@@ -1,0 +1,49 @@
+# VSIX には実行時に必要な成果物だけを含める（ホワイトリスト方式）。
+**/*
+
+# 実行用バンドルのみ。test-harness / probe / source map は含めない。
+!dist/extension.js
+!dist/webview.js
+!dist/settings.js
+dist/test-harness.*
+dist/probe-*
+**/*.map
+
+# 実行時に読む media だけ。README の画像は同梱しない（相対 src と data: は VS Code の拡張詳細ページが剥がす）。
+# icon.png / laisora-icon.svg は package.json、css は extension.ts / settings-panel.ts が読む
+!media/icon.png
+!media/laisora-icon.svg
+!media/main.css
+!media/settings.css
+!package.json
+!package.nls.json
+!package.nls.ja.json
+# 訳の入ったバンドルだけ同梱する。VS Code が開くのは `bundle.l10n.<言語>.json` だけで
+# （実測: extensionHostProcess.js は `bundle.l10n.${currentLanguage}.json` しか組み立てない）、
+# 英語は l10n.t() の引数がそのまま出るため、鍵と値が同一の bundle.l10n.json は実行時に読まれない
+!l10n/bundle.l10n.ja.json
+!README.md
+!README.ja.md
+!LICENSE
+!THIRD-PARTY-NOTICES.md
+!CHANGELOG.md
+
+# 開発・検証用ファイル（ホワイトリスト外であることを明示）
+src/
+test/
+scripts/
+tools/
+artifacts/
+tmp/
+docs/
+node_modules/
+*.log
+harness-*
+probe-*
+codex-*
+sol-*
+REVIEW*.md
+*.map
+agy-*
+PROMPT.md
+tsconfig*

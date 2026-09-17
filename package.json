@@ -1,0 +1,228 @@
+{
+  "name": "laisora",
+  "displayName": "LAISORA",
+  "description": "%extension.description%",
+  "version": "1.0.0",
+  "publisher": "az-llc",
+  "engines": {
+    "vscode": "^1.90.0"
+  },
+  "extensionKind": [
+    "ui"
+  ],
+  "main": "./dist/extension.js",
+  "l10n": "./l10n",
+  "activationEvents": [],
+  "capabilities": {
+    "untrustedWorkspaces": {
+      "supported": false,
+      "description": "%capabilities.untrustedWorkspaces%"
+    },
+    "virtualWorkspaces": false
+  },
+  "contributes": {
+    "commands": [
+      {
+        "command": "laisora.open",
+        "title": "%command.laisora.open.title%"
+      },
+      {
+        "command": "laisora.openSettings",
+        "title": "%command.laisora.openSettings.title%"
+      }
+    ],
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "laisora",
+          "title": "LAISORA",
+          "icon": "media/laisora-icon.svg"
+        }
+      ]
+    },
+    "views": {
+      "laisora": [
+        {
+          "id": "laisora.home",
+          "name": "LAISORA",
+          "type": "webview"
+        }
+      ]
+    },
+    "configuration": {
+      "title": "LAISORA",
+      "properties": {
+        "laisora.claude.settingSources": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "enum": [
+              "user",
+              "project",
+              "local"
+            ]
+          },
+          "default": [
+            "user",
+            "project",
+            "local"
+          ],
+          "description": "%config.laisora.claude.settingSources.description%",
+          "scope": "machine"
+        },
+        "laisora.claude.executablePath": {
+          "type": "string",
+          "default": "",
+          "scope": "machine",
+          "description": "%config.laisora.claude.executablePath.description%"
+        },
+        "laisora.claude.apiKeyPolicy": {
+          "type": "string",
+          "enum": [
+            "inherit",
+            "subscriptionOnly"
+          ],
+          "default": "inherit",
+          "scope": "machine",
+          "description": "%config.laisora.claude.apiKeyPolicy.description%",
+          "enumDescriptions": [
+            "%config.laisora.claude.apiKeyPolicy.inherit%",
+            "%config.laisora.claude.apiKeyPolicy.subscriptionOnly%"
+          ]
+        },
+        "laisora.workLog.semanticView": {
+          "type": "boolean",
+          "default": true,
+          "description": "%config.laisora.workLog.semanticView.description%"
+        },
+        "laisora.workLog.llmAnalysis": {
+          "type": "boolean",
+          "default": true,
+          "description": "%config.laisora.workLog.llmAnalysis.description%"
+        },
+        "laisora.workLog.llmAnalysisDiagnostics": {
+          "type": "boolean",
+          "default": false,
+          "description": "%config.laisora.workLog.llmAnalysisDiagnostics.description%"
+        },
+        "laisora.defaultCwd": {
+          "type": "string",
+          "default": "",
+          "description": "%config.laisora.defaultCwd.description%",
+          "scope": "machine"
+        },
+        "laisora.tabLimit": {
+          "type": "integer",
+          "minimum": 1,
+          "default": 20,
+          "description": "%config.laisora.tabLimit.description%"
+        },
+        "laisora.restoreTabsOnStartup": {
+          "type": "boolean",
+          "default": true,
+          "description": "%config.laisora.restoreTabsOnStartup.description%"
+        },
+        "laisora.claude.fileLinkInstruction": {
+          "type": "boolean",
+          "default": true,
+          "scope": "application",
+          "description": "%config.laisora.claude.fileLinkInstruction.description%"
+        },
+        "laisora.fileLinks.revealInExplorer": {
+          "type": "boolean",
+          "default": true,
+          "scope": "application",
+          "description": "%config.laisora.fileLinks.revealInExplorer.description%"
+        },
+        "laisora.fileLinks.allowOutsideWorkspace": {
+          "type": "boolean",
+          "default": false,
+          "scope": "machine",
+          "description": "%config.laisora.fileLinks.allowOutsideWorkspace.description%"
+        },
+        "laisora.fileLinks.confirmOutsideWorkspace": {
+          "type": "boolean",
+          "default": true,
+          "scope": "machine",
+          "description": "%config.laisora.fileLinks.confirmOutsideWorkspace.description%"
+        },
+        "laisora.fileLinks.openOutsideReadOnly": {
+          "type": "boolean",
+          "default": true,
+          "scope": "machine",
+          "description": "%config.laisora.fileLinks.openOutsideReadOnly.description%"
+        },
+        "laisora.composer.sendKey": {
+          "type": "string",
+          "enum": [
+            "enter",
+            "shiftEnter"
+          ],
+          "default": "enter",
+          "scope": "application",
+          "description": "%config.laisora.composer.sendKey.description%",
+          "enumDescriptions": [
+            "%config.laisora.composer.sendKey.enter%",
+            "%config.laisora.composer.sendKey.shiftEnter%"
+          ]
+        },
+        "laisora.interruptForceKillTimeoutMs": {
+          "type": "number",
+          "default": 5000,
+          "description": "%config.laisora.interruptForceKillTimeoutMs.description%"
+        },
+        "laisora.guardrail.autoMaxLevel": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 3,
+          "default": 1,
+          "description": "%config.laisora.guardrail.autoMaxLevel.description%",
+          "scope": "machine"
+        },
+        "laisora.progressTracking": {
+          "type": "string",
+          "enum": [
+            "off",
+            "observe",
+            "instrument"
+          ],
+          "default": "observe",
+          "description": "%config.laisora.progressTracking.description%"
+        },
+        "laisora.claude.remoteControlAtStartup": {
+          "type": "boolean",
+          "default": false,
+          "description": "%config.laisora.claude.remoteControlAtStartup.description%",
+          "scope": "machine"
+        }
+      }
+    }
+  },
+  "scripts": {
+    "build": "node scripts/esbuild.mjs",
+    "watch": "node scripts/esbuild.mjs --watch",
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "@anthropic-ai/claude-agent-sdk": "^0.3.272",
+    "@types/node": "^24.0.0",
+    "@types/vscode": "^1.90.0",
+    "@vscode/l10n": "0.0.18",
+    "@vscode/l10n-dev": "0.0.35",
+    "esbuild": "^0.24.0",
+    "markdown-it": "^15.0.0",
+    "playwright": "^1.49.1",
+    "typescript": "^5.6.0",
+    "zod": "^4.4.3"
+  },
+  "license": "MIT",
+  "icon": "media/icon.png",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Az-llc/LAISORA.git"
+  },
+  "bugs": {
+    "url": "https://github.com/Az-llc/LAISORA/issues"
+  },
+  "homepage": "https://github.com/Az-llc/LAISORA#readme"
+}

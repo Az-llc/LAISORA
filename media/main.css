@@ -1,0 +1,2691 @@
+/* LAISORA — VS Code テーマトークンに整合したチャットUI（フェーズ3 可視化）
+   方針: 装飾はターン構造の可視化（ユーザー/アシスタント/ツールの区別）に集中し、
+   色はテーマ変数から導出する。署名要素はツールカードのステータスインジケータ。 */
+
+html, body {
+  height: 100%;
+  margin: 0;
+  padding: 0;
+  font-family: var(--vscode-font-family);
+  font-size: 13px;
+  color: var(--vscode-foreground);
+  background: var(--vscode-editor-background);
+  overflow: hidden;
+}
+#app {
+  display: flex;
+  flex-direction: column;
+  height: 100vh;
+}
+
+/* bundle のロード・評価に失敗しても、静的 skeleton のまま誤誘導しない。 */
+.bootstrap-failure {
+  box-sizing: border-box;
+  width: min(520px, calc(100% - 32px));
+  margin: auto;
+  padding: 20px;
+  border: 1px solid var(--vscode-inputValidation-errorBorder, var(--vscode-errorForeground));
+  border-radius: 6px;
+  background: var(--vscode-inputValidation-errorBackground, var(--vscode-editorWidget-background));
+}
+.bootstrap-failure h2 {
+  margin: 0 0 10px;
+  font-size: 15px;
+}
+.bootstrap-failure p {
+  margin: 0 0 12px;
+  line-height: 1.5;
+}
+.bootstrap-failure-detail {
+  color: var(--vscode-descriptionForeground);
+  overflow-wrap: anywhere;
+  font-family: var(--vscode-editor-font-family, monospace);
+  font-size: 11px;
+}
+
+/* ---------- タブバー ---------- */
+#topbar {
+  display: flex;
+  align-items: center;
+  flex: 0 0 auto;
+  background: var(--vscode-editorGroupHeader-tabsBackground, var(--vscode-editor-background));
+  border-bottom: 1px solid var(--vscode-panel-border);
+  overflow-x: auto;
+  position: relative;
+}
+#histbtn,
+#handoffbtn,
+#histbtn:hover,
+#handoffbtn:hover { background: var(--vscode-toolbar-hoverBackground, rgba(128,128,128,0.2)); }
+
+.mode-menu-item.auth-picker-parent {
+  display: flex;
+  align-items: center;
+}
+#exportbtn {
+  flex: 0 0 auto;
+  background: transparent;
+  color: var(--vscode-foreground);
+  border: none;
+  padding: 4px 8px;
+  font-size: 13px;
+  cursor: pointer;
+}
+#exportbtn:hover { background: var(--vscode-toolbar-hoverBackground, rgba(128,128,128,0.2)); }
+
+/* ---------- 履歴パネル ---------- */
+.hist-panel {
+  /* fixed: #topbar の overflow-x:auto によるクリップを受けない（top はJSで設定） */
+  position: fixed;
+  right: 8px;
+  width: 320px;
+  max-width: calc(100vw - 16px);
+  background: var(--vscode-editorWidget-background);
+  border: 1px solid var(--vscode-panel-border);
+  border-radius: 6px;
+  box-shadow: 0 2px 8px rgba(0,0,0,0.3);
+  padding: 8px;
+  z-index: 30;
+}
+.hist-panel.hidden { display: none; }
+#histsearch {
+  width: 100%;
+  box-sizing: border-box;
+  background: var(--vscode-input-background);
+  color: var(--vscode-input-foreground);
+  border: 1px solid var(--vscode-input-border, var(--vscode-panel-border));
+  border-radius: 4px;
+  padding: 4px 8px;
+  font-size: 12px;
+  margin-bottom: 6px;
+}
+#histlist {
+  max-height: 320px;
+  overflow-y: auto;
+}
+.hist-row {
+  padding: 6px 8px;
+  border-radius: 4px;
+  cursor: pointer;
+}
+.hist-row:hover {
+  background: var(--vscode-list-activeSelectionBackground, rgba(128,128,128,0.3));
+  color: var(--vscode-list-activeSelectionForeground, var(--vscode-foreground));
+}
+.hist-title {
+  font-size: 12px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.hist-meta {
+  font-size: 11px;
+  opacity: 0.65;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.hist-empty {
+  font-size: 12px;
+  opacity: 0.65;
+  padding: 8px;
+  text-align: center;
+}
+.hist-note,
+.convlog-history-note {
+  font-size: 11px;
+  padding: 6px 8px;
+  line-height: 1.5;
+  color: var(--vscode-inputValidation-warningForeground, var(--vscode-foreground));
+  background: var(--vscode-inputValidation-warningBackground, transparent);
+  border-bottom: 1px solid var(--vscode-inputValidation-warningBorder, var(--vscode-panel-border));
+}
+.convlog-history-note { margin: 8px 0 6px; }
+.hist-row {
+  position: relative;
+  padding-right: 30px;
+}
+.hist-analyze {
+  position: absolute;
+  right: 4px;
+  top: 50%;
+  transform: translateY(-50%);
+  background: transparent;
+  border: none;
+  color: var(--vscode-foreground);
+  padding: 2px 6px;
+  font-size: 12px;
+  cursor: pointer;
+  border-radius: 4px;
+}
+.hist-analyze:hover { background: var(--vscode-toolbar-hoverBackground, rgba(128,128,128,0.2)); }
+#tabbar {
+  display: flex;
+  flex: 1 1 auto;
+  min-width: 0;
+}
+.tab {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 10px;
+  border: none;
+  border-right: 1px solid var(--vscode-panel-border);
+  border-radius: 0;
+  background: var(--vscode-tab-inactiveBackground, transparent);
+  color: var(--vscode-tab-inactiveForeground, var(--vscode-descriptionForeground));
+  cursor: pointer;
+  font-size: 12px;
+  max-width: 160px;
+}
+.tab.active {
+  background: var(--vscode-tab-activeBackground, var(--vscode-editor-background));
+  color: var(--vscode-tab-activeForeground, var(--vscode-foreground));
+  border-bottom: 2px solid var(--vscode-focusBorder);
+}
+.tab-label {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.tab-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: transparent;
+  flex: 0 0 auto;
+}
+.tab.running .tab-dot {
+  background: var(--vscode-progressBar-background, #0e70c0);
+  animation: pulse 1.2s ease-in-out infinite;
+}
+@keyframes pulse {
+  50% { opacity: 0.35; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .tab.running .tab-dot { animation: none; }
+  .tool-status::before { animation: none !important; }
+}
+/* 承認待ちは実行中より優先。CSS のソース順に依存させない（R-SES-02）。
+   .running と併発するので、詳細度が勝つ形（2 クラス）で明示する */
+.tab.needs-approval.running .tab-dot,
+.tab.needs-approval .tab-dot {
+  background: var(--vscode-editorWarning-foreground, #b8860b);
+  animation: none;
+}
+.tab-close {
+  opacity: 0.5;
+  padding: 0 2px;
+  border-radius: 3px;
+  background: transparent;
+  border: none;
+  color: inherit;
+  font-size: inherit;
+  cursor: pointer;
+}
+.tab-close:focus-visible { outline: 1px solid var(--vscode-focusBorder); opacity: 1; }
+.tab-close:hover { opacity: 1; background: var(--vscode-toolbar-hoverBackground, rgba(128,128,128,0.2)); }
+#newtab {
+  flex: 0 0 auto;
+  background: transparent;
+  color: var(--vscode-foreground);
+  border: none;
+  padding: 4px 10px;
+  font-size: 14px;
+  cursor: pointer;
+}
+#newtab:hover { background: var(--vscode-toolbar-hoverBackground, rgba(128,128,128,0.2)); }
+
+/* ---------- チップ（コンポーザのアクション行内に表示。ユーザー指定） ---------- */
+#composer-actions-left {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  flex: 1 1 auto;
+}
+/* 幅が足りないときはusageから省略（全文はtitleで見える） */
+#usage {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
+  flex-shrink: 4; /* usageをauthより4倍速く縮め、省略を主にusage側へ寄せる */
+}
+/* 狭幅ではauthも省略可にする。flex 0 0 だとusageが潰れきった後に
+   右端の送信ボタンへはみ出して重なる（titleは認証詳細でありチップ本文の全文ではない。
+   モデル/effortの全文はモードメニュー側で確認できる） */
+#auth {
+  white-space: nowrap;
+  flex: 0 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+button#usage.chip { border: none; font: inherit; cursor: pointer; }
+button#usage.chip:hover { filter: brightness(1.15); }
+#usagepanel { left: auto; right: 0; min-width: 280px; }
+.usage-line { font-size: 11px; padding: 3px 8px; }
+.usage-rl { padding-bottom: 4px; }
+.usage-bar-wrap {
+  margin: 2px 8px 4px;
+  height: 6px;
+  border-radius: 3px;
+  background: color-mix(in srgb, var(--vscode-badge-background) 40%, transparent);
+  overflow: hidden;
+}
+.usage-bar { height: 100%; background: var(--vscode-progressBar-background, #0e70c0); }
+.usage-bar.warn { background: var(--vscode-errorForeground); }
+.chip {
+  font-size: 11px;
+  padding: 2px 8px;
+  border-radius: 9px;
+  background: var(--vscode-badge-background);
+  color: var(--vscode-badge-foreground);
+}
+.chip.hidden { display: none; }
+/* #auth はチップ風ボタン（クリックでモデル/effort統合ピッカーを開く） */
+button#auth.chip {
+  border: none;
+  font: inherit;
+  cursor: pointer;
+}
+button#auth.chip:hover { filter: brightness(1.15); }
+
+/* ---------- 統合ピッカー（モデル / effort。inputwrap直上） ---------- */
+.auth-picker {
+  position: absolute;
+  left: 0;
+  bottom: 100%;
+  margin-bottom: 4px;
+  min-width: 240px;
+  max-width: 320px;
+  /* モデル一覧が伸びてもキーボードカーソルが画面外に出ないようスクロールさせる
+     （.suggest-menu と同じ手当て。移動時に scrollIntoView で追従する） */
+  max-height: 320px;
+  overflow-y: auto;
+  background: var(--vscode-editorWidget-background);
+  border: 1px solid var(--vscode-panel-border);
+  border-radius: 6px;
+  box-shadow: 0 2px 8px rgba(0,0,0,0.3);
+  padding: 6px;
+  z-index: 25;
+}
+.auth-picker.hidden { display: none; }
+.auth-submenu {
+  position: fixed;
+  z-index: 26;
+  max-height: 320px;
+  overflow-y: auto;
+  min-width: 220px;
+  max-width: 320px;
+  bottom: auto;
+  margin-bottom: 0;
+}
+.auth-submenu.hidden { display: none; }
+.auth-picker .mode-menu-item.auth-picker-parent {
+  flex-direction: row;
+}
+.auth-picker-section + .auth-picker-section {
+  margin-top: 6px;
+  padding-top: 6px;
+  border-top: 1px solid var(--vscode-panel-border);
+}
+.auth-picker-heading {
+  font-size: 10px;
+  text-transform: uppercase;
+  opacity: 0.6;
+  padding: 2px 8px 4px;
+}
+.auth-picker .mode-menu-item { display: flex; flex-direction: column; gap: 1px; }
+.auth-picker-loading {
+  opacity: 0.6;
+  cursor: default;
+  pointer-events: none;
+}
+.chip.ok { background: var(--vscode-testing-iconPassed, #2d7d46); color: #fff; }
+.chip.warn { background: var(--vscode-editorWarning-foreground, #b8860b); color: #fff; }
+
+/* ---------- ログ ---------- */
+#logs {
+  flex: 1 1 auto;
+  overflow-y: auto;
+  padding: 12px 14px;
+  scrollbar-gutter: stable;
+}
+.log { display: none; }
+.log.active { display: block; max-width: 860px; margin: 0 auto; }
+
+/* ---------- 会話 / 作業ログ の表示切替（セッション内部・tablist） ---------- */
+/* sticky ヘッダ。切替タブとステータス帯をまとめ、どちらのパネルでも常に見える位置に置く */
+.log-head {
+  position: sticky;
+  /* #logs の padding-top(12px) を打ち消して端まで貼り付ける */
+  top: -12px;
+  margin: -12px -14px 8px -14px;
+  z-index: 6;
+  background: var(--vscode-editor-background);
+}
+.session-heading { display: flex; align-items: center; gap: 8px; min-width: 0; padding: 3px 14px 0; min-height: 26px; }
+.session-heading-title { flex: 0 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-weight: 600; }
+.session-rename-icon { flex: none; opacity: 0; padding: 2px 4px; border: 0; border-radius: 3px; background: transparent; color: var(--vscode-descriptionForeground); cursor: pointer; }
+.session-heading:hover .session-rename-icon, .session-heading:focus-within .session-rename-icon { opacity: 1; }
+.session-rename-icon:hover { background: var(--vscode-toolbar-hoverBackground); }
+@media (hover: none) { .session-rename-icon { opacity: 1; } }
+.session-actions { position: relative; margin-left: auto; flex: none; }
+.session-actions summary { cursor: pointer; list-style: none; padding: 3px 6px; border-radius: 3px; }
+.session-actions summary::-webkit-details-marker { display: none; }
+.session-actions summary:hover { background: var(--vscode-toolbar-hoverBackground); }
+.session-actions-panel { position: absolute; right: 0; top: 100%; z-index: 10; width: max-content; max-width: calc(100vw - 40px); padding: 4px; background: var(--vscode-menu-background, var(--vscode-editor-background)); color: var(--vscode-menu-foreground, var(--vscode-foreground)); border: 1px solid var(--vscode-panel-border); border-radius: 4px; box-shadow: 0 3px 8px var(--vscode-widget-shadow); }
+.session-actions-panel button { display: flex; align-items: center; gap: 8px; width: 100%; border: 0; padding: 6px 8px; text-align: left; color: inherit; background: transparent; cursor: pointer; }
+.session-actions-panel button:hover { background: var(--vscode-menu-selectionBackground); color: var(--vscode-menu-selectionForeground); }
+.session-rename-form { display: flex; flex: 1; min-width: 0; gap: 4px; flex-wrap: wrap; }
+.session-rename-form input { flex: 1; min-width: 80px; color: var(--vscode-input-foreground); background: var(--vscode-input-background); border: 1px solid var(--vscode-input-border, var(--vscode-panel-border)); }
+.session-rename-form button { color: var(--vscode-button-foreground); background: var(--vscode-button-background); border: 0; cursor: pointer; }
+.session-heading [hidden], #topbar button[hidden] { display: none; }
+#session-actions-slot { flex: none; padding: 0 4px; }
+#session-actions-slot:empty { display: none; }
+.hist-sources { display: flex; gap: 4px; margin-bottom: 8px; }
+.hist-sources button { flex: 1; padding: 5px; border: 0; border-radius: 3px; color: var(--vscode-foreground); background: transparent; cursor: pointer; }
+.hist-sources button[aria-pressed="true"] { background: var(--vscode-toolbar-hoverBackground); }
+.hist-more { display: block; width: 100%; padding: 6px; color: var(--vscode-foreground); background: transparent; border: 0; cursor: pointer; }
+.hist-more[hidden] { display: none; }
+#session-actions-slot .session-actions-panel { position: fixed; right: 8px; z-index: 40; }
+#session-actions-slot :focus-visible { outline: 1px solid var(--vscode-focusBorder); outline-offset: 1px; }
+.session-heading :focus-visible { outline: 1px solid var(--vscode-focusBorder); outline-offset: 1px; }
+.view-switch {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-end;
+  gap: 8px;
+  padding: 6px 14px 0;
+  border-bottom: 1px solid var(--vscode-panel-border);
+}
+.view-switch-tabs { display: flex; gap: 2px; }
+
+/* 過去ログの裏読みの進行。読み終わると消えるので、会話本文の領域は一切使わない */
+.conv-load {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  padding-bottom: 6px;
+  font-size: 11px;
+  color: var(--vscode-descriptionForeground);
+}
+.conv-load.hidden { display: none; }
+.conv-load-icon { display: inline-block; }
+/* 幅が足りないときは文言から削る。数字を含む末尾ではなく先頭から詰めると残件が消える */
+.conv-load-text {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.conv-load-bar {
+  flex: 0 0 auto;
+  width: 48px;
+  height: 3px;
+  border-radius: 2px;
+  background: var(--vscode-editorWidget-border, var(--vscode-panel-border));
+  overflow: hidden;
+}
+.conv-load-bar.hidden { display: none; }
+.conv-load-bar > i { display: block; height: 100%; background: var(--vscode-focusBorder); }
+.conv-load.failed .conv-load-icon { color: var(--vscode-errorForeground); }
+.conv-load-retry {
+  flex: 0 0 auto;
+  border: none;
+  background: var(--vscode-button-secondaryBackground, var(--vscode-badge-background));
+  color: var(--vscode-button-secondaryForeground, var(--vscode-badge-foreground));
+  font-size: 11px;
+  padding: 1px 8px;
+  border-radius: 9px;
+  cursor: pointer;
+}
+.conv-load-retry.hidden { display: none; }
+.conv-load-retry:focus-visible { outline: 1px solid var(--vscode-focusBorder); }
+.conv-load:not(.failed) .conv-load-icon { animation: conv-load-spin 1s linear infinite; }
+@media (prefers-reduced-motion: reduce) {
+  .conv-load .conv-load-icon { animation: none; }
+}
+@keyframes conv-load-spin {
+  to { transform: rotate(360deg); }
+}
+/* 引き継ぎの進行・失敗。裏読みの進行と同じ行・同じ見た目で右端に並ぶ */
+.handoff-status {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  padding-bottom: 6px;
+  font-size: 11px;
+  color: var(--vscode-descriptionForeground);
+}
+.handoff-status.hidden { display: none; }
+.handoff-status-icon { display: inline-block; }
+.handoff-status-lines {
+  /* flex 項目になるので min-width を 0 にしないと handoff-status-text の省略記号が効かない */
+  min-width: 0;
+}
+.handoff-status-text {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.handoff-status-playful {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  opacity: 0.75;
+}
+.handoff-status-playful.stalled {
+  opacity: 1;
+  color: var(--vscode-errorForeground);
+}
+.handoff-status.failed .handoff-status-icon { color: var(--vscode-errorForeground); }
+.handoff-status:not(.failed) .handoff-status-icon { animation: conv-load-spin 1s linear infinite; }
+@media (prefers-reduced-motion: reduce) {
+  .handoff-status .handoff-status-icon { animation: none; }
+}
+.handoff-status-cancel {
+  flex: 0 0 auto;
+  border: none;
+  background: var(--vscode-button-secondaryBackground, var(--vscode-badge-background));
+  color: var(--vscode-button-secondaryForeground, var(--vscode-badge-foreground));
+  font-size: 11px;
+  padding: 1px 8px;
+  border-radius: 9px;
+  cursor: pointer;
+}
+.handoff-status-cancel.hidden { display: none; }
+.handoff-status-cancel:focus-visible { outline: 1px solid var(--vscode-focusBorder); }
+
+/* 状態カードの展開部。本文は原文のまま出すので折り返しと縦の上限だけ与える */
+.handoff-detail { margin-top: 4px; }
+.handoff-detail > summary { cursor: pointer; font-size: 11px; color: var(--vscode-textLink-foreground); }
+.handoff-detail > summary:focus-visible { outline: 1px solid var(--vscode-focusBorder); }
+.handoff-detail-body {
+  margin: 4px 0 0;
+  max-height: 40vh;
+  overflow: auto;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  font-family: var(--vscode-editor-font-family, monospace);
+  font-size: 11px;
+}
+
+.handoff-source-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 4px 8px;
+}
+.handoff-source-label {
+  word-break: break-word;
+  overflow-wrap: anywhere;
+}
+.handoff-source-link {
+  background: transparent;
+  border: 1px solid var(--vscode-button-border, var(--vscode-textLink-foreground));
+  color: var(--vscode-textLink-foreground);
+  font-size: 11px;
+  padding: 1px 8px;
+  border-radius: 9px;
+  cursor: pointer;
+  flex-shrink: 0;
+  display: inline-flex;
+  align-items: center;
+}
+.handoff-source-link:hover {
+  background: var(--vscode-toolbar-hoverBackground, rgba(128,128,128,0.2));
+  color: var(--vscode-textLink-activeForeground, var(--vscode-textLink-foreground));
+}
+.handoff-source-link:focus-visible {
+  outline: 1px solid var(--vscode-focusBorder);
+}
+
+.view-switch-tab {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  border: none;
+  background: transparent;
+  color: var(--vscode-descriptionForeground);
+  font-size: 12px;
+  padding: 4px 10px 6px;
+  cursor: pointer;
+  border-bottom: 2px solid transparent;
+  /* 狭い幅でも文言が折れない */
+  white-space: nowrap;
+}
+.view-switch-tab:hover { color: var(--vscode-foreground); }
+.view-switch-tab.active {
+  color: var(--vscode-foreground);
+  font-weight: 600;
+  border-bottom-color: var(--vscode-focusBorder);
+}
+.view-switch-tab:focus-visible {
+  outline: 1px solid var(--vscode-focusBorder);
+  outline-offset: -1px;
+  border-radius: 3px;
+}
+.view-switch-badge {
+  min-width: 15px;
+  padding: 0 4px;
+  border-radius: 7px;
+  font-size: 10px;
+  line-height: 15px;
+  text-align: center;
+  background: var(--vscode-badge-background);
+  color: var(--vscode-badge-foreground);
+}
+.view-switch-badge.hidden { display: none; }
+/* 応答が要る／致命的な問題が出たことを、作業ログ表示中でも見落とさせない */
+.view-switch-tab.needs-attention { color: var(--vscode-errorForeground); font-weight: 600; }
+.view-switch-tab.needs-attention::after {
+  content: "●";
+  font-size: 8px;
+  margin-left: 2px;
+}
+
+.panel { display: none; }
+.panel.active { display: block; }
+/* 打鍵ごとの会話全体の再描画を止める。.panel-work へ広げない（fixed の .work-inspector が閉じ込められる）。-8px は包含で先頭の子の上 margin が .log-head の margin-bottom と相殺しなくなる分の打ち消しで、先頭に来うる子（.block / .convlog-history-note）の上 margin が 8px 以上である前提。clip-margin は .flash の outline 用 */
+.panel-conv { contain: layout paint; margin-top: -8px; overflow-clip-margin: 6px; }
+
+/* 作業ログのターン区切り（会話側の「ログを見る」からの着地点）。見出し = 人の発言 1 行目（R-TAB-06） */
+.worklog-turn {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  margin: 14px 0 4px;
+  padding: 8px 10px 4px;
+  border-top: 1px solid var(--vscode-panel-border);
+  font-size: 11px;
+  color: var(--vscode-descriptionForeground);
+  /* sticky な .log-head の裏へ潜らせないための保険。ジャンプ時は JS 側が実高から
+     scroll-margin-top を上書きするため、ここは帯だけ出ている場合の目安値 */
+  scroll-margin-top: 60px;
+}
+.worklog-turn > b {
+  color: var(--vscode-foreground);
+  font-weight: 600;
+  font-size: 12px;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.worklog-turn > b:empty::before { content: attr(data-empty-label); font-weight: 400; color: var(--vscode-descriptionForeground); }
+.worklog-turn > span { flex: 0 0 auto; font-variant-numeric: tabular-nums; }
+.worklog-turn .wl-rep { font-size: 10.5px; }
+.worklog-turn.flash {
+  color: var(--vscode-focusBorder);
+  font-weight: 600;
+}
+.block.user.flash,
+.block.assistant-turn.flash {
+  outline: 2px solid var(--vscode-focusBorder);
+  outline-offset: 2px;
+}
+
+.tool-row.flash,
+.agent-card.flash {
+  outline: 2px solid var(--vscode-focusBorder);
+  outline-offset: 2px;
+}
+
+/* 作業ログの遡り（History Lazy Loading）。more は失敗通知の置き場で body より上に固定し、
+   取り寄せた chunk は body の先頭へ積むので通知が下へ流れない */
+.worklog-history-more { display: flex; justify-content: center; }
+.worklog-history-more:empty { display: none; }
+
+/* 履歴パネル経由の分析はボタンごとパネルが閉じるので、固定表示の #analysis-busy が要る */
+#analysis-busy {
+  display: none;
+  position: fixed;
+  right: 14px;
+  bottom: 14px;
+  z-index: 20;
+  align-items: center;
+  gap: 6px;
+  padding: 5px 9px;
+  border: 1px solid var(--vscode-panel-border);
+  border-radius: 4px;
+  background: var(--vscode-editorWidget-background);
+  color: var(--vscode-foreground);
+  font-size: 11px;
+  pointer-events: none;
+}
+#analysis-busy.on { display: flex; }
+.analysis-busy-spinner,
+button[data-analysis-trigger].is-analysis-pending::after {
+  content: "";
+  display: inline-block;
+  width: 0.75em;
+  height: 0.75em;
+  border: 1px solid color-mix(in srgb, currentColor 40%, transparent);
+  border-top-color: currentColor;
+  border-radius: 50%;
+  animation: analysis-pending-spin 0.7s linear infinite;
+}
+button[data-analysis-trigger].is-analysis-pending { cursor: progress; }
+button[data-analysis-trigger].is-analysis-pending::after { margin-left: 0.45em; vertical-align: -0.05em; }
+/* disabled の減光で回転が見えなくなるのを防ぐ */
+button[data-analysis-trigger]:disabled.is-analysis-pending { opacity: 1; }
+@keyframes analysis-pending-spin { to { transform: rotate(1turn); } }
+@media (prefers-reduced-motion: reduce) {
+  .analysis-busy-spinner,
+  button[data-analysis-trigger].is-analysis-pending::after { animation: none; border-top-color: currentColor; }
+}
+
+/* 承認要求の参照行（操作は会話側。ここは監査用の記録だけ） */
+.block.worklog-approval-ref {
+  font-size: 12px;
+  color: var(--vscode-descriptionForeground);
+  border-left: 2px solid var(--vscode-focusBorder);
+  padding: 4px 10px;
+}
+.block.worklog-approval-ref.allow { border-left-color: var(--vscode-testing-iconPassed, #2d7d46); }
+.block.worklog-approval-ref.deny { border-left-color: var(--vscode-errorForeground); }
+
+/* 会話側のターン要約チップ */
+.block.turn-summary {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  font-size: 11px;
+  color: var(--vscode-descriptionForeground);
+  padding: 2px 12px;
+}
+.turn-summary-link {
+  border: none;
+  background: transparent;
+  color: var(--vscode-textLink-foreground);
+  font-size: 11px;
+  padding: 1px 4px;
+  cursor: pointer;
+  border-radius: 3px;
+}
+.turn-summary-link:hover { text-decoration: underline; }
+.turn-summary-link:focus-visible { outline: 1px solid var(--vscode-focusBorder); }
+
+/* ---------- 稼働中ステータスストリップ（sticky） ---------- */
+/* sticky は親の .log-head が担うため、ここでは位置指定しない（二重stickyを避ける） */
+.status-strip-wrap {
+  background: var(--vscode-editor-background);
+}
+.status-strip-wrap.hidden { display: none; }
+.status-strip {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 14px;
+  font-size: 11px;
+  color: var(--vscode-descriptionForeground);
+  background: var(--vscode-editorWidget-background, var(--vscode-editor-background));
+  border-bottom: 1px solid var(--vscode-panel-border);
+  cursor: pointer;
+}
+.status-strip-spinner {
+  flex: 0 0 auto;
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  border: 1.5px solid var(--vscode-progressBar-background, #0e70c0);
+  border-top-color: transparent;
+}
+.status-strip.spinning .status-strip-spinner { animation: spin 0.9s linear infinite; }
+.status-strip-spinner.hidden { display: none; }
+.status-strip-text {
+  flex: 1 1 auto;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.status-strip-time {
+  flex: 0 0 auto;
+  font-variant-numeric: tabular-nums;
+}
+.status-strip-panel {
+  /* max-height を外形へ効かせる。content-box のままだと padding+border の分だけ
+     上限を超え、tab.ts の capStripPanel の見積もりとずれる */
+  box-sizing: border-box;
+  /* --strip-panel-max は tab.ts が実測で書く。無いと .log-head がスクロールポートより
+     高くなり、最下部でヘッダごとタブバーが押し上げられる */
+  max-height: min(340px, var(--strip-panel-max, 340px));
+  overflow-y: auto;
+  overflow-x: hidden;
+  padding: 6px 14px;
+  background: var(--vscode-editorWidget-background, var(--vscode-editor-background));
+  border-bottom: 1px solid var(--vscode-panel-border);
+  font-size: 12px;
+}
+.status-strip-panel.hidden { display: none; }
+.status-strip-empty { color: var(--vscode-descriptionForeground); font-size: 11px; }
+/* パネル内ミラー: ログ内のカードを clone せず、同じ WorkModel の値から独立に描く */
+.status-strip-mirror .block { margin: 0 0 6px 0; }
+.status-strip-mirror .block:last-child { margin-bottom: 0; }
+.status-strip-running-bg { color: var(--vscode-descriptionForeground); font-size: 11px; padding: 2px 0; }
+
+/* ---------- 分析タブ（会話タブとは別系統） ---------- */
+/* 表示切替は作業ログ内タブ（work-overview.ts）の hidden 属性で行うため display は持たない */
+.analysis-view { max-width: 860px; margin: 0 auto; }
+.analysis-h1 { font-size: 15px; margin: 10px 0 2px; }
+.analysis-sub { font-size: 11px; color: var(--vscode-descriptionForeground); margin-bottom: 14px; }
+.analysis-view .statrow { display: flex; gap: 10px; flex-wrap: wrap; margin-bottom: 16px; }
+.analysis-view .stat {
+  background: var(--vscode-editorWidget-background);
+  border: 1px solid var(--vscode-panel-border);
+  border-radius: 6px;
+  padding: 8px 14px;
+  min-width: 96px;
+}
+.analysis-view .stat .v { font-size: 16px; font-weight: 600; }
+.analysis-view .stat .l { font-size: 10px; color: var(--vscode-descriptionForeground); }
+.analysis-view .stat.warn .v { color: var(--vscode-errorForeground); }
+.analysis-view h2 {
+  font-size: 12px;
+  text-transform: uppercase;
+  opacity: 0.6;
+  margin: 18px 0 6px;
+}
+.analysis-view .analysis-note {
+  font-size: 12px;
+  color: var(--vscode-descriptionForeground);
+}
+.analysis-view .finding {
+  border-left: 3px solid var(--vscode-errorForeground);
+  background: color-mix(in srgb, var(--vscode-errorForeground) 6%, transparent);
+  border-radius: 4px;
+  padding: 8px 10px;
+  margin: 6px 0;
+  font-size: 12px;
+}
+.analysis-view .finding.notice {
+  border-color: var(--vscode-editorWarning-foreground);
+  background: color-mix(in srgb, var(--vscode-editorWarning-foreground) 6%, transparent);
+}
+.analysis-view .finding b { display: block; margin-bottom: 2px; }
+.analysis-view .finding .act { color: var(--vscode-descriptionForeground); font-size: 11px; margin-top: 3px; }
+.analysis-view table { width: 100%; border-collapse: collapse; font-size: 12px; margin-bottom: 8px; }
+.analysis-view th {
+  text-align: left;
+  font-weight: 500;
+  font-size: 10px;
+  text-transform: uppercase;
+  color: var(--vscode-descriptionForeground);
+  padding: 4px 8px;
+  border-bottom: 1px solid var(--vscode-panel-border);
+}
+.analysis-view td { padding: 5px 8px; border-bottom: 1px solid color-mix(in srgb, var(--vscode-panel-border) 50%, transparent); }
+.analysis-view td.num { text-align: right; font-family: var(--vscode-editor-font-family); }
+.analysis-view .bar { display: inline-block; height: 8px; background: var(--vscode-progressBar-background); border-radius: 2px; vertical-align: middle; }
+.analysis-view .fail { color: var(--vscode-errorForeground); }
+.analysis-conclusion { display: flex; align-items: center; gap: 10px; padding: 10px 12px; border: 1px solid var(--vscode-panel-border); border-radius: 6px; background: var(--vscode-editorWidget-background); }
+.analysis-badge { display: inline-block; border-radius: 999px; padding: 3px 9px; font-size: 12px; font-weight: 700; white-space: nowrap; }
+.analysis-badge.complete { color: var(--vscode-testing-iconPassed); background: color-mix(in srgb, var(--vscode-testing-iconPassed) 16%, transparent); }
+.analysis-badge.review { color: var(--vscode-editorWarning-foreground); background: color-mix(in srgb, var(--vscode-editorWarning-foreground) 16%, transparent); }
+.analysis-badge.stop { color: var(--vscode-errorForeground); background: color-mix(in srgb, var(--vscode-errorForeground) 16%, transparent); }
+.analysis-applied-rule { font-size: 12px; }
+.analysis-criteria, .analysis-details { margin-top: 8px; }
+.analysis-criteria summary, .analysis-details > summary { cursor: pointer; color: var(--vscode-textLink-foreground); font-size: 12px; }
+.analysis-criteria ul { margin: 6px 0 0; padding-left: 22px; font-size: 12px; }
+.analysis-evidence-list, .analysis-actions { margin: 0; padding-left: 22px; }
+.analysis-evidence { margin: 6px 0; padding: 8px 10px; border-left: 3px solid var(--vscode-editorWarning-foreground); background: color-mix(in srgb, var(--vscode-editorWarning-foreground) 6%, transparent); font-size: 12px; }
+.analysis-evidence b, .analysis-action-source { display: block; margin-bottom: 3px; }
+.analysis-location, .analysis-action-source { color: var(--vscode-descriptionForeground); font-size: 11px; }
+.analysis-log-link { margin: 0; padding: 0; border: 0; color: var(--vscode-textLink-foreground); background: transparent; cursor: pointer; text-decoration: underline; font: inherit; }
+.analysis-actions li { margin: 6px 0; font-size: 12px; }
+.analysis-details .statrow { margin-top: 12px; }
+
+.block {
+  margin: 8px 0;
+  padding: 8px 12px;
+  border-radius: 8px;
+  word-break: break-word;
+  line-height: 1.55;
+}
+.block.user {
+  background: var(--vscode-input-background);
+  border: 1px solid var(--vscode-input-border, var(--vscode-panel-border));
+  border-left: 3px solid var(--vscode-focusBorder);
+  white-space: pre-wrap;
+  margin-left: 48px;
+}
+.block.assistant {
+  background: transparent;
+  padding-left: 0;
+  padding-right: 0;
+}
+/* ストリーミング中はプレーンテキスト追記のため改行を保持 */
+.block.assistant.streaming { white-space: pre-wrap; }
+/* 同一ターンのassistant本文コンテナ。ツールを挟んで再開しても1つの回答として読ませるため、
+   セグメント間に余白・背景・枠を作らない（断片は連結せずDOM上は別要素のまま保つ）。 */
+.block.assistant-turn {
+  background: transparent;
+  padding-left: 0;
+  padding-right: 0;
+}
+.assistant-seg + .assistant-seg { margin-top: 0.4em; }
+.assistant-seg.streaming { white-space: pre-wrap; }
+.assistant-seg > *:first-child { margin-top: 0; }
+.assistant-seg > *:last-child { margin-bottom: 0; }
+.block.system {
+  color: var(--vscode-descriptionForeground);
+  font-size: 12px;
+  padding: 2px 12px;
+}
+.block.system.warn { color: var(--vscode-editorWarning-foreground, #b8860b); }
+.block[data-model-divider] {
+  user-select: none;
+}
+/* .block.replayed は減光しない。リロードのたびに会話の大半が replayed になり、opacity を
+   かけるとログ全体が AA を割る。復元境界は挿入される区切り行が示す */
+.block.error {
+  color: var(--vscode-errorForeground);
+  border-left: 3px solid var(--vscode-errorForeground);
+  background: color-mix(in srgb, var(--vscode-errorForeground) 6%, transparent);
+  white-space: pre-wrap;
+}
+
+/* markdown-lite */
+.md-line { min-height: 1em; }
+.md-h { font-weight: 600; margin: 10px 0 4px; }
+.md-h1 { font-size: 1.25em; }
+.md-h2 { font-size: 1.15em; }
+.md-h3, .md-h4 { font-size: 1.05em; }
+.md-h5, .md-h6 { font-size: 1em; }
+.block ul { margin: 4px 0; padding-left: 20px; }
+.block ol { margin: 4px 0; padding-left: 20px; list-style: decimal; }
+li.md-task { list-style: none; margin-left: -16px; }
+li.md-task input[type="checkbox"] { margin: 0 6px 0 0; vertical-align: middle; cursor: default; }
+blockquote.md-quote {
+  margin: 6px 0;
+  padding: 0 0 0 12px;
+  border-left: 3px solid var(--vscode-textBlockQuote-border, rgba(128, 128, 128, 0.4));
+  color: var(--vscode-textBlockQuote-foreground, var(--vscode-descriptionForeground));
+}
+hr.md-hr {
+  border: none;
+  border-top: 1px solid var(--vscode-panel-border, rgba(128, 128, 128, 0.3));
+  margin: 10px 0;
+}
+.block del, .approval-plan del { text-decoration: line-through; }
+.block a, .approval-plan a { color: var(--vscode-textLink-foreground); }
+.block .file-link {
+  appearance: none;
+  border: 0;
+  padding: 0;
+  color: var(--vscode-textLink-foreground);
+  background: transparent;
+  font: inherit;
+  cursor: pointer;
+  text-decoration: underline;
+}
+.block .file-link:hover {
+  color: var(--vscode-textLink-activeForeground, var(--vscode-textLink-foreground));
+}
+.block .file-link:focus-visible {
+  outline: 1px solid var(--vscode-focusBorder);
+  outline-offset: 2px;
+}
+.block .link-kind-icon {
+  width: 0.92em;
+  height: 0.92em;
+  margin-right: 0.28em;
+  color: currentColor;
+  opacity: 0.78;
+  pointer-events: none;
+  vertical-align: -0.12em;
+}
+.md-table {
+  border-collapse: collapse;
+  margin: 6px 0;
+  font-size: 0.95em;
+  max-width: 100%;
+  display: block;
+  overflow-x: auto;
+}
+.md-table th, .md-table td {
+  border: 1px solid var(--vscode-panel-border);
+  padding: 3px 8px;
+  text-align: left;
+}
+.md-table th {
+  font-weight: 600;
+  background: var(--vscode-textCodeBlock-background, rgba(128,128,128,0.12));
+}
+.md-table tbody tr:nth-child(even) {
+  background: color-mix(in srgb, var(--vscode-foreground) 4%, transparent);
+}
+/* Compact code blocks: controls overlay the first line, never add a header row. */
+.codeblock {
+  background: var(--vscode-textCodeBlock-background, rgba(128,128,128,0.12));
+  color: var(--vscode-editor-foreground, inherit);
+  border: 1px solid var(--vscode-panel-border);
+  border-radius: 6px;
+  padding: 8px 10px;
+  /* Keep Japanese full-width glyphs exactly two Latin cells wide. */
+  font-family: "BIZ UDGothic", "MS Gothic", "Sarasa Mono J", "Noto Sans Mono CJK JP", monospace;
+  font-variant-ligatures: none;
+  letter-spacing: 0;
+  tab-size: 4;
+  font-size: 12px;
+  line-height: 1.5;
+  position: relative;
+  white-space: normal;
+}
+.codeblock > code {
+  display: block;
+  overflow-x: auto;
+  white-space: pre;
+  overflow-wrap: normal;
+  color: inherit;
+  background: transparent;
+  font: inherit;
+  border: 0;
+  border-radius: 0;
+  padding: 0;
+  margin-right: 52px;
+}
+.codeblock.has-artifact-preview > code { margin-right: 78px; }
+.codeblock.is-wrapped > code { white-space: pre-wrap; overflow-wrap: anywhere; }
+.artifact-preview-actions {
+  display: flex;
+  gap: 2px;
+  position: absolute;
+  top: 4px;
+  right: 4px;
+  opacity: 0;
+  pointer-events: none;
+}
+.codeblock:hover .artifact-preview-actions,
+.codeblock:focus-within .artifact-preview-actions {
+  opacity: 1;
+  pointer-events: auto;
+}
+@media (hover: none) {
+  .codeblock .artifact-preview-actions { opacity: 1; pointer-events: auto; }
+}
+.artifact-preview-button,
+.code-copy-button,
+.code-wrap-button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 24px;
+  height: 24px;
+  border: 0;
+  border-radius: 3px;
+  padding: 4px;
+  color: var(--vscode-foreground);
+  background: var(--vscode-editorWidget-background, var(--vscode-editor-background));
+  cursor: pointer;
+}
+.artifact-preview-actions svg {
+  width: 16px;
+  height: 16px;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.3;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+.artifact-preview-actions button:hover,
+.code-wrap-button[aria-pressed="true"] {
+  background: var(--vscode-toolbar-hoverBackground, rgba(128,128,128,0.2));
+}
+.artifact-preview-actions button:focus-visible {
+  outline: 1px solid var(--vscode-focusBorder);
+  outline-offset: 1px;
+}
+.code-copy-status {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
+}
+.inline-code {
+  background: var(--vscode-textCodeBlock-background, rgba(128,128,128,0.15));
+  border-radius: 3px;
+  padding: 0 4px;
+  font-family: var(--vscode-editor-font-family, monospace);
+  font-size: 0.92em;
+}
+
+/* スピナー。消費者は .tool-status.running と .status-strip.spinning .status-strip-spinner。 */
+@keyframes spin { to { transform: rotate(360deg); } }
+.tool-name {
+  font-weight: 600;
+  font-family: var(--vscode-editor-font-family, monospace);
+  flex: 0 0 auto;
+}
+.tool-preview {
+  color: var(--vscode-descriptionForeground);
+  font-family: var(--vscode-editor-font-family, monospace);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
+}
+
+/* ---------- 作業カード（ターン内ツール実行グループ） ---------- */
+.block.toolgroup {
+  padding: 0;
+  border: 1px solid var(--vscode-panel-border);
+  background: var(--vscode-editorWidget-background);
+  font-size: 12px;
+  overflow: hidden;
+}
+.block.toolgroup > summary {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 10px;
+  cursor: pointer;
+  list-style: none;
+}
+.block.toolgroup > summary::-webkit-details-marker { display: none; }
+.block.toolgroup > summary::before {
+  content: "▸";
+  display: inline-block;
+  color: var(--vscode-descriptionForeground);
+  transition: transform 0.1s ease;
+  flex: 0 0 auto;
+}
+.block.toolgroup[open] > summary::before { transform: rotate(90deg); }
+.toolgroup-label { font-weight: 600; flex: 0 0 auto; }
+.toolgroup-badge {
+  flex: 0 0 auto;
+  min-width: 16px;
+  text-align: center;
+  padding: 0 5px;
+  border-radius: 8px;
+  font-size: 10px;
+  background: var(--vscode-badge-background);
+  color: var(--vscode-badge-foreground);
+}
+.toolgroup-last {
+  color: var(--vscode-descriptionForeground);
+  font-family: var(--vscode-editor-font-family, monospace);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
+  flex: 1 1 auto;
+}
+.toolgroup-stats {
+  flex: 0 0 auto;
+  font-size: 10px;
+  color: var(--vscode-descriptionForeground);
+}
+.toolgroup-stats.has-fail,
+.todo-work-badge.has-fail {
+  color: var(--vscode-errorForeground);
+}
+
+/* ---------- todoカード（TodoWrite）---------- */
+.block.todocard {
+  padding: 0;
+  border: 1px solid var(--vscode-panel-border);
+  background: var(--vscode-editorWidget-background);
+  font-size: 12px;
+  overflow: hidden;
+}
+.block.todocard > summary {
+  padding: 6px 10px;
+  cursor: pointer;
+  list-style: none;
+  font-weight: 600;
+}
+.todocard-summary-label { font-weight: 600; }
+.todocard-summary-stats {
+  font-weight: 400;
+  font-size: 11px;
+  color: var(--vscode-descriptionForeground);
+}
+.todocard-summary-stats.has-fail { color: var(--vscode-errorForeground); }
+.block.todocard > summary::-webkit-details-marker { display: none; }
+.block.todocard > summary::before {
+  content: "▸";
+  display: inline-block;
+  margin-right: 6px;
+  color: var(--vscode-descriptionForeground);
+  transition: transform 0.1s ease;
+}
+.block.todocard[open] > summary::before { transform: rotate(90deg); }
+.todocard-list {
+  display: flex;
+  flex-direction: column;
+  border-top: 1px solid var(--vscode-panel-border);
+  padding: 4px 0;
+}
+.todocard-icon { flex: 0 0 auto; }
+.todocard-completed .todocard-icon { color: var(--vscode-testing-iconPassed, #2d7d46); }
+.todocard-in_progress .todocard-icon { color: var(--vscode-progressBar-background, #0e70c0); }
+.todocard-pending .todocard-icon { color: var(--vscode-descriptionForeground); }
+.todocard-in_progress .todocard-label { font-weight: 600; }
+.todocard-completed .todocard-label { color: var(--vscode-descriptionForeground); text-decoration: line-through; }
+
+/* todo行（details化）。ネストした作業(tool-row)を内包する */
+.todo-item {
+  border-top: 1px solid var(--vscode-panel-border);
+}
+.todo-item:first-child { border-top: none; }
+.todo-item > summary {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  padding: 3px 10px;
+  cursor: pointer;
+  list-style: none;
+}
+.todo-item > summary::-webkit-details-marker { display: none; }
+.todo-work-badge {
+  flex: 0 0 auto;
+  min-width: 16px;
+  text-align: center;
+  padding: 0 5px;
+  border-radius: 8px;
+  font-size: 10px;
+  background: var(--vscode-badge-background);
+  color: var(--vscode-badge-foreground);
+}
+.todo-work {
+  display: flex;
+  flex-direction: column;
+  padding-left: 14px;
+  border-left: 2px solid var(--vscode-panel-border);
+  margin: 0 10px 6px 18px;
+}
+.todo-work .tool-row {
+  border-top: 1px solid var(--vscode-panel-border);
+}
+.todo-work .tool-row:first-child { border-top: none; }
+
+/* ツール行（作業カード内の1件） */
+.tool-row {
+  border-top: 1px solid var(--vscode-panel-border);
+  padding: 0;
+}
+.tool-row > summary {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 5px 10px 5px 22px;
+  cursor: pointer;
+  list-style: none;
+}
+.tool-row > summary::-webkit-details-marker { display: none; }
+.tool-row > summary::before {
+  content: "▸";
+  display: inline-block;
+  color: var(--vscode-descriptionForeground);
+  transition: transform 0.1s ease;
+  flex: 0 0 auto;
+  margin-left: -14px;
+}
+.tool-row[open] > summary::before { transform: rotate(90deg); }
+.tool-row .tool-input,
+.tool-row .tool-result {
+  margin: 0 10px 8px 22px;
+  max-height: 240px;
+  overflow: auto;
+  background: var(--vscode-textCodeBlock-background, rgba(128,128,128,0.12));
+  border-radius: 4px;
+  padding: 6px 8px;
+  font-family: var(--vscode-editor-font-family, monospace);
+  font-size: 11px;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+.tool-row .tool-result-error {
+  color: var(--vscode-errorForeground);
+}
+.tool-elapsed {
+  flex: 0 0 auto;
+  font-size: 10px;
+  color: var(--vscode-descriptionForeground);
+  margin-left: auto;
+  padding-left: 8px;
+}
+.tool-meta {
+  flex: 0 0 auto;
+  font-size: 11px;
+  color: var(--vscode-descriptionForeground);
+  margin-left: auto;
+  padding-left: 8px;
+}
+.tool-meta + .tool-elapsed {
+  margin-left: 0;
+}
+
+/* ---------- エージェントカード（サブエージェント起動: Agent/Task ツール） ---------- */
+.agent-card {
+  border: 1px solid var(--vscode-panel-border);
+  border-radius: 6px;
+  margin: 6px 10px;
+  background: var(--vscode-editorWidget-background);
+  font-size: 12px;
+}
+.agent-card > summary {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 10px;
+  cursor: pointer;
+  list-style: none;
+}
+.agent-card > summary::-webkit-details-marker { display: none; }
+.agent-card > summary::before {
+  content: "▸";
+  font-size: 10px;
+  color: var(--vscode-descriptionForeground);
+  transition: transform 0.1s ease;
+  flex: 0 0 auto;
+}
+.agent-card[open] > summary::before { transform: rotate(90deg); }
+.agent-name {
+  font-weight: 600;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
+}
+/* サブエージェントのモデル・effort等のチップ。名前（可変幅・省略対象）と meta（右寄せ）の間に置く */
+.agent-chips {
+  flex: 0 0 auto;
+  display: inline-flex;
+  gap: 4px;
+}
+.agent-chip {
+  font-size: 10px;
+  line-height: 1.4;
+  padding: 0 5px;
+  border-radius: 7px;
+  border: 1px solid var(--vscode-panel-border);
+  /* 背景は付けない: badge-background と descriptionForeground の組はテーマにより低コントラスト */
+  color: var(--vscode-descriptionForeground);
+  white-space: nowrap;
+}
+.agent-meta {
+  flex: 0 0 auto;
+  margin-left: auto;
+  font-size: 10px;
+  color: var(--vscode-descriptionForeground);
+}
+.agent-meta.has-fail { color: var(--vscode-errorForeground); }
+.agent-children {
+  border-left: 2px solid var(--vscode-panel-border);
+  margin: 0 0 6px 16px;
+}
+.agent-children .tool-row:first-child { border-top: none; }
+.agent-result {
+  margin: 4px 10px 8px 26px;
+  padding: 6px 8px;
+  font-size: 12px;
+  color: var(--vscode-descriptionForeground);
+  border-left: 2px solid var(--vscode-testing-iconPassed, #2d7d46);
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+/* 状態ドット（作業カード・ツール行で共用） */
+.tool-status {
+  flex: 0 0 auto;
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  position: relative;
+}
+.tool-status.running {
+  border: 2px solid var(--vscode-progressBar-background, #0e70c0);
+  border-top-color: transparent;
+  animation: spin 0.9s linear infinite;
+}
+.tool-status.done { background: var(--vscode-testing-iconPassed, #2d7d46); }
+.tool-status.failed { background: var(--vscode-errorForeground); }
+
+/* 実行ログの状態列は文字（✓ ✕ ⏸ 🔄）。丸はエージェントカードと通常の実行中だけに残す（R-TAB-06） */
+.tool-row > summary > .tool-status.done,
+.tool-row > summary > .tool-status.failed,
+.tool-row > summary > .tool-status.stale,
+.tool-row > summary > .tool-status.bg-running {
+  width: 12px;
+  height: auto;
+  border-radius: 0;
+  background: none;
+  border: none;
+  animation: none;
+  text-align: center;
+  font-size: 11px;
+  font-weight: 700;
+  line-height: 1;
+}
+.tool-row > summary > .tool-status.done { color: var(--vscode-testing-iconPassed, #2d7d46); }
+.tool-row > summary > .tool-status.failed { color: var(--vscode-errorForeground); }
+.tool-row > summary > .tool-status.stale { color: var(--vscode-descriptionForeground); opacity: 0.8; }
+.tool-row > summary > .tool-status.bg-running { color: var(--vscode-progressBar-background, #0e70c0); }
+
+/* ---------- 承認 ---------- */
+.block.approval {
+  border: 1.5px solid var(--vscode-editorWarning-foreground, #b8860b);
+  background: color-mix(in srgb, var(--vscode-editorWarning-foreground, #b8860b) 5%, transparent);
+}
+.block.approval.approved { border-color: var(--vscode-testing-iconPassed, #2d7d46); }
+.block.approval.denied { border-color: var(--vscode-errorForeground); }
+.block.approval pre {
+  max-height: 200px;
+  overflow: auto;
+  background: var(--vscode-textCodeBlock-background);
+  padding: 6px;
+  font-size: 12px;
+  border-radius: 4px;
+}
+/* カード全体の details（.approval-det）のタイトル行。解決後は閉じてこの行だけが残る */
+.approval-title {
+  font-weight: 600;
+  margin-bottom: 4px;
+  cursor: pointer;
+  list-style: none;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.approval-title::-webkit-details-marker { display: none; }
+.approval-title::before {
+  content: "▸";
+  color: var(--vscode-descriptionForeground);
+  transition: transform 0.1s ease;
+}
+.approval-det[open] > .approval-title::before { transform: rotate(90deg); }
+.approval-verdict { font-size: 11px; font-weight: 600; }
+.approval-verdict.allow { color: var(--vscode-testing-iconPassed, #2d7d46); }
+.approval-verdict.deny { color: var(--vscode-errorForeground); }
+/* 内側の details（原データJSON）は控えめに */
+.approval-det details > summary {
+  cursor: pointer;
+  color: var(--vscode-descriptionForeground);
+  font-size: 11px;
+  list-style: none;
+  margin: 6px 0 4px;
+}
+.approval-det details > summary::-webkit-details-marker { display: none; }
+.approval-actions { display: flex; gap: 8px; margin-top: 6px; }
+
+/* 承認カードの可読表示 */
+.approval-lead { margin: 6px 0 8px; }
+.approval-field { margin: 6px 0; }
+.approval-field-label {
+  font-size: 10px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--vscode-descriptionForeground);
+  margin-bottom: 2px;
+}
+.approval-field-value { word-break: break-word; }
+/* 承認対象の本文は折り返す。折り返さないと長い1行コマンドの末尾が横スクロールの
+   向こうに隠れ、「要約だけで許可させない」原則が崩れる（レビューAR3-M2） */
+.approval-pre {
+  white-space: pre-wrap;
+  word-break: break-word;
+  max-height: 240px;
+  overflow: auto;
+}
+.approval-plan {
+  max-height: 360px;
+  overflow-y: auto;
+  padding: 8px 10px;
+  border-left: 2px solid var(--vscode-panel-border);
+  background: var(--vscode-textCodeBlock-background);
+  border-radius: 4px;
+}
+.approval-plan > *:first-child { margin-top: 0; }
+.approval-plan > *:last-child { margin-bottom: 0; }
+/* 計画ペイン自体がスクロールするので、中のコードブロックは二重スクロールにしない（AR3-L6） */
+.approval-plan pre.codeblock { max-height: none; }
+
+/* ---------- AskUserQuestion 質問カード（機能B） ---------- */
+.askq-item { margin: 8px 0; padding-top: 8px; border-top: 1px solid var(--vscode-editorWidget-border, transparent); }
+/* L-1: 1枚目のカードは .approval-title の直後に来る（:first-of-typeはdiv全体で見るため
+   titleと衝突し効かない）。隣接セレクタでタイトル直後のカードだけ区切り線を外す */
+.approval-title + .askq-item { border-top: none; padding-top: 0; }
+.askq-header {
+  display: inline-block;
+  font-size: 10px;
+  font-weight: 600;
+  padding: 1px 6px;
+  border-radius: 3px;
+  background: var(--vscode-badge-background);
+  color: var(--vscode-badge-foreground);
+  margin-bottom: 4px;
+}
+.askq-question { font-weight: 600; margin-bottom: 6px; }
+.askq-options { display: flex; flex-direction: column; gap: 4px; }
+.askq-option {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  text-align: left;
+  gap: 2px;
+  position: relative;
+  padding: 6px 8px 6px 24px;
+  border: 1px solid var(--vscode-editorWidget-border, var(--vscode-panel-border));
+  border-radius: 4px;
+  /* 未選択は塗らない。foreground / descriptionForeground は editor-background 前提の色なので、
+     input-background を敷くとテーマによって AA を割る */
+  background: transparent;
+  color: var(--vscode-foreground);
+  cursor: pointer;
+}
+.askq-option:hover { background: var(--vscode-list-hoverBackground); }
+/* 文字色は inputOption-activeForeground。registry既定が明暗で反転するので濃い塗りでも成立する。
+   foreground のままだと濃色の上でコントラストが落ちる。枠は太さを変えず inset shadow で増強 */
+.askq-option.selected {
+  border-color: var(--vscode-inputOption-activeBorder, var(--vscode-focusBorder));
+  box-shadow: inset 0 0 0 1px var(--vscode-inputOption-activeBorder, var(--vscode-focusBorder));
+  background: color-mix(in srgb, var(--vscode-focusBorder) 60%, var(--vscode-input-background));
+  color: var(--vscode-inputOption-activeForeground, var(--vscode-foreground));
+}
+/* 説明を descriptionForeground にすると、テーマによって小さい文字が AA を割る */
+.askq-option-label { font-weight: 600; }
+/* 未選択でも領域を確保して選択切替で文字位置を動かさない。絶対配置なのは、ラベルと説明で
+   font-size が違い em 送りだと字下げがずれるため */
+.askq-option::before {
+  content: "✓";
+  position: absolute;
+  left: 8px;
+  top: 6px;
+  visibility: hidden;
+}
+.askq-option.selected::before { visibility: visible; }
+/* opacity で薄めない。選択済みの濃い塗りの上でコントラストが崩れる */
+.askq-option-desc { font-size: 11px; color: inherit; }
+/* 選択枠とフォーカスリングはテーマによって同値になる。offset で隙間を挟んで区別する */
+.askq-option:focus-visible { outline-offset: 1px; }
+.askq-other {
+  margin-top: 4px;
+  width: 100%;
+  box-sizing: border-box;
+  padding: 4px 6px;
+  border: 1px solid var(--vscode-input-border, transparent);
+  border-radius: 4px;
+  background: var(--vscode-input-background);
+  color: var(--vscode-input-foreground);
+  font-size: 12px;
+}
+/* M-7: 回答の監査サマリー */
+.askq-answers-summary {
+  margin-top: 6px;
+  padding-top: 6px;
+  border-top: 1px dashed var(--vscode-editorWidget-border, transparent);
+  font-size: 11px;
+  color: var(--vscode-descriptionForeground);
+}
+
+/* ---------- コンポーザ ---------- */
+#composer {
+  flex: 0 0 auto;
+  padding: 10px 14px 12px;
+  background: var(--vscode-editor-background);
+}
+#composer-top {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  max-width: 860px;
+  margin: 0 auto;
+}
+/* 画像添付サムネイル */
+#attachments {
+  display: flex;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+#attachments:not(:empty) { padding-bottom: 0; }
+
+/* エディタコンテキストチップ */
+.ctx-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  align-self: flex-start;
+  font-size: 11px;
+  padding: 2px 8px;
+  border-radius: 9px;
+  background: var(--vscode-badge-background);
+  color: var(--vscode-badge-foreground);
+  font-family: var(--vscode-editor-font-family, monospace);
+}
+.ctx-chip.hidden { display: none; }
+.ctx-chip { max-width: 100%; }
+.ctx-chip > span:first-child { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; flex: 0 1 auto; }
+.ctx-chip-remove {
+  background: transparent;
+  border: none;
+  color: inherit;
+  padding: 0;
+  font-size: 11px;
+  line-height: 1;
+  cursor: pointer;
+  opacity: 0.8;
+}
+.ctx-chip-remove:hover { opacity: 1; }
+.attachment { position: relative; }
+.attachment img {
+  height: 48px;
+  border-radius: 4px;
+  border: 1px solid var(--vscode-panel-border);
+  display: block;
+}
+.attachment-remove {
+  position: absolute;
+  top: -6px;
+  right: -6px;
+  width: 16px;
+  height: 16px;
+  padding: 0;
+  border-radius: 50%;
+  font-size: 10px;
+  line-height: 1;
+  background: var(--vscode-badge-background);
+  color: var(--vscode-badge-foreground);
+}
+.block.user .user-image {
+  max-width: 240px;
+  max-height: 180px;
+  border-radius: 4px;
+  border: 1px solid var(--vscode-panel-border);
+  display: block;
+  margin-top: 6px;
+  cursor: zoom-in;
+}
+.user-image-slot {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 120px;
+  min-height: 80px;
+  margin-top: 6px;
+  border: 1px dashed var(--vscode-panel-border);
+  border-radius: 4px;
+  font-size: 11px;
+  color: var(--vscode-descriptionForeground);
+  padding: 8px 12px;
+  box-sizing: border-box;
+  user-select: none;
+}
+.user-image-slot[data-image-state="loading"] {
+  animation: user-image-slot-pulse 1.5s ease-in-out infinite;
+}
+@keyframes user-image-slot-pulse {
+  0%, 100% { opacity: 0.6; }
+  50% { opacity: 1; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .user-image-slot[data-image-state="loading"] {
+    animation: none;
+  }
+}
+.user-image-slot[data-image-state="error"] {
+  border: 1px dashed var(--vscode-input-border, var(--vscode-panel-border));
+  color: var(--vscode-disabledForeground, var(--vscode-descriptionForeground));
+  opacity: 0.7;
+}
+.image-lightbox {
+  position: fixed;
+  inset: 0;
+  z-index: 9999;
+  background: rgba(0, 0, 0, 0.8);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: zoom-out;
+}
+.image-lightbox img {
+  max-width: 96vw;
+  max-height: 90vh;
+  object-fit: contain;
+  border-radius: 4px;
+  box-shadow: 0 4px 24px rgba(0, 0, 0, 0.6);
+  cursor: zoom-out;
+}
+.image-lightbox .image-lightbox-open-editor {
+  position: absolute;
+  top: 12px;
+  right: 12px;
+  z-index: 10000;
+  cursor: pointer;
+  background: var(--vscode-button-background);
+  color: var(--vscode-button-foreground);
+  border: none;
+  border-radius: 4px;
+  padding: 6px 12px;
+  font-size: 12px;
+  line-height: 1.4;
+}
+.image-lightbox .image-lightbox-open-editor:hover {
+  background: var(--vscode-button-hoverBackground);
+}
+
+/* Claude Code 拡張のコンポーザ準拠: 枠付き縦積みコンテナ（textarea + アクション行）を内包 */
+#inputwrap {
+  display: flex;
+  flex-direction: column;
+  max-width: 860px;
+  margin: 0 auto;
+  background: var(--vscode-input-background);
+  border: 1px solid var(--vscode-input-border, var(--vscode-panel-border));
+  border-radius: 8px;
+  padding: 6px 10px 6px;
+}
+#inputwrap:focus-within {
+  border-color: var(--vscode-focusBorder);
+  outline: 1px solid var(--vscode-focusBorder);
+  outline-offset: -1px;
+}
+#input {
+  flex: 1 1 auto;
+  resize: none;
+  background: transparent;
+  color: var(--vscode-input-foreground);
+  border: none;
+  padding: 4px 0;
+  font-family: inherit;
+  font-size: 13px;
+  line-height: 20px;
+  max-height: 160px;
+  overflow-y: auto;
+}
+#input:focus { outline: none; }
+
+/* 下段アクション行: 左端に＋（画像添付）+ モードセレクタ、右端に送信/停止 */
+#composer-actions {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 4px 0 2px;
+}
+#composer-actions-left {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+#composer-actions-right {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+/* ---------- 権限モードセレクタ（chip風ボタン + 上向きポップアップ） ---------- */
+.mode-chip {
+  flex: 0 0 auto;
+  height: 22px;
+  padding: 0 8px;
+  border-radius: 11px;
+  font-size: 11px;
+  line-height: 1;
+  background: transparent;
+  color: var(--vscode-foreground);
+  border: 1px solid var(--vscode-panel-border);
+}
+.mode-chip:hover { background: var(--vscode-toolbar-hoverBackground, rgba(128,128,128,0.2)); }
+/* 入力欄の会話内移動（↑ / ↓）。表示は記号だけで、意味は title で出す */
+.headbtn {
+  flex: 0 0 auto;
+  height: 22px;
+  min-width: 22px;
+  padding: 0 4px;
+  border-radius: 11px;
+  font-size: 12px;
+  line-height: 1;
+  background: transparent;
+  color: var(--vscode-foreground);
+  border: 1px solid var(--vscode-panel-border);
+  cursor: pointer;
+}
+.headbtn:hover:not(:disabled) { background: var(--vscode-toolbar-hoverBackground, rgba(128,128,128,0.2)); }
+.headbtn:disabled { opacity: 0.4; cursor: default; }
+.headbtn:focus-visible { outline: 1px solid var(--vscode-focusBorder); }
+.mode-chip.mode-danger {
+  color: var(--vscode-errorForeground);
+  border-color: var(--vscode-errorForeground);
+}
+
+.mode-menu {
+  position: absolute;
+  right: 0;
+  bottom: calc(100% + 4px);
+  min-width: 140px;
+  background: var(--vscode-editorWidget-background);
+  border: 1px solid var(--vscode-panel-border);
+  border-radius: 6px;
+  box-shadow: 0 2px 8px rgba(0,0,0,0.3);
+  padding: 4px;
+  z-index: 20;
+}
+.mode-menu.hidden { display: none; }
+.mode-menu-item {
+  padding: 5px 8px;
+  border-radius: 4px;
+  font-size: 12px;
+  cursor: pointer;
+}
+.mode-menu-item:hover,
+.mode-menu-item.selected {
+  background: var(--vscode-list-activeSelectionBackground, rgba(128,128,128,0.3));
+  color: var(--vscode-list-activeSelectionForeground, var(--vscode-foreground));
+}
+.mode-menu-item.mode-danger { color: var(--vscode-errorForeground); }
+.mode-menu-item.mode-danger:hover,
+.mode-menu-item.mode-danger.selected {
+  background: var(--vscode-errorForeground);
+  color: var(--vscode-editor-background);
+}
+/* キーボードカーソル。.selected（=適用中の値）とは別軸なので「塗り vs 枠線」で直交させ、
+   同一項目に重なっても両方読み取れるようにする */
+.mode-menu-item.cursor {
+  background: var(--vscode-list-hoverBackground, rgba(128,128,128,0.15));
+  outline: 1px solid var(--vscode-focusBorder);
+  outline-offset: -1px;
+}
+.mode-menu-item.selected.cursor {
+  background: var(--vscode-list-activeSelectionBackground, rgba(128,128,128,0.3));
+}
+.mode-menu-item.mode-danger.cursor { outline-color: var(--vscode-errorForeground); }
+/* mode-danger かつ適用中かつカーソル: .selected.cursor が赤塗りを打ち消してしまい
+   文字色・枠色（editor-background）だけが残って判読不能になるため、全プロパティを
+   明示して赤塗りを復元する（レビューAR2-M2） */
+.mode-menu-item.mode-danger.selected.cursor {
+  background: var(--vscode-errorForeground);
+  color: var(--vscode-editor-background);
+  outline-color: var(--vscode-editor-background);
+}
+/* コンテナ自身がフォーカスを持つが、可視表現はカーソル行が担うのでリングは出さない */
+.mode-menu:focus, .auth-picker:focus { outline: none; }
+
+/* ---------- 入力サジェスト（/コマンド・@ファイル） ---------- */
+#inputwrap { position: relative; }
+.suggest-menu {
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 100%;
+  margin-bottom: 6px;
+  max-height: 200px;
+  overflow-y: auto;
+  background: var(--vscode-editorWidget-background);
+  border: 1px solid var(--vscode-panel-border);
+  border-radius: 6px;
+  box-shadow: 0 2px 8px rgba(0,0,0,0.3);
+  z-index: 20;
+}
+.suggest-menu.hidden { display: none; }
+.suggest-item {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  padding: 5px 10px;
+  font-size: 12px;
+  cursor: pointer;
+}
+.suggest-item.active,
+.suggest-item:hover {
+  background: var(--vscode-list-activeSelectionBackground, rgba(128,128,128,0.3));
+  color: var(--vscode-list-activeSelectionForeground, var(--vscode-foreground));
+}
+.suggest-name { flex: 0 0 auto; font-family: var(--vscode-editor-font-family, monospace); }
+.suggest-desc {
+  flex: 1 1 auto;
+  opacity: 0.65;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+/* 選択中の行だけ折り返して全文を表示する。
+   overflow-wrap: anywhere で長トークンも折り返す。overflow: hidden は基底のまま保険として維持 */
+.suggest-item.active .suggest-desc {
+  white-space: normal;
+  overflow-wrap: anywhere;
+}
+button.icon {
+  flex: 0 0 auto;
+  width: 26px;
+  height: 26px;
+  padding: 0;
+  border-radius: 5px;
+  font-size: 13px;
+  line-height: 1;
+  background: var(--vscode-button-background);
+  color: var(--vscode-button-foreground);
+}
+button.icon:hover:not(:disabled) { background: var(--vscode-button-hoverBackground, var(--vscode-button-background)); }
+button.icon.stop {
+  background: transparent;
+  color: var(--vscode-errorForeground);
+  border: 1px solid var(--vscode-errorForeground);
+}
+/* ＋（画像添付）: 控えめ・枠なし、hoverで背景のみ */
+button.icon.ghost {
+  background: transparent;
+  color: var(--vscode-foreground);
+}
+button.icon.ghost:hover:not(:disabled) {
+  background: var(--vscode-toolbar-hoverBackground, rgba(128,128,128,0.2));
+}
+button {
+  background: var(--vscode-button-secondaryBackground, rgba(128,128,128,0.2));
+  color: var(--vscode-button-secondaryForeground, var(--vscode-foreground));
+  border: none;
+  border-radius: 5px;
+  padding: 6px 14px;
+  cursor: pointer;
+  font-size: 12px;
+}
+button:focus-visible { outline: 1px solid var(--vscode-focusBorder); }
+button.primary {
+  background: var(--vscode-button-background);
+  color: var(--vscode-button-foreground);
+}
+button.primary:hover { background: var(--vscode-button-hoverBackground, var(--vscode-button-background)); }
+button.danger {
+  background: transparent;
+  color: var(--vscode-errorForeground);
+  border: 1px solid var(--vscode-errorForeground);
+}
+button:disabled { opacity: 0.4; cursor: default; }
+/* ストリーミングの増分描画: 確定済み(seg-committed)と未確定(seg-tail)を隙間なく繋ぐ */
+.seg-committed > div > *:first-child, .seg-tail > *:first-child { margin-top: 0; }
+.seg-committed > div > *:last-child, .seg-tail > *:last-child { margin-bottom: 0; }
+.seg-committed > div + div { margin-top: 0.6em; }
+.seg-committed:not(:empty) + .seg-tail:not(:empty) { margin-top: 0.6em; }
+/* ターン終端時に完了イベントが来なかったツールの表示（回転を止めて中立色にする） */
+.tool-status.stale::before { animation: none !important; }
+.tool-status.stale { color: var(--vscode-descriptionForeground); opacity: 0.6; }
+
+/* effort 行: ラベル + 段階ドット（Claude Code 拡張の視覚表現に合わせる） */
+.auth-picker .mode-menu-item.effort-item {
+  flex-direction: row;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+.effort-name { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.effort-dots { display: inline-flex; gap: 5px; flex: 0 0 auto; align-items: center; }
+.effort-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: currentColor;
+  opacity: 0.22;
+  cursor: pointer;
+}
+.effort-dot:hover { opacity: 0.6; }
+.effort-dot.on { opacity: 0.95; }
+.auth-picker .mode-menu-item.effort-item { background: var(--vscode-list-hoverBackground, rgba(128,128,128,0.12)); border-radius: 4px; }
+
+.analysis-quiet-complete { margin: 24px 0; color: var(--vscode-descriptionForeground); font-size: 13px; }
+.analysis-coverage-warn { color: var(--vscode-inputValidation-warningForeground, var(--vscode-foreground)); background: var(--vscode-inputValidation-warningBackground, transparent); border-left: 3px solid var(--vscode-inputValidation-warningBorder, var(--vscode-panel-border)); padding: 6px 8px; }
+.analysis-evidence-actions { display: flex; gap: 12px; align-items: baseline; margin-top: 6px; }
+
+/* ---------- 作業ログ内の概要 / 詳細 切替（work-overview.ts） ---------- */
+
+/* 切替は hidden 属性で行う。作業ログ直下には display を明示するクラスがあり、
+   UA の [hidden]{display:none} より詳細度が高い規則に負ける。
+   全体へ効かせず作業ログ配下に限定する（他所の hidden 属性を巻き込まないため） */
+#logs .panel-work > [hidden] { display: none !important; }
+
+/* .log-head の中（work-switch-slot）に置く。sticky 指定は要らない — .log-head 自体が
+   sticky なので、作業ログをどこまでスクロールしても一緒に残る。
+   会話ビューでは出さない。data-view が未設定のときも出さない側へ倒す（:not で書く理由） */
+.log-head:not([data-view="work"]) .work-switch-slot { display: none; }
+.work-view-switch {
+  display: flex;
+  gap: 4px;
+  /* .log-head の margin: 0 -14px を打ち消して .view-switch と左端を揃える */
+  padding: 6px 14px 8px;
+  border-bottom: 1px solid var(--vscode-panel-border, rgba(128, 128, 128, 0.35));
+}
+/* .panel-work の外にあるので #logs .panel-work > [hidden] の射程に入らない。
+   display:flex が UA の [hidden]{display:none} を上回るため明示的に戻す */
+.work-view-switch[hidden] { display: none; }
+.work-view-tab {
+  background: none;
+  border: 1px solid transparent;
+  border-radius: 4px;
+  color: var(--vscode-descriptionForeground);
+  cursor: pointer;
+  font-size: 12px;
+  padding: 3px 12px;
+}
+.work-view-tab:hover { color: var(--vscode-foreground); }
+.work-view-tab.active {
+  background: var(--vscode-toolbar-activeBackground, rgba(128, 128, 128, 0.2));
+  color: var(--vscode-foreground);
+}
+.work-view-tab:focus-visible { outline: 1px solid var(--vscode-focusBorder); outline-offset: 1px; }
+
+.wo-coverage {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  font-size: 12px;
+  color: var(--vscode-descriptionForeground);
+  margin-bottom: 10px;
+}
+.wo-coverage-row[data-state="prefix-truncated"] { color: var(--vscode-editorWarning-foreground, #b8860b); }
+
+.wo-empty, .wo-note { color: var(--vscode-descriptionForeground); font-size: 12px; }
+.wo-note { display: block; margin: 4px 0 8px; }
+
+/* ---------- Agent Inspector（agent-inspector.ts） ---------- */
+.work-inspector { min-width: 0; font-size: 12px; }
+.wi-status { min-height: 18px; color: var(--vscode-descriptionForeground); }
+.wi-sections { display: flex; flex-wrap: wrap; gap: 4px; margin: 4px 0 10px; }
+.wi-section-button, .wi-retry {
+  background: var(--vscode-button-secondaryBackground, transparent);
+  border: 1px solid var(--vscode-button-border, var(--vscode-panel-border));
+  border-radius: 4px;
+  color: var(--vscode-button-secondaryForeground, var(--vscode-foreground));
+  cursor: pointer;
+  font-size: 11px;
+  padding: 3px 9px;
+}
+.wi-section-button.active { border-color: var(--vscode-focusBorder); color: var(--vscode-foreground); }
+.wi-section-button:focus-visible, .wi-retry:focus-visible {
+  outline: 2px solid var(--vscode-focusBorder);
+  outline-offset: 1px;
+}
+.wi-content { min-width: 0; }
+.wi-overview { display: grid; grid-template-columns: minmax(88px, max-content) minmax(0, 1fr); gap: 5px 10px; }
+.wi-overview dt { color: var(--vscode-descriptionForeground); }
+.wi-overview dd { margin: 0; min-width: 0; overflow-wrap: anywhere; white-space: pre-wrap; }
+.wi-tool, .wi-message {
+  border: 1px solid var(--vscode-panel-border, rgba(128, 128, 128, 0.35));
+  border-radius: 5px;
+  margin: 6px 0;
+  padding: 7px 9px;
+}
+.wi-tool-title { font-size: 11px; margin: 0 0 5px; }
+.wi-tool-summary, .wi-empty { color: var(--vscode-descriptionForeground); }
+.wi-preview, .wi-result, .wi-message-text, .wi-report {
+  background: var(--vscode-textCodeBlock-background, rgba(128, 128, 128, 0.12));
+  border-radius: 3px;
+  font-family: var(--vscode-editor-font-family, monospace);
+  font-size: 11px;
+  margin: 5px 0 0;
+  max-width: 100%;
+  overflow: auto;
+  padding: 6px;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+.wi-result { border-left: 2px solid var(--vscode-panel-border); }
+.wi-coverage { color: var(--vscode-descriptionForeground); font-size: 10px; margin: 10px 0 6px; }
+.wi-coverage[data-state="partial"] { color: var(--vscode-editorWarning-foreground); }
+
+/* ---------- Agent実行グラフ（work-graph.ts） ---------- */
+
+.work-graph { font-size: 12px; }
+.wg-empty { color: var(--vscode-descriptionForeground); font-size: 12px; }
+.wg-coverage {
+  color: var(--vscode-descriptionForeground);
+  display: flex;
+  flex-direction: column;
+  font-size: 12px;
+  gap: 2px;
+  margin-bottom: 10px;
+}
+.wg-coverage-row[data-state="prefix-truncated"] { color: var(--vscode-editorWarning-foreground); }
+
+/* Analysis Facts View */
+.af-coverage-note {
+  font-size: 11px;
+  color: var(--vscode-descriptionForeground);
+  margin-bottom: 8px;
+}
+
+/* OS側の強制配色。VS Code の高コントラストテーマは変数値で来るので上の var() で足りるが、
+   Windows のハイコントラストは配色ごと置き換えるため枠線を明示的に残す */
+@media (forced-colors: active) {
+  .wi-tool, .wi-message, .wi-section-button, .wi-retry {
+    border: 1px solid CanvasText;
+    forced-color-adjust: none;
+    background: Canvas;
+    color: CanvasText;
+  }
+  .wi-section-button.active,
+  .wi-section-button:focus-visible,
+  .wi-retry:focus-visible { outline: 2px solid Highlight; }
+}
+
+/* LLM 区画（検証通過分のみ）と診断面（棄却分・オプトイン）。
+   診断面は4タブの外の要素で、既定では生成されない */
+.llm-findings {
+  border: 1px solid var(--vscode-panel-border, rgba(128, 128, 128, 0.3));
+  border-radius: 5px;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  padding: 6px 10px;
+}
+.llm-head-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+.llm-head {
+  color: var(--vscode-descriptionForeground);
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+}
+.llm-toggle {
+  align-items: center;
+  background: var(--vscode-button-secondaryBackground, var(--vscode-badge-background));
+  border: 1px solid var(--vscode-panel-border, rgba(128, 128, 128, 0.3));
+  border-radius: 12px;
+  color: var(--vscode-button-secondaryForeground, var(--vscode-badge-foreground));
+  cursor: pointer;
+  display: inline-flex;
+  font-size: 11px;
+  gap: 6px;
+  padding: 2px 8px 2px 6px;
+  user-select: none;
+  white-space: nowrap;
+}
+.llm-toggle:hover:enabled { filter: brightness(1.15); }
+.llm-toggle:focus-visible { outline: 1px solid var(--vscode-focusBorder); outline-offset: 1px; }
+.llm-toggle::before {
+  background: var(--vscode-descriptionForeground);
+  border-radius: 50%;
+  content: "";
+  display: inline-block;
+  height: 10px;
+  transition: transform 0.15s ease, background 0.15s ease;
+  width: 10px;
+}
+.llm-toggle[aria-checked="true"]::before {
+  background: var(--vscode-testing-iconPassed, #4caf50);
+  box-shadow: 0 0 4px var(--vscode-testing-iconPassed, #4caf50);
+}
+.llm-toggle[aria-checked="false"]::before {
+  background: var(--vscode-descriptionForeground);
+  opacity: 0.6;
+}
+.llm-toggle[aria-busy="true"] {
+  cursor: wait;
+  opacity: 0.6;
+}
+.llm-state-note {
+  color: var(--vscode-descriptionForeground);
+  font-size: 11px;
+  margin-top: 2px;
+}
+.llm-summary {
+  display: block;
+  font-weight: 600;
+  margin: 2px 0;
+}
+.llm-attached-meta {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 2px 12px;
+}
+
+.llm-run-targets {
+  display: block;
+  color: var(--vscode-descriptionForeground);
+  font-size: 11px;
+  margin-top: 2px;
+}
+
+.llm-run[data-run-state="in-flight"] .llm-run-btn {
+  cursor: progress;
+}
+
+.llm-none, .llm-provenance {
+  color: var(--vscode-descriptionForeground);
+  font-size: 12px;
+}
+.llm-finding { display: flex; flex-wrap: wrap; gap: 6px; font-size: 12px; }
+.llm-run {
+  align-items: center;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+.llm-run-btn {
+  background: var(--vscode-button-secondaryBackground, var(--vscode-badge-background));
+  border: none;
+  border-radius: 10px;
+  color: var(--vscode-button-secondaryForeground, var(--vscode-badge-foreground));
+  cursor: pointer;
+  flex: 0 0 auto;
+  font-size: 11px;
+  padding: 3px 10px;
+  white-space: nowrap;
+}
+.llm-run-btn:hover:enabled { filter: brightness(1.15); }
+.llm-run-btn:focus-visible { outline: 1px solid var(--vscode-focusBorder); }
+.llm-run-btn:disabled { cursor: default; opacity: 0.5; }
+.llm-run-note { color: var(--vscode-descriptionForeground); font-size: 11px; }
+.llm-run-note.llm-run-refusal { color: var(--vscode-editorWarning-foreground); }
+.llm-run-note.analysis-failure { display: block; color: var(--vscode-errorForeground); margin-top: 6px; white-space: pre-wrap; overflow-wrap: anywhere; }
+.llm-diagnostics {
+  background: var(--vscode-editorWidget-background, var(--vscode-editor-background));
+  border: 1px solid var(--vscode-panel-border, rgba(128, 128, 128, 0.3));
+  border-radius: 6px;
+  bottom: 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  font-size: 12px;
+  max-height: 40vh;
+  max-width: 420px;
+  overflow: auto;
+  padding: 8px 10px;
+  position: fixed;
+  right: 12px;
+  z-index: 40;
+}
+.llmdiag-head { display: flex; align-items: center; gap: 8px; justify-content: space-between; }
+.llmdiag-title { font-weight: 600; }
+.llmdiag-close { background: none; border: none; color: inherit; cursor: pointer; }
+.llmdiag-item { display: flex; flex-direction: column; gap: 2px; }
+.llmdiag-kind { font-weight: 600; }
+.llmdiag-rejection { color: var(--vscode-descriptionForeground); }
+
+/* OS側の強制配色（Windows ハイコントラスト等） */
+@media (forced-colors: active) {
+  .llm-toggle {
+    border: 1px solid CanvasText;
+    background: Canvas;
+    color: CanvasText;
+  }
+  .llm-toggle[aria-checked="true"]::before {
+    background: Highlight;
+  }
+  .llm-toggle[aria-checked="false"]::before {
+    background: CanvasText;
+  }
+}
+
+/* ---------- LLM Action Finding Cards ---------- */
+.llm-finding-cards {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  margin-top: 10px;
+}
+
+.llm-finding-card {
+  border: 1px solid var(--vscode-panel-border, rgba(128, 128, 128, 0.3));
+  border-radius: 6px;
+  padding: 10px 12px;
+  background: var(--vscode-editorWidget-background, rgba(128, 128, 128, 0.05));
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.llm-finding-title-row {
+  flex-wrap: wrap;
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
+  margin-bottom: 6px;
+}
+
+.llm-finding-title-left {
+  min-width: 0;
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  flex: 1 1 auto;
+}
+
+.llm-finding-num {
+  font-weight: 700;
+  color: var(--vscode-foreground);
+  white-space: nowrap;
+}
+
+.llm-finding-title {
+  overflow-wrap: anywhere;
+  font-weight: 600;
+  color: var(--vscode-foreground);
+}
+
+.llm-finding-badge {
+  flex: 0 0 auto;
+  font-size: 10px;
+  padding: 1px 6px;
+  border-radius: 3px;
+  background: var(--vscode-badge-background, rgba(128, 128, 128, 0.2));
+  color: var(--vscode-badge-foreground, var(--vscode-foreground));
+  border: 1px solid var(--vscode-panel-border, rgba(128, 128, 128, 0.3));
+}
+
+.llm-finding-observed {
+  margin-bottom: 4px;
+  color: var(--vscode-descriptionForeground);
+}
+
+.llm-finding-impact {
+  margin-bottom: 4px;
+  font-weight: 500;
+}
+
+.llm-finding-action {
+  margin-bottom: 6px;
+}
+
+.llm-finding-evidence {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-bottom: 8px;
+  font-size: 11px;
+}
+
+.llm-evidence-label {
+  color: var(--vscode-descriptionForeground);
+  font-weight: 600;
+}
+
+.llm-evidence-chips {
+  display: inline-flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  align-items: center;
+}
+
+.llm-evidence-chip {
+  display: inline-flex;
+  align-items: center;
+  font-size: 11px;
+  padding: 1px 6px;
+  border-radius: 3px;
+  background: var(--vscode-badge-background, rgba(128, 128, 128, 0.15));
+  color: var(--vscode-foreground);
+  border: 1px solid var(--vscode-panel-border, rgba(128, 128, 128, 0.3));
+}
+
+button.llm-evidence-chip,
+.llm-evidence-btn {
+  cursor: pointer;
+  color: var(--vscode-textLink-foreground, #3794ff);
+  background: transparent;
+  padding: 1px 6px;
+  border: 1px solid var(--vscode-panel-border, rgba(128, 128, 128, 0.3));
+}
+
+button.llm-evidence-chip:hover,
+.llm-evidence-btn:hover {
+  text-decoration: underline;
+  background: var(--vscode-toolbar-hoverBackground, rgba(128, 128, 128, 0.2));
+}
+
+.llm-finding-footer {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-top: 6px;
+  padding-top: 6px;
+  border-top: 1px solid var(--vscode-panel-border, rgba(128, 128, 128, 0.15));
+}
+
+.llm-start-session-btn {
+  padding: 4px 10px;
+  font-size: 11px;
+  border-radius: 4px;
+  background: var(--vscode-button-background);
+  color: var(--vscode-button-foreground);
+  border: none;
+  cursor: pointer;
+}
+
+.llm-start-session-btn:hover {
+  background: var(--vscode-button-hoverBackground);
+}
+
+.llm-start-session-note {
+  font-size: 10px;
+  color: var(--vscode-descriptionForeground);
+}
+
+/* ---------- 状況タブ（概要 / グラフ / インスペクター / 実行ログ） ---------- */
+
+/* 用語の注記（R-DSP-12） */
+.term-note { border-bottom: 1px dashed var(--vscode-descriptionForeground); cursor: help; }
+
+/* 概要（work-overview.ts） */
+.wo-head { padding: 4px 0 10px; }
+.wo-when { font-size: 12px; color: var(--vscode-descriptionForeground); font-variant-numeric: tabular-nums; margin-bottom: 9px; }
+.wo-when b { color: var(--vscode-foreground); }
+/* セッション全体の 4 区分と棒 3 本（R-DSP-19） */
+.wo-band { margin: -4px 0 12px; }
+.wo-buckets { display: flex; flex-wrap: wrap; gap: 3px 14px; font-size: 11.5px; color: var(--vscode-descriptionForeground); margin-bottom: 7px; }
+.wo-bk-v { color: var(--vscode-foreground); font-variant-numeric: tabular-nums; }
+.wo-bars { display: grid; gap: 4px; max-width: 560px; }
+.wo-bar-row { display: grid; grid-template-columns: 96px minmax(0, 1fr) 64px; gap: 8px; align-items: center; font-size: 11px; }
+.wo-bar-l { color: var(--vscode-descriptionForeground); }
+.wo-bar-t { display: block; height: 9px; background: rgba(128, 128, 128, 0.15); border-radius: 2px; overflow: hidden; }
+.wo-bar-f { display: block; height: 100%; background: #4a6a8a; }
+.wo-bar-row[data-bar="subagent"] .wo-bar-f { background: #a8783a; }
+.wo-bar-f.unmeasured { width: 0; }
+.wo-bar-v { text-align: right; font-variant-numeric: tabular-nums; }
+.wo-gist { display: flex; align-items: flex-start; gap: 10px; }
+.wo-gist-t { flex: 1; font-size: 13px; line-height: 1.6; white-space: pre-wrap; overflow-wrap: anywhere; max-height: 9.6em; overflow: auto; }
+.wo-gist-t.wo-raw { font-family: var(--vscode-editor-font-family); font-size: 12.5px; color: var(--vscode-descriptionForeground); }
+.wo-gist-n { font-size: 11px; color: var(--vscode-descriptionForeground); margin-top: 4px; }
+.wo-gist-err { font-size: 11px; color: var(--vscode-errorForeground); margin-top: 4px; white-space: pre-wrap; overflow-wrap: anywhere; }
+.wo-gist-b { flex: none; font-size: 11px; padding: 1px 8px; border-radius: 3px; border: 1px solid var(--vscode-button-border, rgba(128, 128, 128, 0.45)); background: transparent; color: var(--vscode-foreground); cursor: pointer; }
+.wo-gist-b:disabled { opacity: 0.6; cursor: default; }
+.wo-live-dot { width: 7px; height: 7px; border-radius: 50%; background: #a8783a; display: inline-block; animation: wo-pulse 1.6s ease-in-out infinite; }
+.wo-card-t .wo-live-dot { margin-right: 5px; vertical-align: middle; }
+@keyframes wo-pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.3; } }
+.wo-cards { display: grid; grid-template-columns: repeat(5, 1fr); gap: 1px; padding: 0 0 14px; }
+@media (max-width: 380px) {
+  .wo-card { padding: 2px 4px 2px 6px; }
+  .wo-card-t { font-size: 10.5px; white-space: normal; }
+  .wo-card-v { font-size: 19px; }
+}
+.wo-card { padding: 2px 12px 2px 13px; border-left: 1px solid var(--vscode-editorWidget-border, var(--vscode-panel-border)); }
+.wo-card:first-child { border-left: none; padding-left: 0; }
+.wo-card-t { font-size: 11.5px; color: var(--vscode-descriptionForeground); margin-bottom: 1px; white-space: nowrap; text-align: left; }
+.wo-card-v { font-size: 24px; font-weight: 600; line-height: 1.25; text-align: center; }
+.wo-card.wo-hot .wo-card-v { color: #a8622a; }
+.wo-card.wo-quiet .wo-card-v { color: var(--vscode-descriptionForeground); font-weight: 400; }
+.wo-flow { padding: 12px 0 4px; border-top: 1px solid var(--vscode-editorWidget-border, var(--vscode-panel-border)); }
+.wo-flow-h { font-size: 11.5px; color: var(--vscode-descriptionForeground); margin-bottom: 9px; display: flex; align-items: baseline; gap: 9px; }
+.wo-flow-h .wo-c { margin-left: auto; font-variant-numeric: tabular-nums; }
+.wo-fold { display: block; background: none; border: none; font-size: 11.5px; color: var(--vscode-descriptionForeground); padding: 5px 0 5px 63px; cursor: pointer; }
+.wo-fold:hover { color: var(--vscode-foreground); }
+.wo-list { list-style: none; margin: 0; padding: 0; }
+.wo-it { display: grid; grid-template-columns: minmax(54px, max-content) 4px minmax(0, 1fr) auto; gap: 9px; align-items: baseline; padding: 4px 6px 4px 0; border-radius: 4px; cursor: pointer; }
+.wo-it:hover { background: rgba(176, 139, 87, 0.09); }
+.wo-it-at { font-size: 11px; color: var(--vscode-descriptionForeground); font-variant-numeric: tabular-nums; }
+.wo-it-bar { width: 4px; align-self: stretch; border-radius: 2px; background: #ddd4c5; }
+.wo-it.w .wo-it-bar { background: #8aa2c0; }
+.wo-it.m .wo-it-bar { background: #c48a4a; }
+.wo-it-t { font-size: 12.5px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; line-height: 1.55; }
+.wo-it.open .wo-it-t { white-space: pre-wrap; overflow: visible; overflow-wrap: anywhere; }
+.wo-it-t::before { content: "›"; display: inline-block; width: 11px; color: var(--vscode-descriptionForeground); transition: transform 0.12s ease; }
+.wo-it.open .wo-it-t::before { transform: rotate(90deg); }
+.wo-it.wo-short .wo-it-t::before { visibility: hidden; }
+.wo-it.wo-short { cursor: default; }
+.wo-it-s { font-size: 11px; color: var(--vscode-descriptionForeground); font-variant-numeric: tabular-nums; white-space: nowrap; }
+.wo-it-s .wo-mk { color: #8a5a2f; font-weight: 600; }
+.wo-conv { margin-left: 8px; font-size: 10.5px; padding: 0 6px; border-radius: 3px; border: 1px solid rgba(176, 139, 87, 0.5); background: transparent; color: var(--vscode-foreground); cursor: pointer; opacity: 0; }
+.wo-it:hover .wo-conv, .wo-conv:focus-visible { opacity: 1; }
+.wo-conv:focus-visible { outline: 1px solid var(--vscode-focusBorder); outline-offset: 1px; }
+.wo-it.now { background: rgba(176, 139, 87, 0.16); box-shadow: inset 3px 0 0 #a8783a; }
+.wo-it.now .wo-it-t { font-weight: 600; }
+.wo-run { display: flex; align-items: center; gap: 8px; margin: 9px 0 0 63px; padding: 7px 11px; border-radius: 5px; background: rgba(176, 139, 87, 0.12); border: 1px solid rgba(176, 139, 87, 0.4); font-size: 12.5px; }
+.wo-dot { width: 8px; height: 8px; border-radius: 50%; background: #a8783a; flex: none; animation: wo-pulse 1.6s ease-in-out infinite; }
+.wo-run-n { font-weight: 600; }
+.wo-run-m { color: var(--vscode-descriptionForeground); font-size: 11.5px; font-family: var(--vscode-editor-font-family); }
+.wo-run-e { margin-left: auto; font-variant-numeric: tabular-nums; font-size: 12px; }
+.wo-todo-wrap { list-style: none; margin: 0; padding: 0; }
+.wo-todo { list-style: none; margin: 9px 0 0 63px; padding: 0; }
+.wo-todo li { display: flex; align-items: baseline; gap: 8px; padding: 2px 0; font-size: 12.5px; }
+.wo-todo .wo-s { width: 13px; flex: none; text-align: center; font-size: 11px; }
+.wo-todo .wo-s.done { color: #4f7a4a; }
+.wo-todo .wo-s.now { color: #a8783a; }
+.wo-todo li.wo-onnow { font-weight: 600; }
+.wo-todo li.wo-doneli { color: var(--vscode-descriptionForeground); }
+.wo-todo-n { display: block; font-size: 11px; color: var(--vscode-descriptionForeground); margin: 6px 0 0 63px; }
+.wo-flow > .wo-todo-n { margin-left: 0; }
+@media (prefers-reduced-motion: reduce) {
+  .wo-live-dot, .wo-dot { animation: none; }
+  .wo-it-t::before { transition: none; }
+}
+
+/* グラフ（work-graph.ts・SVG 時間軸） */
+.wg-stage { position: relative; }
+/* .log-head（top: -12px）の直下に貼り付く。--log-head-h は tab.ts の syncLogHeadHeight() が実測して書く
+   （契機は syncStripPanelCap と .log-head の ResizeObserver）。z-index は .log-head（6）より下 */
+/* 軸 SVG は下限幅（MIN_CHART_W=520）で描かれる。狭いと .wg-head からはみ出して #logs に
+   横スクロールが出る（実測: pane 433px で軸 520px・scrollWidth 534 > clientWidth 461。G-99）。
+   clip は overflow-y: visible を保てる唯一の値で、sticky もスクロール枠も壊さない */
+.wg-head { position: sticky; top: calc(var(--log-head-h, 0px) - 12px); z-index: 5; background: var(--vscode-editor-background); padding: 4px 0 8px; overflow-x: clip; }
+.wg-axis { display: block; }
+.wg-zoom-bar { display: flex; align-items: center; justify-content: space-between; font-size: 11.5px; color: var(--vscode-descriptionForeground); padding: 0 0 6px; }
+.wg-zoom-range { font-variant-numeric: tabular-nums; }
+.wg-zoom-all { font-size: 11px; padding: 2px 9px; cursor: pointer; border-radius: 4px; color: var(--vscode-foreground); background: var(--vscode-button-secondaryBackground); border: 1px solid var(--vscode-button-border, var(--vscode-editorWidget-border)); }
+.wg-zoom-all[aria-pressed="true"] { border-color: #b08b57; box-shadow: inset 0 -2px 0 #b08b57; }
+.wg-zoom-all:focus-visible { outline: 2px solid var(--vscode-focusBorder); outline-offset: 1px; }
+.wg-zoom-live { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; border-width: 0; }
+.wg-mini { display: block; width: 100%; height: 34px; touch-action: none; cursor: pointer; }
+.wg-mini.can-drag { cursor: grab; }
+.wg-mini.dragging { cursor: grabbing; }
+.wg-mini-win { fill: rgba(176, 139, 87, 0.12); stroke: #b08b57; stroke-width: 1.8; vector-effect: non-scaling-stroke; }
+.wg-mini-hint { font-size: 10px; fill: var(--vscode-foreground); pointer-events: none; }
+.wg-legend { display: flex; flex-wrap: wrap; gap: 4px 14px; font-size: 11px; color: var(--vscode-descriptionForeground); padding: 6px 0 2px; }
+.wg-legend-item { display: inline-flex; align-items: center; gap: 5px; }
+.wg-sw { width: 10px; height: 10px; border-radius: 2px; display: inline-block; }
+.wg-sw-g, .wg-seg-g { fill: #4a6a8a; background: #4a6a8a; }
+.wg-sw-t, .wg-seg-t { fill: #6f8b57; background: #6f8b57; }
+.wg-sw-a, .wg-seg-a { fill: #7a5a8a; background: #7a5a8a; }
+.wg-sw-wait, .wg-seg-wait { fill: #d8cdba; background: #d8cdba; stroke: #b9a887; stroke-width: 0.8; }
+.wg-sw-sub, .wg-seg-sub { fill: #a8783a; background: #a8783a; }
+.wg-seg-sub.open, .wg-seg-g.open, .wg-seg-t.open, .wg-seg-a.open { fill-opacity: 0.6; }
+.wg-note { font-size: 11.5px; color: var(--vscode-descriptionForeground); padding: 4px 0; }
+.wg-note-line { display: block; }
+.wg-body { display: grid; grid-template-columns: minmax(0, 1fr); align-items: start; }
+.wg-chart-pane { min-width: 0; overflow-x: auto; }
+.wg-chart { display: block; }
+.wg-chart [data-clipped] { stroke: var(--vscode-foreground); stroke-opacity: .55; stroke-dasharray: 2 2; }
+.wg-tick { font-size: 10px; fill: var(--vscode-descriptionForeground); }
+.wg-tick-line { stroke: var(--vscode-editorWidget-border, rgba(128, 128, 128, 0.35)); stroke-width: 1; }
+.wg-fold { fill: rgba(128, 128, 128, 0.12); }
+.wg-fold-bg { fill: rgba(168, 120, 58, 0.18); }
+.wg-fold[data-fold-kind="unobserved"] { fill: rgba(128, 128, 128, 0.08); }
+.wg-fold[data-fold-kind="confirm"] { fill: rgba(122, 90, 138, 0.2); }
+.wg-fold-label { fill: #b08b57; }
+.wg-row { cursor: pointer; outline: none; }
+.wg-row-bg { fill: transparent; }
+.wg-row:hover .wg-row-bg { fill: rgba(176, 139, 87, 0.1); }
+.wg-row.on .wg-row-bg, .wg-row.open .wg-row-bg { fill: rgba(176, 139, 87, 0.18); }
+.wg-row:focus-visible .wg-row-bg { stroke: var(--vscode-focusBorder); stroke-width: 1.5; }
+.wg-lbl { font-size: 12px; fill: var(--vscode-foreground); }
+.wg-lbl-dim { font-size: 10px; fill: var(--vscode-descriptionForeground); }
+.wg-open { font-size: 16px; fill: var(--vscode-descriptionForeground); cursor: pointer; }
+.wg-row:hover .wg-open, .wg-row:focus-visible .wg-open { fill: var(--vscode-foreground); }
+.wg-sub-link { fill: none; stroke: #a8783a; stroke-width: 1.2; opacity: 0.65; }
+@keyframes wg-row-pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.55; } }
+.wg-row.running .wg-seg { animation: wg-row-pulse 1.8s ease-in-out infinite; }
+@media (prefers-reduced-motion: reduce) { .wg-row.running .wg-seg { animation: none; } }
+@media (max-width: 640px) { .wg-body { grid-template-columns: minmax(0, 1fr); } }
+
+/* インスペクター（agent-inspector.ts・グラフ行から開くポップアップ） */
+.work-inspector { position: fixed; inset: 0; z-index: 50; }
+.work-inspector[hidden] { display: none; }
+.wi-scrim { position: absolute; inset: 0; background: rgba(0, 0, 0, 0.35); }
+.wi-pop { position: absolute; left: 4%; top: 6%; width: 92%; height: 88%; display: flex; flex-direction: column; background: var(--vscode-editorWidget-background, var(--vscode-editor-background)); border: 1px solid var(--vscode-editorWidget-border, var(--vscode-panel-border)); border-radius: 6px; box-shadow: 0 6px 24px rgba(0, 0, 0, 0.3); min-width: 0; }
+.wi-pop.max { left: 6px; top: 6px; width: calc(100% - 12px); height: calc(100% - 12px); }
+.wi-head { display: flex; align-items: center; gap: 8px; padding: 8px 10px; border-bottom: 1px solid var(--vscode-editorWidget-border, var(--vscode-panel-border)); min-width: 0; }
+.wi-kind { font-size: 10px; padding: 1px 6px; border-radius: 3px; background: var(--vscode-badge-background, rgba(128, 128, 128, 0.25)); color: var(--vscode-badge-foreground, inherit); white-space: nowrap; }
+.wi-kind[data-kind="agent"] { background: #a8783a; color: #fff; }
+.wi-title { flex: 1; font-size: 13px; margin: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
+.wi-meta { font-size: 11px; color: var(--vscode-descriptionForeground); white-space: nowrap; }
+.wi-max, .wi-close { background: none; border: 1px solid var(--vscode-button-border, var(--vscode-panel-border)); border-radius: 3px; color: var(--vscode-foreground); cursor: pointer; font-size: 11px; padding: 2px 8px; }
+.wi-max:focus-visible, .wi-close:focus-visible { outline: 1px solid var(--vscode-focusBorder); outline-offset: 1px; }
+.wi-axis { display: grid; grid-template-columns: max-content minmax(0, 1fr) max-content max-content; gap: 8px; align-items: center; padding: 6px 10px; font-size: 10px; color: var(--vscode-descriptionForeground); }
+.wi-axis-t { position: relative; height: 8px; background: #d8cdba; border-radius: 2px; }
+.wi-axis-me { position: absolute; top: 0; height: 100%; background: #a8783a; border-radius: 2px; }
+.wi-axis-w { font-variant-numeric: tabular-nums; }
+.wi-cnt { font-size: 10px; color: var(--vscode-descriptionForeground); margin-left: 5px; }
+.wi-body { flex: 1; min-height: 0; overflow: auto; padding: 4px 10px 10px; }
+.wi-sections { padding: 0 10px; }
+
+/* 実行ログの印（R-TAB-06）。行は tab.ts が組む。ここは印・まとめ・時刻列の見た目だけ */
+.wl-head { padding: 4px 0 6px; }
+.wl-sum { position: sticky; top: 0; display: flex; flex-wrap: wrap; gap: 6px; align-items: center; font-size: 11.5px; padding: 6px 0; background: var(--vscode-editor-background); }
+.wl-sum-n { font-weight: 600; }
+.wl-chip { font-size: 10.5px; padding: 1px 7px; border-radius: 3px; background: rgba(176, 139, 87, 0.18); color: var(--vscode-foreground); }
+.tool-row.wl-flag { box-shadow: inset 3px 0 0 #b08b57; }
+.tool-row.wl-fail { box-shadow: inset 3px 0 0 var(--vscode-errorForeground); }
+/* 印は summary の中で改行して 1 段下に並ぶ（行を閉じたままで見える） */
+.tool-row.wl-flag > summary, .tool-row.wl-fail > summary { flex-wrap: wrap; }
+.wl-tag { flex: 0 0 100%; padding: 0 0 2px 4px; }
+.wl-tag > button { font-size: 10.5px; padding: 1px 7px; border-radius: 3px; cursor: pointer; background: rgba(176, 139, 87, 0.18); color: var(--vscode-foreground); border: 1px solid rgba(176, 139, 87, 0.5); }
+.wl-tag > button:focus-visible { outline: 1px solid var(--vscode-focusBorder); outline-offset: 1px; }
+.tool-at { flex: 0 0 auto; white-space: nowrap; min-width: 7.5ch; font-size: 10.5px; color: var(--vscode-descriptionForeground); font-variant-numeric: tabular-nums; margin-right: 6px; }
+@keyframes wlflash { 0% { background: rgba(176, 139, 87, 0.35); } 100% { background: transparent; } }
+.tool-row.wl-back > summary { animation: wlflash 1.4s ease-out; }
+@media (prefers-reduced-motion: reduce) { .tool-row.wl-back > summary { animation: none; outline: 1px solid #b08b57; } }
+.wl-chip { cursor: pointer; border: 1px solid rgba(176, 139, 87, 0.5); }
+.wl-chip:focus-visible { outline: 1px solid var(--vscode-focusBorder); outline-offset: 1px; }
+
+/* 分析タブ: サブタブ（スクリプト分析 / LLM 分析）・セッションの実測・スクリプト分析の所見（R-TAB-06） */
+.wa-tabs { display: flex; gap: 2px; margin: 0 0 12px; border-bottom: 1px solid var(--vscode-editorWidget-border, var(--vscode-panel-border)); }
+.wa-tab { font-size: 12.5px; padding: 6px 14px; border: none; border-bottom: 2px solid transparent; background: none; color: var(--vscode-descriptionForeground); cursor: pointer; }
+.wa-tab:hover { color: var(--vscode-foreground); }
+.wa-tab.active { color: var(--vscode-foreground); font-weight: 600; border-bottom-color: #a8783a; }
+.wa-tab:focus-visible { outline: 1px solid var(--vscode-focusBorder); outline-offset: -1px; }
+.wa-sub[hidden] { display: none; }
+.wa-sec-h { display: block; font-size: 12px; font-weight: 600; margin: 8px 0 4px; border-bottom: 1px dashed var(--vscode-descriptionForeground); width: max-content; cursor: help; }
+.wa-head, .wa-findings { padding: 0 0 12px; margin-bottom: 10px; border-bottom: 1px solid var(--vscode-editorWidget-border, var(--vscode-panel-border)); }
+.wa-head-t { display: block; font-size: 12.5px; font-weight: 600; margin-bottom: 7px; }
+.wa-when { display: flex; flex-wrap: wrap; align-items: baseline; gap: 6px; font-size: 12px; color: var(--vscode-descriptionForeground); font-variant-numeric: tabular-nums; }
+.wa-when b, .wa-strong { color: var(--vscode-foreground); font-weight: 600; }
+.wa-arrow { padding: 0 2px; }
+.wa-elapsed { margin-left: 10px; }
+.wa-idle { font-size: 11.5px; color: var(--vscode-descriptionForeground); margin: 4px 0 8px; }
+.wa-cap { display: flex; align-items: baseline; gap: 8px; margin: 6px 0 4px; font-size: 12px; }
+.wa-cap-n { color: var(--vscode-descriptionForeground); }
+.wa-cap-v { font-size: 15px; font-weight: 600; }
+.wa-rows { display: grid; grid-template-columns: minmax(96px, auto) minmax(0, 1fr) minmax(80px, auto); gap: 6px 10px; align-items: center; margin: 4px 0 6px; }
+.wa-rn { font-size: 11.5px; color: var(--vscode-descriptionForeground); white-space: nowrap; }
+.wa-rn.wa-total { font-weight: 600; color: var(--vscode-foreground); }
+.wa-c { font-size: 10.5px; margin-left: 5px; }
+.wa-bar { display: flex; height: 18px; border-radius: 3px; overflow: hidden; background: rgba(128, 128, 128, 0.12); }
+.wa-bar.wa-total { height: 22px; }
+.wa-bar.unmeasured { background: repeating-linear-gradient(45deg, rgba(128, 128, 128, 0.08), rgba(128, 128, 128, 0.08) 4px, transparent 4px, transparent 8px); }
+.wa-seg { display: flex; align-items: center; justify-content: center; overflow: hidden; white-space: nowrap; font-size: 10.5px; color: #fff; }
+.wa-seg.wa-gen, .wa-sw.wa-gen { background: #4a6a8a; }
+.wa-seg.wa-tool, .wa-sw.wa-tool { background: #a8783a; }
+.wa-seg-v { padding: 0 4px; }
+.wa-rt { font-size: 12px; font-variant-numeric: tabular-nums; white-space: nowrap; }
+.wa-sm { font-size: 10.5px; color: var(--vscode-descriptionForeground); margin-left: 5px; }
+.wa-key { display: flex; gap: 14px; list-style: none; margin: 4px 0 8px; padding: 0; font-size: 11px; color: var(--vscode-descriptionForeground); }
+.wa-key li { display: flex; align-items: center; gap: 5px; }
+.wa-sw { display: inline-block; width: 10px; height: 10px; border-radius: 2px; }
+.wa-facts { display: flex; flex-wrap: wrap; gap: 6px 22px; font-size: 12px; margin-bottom: 6px; }
+.wa-lbl { color: var(--vscode-descriptionForeground); font-size: 11.5px; }
+.wa-more { font-size: 12px; }
+.wa-more > summary { cursor: pointer; color: var(--vscode-descriptionForeground); font-size: 11.5px; }
+.wa-types { margin-top: 6px; }
+.wa-thead, .wa-trow > summary, .wa-runs li { display: grid; grid-template-columns: minmax(0, 1fr) 40px 74px 74px 48px 40px; gap: 6px; align-items: baseline; }
+.wa-thead { font-size: 10.5px; color: var(--vscode-descriptionForeground); padding: 2px 0; border-bottom: 1px solid var(--vscode-editorWidget-border, var(--vscode-panel-border)); }
+.wa-trow > summary { cursor: pointer; padding: 3px 0; list-style: none; }
+.wa-trow > summary::-webkit-details-marker { display: none; }
+.wa-ty { font-weight: 600; }
+.wa-runs { list-style: none; margin: 0 0 4px; padding: 0 0 0 12px; font-size: 11.5px; color: var(--vscode-descriptionForeground); }
+.wa-num { text-align: right; font-variant-numeric: tabular-nums; }
+.wa-num.wa-zero { opacity: 0.55; }
+.wa-num.wa-fail { color: var(--vscode-errorForeground); font-weight: 600; }
+.wa-quiet { display: block; font-size: 12px; line-height: 1.6; color: var(--vscode-descriptionForeground); }
+.wa-find { border: 1px solid var(--vscode-editorWidget-border, var(--vscode-panel-border)); border-radius: 5px; padding: 7px 10px; margin-bottom: 7px; scroll-margin-top: 12px; }
+.wa-find:focus { outline: none; }
+.wa-find.wa-hit { border-color: #a8783a; box-shadow: 0 0 0 2px rgba(168, 120, 58, 0.22); }
+.wa-find-n { font-size: 12.5px; font-weight: 600; }
+.wa-badge { display: inline-block; font-size: 10.5px; font-weight: 400; padding: 1px 6px; border-radius: 3px; margin-right: 6px; background: rgba(176, 139, 87, 0.16); color: var(--vscode-descriptionForeground); border: 1px solid rgba(176, 139, 87, 0.4); vertical-align: 1px; }
+.wa-find-c { font-size: 11.5px; color: var(--vscode-descriptionForeground); font-variant-numeric: tabular-nums; margin-left: 10px; }
+.wa-chips { display: flex; flex-wrap: wrap; gap: 5px; margin-top: 6px; }
+.wa-chip { font-size: 10.5px; padding: 1px 7px; border-radius: 3px; cursor: pointer; background: rgba(176, 139, 87, 0.18); color: var(--vscode-foreground); border: 1px solid rgba(176, 139, 87, 0.5); }
+.wa-chip:focus-visible { outline: 1px solid var(--vscode-focusBorder); outline-offset: 1px; }
+.af-llm-section { margin-top: 10px; padding-top: 10px; border-top: 1px solid var(--vscode-editorWidget-border, var(--vscode-panel-border)); }
+@media (forced-colors: active) {
+  .wi-pop, .wi-max, .wi-close, .wl-tag > button, .wo-card { border: 1px solid CanvasText; forced-color-adjust: none; background: Canvas; color: CanvasText; }
+  .wg-row:focus-visible .wg-row-bg { stroke: Highlight; }
+  .term-note { border-bottom-color: CanvasText; }
+}
+
+/* ---------- 検索バー ---------- */
+.find-bar {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  height: 28px;
+  min-height: 28px;
+  flex: 0 0 28px;
+  box-sizing: border-box;
+  padding: 2px 8px;
+  background: var(--vscode-editorWidget-background);
+  border-bottom: 1px solid var(--vscode-panel-border);
+  z-index: 20;
+}
+.find-bar.hidden {
+  display: none;
+}
+.find-bar input {
+  flex: 1 1 auto;
+  min-width: 60px;
+  height: 22px;
+  box-sizing: border-box;
+  background: var(--vscode-input-background);
+  color: var(--vscode-input-foreground);
+  border: 1px solid var(--vscode-input-border, var(--vscode-panel-border));
+  border-radius: 3px;
+  padding: 2px 6px;
+  font-size: 12px;
+  outline: none;
+}
+.find-bar input:focus {
+  border-color: var(--vscode-focusBorder);
+}
+.find-bar input.no-match {
+  border-color: var(--vscode-inputValidation-warningBorder, #cca700);
+}
+.find-count {
+  flex: 0 0 auto;
+  font-size: 11px;
+  color: var(--vscode-descriptionForeground);
+  padding: 0 4px;
+  white-space: nowrap;
+}
+.find-btn {
+  flex: 0 0 auto;
+  width: 22px;
+  height: 22px;
+  padding: 0;
+  margin: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  background: transparent;
+  color: var(--vscode-foreground);
+  border: 1px solid transparent;
+  border-radius: 3px;
+  cursor: pointer;
+  font-size: 12px;
+  line-height: 1;
+}
+.find-btn:hover {
+  background: var(--vscode-toolbar-hoverBackground, rgba(128, 128, 128, 0.2));
+}
+mark.find-match {
+  background: var(--vscode-editor-findMatchHighlightBackground);
+  color: inherit;
+}
+mark.find-match-current {
+  background: var(--vscode-editor-findMatchBackground);
+  color: inherit;
+}
+
+/* One destination tag per finding; reuse existing badge tokens. */
+.llm-finding-routing { margin-bottom: 6px; }
+.llm-destination-badge { display: inline-block; max-width: 100%; overflow-wrap: anywhere; }
