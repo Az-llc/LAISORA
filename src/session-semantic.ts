@@ -1,4 +1,5 @@
 import { getLaisoraConfiguration } from "./claude-settings";
+import { projectPlanUsage } from "./plan-usage";
 import * as l10n from "@vscode/l10n";
 
 import { projectAnalysisFactsView } from "./analysis-facts-view";
@@ -23,6 +24,7 @@ import { deriveSemanticModel, type SemanticModel } from "./semantic-model";
 import { deriveSessionFacts, type SessionFacts, type SessionFactsAccumulator } from "./session-facts";
 import { inspectorSessionFile, isInSessionStore } from "./session-files";
 import type { Session } from "./extension";
+import type { LearningFacts } from "./learning";
 import type { SessionStore } from "./store-surfaces";
 import { overlayLiveTimeBucketState, type TimeBucketView } from "./time-buckets";
 import { childSpansOf, readTranscriptTimeBucketsWithCoverage } from "./transcript-time-buckets";
@@ -82,14 +84,15 @@ function deriveL3Payload(
   model: SemanticModel,
   evidence: SemanticEvidenceIndex,
   divergenceReport: DivergenceReport,
-  facts?: SessionFacts
+  facts?: SessionFacts,
+  learning?: LearningFacts
 ): L3ReportPayload {
   const analysis = deriveL3(model, evidence);
   const divergences = projectDivergences(divergenceReport);
   return {
     analysis,
     divergences,
-    ...(facts !== undefined ? { facts: projectAnalysisFactsView(facts, divergenceReport) } : {}),
+    ...(facts !== undefined ? { facts: projectAnalysisFactsView(facts, divergenceReport, learning) } : {}),
   };
 }
 
@@ -134,6 +137,7 @@ export class SessionSemantic {
     // memo が hit し続け、古い L3 を返す。foldSessionFacts は毎回新しいオブジェクトを
     // 返すので参照比較で足りる
     sessionFacts: SessionFactsAccumulator;
+    learningKey: string | undefined;
     baseline: PersonalBaseline | null;
     restoredAgents: RestoredAgent[];
     derivation: {
@@ -227,6 +231,13 @@ export class SessionSemantic {
   // 「セッション全体の確定値」として出さない（R-TAB-07）
   projectedWorkModel(): WorkModelPayload {
     const model = projectWorkModel(this.host.workModel, this.host.restoredAgents);
+    const time = this.host.evidenceIndex.timeBuckets;
+    const block = time.blocks[time.blocks.length - 1];
+    if (block) {
+      model.planContext = { blockId: block.blockId, text: block.text, start: block.start,
+        end: Math.max(block.start, time.lastAt ?? block.start), running: this.host.workModel.turnActive ||
+          this.host.streamOpen() && model.phases.some(phase => phase.runningCount > 0 || (phase.backgroundRunningCount ?? 0) > 0) };
+    }
     // 状況の導出が例外で欠けたら、semantic を送れない間も workModel 側で申告する。
     // 申告しないと状況タブは古い表示のまま「現在」として残る（R-DSP-01。G-COV-8 / W-SD-1 / W-SD-2）
     const semanticDerivationFailed: WorkCoverage["semanticDerivationFailed"] | undefined =
@@ -261,6 +272,8 @@ export class SessionSemantic {
     if (this.workModelPostTimer !== null) return;
     this.workModelPostTimer = setTimeout(() => {
       this.workModelPostTimer = null;
+      this.store.post({ type: "planUsage", tabId: this.host.tabId,
+        state: projectPlanUsage(this.host.sessionFacts.planUsage, this.host.evidenceIndex.timeBuckets.blocks) });
       this.store.post({
         type: "workModel",
         tabId: this.host.tabId,
@@ -280,6 +293,8 @@ export class SessionSemantic {
     divergenceReport?: DivergenceReport;
   } | undefined {
     const streamOpen = this.host.streamOpen();
+    const learning = this.host.learningFacts?.();
+    const learningKey = JSON.stringify(learning);
     const memo = this.semanticMemo;
     if (
       memo !== null &&
@@ -288,6 +303,7 @@ export class SessionSemantic {
       memo.streamOpen === streamOpen &&
       memo.liveDelegationRev === this.host.liveDelegationRev &&
       memo.sessionFacts === this.host.sessionFacts &&
+      memo.learningKey === learningKey &&
       memo.baseline === cachedPersonalBaseline &&
       memo.restoredAgents === this.host.restoredAgents
     ) {
@@ -317,7 +333,7 @@ export class SessionSemantic {
         const facts = deriveSessionFacts(this.host.sessionFacts, this.host.evidenceIndex, cachedPersonalBaseline, {
           eventLogTrimmed: (this.host.workModel.coverage.droppedEventCount ?? 0) > 0,
         });
-        payload = { ...payload, l3: deriveL3Payload(model, this.host.evidenceIndex, divergenceReport, facts) };
+        payload = { ...payload, l3: deriveL3Payload(model, this.host.evidenceIndex, divergenceReport, facts, learning) };
       } catch (error) {
         derivationError = { stage: "metrics", detail: String(error) };
         output.appendLine(`[${this.host.title}] L3 derivation failed: ${derivationError.detail}`);
@@ -334,6 +350,7 @@ export class SessionSemantic {
       streamOpen,
       liveDelegationRev: this.host.liveDelegationRev,
       sessionFacts: this.host.sessionFacts,
+      learningKey,
       baseline: cachedPersonalBaseline,
       restoredAgents: this.host.restoredAgents,
       derivation,

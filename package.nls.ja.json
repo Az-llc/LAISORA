@@ -1,4 +1,5 @@
 {
+  "config.laisora.learning.enabled.description": "laisora-learning の現役対策を配信し、学習記録ツールを提供し、配信とモデル変更を記録します。編成の有効・無効に依りません。次の会話プロセス起動から適用します。既定は無効で、無効時は学習記録の読み書きを行いません。",
   "extension.description": "VS CodeでAIエージェントとの会話に集中し、作業状況の確認とログ分析による改善を進められます。",
   "capabilities.untrustedWorkspaces": "Claude Codeを実行するには、このワークスペースを信頼する必要があります。",
   "command.laisora.open.title": "LAISORA: 開く",
@@ -14,16 +15,22 @@
   "config.laisora.defaultCwd.description": "新しい会話の作業ディレクトリ。空欄の場合は開いているワークスペースを使います。",
   "config.laisora.tabLimit.description": "同時に開ける会話タブの上限。履歴を調べる範囲の上限にも使います。",
   "config.laisora.restoreTabsOnStartup.description": "ウィンドウを最後に閉じた・再読み込みしたときに開いていた会話タブを、起動時に開き直します。一度も送信していないタブは復元しません。",
+  "config.laisora.claude.planInstruction.description": "Claudeに計画を更新させ、判断と実機確認を専用のブロックで表示させます。新しく始めた会話と、再開した会話から有効です。実行中の会話には反映しません。",
   "config.laisora.claude.fileLinkInstruction.description": "Claudeに、ローカルファイルをエディタで開けるMarkdownリンクの形式で書かせます（短いシステムプロンプトとして渡します）。新しく始めた会話と、再開した会話から有効です。実行中の会話には反映しません（会話の途中でシステムプロンプトを変えるとプロンプトキャッシュが使えなくなり、次の返答で会話全体を送り直すことになるため）。",
   "config.laisora.fileLinks.revealInExplorer.description": "LAISORAのエディタータブでファイルリンクを押したとき、エクスプローラーでもそのファイルを選択します。サイドバーのLAISORAで押したリンクでは選択しません（サイドバーではエクスプローラーが会話と入れ替わるため）。ワークスペース外のファイルはエクスプローラーで選択しません。",
   "config.laisora.fileLinks.allowOutsideWorkspace.description": "会話中のMarkdownファイルリンクが、ワークスペースと会話フォルダーの外を指していても開きます。ネットワーク共有（UNCパス）とデバイスパスは常に拒否し、リンクにもしません。ユーザー設定でのみ指定できます。",
   "config.laisora.fileLinks.confirmOutsideWorkspace.description": "ワークスペース外のファイルを開く前に確認します。laisora.fileLinks.allowOutsideWorkspaceがオンのときだけ使います。ユーザー設定でのみ指定できます。",
   "config.laisora.fileLinks.openOutsideReadOnly.description": "ワークスペース外のファイルを、保存できない読み取り専用のエディターで開きます。ワークスペース内のファイルは通常どおり開きます。laisora.fileLinks.allowOutsideWorkspaceがオンのときだけ使います。ユーザー設定でのみ指定できます。",
-  "config.laisora.composer.sendKey.description":"入力欄の内容を送信するキー。もう一方の組み合わせは改行になります。",
+  "config.laisora.composer.sendKey.description": "入力欄の内容を送信するキー。もう一方の組み合わせは改行になります。",
   "config.laisora.composer.sendKey.enter": "Enterで送信、Shift+Enterで改行。",
   "config.laisora.composer.sendKey.shiftEnter": "Shift+Enterで送信、Enterで改行。",
   "config.laisora.interruptForceKillTimeoutMs.description": "停止要求から強制終了まで待つ時間（ミリ秒）。",
   "config.laisora.guardrail.autoMaxLevel.description": "自動介入の上限。0は介入なし、1は警告、2は追加指示、3は対応の引き上げです。実行中のモデルへの報告は、この上限とは別に行います。自動で中断しません。",
   "config.laisora.progressTracking.description": "instrumentを選ぶと、モデルに進捗報告用のツールを追加します。他の値では追加しません。記録済みの進捗は、設定にかかわらず読み取ります。",
-  "config.laisora.claude.remoteControlAtStartup.description": "LAISORAで開始する会話のRemote Controlを有効にします。Claude Code共通の設定ファイルは変更しません。"
+  "config.laisora.claude.remoteControlAtStartup.description": "LAISORAで開始する会話のRemote Controlを有効にします。Claude Code共通の設定ファイルは変更しません。",
+  "config.laisora.orchestration.enabled.description": "エージェントのオーケストレーションを有効にします。次のセッションから有効。",
+  "config.laisora.orchestration.agents.description": "コンダクターが使うエージェント構成。次のセッションから有効。",
+  "config.laisora.orchestration.conductorPolicy.description": "生成されたコンダクター指示の後に追加する利用者の方針。次のセッションから有効。",
+  "config.orchestration.externalTimeoutMinutes": "外部実行の待ち時間（分）。次のセッションから有効になります。",
+  "config.laisora.fileLinks.openWithSystemApp.description": "ワークスペースと会話フォルダ内で OS の既定アプリで開く拡張子。先頭にドットを付けた小文字で指定します。実行ファイルやスクリプトの拡張子は無視されます。ユーザー設定のみ。"
 }

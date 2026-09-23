@@ -225,29 +225,7 @@ export function liveBackgroundTasks(state: BackgroundActivityState): BackgroundT
   return state.tasks.filter((t) => !t.ambient && !state.finishedTaskIds.has(t.id));
 }
 
-// Agent の非同期起動は 🤖、Bash の run_in_background は 🔄。同じ印にすると区別できない
-export function isAgentBackgroundTask(t: { type: string }): boolean {
-  return /agent/i.test(t.type);
-}
-
 export function hasRunningDelegation(state: BackgroundActivityState): boolean {
   for (const d of state.delegations.values()) if (d.running) return true;
   return false;
-}
-
-export function hasRunningDelegationFor(state: BackgroundActivityState, agentId: string): boolean {
-  for (const d of state.delegations.values()) if (d.running && d.agentId === agentId) return true;
-  return false;
-}
-
-// 起動が窓の外にある Agent の背景タスクは delegations に無い。種別だけで除くと帯に何も出ない。
-// 集合は起動 ACK より先に届き、ACK までは agentId で突き合わせられないので、未解決の背景委任の数だけ新しい側を除く
-export function orphanAgentTasks(state: BackgroundActivityState, turnIdle: boolean): BackgroundTaskEntry[] {
-  const unmatched = liveBackgroundTasks(state).filter(
-    (t) => isAgentBackgroundTask(t) && !hasRunningDelegationFor(state, t.id)
-  );
-  // ACK は起動と同じターン内に届く。ターン外まで数えると、ACK を失った委任が実在の孤児を隠し続ける
-  let pending = 0;
-  if (!turnIdle) for (const d of state.delegations.values()) if (d.running && d.background && d.agentId === undefined) pending++;
-  return unmatched.slice(0, Math.max(0, unmatched.length - pending));
 }

@@ -1,9 +1,12 @@
 import type { PersonalBaseline } from "./analysis";
+import { foldPlanUsage, type PlanUsageAccumulator } from "./plan-usage";
+import type { AssistantUsage } from "./protocol";
 import type { SemanticEvidenceIndex } from "./evidence-index";
 import { HUMAN_REJECTED_TOOL_RESULT_RE } from "./guardrail";
 import type { NormalizedEvent } from "./protocol";
 
 export interface SessionFactsAccumulator {
+  planUsage?: PlanUsageAccumulator;
   firstAt: number | null;
   lastAt: number | null;
   toolCalls: number;
@@ -104,6 +107,9 @@ export function foldSessionFacts(
     openToolNames,
     outputTokens,
     hasOutputTokens,
+    planUsage: event.kind === "assistant_usage" && typeof event.messageId === "string" && typeof event.timestamp === "number"
+      ? foldPlanUsage(acc.planUsage, event.messageId, event.timestamp, (event.usage ?? {}) as AssistantUsage)
+      : acc.planUsage,
   };
 }
 

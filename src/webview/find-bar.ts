@@ -85,8 +85,12 @@ export function runSearch(query: string, preserveIndex = false, anchor: "start" 
       if (tag === "script" || tag === "style" || tag === "textarea" || tag === "input") {
         return NodeFilter.FILTER_REJECT;
       }
+      // .code-copy-status は視覚的非表示（clip-path）。当てるとハイライトが見えないまま
+      // 件数だけ増え、コピー後 2 秒だけ「見つかったのにどこも光らない」になる
       if (
         parent.closest(".find-bar") ||
+        parent.closest(".turn-label") ||
+        parent.closest(".code-copy-status") ||
         parent.closest(".assistant-seg.streaming .seg-tail") ||
         Boolean(parent.closest(".seg-tail")?.closest(".streaming"))
       ) {

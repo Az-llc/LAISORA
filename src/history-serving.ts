@@ -411,7 +411,14 @@ export async function handleHistoryMessage(
             );
             break;
           }
-          const read = await readConversationMessages(filePath, isInSessionStore);
+          // 裏読みも同じ世代境界で止める（R-CNV-01 / R-HND-09）。resumeSessionId は未設定に
+          // なりうるので auth 側へ落とす
+          const read = await readConversationMessages(
+            filePath,
+            isInSessionStore,
+            undefined,
+            session.resumeSessionId ?? session.auth?.sessionId
+          );
           if (!requestStillValid()) {
             await postConversationHistoryError(
               st, sender, session, msg.requestId, generation, "stale-request"

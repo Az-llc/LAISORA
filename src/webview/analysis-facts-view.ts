@@ -110,6 +110,14 @@ export function renderAnalysisFactsView(
     container.appendChild(covEl);
   }
 
+  if (facts.learning) {
+    const learning = makeEl("div", "af-learning af-coverage-note");
+    learning.dataset.state = facts.learning.state;
+    if (facts.learning.note) learning.appendChild(makeEl("div", "af-learning-note", facts.learning.note));
+    for (const line of facts.learning.lines) learning.appendChild(makeEl("div", "af-learning-line", line));
+    container.appendChild(learning);
+  }
+
   // LLM 分析への導線（実行ボタン・所見）は LLM 側の区画にまとめる。スクリプト由来の値と同じ平坦な親に置かない（R-ANL-14）
   const llmSection = makeEl("div", "af-llm-section");
   llmSection.appendChild(

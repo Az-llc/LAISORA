@@ -8,14 +8,28 @@ import type {
   forkSession as sdkForkSession,
   query as sdkQuery,
 } from "@anthropic-ai/claude-agent-sdk" with { "resolution-mode": "import" };
-import { acceptCompactSummary, COMPACT_INSTRUCTION, ENVELOPE_PREAMBLE } from "./handoff-accept";
+import {
+  acceptCompactSummary,
+  COMPACT_INSTRUCTION,
+  DECISIONS_PREAMBLE,
+  ENVELOPE_PREAMBLE,
+  extractDecisionLines,
+  type ExtractedDecisionLine,
+} from "./handoff-accept";
 import {
   buildHandoffEnvelopeV2,
   parseHandoffEnvelope,
+  type HandoffDecisionEntry,
+  type HandoffDecisions,
   type HandoffEnvelopeV2,
   type HandoffUtterance,
 } from "./handoff-envelope";
-import { createRecordUuidFilter, extractVerbatimUserUtterances } from "./session-transcript";
+import {
+  createParseYielder,
+  createRecordUuidFilter,
+  extractVerbatimUserUtterances,
+  isHandoffGenerationBoundary,
+} from "./session-transcript";
 import { claudeProjectsDir } from "./claude-env";
 
 export type ForkSessionFn = typeof sdkForkSession;
@@ -28,12 +42,17 @@ export interface HandoffRecordsRead {
   unreadableLineCount: number;
 }
 
-export function parseHandoffRecords(text: string): HandoffRecordsRead {
+// 14MB 級の複製を 1 つの JS turn で parse すると拡張ホストがその間止まる。他の読取器と同じ
+// 譲り方（createParseYielder）で分割する
+export async function parseHandoffRecords(text: string): Promise<HandoffRecordsRead> {
   const accept = createRecordUuidFilter();
   const records: Record<string, unknown>[] = [];
+  const maybeYield = createParseYielder();
   let unreadableLineCount = 0;
   for (const line of text.split("\n")) {
     if (line.trim().length === 0) continue;
+    const pendingYield = maybeYield();
+    if (pendingYield) await pendingYield;
     let parsed: unknown;
     try {
       parsed = JSON.parse(line);
@@ -299,32 +318,160 @@ function forkIncompleteReason(
 // 会話面の既存表示は compact 要約も封筒も非人間として捨てるので、ここで取り出さないと
 // 利用者はどちらも読めない
 export interface HandoffDetail {
-  summary: string;
+  // 要約だけ取れない記録がある（封筒はあるが直前の要約が無い）。発言と決定行は封筒が持つので、
+  // 要約の欠落で展開部ごと落とさない。画面は要約の欄にだけ「取得できません」を出す
+  summary?: string;
   utterances: HandoffUtterance[];
+  decisions?: HandoffDecisions;
 }
 
+// 拾うのは**封筒の直前**の要約（R-HND-10）。最新の compact 境界で選ぶと、引き継ぎの後に
+// 自動 / 手動 compact が走った記録を再読込したとき別世代の要約が出るか取得に失敗する。
+// live と復元で同じ関数を使う（引き継ぎ完了直後は封筒が最終レコードなので結果は変わらない）
 export function extractHandoffDetail(
   records: readonly Record<string, unknown>[],
   forkSessionId: string
 ): HandoffDetail | undefined {
-  const lastBoundary = lastCompactBoundaryIndex(records);
-  const summaries = compactSummariesAfter(records, lastBoundary);
-  const envelopes = records
-    .filter((record) => record.type === "user")
-    .map((record) => parseHandoffEnvelope(textFromRecord(record)))
-    .filter(
-      (parsed) => parsed.ok && parsed.version === "2" && parsed.envelope.snapshot.forkSessionId === forkSessionId
-    );
-  if (lastBoundary < 0 || summaries.length !== 1 || envelopes.length !== 1) return undefined;
-  const envelope = envelopes[0];
-  if (!envelope.ok || envelope.version !== "2") return undefined;
-  return { summary: textFromRecord(summaries[0]), utterances: envelope.envelope.userUtterances };
+  let pendingSummary: string | undefined;
+  let summary: string | undefined;
+  let envelope: HandoffEnvelopeV2 | undefined;
+  for (const record of records) {
+    if (record.type === "user" && record.isCompactSummary === true) {
+      pendingSummary = textFromRecord(record);
+      continue;
+    }
+    if (!isHandoffGenerationBoundary(record, forkSessionId)) continue;
+    const parsed = parseHandoffEnvelope(textFromRecord(record));
+    if (!parsed.ok || parsed.version !== "2") continue;
+    envelope = parsed.envelope;
+    summary = pendingSummary;
+  }
+  if (envelope === undefined) return undefined;
+  return {
+    ...(summary !== undefined ? { summary } : {}),
+    utterances: envelope.userUtterances,
+    ...(envelope.decisions !== undefined ? { decisions: envelope.decisions } : {}),
+  };
+}
+
+// 警報の閾値（R-HND-12）。**超過で新規の転記を止めたり古い行を落としたりしないこと**:
+// 止めると言い換えで増えた古い重複が枠を占有し、最新の決定が落ちる＝この機能の目的と逆になる
+export const DECISIONS_WARN_ENTRIES = 120;
+export const DECISIONS_WARN_BYTES = 24_000;
+
+// 世代をまたぐ重複排除のキー。**近似一致（prefix・編集距離）へ広げないこと**: 別の決定を
+// 同一視する誤結合＝決定の取り違えになる
+function decisionKey(tag: string, body: string): string {
+  return `${tag}\0${body.replace(/\s+/g, " ").trim().replace(/\s*src=(?:user|assistant)$/i, "")}`;
+}
+
+function decisionIdNumber(id: string): number {
+  const m = /^D(\d+)$/.exec(id);
+  return m === null ? 0 : Number(m[1]);
+}
+
+export function mergeHandoffDecisions(
+  previous: HandoffDecisions | undefined,
+  lines: readonly ExtractedDecisionLine[],
+  source: "hook" | "previous_only"
+): HandoffDecisions {
+  const carriedEntries = (previous?.entries ?? []).map((entry) => ({ ...entry }));
+  const seen = [...carriedEntries, ...(previous?.removedLastGen ?? [])];
+  const generation = seen.reduce((max, entry) => Math.max(max, entry.g), 0) + 1;
+  // 採番は単調増加。removedLastGen は 1 世代で落ちるので、見えている id の最大値だけから
+  // 決めると消した id が次々世代で別の決定へ再採番される（利用者が古い id を名指しすると
+  // 別の決定が消える）。封筒が運ぶ nextId を優先し、欄が無い封筒でだけ最大値から復元する
+  let nextId = Math.max(
+    previous?.nextId ?? 0,
+    seen.reduce((max, entry) => Math.max(max, decisionIdNumber(entry.id)), 0) + 1
+  );
+  // entries は carriedEntries そのもの。件数は追加より前に控える
+  const carriedCount = carriedEntries.length;
+  const entries = carriedEntries;
+  const removedLastGen: HandoffDecisionEntry[] = [];
+  let extracted = 0;
+  let unknownIdRefs = 0;
+
+  // 同じ id に [DONE] と [DROPPED] が並んだとき、行の順序で結果が変わらないようにする。
+  // [DONE] を先に処理して勝たせ、その id を消せた [DROPPED] だけを取りこぼしから除く
+  // （存在しない id を名指しした [DROPPED] は消せた結果ではないので従来どおり数える）
+  const ordered = [...lines].sort((a, b) => Number(b.t === "DONE") - Number(a.t === "DONE"));
+  const removedIds = new Set<string>();
+
+  for (const line of ordered) {
+    if (line.t === "DONE") {
+      const at = line.id === undefined ? -1 : entries.findIndex((entry) => entry.id === line.id);
+      // 存在しない ID を名指しした行は無視して数える。新規追加へ倒すと誤った決定が増える
+      if (at < 0) {
+        unknownIdRefs++;
+        continue;
+      }
+      const gone = entries.splice(at, 1)[0];
+      removedIds.add(gone.id);
+      removedLastGen.push(gone);
+      continue;
+    }
+    if (line.t === "DROPPED" && line.id !== undefined) {
+      const target = entries.find((entry) => entry.id === line.id);
+      if (target === undefined) {
+        if (!removedIds.has(line.id)) unknownIdRefs++;
+        continue;
+      }
+      // 消さない（DROPPED の記録が無いと恒久禁止に読まれる）
+      target.t = "DROPPED";
+      target.s = line.s;
+      target.g = generation;
+      continue;
+    }
+    const key = decisionKey(line.t, line.s);
+    if (entries.some((entry) => decisionKey(entry.t, entry.s) === key)) continue;
+    entries.push({ id: `D${nextId++}`, t: line.t, g: generation, s: line.s });
+    extracted++;
+  }
+
+  // 警報の対象は恒久的に積む entries だけ。removedLastGen は 1 世代で落ちる一時の積み荷
+  const bytes = jsonBytes({ preamble: DECISIONS_PREAMBLE, entries });
+  const warn =
+    entries.length >= DECISIONS_WARN_ENTRIES || bytes >= DECISIONS_WARN_BYTES
+      ? { entries: entries.length, bytes }
+      : undefined;
+
+  return {
+    preamble: DECISIONS_PREAMBLE,
+    entries,
+    ...(removedLastGen.length > 0 ? { removedLastGen } : {}),
+    nextId,
+    carried: carriedCount,
+    extracted,
+    removed: removedLastGen.length,
+    unknownIdRefs,
+    source,
+    ...(warn !== undefined ? { warn } : {}),
+  };
+}
+
+// 前世代の転記行。世代の切れ目は最後の v2 封筒（compact 境界ではない）
+function previousDecisionsOf(
+  records: readonly Record<string, unknown>[],
+  log: (line: string) => void
+): HandoffDecisions | undefined {
+  for (let i = records.length - 1; i >= 0; i--) {
+    if (records[i].type !== "user") continue;
+    const parsed = parseHandoffEnvelope(textFromRecord(records[i]));
+    if (!parsed.ok || parsed.version !== "2") continue;
+    // 落ちた decisions は次世代へ引き継がれない＝転記の連鎖がここで切れる。黙らせない
+    if (parsed.decisionsDropped) log("handoff previous decisions dropped: envelope decisions failed validation");
+    return parsed.envelope.decisions;
+  }
+  return undefined;
 }
 
 export const HANDOFF_DETAIL_MAX_BYTES = 200_000;
 
 // `"summary":` と直後のカンマ。summary を載せた part の固定費
 const SUMMARY_KEY_BYTES = 11;
+// `"decisions":` と直後のカンマ
+const DECISIONS_KEY_BYTES = 13;
 
 function jsonBytes(value: unknown): number {
   return Buffer.byteLength(JSON.stringify(value), "utf8");
@@ -333,6 +480,7 @@ function jsonBytes(value: unknown): number {
 export interface HandoffDetailPart {
   summary?: string;
   utterances: HandoffUtterance[];
+  decisions?: HandoffDecisions;
 }
 
 // 展開部の分割（R-HND-02）。逐語は 1 件も切らない: 1 件だけで budget を超えるなら
@@ -340,19 +488,25 @@ export interface HandoffDetailPart {
 // budgetBytes は「メッセージ全体の上限 − 封筒（type/tabId/runId/part/total/utterances:[]）」を
 // 呼び出し側が引いて渡す
 export function buildHandoffDetailParts(
-  summary: string,
+  summary: string | undefined,
   utterances: readonly HandoffUtterance[],
-  budgetBytes: number
+  budgetBytes: number,
+  decisions?: HandoffDecisions
 ): HandoffDetailPart[] {
-  const parts: HandoffDetailPart[] = [{ summary, utterances: [] }];
-  let used = jsonBytes(summary) + SUMMARY_KEY_BYTES;
+  const parts: HandoffDetailPart[] = [
+    { ...(summary !== undefined ? { summary } : {}), utterances: [], ...(decisions !== undefined ? { decisions } : {}) },
+  ];
+  let used =
+    (summary === undefined ? 0 : jsonBytes(summary) + SUMMARY_KEY_BYTES) +
+    (decisions === undefined ? 0 : jsonBytes(decisions) + DECISIONS_KEY_BYTES);
   for (const utterance of utterances) {
     const current = parts[parts.length - 1];
     // 配列要素の実費は JSON 本体 ＋ 直前要素との区切り 1 バイト
     const cost = jsonBytes(utterance) + (current.utterances.length === 0 ? 0 : 1);
     // part を切れないのは「空の part」だけ。summary 付き part 0 の最初の逐語も
     // 予算を超えるなら次の part へ回す（summary との合計で上限を割らないため）
-    const canSplit = current.utterances.length > 0 || current.summary !== undefined;
+    const canSplit =
+      current.utterances.length > 0 || current.summary !== undefined || current.decisions !== undefined;
     if (canSplit && used + cost > budgetBytes) {
       parts.push({ utterances: [utterance] });
       used = jsonBytes(utterance);
@@ -518,6 +672,7 @@ export class HandoffRunner {
           unreadableLineCount = read.unreadableLineCount;
           const utterances = extractVerbatimUserUtterances(read.records);
           utteranceCount = utterances.length;
+          const previousDecisions = previousDecisionsOf(read.records, this.deps.log);
 
           if (this.terminal !== undefined) return this.failureOutcome(input.runId, forkSessionId);
           this.transition("compacting");
@@ -567,9 +722,19 @@ export class HandoffRunner {
             if (this.commitTerminal(reason)) abortRun();
           };
 
-          const appendEnvelope = (): void => {
+          // acceptedBody を渡せるのは hook 経路だけ。stream の完了信号で進む経路で封筒 push の前に
+          // F の読取（await）を挟むと query の終了と競合し、失敗すれば課金済み compact の喪失になる。
+          // その経路は前世代の転記だけを積む（source: "previous_only"）
+          const appendEnvelope = (acceptedBody?: string): void => {
             if (envelopeCount > 0) return;
             this.transition("appending");
+            const decisions = mergeHandoffDecisions(
+              previousDecisions,
+              acceptedBody === undefined ? [] : extractDecisionLines(acceptedBody),
+              acceptedBody === undefined ? "previous_only" : "hook"
+            );
+            const carryDecisions =
+              decisions.entries.length > 0 || (decisions.removedLastGen?.length ?? 0) > 0 ? decisions : undefined;
             const envelope: HandoffEnvelopeV2 = {
               schema: "hb2",
               preamble: ENVELOPE_PREAMBLE,
@@ -580,6 +745,7 @@ export class HandoffRunner {
                 ...(compact !== undefined ? { compact } : {}),
               },
               userUtterances: utterances,
+              ...(carryDecisions !== undefined ? { decisions: carryDecisions } : {}),
             };
             try {
               queue.push({
@@ -629,7 +795,7 @@ export class HandoffRunner {
               return {};
             }
             acceptedByHook = true;
-            appendEnvelope();
+            appendEnvelope(accepted.body);
             return {};
           };
 

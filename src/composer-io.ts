@@ -1,3 +1,4 @@
+import { decideOpenMode, DEFAULT_SYSTEM_APP_EXTENSIONS, systemAppExtensions } from "./file-link-open-mode";
 import * as vscode from "vscode";
 import * as l10n from "@vscode/l10n";
 import { createHash } from "node:crypto";
@@ -24,31 +25,38 @@ import {
   IMAGE_MAX_BASE64_LEN,
   PICKED_FILE_MAX_COUNT,
   type ImageAttachment,
+  type NormalizedEvent,
+  type NormalizedEventBody,
   type WebviewToHost,
 } from "./protocol";
 import { pendingAttachments } from "./pending-attachments";
+import { createHydrationDraft, foldHistoryEvents } from "./resume-hydration";
+import { isInSessionStore, sessionTranscriptRef } from "./session-files";
+import { readSessionHistory } from "./session-transcript";
 import type { SessionStore } from "./store-surfaces";
 
-// 会話ログのMarkdown書き出し（/export相当）。assistantのストリーミングdeltaはターン単位に結合する
-function buildExportMarkdown(s: Session): string {
-  const dateLocale = String(vscode.env.language ?? "").toLowerCase().startsWith("ja") ? "ja-JP" : "en-US";
-  const lines: string[] = [`# ${s.title}`, "", l10n.t("- Exported: {0}", new Date().toLocaleString(dateLocale)), `- cwd: ${s.cwd}`, ""];
+// 会話ログのMarkdown書き出し（/export相当）。assistantのストリーミングdeltaはターン単位に結合する。
+// 1 行ずつ積む入れ物。記録経路と保持分経路で同じ描き方にする（別実装にすると片方だけ形式が変わる）
+function createExportSink(lines: string[]): {
+  push: (ev: NormalizedEventBody) => void;
+  flush: () => void;
+} {
   let assistantBuf = "";
   const flush = () => {
-    if (assistantBuf.trim()) {
-      lines.push("## Assistant", "", assistantBuf.trim(), "");
-    }
+    if (assistantBuf.trim()) lines.push("## Assistant", "", assistantBuf.trim(), "");
     assistantBuf = "";
   };
-  for (const ev of s.events) {
+  const push = (ev: NormalizedEventBody): void => {
     switch (ev.kind) {
       case "user_message":
         flush();
         lines.push("## User", "", ev.text, "");
         break;
+      // 復元の印は Host の持ち方の都合であって会話の性質ではない。見出しを分けると
+      // 同じ会話が 2 種類の見出しで並ぶ（R-CNV-19）
       case "replayed_message":
         flush();
-        lines.push(`## ${l10n.t("{0} (restored)", ev.role === "user" ? "User" : "Assistant")}`, "", ev.text, "");
+        lines.push(ev.role === "user" ? "## User" : "## Assistant", "", ev.text, "");
         break;
       case "assistant_text_delta":
         assistantBuf += ev.text;
@@ -72,9 +80,159 @@ function buildExportMarkdown(s: Session): string {
       default:
         break;
     }
+  };
+  return { push, flush };
+}
+
+// 記録を読めなかったときだけ通る。保持分は復元タブで「history 由来の会話イベント」と
+// 「replayed_message」の両方を持つ（前者は画面に描かれない）ので、重なる区間を落として二重を防ぐ。
+// **逆向き（replayed_message を落とす）にしない**: 切り詰めで history 由来が消えたタブでは会話が消える。
+// handoff のときは世代境界の印が保持分に無いため、当世代の先頭として観測できる replayed_message の
+// 時刻を境にする。観測できなければ history 由来を全部落とす（前世代を混ぜない側へ倒す）
+function heldEventsForExport(events: readonly NormalizedEvent[], handoff: boolean): NormalizedEvent[] {
+  let replayedFrom: number | undefined;
+  for (const ev of events) {
+    if (ev.kind !== "replayed_message") continue;
+    const at = ev.recordedAt ?? ev.timestamp;
+    if (replayedFrom === undefined || at < replayedFrom) replayedFrom = at;
   }
-  flush();
+  const isHistoryConversation = (ev: NormalizedEvent): boolean =>
+    ev.provenance?.path === "history" &&
+    (ev.kind === "user_message" || ev.kind === "assistant_text_delta" || ev.kind === "tool_call_started");
+  if (replayedFrom === undefined) {
+    return handoff ? events.filter((ev) => !isHistoryConversation(ev)) : [...events];
+  }
+  const covered = replayedFrom;
+  return events.filter((ev) => {
+    if (!isHistoryConversation(ev)) return true;
+    // 当世代の範囲は replayed_message が持つ。その前は前世代、その後は復元と重なる
+    if (handoff && ev.timestamp < covered) return false;
+    return !(ev.timestamp >= covered && ev.kind !== "tool_call_started");
+  });
+}
+
+// 記録（JSONL）から当世代を書き出す。読めなければ保持分へ縮退する（R-CNV-19）。
+// 保持分は EVENT_LOG_MAX で先頭が落ちているので、縮退したことを書き出しの冒頭に明記する
+// （黙って直近だけを完全なログとして渡さない。R-DSP-01 / R-DSP-03）
+async function buildExportMarkdown(s: Session): Promise<string> {
+  const dateLocale = String(vscode.env.language ?? "").toLowerCase().startsWith("ja") ? "ja-JP" : "en-US";
+  const lines: string[] = [`# ${s.title}`, "", l10n.t("- Exported: {0}", new Date().toLocaleString(dateLocale)), `- cwd: ${s.cwd}`];
+  if (s.handoffSource !== undefined) {
+    // 名前が空のセッションがある（?? では空文字が採用されて行が空欄になる）
+    const source = s.handoffSource.title !== undefined && s.handoffSource.title.length > 0
+      ? s.handoffSource.title
+      : s.handoffSource.sessionId;
+    lines.push(l10n.t("- Continued from: {0}", source));
+  }
+  const ref = sessionTranscriptRef(s);
+  let degraded: string | undefined;
+  let history: Awaited<ReturnType<typeof readSessionHistory>> | undefined;
+  if (ref === null) {
+    degraded = "session-file-not-resolved";
+  } else {
+    try {
+      // subagents/ だけが読めなかった場合は親の会話が揃っているので縮退しない
+      history = await readSessionHistory(ref.file, isInSessionStore, { generationSessionId: ref.sessionId });
+      if (history.readError !== undefined) degraded = history.readError;
+      else if (history.events.length === 0) degraded = "empty-record";
+    } catch (error) {
+      degraded = String(error);
+    }
+  }
+  if (degraded !== undefined || history === undefined) {
+    output.appendLine(`[${s.title}] export: falling back to held events (${degraded ?? "empty-record"})`);
+    lines.push(l10n.t("- Note: the record could not be read, so only the part held in memory was exported."), "");
+    const sink = createExportSink(lines);
+    for (const ev of heldEventsForExport(s.events, s.handoffSource !== undefined)) sink.push(ev);
+    sink.flush();
+    return lines.join("\n");
+  }
+  lines.push("");
+  const sink = createExportSink(lines);
+  // 当世代の境界。引き継いでいないセッションでは undefined（全件が当世代）
+  const from = history.generationStartAt;
+  // 記録の末尾時刻。ここより後の live イベントは CLI がまだ書いていない
+  let recordEnd = 0;
+  // 記録の最後のターンの内容。応答中のターンは、ここまでが記録にあり続きだけが live にある
+  const tail = {
+    turnId: undefined as string | undefined,
+    text: "",
+    userTexts: new Set<string>(),
+    toolUseIds: new Set<string>(),
+  };
+  // 記録が持つ通知文。live 側の同じ通知（turnId を持たない）を二重にしないための突合
+  const recordNotices = new Set<string>();
+  const draft = createHydrationDraft(s);
+  await foldHistoryEvents(
+    draft,
+    history,
+    (step) => {
+      const ev = step.normalizedEvent;
+      if (ev === null) return "continue";
+      if (from !== undefined && ev.timestamp < from) return "continue";
+      if (ev.timestamp > recordEnd) recordEnd = ev.timestamp;
+      if (ev.kind === "error") recordNotices.add(ev.message);
+      if (ev.kind === "turn_started") {
+        tail.turnId = ev.turnId;
+        tail.text = "";
+        tail.userTexts.clear();
+        tail.toolUseIds.clear();
+      } else if ((ev as { turnId?: unknown }).turnId === tail.turnId) {
+        if (ev.kind === "assistant_text_delta") tail.text += ev.text;
+        else if (ev.kind === "user_message") tail.userTexts.add(ev.text);
+        else if (ev.kind === "tool_call_started") tail.toolUseIds.add(ev.toolUseId);
+      }
+      sink.push(ev);
+      return "continue";
+    },
+    () => false
+  );
+  // 記録に無い末尾を保持分から足す。**turnId で突合してはならない**: 記録の turnId は
+  // `session-transcript.ts` の合成値、live は `claude-normalizer.ts` の randomUUID で、
+  // 決して一致しない（全ターンが「記録に無い」となり丸ごと二重になる）。
+  // 応答中のターンを時刻で分けてもいけない: delta は直前イベントの時刻を継ぐ
+  const openTurnId = openLiveTurnId(s.events);
+  let openTurnText = "";
+  for (const ev of s.events) {
+    if (ev.provenance?.path !== "live") continue;
+    const turnId = (ev as { turnId?: unknown }).turnId;
+    // turnId を持たない通知（error）はターンで分けられない。記録が同じ文を持つときだけ落とす
+    if (typeof turnId !== "string") {
+      if (ev.kind === "error" && recordNotices.has(ev.message)) continue;
+      sink.push(ev);
+      continue;
+    }
+    if (openTurnId === undefined || turnId !== openTurnId) {
+      if (ev.timestamp <= recordEnd) continue;
+      sink.push(ev);
+      continue;
+    }
+    if (ev.kind === "assistant_text_delta") {
+      openTurnText += ev.text;
+      if (tail.text.startsWith(openTurnText)) continue;
+      sink.push(ev);
+      continue;
+    }
+    if (ev.kind === "user_message" && tail.userTexts.has(ev.text)) continue;
+    if (ev.kind === "tool_call_started" && tail.toolUseIds.has(ev.toolUseId)) continue;
+    sink.push(ev);
+  }
+  sink.flush();
   return lines.join("\n");
+}
+
+// 終端していない末尾ターン。応答中のターンは記録に無いので、時刻ではなくこの印で足す
+// （live の delta は直前イベントの時刻を継ぐため、時刻だけだと同時刻の本文が落ちる）
+function openLiveTurnId(events: readonly NormalizedEvent[]): string | undefined {
+  let open: string | undefined;
+  for (const ev of events) {
+    if (ev.provenance?.path !== "live") continue;
+    if (ev.kind === "turn_started") open = ev.turnId;
+    else if (ev.kind === "turn_completed" || ev.kind === "turn_interrupted" || ev.kind === "turn_failed") {
+      if (ev.turnId === open) open = undefined;
+    }
+  }
+  return open;
 }
 
 let fileCache: { at: number; paths: string[] } | null = null;
@@ -323,7 +481,7 @@ export async function openConversationFile(session: Session, rawTarget: string, 
           confirm: config.get<boolean>("fileLinks.confirmOutsideWorkspace", true) !== false,
           readOnly: config.get<boolean>("fileLinks.openOutsideReadOnly", true) !== false,
         }
-      : null, fromEditorPanel);
+      : null, fromEditorPanel, !outsideRoots);
     return;
   }
   if (hasSymlinkBelowRoot(preflightRoot, candidate) !== false) {
@@ -343,14 +501,16 @@ export async function openConversationFile(session: Session, rawTarget: string, 
     );
     return;
   }
-  await openResolvedFile(realCandidate, parsed, null, fromEditorPanel);
+  await openResolvedFile(realCandidate, parsed, null, fromEditorPanel,
+    roots.some((root) => pathIsInside(root.real, realCandidate)));
 }
 
 async function openResolvedFile(
   realCandidate: string,
   parsed: FileLinkTarget,
   outside: { confirm: boolean; readOnly: boolean } | null,
-  fromEditorPanel: boolean
+  fromEditorPanel: boolean,
+  inside: boolean
 ): Promise<void> {
   if (isWindowsReservedOrStreamPath(realCandidate)) {
     void vscode.window.showWarningMessage(l10n.t("LAISORA: This file link cannot be opened."));
@@ -368,8 +528,25 @@ async function openResolvedFile(
     }
     return;
   }
-  if (!info.isFile()) {
+  const extensions = systemAppExtensions(
+    vscode.workspace.getConfiguration("laisora").get("fileLinks.openWithSystemApp", DEFAULT_SYSTEM_APP_EXTENSIONS),
+    () => output.appendLine(l10n.t("R-CNV-20: Invalid or blocked extensions in the default app setting were ignored."))
+  );
+  const mode = decideOpenMode(realCandidate, { isDirectory: info.isDirectory(), inside, systemAppExtensions: extensions });
+  if (mode === "refuse" || (!info.isFile() && !info.isDirectory())) {
     void vscode.window.showWarningMessage(l10n.t("LAISORA: The file was not found."));
+    return;
+  }
+
+  if (mode === "reveal-folder" || mode === "system-app") {
+    try {
+      const uri = vscode.Uri.file(realCandidate);
+      if (mode === "reveal-folder") await vscode.commands.executeCommand("revealFileInOS", uri);
+      else if (!await vscode.env.openExternal(uri)) throw new Error("openExternal returned false");
+    } catch (error) {
+      output.appendLine(`[file-link] R-CNV-20: ${String(error)}`);
+      void vscode.window.showWarningMessage(l10n.t("LAISORA: This file link cannot be opened."));
+    }
     return;
   }
 
@@ -459,7 +636,7 @@ export async function handleComposerMessage(
       break;
     }
     case "exportTab": {
-      const md = buildExportMarkdown(target!);
+      const md = await buildExportMarkdown(target!);
       const uri = await vscode.window.showSaveDialog({
         defaultUri: vscode.Uri.file(
           join(target!.cwd || homedir(), `laisora-${target!.title.replace(/[\\/:*?"<>|]/g, "_")}.md`)

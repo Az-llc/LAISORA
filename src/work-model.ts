@@ -1,5 +1,8 @@
 import type { NormalizedEvent } from "./protocol.js";
 import * as l10n from "@vscode/l10n";
+import { isRequestMessageText } from "./time-buckets";
+import { parseMarkdown } from "./webview/markdown-ast";
+import { findCommitBoundary, recordSeparator } from "./webview/commit-boundary";
 
 export const MAX_PHASES = 256;
 
@@ -123,6 +126,7 @@ export interface WorkTask {
 
 export interface WorkAgent {
   agentId: string;
+  transcriptAgentId?: string;
   parentAgentId: string | null;
   toolUseId: string;
   parentToolUseId: string | null;
@@ -250,6 +254,10 @@ export interface ToolPlacementIndex {
 }
 
 export interface WorkModelState {
+  planDeclaration?: { goal: string; at: number };
+  planText?: { turnId: string; text: string; declaredThrough: number; recordEnded?: true };
+  planHistory?: PlanHistoryEntry[];
+  planHistoryTruncated?: boolean;
   revision: number;
   phases: WorkPhase[];
   rollup?: WorkRollup;
@@ -283,6 +291,9 @@ export interface WorkModelState {
 }
 
 export type WorkModel = WorkModelState;
+export type PlanHistoryEntry = { at: number; kind: "user" } | {
+  at: number; kind: "todos"; source?: "tasks"; created?: boolean; removed?: boolean; items: Extract<TaskIntent, { kind: "todo" }>["items"];
+};
 export type WorkSignal = Readonly<NormalizedEvent>;
 
 type ToolStartedSignal = Extract<NormalizedEvent, { kind: "tool_call_started" }>;
@@ -1704,6 +1715,11 @@ function handleToolFinish(d: Draft, e: ToolFinishedSignal): void {
   const backgroundTaskId =
     !e.isError && placement.taskIntent === undefined ? (e.asyncLaunchedAgentId ?? e.backgroundTaskId) : undefined;
   if (backgroundTaskId !== undefined) {
+    if (e.asyncLaunchedAgentId && placement.phaseRef?.kind === "phase") {
+      const phase = draftPhase(d, placement.phaseRef.phaseId);
+      const agent = phase && draftAgent(d, phase, placement.agentId);
+      if (agent) agent.transcriptAgentId = e.asyncLaunchedAgentId;
+    }
     // 起動 ACK は完了ではない（裁定A2）。閉じずに索引へ登録し、通知を待つ
     markBackgroundStarted(d, e.toolUseId, backgroundTaskId);
     return;
@@ -1716,7 +1732,22 @@ function handleToolFinish(d: Draft, e: ToolFinishedSignal): void {
   }
   deletePlacement(d, e.toolUseId);
   if (placement.taskIntent !== undefined) {
-    if (!e.isError) applyTaskIntent(d, placement.taskIntent, e);
+    if (!e.isError && placement.parentToolUseId === null && placement.taskIntent.kind === "todo")
+      recordPlanHistory(d, { kind: "todos", at: e.timestamp, items: placement.taskIntent.items });
+    if (!e.isError) {
+      const intent = placement.taskIntent;
+      const taskKey = intent.kind === "create" ? taskCreateKeyFromResult(intent.toolUseId, e.resultPreview)
+        : intent.kind === "update" ? intent.taskKey : undefined;
+      const previousTask = d.next.tasks.find(task => task.taskKey === taskKey);
+      applyTaskIntent(d, placement.taskIntent, e);
+      if (placement.parentToolUseId === null && placement.taskIntent.kind !== "todo") {
+        const task = d.next.tasks.find(task => task.taskKey === taskKey) ?? previousTask;
+        if (task) recordPlanHistory(d, { kind: "todos", source: "tasks", at: e.timestamp,
+          ...(intent.kind === "create" ? { created: true } : {}),
+          ...(intent.kind === "update" && intent.deleted ? { removed: true } : {}),
+          items: [{ taskKey: task.taskKey, description: task.description, activeForm: task.activeForm, status: task.status }] });
+      }
+    }
     return;
   }
   removeRunningAgent(d, e.toolUseId);
@@ -1843,7 +1874,15 @@ function handleSubagentInfo(d: Draft, e: Extract<NormalizedEvent, { kind: "subag
   if (!phase) return;
   const agent = draftAgent(d, phase, placement.agentId);
   if (!agent) return;
-  agent.modelMeasured = e.model;
+  if (e.model !== undefined) agent.modelMeasured = e.model;
+  if (e.agentId !== undefined) agent.transcriptAgentId = e.agentId;
+}
+
+function recordPlanHistory(d: Draft, entry: PlanHistoryEntry): void {
+  const history = [...(d.next.planHistory ?? []), entry];
+  // R-DSP-03: bound retained declaration events like tasks, and disclose the missing prefix in PLAN.
+  if (history.length > MAX_TASKS) d.next.planHistoryTruncated = true;
+  d.next.planHistory = history.slice(-MAX_TASKS);
 }
 
 function applySignal(d: Draft, signal: WorkSignal): void {
@@ -1863,7 +1902,24 @@ function applySignal(d: Draft, signal: WorkSignal): void {
     case "approval_resolved":
       handleApprovalResolved(d, signal);
       return;
+    case "assistant_message_uuid":
+      if (d.next.planText?.turnId === signal.turnId) d.next.planText = { ...d.next.planText, recordEnded: true };
+      return;
     case "assistant_text_delta": {
+      const previous = d.next.planText?.turnId === signal.turnId ? d.next.planText : undefined;
+      const head = previous === undefined ? "" : previous.text + (previous.recordEnded ? recordSeparator(previous.text) : "");
+      const text = head + signal.text;
+      let declaredThrough = previous?.declaredThrough ?? -1;
+      if (text.includes("laisora-plan")) {
+        for (const node of parseMarkdown(text)) {
+          if (node.type !== "plan" || node.offset <= declaredThrough) continue;
+          d.next.planDeclaration = { goal: node.goal, at: signal.timestamp };
+          declaredThrough = node.offset;
+        }
+      }
+      const boundary = findCommitBoundary(text, 0);
+      d.next.planText = { turnId: signal.turnId, text: boundary < 0 ? text : text.slice(boundary),
+        declaredThrough: boundary < 0 ? declaredThrough : declaredThrough - boundary };
       // ツールを1件も使わないターンでも概要を空にしない
       const phase = destination(d, "unknown", signal.timestamp);
       place(d, phase, signal.timestamp, signal.turnId);
@@ -1896,6 +1952,7 @@ function applySignal(d: Draft, signal: WorkSignal): void {
       notePendingStale(d, signal.tasks);
       return;
     case "user_message":
+      if (isRequestMessageText(signal.text)) recordPlanHistory(d, { kind: "user", at: signal.timestamp });
       closeSegment(d, signal.timestamp);
       return;
     default:

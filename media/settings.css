@@ -1,3 +1,11 @@
+:root {
+  --settings-gap-1: 4px;
+  --settings-gap-2: 8px;
+  --settings-gap-3: 12px;
+  --settings-gap-4: 16px;
+  --settings-gap-6: 24px;
+}
+
 html, body {
   margin: 0;
   padding: 0;
@@ -9,9 +17,9 @@ html, body {
 
 #settings-root {
   box-sizing: border-box;
-  max-width: 760px;
+  max-width: calc(184px + 760px + 3 * var(--settings-gap-6));
   margin: 0 auto;
-  padding: 32px 24px 48px;
+  padding: var(--settings-gap-6);
 }
 
 .settings-title {
@@ -144,12 +152,14 @@ html, body {
   cursor: pointer;
 }
 
-.settings-segment:not(:disabled):not([aria-checked="true"]):hover {
+.settings-segment:not(:disabled):not([aria-checked="true"]):not([aria-pressed="true"]):not([aria-current="page"]):hover {
   background: var(--vscode-toolbar-hoverBackground, rgba(128, 128, 128, 0.2));
 }
 
 /* ハイコントラストでは button-background が未定義・透明になりうる。選択の区別を枠（contrastActiveBorder）と太字でも持つ */
-.settings-segment[aria-checked="true"] {
+.settings-segment[aria-checked="true"],
+.settings-segment[aria-pressed="true"],
+.settings-nav-button[aria-current="page"] {
   font-weight: 600;
   color: var(--vscode-button-foreground);
   background: var(--vscode-button-background);
@@ -176,7 +186,7 @@ html, body {
   height: 14px;
   border-radius: 50%;
   background: var(--vscode-descriptionForeground);
-  transition: left 120ms ease;
+
 }
 
 .settings-switch[aria-checked="true"] {
@@ -220,24 +230,132 @@ html, body {
   outline-offset: 2px;
 }
 
-@media (max-width: 600px) {
-  .settings-row {
-    flex-direction: column;
-    align-items: stretch;
-    gap: 10px;
-  }
+.settings-input {
+  box-sizing: border-box;
+  max-width: 100%;
+  padding: 4px 8px;
+  font: inherit;
+  color: var(--vscode-input-foreground, var(--vscode-foreground));
+  background: var(--vscode-input-background);
+  border: 1px solid var(--vscode-dropdown-border);
+  border-radius: 4px;
+}
+.settings-input:disabled {
+  opacity: 0.5;
+}
+.settings-input:focus-visible {
+  outline: 1px solid var(--vscode-focusBorder);
+  outline-offset: 2px;
+}
+.settings-policy {
+  width: 100%;
+  resize: vertical;
+}
 
-  .settings-row-control,
-  .settings-select,
-  .settings-segmented {
-    width: 100%;
-  }
-
-  .settings-select {
-    min-width: 0;
-  }
-
-  .settings-segment {
-    flex: 1 1 0;
+[hidden] { display: none !important; }
+.settings-shell {
+  display: grid;
+  grid-template-columns: 184px minmax(0, 760px);
+  gap: var(--settings-gap-6);
+}
+.settings-content, .settings-category, .settings-card { min-width: 0; }
+.settings-nav { display: flex; flex-direction: column; gap: var(--settings-gap-1); align-self: start; }
+.settings-nav-button { text-align: left; white-space: normal; padding: var(--settings-gap-2) var(--settings-gap-3); }
+.settings-row { gap: var(--settings-gap-4); padding: var(--settings-gap-3) var(--settings-gap-4); }
+.settings-row-control { min-width: 0; max-width: 100%; }
+.settings-roster-note { margin: 0 0 var(--settings-gap-4); color: var(--vscode-descriptionForeground); }
+.settings-roster-rows { display: flex; flex-direction: column; gap: var(--settings-gap-4); margin-top: var(--settings-gap-4); }
+.settings-role-card, .settings-policy-card { padding: var(--settings-gap-4); }
+.settings-role-card { container-type: inline-size; container-name: roster-role; }
+.settings-role-header { display: flex; align-items: baseline; gap: var(--settings-gap-3); margin-bottom: var(--settings-gap-3); }
+.settings-role-header .settings-switch { flex: 0 0 auto; }
+.settings-role-name { flex: 1; min-width: 0; overflow-wrap: anywhere; }
+.settings-mono { font-family: var(--vscode-editor-font-family); }
+.settings-role-description { width: 100%; }
+.settings-matrix-wrapper { overflow-x: auto; max-width: 100%; margin-top: var(--settings-gap-4); }
+.settings-matrix-wrapper:focus-visible { outline: 1px solid var(--vscode-focusBorder); outline-offset: -1px; }
+.settings-matrix {
+  display: grid;
+  grid-template-columns: minmax(220px, 260px) repeat(6, 60px) 28px;
+  gap: var(--settings-gap-2);
+  align-items: center;
+  min-width: 560px;
+}
+.settings-no-effort { grid-column: 2 / 8; }
+.settings-add-row { grid-column: 1 / -1; justify-self: start; }
+.settings-matrix-caption { grid-column: 1 / -1; }
+.settings-muted { color: var(--vscode-descriptionForeground); font-size: 12px; overflow-wrap: anywhere; }
+.settings-chip { width: 100%; padding: var(--settings-gap-1); font-size: 12px; }
+.settings-model-field { min-width: 0; display: flex; flex-direction: column; align-items: stretch; gap: 4px; }
+.settings-remove-model { font-size: 18px; }
+.settings-link:disabled { opacity: 0.5; cursor: default; }
+.settings-model-field input, .settings-model-field select { box-sizing: border-box; width: 100%; min-width: 0; max-width: 100%; }
+.settings-chip.settings-unsupported { color: var(--vscode-descriptionForeground); background: var(--vscode-dropdown-background); opacity: 0.5; }
+.settings-role-warning { margin: var(--settings-gap-3) 0 0; }
+.settings-instruction-details { margin-top: var(--settings-gap-4); }
+.settings-instruction-preview { white-space: pre-wrap; overflow-wrap: anywhere; max-height: 320px; overflow-y: auto; }
+.settings-instruction-preview:focus-visible { outline: 1px solid var(--vscode-focusBorder); }
+.settings-disabled { opacity: 0.5; }
+.settings-disabled :disabled { opacity: 1; }
+.settings-roster-actions { display: flex; flex-wrap: wrap; align-items: baseline; gap: var(--settings-gap-2); margin: var(--settings-gap-4) 0; }
+.settings-role-field { flex: 1; min-width: 140px; max-width: 100%; }
+.settings-role-field .settings-input { width: 100%; }
+#setting-role-error { margin: var(--settings-gap-1) 0 0; }
+#setting-restore-roster { margin-left: auto; }
+.settings-policy-card { display: flex; flex-direction: column; gap: var(--settings-gap-2); }
+.settings-policy-card p { margin: 0; }
+.settings-policy-warning { color: var(--vscode-editorWarning-foreground, #cca700); }
+.settings-policy { display: block; min-height: 160px; width: 100%; resize: vertical; }
+.settings-environment { margin-top: var(--settings-gap-6); }
+.settings-detection-header { display: flex; align-items: baseline; justify-content: space-between; gap: var(--settings-gap-4); }
+.settings-detection-header .settings-section-title { margin: 0; }
+.settings-environment-help { margin: var(--settings-gap-2) 0 var(--settings-gap-3); }
+.settings-environment .settings-row-description { overflow-wrap: anywhere; }
+.settings-detection-badge {
+  display: inline-block;
+  color: var(--vscode-foreground);
+  border: 1px solid var(--vscode-contrastBorder, var(--vscode-widget-border, var(--vscode-panel-border, rgba(128, 128, 128, 0.35))));
+  border-radius: 4px;
+  padding: 2px 8px;
+  white-space: nowrap;
+}
+.settings-timeout-control { display: flex; align-items: center; gap: var(--settings-gap-2); }
+#setting-external-timeout { width: 72px; }
+.settings-visually-hidden { position: absolute; width: 1px; height: 1px; padding: 0; overflow: hidden; clip-path: inset(50%); white-space: nowrap; }
+@media (max-width: 900px) {
+  .settings-shell { grid-template-columns: minmax(0, 1fr); gap: var(--settings-gap-4); }
+  .settings-nav { flex-direction: row; flex-wrap: wrap; }
+  #settings-root { padding: var(--settings-gap-4); }
+}
+@container roster-role (max-width: 719px) {
+  .settings-matrix { grid-template-columns: minmax(180px, 1fr) repeat(6, 48px) 28px; }
+}
+@supports not (container-type: inline-size) {
+  @media (max-width: 900px) {
+    .settings-matrix { grid-template-columns: minmax(180px, 1fr) repeat(6, 48px) 28px; }
   }
 }
+@media (max-width: 480px) {
+  .settings-row:has(.settings-select), .settings-row:has(.settings-segmented) { flex-wrap: wrap; }
+  .settings-select { min-width: 0; }
+}
+
+.settings-chip,
+#setting-add-role,
+#setting-restore-roster,
+#setting-recheck-external {
+  border-color: var(--vscode-contrastBorder, var(--vscode-dropdown-border, var(--vscode-widget-border, rgba(128, 128, 128, 0.35))));
+  background: var(--vscode-dropdown-background, var(--vscode-input-background));
+}
+.settings-chip[aria-pressed="true"] { background: var(--vscode-button-background); }
+.settings-role-name { font-size: 14px; font-weight: 600; }
+.settings-roster-actions { align-items: flex-end; }
+.settings-matrix-wrapper { position: relative; }
+.settings-environment { margin-top: var(--settings-gap-6); padding-top: var(--settings-gap-4); border-top: 1px solid var(--vscode-widget-border, rgba(128, 128, 128, 0.35)); }
+.settings-environment-help { margin: var(--settings-gap-1) 0 var(--settings-gap-3); }
+
+.settings-extension-chips { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 8px; }
+.settings-extension-chip { display: inline-flex; align-items: center; gap: 4px; padding-left: 8px; border: 1px solid var(--vscode-widget-border); border-radius: 12px; }
+.settings-extension-control { max-width: 100%; }
+.settings-row:has(.settings-extension-control) { flex-direction: column; align-items: stretch; gap: var(--settings-gap-3); }
+.settings-row:has(.settings-extension-control) > .settings-row-control { flex: 1 1 auto; width: 100%; }

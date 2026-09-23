@@ -6,14 +6,14 @@ LAISORA is distributed under the MIT License (see `LICENSE`). The VSIX bundles t
 
 | Package | Version | License | Bundled into | Source |
 | --- | --- | --- | --- | --- |
-| @anthropic-ai/claude-agent-sdk | 0.3.272 | SEE LICENSE IN README.md | dist/extension.js | https://github.com/anthropics/claude-agent-sdk-typescript |
+| @anthropic-ai/claude-agent-sdk | 0.3.280 | SEE LICENSE IN README.md | dist/extension.js | https://github.com/anthropics/claude-agent-sdk-typescript |
 | @vscode/l10n | 0.0.18 | MIT | dist/extension.js, dist/settings.js, dist/webview.js | https://github.com/Microsoft/vscode-l10n |
-| entities | 8.0.0 | BSD-2-Clause | dist/webview.js | https://github.com/fb55/entities |
-| linkify-it | 6.1.0 | MIT | dist/webview.js | https://github.com/markdown-it/linkify-it |
-| markdown-it | 15.0.0 | MIT | dist/webview.js | https://github.com/markdown-it/markdown-it |
-| mdurl | 2.1.0 | MIT | dist/webview.js | https://github.com/markdown-it/mdurl |
-| punycode.js | 2.3.1 | MIT | dist/webview.js | https://github.com/mathiasbynens/punycode.js |
-| uc.micro | 3.0.0 | MIT | dist/webview.js | https://github.com/markdown-it/uc.micro |
+| entities | 8.0.0 | BSD-2-Clause | dist/extension.js, dist/settings.js, dist/webview.js | https://github.com/fb55/entities |
+| linkify-it | 6.1.0 | MIT | dist/extension.js, dist/settings.js, dist/webview.js | https://github.com/markdown-it/linkify-it |
+| markdown-it | 15.0.0 | MIT | dist/extension.js, dist/settings.js, dist/webview.js | https://github.com/markdown-it/markdown-it |
+| mdurl | 2.1.0 | MIT | dist/extension.js, dist/settings.js, dist/webview.js | https://github.com/markdown-it/mdurl |
+| punycode.js | 2.3.1 | MIT | dist/extension.js, dist/settings.js, dist/webview.js | https://github.com/mathiasbynens/punycode.js |
+| uc.micro | 3.0.0 | MIT | dist/extension.js, dist/settings.js, dist/webview.js | https://github.com/markdown-it/uc.micro |
 | zod | 4.4.3 | MIT | dist/extension.js | https://github.com/colinhacks/zod |
 
 ## Declared dependencies of the packages above that are not in the VSIX
@@ -34,7 +34,7 @@ Listed for completeness; their code is not bundled and they are not installed by
 
 ## License texts
 
-### @anthropic-ai/claude-agent-sdk@0.3.272
+### @anthropic-ai/claude-agent-sdk@0.3.280
 
 - License: SEE LICENSE IN README.md
 - Homepage: https://github.com/anthropics/claude-agent-sdk-typescript
@@ -59,7 +59,7 @@ License text not shipped in package; SPDX: MIT.
 
 - License: BSD-2-Clause
 - Repository: https://github.com/fb55/entities
-- Bundled into: dist/webview.js
+- Bundled into: dist/extension.js, dist/settings.js, dist/webview.js
 
 #### LICENSE
 
@@ -81,7 +81,7 @@ EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 - License: MIT
 - Repository: https://github.com/markdown-it/linkify-it
-- Bundled into: dist/webview.js
+- Bundled into: dist/extension.js, dist/settings.js, dist/webview.js
 
 #### LICENSE
 
@@ -114,7 +114,7 @@ OTHER DEALINGS IN THE SOFTWARE.
 
 - License: MIT
 - Repository: https://github.com/markdown-it/markdown-it
-- Bundled into: dist/webview.js
+- Bundled into: dist/extension.js, dist/settings.js, dist/webview.js
 
 #### LICENSE
 
@@ -147,7 +147,7 @@ OTHER DEALINGS IN THE SOFTWARE.
 
 - License: MIT
 - Repository: https://github.com/markdown-it/mdurl
-- Bundled into: dist/webview.js
+- Bundled into: dist/extension.js, dist/settings.js, dist/webview.js
 
 #### LICENSE
 
@@ -204,7 +204,7 @@ IN THE SOFTWARE.
 - License: MIT
 - Homepage: https://mths.be/punycode
 - Repository: https://github.com/mathiasbynens/punycode.js
-- Bundled into: dist/webview.js
+- Bundled into: dist/extension.js, dist/settings.js, dist/webview.js
 
 #### LICENSE-MIT.txt
 
@@ -235,7 +235,7 @@ WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
 - License: MIT
 - Repository: https://github.com/markdown-it/uc.micro
-- Bundled into: dist/webview.js
+- Bundled into: dist/extension.js, dist/settings.js, dist/webview.js
 
 #### LICENSE.txt
 

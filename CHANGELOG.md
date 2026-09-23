@@ -1,5 +1,35 @@
 # Changelog
 
+## 1.1.0
+
+- **Five views in one vertical navigation.** CHAT, SUMMARY, GRAPH, ANALYSIS and LOG sit on a
+  narrow rail beside the conversation. The composer stays available in every view.
+- **PLAN beside the conversation.** When the agent works in steps, the plan appears in a column
+  next to the chat: the goal it declared, each step with its status, who is working on it,
+  elapsed time and tokens. It stays for the whole goal, not just the latest message, and
+  completed steps fold away. In a narrow window a one-line bar under the title opens it as a
+  drawer.
+- **YOU: what is waiting on you.** Approvals, decisions and checks on your machine are collected
+  in one list next to PLAN, each linking back to where it was asked. Decisions the agent asks in
+  the reply are shown as a card with the options, their pros and cons, the recommendation and
+  what happens if you do not answer.
+- **SUMMARY rebuilt.** PLAN and YOU side by side, earlier requests with their step count, time
+  and tokens, and the agents that were observed.
+- **Agent roster.** A settings page for the roles the main agent can delegate to (worker,
+  explorer, reviewer), with model and effort per row, and optional external executors (Codex,
+  Antigravity) when their CLIs are installed. Changes apply from the next session.
+- **Learning ledger (off by default).** When enabled, the main agent can record what it learned —
+  model-specific or general — and the active rules are passed to the next sessions. Records stay
+  on your machine; text with absolute paths or credentials is refused.
+- **Replies.** Every reply ends with a copy button and its time; your own messages can be copied
+  too. Replies no longer jump while they stream, and a reply that was not drawn is recovered.
+- **File links.** Office documents, PDFs and other files you choose open in their default app,
+  and folder links open in the file manager.
+- **Handoff.** A handed-off conversation starts from its summary card and carries the recorded
+  decisions forward.
+- **Effort.** The model chip shows the effort the CLI actually applies.
+- A new, quieter loading indicator.
+
 ## 1.0.0
 
 First public release.

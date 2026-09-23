@@ -1,11 +1,13 @@
+import { join } from "node:path";
+import * as vscode from "vscode";
 import { getLaisoraConfiguration } from "./claude-settings";
+import { cachedExternalModels } from "./gateway-host-actions";
 
 import {
   PERMISSION_MODE_KEY,
   canonicalEffortModel,
-  configuredEffortFromSnapshot,
   configuredClaudeExecutablePath,
-  defaultEffortFromSnapshot,
+  effortDisplayFromSnapshot,
   invalidateClaudeCodeSettingsCache,
   resolveSessionCwd,
   resolveConfiguredEffortSnapshot,
@@ -15,6 +17,7 @@ import {
 } from "./claude-settings";
 import { createBackgroundActivityState } from "./background-activity";
 import { ClaudeConversation } from "./claudeHost";
+import { OrchestrationViewPublisher, orchestrationViewForConversation } from "./orchestration-view";
 import { postAttachments } from "./composer-io";
 import { pendingAttachments } from "./pending-attachments";
 import * as l10n from "@vscode/l10n";
@@ -29,38 +32,53 @@ import { normalizeApiKeyPolicy, type WebviewToHost } from "./protocol";
 import { displayTitleFromSummary } from "./session-list";
 import type { SessionStore } from "./store-surfaces";
 
-function publishConfiguredEffort(
-  st: SessionStore | null | undefined,
-  s: Session,
-  effort: Session["configuredEffort"],
-  force = false
-): void {
-  void force; // Model resolution must also be published when effort is unchanged.
-  s.configuredEffort = effort;
-  s.defaultEffort = defaultEffortFromSnapshot(
+const orchestrationPublishers = new WeakMap<ClaudeConversation, OrchestrationViewPublisher>();
+
+export function postOrchestrationView(s: Session): void {
+  const conv = s.conversation;
+  if (!conv?.orchestrationActive || s.closed) return; // R-ORC-01
+  let publisher = orchestrationPublishers.get(conv);
+  if (publisher === undefined) {
+    publisher = new OrchestrationViewPublisher(() => {
+      if (s.closed || s.conversation !== conv) return undefined; // R-ORC-21
+      const current = getLaisoraConfiguration();
+      return orchestrationViewForConversation(conv, {
+        orchestrationEnabled: current.get<boolean>("orchestration.enabled", false),
+        learningEnabled: current.get<boolean>("learning.enabled", false),
+        orchestrationAgents: current.get<unknown>("orchestration.agents", []),
+        externalTimeoutMinutes: current.get<number>("orchestration.externalTimeoutMinutes", 10),
+        conductorPolicy: current.get<string>("orchestration.conductorPolicy", ""),
+      });
+    }, (state) => store?.post({ type: "orchestrationView", tabId: s.tabId, state }));
+    orchestrationPublishers.set(conv, publisher);
+  }
+  publisher.schedule();
+}
+
+// Always posts, even when the effort is unchanged: the message also carries model resolution.
+function publishConfiguredEffort(st: SessionStore | null | undefined, s: Session): void {
+  const shown = effortDisplayFromSnapshot(
     s.configuredEffortSnapshot,
     s.effectiveModel ?? s.modelOverride,
     s.discoveredModels,
     s.effortOverride === undefined ? s.appliedEffort : undefined
   );
+  s.configuredEffort = shown.configured;
+  s.defaultEffort = shown.default;
   st?.post({
     type: "configuredEffortChanged",
     tabId: s.tabId,
-    effort: effort ?? null,
+    effort: shown.configured ?? null,
     model: s.configuredEffortSnapshot?.resolvedModel ?? null,
-    defaultEffort: s.defaultEffort ?? null,
+    defaultEffort: shown.default ?? null,
     appliedModel: s.appliedModel ?? null,
+    ...(s.appliedEffort === undefined ? {} : { appliedEffort: s.appliedEffort }),
   });
 }
 
 function rederiveConfiguredEffort(st: SessionStore | null | undefined, s: Session): void {
-  const snapshot = s.configuredEffortSnapshot;
-  if (snapshot === undefined) return;
-  publishConfiguredEffort(
-    st,
-    s,
-    configuredEffortFromSnapshot(snapshot, s.effectiveModel ?? s.modelOverride, s.discoveredModels)
-  );
+  if (s.configuredEffortSnapshot === undefined) return;
+  publishConfiguredEffort(st, s);
 }
 
 function refreshConfiguredEffort(
@@ -76,7 +94,7 @@ function refreshConfiguredEffort(
   s.configuredEffortSnapshot = undefined;
   s.appliedEffort = undefined;
   s.appliedModel = undefined;
-  publishConfiguredEffort(st, s, undefined, true);
+  publishConfiguredEffort(st, s);
   const current = (): boolean =>
     !s.closed &&
     s.configuredEffortGeneration === refreshGeneration &&
@@ -92,9 +110,8 @@ function refreshConfiguredEffort(
     if (applied === undefined || !current()) return;
     s.appliedEffort = applied.effort;
     s.appliedModel = applied.model;
-    // 設定の解決（resolveSettings）が失敗・未着でも applied model は届ける
-    if (s.configuredEffortSnapshot === undefined) publishConfiguredEffort(st, s, undefined);
-    else rederiveConfiguredEffort(st, s);
+    // 設定の解決（resolveSettings）が失敗・未着でも applied model / effort は届ける
+    publishConfiguredEffort(st, s);
   });
 }
 
@@ -198,7 +215,7 @@ async function applyEffortChange(
     st.post({ type: "effortChanged", tabId: s.tabId, effort: requested, notice });
     s.configuredEffortSnapshot = undefined;
     s.configuredEffortGeneration += 1;
-    publishConfiguredEffort(st, s, undefined, true);
+    publishConfiguredEffort(st, s);
     if (conv !== null && !conv.isClosed && s.conversation === conv) {
       const cfg = getLaisoraConfiguration();
       const cwd = s.cwd ?? resolveSessionCwd(s);
@@ -282,7 +299,7 @@ async function applyModelChange(
     s.appliedModel = undefined;
     s.appliedEffort = undefined;
     s.configuredEffortGeneration += 1;
-    publishConfiguredEffort(st, s, undefined, true);
+    publishConfiguredEffort(st, s);
     output.appendLine(`[${s.title}] setModel: ${requested ?? "(既定)"} を適用`);
     if (conv === null || conv.isClosed) warmup(s);
     else {
@@ -391,7 +408,7 @@ export async function handleConversationMessage(
         // hydration 中は token を journal entry へ載せる。失敗確定時に確定
         // user_message を配送する前に、同じ token の楽観バブルを撤去して二重表示を防ぐ
         target!.pushEvent(
-          { kind: "user_message", turnId: null, text: msg.text, images: msg.images },
+          { kind: "user_message", turnId: null, text: msg.text, images: msg.images, sentAt: Date.now() },
           undefined,
           undefined,
           clientToken
@@ -400,7 +417,10 @@ export async function handleConversationMessage(
       } else {
         disposition("accepted-nonhuman");
       }
-      target!.conversation!.send(msg.text, msg.images);
+      // 会話生成時の種は undefined でありうる（read-set の捕捉失敗・hydration 設置前の生成）。
+      // 未観測のまま送ると turn_started が timestamp 契約（event-fold）で破棄され、
+      // webview はそのターンの本文を全て捨てる（RFT-1 / RFT-2）
+      target!.conversation!.send(msg.text, msg.images, sessionObservedTimestampSeed(target!));
       break;
     }
     case "interrupt":
@@ -443,6 +463,14 @@ export function warmup(s: Session): void {
   void ensureConversation(s).catch((e: unknown) =>
     output.appendLine(`[${s.title}] ${sinceActivation()} warmup失敗: ${String(e)}`)
   );
+}
+
+// hydration 中は捕捉した read-set の境界時刻（journal の到着 gate が使う値と同一）
+// を渡す。ここがずれると live の timestamp 継承と Host の gate が食い違い、境界を決めない
+// イベントが到着時に落ちる。種の合成規則は observed-timestamp-seed.ts
+function sessionObservedTimestampSeed(s: Session): number | undefined {
+  const hydrating = s.hydration !== null && s.hydration.buffering ? s.hydration : null;
+  return observedTimestampSeed(hydrating?.arrivalTimestamp, s.lastRecordedEventTimestamp);
 }
 
 async function ensureConversation(s: Session): Promise<void> {
@@ -499,20 +527,15 @@ async function ensureConversationInner(s: Session): Promise<void> {
   // effortOverride は要求値であって適用観測ではない。実効値は init の auth_status だけが確定する。
   s.effectiveEffort = undefined;
 
-  // hydration 中は捕捉した read-set の境界時刻（journal の到着 gate が使う値と同一）
-  // を渡す。ここがずれると live の timestamp 継承と Host の gate が食い違い、境界を決めない
-  // イベントが到着時に落ちる。種の合成規則は observed-timestamp-seed.ts
-  const hydrating = s.hydration !== null && s.hydration.buffering ? s.hydration : null;
-  const initialObservedTimestamp = observedTimestampSeed(
-    hydrating?.arrivalTimestamp,
-    s.lastRecordedEventTimestamp
-  );
+  const initialObservedTimestamp = sessionObservedTimestampSeed(s);
 
   // 既定値は CLI 本体の設定解決（settingSources=user）に任せ、独自設定は作らない
   // （ユーザー方針: Claude Code と常に同期）。ただしユーザーがこのタブで明示的に選んだ
   // モデル/effort は、会話プロセスを作り直しても引き継ぐ。
   // モデルと effort の両方を渡す。effort だけだと、/clear・effort 変更による再起動・クラッシュ復帰のたびに
   // モデルだけ既定へ戻り、チップの表示と実体が食い違う。
+  const learningEnabled = cfg.get<boolean>("learning.enabled", false) === true;
+  const learningConfiguredSnapshot = learningEnabled ? await resolveConfiguredEffortSnapshot(cwd, settingSources) : undefined;
   const conv = new ClaudeConversation({
     cwd,
     initialObservedTimestamp,
@@ -526,6 +549,20 @@ async function ensureConversationInner(s: Session): Promise<void> {
     claudeCodeExecutablePath: configuredClaudeExecutablePath(cfg),
     apiKeyPolicy: normalizeApiKeyPolicy(cfg.get("claude.apiKeyPolicy", "inherit")),
     fileLinkInstruction: cfg.get<boolean>("claude.fileLinkInstruction", true) !== false,
+    planInstruction: cfg.get<boolean>("claude.planInstruction", true) !== false,
+    orchestrationEnabled: cfg.get<boolean>("orchestration.enabled", false) === true,
+    learningEnabled,
+    learningDirectory: extensionContext?.globalStorageUri?.fsPath ? join(extensionContext.globalStorageUri.fsPath, "laisora-learning") : undefined,
+    learningScope: vscode.workspace.getWorkspaceFolder?.(vscode.Uri.file(cwd))?.name ?? "global",
+    configuredResolvedModel: learningConfiguredSnapshot?.resolvedModel,
+    orchestrationAgents: cfg.get<unknown>("orchestration.agents", []),
+    externalModels: cachedExternalModels(),
+    externalTimeoutMinutes: cfg.get<number>("orchestration.externalTimeoutMinutes", 10),
+    orchestrationRunsDirectory: extensionContext?.globalStorageUri?.fsPath ? join(extensionContext.globalStorageUri.fsPath, "orchestration") : undefined,
+    conductorPolicy: cfg.get<string>("orchestration.conductorPolicy", ""),
+    onOrchestrationChanged: () => {
+      if (s.conversation === conv) postOrchestrationView(s); // R-ORC-21
+    },
     interruptForceKillTimeoutMs: cfg.get("interruptForceKillTimeoutMs", 5000),
     onEvent: (ev, conversationId, meta) => {
       // CLI 既定の model は設定からは見えない。init が申告した実値を継承元にする
@@ -573,6 +610,7 @@ async function ensureConversationInner(s: Session): Promise<void> {
       throw new Error(l10n.t("The logical session of this tab changed while the conversation was starting (restore or clear)."));
     }
     s.conversation = conv;
+    postOrchestrationView(s);
     refreshConfiguredEffort(store, s, cwd, settingSources, conv);
     // スラッシュコマンド/モデル一覧をサジェスト・ピッカー用にWebviewへ供給（非同期・失敗しても無視）
     void conv.supportedCommands().then((cmds) => {

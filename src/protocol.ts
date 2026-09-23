@@ -1,3 +1,10 @@
+import { normalizeSystemAppExtension } from "./file-link-open-mode";
+import { isPlanUsage } from "./plan-usage";
+import type { ExecutorId } from "./orchestration-executors";
+import { isExternalTimeout, isExternalDetection, isExternalModels, type ExternalModels, type ExternalDetection } from "./orchestration-roster";
+import { isOrchestrationSettingRoster, type OrchestrationSettingRow } from "./orchestration-roster";
+import { isOrchestrationView, type OrchestrationView } from "./orchestration-view";
+export type { OrchestrationView } from "./orchestration-view";
 // 拡張⇔Webview メッセージプロトコル
 // マルチタブ（tabId ごとに Conversation 1本）。
 // generation+seq / cursor / backendId は差分再送のための語彙として先に固定してあるが、
@@ -41,6 +48,9 @@ import type {
 } from "./l3-divergence";
 // type-only に保つこと: llm-finding-verify.ts は protocol.ts を import しており、値を取ると循環する
 import type { LlmAnalysisProvenance, RejectedFinding } from "./llm-finding-verify";
+// type-only に保つこと: handoff-envelope.ts は handoff-accept.ts 経由で @vscode/l10n を取り込むため、
+// 値を取ると browser バンドル（dist/webview.js）へ Host 専用の依存が入る
+import type { HandoffDecisionEntry, HandoffDecisions } from "./handoff-envelope";
 
 // Host と webview は同じ VSIX で出るが、webview の再読込前などに版がずれる。wire の形を変えたら版を上げる。
 // webview は init で版を突き合わせ、食い違いを利用者へ出す（黙って行が消える状態にしない）。
@@ -174,12 +184,29 @@ export type NormalizedEventBody =
         text: string;
         images?: ImageAttachment[];
         imageRefs?: ImageRefInfo[];
+        // sentAt は Host が送信を観測した実時刻（R-CNV-16 のフッター表示専用）。
+        // envelope の timestamp は順序用の観測時刻の継承で、復元タブの初回送信では
+        // 記録末尾の時刻になる。名前を `timestamp` にすると envelope の spread に潰される
+        sentAt?: number;
       }
     // resume 時の過去ログ再生（表示専用。復元境界は会話へ挿入する区切り行で示す）
     // uuid は会話の過去 chunk との重複判定にだけ使う表示専用の項目。
     // replayed_message は work-model / evidence-index / semantic-model / l3-analysis の
     // どこにも現れない（grep 0 件）ので、足しても導出には入り得ない
-    | { kind: "replayed_message"; role: "user" | "assistant"; text: string; uuid?: string; imageRefs?: ImageRefInfo[]; model?: string }
+    // recordedAt はそのレコード自身の時刻（R-CNV-15 / R-CNV-16 のフッター表示専用）。
+    // 名前を `timestamp` にすると envelope の spread に潰される。meta.timestamp で運ぶと
+    // timestamp gate の判定基準（lastEventTimestamp）が過去へ巻き戻る
+    | {
+        kind: "replayed_message";
+        role: "user" | "assistant";
+        text: string;
+        uuid?: string;
+        imageRefs?: ImageRefInfo[];
+        model?: string;
+        recordedAt?: number;
+        // Original send time, used for display when recordedAt is absent.
+        sentAt?: number;
+      }
     | {
         kind: "tool_call_started";
         turnId: string;
@@ -213,11 +240,13 @@ export type NormalizedEventBody =
     // 実測値でカード表示を上書きする。effort フィールドを持たない理由: SDKAssistantMessage 型に
     // effort は無く、セッションJSONLでは永続化エンベロープにのみ現れる。SDK hooks 入力には
     // 載るが表示のためだけの hooks 配線は不採用（claudeHost.ts 参照）。宣言値は tool_call_started 側で運ぶ
-    | { kind: "subagent_info"; turnId: string | null; toolUseId: string; model: string }
+    | { kind: "subagent_info"; turnId: string | null; toolUseId: string; model?: string; agentId?: string }
     // root message.model の変化ごとに1回 emit（表示専用。work-model / evidence-index / semantic-model / l3-analysis は読まない）
     | { kind: "model_observed"; turnId: string | null; model: string }
     // CLI のコンテキスト圧縮地点（表示専用。model_observed と同じ扱い。turn 境界ではない）
-    | { kind: "compact_boundary"; trigger: "auto" | "manual"; preTokens?: number }
+    // priorGeneration: 世代境界より前の圧縮（`src/session-transcript.ts#readSessionHistory` だけが立てる）。
+    // 作業ログ・集計は全世代を保つので、落とすのは会話面（conv-renderable.ts）だけ
+    | { kind: "compact_boundary"; trigger: "auto" | "manual"; preTokens?: number; priorGeneration?: true }
     | {
         kind: "tool_call_finished";
         turnId: string;
@@ -563,24 +592,30 @@ export function normalizeComposerSendKey(v: unknown): ComposerSendKey {
   return v === "shiftEnter" ? "shiftEnter" : "enter";
 }
 
-export const FILE_LINK_SETTINGS = ["fileLinkInstruction", "revealInExplorer", "allowOutsideWorkspace", "confirmOutsideWorkspace", "openOutsideReadOnly"] as const;
+export const FILE_LINK_BOOLEAN_SETTINGS = ["fileLinkInstruction", "planInstruction", "revealInExplorer", "allowOutsideWorkspace", "confirmOutsideWorkspace", "openOutsideReadOnly"] as const;
+export const FILE_LINK_SETTINGS = [...FILE_LINK_BOOLEAN_SETTINGS, "openWithSystemApp"] as const;
+export type FileLinkBooleanSetting = (typeof FILE_LINK_BOOLEAN_SETTINGS)[number];
 export type FileLinkSetting = (typeof FILE_LINK_SETTINGS)[number];
 
 // 設定エディタ（src/settings-panel.ts が開く WebviewPanel）との境界。会話面の WebviewToHost / HostToWebview とは受信口が別
 // requestId は画面が書込み要求ごとに採番し、Host は書込み後の返送に replyTo として写す
 export type SettingsPageToHost =
   | { type: "settingsPageReady" }
+  | { type: "recheckExternalExecutors" }
   | { type: "setComposerSendKey"; requestId: number; sendKey: ComposerSendKey }
   | { type: "setApiKeyPolicy"; requestId: number; policy: ApiKeyPolicy }
   | { type: "setRestoreTabsOnStartup"; requestId: number; enabled: boolean }
-  | { type: "setFileLinkSetting"; requestId: number; setting: FileLinkSetting; enabled: boolean }
+  | { type: "setLearningEnabled"; requestId: number; enabled: boolean }
+  | { type: "setOrchestrationSetting"; requestId: number; setting: "enabled" | "agents" | "conductorPolicy" | "externalTimeoutMinutes"; value: unknown }
+  | { type: "setFileLinkSetting"; requestId: number; setting: FileLinkBooleanSetting; enabled: boolean }
+  | { type: "setFileLinkSetting"; requestId: number; setting: "openWithSystemApp"; value: string[] }
   | { type: "openVsCodeSettings" };
 
 export type HostToSettingsPage =
   // 構成から読み直した実効値。書込みの後も要求値ではなくこれを返す（R-DSP-01）。
   // replyTo は書込み要求への返送だけが持つ。構成変更・ready への送信は持たない
-  | ({ type: "settingsState"; composerSendKey: ComposerSendKey; apiKeyPolicy: ApiKeyPolicy; restoreTabsOnStartup: boolean; replyTo?: number }
-    & Record<FileLinkSetting, boolean>);
+  | ({ type: "settingsState"; composerSendKey: ComposerSendKey; apiKeyPolicy: ApiKeyPolicy; restoreTabsOnStartup: boolean; learningEnabled: boolean; replyTo?: number }
+    & Record<FileLinkBooleanSetting, boolean> & { openWithSystemApp: string[] } & { orchestrationEnabled: boolean; orchestrationAgents: OrchestrationSettingRow[]; orchestrationDefaults: OrchestrationSettingRow[]; conductorPolicy: string; conductorPolicyDefault: string; externalTimeoutMinutes: number; externalDetection: Record<ExecutorId, ExternalDetection>; externalModels: ExternalModels });
 
 function isSettingsRequestId(v: unknown): v is number {
   return typeof v === "number" && Number.isSafeInteger(v) && v > 0;
@@ -590,7 +625,7 @@ export function isSettingsPageToHost(v: unknown): v is SettingsPageToHost {
   if (typeof v !== "object" || v === null) return false;
   const m = v as Record<string, unknown>;
   const t = m.type as SettingsPageToHost["type"];
-  if (t === "settingsPageReady" || t === "openVsCodeSettings") return hasOnlyKeys(m, ["type"]);
+  if (t === "settingsPageReady" || t === "recheckExternalExecutors" || t === "openVsCodeSettings") return hasOnlyKeys(m, ["type"]);
   if (t === "setComposerSendKey") {
     return isSettingsRequestId(m.requestId)
       && (COMPOSER_SEND_KEYS as readonly string[]).includes(m.sendKey as string) && hasOnlyKeys(m, ["type", "requestId", "sendKey"]);
@@ -599,13 +634,21 @@ export function isSettingsPageToHost(v: unknown): v is SettingsPageToHost {
     return isSettingsRequestId(m.requestId)
       && (API_KEY_POLICIES as readonly string[]).includes(m.policy as string) && hasOnlyKeys(m, ["type", "requestId", "policy"]);
   }
-  if (t === "setRestoreTabsOnStartup") {
+  if (t === "setRestoreTabsOnStartup" || t === "setLearningEnabled") {
     return isSettingsRequestId(m.requestId) && typeof m.enabled === "boolean" && hasOnlyKeys(m, ["type", "requestId", "enabled"]);
+  }
+  if (t === "setOrchestrationSetting") {
+    return isSettingsRequestId(m.requestId) && ["enabled", "agents", "conductorPolicy", "externalTimeoutMinutes"].includes(m.setting as string)
+      && Object.hasOwn(m, "value") && hasOnlyKeys(m, ["type", "requestId", "setting", "value"]);
   }
   if (t === "setFileLinkSetting") {
     return isSettingsRequestId(m.requestId)
-      && (FILE_LINK_SETTINGS as readonly string[]).includes(m.setting as string)
-      && typeof m.enabled === "boolean" && hasOnlyKeys(m, ["type", "requestId", "setting", "enabled"]);
+      && (m.setting === "openWithSystemApp"
+        // R-CNV-20: validate chip writes again at the Host boundary; no workspace target is accepted.
+        ? Array.isArray(m.value) && m.value.every((item) => typeof item === "string" && normalizeSystemAppExtension(item) === item)
+          && hasOnlyKeys(m, ["type", "requestId", "setting", "value"])
+        : (FILE_LINK_BOOLEAN_SETTINGS as readonly string[]).includes(m.setting as string)
+          && typeof m.enabled === "boolean" && hasOnlyKeys(m, ["type", "requestId", "setting", "enabled"]));
   }
   t satisfies never;
   return false;
@@ -619,9 +662,15 @@ export function isHostToSettingsPage(v: unknown): v is HostToSettingsPage {
     return (COMPOSER_SEND_KEYS as readonly string[]).includes(m.composerSendKey as string)
       && (API_KEY_POLICIES as readonly string[]).includes(m.apiKeyPolicy as string)
       && typeof m.restoreTabsOnStartup === "boolean"
-      && FILE_LINK_SETTINGS.every((key) => typeof m[key] === "boolean")
+      && typeof m.learningEnabled === "boolean"
+      && typeof m.orchestrationEnabled === "boolean" && typeof m.conductorPolicy === "string"
+      && typeof m.conductorPolicyDefault === "string"
+      && isOrchestrationSettingRoster(m.orchestrationAgents) && isOrchestrationSettingRoster(m.orchestrationDefaults)
+      && isExternalTimeout(m.externalTimeoutMinutes) && isExternalDetection(m.externalDetection) && isExternalModels(m.externalModels)
+      && FILE_LINK_BOOLEAN_SETTINGS.every((key) => typeof m[key] === "boolean")
+      && Array.isArray(m.openWithSystemApp) && m.openWithSystemApp.every((item) => typeof item === "string")
       && (m.replyTo === undefined || isSettingsRequestId(m.replyTo))
-      && hasOnlyKeys(m, ["type", "composerSendKey", "apiKeyPolicy", "restoreTabsOnStartup", ...FILE_LINK_SETTINGS, "replyTo"]);
+      && hasOnlyKeys(m, ["type", "composerSendKey", "apiKeyPolicy", "restoreTabsOnStartup", "learningEnabled", ...FILE_LINK_SETTINGS, "orchestrationEnabled", "orchestrationAgents", "orchestrationDefaults", "conductorPolicy", "conductorPolicyDefault", "externalTimeoutMinutes", "externalDetection", "externalModels", "replyTo"]);
   }
   t satisfies never;
   return false;
@@ -698,7 +747,7 @@ export type WebviewToHost =
       cursor?: string;
       anchor?: { generation: number; seq: number };
     }
-  // 作業ログの過去イベントを transcript から読み直して取り寄せる（R-49）。
+  // 作業ログの過去イベントを transcript から読み直して取り寄せる（R-TAB-07）。
   // cursor は Host 発行 token、初回は anchor。file path / offset は受け取らない
   | {
       type: "worklogTranscriptRequest";
@@ -765,7 +814,13 @@ export type WebviewToHost =
     }
   // first-paint: init を受け取ってから活性タブが画面に載るまでの実測。時刻は document age
   // （performance.now）で、現在時刻は載せない（TB-7）
-  | { type: "webviewDiagnostic"; kind: "error" | "ready-retry" | "first-paint"; message: string }
+  // orphan-turn-adopted: turn_started 不着のまま本文デルタで開いたターン（OA-1〜OA-7）。
+  // message は tabId と turnId だけで、本文を載せない
+  | {
+      type: "webviewDiagnostic";
+      kind: "error" | "ready-retry" | "first-paint" | "orphan-turn-adopted";
+      message: string;
+    }
   // intoTabId: 未使用の会話タブがあればそこへ開く（新タブを増やさない）。ホスト側で
   // 「本当に未使用か」を判定し、使用中なら従来どおり新タブを作る
   | { type: "resumeSession"; sessionId: string; filePath: string; intoTabId?: string }
@@ -1133,12 +1188,20 @@ export interface WorkEventInfo {
   // ターン境界で running から stale へ移った toolUseId
   staled?: string[];
   pendingApprovalCount?: number;
-  // turn_completed のみ。そのターンの counted ツール件数（ターン要約チップの値）。webview で開始イベントを
-  // 数え直さない——再生窓がターンの途中を落とすと少なく出る
+  // turn_completed のみ。そのターンの counted ツール件数。今は webview に消費点が無い（返信フッターは件数を出さない）
   turnToolCount?: number;
 }
 
+export interface PlanContext {
+  blockId: string; start: number; end: number; text: string; running: boolean;
+}
+
 export interface WorkModelPayload {
+  planDeclaration?: { goal: string; at: number };
+  planHistory?: import("./work-model").PlanHistoryEntry[];
+  planHistoryTruncated?: boolean;
+  planContext?: PlanContext;
+  planTools?: Array<{ id: string; name: string; description: string; startedAt: number }>;
   version: number;
   revision: number;
   coverage: WorkCoverage;
@@ -1428,6 +1491,7 @@ export function projectWorkModel(
   restoredAgents: readonly RestoredAgent[] = []
 ): WorkModelPayload {
   const restoredByToolUseId = new Map<string, RestoredAgent>();
+  const restoredById = new Map(restoredAgents.map(agent => [agent.agentId, agent]));
   for (const agent of restoredAgents) {
     if (agent.toolUseId.length > 0 && !restoredByToolUseId.has(agent.toolUseId)) {
       restoredByToolUseId.set(agent.toolUseId, agent);
@@ -1483,11 +1547,11 @@ export function projectWorkModel(
   for (const phase of state.phases) {
     const created: WorkAgentNode[] = [];
     for (const agent of phase.agents) {
-      const restored = restoredByToolUseId.get(agent.toolUseId);
+      const restored = restoredByToolUseId.get(agent.toolUseId) ?? restoredById.get(agent.transcriptAgentId ?? "");
       if (restored) matchedRestoredIds.add(restored.agentId);
       const node: WorkAgentNode = {
         agentId: agent.agentId,
-        transcriptAgentId: restored?.agentId,
+        transcriptAgentId: agent.transcriptAgentId ?? restored?.agentId,
         parentAgentId: agent.parentAgentId,
         toolUseId: agent.toolUseId,
         parentToolUseId: agent.parentToolUseId,
@@ -1511,6 +1575,7 @@ export function projectWorkModel(
       };
       created.push(node);
       nodeByKey.set(agent.agentId, node);
+      if (agent.transcriptAgentId) nodeByKey.set(agent.transcriptAgentId, node);
       if (restored) nodeByKey.set(restored.agentId, node);
     }
     const roots: WorkAgentNode[] = [];
@@ -1547,6 +1612,14 @@ export function projectWorkModel(
 
   return {
     version: WORK_MODEL_VERSION,
+    planDeclaration: state.planDeclaration,
+    planHistory: state.planHistory,
+    planHistoryTruncated: state.planHistoryTruncated,
+    planTools: state.runningToolUseIds.flatMap(id => {
+      const tool = findToolPlacement(state, id);
+      return tool && !tool.stale && tool.parentToolUseId === null
+        ? [{ id, name: tool.toolName, description: tool.description, startedAt: tool.startedAt }] : [];
+    }),
     revision: state.revision,
     coverage:
       depthLimitedCount > 0
@@ -1858,6 +1931,20 @@ export function isWorkModelPayload(v: unknown): v is WorkModelPayload {
   if (typeof v !== "object" || v === null) return false;
   const m = v as Record<string, unknown>;
   return (
+    (m.planHistory === undefined || isArrayOf(m.planHistory, entry => {
+      if (!entry || typeof entry !== "object") return false;
+      const row = entry as Record<string, unknown>;
+      return isNumber(row.at) && (row.kind === "user" || row.kind === "todos" &&
+        (row.source === undefined || row.source === "tasks") && (row.created === undefined || typeof row.created === "boolean") && (row.removed === undefined || typeof row.removed === "boolean") && isArrayOf(row.items, isWorkTaskItemView));
+    })) &&
+    (m.planDeclaration === undefined || isPlanDeclaration(m.planDeclaration)) &&
+    (m.planHistoryTruncated === undefined || typeof m.planHistoryTruncated === "boolean") &&
+    (m.planContext === undefined || isPlanContext(m.planContext)) &&
+    (m.planTools === undefined || isArrayOf(m.planTools, tool => {
+      if (!tool || typeof tool !== "object") return false;
+      const row = tool as Record<string, unknown>;
+      return typeof row.id === "string" && typeof row.name === "string" && typeof row.description === "string" && isNumber(row.startedAt);
+    })) &&
     isNumber(m.version) &&
     isNumber(m.revision) &&
     isWorkCoverage(m.coverage) &&
@@ -1870,6 +1957,18 @@ export function isWorkModelPayload(v: unknown): v is WorkModelPayload {
     isArrayOf(m.tasks, isWorkTaskItemView) &&
     isArrayOf(m.taskTotals, isWorkTaskTotalsView)
   );
+}
+
+function isPlanContext(value: unknown): boolean {
+  if (!value || typeof value !== "object") return false;
+  const row = value as Record<string, unknown>;
+  return typeof row.blockId === "string" && typeof row.text === "string" && isNumber(row.start) && isNumber(row.end) && typeof row.running === "boolean";
+}
+
+function isPlanDeclaration(value: unknown): boolean {
+  if (!value || typeof value !== "object") return false;
+  const row = value as Record<string, unknown>;
+  return typeof row.goal === "string" && row.goal.trim().length > 0 && isNumber(row.at);
 }
 
 const SEMANTIC_MODES = ["recorded", "fallback"];
@@ -2557,15 +2656,29 @@ export function isLlmFindingDiagnosticsPayload(v: unknown): v is LlmFindingDiagn
   );
 }
 
+function isAnalysisLearningRANL20(v: unknown): boolean {
+  if (typeof v !== "object" || v === null || Array.isArray(v)) return false;
+  const learning = v as Record<string, unknown>;
+  return hasOnlyKeys(learning, ["state", "note", "lines"])
+    && (learning.state === "unobserved" || learning.state === "observed")
+    && typeof learning.note === "string" && Array.isArray(learning.lines)
+    && learning.lines.every(line => typeof line === "string")
+    && (learning.state === "unobserved" ? learning.note.length > 0 && learning.lines.length === 0 : learning.lines.length > 0);
+}
+
 function isAnalysisFactsView(v: unknown): boolean {
-  if (typeof v !== "object" || v === null) return false;
+  if (typeof v !== "object" || v === null || Array.isArray(v)) return false;
   const f = v as Record<string, unknown>;
   return (
+    hasOnlyKeys(f, ["llmTargets", "coverageNote", "learning"]) &&
     typeof f.llmTargets === "object" &&
     f.llmTargets !== null &&
+    !Array.isArray(f.llmTargets) &&
+    hasOnlyKeys(f.llmTargets as Record<string, unknown>, ["toolCalls", "label"]) &&
     isNumber((f.llmTargets as Record<string, unknown>).toolCalls) &&
     typeof (f.llmTargets as Record<string, unknown>).label === "string" &&
-    isOptionalString(f.coverageNote)
+    isOptionalString(f.coverageNote) &&
+    (f.learning === undefined || isAnalysisLearningRANL20(f.learning))
   );
 }
 
@@ -2607,6 +2720,17 @@ export type ResumeHydrationPhase = "loading" | "complete" | "failed";
 
 export const RESUME_PREVIEW_MESSAGE_MAX = 80;
 
+// 「転記済みと同じ内容が書き直されている可能性」を出す比（R-HND-11）。機械側は重複を消さない
+// （近似一致は決定の取り違えになる）ので、防御は指示文側に置き、ここは観測だけを持つ
+export const DECISIONS_REWRITE_RATIO = 0.8;
+
+// 記録から復元した引き継ぎカードの展開部を指す実行 ID（R-HND-10）。Host と webview が
+// 同じ関数で作る。**固定値にしないこと**: intoTabId によるタブ再利用で同じ tabId に別セッションが
+// 載ったとき、古い展開部の cache が一致して別会話の本文を返す
+export function restoredHandoffRunId(forkSessionId: string): string {
+  return `restored:${forkSessionId}`;
+}
+
 export interface ResumePreviewMessage {
   uuid: string;
   role: "user" | "assistant";
@@ -2647,9 +2771,11 @@ export interface LlmAnalysisRunProgress {
 }
 
 export type HostToWebview =
+  | { type: "planUsage"; tabId: string; state: import("./plan-usage").PlanUsage }
+  | { type: "orchestrationView"; tabId: string; state: OrchestrationView }
   // hostWindows: the Extension Host platform, which decides the Windows-only file-link refusals (R-CNV-12). The webview
   // treats a missing value as Windows (stricter) and never infers it from its own navigator.
-  | { type: "init"; protocolVersion: number; tabs: TabSnapshot[]; hostWindows?: boolean }
+  | { type: "init"; protocolVersion: number; tabs: TabSnapshot[]; hostWindows?: boolean; systemAppExtensions?: string[] }
   | { type: "events"; tabId: string; events: NormalizedEvent[] }
   // Resume fast path v4 F-2/F-5/F-8: hydration 中の表示差分だけを in-place で運ぶ。
   // 判別ユニオンは runtime guard（isResumeHydrationStateShape）と同じ制約を型に持たせるため:
@@ -2715,6 +2841,15 @@ export type HostToWebview =
       utteranceCount?: number;
       // F のうち JSON として読めず捨てた行数（done のときだけ。0 は載せない）
       unreadableLineCount?: number;
+      // 決定行の転記の件数だけ（R-HND-11 / R-HND-12）。本文は handoffDetail の part 0 が運ぶ
+      decisions?: {
+        total: number;
+        carried: number;
+        extracted: number;
+        removed: number;
+        unknownIdRefs: number;
+        warn?: { entries: number; bytes: number };
+      };
     }
   // 状態カードの展開部。getHandoffDetail への応答で、1 通あたり
   // HANDOFF_DETAIL_MAX_BYTES 以下に分割する。summary は part 0 だけが運ぶ。
@@ -2727,6 +2862,8 @@ export type HostToWebview =
       total: number;
       summary?: string;
       utterances: { n: number; at: string; kind: "typed" | "answer"; text: string; questions?: string[] }[];
+      // 転記した決定行。summary と同じく part 0 だけが運ぶ
+      decisions?: HandoffDecisions;
     }
   | { type: "modeChanged"; tabId: string; mode: PermissionModeId }
   | { type: "commands"; tabId: string; commands: SlashCommandInfo[] }
@@ -2739,7 +2876,7 @@ export type HostToWebview =
   // 自前で「保存しました」を出さない（R-DSP-01: 保存前に保存済みを名乗らない）
   | { type: "modelChanged"; tabId: string; model: string | null; notice?: string }
   | { type: "effortChanged"; tabId: string; effort: string | null; notice?: string }
-  | { type: "configuredEffortChanged"; tabId: string; effort: string | null; model?: string | null; defaultEffort?: string | null; appliedModel?: string | null }
+  | { type: "configuredEffortChanged"; tabId: string; effort: string | null; model?: string | null; defaultEffort?: string | null; appliedModel?: string | null; appliedEffort?: string | null }
   | { type: "files"; reqId: number; paths: string[] }
   // pickFiles の応答。キャンセルは paths / images とも空で返す（無応答にしない）
   | { type: "pickedFiles"; reqId: number; paths: string[]; images: ImageAttachment[] }
@@ -2836,7 +2973,7 @@ export type HostToWebview =
       generation: number;
       reason: HistoryChunkErrorReason;
     }
-  // 作業ログの過去 chunk（transcript 読み直し由来。R-49）。破棄は requestId で行う
+  // 作業ログの過去 chunk（transcript 読み直し由来。R-TAB-07）。破棄は requestId で行う
   | {
       type: "worklogTranscriptResult";
       tabId: string;
@@ -2917,6 +3054,9 @@ export interface ConversationSnapshot {
   defaultEffort?: string;
   // 実行中 CLI が次のリクエストで使う model（get_settings の applied.model）。resume では記録の model で、configModel より優先する
   appliedModel?: string;
+  // get_settings の applied.effort。null = CLI が effort を送らない。configEffort / defaultEffort はこれと一致するときだけ立つ
+  appliedEffort?: string | null;
+  recordedModel?: string;
   permissionMode: PermissionModeId;
   commands?: SlashCommandInfo[];
   models?: ModelInfo[];
@@ -2931,10 +3071,15 @@ export interface ConversationSnapshot {
     title?: string;
     compact?: { preTokens: number; postTokens: number };
     utteranceCount?: number;
+    detailRunId?: string;
+    // 封筒が運ぶ決定行の本数（消した行を含む）。これが無いと復元したカードは決定行の展開部を
+    // 作れず、他の展開を開いて part 0 が届くまで決定行へ到達する導線が無い（R-HND-11）
+    decisionCount?: number;
   };
   resumeHydration?: ResumeHydrationSnapshotState;
   // Host が保持する materialized WorkModel。イベント再 fold で作らせない
   workModel?: WorkModelPayload;
+  planUsage?: import("./plan-usage").PlanUsage;
   // semanticView の明示状態。「未着」と「明示off」を同一視しない。
   // true = on（semanticModel が無ければ未着/導出失敗）、false = 設定で明示off
   semanticView?: boolean;
@@ -2968,6 +3113,7 @@ export function isWebviewToHost(v: unknown): v is WebviewToHost {
   // ここでの as は「t の静的型を絞る」ためだけで、実行時の妥当性は保証しない）
   const t = (v as { type?: unknown }).type as WebviewToHost["type"];
   const tabId = (v as { tabId?: unknown }).tabId;
+
   if (t === "ready") {
     // cursor は null または {generation, seq}（レビューP2-2: 型検証の抜けを塞ぐ）
     const c = (v as { cursor?: unknown }).cursor;
@@ -2981,7 +3127,7 @@ export function isWebviewToHost(v: unknown): v is WebviewToHost {
   if (t === "webviewDiagnostic") {
     const diagnostic = v as { kind?: unknown; message?: unknown };
     return (diagnostic.kind === "error" || diagnostic.kind === "ready-retry" ||
-      diagnostic.kind === "first-paint") &&
+      diagnostic.kind === "first-paint" || diagnostic.kind === "orphan-turn-adopted") &&
       typeof diagnostic.message === "string" && diagnostic.message.length > 0 &&
       diagnostic.message.length <= 2000;
   }
@@ -3674,6 +3820,7 @@ function isPlausibleNormalizedEvent(x: unknown): x is NormalizedEvent {
     ) {
       return false;
     }
+    if (e.priorGeneration !== undefined && e.priorGeneration !== true) return false;
   }
   return true;
 }
@@ -3855,11 +4002,15 @@ function isTabSnapshotShape(x: unknown): x is TabSnapshot {
     (PERMISSION_MODES as string[]).includes(s.permissionMode as string) &&
     // 省略可能にするのは commands?/models? と同じ扱い。存在するなら中身は緩めない
     (s.workModel === undefined || isWorkModelPayload(s.workModel)) &&
+    (s.planUsage === undefined || isPlanUsage(s.planUsage)) &&
     (s.semanticView === undefined || typeof s.semanticView === "boolean") &&
     (s.semanticModel === undefined || isSemanticModelPayload(s.semanticModel)) &&
     (s.effortOverride === undefined || s.effortOverride === null || typeof s.effortOverride === "string") &&
     (s.defaultEffort === undefined || typeof s.defaultEffort === "string") &&
     (s.appliedModel === undefined || typeof s.appliedModel === "string") &&
+    (s.appliedEffort === undefined || s.appliedEffort === null ||
+      (typeof s.appliedEffort === "string" && ["low", "medium", "high", "xhigh", "max"].includes(s.appliedEffort))) &&
+    (s.recordedModel === undefined || typeof s.recordedModel === "string") &&
     (s.llmAnalysisEnabled === undefined || typeof s.llmAnalysisEnabled === "boolean") &&
     (s.llmAnalysisRunning === undefined || typeof s.llmAnalysisRunning === "boolean") &&
     (s.llmAnalysisProgress === undefined ||
@@ -3892,14 +4043,79 @@ function isLlmAnalysisRunProgress(value: unknown): value is LlmAnalysisRunProgre
   );
 }
 
+function isNonNegativeInt(v: unknown): boolean {
+  return typeof v === "number" && Number.isInteger(v) && v >= 0;
+}
+
+function isDecisionWarn(v: unknown): boolean {
+  if (v === undefined) return true;
+  if (typeof v !== "object" || v === null) return false;
+  const w = v as Record<string, unknown>;
+  return isNonNegativeInt(w.entries) && isNonNegativeInt(w.bytes);
+}
+
+function isHandoffDecisionCounts(v: unknown): boolean {
+  if (v === undefined) return true;
+  if (typeof v !== "object" || v === null) return false;
+  const d = v as Record<string, unknown>;
+  return (
+    isNonNegativeInt(d.total) &&
+    isNonNegativeInt(d.carried) &&
+    isNonNegativeInt(d.extracted) &&
+    isNonNegativeInt(d.removed) &&
+    isNonNegativeInt(d.unknownIdRefs) &&
+    isDecisionWarn(d.warn)
+  );
+}
+
+const DECISION_TAG_VALUES: readonly string[] = ["GOAL", "KILLED", "DECIDED", "DROPPED"];
+
+function isDecisionEntryList(v: unknown): v is HandoffDecisionEntry[] {
+  return (
+    Array.isArray(v) &&
+    v.every((item) => {
+      if (typeof item !== "object" || item === null) return false;
+      const e = item as Record<string, unknown>;
+      return (
+        typeof e.id === "string" &&
+        e.id.length > 0 &&
+        typeof e.t === "string" &&
+        DECISION_TAG_VALUES.includes(e.t) &&
+        isNonNegativeInt(e.g) &&
+        typeof e.s === "string"
+      );
+    })
+  );
+}
+
+function isHandoffDecisions(v: unknown): v is HandoffDecisions | undefined {
+  if (v === undefined) return true;
+  if (typeof v !== "object" || v === null) return false;
+  const d = v as Record<string, unknown>;
+  return (
+    typeof d.preamble === "string" &&
+    isDecisionEntryList(d.entries) &&
+    (d.removedLastGen === undefined || isDecisionEntryList(d.removedLastGen)) &&
+    isNonNegativeInt(d.carried) &&
+    isNonNegativeInt(d.extracted) &&
+    isNonNegativeInt(d.removed) &&
+    isNonNegativeInt(d.unknownIdRefs) &&
+    (d.source === "hook" || d.source === "previous_only") &&
+    isDecisionWarn(d.warn)
+  );
+}
+
 function isHandoffSource(v: unknown): boolean {
   if (typeof v !== "object" || v === null || Array.isArray(v)) return false;
   const h = v as Record<string, unknown>;
   const compact = h.compact as { preTokens?: unknown; postTokens?: unknown } | undefined;
   return typeof h.sessionId === "string" && SESSION_ID_RE.test(h.sessionId) &&
     (h.title === undefined || typeof h.title === "string") &&
+    (h.detailRunId === undefined || typeof h.detailRunId === "string") &&
     (h.utteranceCount === undefined ||
       (typeof h.utteranceCount === "number" && Number.isSafeInteger(h.utteranceCount) && h.utteranceCount >= 0)) &&
+    (h.decisionCount === undefined ||
+      (typeof h.decisionCount === "number" && Number.isSafeInteger(h.decisionCount) && h.decisionCount >= 0)) &&
     (compact === undefined ||
       (typeof compact === "object" && compact !== null &&
         typeof compact.preTokens === "number" && Number.isFinite(compact.preTokens) && compact.preTokens >= 0 &&
@@ -3926,12 +4142,27 @@ export function isHostToWebview(v: unknown): v is HostToWebview {
   const t = (v as { type?: unknown }).type as HostToWebview["type"];
   const tabId = (v as { tabId?: unknown }).tabId;
 
+  if (t === "planUsage") {
+    return typeof tabId === "string" && Object.keys(v).length === 3
+      && hasOnlyKeys(v as Record<string, unknown>, ["type", "tabId", "state"])
+      && isPlanUsage((v as { state?: unknown }).state);
+  }
+
+  if (t === "orchestrationView") {
+    return typeof tabId === "string" && hasOnlyKeys(v as Record<string, unknown>, ["type", "tabId", "state"])
+      && isOrchestrationView((v as { state?: unknown }).state); // R-ORC-14, R-ORC-22
+  }
+
   if (t === "init") {
     const tabs = (v as { tabs?: unknown }).tabs;
+    const extensions = (v as { systemAppExtensions?: unknown }).systemAppExtensions;
     return (
       typeof (v as { protocolVersion?: unknown }).protocolVersion === "number" &&
       ((v as { hostWindows?: unknown }).hostWindows === undefined ||
         typeof (v as { hostWindows?: unknown }).hostWindows === "boolean") &&
+      // R-CNV-20: init carries only normalized, non-blocked display extensions.
+      (extensions === undefined || (Array.isArray(extensions) &&
+        extensions.every((item) => typeof item === "string" && normalizeSystemAppExtension(item) === item))) &&
       Array.isArray(tabs) &&
       (tabs as unknown[]).every(isTabSnapshotShape)
     );
@@ -3998,7 +4229,8 @@ export function isHostToWebview(v: unknown): v is HostToWebview {
           typeof compact.preTokens === "number" &&
           typeof compact.postTokens === "number")) &&
       (m.utteranceCount === undefined || typeof m.utteranceCount === "number") &&
-      (m.unreadableLineCount === undefined || typeof m.unreadableLineCount === "number")
+      (m.unreadableLineCount === undefined || typeof m.unreadableLineCount === "number") &&
+      isHandoffDecisionCounts(m.decisions)
     );
   }
   if (t === "handoffDetail") {
@@ -4027,7 +4259,8 @@ export function isHostToWebview(v: unknown): v is HostToWebview {
           (item.questions === undefined ||
             (Array.isArray(item.questions) && item.questions.every((q) => typeof q === "string")))
         );
-      })
+      }) &&
+      isHandoffDecisions(m.decisions)
     );
   }
   if (t === "modeChanged") {
@@ -4087,6 +4320,9 @@ export function isHostToWebview(v: unknown): v is HostToWebview {
       !(typeof defaultEffort === "string" && ["low", "medium", "high", "xhigh", "max"].includes(defaultEffort))) return false;
     const appliedModel = (v as { appliedModel?: unknown }).appliedModel;
     if (appliedModel !== undefined && appliedModel !== null && typeof appliedModel !== "string") return false;
+    const appliedEffort = (v as { appliedEffort?: unknown }).appliedEffort;
+    if (appliedEffort !== undefined && appliedEffort !== null &&
+      !(typeof appliedEffort === "string" && ["low", "medium", "high", "xhigh", "max"].includes(appliedEffort))) return false;
     return typeof tabId === "string" && (effort === null ||
       (typeof effort === "string" && ["low", "medium", "high", "xhigh", "max"].includes(effort)));
   }

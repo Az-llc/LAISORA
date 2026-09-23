@@ -29,7 +29,7 @@ export const COMPACT_MIN_BODY_CHARS = 1500;
 export const COMPACT_INSTRUCTION = {
   get text(): string {
     return l10n.t(
-      "Summary for handoff. Keep the nine required sections and keep each section heading on a line of its own. Inside those sections carry state as tagged one-line entries rather than prose, one line per item, each line ending with src=user or src=assistant. Under \"Primary Request and Intent\": one [GOAL] line for each end state the user wants reached (the state itself, not the means to it) with its scope and whether it still holds, and one [KILLED] line for each thing the user rejected, naming what would let it be raised again. Under \"Pending Tasks\": one [DECIDED] line for each action that is settled but not yet carried out, and one [OPEN] line for each question that is still unsettled; include here the commitments you or an earlier assistant volunteered unasked and the user did not object to, and include items that carry no tracking ID. Under \"Problem Solving\": one [DROPPED] line for each claim later retracted or disproved, naming its current standing, because an entry without that reads as a permanent ban. Quote the user's statements verbatim without paraphrasing."
+      "Summary for handoff. Keep the nine required sections and keep each section heading on a line of its own. Inside those sections carry state as tagged one-line entries rather than prose, one line per item, each line ending with src=user or src=assistant. Under \"Primary Request and Intent\": one [GOAL] line for each end state the user wants reached (the state itself, not the means to it) with its scope and whether it still holds, and one [KILLED] line for each thing the user rejected, naming what would let it be raised again. Under \"Pending Tasks\": one [DECIDED] line for each action that is settled but not yet carried out, and one [OPEN] line for each question that is still unsettled; include here the commitments you or an earlier assistant volunteered unasked and the user did not object to, and include items that carry no tracking ID. Under \"Problem Solving\": one [DROPPED] line for each claim later retracted or disproved, naming its current standing, because an entry without that reads as a permanent ban. Quote the user's statements verbatim without paraphrasing. If the conversation contains a <laisora-handoff> block, its decisions.entries already carry earlier [GOAL]/[KILLED]/[DECIDED]/[DROPPED] lines under ids such as D1. Do not rewrite a transcribed entry as a new tagged line. Write a new tagged line only for a decision that is not transcribed yet. When the status of a transcribed entry changed, write either [DROPPED] D7 … (the user retracted it) or, under \"Pending Tasks\", [DONE] D7 … (it was carried out, or the user said it is no longer wanted); put the id first on those lines and write them only when the user said so."
     );
   },
 };
@@ -44,7 +44,86 @@ export const COMPACT_ENTRY_TAGS: readonly string[] = Object.freeze([
   "[DECIDED]",
   "[OPEN]",
   "[DROPPED]",
+  "[DONE]",
 ]);
+
+// 次世代へ機械転記するタグ（R-HND-11）。`[OPEN]` は入れない（未決は次世代で問い直される）
+export const DECISION_TAGS: readonly string[] = Object.freeze(["GOAL", "KILLED", "DECIDED", "DROPPED"]);
+// 利用者が「済んだ / 要らない」と言ったときだけ書かれる。転記済みエントリを外す唯一の入口
+export const DECISION_DONE_TAG = "DONE";
+
+export type DecisionTag = "GOAL" | "KILLED" | "DECIDED" | "DROPPED";
+
+export interface ExtractedDecisionLine {
+  t: DecisionTag | "DONE";
+  // タグと（名指しがあれば）ID を除いた本文。空白正規化だけで原文を書き換えない
+  s: string;
+  id?: string;
+}
+
+// 行頭の番号・見出し記号・箇条書き・強調を剥がす。countCompactHeadings と extractDecisionLines が
+// 同じ規則を見るための唯一の定義（別実装にすると片方だけ直り、見出しと決定行で拾える形が食い違う）
+export function normalizeSummaryLine(line: string): string {
+  return line.trim().replace(/^(?:\d+[.)]\s*|#{1,6}\s*|[-*+]\s*|\*\*|__)+/, "");
+}
+
+// ``` と ~~~ の両方をフェンスとして扱い、開いた記号と同じ記号でだけ閉じる。
+// 片方しか見ないと、もう片方のフェンスに囲まれた見出し・タグ行を本文として拾う。
+// 返り値が true の行は「フェンスの印か、フェンスの内側」で、呼び出し側は読み飛ばす
+export function createFenceTracker(): (line: string) => boolean {
+  let open: string | undefined;
+  return (line) => {
+    const mark = /^(?:`{3,}|~{3,})/.exec(line.trim())?.[0][0];
+    if (mark !== undefined) {
+      if (open === undefined) {
+        open = mark;
+        return true;
+      }
+      if (open === mark) {
+        open = undefined;
+        return true;
+      }
+    }
+    return open !== undefined;
+  };
+}
+
+// `D1` / `D-1` / `d1` / `D 1` / `#D1` を同一視する（R-HND-11）
+const DECISION_ID_RE = /^[#\s]*[Dd][-\s]?(\d+)/;
+
+export function normalizeDecisionId(text: string): { id: string; rest: string } | null {
+  const m = DECISION_ID_RE.exec(text);
+  return m === null ? null : { id: `D${Number(m[1])}`, rest: text.slice(m[0].length) };
+}
+
+// 受理済みの要約本文からタグ行を拾う。**節は見ない**: 見出しと本文の同居で見出しが数え落ちるのは
+// 既知の外部制約で、節で門を作ると落ちた節の決定行が黙って消える。過剰取得より黙った欠落を避ける
+export function extractDecisionLines(body: string): ExtractedDecisionLine[] {
+  const out: ExtractedDecisionLine[] = [];
+  const fenced = createFenceTracker();
+  for (const raw of body.replace(/\r\n?/g, "\n").split("\n")) {
+    if (fenced(raw)) continue;
+    const line = normalizeSummaryLine(raw);
+    const tag = [...DECISION_TAGS, DECISION_DONE_TAG].find((candidate) => line.startsWith(`[${candidate}]`));
+    if (tag === undefined) continue;
+    // タグを囲んだ強調（`**[GOAL]**`）の閉じだけを剥がす。残すと本文の先頭に markup が混ざり、
+    // 世代をまたぐ完全一致の重複排除が同じ決定を取り逃す
+    const rest = line.slice(tag.length + 2).replace(/^(?:\*\*|__)/, "");
+    // ID の名指しは状態変更（DROPPED / DONE）だけが持つ。他のタグで剥がすと本文が書き換わる
+    const ref = tag === "DROPPED" || tag === DECISION_DONE_TAG ? normalizeDecisionId(rest) : null;
+    out.push({
+      t: tag as DecisionTag | "DONE",
+      ...(ref === null ? {} : { id: ref.id }),
+      s: (ref === null ? rest : ref.rest).replace(/\s+/g, " ").trim(),
+    });
+  }
+  return out;
+}
+
+// 転記行を読むモデルへの前置き。封筒 JSON へ永続するので l10n を通さず、値は sha256 で固定する。
+// ENVELOPE_PREAMBLE とは別の定数にする（同じ値にすると既存封筒の一致検査が巻き添えで壊れる）
+export const DECISIONS_PREAMBLE =
+  "The following entries were transcribed mechanically from the tagged lines of earlier summaries in this handoff chain; they were not re-summarized. A larger g means a more recent generation. For what a decision says, these transcribed lines are authoritative because they stay close to the original wording. For the current status of a decision (effective / retracted / already done), the explicit tags in the preceding summary are authoritative. Differences in wording are not contradictions: the same matter described in other words is not a conflict, so do not report it. Ask the user only when two statements about the same id collide head-on, such as the same id being named both effective and retracted. Do not rewrite these entries as new tagged lines; to change the status of an entry, name its id.";
 
 // 封筒 JSON の `preamble` として記録へ永続し、読み直しはこの値との完全一致で判定される
 // （R-HND-04。`handoff-envelope.ts#parseV2`）。表示文言ではなく記録上のトークンなので
@@ -101,24 +180,17 @@ export function stripAnalysis(raw: string): { body: string; unclosed: boolean } 
 
 export function countCompactHeadings(body: string): string[] {
   const lines = body.replace(/\r\n?/g, "\n").split("\n");
-  let inCodeBlock = false;
+  const fenced = createFenceTracker();
   const headings: string[] = [];
   const headingSet = new Set<string>(COMPACT_HEADINGS);
   const seen = new Set<string>();
 
   for (const line of lines) {
+    if (fenced(line)) continue;
     const trimmed = line.trim();
-    if (trimmed.startsWith("```")) {
-      inCodeBlock = !inCodeBlock;
-      continue;
-    }
-    if (inCodeBlock) {
-      continue;
-    }
     // 接頭辞は重なる（CLI の要約見出しは `## 1. Primary Request and Intent` の形）。
     // 番号・#・箇条書き・強調を全部剥がしてから照合する
-    const candidate = trimmed
-      .replace(/^(?:\d+[.)]\s*|#{1,6}\s*|[-*]\s*|\*\*|__)+/, "")
+    const candidate = normalizeSummaryLine(trimmed)
       .replace(/(?::\s*)?(?:\*\*|__)?\s*:?\s*$/, "")
       .trim();
     if (headingSet.has(candidate) && !seen.has(candidate)) {

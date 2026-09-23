@@ -185,8 +185,6 @@ export function checkClaudeCodeVersion(
         warning = l10n.t("Could not read the Claude Code CLI version, so compatibility is unverified") + (failure ? ` (${failure})` : "");
       } else if (!sdkVersion || !sdkMinor || !cliMinor) {
         warning = l10n.t("Could not parse the version formats of the Claude Code CLI and the SDK, so compatibility is unverified");
-      } else if (cliVersion !== sdkVersion) {
-        warning = l10n.t("Claude Code CLI {0} does not match the version the SDK expects ({1}). Check compatibility", cliVersion, sdkVersion);
       }
       resolveVersion({ cliVersion, sdkVersion, warning });
     };

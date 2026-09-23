@@ -3,4 +3,6 @@
 // 実物の reducer と projectWorkEvent を渡す（preview 側で注釈を再実装すると、
 // 実装とずれても preview だけが正しく見えてしまう）。
 export { createWorkModelState, reduceWorkModel } from "./work-model";
-export { projectWorkEvent, PROTOCOL_VERSION } from "./protocol";
+export { projectWorkEvent, projectWorkModel, PROTOCOL_VERSION } from "./protocol";
+export { createTimeBucketState, foldTimeBuckets, deriveTimeBuckets } from "./time-buckets";
+export { foldPlanUsage, projectPlanUsage } from "./plan-usage";

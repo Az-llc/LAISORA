@@ -2,22 +2,23 @@
 // createElement / addEventListener 等は各モジュールに残る。この入口が守るのは取得の評価順だけ。
 // テンプレート書き込みは init 関数に包まない: 値 import された時点で必ず走ることが、
 // 「要素取得はテンプレートより後」を規律ではなくモジュールグラフで保証する仕組みそのもの。
-// この保証は本モジュールが値 import を持たない葉であることに依存する（import を足すな）。
+// この保証は本モジュールの値 import が、import もトップレベルの DOM 参照も持たない葉（@vscode/l10n・./loader）
+// だけであることに依存する（それ以外の import を足すな）。
 import * as l10n from "@vscode/l10n";
+import { createLoader } from "./loader";
 import type { WebviewToHost } from "../protocol";
 
 type VsCodeWebviewApi = {
   postMessage(msg: WebviewToHost): void;
   getState():
-    | { activeTabId: string | null; drafts?: Record<string, string>; views?: Record<string, "conv" | "work">; analysisViews?: Record<string, "script" | "ai">; workViews?: Record<string, "summary" | "graph" | "analysis" | "log">; stripCards?: Record<string, boolean> }
+    | { activeTabId: string | null; drafts?: Record<string, string>; askChecks?: Record<string, Record<string, boolean[]>>; views?: Record<string, "conv" | "work">; analysisViews?: Record<string, "script" | "ai">; workViews?: Record<string, "summary" | "graph" | "analysis" | "log"> }
     | undefined;
   setState(s: {
     activeTabId: string | null;
-    drafts?: Record<string, string>;
+    drafts?: Record<string, string>; askChecks?: Record<string, Record<string, boolean[]>>;
     views?: Record<string, "conv" | "work">;
     analysisViews?: Record<string, "script" | "ai">;
     workViews?: Record<string, "summary" | "graph" | "analysis" | "log">;
-    stripCards?: Record<string, boolean>;
   }): void;
 };
 
@@ -131,6 +132,7 @@ analysisBusyEl.id = "analysis-busy";
 analysisBusyEl.setAttribute("role", "status");
 const analysisBusySpinner = document.createElement("span");
 analysisBusySpinner.className = "analysis-busy-spinner";
+analysisBusySpinner.append(createLoader());
 const analysisBusyLabel = document.createElement("span");
 analysisBusyLabel.textContent = l10n.t("Analyzing…");
 analysisBusyEl.append(analysisBusySpinner, analysisBusyLabel);
@@ -146,12 +148,14 @@ let analysisPendingButton: HTMLButtonElement | null = null;
 function setAnalysisPending(pending: boolean, button: HTMLButtonElement | null): void {
   if (analysisPendingTimer !== undefined) { clearTimeout(analysisPendingTimer); analysisPendingTimer = undefined; }
   analysisPendingButton?.classList.remove("is-analysis-pending");
+  analysisPendingButton?.querySelector(".loader")?.remove();
   analysisPendingButton?.removeAttribute("aria-busy");
   analysisPendingButton = button;
   analysisBusyEl.classList.toggle("on", pending);
   document.querySelectorAll<HTMLButtonElement>("[data-analysis-trigger]").forEach((el) => { el.disabled = pending; });
   if (!pending) return;
   button?.classList.add("is-analysis-pending");
+  button?.append(createLoader(12));
   button?.setAttribute("aria-busy", "true");
   analysisPendingTimer = setTimeout(() => setAnalysisPending(false, null), ANALYSIS_PENDING_TIMEOUT_MS);
 }

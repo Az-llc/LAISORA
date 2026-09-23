@@ -16,6 +16,7 @@ import {
   type FoldEffect,
   type FoldEventResult,
 } from "./event-fold";
+import { handoffDecisionLineCount } from "./handoff-envelope";
 import { output } from "./host-context";
 import {
   EventProvenance,
@@ -23,6 +24,7 @@ import {
   NormalizedEventBody,
   ResumeHydrationPhase,
   ResumePreviewMessage,
+  restoredHandoffRunId,
   WebviewToHost,
 } from "./protocol";
 import { createGuardrailState } from "./guardrail";
@@ -40,6 +42,7 @@ import {
   readSubagentAgents,
   type HistoryEvent,
   type ResumeReadSet,
+  type SessionTranscript,
 } from "./session-transcript";
 import {
   Session,
@@ -321,6 +324,8 @@ export async function openResumedSession(
     try {
       readSetT0 = Date.now();
       readSet = await captureResumeReadSet(req.filePath);
+      // Resume keeps the transcript model unless explicitly overridden (CLI resume behaviour).
+      s.recordedModel = readSet.recordedModel;
       // 推定を read-set と同じ try に入れるのは、読み取り失敗の扱い（read-set 無しで続行）が同じであるため
       if (recordedCwd === undefined) {
         const recorded = await readRecordedSessionCwd(req.filePath);
@@ -384,7 +389,7 @@ export async function openResumedSession(
     let previewMessages: ResumePreviewMessage[] = [];
     const previewT0 = Date.now();
     try {
-      previewMessages = await readResumePreviewTail(req.filePath);
+      previewMessages = await readResumePreviewTail(req.filePath, req.sessionId);
     } catch (error) {
       output.appendLine(`[${s.title}] resume preview 取得に失敗: ${String(error)}`);
     }
@@ -397,6 +402,16 @@ export async function openResumedSession(
       return { tabPosted, session: undefined };
     }
     hydration.previewMessages = previewMessages;
+    let transcript: SessionTranscript | undefined;
+    if (s.recordedModel === undefined) {
+      transcript = await readSessionTranscript(req.filePath, isInSessionStore, readSet, req.sessionId);
+      if (s.closed || st.sessions.get(s.tabId) !== s || s.hydration !== hydration || s.logicalGeneration !== hydration.logicalGeneration) {
+        if (s.hydration === hydration) s.finalizeHydrationFailure(hydration, "cancelled", false);
+        return { tabPosted, session: undefined };
+      }
+      s.recordedModel = transcript.recordedModel;
+      if (s.recordedModel !== undefined) st.post({ type: "tabCleared", tab: s.resumePreviewSnapshot(hydration) });
+    }
     if (previewMessages.length > 0) {
       st.post({
         type: "resumeHydrationState",
@@ -415,7 +430,7 @@ export async function openResumedSession(
     lagProbe.stop();
     // post と warmup の間に hydration 処理を挟まない
     warmup(s);
-    await runResumeHydration(st, s, hydration);
+    await runResumeHydration(st, s, hydration, transcript);
   } catch (e) {
     output.appendLine(`[${s.title}] resume 失敗: ${String(e)}`);
     // phase === "complete" は commit 済み。commit 後に走る flushHydrationPosts /
@@ -702,7 +717,7 @@ function replayJournalInto(
 }
 
 // Phase 2/3。Phase 1（read-set 捕捉・preview post・warmup）は resumeSession 側にある
-async function runResumeHydration(st: SessionStore, s: Session, h: ResumeHydration): Promise<void> {
+async function runResumeHydration(st: SessionStore, s: Session, h: ResumeHydration, capturedTranscript?: SessionTranscript): Promise<void> {
   const invalidated = (): boolean =>
     s.closed ||
     st.sessions.get(s.tabId) !== s ||
@@ -719,11 +734,16 @@ async function runResumeHydration(st: SessionStore, s: Session, h: ResumeHydrati
     }
     s.finalizeHydrationFailure(h, "cancelled", !s.closed && st.sessions.get(s.tabId) === s);
   };
-  const historyOpts = h.readSet === undefined ? undefined : { resumeReadSet: h.readSet };
+  // generationSessionId は events を切らない。会話面が前世代の圧縮境界を落とすための印だけが付く（R-HND-13）
+  const historyOpts = {
+    ...(h.readSet === undefined ? {} : { resumeReadSet: h.readSet }),
+    generationSessionId: h.sessionId,
+  };
 
-  const transcript = await readSessionTranscript(h.filePath, isInSessionStore, h.readSet);
+  const transcript = capturedTranscript ?? await readSessionTranscript(h.filePath, isInSessionStore, h.readSet, h.sessionId);
   if (invalidated()) return abort("読み取り中にセッションが変化しました");
   const { title, messages } = transcript;
+  s.recordedModel = transcript.recordedModel ?? s.recordedModel;
   if (transcript.readError) {
     output.appendLine(`[${s.title}] resume transcript read failed: ${transcript.readError}`);
   } else if (
@@ -883,6 +903,7 @@ async function runResumeHydration(st: SessionStore, s: Session, h: ResumeHydrati
       uuid: m.uuid,
       ...(m.imageRefs && m.imageRefs.length > 0 ? { imageRefs: m.imageRefs } : {}),
       ...(m.model ? { model: m.model } : {}),
+      ...(m.timestamp > 0 ? { recordedAt: m.timestamp } : {}),
     });
     const pending = maybeYield();
     if (pending) {
@@ -892,9 +913,11 @@ async function runResumeHydration(st: SessionStore, s: Session, h: ResumeHydrati
   }
 
   // 会話ページングの登録を Phase 3 より前に済ませる（Phase 2 / FP-C7）
-  const conversation = await readConversationMessages(h.filePath, isInSessionStore, h.readSet);
+  const conversation = await readConversationMessages(h.filePath, isInSessionStore, h.readSet, h.sessionId);
   if (invalidated()) return abort("会話履歴読み取り中にセッションが変化しました");
 
+  // カードを出す条件は会話面を切る述語と同じ（R-HND-09）。片方だけが真になると、
+  // 前世代が消えたのに到達する導線が無いタブができる
   if (conversation.handoffEnvelope?.snapshot.forkSessionId === h.sessionId) {
     const sourceId = conversation.handoffEnvelope.snapshot.sourceSessionId;
     const existingSource = [...st.sessions.values()].find(
@@ -907,6 +930,10 @@ async function runResumeHydration(st: SessionStore, s: Session, h: ResumeHydrati
         ? { compact: conversation.handoffEnvelope.snapshot.compact }
         : {}),
       utteranceCount: conversation.handoffEnvelope.userUtterances.length,
+      ...(conversation.handoffEnvelope.decisions !== undefined
+        ? { decisionCount: handoffDecisionLineCount(conversation.handoffEnvelope.decisions) }
+        : {}),
+      detailRunId: restoredHandoffRunId(h.sessionId),
     };
   }
 

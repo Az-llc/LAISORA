@@ -1,4 +1,5 @@
 {
+  "config.laisora.learning.enabled.description": "Deliver learned rules, provide the learning record tool, and record deliveries and model changes in laisora-learning, with or without orchestration. Applies at the next conversation process start. Disabled by default; when disabled, learning records are not read or written.",
   "extension.description": "Focus on conversations with AI agents, review their work, and turn work logs into improvements inside VS Code.",
   "capabilities.untrustedWorkspaces": "Trust this workspace before running Claude Code.",
   "command.laisora.open.title": "LAISORA: Open",
@@ -14,16 +15,22 @@
   "config.laisora.defaultCwd.description": "Working directory for new conversations. Leave empty to use the open workspace.",
   "config.laisora.tabLimit.description": "Maximum number of open conversation tabs. Also determines history inspection limits.",
   "config.laisora.restoreTabsOnStartup.description": "Reopen the conversation tabs that were open when the window was last closed or reloaded. Tabs that never sent a message are not restored.",
+  "config.laisora.claude.planInstruction.description": "Ask Claude to maintain plans and show decisions and real-machine checks as structured blocks. Applies to conversations started or resumed afterwards; running conversations are not changed.",
   "config.laisora.claude.fileLinkInstruction.description": "Ask Claude to write local files as Markdown links that open in the editor (sent as a short system prompt). Takes effect in conversations started or resumed afterwards, not in running ones: changing the system prompt mid-conversation invalidates the prompt cache, so the next reply would resend the whole conversation.",
   "config.laisora.fileLinks.revealInExplorer.description": "When a file link is clicked in the LAISORA editor tab, also select the file in the Explorer. Links clicked in the LAISORA side bar never do this, because the Explorer would replace the conversation there. Files outside the workspace are never selected in the Explorer.",
   "config.laisora.fileLinks.allowOutsideWorkspace.description": "Open Markdown file links in conversations even when the file is outside the workspace and the conversation folder. Network shares (UNC paths) and device paths are always refused and never become links. User setting only.",
   "config.laisora.fileLinks.confirmOutsideWorkspace.description": "Ask before opening a file outside the workspace. Used only when laisora.fileLinks.allowOutsideWorkspace is on. User setting only.",
   "config.laisora.fileLinks.openOutsideReadOnly.description": "Open files outside the workspace in a read-only editor that cannot save them. Files inside the workspace open normally. Used only when laisora.fileLinks.allowOutsideWorkspace is on. User setting only.",
-  "config.laisora.composer.sendKey.description":"Key that sends the message box contents. The other combination inserts a new line.",
+  "config.laisora.composer.sendKey.description": "Key that sends the message box contents. The other combination inserts a new line.",
   "config.laisora.composer.sendKey.enter": "Enter sends; Shift+Enter inserts a new line.",
   "config.laisora.composer.sendKey.shiftEnter": "Shift+Enter sends; Enter inserts a new line.",
   "config.laisora.interruptForceKillTimeoutMs.description": "Milliseconds to wait after a stop request before forcing the process to exit.",
   "config.laisora.guardrail.autoMaxLevel.description": "Automatic intervention limit: 0 = none, 1 = warning, 2 = steering, 3 = escalation. Reports to the running model are separate from this limit. Never automatically interrupts.",
   "config.laisora.progressTracking.description": "Use instrument to provide the model with a progress-reporting tool. Other values do not add that tool. Existing recorded progress is still read.",
-  "config.laisora.claude.remoteControlAtStartup.description": "Enable Remote Control for conversations started by LAISORA. Does not change the shared Claude Code settings file."
+  "config.laisora.claude.remoteControlAtStartup.description": "Enable Remote Control for conversations started by LAISORA. Does not change the shared Claude Code settings file.",
+  "config.laisora.orchestration.enabled.description": "Enable agent orchestration; takes effect from the next session.",
+  "config.laisora.orchestration.agents.description": "Agent roster used by the conductor; takes effect from the next session.",
+  "config.laisora.orchestration.conductorPolicy.description": "Additional user policy appended after the generated conductor instruction; takes effect from the next session.",
+  "config.orchestration.externalTimeoutMinutes": "External executor wait limit in minutes; takes effect from the next session.",
+  "config.laisora.fileLinks.openWithSystemApp.description": "Extensions opened with the OS default app inside the workspace and conversation folder. Use lowercase extensions with a leading dot. Executable and script extensions are ignored. User setting only."
 }

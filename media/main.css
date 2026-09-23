@@ -13,6 +13,8 @@ html, body {
   overflow: hidden;
 }
 #app {
+  --pane-padding: 20px;
+  --view-nav-width: 28px;
   display: flex;
   flex-direction: column;
   height: 100vh;
@@ -350,24 +352,155 @@ button#auth.chip:hover { filter: brightness(1.15); }
 #logs {
   flex: 1 1 auto;
   overflow-y: auto;
-  padding: 12px 14px;
+  padding: 0 var(--pane-padding) 12px;
   scrollbar-gutter: stable;
 }
 .log { display: none; }
-.log.active { display: block; max-width: 860px; margin: 0 auto; }
+.log.active { display: grid; grid-template-columns: var(--view-nav-width) minmax(0, 1fr); width: 100%; }
+/* Both columns start at the scroll port's top edge; the header owns the top spacing. */
+.log-content { container: log-content / inline-size; --conv-gutter: 24px; box-sizing: border-box; min-width: 0; width: 100%; padding-left: calc(var(--pane-padding) - 12px); }
 
-/* ---------- 会話 / 作業ログ の表示切替（セッション内部・tablist） ---------- */
-/* sticky ヘッダ。切替タブとステータス帯をまとめ、どちらのパネルでも常に見える位置に置く */
+/* Sticky content header beside the session navigation. */
 .log-head {
+  container: session-header / inline-size;
   position: sticky;
-  /* #logs の padding-top(12px) を打ち消して端まで貼り付ける */
-  top: -12px;
-  margin: -12px -14px 8px -14px;
+  /* The content wrapper is the containing block; pin inside the scroll port. */
+  top: 0;
+  margin: 0 0 8px;
+  /* Paint the top spacing and include it in --log-head-h and the TODO panel cap. */
+  padding-top: 12px;
+  padding-bottom: 13px;
   z-index: 6;
   background: var(--vscode-editor-background);
 }
-.session-heading { display: flex; align-items: center; gap: 8px; min-width: 0; padding: 3px 14px 0; min-height: 26px; }
-.session-heading-title { flex: 0 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-weight: 600; }
+.log-head::after { content: ""; position: absolute; left: var(--conv-gutter); right: 0; bottom: 0; height: 1px; background: var(--vscode-panel-border); }
+.plan-chat { display: grid; grid-template-columns: minmax(0, 1fr); align-items: start; }
+.plan-chat[hidden] { display: none; }
+.plan-side { display: none; min-width: 0; box-sizing: border-box; }
+.plan-side-you:empty { display: none; }
+.plan-side-you { margin-bottom: 24px; }
+.you-section, .wo-plan-you { font-size: 13px; line-height: 1.7; word-break: auto-phrase; text-wrap: pretty; font-variant-numeric: tabular-nums; }
+.you-section { border-bottom: 1px solid var(--vscode-panel-border); }
+.you-label, .you-kind, .earlier-label { font-size: 10px; font-weight: 600; line-height: 1.4; letter-spacing: .08em; font-feature-settings: "palt"; color: var(--vscode-descriptionForeground); }
+.you-label { color: var(--vscode-textLink-foreground); }
+.you-heading { font-size: 14px; font-weight: 700; line-height: 1.4; margin: 4px 0; text-wrap: balance; font-feature-settings: "palt"; }
+.you-lede, .you-empty, .you-summary { font-size: 11.5px; line-height: 1.5; color: var(--vscode-descriptionForeground); margin: 0 0 12px; }
+.you-item { display: grid; grid-template-columns: 44px minmax(0, 1fr); padding: 12px 0; border-top: 1px solid var(--vscode-panel-border); }
+.you-square { width: 7px; height: 7px; margin-top: 8px; box-sizing: border-box; background: var(--vscode-textLink-foreground); }
+.you-title { display: flex; align-items: baseline; gap: 8px; }
+.you-title-text { min-width: 0; overflow-wrap: anywhere; }
+.you-link, .earlier-expand { border: 0; padding: 0; background: none; color: var(--vscode-descriptionForeground); cursor: pointer; font-family: inherit; }
+.you-link { margin-left: auto; flex: none; font-size: 11.5px; line-height: 1.5; }
+.you-link:hover, .earlier-expand:hover { text-decoration: underline; }
+.you-summary { margin: 4px 0 0; overflow-wrap: anywhere; }
+.you-resolved .you-square { background: none; border: 1px solid var(--vscode-descriptionForeground); }
+.you-resolved .you-title-text { color: var(--vscode-descriptionForeground); text-decoration: line-through; }
+.laisora-ask.flash, .block.approval.flash { outline: 2px solid var(--vscode-textLink-foreground); outline-offset: 4px; }
+.work-overview { container: summary / inline-size; }
+.wo-plan-you { display: grid; grid-template-columns: minmax(0, 1.35fr) minmax(0, 1fr); grid-template-rows: auto auto minmax(20px, auto) auto auto; column-gap: 44px; padding: 16px 0 16px var(--conv-gutter); }
+.wo-plan-column, .wo-you { min-width: 0; }
+.plan-section-head { display: grid; grid-template-rows: auto auto minmax(20px, auto); position: relative; padding-top: 12px; }
+.plan-section-head::before { content: ""; position: absolute; top: 0; left: 0; width: 24px; height: 2px; background: var(--vscode-textLink-foreground); }
+.plan-section-head > .plan-top { min-height: 20px; }
+.plan-section-head > p { align-self: start; }
+.you-empty { border-top: 1px solid var(--vscode-panel-border); padding-top: 12px; }
+.wo-plan-column, .wo-you { display: grid; grid-template-rows: subgrid; grid-row: 1 / span 5; }
+.wo-plan-column { grid-column: 1; }
+.wo-you { grid-column: 2; }
+.wo-plan-you .plan-section, .wo-plan-you .you-section { display: grid; grid-template-rows: subgrid; grid-row: 1 / span 4; border-bottom: 0; }
+.wo-plan-you .plan-section[hidden] { display: none; }
+.wo-plan-you .plan-section-head { grid-row: 1 / span 3; grid-template-rows: subgrid; }
+.wo-plan-you .plan-section-body, .wo-plan-you .you-section-body { align-self: start; border-bottom: 1px solid var(--vscode-panel-border); }
+.wo-plan-column > .earlier-requests { grid-row: 5; }
+.earlier-requests { margin-top: 24px; }
+.earlier-label { margin: 0 0 8px; text-wrap: balance; }
+.earlier-row { display: grid; grid-template-columns: 80px minmax(0, 1fr) auto; gap: 8px; align-items: baseline; width: 100%; border: 0; border-top: 1px solid var(--vscode-panel-border); padding: 8px 0; background: none; font: inherit; text-align: left; color: var(--vscode-descriptionForeground); cursor: pointer; }
+.earlier-row:disabled { cursor: default; opacity: 1; }
+.earlier-row:not(:disabled):hover .earlier-title { text-decoration: underline; }
+.earlier-at, .earlier-stats, .earlier-empty { font-size: 11.5px; line-height: 1.5; }
+.earlier-title { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-weight: 700; color: var(--vscode-foreground); }
+.earlier-stats { text-align: right; }
+.earlier-expand { font-size: 11.5px; line-height: 1.5; margin-top: 8px; }
+@container summary (width < 900px) {
+  .wo-plan-you { grid-template-columns: minmax(0, 1fr); grid-template-rows: auto auto; gap: 24px; }
+  .wo-plan-column, .wo-you { display: block; grid-row: auto; grid-column: 1; }
+  .wo-plan-you .plan-section, .wo-plan-you .you-section { display: block; }
+  .wo-plan-you .plan-section-head { grid-template-rows: auto auto minmax(20px, auto); }
+  .wo-you { order: -1; }
+}
+@container summary (width < 500px) {
+  .earlier-row { grid-template-columns: 80px minmax(0, 1fr); }
+  .earlier-stats { grid-column: 2; }
+}
+.plan-section { border-bottom: 1px solid var(--vscode-panel-border); }
+.plan-top { display: flex; align-items: baseline; gap: 8px; }
+.plan-label { font-size: 10px; font-weight: 600; letter-spacing: .08em; color: var(--vscode-descriptionForeground); white-space: nowrap; }
+.plan-stats { margin-left: auto; font-size: 11.5px; text-align: right; }
+.plan-stats, .plan-metric, .plan-step-metric, .plan-bar-stats { color: var(--vscode-descriptionForeground); font-variant-numeric: tabular-nums; }
+.plan-goal { font-size: 14px; font-weight: 700; line-height: 1.4; margin: 4px 0 4px; overflow-wrap: anywhere; }
+.plan-lede { font-size: 11.5px; color: var(--vscode-descriptionForeground); margin: 0 0 12px; }
+.plan-item { display: grid; grid-template-columns: 44px minmax(0, 1fr); padding: 12px 0; border-top: 1px solid var(--vscode-panel-border); position: relative; }
+.plan-number { font-size: 28px; font-weight: 300; line-height: 1; color: var(--vscode-descriptionForeground); padding-top: 0; }
+.plan-done .plan-number { opacity: .45; }
+.plan-current .plan-number { color: var(--vscode-textLink-foreground); }
+.plan-current::before, .plan-ahead::before { content: ""; position: absolute; left: -12px; top: 12px; bottom: 12px; border-left: 2px solid var(--vscode-textLink-foreground); }
+.plan-ahead:not(.plan-current)::before { border-left: 2px dotted var(--vscode-descriptionForeground); }
+.plan-ahead::before { border-left-style: dotted; }
+.plan-title { display: flex; align-items: baseline; flex-wrap: wrap; gap: 4px 8px; font-size: 13px; font-weight: 700; overflow-wrap: anywhere; }
+.plan-step-title { flex: 1 1 130px; }
+.plan-status { margin-left: auto; font-size: 11.5px; font-weight: 600; color: var(--vscode-descriptionForeground); }
+.plan-mark { font-size: 10px; font-weight: 600; letter-spacing: .08em; }
+.plan-removed .plan-step-title { text-decoration: line-through; }
+.plan-removed, .plan-done .plan-title { color: var(--vscode-descriptionForeground); }
+.plan-step-metric { font-size: 11.5px; margin: 4px 0; }
+.plan-lane { display: grid; grid-template-columns: auto minmax(0, 1fr) auto; gap: 4px 8px; align-items: baseline; font-size: 11.5px; padding: 4px 0; }
+.plan-agent { color: var(--vscode-descriptionForeground); font-size: 10px; font-weight: 600; letter-spacing: .08em; text-transform: uppercase; overflow-wrap: anywhere; max-width: 110px; }
+.plan-lane-title { overflow-wrap: anywhere; }
+.plan-metric { justify-self: end; font-size: 11.5px; white-space: nowrap; }
+.plan-now { border-top: 1px solid var(--vscode-panel-border); padding: 12px 0; }
+.plan-bar { display: flex; align-items: baseline; box-sizing: border-box; width: calc(100% - var(--conv-gutter) - 12px); gap: 8px; margin: 8px 12px 0 var(--conv-gutter); padding: 0; border: 0; color: var(--vscode-foreground); background: var(--vscode-editor-background); font: inherit; text-align: left; cursor: pointer; }
+.log-head[data-view="work"] .plan-bar, .plan-empty { display: none; }
+.plan-bar-count { font-size: 11.5px; color: var(--vscode-descriptionForeground); font-variant-numeric: tabular-nums; white-space: nowrap; }
+.plan-bar-count:empty, .plan-bar-number:empty, .plan-bar-stats:empty { display: none; }
+.plan-bar-number { font-size: 18px; font-weight: 300; line-height: 1; font-variant-numeric: tabular-nums; color: var(--vscode-textLink-foreground); }
+.plan-bar-current { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 13px; font-weight: 600; }
+.plan-bar-stats { white-space: nowrap; font-size: 11.5px; }
+.plan-bar-waiting { margin-left: auto; white-space: nowrap; }
+.plan-bar-waiting:empty { display: none; }
+.plan-bar-chevron { color: var(--vscode-descriptionForeground); }
+.plan-drawer { position: fixed; inset: 0 0 0 auto; margin: 0; width: min(420px, 100vw); max-width: 100vw; height: 100dvh; max-height: 100dvh; padding: 16px 24px; box-sizing: border-box; border: 0; border-left: 1px solid var(--vscode-panel-border); background: var(--vscode-editor-background); color: var(--vscode-foreground); overflow-y: auto; }
+.plan-drawer::backdrop { background: var(--vscode-widget-shadow); }
+.plan-drawer[open] .plan-side { display: block; position: static; width: auto; max-height: none; overflow: visible; }
+.plan-drawer-close { display: block; margin: 0 0 8px auto; background: var(--vscode-editor-background); color: var(--vscode-foreground); border: 0; font-size: 18px; cursor: pointer; }
+.plan-section { line-height: 1.7; word-break: auto-phrase; text-wrap: pretty; font-variant-numeric: tabular-nums; }
+.plan-goal, .plan-title { text-wrap: balance; font-feature-settings: "palt"; }
+.plan-label, .plan-agent, .plan-mark, .plan-status { font-feature-settings: "palt"; line-height: 1.4; }
+.plan-label, .plan-mark { text-transform: uppercase; }
+.plan-lede, .plan-lane, .plan-metric, .plan-step-metric, .plan-stats { line-height: 1.5; }
+.plan-mark, .plan-bar-waiting { color: var(--vscode-descriptionForeground); }
+.plan-bar-waiting { font-size: 11.5px; }
+.plan-failed .plan-metric { color: var(--vscode-errorForeground); }
+@container log-content (min-width: 1100px) {
+  .plan-chat { grid-template-columns: minmax(0, 1fr) 380px; gap: 44px; }
+  .plan-chat > .plan-side { display: block; position: sticky; top: var(--log-head-h, 0px); align-self: start; padding: 8px 0 0 12px; max-height: calc(100dvh - var(--log-head-h, 0px) - 100px); overflow-y: auto; scrollbar-width: thin; }
+  .plan-chat > .plan-side.plan-empty { display: none; }
+  .plan-chat:has(> .plan-side.plan-empty) { grid-template-columns: minmax(0, 1fr); }
+  .plan-bar { display: none; }
+}
+@container log-content (min-width: 1500px) {
+  .plan-chat:has(> .plan-side > .plan-section:not([hidden])) { grid-template-columns: minmax(0, 1fr) 816px; }
+  .plan-chat > .plan-side:has(> .plan-section:not([hidden])) { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); grid-template-rows: auto auto minmax(20px, auto) auto; column-gap: 44px; align-content: start; }
+  .plan-side:has(> .plan-section:not([hidden])) > .plan-side-you, .plan-side:has(> .plan-section:not([hidden])) > .plan-side-you > .you-section, .plan-chat > .plan-side > .plan-section:not([hidden]) { display: grid; grid-template-rows: subgrid; grid-row: 1 / span 4; min-width: 0; margin-bottom: 0; border-bottom: 0; }
+  .plan-side:has(> .plan-section:not([hidden])) .plan-section-head { grid-row: 1 / span 3; grid-template-rows: subgrid; }
+  .plan-side:has(> .plan-section:not([hidden])) .plan-section-body, .plan-side:has(> .plan-section:not([hidden])) .you-section-body { align-self: start; }
+}
+.plan-done-toggle { display: block; box-sizing: border-box; width: 100%; padding: 12px 0; border: 0; border-top: 1px solid var(--vscode-panel-border); background: none; color: var(--vscode-descriptionForeground); font: inherit; font-size: 11.5px; line-height: 1.5; font-variant-numeric: tabular-nums; text-align: left; cursor: pointer; }
+.plan-done-toggle:focus-visible { outline: 1px solid var(--vscode-focusBorder); outline-offset: -1px; }
+.session-header { display: flex; align-items: center; min-width: 0; }
+.session-heading-block { flex: 1 1 0; min-width: 0; }
+.session-heading { display: flex; align-items: center; gap: 8px; min-width: 0; padding: 3px 12px 0 var(--conv-gutter); min-height: 26px; }
+.session-heading-title { flex: 0 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 18px; line-height: 1.4; font-weight: 700; }
+.session-heading-title::before { content: ""; display: block; width: 24px; height: 2px; margin-bottom: 8px; background: var(--vscode-textLink-foreground); }
 .session-rename-icon { flex: none; opacity: 0; padding: 2px 4px; border: 0; border-radius: 3px; background: transparent; color: var(--vscode-descriptionForeground); cursor: pointer; }
 .session-heading:hover .session-rename-icon, .session-heading:focus-within .session-rename-icon { opacity: 1; }
 .session-rename-icon:hover { background: var(--vscode-toolbar-hoverBackground); }
@@ -394,14 +527,28 @@ button#auth.chip:hover { filter: brightness(1.15); }
 #session-actions-slot :focus-visible { outline: 1px solid var(--vscode-focusBorder); outline-offset: 1px; }
 .session-heading :focus-visible { outline: 1px solid var(--vscode-focusBorder); outline-offset: 1px; }
 .view-switch {
-  display: flex;
-  justify-content: space-between;
-  align-items: flex-end;
-  gap: 8px;
-  padding: 6px 14px 0;
-  border-bottom: 1px solid var(--vscode-panel-border);
+  width: var(--view-nav-width);
+  position: sticky;
+  top: 0;
+  align-self: start;
+  height: var(--view-nav-h, 0px);
+  max-height: 100%;
+  min-height: 0;
+  overflow-y: auto;
+  overflow-x: hidden;
+  scrollbar-width: thin;
+  background: var(--vscode-editor-background);
 }
-.view-switch-tabs { display: flex; gap: 2px; }
+.view-switch-tabs { display: flex; flex-direction: column; padding-top: 17px; }
+.pane-progress-row { display: flex; flex: 0 1 auto; align-items: center; justify-content: flex-end; flex-wrap: wrap; gap: 8px; min-width: 0; max-width: calc(100% - 140px); margin-right: 12px; text-align: right; }
+.pane-progress-row:not(:has(> :not(.hidden))) { display: none; }
+@container session-header (width < 560px) {
+  .session-header { flex-wrap: wrap; row-gap: 6px; }
+  .session-heading-block { flex-basis: 140px; }
+  .pane-progress-row { max-width: calc(100% - 24px); margin-left: auto; }
+  /* R-HND-08: stalled は装飾ではなく警告なので狭幅でも残す。 */
+  .handoff-status-playful:not(.stalled) { display: none; }
+}
 
 /* 過去ログの裏読みの進行。読み終わると消えるので、会話本文の領域は一切使わない */
 .conv-load {
@@ -409,12 +556,11 @@ button#auth.chip:hover { filter: brightness(1.15); }
   align-items: center;
   gap: 6px;
   min-width: 0;
-  padding-bottom: 6px;
   font-size: 11px;
   color: var(--vscode-descriptionForeground);
 }
 .conv-load.hidden { display: none; }
-.conv-load-icon { display: inline-block; }
+.conv-load-icon { display: inline-block; flex: none; }
 /* 幅が足りないときは文言から削る。数字を含む末尾ではなく先頭から詰めると残件が消える */
 .conv-load-text {
   overflow: hidden;
@@ -444,25 +590,18 @@ button#auth.chip:hover { filter: brightness(1.15); }
 }
 .conv-load-retry.hidden { display: none; }
 .conv-load-retry:focus-visible { outline: 1px solid var(--vscode-focusBorder); }
-.conv-load:not(.failed) .conv-load-icon { animation: conv-load-spin 1s linear infinite; }
-@media (prefers-reduced-motion: reduce) {
-  .conv-load .conv-load-icon { animation: none; }
-}
-@keyframes conv-load-spin {
-  to { transform: rotate(360deg); }
-}
-/* 引き継ぎの進行・失敗。裏読みの進行と同じ行・同じ見た目で右端に並ぶ */
+
+/* 進行をヘッダー内で収め、中止ボタンの幅は文言より優先する（R-HND-08）。 */
 .handoff-status {
   display: flex;
   align-items: center;
   gap: 6px;
   min-width: 0;
-  padding-bottom: 6px;
   font-size: 11px;
   color: var(--vscode-descriptionForeground);
 }
 .handoff-status.hidden { display: none; }
-.handoff-status-icon { display: inline-block; }
+.handoff-status-icon { display: inline-block; flex: none; }
 .handoff-status-lines {
   /* flex 項目になるので min-width を 0 にしないと handoff-status-text の省略記号が効かない */
   min-width: 0;
@@ -483,10 +622,6 @@ button#auth.chip:hover { filter: brightness(1.15); }
   color: var(--vscode-errorForeground);
 }
 .handoff-status.failed .handoff-status-icon { color: var(--vscode-errorForeground); }
-.handoff-status:not(.failed) .handoff-status-icon { animation: conv-load-spin 1s linear infinite; }
-@media (prefers-reduced-motion: reduce) {
-  .handoff-status .handoff-status-icon { animation: none; }
-}
 .handoff-status-cancel {
   flex: 0 0 auto;
   border: none;
@@ -546,41 +681,34 @@ button#auth.chip:hover { filter: brightness(1.15); }
 
 .view-switch-tab {
   position: relative;
-  display: inline-flex;
+  display: flex;
+  writing-mode: vertical-rl;
   align-items: center;
+  flex: none;
   gap: 6px;
-  border: none;
-  background: transparent;
+  width: 100%;
+  border: 0;
+  background: var(--vscode-editor-background);
   color: var(--vscode-descriptionForeground);
-  font-size: 12px;
-  padding: 4px 10px 6px;
+  font-size: 10px;
+  line-height: 1.2;
+  letter-spacing: 0.08em;
+  padding: 6px 0 16px;
   cursor: pointer;
-  border-bottom: 2px solid transparent;
-  /* 狭い幅でも文言が折れない */
   white-space: nowrap;
 }
-.view-switch-tab:hover { color: var(--vscode-foreground); }
+.view-switch-number { font-variant-numeric: tabular-nums; }
+.view-switch-label { text-transform: uppercase; }
 .view-switch-tab.active {
-  color: var(--vscode-foreground);
+  color: var(--vscode-textLink-foreground, var(--vscode-focusBorder));
   font-weight: 600;
-  border-bottom-color: var(--vscode-focusBorder);
+  box-shadow: inset -2px 0 var(--vscode-textLink-foreground, var(--vscode-focusBorder));
 }
 .view-switch-tab:focus-visible {
   outline: 1px solid var(--vscode-focusBorder);
   outline-offset: -1px;
   border-radius: 3px;
 }
-.view-switch-badge {
-  min-width: 15px;
-  padding: 0 4px;
-  border-radius: 7px;
-  font-size: 10px;
-  line-height: 15px;
-  text-align: center;
-  background: var(--vscode-badge-background);
-  color: var(--vscode-badge-foreground);
-}
-.view-switch-badge.hidden { display: none; }
 /* 応答が要る／致命的な問題が出たことを、作業ログ表示中でも見落とさせない */
 .view-switch-tab.needs-attention { color: var(--vscode-errorForeground); font-weight: 600; }
 .view-switch-tab.needs-attention::after {
@@ -594,7 +722,7 @@ button#auth.chip:hover { filter: brightness(1.15); }
 /* 打鍵ごとの会話全体の再描画を止める。.panel-work へ広げない（fixed の .work-inspector が閉じ込められる）。-8px は包含で先頭の子の上 margin が .log-head の margin-bottom と相殺しなくなる分の打ち消しで、先頭に来うる子（.block / .convlog-history-note）の上 margin が 8px 以上である前提。clip-margin は .flash の outline 用 */
 .panel-conv { contain: layout paint; margin-top: -8px; overflow-clip-margin: 6px; }
 
-/* 作業ログのターン区切り（会話側の「ログを見る」からの着地点）。見出し = 人の発言 1 行目（R-TAB-06） */
+/* 作業ログのターン区切り。見出し = 人の発言 1 行目（R-TAB-06） */
 .worklog-turn {
   display: flex;
   align-items: baseline;
@@ -659,27 +787,10 @@ button#auth.chip:hover { filter: brightness(1.15); }
   pointer-events: none;
 }
 #analysis-busy.on { display: flex; }
-.analysis-busy-spinner,
-button[data-analysis-trigger].is-analysis-pending::after {
-  content: "";
-  display: inline-block;
-  width: 0.75em;
-  height: 0.75em;
-  border: 1px solid color-mix(in srgb, currentColor 40%, transparent);
-  border-top-color: currentColor;
-  border-radius: 50%;
-  animation: analysis-pending-spin 0.7s linear infinite;
-}
+.analysis-busy-spinner { display: inline-flex; }
 button[data-analysis-trigger].is-analysis-pending { cursor: progress; }
-button[data-analysis-trigger].is-analysis-pending::after { margin-left: 0.45em; vertical-align: -0.05em; }
-/* disabled の減光で回転が見えなくなるのを防ぐ */
+button[data-analysis-trigger].is-analysis-pending .loader { margin-left: 8px; vertical-align: middle; }
 button[data-analysis-trigger]:disabled.is-analysis-pending { opacity: 1; }
-@keyframes analysis-pending-spin { to { transform: rotate(1turn); } }
-@media (prefers-reduced-motion: reduce) {
-  .analysis-busy-spinner,
-  button[data-analysis-trigger].is-analysis-pending::after { animation: none; border-top-color: currentColor; }
-}
-
 /* 承認要求の参照行（操作は会話側。ここは監査用の記録だけ） */
 .block.worklog-approval-ref {
   font-size: 12px;
@@ -690,89 +801,98 @@ button[data-analysis-trigger]:disabled.is-analysis-pending { opacity: 1; }
 .block.worklog-approval-ref.allow { border-left-color: var(--vscode-testing-iconPassed, #2d7d46); }
 .block.worklog-approval-ref.deny { border-left-color: var(--vscode-errorForeground); }
 
-/* 会話側のターン要約チップ */
-.block.turn-summary {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  gap: 8px;
-  font-size: 11px;
-  color: var(--vscode-descriptionForeground);
-  padding: 2px 12px;
-}
-.turn-summary-link {
-  border: none;
-  background: transparent;
-  color: var(--vscode-textLink-foreground);
-  font-size: 11px;
-  padding: 1px 4px;
-  cursor: pointer;
-  border-radius: 3px;
-}
-.turn-summary-link:hover { text-decoration: underline; }
-.turn-summary-link:focus-visible { outline: 1px solid var(--vscode-focusBorder); }
-
-/* ---------- 稼働中ステータスストリップ（sticky） ---------- */
-/* sticky は親の .log-head が担うため、ここでは位置指定しない（二重stickyを避ける） */
-.status-strip-wrap {
-  background: var(--vscode-editor-background);
-}
-.status-strip-wrap.hidden { display: none; }
-.status-strip {
+/* 返信フッター（R-CNV-15）。`.block` は付けない（会話面の行を数える検査と
+   `.block` の余白規則に返信フッターが混ざる）。常時表示は最新の返信だけで、
+   それ以外は返信か自身への hover / focus-within で出す */
+.reply-footer {
   display: flex;
   align-items: center;
   gap: 6px;
-  padding: 4px 14px;
   font-size: 11px;
   color: var(--vscode-descriptionForeground);
-  background: var(--vscode-editorWidget-background, var(--vscode-editor-background));
-  border-bottom: 1px solid var(--vscode-panel-border);
+  margin: 0 0 8px;
+  padding: 0 12px 0 0;
+  opacity: 0;
+  pointer-events: none;
+}
+.reply-footer[data-latest] { opacity: 1; pointer-events: auto; }
+.block:hover + .reply-footer,
+.block:focus-within + .reply-footer,
+.reply-footer:hover,
+.reply-footer:focus-within {
+  opacity: 1;
+  pointer-events: auto;
+}
+/* 発言フッター（R-CNV-16）。吹き出しの外（直後の兄弟）に置く。hover / focus-within で
+   opacity と pointer-events だけを切り替える。display や要素の出し入れで切り替えると
+   行の高さが変わり会話面が揺れる。左の字下げは `.block.user` に合わせる */
+.msg-foot {
+  display: flex;
+  justify-content: flex-end;
+  align-items: center;
+  gap: 6px;
+  margin: 0 0 8px;
+  font-size: 11px;
+  color: var(--vscode-descriptionForeground);
+  opacity: 0;
+  pointer-events: none;
+}
+.block.user:hover + .msg-foot,
+.block.user:focus-within + .msg-foot,
+.msg-foot:hover,
+.msg-foot:focus-within {
+  opacity: 1;
+  pointer-events: auto;
+}
+@media (hover: none) {
+  .msg-foot,
+  .reply-footer { opacity: 1; pointer-events: auto; }
+}
+.msg-copy-button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 22px;
+  height: 22px;
+  border: 0;
+  border-radius: 3px;
+  padding: 3px;
+  color: inherit;
+  background: transparent;
   cursor: pointer;
 }
-.status-strip-spinner {
-  flex: 0 0 auto;
-  width: 10px;
-  height: 10px;
-  border-radius: 50%;
-  border: 1.5px solid var(--vscode-progressBar-background, #0e70c0);
-  border-top-color: transparent;
+.msg-copy-button svg {
+  width: 14px;
+  height: 14px;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.3;
+  stroke-linecap: round;
+  stroke-linejoin: round;
 }
-.status-strip.spinning .status-strip-spinner { animation: spin 0.9s linear infinite; }
-.status-strip-spinner.hidden { display: none; }
+.msg-copy-button:hover { background: var(--vscode-toolbar-hoverBackground, rgba(128,128,128,0.2)); }
+.msg-copy-button:focus-visible { outline: 1px solid var(--vscode-focusBorder); outline-offset: 1px; }
+.msg-copy-button[data-copy-state="copied"] { color: var(--vscode-testing-iconPassed, #2d7d46); }
+.msg-copy-button[data-copy-state="failed"] { color: var(--vscode-errorForeground); }
+
+/* ---------- タイトル右の状態行 ---------- */
+/* sticky は親の .log-head が担うため、ここでは位置指定しない（二重stickyを避ける） */
+.status-strip-wrap { min-width: 0; }
+.status-strip-wrap.hidden { display: none; }
+.status-strip { display: flex; align-items: center; gap: 8px; font-size: 11.5px; line-height: 1.5; color: var(--vscode-descriptionForeground); font-variant-numeric: tabular-nums; }
+.status-strip-spinner { display: inline-flex; flex: none; }
 .status-strip-text {
   flex: 1 1 auto;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
-.status-strip-time {
-  flex: 0 0 auto;
-  font-variant-numeric: tabular-nums;
-}
-.status-strip-panel {
-  /* max-height を外形へ効かせる。content-box のままだと padding+border の分だけ
-     上限を超え、tab.ts の capStripPanel の見積もりとずれる */
-  box-sizing: border-box;
-  /* --strip-panel-max は tab.ts が実測で書く。無いと .log-head がスクロールポートより
-     高くなり、最下部でヘッダごとタブバーが押し上げられる */
-  max-height: min(340px, var(--strip-panel-max, 340px));
-  overflow-y: auto;
-  overflow-x: hidden;
-  padding: 6px 14px;
-  background: var(--vscode-editorWidget-background, var(--vscode-editor-background));
-  border-bottom: 1px solid var(--vscode-panel-border);
-  font-size: 12px;
-}
-.status-strip-panel.hidden { display: none; }
-.status-strip-empty { color: var(--vscode-descriptionForeground); font-size: 11px; }
-/* パネル内ミラー: ログ内のカードを clone せず、同じ WorkModel の値から独立に描く */
-.status-strip-mirror .block { margin: 0 0 6px 0; }
-.status-strip-mirror .block:last-child { margin-bottom: 0; }
-.status-strip-running-bg { color: var(--vscode-descriptionForeground); font-size: 11px; padding: 2px 0; }
+.status-strip-time { flex: 0 0 auto; }
+.status-strip-time:not(:empty)::before { content: "· "; }
 
 /* ---------- 分析タブ（会話タブとは別系統） ---------- */
 /* 表示切替は作業ログ内タブ（work-overview.ts）の hidden 属性で行うため display は持たない */
-.analysis-view { max-width: 860px; margin: 0 auto; }
+.analysis-view { padding-left: var(--conv-gutter); }
 .analysis-h1 { font-size: 15px; margin: 10px 0 2px; }
 .analysis-sub { font-size: 11px; color: var(--vscode-descriptionForeground); margin-bottom: 14px; }
 .analysis-view .statrow { display: flex; gap: 10px; flex-wrap: wrap; margin-bottom: 16px; }
@@ -849,11 +969,9 @@ button[data-analysis-trigger]:disabled.is-analysis-pending { opacity: 1; }
   line-height: 1.55;
 }
 .block.user {
-  background: var(--vscode-input-background);
-  border: 1px solid var(--vscode-input-border, var(--vscode-panel-border));
-  border-left: 3px solid var(--vscode-focusBorder);
   white-space: pre-wrap;
-  margin-left: 48px;
+  padding-left: 0;
+  padding-right: 0;
 }
 .block.assistant {
   background: transparent;
@@ -1058,8 +1176,6 @@ hr.md-hr {
   font-size: 0.92em;
 }
 
-/* スピナー。消費者は .tool-status.running と .status-strip.spinning .status-strip-spinner。 */
-@keyframes spin { to { transform: rotate(360deg); } }
 .tool-name {
   font-weight: 600;
   font-family: var(--vscode-editor-font-family, monospace);
@@ -1077,9 +1193,12 @@ hr.md-hr {
 /* ---------- 作業カード（ターン内ツール実行グループ） ---------- */
 .block.toolgroup {
   padding: 0;
-  border: 1px solid var(--vscode-panel-border);
-  background: var(--vscode-editorWidget-background);
-  font-size: 12px;
+  border: 0;
+  border-top: 1px solid var(--vscode-panel-border);
+  border-radius: 0;
+  background: none;
+  font-size: 13px;
+  line-height: 1.7;
   overflow: hidden;
 }
 .block.toolgroup > summary {
@@ -1099,17 +1218,8 @@ hr.md-hr {
   flex: 0 0 auto;
 }
 .block.toolgroup[open] > summary::before { transform: rotate(90deg); }
-.toolgroup-label { font-weight: 600; flex: 0 0 auto; }
-.toolgroup-badge {
-  flex: 0 0 auto;
-  min-width: 16px;
-  text-align: center;
-  padding: 0 5px;
-  border-radius: 8px;
-  font-size: 10px;
-  background: var(--vscode-badge-background);
-  color: var(--vscode-badge-foreground);
-}
+.toolgroup-label { font-size: 10px; font-weight: 600; letter-spacing: .08em; text-transform: uppercase; color: var(--vscode-descriptionForeground); flex: 0 0 auto; }
+.toolgroup-badge { flex: none; font-size: 10px; color: var(--vscode-descriptionForeground); font-variant-numeric: tabular-nums; }
 .toolgroup-last {
   color: var(--vscode-descriptionForeground);
   font-family: var(--vscode-editor-font-family, monospace);
@@ -1132,9 +1242,12 @@ hr.md-hr {
 /* ---------- todoカード（TodoWrite）---------- */
 .block.todocard {
   padding: 0;
-  border: 1px solid var(--vscode-panel-border);
-  background: var(--vscode-editorWidget-background);
-  font-size: 12px;
+  border: 0;
+  border-top: 1px solid var(--vscode-panel-border);
+  border-radius: 0;
+  background: none;
+  font-size: 13px;
+  line-height: 1.7;
   overflow: hidden;
 }
 .block.todocard > summary {
@@ -1343,11 +1456,7 @@ hr.md-hr {
   border-radius: 50%;
   position: relative;
 }
-.tool-status.running {
-  border: 2px solid var(--vscode-progressBar-background, #0e70c0);
-  border-top-color: transparent;
-  animation: spin 0.9s linear infinite;
-}
+.tool-status.running { display: inline-flex; width: 12px; height: 12px; border: 0; border-radius: 0; }
 .tool-status.done { background: var(--vscode-testing-iconPassed, #2d7d46); }
 .tool-status.failed { background: var(--vscode-errorForeground); }
 
@@ -1521,6 +1630,72 @@ hr.md-hr {
   font-size: 12px;
 }
 /* M-7: 回答の監査サマリー */
+.laisora-ask {
+  position: relative;
+  margin: 14px 0 12px;
+  padding: 10px 0 12px 14px;
+  border-top: 1px solid var(--vscode-panel-border);
+  border-bottom: 1px solid var(--vscode-panel-border);
+  white-space: normal;
+  overflow-wrap: anywhere;
+}
+.laisora-ask::before {
+  content: "";
+  position: absolute;
+  left: 0;
+  top: 10px;
+  bottom: 12px;
+  width: 2px;
+  background: var(--vscode-textLink-foreground);
+}
+.ask-rail {
+  position: absolute;
+  left: calc(0px - var(--conv-gutter));
+  top: 15px;
+  width: 7px;
+  height: 7px;
+  background: var(--vscode-textLink-foreground);
+}
+.ask-heading { display: flex; gap: 8px; align-items: baseline; }
+.ask-label { color: var(--vscode-textLink-foreground); font-size: 10px; font-weight: 600; letter-spacing: .08em; }
+.ask-topic { font-size: 10px; color: var(--vscode-descriptionForeground); }
+.ask-counter { margin-left: auto; flex-shrink: 0; font-size: 10px; font-variant-numeric: tabular-nums; color: var(--vscode-descriptionForeground); }
+.ask-title { font-size: 14px; font-weight: 700; margin: 2px 0 4px; }
+.ask-why { font-size: 12px; color: var(--vscode-descriptionForeground); margin-bottom: 8px; }
+.ask-options { display: grid; gap: 6px; }
+.ask-option, .askq-option.ask-option {
+  display: grid;
+  grid-template-columns: 22px minmax(0, 1fr);
+  gap: 4px;
+  align-items: baseline;
+  padding: 6px 10px;
+  border: 1px solid var(--vscode-panel-border);
+  border-radius: 3px;
+  background: var(--vscode-editor-background);
+  color: var(--vscode-foreground);
+  text-align: left;
+  font: inherit;
+  font-size: 12.5px;
+  white-space: normal;
+  cursor: pointer;
+}
+.ask-option:hover, .ask-option.recommended, .askq-option.ask-option.selected { border-color: var(--vscode-textLink-foreground); }
+.ask-option:focus-visible { outline: 1px solid var(--vscode-focusBorder); outline-offset: 2px; }
+.ask-letter { font-size: 11px; font-weight: 700; color: var(--vscode-textLink-foreground); }
+.ask-option-label { font-weight: 600; }
+.ask-recommended { font-size: 9.5px; letter-spacing: .08em; color: var(--vscode-textLink-foreground); margin-left: 6px; }
+.ask-effect, .ask-detail { grid-column: 2; font-size: 11px; color: var(--vscode-descriptionForeground); }
+.ask-default { font-size: 10.5px; color: var(--vscode-descriptionForeground); margin-top: 6px; }
+.ask-step { display: grid; grid-template-columns: 18px minmax(0, 1fr); gap: 4px; padding: 3px 0; font-size: 12.5px; cursor: pointer; }
+.ask-checkbox { margin: 3px 0 0; width: 12px; height: 12px; accent-color: var(--vscode-textLink-foreground); }
+.ask-look { grid-column: 2; color: var(--vscode-descriptionForeground); font-size: 11px; }
+.ask-check::before { background: var(--vscode-descriptionForeground); }
+.block.approval.askq-approval { background: var(--vscode-editor-background); border: none; border-radius: 0; padding-left: 0; padding-right: 0; }
+.askq-approval .approval-title { color: var(--vscode-descriptionForeground); font-size: 10px; }
+.approval-title + .askq-item.laisora-ask { border-top: 1px solid var(--vscode-panel-border); padding-top: 10px; }
+.askq-option.ask-option::before { content: none; }
+.askq-option.ask-option.selected .ask-letter { text-decoration: underline; text-underline-offset: 3px; }
+.askq-item .askq-other { margin-top: 8px; }
 .askq-answers-summary {
   margin-top: 6px;
   padding-top: 6px;
@@ -1532,15 +1707,13 @@ hr.md-hr {
 /* ---------- コンポーザ ---------- */
 #composer {
   flex: 0 0 auto;
-  padding: 10px 14px 12px;
+  padding: 10px var(--pane-padding) 12px calc(var(--pane-padding) * 2 + var(--view-nav-width));
   background: var(--vscode-editor-background);
 }
 #composer-top {
   display: flex;
   flex-direction: column;
   gap: 6px;
-  max-width: 860px;
-  margin: 0 auto;
 }
 /* 画像添付サムネイル */
 #attachments {
@@ -1678,8 +1851,6 @@ hr.md-hr {
 #inputwrap {
   display: flex;
   flex-direction: column;
-  max-width: 860px;
-  margin: 0 auto;
   background: var(--vscode-input-background);
   border: 1px solid var(--vscode-input-border, var(--vscode-panel-border));
   border-radius: 8px;
@@ -1940,36 +2111,6 @@ button:disabled { opacity: 0.4; cursor: default; }
    UA の [hidden]{display:none} より詳細度が高い規則に負ける。
    全体へ効かせず作業ログ配下に限定する（他所の hidden 属性を巻き込まないため） */
 #logs .panel-work > [hidden] { display: none !important; }
-
-/* .log-head の中（work-switch-slot）に置く。sticky 指定は要らない — .log-head 自体が
-   sticky なので、作業ログをどこまでスクロールしても一緒に残る。
-   会話ビューでは出さない。data-view が未設定のときも出さない側へ倒す（:not で書く理由） */
-.log-head:not([data-view="work"]) .work-switch-slot { display: none; }
-.work-view-switch {
-  display: flex;
-  gap: 4px;
-  /* .log-head の margin: 0 -14px を打ち消して .view-switch と左端を揃える */
-  padding: 6px 14px 8px;
-  border-bottom: 1px solid var(--vscode-panel-border, rgba(128, 128, 128, 0.35));
-}
-/* .panel-work の外にあるので #logs .panel-work > [hidden] の射程に入らない。
-   display:flex が UA の [hidden]{display:none} を上回るため明示的に戻す */
-.work-view-switch[hidden] { display: none; }
-.work-view-tab {
-  background: none;
-  border: 1px solid transparent;
-  border-radius: 4px;
-  color: var(--vscode-descriptionForeground);
-  cursor: pointer;
-  font-size: 12px;
-  padding: 3px 12px;
-}
-.work-view-tab:hover { color: var(--vscode-foreground); }
-.work-view-tab.active {
-  background: var(--vscode-toolbar-activeBackground, rgba(128, 128, 128, 0.2));
-  color: var(--vscode-foreground);
-}
-.work-view-tab:focus-visible { outline: 1px solid var(--vscode-focusBorder); outline-offset: 1px; }
 
 .wo-coverage {
   display: flex;
@@ -2454,12 +2595,12 @@ button.llm-evidence-chip:hover,
 
 /* グラフ（work-graph.ts・SVG 時間軸） */
 .wg-stage { position: relative; }
-/* .log-head（top: -12px）の直下に貼り付く。--log-head-h は tab.ts の syncLogHeadHeight() が実測して書く
-   （契機は syncStripPanelCap と .log-head の ResizeObserver）。z-index は .log-head（6）より下 */
+/* .log-head（top: 0）の直下に貼り付く。--log-head-h は tab.ts の syncLogHeadHeight() が実測して書く
+   （契機は syncHeadLayout と .log-head の ResizeObserver）。z-index は .log-head（6）より下 */
 /* 軸 SVG は下限幅（MIN_CHART_W=520）で描かれる。狭いと .wg-head からはみ出して #logs に
    横スクロールが出る（実測: pane 433px で軸 520px・scrollWidth 534 > clientWidth 461。G-99）。
    clip は overflow-y: visible を保てる唯一の値で、sticky もスクロール枠も壊さない */
-.wg-head { position: sticky; top: calc(var(--log-head-h, 0px) - 12px); z-index: 5; background: var(--vscode-editor-background); padding: 4px 0 8px; overflow-x: clip; }
+.wg-head { position: sticky; top: var(--log-head-h, 0px); z-index: 5; background: var(--vscode-editor-background); padding: 4px 0 8px; overflow-x: clip; }
 .wg-axis { display: block; }
 .wg-zoom-bar { display: flex; align-items: center; justify-content: space-between; font-size: 11.5px; color: var(--vscode-descriptionForeground); padding: 0 0 6px; }
 .wg-zoom-range { font-variant-numeric: tabular-nums; }
@@ -2689,3 +2830,95 @@ mark.find-match-current {
 /* One destination tag per finding; reuse existing badge tokens. */
 .llm-finding-routing { margin-bottom: 6px; }
 .llm-destination-badge { display: inline-block; max-width: 100%; overflow-wrap: anywhere; }
+
+/* Conversation timeline: reserve a fixed gutter for the rail and turn markers. */
+.panel-conv { --turn-marker-top: 7.5px; --turn-marker-size: 7px; position: relative; padding-left: var(--conv-gutter); }
+.panel-conv::before {
+  content: "";
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: 3px;
+  width: 1px;
+  background: var(--vscode-panel-border);
+  pointer-events: none;
+}
+.panel-conv .block.user,
+.panel-conv .block.assistant,
+.panel-conv .block.assistant-turn { position: relative; padding-top: 4px; }
+.panel-conv .block.user { padding-bottom: 0; }
+.panel-conv .block.user::before,
+.panel-conv .block.assistant::before,
+.panel-conv .block.assistant-turn::before {
+  content: "";
+  position: absolute;
+  left: calc(0px - var(--conv-gutter));
+  top: var(--turn-marker-top);
+  width: var(--turn-marker-size);
+  height: var(--turn-marker-size);
+  box-sizing: border-box;
+  pointer-events: none;
+  z-index: 2;
+}
+.panel-conv .block.user::after {
+  content: "";
+  position: absolute;
+  top: calc(var(--turn-marker-top) + var(--turn-marker-size) / 2);
+  height: var(--user-rail-height, calc(100% - var(--turn-marker-top) - var(--turn-marker-size) / 2));
+  left: calc(3px - var(--conv-gutter));
+  width: 1px;
+  z-index: 1;
+  background: var(--vscode-textLink-foreground, var(--vscode-focusBorder));
+  pointer-events: none;
+}
+.panel-conv .block.user::before { background: var(--vscode-textLink-foreground, var(--vscode-focusBorder)); }
+.panel-conv .block.assistant::before,
+.panel-conv .block.assistant-turn::before {
+  border: 1px solid var(--vscode-descriptionForeground);
+  border-radius: 50%;
+  background: var(--vscode-editor-background);
+}
+.turn-label {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  min-height: 14px;
+  margin: 0 0 3px;
+  font-size: 10px;
+  line-height: 14px;
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  color: var(--vscode-descriptionForeground);
+}
+.block.user > .turn-label { color: var(--vscode-textLink-foreground, var(--vscode-focusBorder)); }
+
+.turn-label-name { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+.conv-title-date { padding: 4px 12px 0 var(--conv-gutter); font-size: 10px; line-height: 14px; letter-spacing: 0.08em; font-variant: small-caps; color: var(--vscode-descriptionForeground); }
+
+.laisora-plan { display: flex; align-items: baseline; gap: 8px; margin: 8px 0; font: inherit; }
+.declared-goal { min-width: 0; }
+.plan-bar-running { white-space: nowrap; font-size: 11.5px; color: var(--vscode-descriptionForeground); }
+.plan-bar-running:empty { display: none; }
+.loader { color: var(--vscode-foreground); display: inline-block; vertical-align: middle; flex: none; }
+.loader .loader-group { transform-box: view-box; transform-origin: 50% 50%; animation: loader-group 4s infinite; }
+.loader rect { transform-box: fill-box; transform-origin: 50% 50%; animation: 4s infinite; }
+.loader .loader-a { animation-name: loader-a; }
+.loader .loader-b { animation-name: loader-b; }
+.loader .loader-c { animation-name: loader-c; }
+.loader .loader-d { animation-name: loader-d; }
+.loader .loader-group, .loader rect { animation-timing-function: cubic-bezier(.65,0,.25,1); }
+@keyframes loader-a { 0%,18% { transform: translate(0,0); } 28%,46% { transform: translate(10px,0); } 54%,86% { transform: translate(9px,1px); } 94%,100% { transform: translate(10px,0); } }
+@keyframes loader-b { 0%,8% { transform: translate(10px,0); } 18%,46% { transform: translate(10px,10px); } 54%,86% { transform: translate(9px,9px); } 94%,100% { transform: translate(10px,10px); } }
+@keyframes loader-c { 0%,28% { transform: translate(0,10px); } 38%,46% { transform: translate(0,0); } 54%,86% { transform: translate(1px,1px); } 94%,100% { transform: translate(0,0); } }
+@keyframes loader-d { 0% { transform: translate(10px,10px) scale(1); } 8%,36.9% { transform: translate(10px,10px) scale(0); } 37% { transform: translate(0,10px) scale(0); } 46% { transform: translate(0,10px) scale(1); } 54%,86% { transform: translate(1px,9px) scale(1); } 94%,100% { transform: translate(0,10px) scale(1); } }
+@keyframes loader-group { 0%,54% { transform: rotate(0) scale(1,1); } 66% { transform: rotate(90deg) scale(1,1); } 71% { transform: rotate(90deg) scale(1,.12); } 76% { transform: rotate(90deg) scale(1,1); } 81% { transform: rotate(90deg) scale(.12,1); } 86%,100% { transform: rotate(90deg) scale(1,1); } }
+@media (prefers-reduced-motion: reduce) {
+  .loader .loader-group, .loader rect { animation: none; }
+  .loader .loader-b { transform: translate(10px,0); }
+  .loader .loader-c { transform: translate(0,10px); }
+  .loader .loader-d { transform: scale(0); }
+}

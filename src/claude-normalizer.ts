@@ -242,6 +242,7 @@ export class ClaudeLiveNormalizer {
   private assistantTextEvidence = new Map<string, AssistantTextEvidenceState>();
   private resumeSignalToolNames = new Map<string, string>();
   private emittedAssistantUsageMessageIds = new Set<string>();
+  private rootAssistantUsage: ReturnType<typeof assistantUsageFromRaw> = {};
   // ゲートで捨てた task_notification の計数（T0 レビュー M-2）。破棄は fold 到達前で
   // EvidenceIndex からは観測できないため、Adapter 側の hash 非入力カウンタとして持つ
   droppedTaskNotificationCount = 0;
@@ -251,6 +252,10 @@ export class ClaudeLiveNormalizer {
     if (opts.usageLimitPrefixes) {
       this.usageLimitPrefixes = [...opts.usageLimitPrefixes];
     }
+  }
+
+  seedObservedTimestamp(timestamp: number | undefined): void {
+    if (this.lastObservedTimestamp === undefined) this.lastObservedTimestamp = timestamp;
   }
 
   setUsageLimitPrefixes(prefixes: string[]): void {
@@ -426,6 +431,12 @@ export class ClaudeLiveNormalizer {
             },
             defaultMeta
           );
+        } else if (record.subtype === "task_started") {
+          if (record.task_type === "local_agent" && typeof record.task_id === "string" &&
+            typeof record.tool_use_id === "string" && record.task_id && record.tool_use_id) {
+            this.emit({ kind: "subagent_info", turnId: this.currentTurnId,
+              toolUseId: record.tool_use_id, agentId: record.task_id }, defaultMeta);
+          }
         } else if (record.subtype === "task_updated") {
           // patch.end_time は task_notification（同一 task_id・直後に届く）の唯一の時刻源。
           // system メッセージ自体は timestamp を持たない（SDK 実測）
@@ -498,6 +509,7 @@ export class ClaudeLiveNormalizer {
         if (ev?.type === "message_start" && this.currentTurnId && record.parent_tool_use_id == null) {
           this.sawMessageStartForTurn = true;
           const message = ev.message as Record<string, unknown> | undefined;
+          this.rootAssistantUsage = assistantUsageFromRaw(message?.usage, false);
           this.rootAssistantMessageId =
             typeof message?.id === "string" && message.id.length > 0 ? message.id : null;
           this.activeRootAssistantTextEvidence = this.rootAssistantMessageId
@@ -568,7 +580,7 @@ export class ClaudeLiveNormalizer {
               turnId: this.currentTurnId,
               messageId: this.rootAssistantMessageId,
               parentToolUseId: null,
-              usage: assistantUsageFromRaw(ev.usage, true),
+              usage: { ...this.rootAssistantUsage, ...assistantUsageFromRaw(ev.usage, true) },
             },
             defaultMeta
           );

@@ -1,4 +1,7 @@
 import MarkdownIt, { type Token } from "markdown-it";
+import { parseAskBlock, parsePlanBlock, type AskBlock } from "./ask-parser";
+import { isClosingFence } from "./commit-boundary";
+import { DEFAULT_SYSTEM_APP_EXTENSIONS } from "../file-link-open-mode";
 import { parseFileLinkTarget, type FileLinkPlatform, type FileLinkTarget } from "../file-link-target";
 
 export type TableAlign = "left" | "center" | "right" | undefined;
@@ -104,6 +107,8 @@ export interface MdHardbreakNode {
 }
 
 export type MdNode =
+  | { type: "plan"; goal: string; offset: number }
+  | { type: "ask"; ask: AskBlock; offset: number }
   | MdHeadingNode
   | MdParagraphNode
   | MdTextNode
@@ -125,6 +130,17 @@ export type MdNode =
 
 // R-CNV-12: Windows (stricter) until the Host's init says otherwise.
 const hostPlatform: FileLinkPlatform = { windows: true };
+let fileLinkSystemAppExtensions = new Set(DEFAULT_SYSTEM_APP_EXTENSIONS);
+export function setFileLinkSystemAppExtensions(extensions?: readonly string[]): void {
+  fileLinkSystemAppExtensions = new Set(extensions ?? DEFAULT_SYSTEM_APP_EXTENSIONS);
+}
+export function fileLinkDisplayKind(target: string): "file" | "folder" | "app" {
+  const resource = parseHostFileLinkTarget(target)?.resource ?? target;
+  const segment = resource.split(/[\\/]/).at(-1) ?? "";
+  if (/[\\/]$/.test(resource) || !segment.includes(".")) return "folder";
+  const extension = segment.slice(segment.lastIndexOf(".")).toLowerCase();
+  return fileLinkSystemAppExtensions.has(extension) ? "app" : "file";
+}
 export function setFileLinkHostPlatform(windows: boolean): void {
   hostPlatform.windows = windows;
 }
@@ -399,7 +415,21 @@ export function parseMarkdown(src: string): MdNode[] {
           currentContainer().push(...parseInlineTokens(token.children));
         }
       } else if (token.type === "fence") {
+        const lines = src.split("\n");
+        const plan = token.info.trim() === "laisora-plan" && token.map &&
+          isClosingFence(lines[token.map[1] - 1] ?? "", token.markup) ? parsePlanBlock(token.content) : null;
+        if (plan) {
+          const offset = lines.slice(0, token.map?.[0] ?? 0).reduce((n, line) => n + line.length + 1, 0);
+          currentContainer().push({ type: "plan", goal: plan.goal, offset });
+          continue;
+        }
         const lang = token.info ? token.info.trim().split(/\s+/)[0].toLowerCase() : "";
+        const ask = token.info.trim() === "laisora-ask" ? parseAskBlock(token.content) : null;
+        if (ask) {
+          const offset = src.split("\n").slice(0, token.map?.[0] ?? 0).reduce((n, line) => n + line.length + 1, 0);
+          currentContainer().push({ type: "ask", ask, offset });
+          continue;
+        }
         currentContainer().push({
           type: "code_block",
           fenced: true,

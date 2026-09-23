@@ -55,3 +55,10 @@ export function dayClock(ms: number): string {
   return `${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")} ${clock(ms)}`;
 }
 
+// 発言・返信フッターの日時（R-CNV-15 / R-CNV-16）。当日でも日付を省かない。
+// toLocaleString へ任せると en-US で "9/18, 14:35" になり表記が言語で割れるので手で組む
+export function monthDayClock(ms: number): string {
+  const d = new Date(ms);
+  return `${d.getMonth() + 1}/${d.getDate()} ${clock(ms)}`;
+}
+

@@ -1,7 +1,11 @@
+import { modelLabelWithVersion } from "./model-display-name";
+export { modelLabelWithVersion } from "./model-display-name";
+import { appendRunRecord, externalDescription, isExternalTimeout, observeAgentRun, runExternal, runFailureReason, type ExternalRow, type OrchestrationRunRecord, type AgentRunRecord } from "./orchestration-external";
 // ClaudeConversation: Agent SDK を長寿命 Query（ストリーミング入力モード）で駆動する。
 // 1 Conversation = 1 Query = 1 CLI プロセス。interrupt はこのモード限定。
 
 import { randomUUID } from "node:crypto";
+import { isDeepStrictEqual } from "node:util";
 import { readdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import * as l10n from "@vscode/l10n";
@@ -45,6 +49,11 @@ import type { ProgressTrackingMode } from "./progress-protocol";
 import { PROGRESS_WIRE_TOOL_NAME } from "./artifact-access";
 import { z } from "zod";
 import { ClaudeLiveNormalizer, parseAliases } from "./claude-normalizer";
+import { conductorInstruction, orchestrationExternalTargets, orchestrationAgents, resolveOrchestrationRoster, type OrchestrationRow, type ExternalModels } from "./orchestration-roster";
+import { admitTransition, textHash, selectDelivery, renderDeliverySection, learningFacts, type LearningFacts, type LearningRecord, type LearningState, type LearningTransition } from "./learning";
+import { sharedLearningService, type LearningResult, type LearningService } from "./learning-service";
+import { createLearningMcpServer, LearningRootGate, LEARNING_INSTRUCTION, LEARNING_TOOL_NAME } from "./learning-mcp";
+import { splitAgyModel, type ExecutorId } from "./orchestration-executors";
 import type { NormalizedOutMeta } from "./claude-normalizer";
 
 // The SDK is bundled into extension.js; its runtime value is obtained with synchronous require().
@@ -73,13 +82,30 @@ const CAP_INTERRUPT_CANCEL_QUEUED = "interrupt_cancel_queued_v1";
 // The link grammar must stay within src/file-link-target.ts#parseFileLinkTarget. Forward slashes are required:
 // a Markdown link destination treats a backslash before ASCII punctuation as an escape and drops it.
 export const FILE_LINK_INSTRUCTION =
-  "When you mention a local file, write it as a Markdown link. The link target is the absolute path or the path relative to the working directory, with forward slashes, optionally followed by #L<line> or #L<line>C<column>. Use the path and line as the link text, for example [src/app.ts:42](src/app.ts#L42) or [app.ts](C:/work/src/app.ts). If the path contains spaces, wrap the target in angle brackets: [notes.md](<docs/my notes.md>). Write web URLs with the https:// scheme.";
+  "When you mention a local file or folder, write it as a Markdown link. The link target is the absolute path or the path relative to the working directory, with forward slashes, optionally followed by #L<line> or #L<line>C<column>. Use the path and line as the link text, for example [src/app.ts:42](src/app.ts#L42) or [app.ts](C:/work/src/app.ts). Folders end with a slash: [artifacts/](artifacts/). Files such as spreadsheets, documents and PDFs are linked the same way and open in their default app. If the path contains spaces, wrap the target in angle brackets: [notes.md](<docs/my notes.md>). Write web URLs with the https:// scheme.";
 
 // SDK 0.3.270: an omitted systemPrompt is an empty custom prompt (not the claude_code preset), so OFF passes "" to keep that prompt.
 // snapshot:false is required on every launch: the default snapshot replays the prompt recorded when the session was
 // first rendered on each resume (until /compact), so a changed setting would never reach a resumed conversation.
-export function conversationSystemPrompt(fileLinkInstruction: boolean): NonNullable<ClaudeCodeOptions["systemPrompt"]> {
-  return { type: "custom", prompt: fileLinkInstruction ? FILE_LINK_INSTRUCTION : "", snapshot: false };
+export const PLAN_INSTRUCTION = [
+  "When starting multi-step work, first write a laisora-plan block with the goal as you understand it, then the TaskCreate steps; do not restate the user's words.",
+  "For requests with more than one step, use TaskCreate before starting: one task per step, subject as the step title, and activeForm set.",
+  "Use TaskUpdate to mark each step in_progress when starting and completed when done. Add new steps at the end with TaskCreate.",
+  "When you need the user's decision or a real-machine check, do not bury it in prose. Write a ```laisora-ask block (format below) at the point you ask.",
+  "In every decision, whether in a laisora-ask block or AskUserQuestion, state: what is being decided and why now; for each option, what happens after choosing it, with its merits and drawbacks in plain words rather than technical terms; your recommendation and why; and what you will do if there is no answer.",
+  "Use AskUserQuestion only when you cannot continue without the answer; otherwise use a laisora-ask block and continue with the stated default.",
+  "<format>",
+  "A laisora-plan fence contains only goal: followed by one nonempty line in the user's language, using the same scalar rules below: ```laisora-plan\ngoal: Make progress visible throughout the work\n```.",
+  "Use a fenced code block whose language is exactly laisora-ask. Use the user's language for values. This is a strict YAML-like subset: one nonempty scalar key: value per line; no comments, multiline scalars, nesting, aliases or flow collections. Plain text and JSON double-quoted strings are supported. Keys are unique. List entries use exactly two spaces before '- ' and four spaces before subsequent keys.",
+  "A decision requires kind, title, why, options and default. Every option requires label, effect, pros and cons; mark your recommended option with recommended: true and explain why in its effect. Other options omit recommended.",
+  "```laisora-ask\nkind: decide\ntitle: What should we choose?\nwhy: Why this decision matters now.\noptions:\n  - label: First choice\n    effect: What happens next and why I recommend it.\n    pros: Its benefit in plain words.\n    cons: Its drawback in plain words.\n    recommended: true\n  - label: Second choice\n    effect: What happens next.\n    pros: Its benefit.\n    cons: Its drawback.\ndefault: Without an answer, I will continue with A.\n```",
+  "A real-machine check requires kind, title, why, steps and default. Every step requires do (the action) and look (what to observe). Do not mix options and steps.",
+  "```laisora-ask\nkind: check\ntitle: Check the result on your machine\nwhy: What I cannot verify here.\nsteps:\n  - do: Open the changed screen.\n    look: Confirm the labels fit without clipping.\n  - do: Resize the window.\n    look: Confirm every action remains reachable.\ndefault: While awaiting the result, I will continue with the independent work.\n```",
+  "</format>",
+].join("\n");
+
+export function conversationSystemPrompt(fileLinkInstruction: boolean, planInstruction = true): NonNullable<ClaudeCodeOptions["systemPrompt"]> {
+  return { type: "custom", prompt: [fileLinkInstruction ? FILE_LINK_INSTRUCTION : "", planInstruction ? PLAN_INSTRUCTION : ""].filter(Boolean).join("\n\n"), snapshot: false };
 }
 
 interface QueryHandle extends AsyncIterable<any> {
@@ -121,6 +147,18 @@ export interface ClaudeHostOptions {
   claudeCodeExecutablePath?: string;
   apiKeyPolicy?: ApiKeyPolicy;
   fileLinkInstruction?: boolean;
+  planInstruction?: boolean;
+  orchestrationEnabled?: boolean;
+  orchestrationAgents?: unknown;
+  externalModels?: ExternalModels;
+  externalTimeoutMinutes?: number;
+  orchestrationRunsDirectory?: string;
+  learningEnabled?: boolean;
+  learningDirectory?: string;
+  learningScope?: string;
+  configuredResolvedModel?: string;
+  conductorPolicy?: string;
+  onOrchestrationChanged?: () => void;
   interruptForceKillTimeoutMs: number;
   // テスト専用: provider interrupt を意図的にスキップし abort フォールバック経路を検証する。
   // 拡張本体（extension.ts）からは決して設定しないこと（敵対レビュー指摘[8]: 環境変数方式は本番汚染リスク）。
@@ -190,10 +228,8 @@ function parseAskUserQuestionInput(input: Record<string, unknown>): AskUserQuest
 }
 
 // agent定義（.claude/agents/**/*.md）の frontmatter から model / effort を読む。
-// effort は SDK ストリームメッセージには載らない（SDKAssistantMessage 型に無く、セッション
-// JSONL の永続化エンベロープにのみ現れる）。hooks 入力（sdk.d.ts の tool-use 系 hook）には
-// 載るが、表示のためだけに hooks を配線するのは過剰と判断し不採用。よって宣言値は
-// このファイルから読む。SDK AgentDefinition（sdk.d.ts）の effort は名前付きレベルまたは整数。
+// 表示用の宣言値であり、orchestration の hook 観測値とは混ぜない（R-ORC-07）。
+// SDK AgentDefinition（sdk.d.ts）の effort は名前付きレベルまたは整数。
 // 値の妥当性検証はどちらの側でもしない（不正値は CLI が黙って無視するが、UI は宣言値を
 // そのまま表示する。実効値との食い違いは許容）。
 interface AgentDefInfo {
@@ -249,23 +285,6 @@ function loadAgentDefs(cwd: string, log: (msg: string) => void): Map<string, Age
   return defs;
 }
 
-// SDK 0.3.257 実測: claude-fable-5[1m] と claude-fable-5-1[1m] の両方が displayName "Fable" を返す
-// （5.1 の description も "Fable 5"）。モデル名に版が無ければ resolvedModel / id から補う。
-export function modelLabelWithVersion(displayName: string | undefined, id: string, resolvedModel?: string): string {
-  if (!displayName || displayName === id) return id;
-  const base = displayName ?? id;
-  const m = /^claude-(opus|sonnet|haiku|fable)-(\d+(?:-\d+)*?)(?:-\d{8})?(?:\[|$)/i.exec(resolvedModel || id);
-  if (!m) return base;
-  const family = m[1];
-  const version = m[2].replace(/-/g, ".");
-  // R-CMD-02: context sizes (1M) are not model versions; use SDK resolution, never a latest-version table.
-  const namedFamily = new RegExp(`\\b${family}\\b(?!\\s+\\d)`, "i");
-  if (new RegExp(`\\b${family}\\s+\\d`, "i").test(base)) return base;
-  if (namedFamily.test(base)) return base.replace(namedFamily, (name) => `${name} ${version}`);
-  if (id === "default") return `${base} — ${family[0].toUpperCase()}${family.slice(1)} ${version}`;
-  return base;
-}
-
 // 手動ハンドオフが使う SDK と起動環境。ClaudeConversation.start と
 // 同じ require 経路・同じ buildClaudeEnv / resolveClaudeCodeStartup を通す。別経路で
 // process.env をそのまま渡すと apiKeyPolicy を素通りして ANTHROPIC_API_KEY が子プロセスへ漏れる
@@ -286,7 +305,241 @@ export async function resolveHandoffRuntime(
   return { sdk, claudeExecutablePath: startup.executable.path, env };
 }
 
+function normalizeLearningModel(value: string | undefined, context: ClaudeHostOptions): string | undefined {
+  const clean = (model: string) => model.trim().toLowerCase().replace(/\[1m\]$/, "");
+  const known = value ? clean(value) : undefined;
+  const models = context.externalModels?.claude;
+  const resolved = models?.state === "ok" ? models.models.find(row => clean(row.id) === known)?.resolvedModel : undefined;
+  const model = resolved ?? (known && !/^(default|haiku|sonnet|opus)$/.test(known) ? known : context.configuredResolvedModel);
+  const normalized = model ? clean(model) : undefined;
+  return normalized && !/^(default|haiku|sonnet|opus)$/.test(normalized) ? normalized : undefined;
+}
+
+function learningModelsR12(context: ClaudeHostOptions, observed?: string) {
+  const clean = (model: string) => model.trim().toLowerCase().replace(/\[1m\]$/, "");
+  const known: Array<{ executor: ExecutorId; model: string }> = [], unresolved: Array<{ executor: ExecutorId; model: string }> = [];
+  for (const executor of ["claude", "codex", "agy"] as const) {
+    const list = context.externalModels?.[executor];
+    if (list?.state !== "ok") continue;
+    for (const row of list.models) {
+      const id = clean(row.id);
+      if (row.resolvedModel) known.push({ executor, model: clean(row.resolvedModel) });
+      if (executor === "claude" && /^(default|haiku|sonnet|opus)$/.test(id)) unresolved.push({ executor, model: id });
+      else known.push({ executor, model: id }, ...(executor === "agy" ? [{ executor, model: splitAgyModel(id).model }] : []));
+    }
+  }
+  for (const model of [normalizeLearningModel(context.model, context), observed]) if (model) known.push({ executor: "claude", model });
+  return { known, unresolved };
+}
+
 export class ClaudeConversation {
+  private readonly externalRows: readonly ExternalRow[];
+  private readonly externalTimeoutMinutes: number;
+  private readonly runs: OrchestrationRunRecord[] = [];
+  private readonly agentRuns = new Map<string, AgentRunRecord>();
+  get orchestrationRuns(): readonly OrchestrationRunRecord[] { return Object.freeze([...this.runs]); }
+  get observedAgentRuns(): ReadonlyMap<string, AgentRunRecord> { return new Map(this.agentRuns); }
+  private async recordRun(record: OrchestrationRunRecord): Promise<OrchestrationRunRecord> {
+    const index = this.runs.length;
+    this.runs.push(record);
+    if (this.opts.orchestrationRunsDirectory) {
+      try { await appendRunRecord(this.opts.orchestrationRunsDirectory, record); }
+      catch (error) {
+        record = Object.freeze({ ...record, outcome: "failed", reason: [record.reason,
+          runFailureReason("R-ORC-14: could not append orchestration run record", error)].filter(Boolean).join("; ") });
+        this.runs[index] = record;
+      }
+    }
+    if (record.reason) this.opts.log(record.reason);
+    this.opts.onOrchestrationChanged?.();
+    return record;
+  }
+  private readonly roster: readonly OrchestrationRow[];
+  private readonly orchestrationEnabled: boolean;
+  private readonly conductorPolicy: string;
+  private readonly initialOrchestrationSettings: { settings: unknown; deliveredSetHash?: string };
+  private learningDelivery?: Extract<LearningRecord, { kind: "delivery" }>;
+  private learningSessionRef?: string;
+  private learningState?: LearningState;
+  private learningService?: LearningService;
+  private learningGate?: LearningRootGate;
+  private learningDeliveryRecorded = false;
+  private learningMismatchRecorded = false;
+  private learningPendingModels: string[] = [];
+  private learningObservedModel?: string;
+  private learningObservation: Promise<void> = Promise.resolve();
+  private readonly observedAgents = new Map<string, Readonly<{ agentType?: string; model?: string; effort?: string }>>();
+
+  get orchestrationRoster(): readonly OrchestrationRow[] { return this.roster; }
+  get orchestrationActive(): boolean { return this.orchestrationEnabled; }
+  get orchestrationExternalRoster(): readonly ExternalRow[] { return this.externalRows; }
+
+  get learningFacts(): LearningFacts | undefined {
+    // R-LRN-09: unavailable learning records must not become observed empty records.
+    if (!this.learningFileR33() || !this.learningState) return undefined;
+    const state = this.learningDelivery && !this.learningDeliveryRecorded
+      ? { ...this.learningState, records: new Map(this.learningState.records).set(this.learningDelivery.opId, this.learningDelivery) }
+      : this.learningState;
+    return learningFacts(state, {
+      conversationRef: this.conversationId,
+      sessionRef: this.learningSessionRef ?? this.opts.resumeSessionId ?? null,
+      model: this.learningObservedModel ?? this.learningDelivery?.model ?? null,
+      scope: this.opts.learningScope ?? "global",
+    });
+  }
+
+  private orchestrationSettings(options: Partial<ClaudeHostOptions>): unknown {
+    return { enabled: options.orchestrationEnabled === true, agents: options.orchestrationAgents ?? [],
+      learningEnabled: options.learningEnabled === true,
+      timeout: options.externalTimeoutMinutes ?? 10,
+      policy: options.conductorPolicy ?? "" };
+  }
+
+  orchestrationSettingsChanged(options: Partial<ClaudeHostOptions>): boolean {
+    return !isDeepStrictEqual(this.initialOrchestrationSettings, {
+      settings: this.orchestrationSettings(options), deliveredSetHash: this.initialOrchestrationSettings.deliveredSetHash,
+    });
+  }
+
+  private learningFileR33(): string | undefined {
+    if (this.opts.learningEnabled !== true) return undefined;
+    return this.opts.learningDirectory ? join(this.opts.learningDirectory, "records.jsonl") : undefined;
+  }
+
+  private async appendLearningTransitionR33(transition: LearningTransition): Promise<boolean> {
+    const file = this.learningFileR33();
+    if (!file || !this.learningState) return false;
+    const admitted = await this.learningService!.transition(transition);
+    if (!admitted.ok) {
+      this.opts.log(`R-LRN-07: learning admission refused: ${admitted.reason}`);
+      return false;
+    }
+    return true;
+  }
+
+  private async prepareLearningDeliveryR31(): Promise<string> {
+    const file = this.learningFileR33();
+    if (!file) return "";
+    try {
+      this.learningService = sharedLearningService(file);
+      if (!await this.learningService.load()) throw new Error("R-LRN-07: store-error");
+      const state = this.learningState = this.learningService.state!;
+      if (this.learningService.skipped) this.opts.log(`R-LRN-07: learning skipped ${this.learningService.skipped} records`);
+      const scope = this.opts.learningScope ?? "global";
+      for (const [ruleId, rule] of state.rules) for (const version of rule.versions) {
+        if (version.record.scope !== scope) continue;
+        for (const [model, qualification] of version.qualifications) {
+          if (qualification.state === "quarantined" && qualification.reviewDueAt && Date.parse(qualification.reviewDueAt) <= Date.now()) {
+            await this.appendLearningTransitionR33({ kind: "reviewDue", at: new Date().toISOString(),
+              opId: textHash(`reviewDue:${ruleId}:${version.record.hash}:${model}:${qualification.reviewDueAt}`), rule_id: ruleId, model });
+          }
+        }
+      }
+      const model = normalizeLearningModel(this.opts.model, this.opts);
+      if (!model) return "";
+      if ([...state.records.values()].filter(record => record.kind === "control").at(-1)?.autoApply === false) return "";
+      const selection = selectDelivery(state, { model, scope });
+      this.learningDelivery = { kind: "delivery", at: new Date().toISOString(), opId: randomUUID(),
+        conversationRef: this.conversationId, sessionRef: this.opts.resumeSessionId ?? null, model, scope,
+        rules: selection.rules.map(({ ruleId, hash }) => ({ ruleId, hash })), setHash: selection.setHash, outcome: "sent" };
+      const admitted = admitTransition(state, this.learningDelivery);
+      if (!admitted.ok) throw new Error(admitted.reason);
+      this.initialOrchestrationSettings.deliveredSetHash = selection.setHash;
+      if (selection.overflow > 0) this.opts.log(`R-LRN-05: learning delivery overflow ${selection.overflow}; retained for review`);
+      return renderDeliverySection(selection);
+    } catch (error) {
+      this.learningDelivery = undefined;
+      this.learningState = this.learningService?.state;
+      this.opts.log(runFailureReason("R-LRN-07: could not prepare learning delivery", error));
+      return "";
+    }
+  }
+
+  private recordLearningR12(input: unknown, rootVerified: boolean): Promise<LearningResult> {
+    if (!rootVerified) this.opts.log("R-LRN-12: learning admission refused: caller-unverified");
+    if (!this.learningService) return Promise.resolve(rootVerified ? { ok: false, code: "store-error", requirement: "R-LRN-07" }
+      : { ok: false, code: "caller-unverified", requirement: "R-LRN-12" });
+    const models = learningModelsR12(this.opts, this.learningObservedModel);
+    return this.learningService.record(input, { enabled: this.opts.learningEnabled === true, rootVerified,
+      conversationRef: this.conversationId, scope: this.opts.learningScope ?? "global",
+      knownModels: models.known, unresolvedModels: models.unresolved, sourceRefs: [] });
+  }
+
+  private queueLearningR33(action: () => Promise<void>): Promise<void> {
+    this.learningObservation = this.learningObservation.then(action).catch(error => {
+      this.opts.log(runFailureReason("R-LRN-04 R-LRN-07: could not append learning record", error));
+    });
+    return this.learningObservation;
+  }
+
+  private recordLearningDeliveryR31(closing = false): Promise<void> {
+    return this.queueLearningR33(async () => {
+      const sent = this.learningDelivery;
+      const sessionRef = this.learningSessionRef ?? this.opts.resumeSessionId ?? null;
+      if (!sent || this.learningDeliveryRecorded || (!sessionRef && !closing)) return;
+      if (!await this.appendLearningTransitionR33({ ...sent, sessionRef })) return;
+      this.learningDeliveryRecorded = true;
+      for (const model of this.learningPendingModels.splice(0)) await this.applyLearningModelR30(model);
+    });
+  }
+
+  private observeLearningModelR30(model: string): Promise<void> {
+    if (!this.learningState) return Promise.resolve();
+    return this.queueLearningR33(async () => {
+      const observed = normalizeLearningModel(model, this.opts);
+      if (!observed) return;
+      if (this.learningDelivery && !this.learningDeliveryRecorded) this.learningPendingModels.push(observed);
+      else await this.applyLearningModelR30(observed);
+    });
+  }
+
+  private async applyLearningModelR30(observed: string): Promise<void> {
+    const state = this.learningState;
+    if (!state) return;
+    const previousObserved = this.learningObservedModel;
+    this.learningObservedModel = observed;
+    const scope = this.opts.learningScope ?? "global";
+    const sessionRef = this.learningSessionRef ?? this.opts.resumeSessionId ?? null;
+    const sent = this.learningDelivery;
+    if (sent && observed !== sent.model && !this.learningMismatchRecorded) {
+      this.learningMismatchRecorded = await this.appendLearningTransitionR33({ ...sent, at: new Date().toISOString(), opId: randomUUID(),
+        sessionRef, model: observed, outcome: "model-mismatch" });
+    }
+    for (const [ruleId, rule] of state.rules) {
+      const version = rule.versions.at(-1)!;
+      if (version.record.scope !== scope || ![...version.qualifications.values()].some(value => value.state === "active")) continue;
+      const last = [...state.records.values()].reverse().find(record =>
+        record.kind === "delivery" && record.scope === scope && record.outcome === "sent"
+          && record.rules.some(value => value.ruleId === ruleId && value.hash === version.record.hash)
+        || record.kind === "quarantine" && record.rule_id === ruleId && record.hash === version.record.hash);
+      const lastModel = last?.kind === "delivery" ? last.model : last?.kind === "quarantine" ? last.newModel : undefined;
+      const oldModel = previousObserved ?? lastModel;
+      if (oldModel && oldModel !== observed) {
+        await this.appendLearningTransitionR33({ kind: "modelChange", at: new Date().toISOString(),
+          opId: textHash(`quarantine:${ruleId}:${version.record.hash}:${oldModel}:${observed}:${this.conversationId}`),
+          rule_id: ruleId, oldModel, newModel: observed, source: "conductor",
+          conversationRef: this.conversationId, sessionRef, observationRef: randomUUID() });
+      }
+    }
+  }
+
+  get observedAgentSettings(): ReadonlyMap<string, Readonly<{ agentType?: string; model?: string; effort?: string }>> {
+    return new Map(this.observedAgents);
+  }
+
+  private observeAgentSettings(input: unknown): void {
+    if (!input || typeof input !== "object") return; // R-ORC-07
+    const value = input as Record<string, unknown>;
+    if (typeof value.agent_id !== "string" || !value.agent_id) return; // R-ORC-07: parent hooks carry parent effort.
+    const previous = this.observedAgents.get(value.agent_id);
+    const effort = value.effort as { level?: unknown } | undefined;
+    this.observedAgents.set(value.agent_id, Object.freeze({
+      agentType: typeof value.agent_type === "string" ? value.agent_type : previous?.agentType,
+      model: typeof value.model === "string" ? value.model : previous?.model,
+      effort: typeof effort?.level === "string" ? effort.level : previous?.effort,
+    }));
+  }
+
   readonly conversationId = randomUUID();
   lastRecordReceivedAt: number | undefined;
   private normalizer: ClaudeLiveNormalizer;
@@ -306,6 +559,14 @@ export class ClaudeConversation {
   private cliCapabilities: string[] | null = null;
 
   constructor(private readonly opts: ClaudeHostOptions) {
+    this.initialOrchestrationSettings = { settings: structuredClone(this.orchestrationSettings(opts)), deliveredSetHash: undefined };
+    this.orchestrationEnabled = opts.orchestrationEnabled === true;
+    const resolved = resolveOrchestrationRoster(this.orchestrationEnabled ? opts.orchestrationAgents : []);
+    this.roster = resolved.roster;
+    this.externalRows = orchestrationExternalTargets(this.roster, opts.externalModels, opts.log);
+    this.externalTimeoutMinutes = isExternalTimeout(opts.externalTimeoutMinutes) ? opts.externalTimeoutMinutes : 10;
+    this.conductorPolicy = opts.conductorPolicy ?? "";
+    for (const dropped of resolved.droppedRows) opts.log(dropped);
     this.normalizer = new ClaudeLiveNormalizer({
       cwd: this.opts.cwd,
       initialObservedTimestamp: this.opts.initialObservedTimestamp,
@@ -426,7 +687,15 @@ ${ctxJson}`
       });
       // approval_resolved の emit は解決経路側（resolveApproval / endTurn / dispose）が単一責務で行う。
       // ここで emit すると turn-end/dispose 解決時に "user" の偽レコードが重複する（レビューR2-1）。
+      const learningCall = toolName === LEARNING_TOOL_NAME ? ctx.toolUseID : undefined;
+      self.learningGate?.hold(learningCall);
+      if (learningCall !== undefined) {
+        if (ctx.signal.aborted) self.learningGate?.revoke(learningCall);
+        else ctx.signal.addEventListener("abort", () => self.learningGate?.revoke(learningCall), { once: true });
+      }
       const decision = await self.opts.onApprovalRequest({ requestId, toolName, rawInputJson });
+      if (decision.behavior === "deny") self.learningGate?.revoke(learningCall);
+      else self.learningGate?.release(learningCall);
       if (decision.behavior === "deny") {
         return { behavior: "deny", message: l10n.t("Denied by the LAISORA user") };
       }
@@ -500,7 +769,59 @@ ${ctxJson}`
         ],
       } as ClaudeCodeOptions["hooks"];
     }
-    options.systemPrompt = conversationSystemPrompt(this.opts.fileLinkInstruction === true);
+    if (this.opts.planInstruction !== false) {
+      options.allowedTools = [...(options.allowedTools ?? []), "TaskCreate", "TaskGet", "TaskUpdate", "TaskList"];
+    }
+    options.systemPrompt = conversationSystemPrompt(this.opts.fileLinkInstruction === true, this.opts.planInstruction !== false);
+    const deliverySection = await this.prepareLearningDeliveryR31();
+    if (this.orchestrationEnabled) {
+      options.agents = orchestrationAgents(this.roster);
+      const base = this.opts.fileLinkInstruction === true ? FILE_LINK_INSTRUCTION : "";
+      options.systemPrompt = { type: "custom", snapshot: false,
+        prompt: [base, this.opts.planInstruction !== false ? PLAN_INSTRUCTION : "", conductorInstruction(this.roster, this.conductorPolicy, this.externalRows, deliverySection)].filter(Boolean).join("\n\n") };
+      const observe: ClaudeCodeSdk.HookCallback = async (input) => {
+        this.observeAgentSettings(input);
+        const record = observeAgentRun(this.agentRuns.get((input as { agent_id?: string }).agent_id ?? ""), input);
+        if (record) {
+          this.agentRuns.set(record.agent_id, record);
+          if (input.hook_event_name === "SubagentStop") await this.recordRun(record);
+        }
+        this.opts.onOrchestrationChanged?.();
+        return {};
+      };
+      options.hooks = {
+        ...(options.hooks ?? {}),
+        SubagentStart: [...(options.hooks?.SubagentStart ?? []), { hooks: [observe] }],
+        PreToolUse: [...(options.hooks?.PreToolUse ?? []), { hooks: [observe] }],
+        SubagentStop: [...(options.hooks?.SubagentStop ?? []), { hooks: [observe] }],
+      };
+    }
+    if (this.orchestrationEnabled && this.externalRows.length > 0) { // R-ORC-10
+      options.mcpServers = { ...(options.mcpServers ?? {}), laisora_external: sdk.createSdkMcpServer({
+        name: "laisora_external", timeout: this.externalTimeoutMinutes * 60_000 + 10_000,
+        tools: [sdk.tool("run", externalDescription(this.externalRows), {
+          target: z.string(), prompt: z.string(), files: z.array(z.string()).optional(), diff: z.string().optional(),
+        }, async (input) => {
+          const row = this.externalRows.find((entry) => entry.target === input.target);
+          if (!row) return { isError: true, content: [{ type: "text" as const, text: "R-ORC-10: target is not in the conversation snapshot." }] };
+          const run = await runExternal(row, input, { cwd: this.opts.cwd, timeoutMinutes: this.externalTimeoutMinutes, apiKeyPolicy: this.opts.apiKeyPolicy });
+          const record = await this.recordRun(run.record);
+          if (record !== run.record) return { isError: true, content: [{ type: "text" as const, text: record.reason! }] }; // R-ORC-14
+          return run.result;
+        })],
+      }) };
+    }
+    if (this.opts.learningEnabled === true) {
+      const prompt = options.systemPrompt as { type: "custom"; snapshot: false; prompt: string };
+      options.systemPrompt = { ...prompt, prompt: [prompt.prompt, !this.orchestrationEnabled ? deliverySection : "", LEARNING_INSTRUCTION].filter(Boolean).join("\n\n") };
+      const gate = this.learningGate = new LearningRootGate();
+      options.mcpServers = { ...(options.mcpServers ?? {}), laisora_learning: createLearningMcpServer(sdk, gate, (input, root) => this.recordLearningR12(input, root)) };
+      const gated = { matcher: LEARNING_TOOL_NAME, hooks: [gate.hook] };
+      options.hooks = { ...(options.hooks ?? {}),
+        PreToolUse: [...(options.hooks?.PreToolUse ?? []), gated],
+        PermissionDenied: [...(options.hooks?.PermissionDenied ?? []), gated],
+        PostToolUseFailure: [...(options.hooks?.PostToolUseFailure ?? []), gated] };
+    }
     if (this.opts.model) options.model = this.opts.model;
     if (this.opts.effort) options.effort = this.opts.effort;
     if (this.opts.resumeSessionId) options.resume = this.opts.resumeSessionId;
@@ -514,6 +835,7 @@ ${ctxJson}`
       options,
     }) as QueryHandle;
 
+    await this.recordLearningDeliveryR31();
     this.emit({ kind: "conversation_opened", cwd: this.opts.cwd, model: this.opts.model });
     void this.requestContextUsage();
     this.runLoopDone = this.runLoop();
@@ -581,7 +903,7 @@ ${ctxJson}`
     return { ok: true };
   }
 
-  send(text: string, images?: ImageAttachment[]): void {
+  send(text: string, images?: ImageAttachment[], observedTimestampSeed?: number): void {
     if (this.closed) {
       // interrupt強制終了直後の追加送信等。user_messageは記録済みのため無言ドロップにしない
       // （レビューAR2-4: 返答もエラーも来ない幽霊バブル化を防ぐ）
@@ -609,6 +931,7 @@ ${ctxJson}`
     // も emit しない）。SDK 側は現在ターンへの追加入力として扱う。turn_completed まで待たせない（CLI プロセスは複数入力を受け付ける）。
     const runningAlready = this.normalizer.turnState !== "idle";
     if (!runningAlready) {
+      this.normalizer.seedObservedTimestamp(observedTimestampSeed);
       this.normalizer.startTurn();
     }
     // 画像は本文より前に置く。Anthropic API は画像を先に置いたほうが指示の解釈が安定する
@@ -772,6 +1095,8 @@ ${ctxJson}`
           reason: aborted ? "aborted" : `error: ${String(e)}`,
         });
       }
+    } finally {
+      await this.recordLearningDeliveryR31(true);
     }
   }
 
@@ -789,6 +1114,10 @@ ${ctxJson}`
     ev: NormalizedEventBody & { provenance?: EventProvenance },
     meta?: NormalizedOutMeta
   ): void {
+    if (ev.kind === "auth_status" && ev.auth?.sessionId) {
+      this.learningSessionRef = ev.auth.sessionId;
+      void this.recordLearningDeliveryR31(false);
+    }
     this.opts.onEvent(ev, this.conversationId, meta);
   }
 
@@ -797,6 +1126,7 @@ ${ctxJson}`
       this.opts.log(`dispose: ${this.inputQueue.length} unsent inputs remain`);
     }
     this.closed = true;
+    this.learningGate?.clear();
     if (this.interruptTimer) {
       clearTimeout(this.interruptTimer);
       this.interruptTimer = null;
@@ -826,6 +1156,7 @@ ${ctxJson}`
         new Promise((r) => setTimeout(r, 3000)),
       ]);
     }
+    await this.recordLearningDeliveryR31(true);
   }
 
   // 実行中のモデル切替（SDK公式API・ストリーミング入力モード限定）
@@ -859,6 +1190,7 @@ ${ctxJson}`
       const applied = typeof settings === "object" && settings !== null ? (settings as { applied?: unknown }).applied : undefined;
       if (typeof applied !== "object" || applied === null) return undefined;
       const { model, effort } = applied as { model?: unknown; effort?: unknown };
+      if (typeof model === "string" && model.trim()) await this.observeLearningModelR30(model.trim());
       return {
         ...(typeof model === "string" && model.trim().length > 0 ? { model: model.trim() } : {}),
         ...(effort === null || effort === "low" || effort === "medium" || effort === "high" || effort === "xhigh" || effort === "max"

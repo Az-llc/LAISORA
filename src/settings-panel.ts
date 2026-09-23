@@ -5,15 +5,18 @@ import { output } from "./host-context";
 import { isSettingsPageToHost } from "./protocol";
 import {
   settingsStateMessage,
+  refreshExternalDetection,
   writeApiKeyPolicy,
+  writeLearningEnabled,
   writeComposerSendKey,
   writeFileLinkSetting,
+  writeOrchestrationSetting,
   writeRestoreTabsOnStartup,
 } from "./gateway-host-actions";
 
 let settingsPanel: vscode.WebviewPanel | null = null;
 
-export function openSettingsPanel(context: vscode.ExtensionContext): void {
+export function openSettingsPanel(context: vscode.ExtensionContext, detect?: Parameters<typeof refreshExternalDetection>[0]): void {
   if (settingsPanel) {
     settingsPanel.reveal();
     return;
@@ -27,7 +30,7 @@ export function openSettingsPanel(context: vscode.ExtensionContext): void {
   });
   settingsPanel = panel;
   // HTML を評価可能にする前に受信口を開く（逆順だと画面の settingsPageReady を取りこぼす）
-  panel.webview.onDidReceiveMessage((raw: unknown) => void handleSettingsPageMessage(panel.webview, raw));
+  panel.webview.onDidReceiveMessage((raw: unknown) => void handleSettingsPageMessage(panel.webview, raw, detect));
   panel.webview.html = settingsPageHtml({
     cspSource: panel.webview.cspSource,
     nonce: randomBytes(16).toString("base64"),
@@ -43,10 +46,11 @@ export function openSettingsPanel(context: vscode.ExtensionContext): void {
 }
 
 export function postSettingsState(): void {
-  if (settingsPanel) void settingsPanel.webview.postMessage(settingsStateMessage());
+  const panel = settingsPanel;
+  if (panel) void panel.webview.postMessage(settingsStateMessage());
 }
 
-export async function handleSettingsPageMessage(webview: vscode.Webview, raw: unknown): Promise<void> {
+export async function handleSettingsPageMessage(webview: vscode.Webview, raw: unknown, detect?: Parameters<typeof refreshExternalDetection>[0]): Promise<void> {
   if (!isSettingsPageToHost(raw)) {
     output.appendLine(`[drop] invalid settings page message: ${JSON.stringify(raw).slice(0, 200)}`);
     return;
@@ -56,6 +60,7 @@ export async function handleSettingsPageMessage(webview: vscode.Webview, raw: un
       await vscode.commands.executeCommand("workbench.action.openSettings", "laisora");
       return;
     case "settingsPageReady":
+    case "recheckExternalExecutors":
       break;
     case "setComposerSendKey":
       await writeComposerSendKey(raw.sendKey);
@@ -66,17 +71,30 @@ export async function handleSettingsPageMessage(webview: vscode.Webview, raw: un
     case "setRestoreTabsOnStartup":
       await writeRestoreTabsOnStartup(raw.enabled);
       break;
+    case "setLearningEnabled":
+      await writeLearningEnabled(raw.enabled);
+      break;
+    case "setOrchestrationSetting":
+      await writeOrchestrationSetting(raw.setting, raw.value);
+      break;
     case "setFileLinkSetting":
-      await writeFileLinkSetting(raw.setting, raw.enabled);
+      await writeFileLinkSetting(raw.setting, raw.setting === "openWithSystemApp" ? raw.value : raw.enabled);
       break;
   }
   // 書込みを待つ間に閉じられた画面へは送らない（R-DSP-01）
-  if (settingsPanel?.webview !== webview) return;
   // 書込みが失敗しても、上位の層が値を持っていても、画面は構成から読み直した値へ戻る（R-DSP-01）。
   // 値が変わらない書込みでは構成変更の通知が出ないことがあるので、成功時もこの返送を省かない。画面の押下ロックは replyTo でだけ解ける
   const reply = settingsStateMessage();
+  if (settingsPanel?.webview !== webview) return; // R-DSP-01
   if ("requestId" in raw) reply.replyTo = raw.requestId;
   void webview.postMessage(reply);
+  if (raw.type === "settingsPageReady" || raw.type === "recheckExternalExecutors") {
+    const pending = refreshExternalDetection(detect);
+    void webview.postMessage(settingsStateMessage());
+    void pending.then(() => {
+      if (settingsPanel?.webview === webview) void webview.postMessage(settingsStateMessage()); // R-ORC-20: completion belongs to the requesting page.
+    });
+  }
 }
 
 export function settingsPageHtml(page: { cspSource: string; nonce: string; scriptUri: string; cssUri: string; lang: "ja" | "en" }): string {

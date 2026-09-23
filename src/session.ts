@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { projectPlanUsage } from "./plan-usage";
 
 import * as l10n from "@vscode/l10n";
 import {
@@ -16,6 +17,7 @@ import {
 } from "./background-activity";
 import { resolveInitialMode, type ConfiguredEffort, type ConfiguredEffortSnapshot } from "./claude-settings";
 import { ClaudeConversation } from "./claudeHost";
+import type { LearningFacts } from "./learning";
 import { isConvRenderableEvent } from "./conv-renderable";
 import { releaseConversationHistory } from "./conversation-history";
 import { createEvidenceIndex, type SemanticEvidenceIndex } from "./evidence-index";
@@ -115,6 +117,7 @@ export class Session {
   readonly llmRunner: SessionLlm;
   readonly summaryRunner: SessionSummaryWiring;
   sessionFacts: SessionFactsAccumulator = initialSessionFacts();
+  readonly learningFacts?: () => LearningFacts | undefined = () => this.conversation?.learningFacts;
   // MED-1: 現在の live CLI プロセスで ACK/再開を観測した async 委任の transcriptAgentId。
   // resume 復元・旧プロセス由来の未終端委任を streamOpen だけで running と再主張しないための
   // 制限集合。プロセス交代（generation++）と論理セッション初期化で必ず空へ戻す
@@ -194,7 +197,7 @@ export class Session {
   // undefined = このタブはまだ一度も起動していない
   effectiveModel: string | null | undefined;
   effectiveEffort: "low" | "medium" | "high" | "xhigh" | "max" | undefined;
-  // resolveSettings から起動時またはモデル変更時に固定した、表示専用の設定値。
+  // resolveSettings から起動時またはモデル変更時に固定した、表示専用の設定値。applied.effort が分かっていて食い違うときは立てない。
   // SDK 起動 options / 実効観測には使わない。
   configuredEffort: ConfiguredEffort | undefined;
   configuredEffortSnapshot: ConfiguredEffortSnapshot | undefined;
@@ -202,6 +205,7 @@ export class Session {
   // 実行中 CLI の get_settings が返した applied.effort / applied.model と、設定に effort が無いときだけ applied.effort を採った表示専用の既定値
   appliedEffort: ConfiguredEffort | null | undefined;
   appliedModel: string | undefined;
+  recordedModel: string | undefined;
   defaultEffort: ConfiguredEffort | undefined;
   // resume 用: 次回 ensureConversation でこのセッションIDを引き継ぐ
   resumeSessionId: string | undefined;
@@ -210,6 +214,8 @@ export class Session {
     title?: string;
     compact?: { preTokens: number; postTokens: number };
     utteranceCount?: number;
+    detailRunId?: string;
+    decisionCount?: number;
   };
   // 過去ログ読み取り中フラグ。clearing は読み取り前に降りるため、これが無いと同じタブへ
   // 二重 resume が入り、バックエンドと表示が別セッションになる
@@ -280,6 +286,7 @@ export class Session {
     this.configuredEffortSnapshot = undefined;
     this.appliedEffort = undefined;
     this.appliedModel = undefined;
+    this.recordedModel = undefined;
     this.defaultEffort = undefined;
     this.configuredEffortGeneration += 1;
     this.store.post({ type: "configuredEffortChanged", tabId: this.tabId, effort: null });
@@ -384,6 +391,8 @@ export class Session {
   flushHydrationPosts(h: ResumeHydration): void {
     if (h.workPostDirty) {
       h.workPostDirty = false;
+      this.store.post({ type: "planUsage", tabId: this.tabId,
+        state: projectPlanUsage(this.sessionFacts.planUsage, this.evidenceIndex.timeBuckets.blocks) });
       this.store.post({ type: "workModel", tabId: this.tabId, model: this.semantic.projectedWorkModel() });
     }
     if (h.semanticPostDirty) {
@@ -634,6 +643,8 @@ export class Session {
         configEffort: this.configuredEffort,
         defaultEffort: this.defaultEffort,
         appliedModel: this.appliedModel,
+        appliedEffort: this.appliedEffort,
+        recordedModel: this.recordedModel,
         configModel: this.configuredEffortSnapshot?.resolvedModel,
         modelOverride: this.modelOverride,
         effortOverride: this.effortOverride,
@@ -641,6 +652,7 @@ export class Session {
         resumeFilePath: this.resumeFilePath,
         handoffSource: this.handoffSource,
         workModel: this.semantic.projectedWorkModel(),
+        planUsage: projectPlanUsage(this.sessionFacts.planUsage, this.evidenceIndex.timeBuckets.blocks),
         semanticView,
         semanticModel: semanticView ? this.semantic.semanticModelPostPayload() : undefined,
         llmAnalysisEnabled: llmAnalysisEnabled(),
@@ -740,6 +752,8 @@ export class Session {
         configEffort: this.configuredEffort,
         defaultEffort: this.defaultEffort,
         appliedModel: this.appliedModel,
+        appliedEffort: this.appliedEffort,
+        recordedModel: this.recordedModel,
         configModel: this.configuredEffortSnapshot?.resolvedModel,
         modelOverride: this.modelOverride,
         effortOverride: this.effortOverride,
@@ -794,6 +808,8 @@ export class Session {
         configEffort: this.configuredEffort,
         defaultEffort: this.defaultEffort,
         appliedModel: this.appliedModel,
+        appliedEffort: this.appliedEffort,
+        recordedModel: this.recordedModel,
         configModel: this.configuredEffortSnapshot?.resolvedModel,
         modelOverride: this.modelOverride,
         effortOverride: this.effortOverride,
@@ -1009,6 +1025,11 @@ export function historyTranscriptScopeKey(session: Session): string {
 export function isUnusedSession(s: Session): boolean {
   if (s.closed || s.clearing || s.resuming) return false;
   if (s.conversation && s.conversation.state !== "idle") return false;
+  // 引き継ぎカードを持つタブは未使用にしない（R-HND-09）。前世代を描かなくなって
+  // replayed_message が 0 件になった後も、痕跡は作業ログ側（readSessionHistory は切らない）が
+  // 埋めるので通常は使用済みになるが、記録を読めなかった複製では events が空になり、
+  // intoTabId の再利用でカードごと上書きされ、クラッシュ再開は複製の ID を捨てる
+  if (s.handoffSource !== undefined) return false;
   const used = s.events.some(
     (e) =>
       e.kind === "user_message" ||

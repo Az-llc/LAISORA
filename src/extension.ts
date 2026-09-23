@@ -41,8 +41,10 @@ import {
   restoreTabsOnStartupEnabled,
   type PersistedOpenTab,
 } from "./session-list-wiring";
-import { userSettingsMessage } from "./gateway-host-actions";
+import { configuredSystemAppExtensions, userSettingsMessage } from "./gateway-host-actions";
+export { settingsStateMessage, setExternalDetectorForTest } from "./gateway-host-actions";
 import { openSettingsPanel, postSettingsState } from "./settings-panel";
+import { postOrchestrationView } from "./conversation-lifecycle";
 import { registerReadOnlyFileProvider } from "./composer-io";
 // 公開面と検証ハーネスの互換性を保つ再 export。Host 内部は各所有モジュールを直接参照する。
 export { Session, historyScopeKey, historyTranscriptScopeKey, isUnusedSession } from "./session";
@@ -168,6 +170,10 @@ function activateReady(context: vscode.ExtensionContext): void {
   // semanticView / llmAnalysisDiagnostics の「明示off」は snapshot でしか運べない。
   // ?. は検証ハーネスの偽 vscode が onDidChangeConfiguration を持たないため
   const displayConfigSub = vscode.workspace.onDidChangeConfiguration?.((e) => {
+    if (["enabled", "agents", "externalTimeoutMinutes", "conductorPolicy"]
+      .some((key) => affectsProductConfiguration(e, `orchestration.${key}`))) {
+      for (const session of store?.sessions.values() ?? []) postOrchestrationView(session);
+    }
     // settings.json を直接編集した変更も設定画面と入力欄へ届ける（R-DSP-01）
     if (affectsProductConfiguration(e, "composer.sendKey")) store?.post(userSettingsMessage());
     if (
@@ -175,10 +181,16 @@ function activateReady(context: vscode.ExtensionContext): void {
       affectsProductConfiguration(e, "claude.apiKeyPolicy") ||
       affectsProductConfiguration(e, "restoreTabsOnStartup") ||
       affectsProductConfiguration(e, "claude.fileLinkInstruction") ||
+      affectsProductConfiguration(e, "claude.planInstruction") ||
+      affectsProductConfiguration(e, "fileLinks.openWithSystemApp") ||
       affectsProductConfiguration(e, "fileLinks.revealInExplorer") ||
       affectsProductConfiguration(e, "fileLinks.allowOutsideWorkspace") ||
       affectsProductConfiguration(e, "fileLinks.confirmOutsideWorkspace") ||
-      affectsProductConfiguration(e, "fileLinks.openOutsideReadOnly")
+      affectsProductConfiguration(e, "fileLinks.openOutsideReadOnly") ||
+      affectsProductConfiguration(e, "orchestration.enabled") ||
+      affectsProductConfiguration(e, "orchestration.agents") ||
+      affectsProductConfiguration(e, "orchestration.externalTimeoutMinutes") ||
+      affectsProductConfiguration(e, "orchestration.conductorPolicy")
     ) {
       postSettingsState();
     }
@@ -204,7 +216,7 @@ function activateReady(context: vscode.ExtensionContext): void {
       }
       return;
     }
-    store.post({ type: "init", protocolVersion: PROTOCOL_VERSION, tabs: store.snapshotAll(), hostWindows: process.platform === "win32" });
+    store.post({ type: "init", protocolVersion: PROTOCOL_VERSION, tabs: store.snapshotAll(), hostWindows: process.platform === "win32", systemAppExtensions: configuredSystemAppExtensions() });
   });
   if (displayConfigSub) context.subscriptions.push(displayConfigSub);
   // エディタの選択をWebviewへ通知（Claude拡張のファイル/行コンテキスト相当。300msデバウンス）

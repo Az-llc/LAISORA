@@ -124,6 +124,18 @@ function modelSettingsKey(resolvedModel: string): string {
   return resolvedModel.endsWith("[1m]") ? resolvedModel.slice(0, -"[1m]".length) : resolvedModel;
 }
 
+const BUILTIN_CANONICAL_MODEL = /^claude-(?:opus|sonnet|haiku|fable)-\d+(?:-\d{1,2})?$/;
+
+function settingsKeysForModel(selected: string, models: readonly Pick<ModelInfo, "id" | "resolvedModel">[]): Set<string> {
+  const keys = new Set(models.filter((row) => row.id === selected || row.resolvedModel === selected)
+    .map((row) => row.resolvedModel).filter((key): key is string => typeof key === "string" && key.length > 0)
+    .map(modelSettingsKey));
+  // A CLI started with a resolved id (handoff inherits claude-opus-5-5[1m]) lists no row for that id
+  // (CLI 2.1.280). A built-in id is already the settings key once [1m] is dropped.
+  if (keys.size === 0 && BUILTIN_CANONICAL_MODEL.test(modelSettingsKey(selected))) keys.add(modelSettingsKey(selected));
+  return keys;
+}
+
 export function canonicalEffortModel(s: Session): string | undefined {
   // 初回送信前は CLI の init が来ておらず effectiveModel が無い。CLI が get_settings で報告した applied model を先に使い
   // （resume の CLI は設定ではなく記録の model で走る）、無ければ設定の model、それも無ければ SDK 一覧の "default" 行で解く。
@@ -131,13 +143,11 @@ export function canonicalEffortModel(s: Session): string | undefined {
   const snapshot = s.configuredEffortSnapshot;
   const selected = s.modelOverride ?? s.effectiveModel ?? s.appliedModel ?? (snapshot ? snapshot.resolvedModel ?? "default" : undefined);
   if (!selected) return undefined;
-  const keys = new Set(s.models.filter((row) => row.id === selected || row.resolvedModel === selected)
-    .map((row) => row.resolvedModel).filter((key): key is string => typeof key === "string" && key.length > 0)
-    .map(modelSettingsKey));
+  const keys = settingsKeysForModel(selected, s.models);
   const key = keys.size === 1 ? [...keys][0] : undefined;
   // The CLI matches a canonical key against dated / Bedrock / Vertex spellings too, but nothing here derives
   // the canonical key from those IDs (or from custom IDs). Persist only unqualified built-in IDs.
-  return key && /^claude-(?:opus|sonnet|haiku|fable)-\d+(?:-\d{1,2})?$/.test(key) ? key : undefined;
+  return key && BUILTIN_CANONICAL_MODEL.test(key) ? key : undefined;
 }
 
 // null = 保存を試みなかった（max は session-only で settings.json へ書かない。R-CMD-02）
@@ -189,15 +199,7 @@ function canonicalSettingsKeys(
   models: readonly Pick<ModelInfo, "id" | "resolvedModel">[]
 ): Set<string> {
   const selectedModel = model ?? snapshot.resolvedModel;
-  return new Set(
-    selectedModel === null || selectedModel === undefined
-      ? []
-      : models
-          .filter((row) => row.id === selectedModel || row.resolvedModel === selectedModel)
-          .map((row) => row.resolvedModel)
-          .filter((value): value is string => typeof value === "string" && value.length > 0)
-          .map(modelSettingsKey)
-  );
+  return selectedModel === null || selectedModel === undefined ? new Set() : settingsKeysForModel(selectedModel, models);
 }
 
 // applied.effort は env・設定・フラグ層を反映した値なので、現在のモデルに効く層（env > そのモデルの行 > global）に
@@ -213,6 +215,23 @@ export function defaultEffortFromSnapshot(
   if (Object.keys(snapshot.modelEfforts).length === 0) return applied;
   const keys = canonicalSettingsKeys(snapshot, model, models);
   return keys.size === 1 && snapshot.modelEfforts[[...keys][0]] === undefined ? applied : undefined;
+}
+
+// The settings layers only predict the effort; the CLI can ignore them (CLI 2.1.280 drops the top-level
+// effortLevel for claude-opus-5-5). Once applied.effort is known, a layer is named only
+// when it agrees with it; otherwise the webview shows the applied value unlabelled (R-CMD-02).
+export function effortDisplayFromSnapshot(
+  snapshot: ConfiguredEffortSnapshot | undefined,
+  model: string | null | undefined,
+  models: readonly Pick<ModelInfo, "id" | "resolvedModel">[],
+  applied: ConfiguredEffort | null | undefined
+): { configured?: ConfiguredEffort; default?: ConfiguredEffort } {
+  const configured = snapshot === undefined ? undefined : configuredEffortFromSnapshot(snapshot, model, models);
+  if (applied === undefined || (configured !== undefined && configured === applied)) {
+    return configured === undefined ? {} : { configured };
+  }
+  const fallback = defaultEffortFromSnapshot(snapshot, model, models, applied);
+  return fallback === undefined ? {} : { default: fallback };
 }
 
 export async function resolveConfiguredEffortSnapshot(

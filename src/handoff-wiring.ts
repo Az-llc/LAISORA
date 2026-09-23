@@ -10,10 +10,12 @@ import { claudeConfigDir } from "./claude-env";
 import { resolveHandoffRuntime } from "./claudeHost";
 import { openResumedSession } from "./resume-hydration";
 import type { Session } from "./session";
+import { handoffDecisionLineCount } from "./handoff-envelope";
 import {
   HANDOFF_DETAIL_MAX_BYTES,
   HandoffRunner,
   buildHandoffDetailParts,
+  extractHandoffDetail,
   parseHandoffRecords,
   shouldActivateForkTab,
   type HandoffDetail,
@@ -22,7 +24,7 @@ import {
   COMPACT_HEARTBEAT_GRACE_MS,
 } from "./handoff-runner";
 import { extensionContext, output } from "./host-context";
-import { normalizeApiKeyPolicy, type HostToWebview, type WebviewToHost } from "./protocol";
+import { normalizeApiKeyPolicy, restoredHandoffRunId, type HostToWebview, type WebviewToHost } from "./protocol";
 import { lookupSessionFile } from "./session-files";
 import { displayTitleFromSummary } from "./session-list";
 import { sessionSummaryOf } from "./session-list-wiring";
@@ -200,14 +202,33 @@ async function runHandoff(st: SessionStore, sender: vscode.Webview, target: Sess
       title: sourceTitle,
       ...(outcome.compact !== undefined ? { compact: outcome.compact } : {}),
       utteranceCount: outcome.utteranceCount,
+      ...(outcome.detail?.decisions !== undefined
+        ? { decisionCount: handoffDecisionLineCount(outcome.detail.decisions) }
+        : {}),
+      // 再読込後の snapshot もこの ID でカードを描き、展開部は記録から取り直す（R-HND-10）
+      detailRunId: restoredHandoffRunId(outcome.forkSessionId),
     };
     if (outcome.unreadableLineCount > 0) {
       output.appendLine(`[handoff] ${runId} F の ${outcome.unreadableLineCount} 行を JSON として読めなかった（逐語が欠けている可能性）`);
     }
+    // 本文は載せない（既存条項）。件数だけを状態通知に載せ、行は handoffDetail の part 0 が運ぶ
+    const decisions = outcome.detail?.decisions;
     const done = {
       type: "handoffStatus",
       runId,
       state: "done",
+      ...(decisions !== undefined
+        ? {
+            decisions: {
+              total: decisions.entries.length,
+              carried: decisions.carried,
+              extracted: decisions.extracted,
+              removed: decisions.removed,
+              unknownIdRefs: decisions.unknownIdRefs,
+              ...(decisions.warn !== undefined ? { warn: decisions.warn } : {}),
+            },
+          }
+        : {}),
       message:
         outcome.unreadableLineCount > 0
           ? l10n.t(
@@ -235,6 +256,48 @@ async function runHandoff(st: SessionStore, sender: vscode.Webview, target: Sess
   }
 }
 
+// 再読込・復元で開いたカードの展開部（R-HND-10）。handoffDetailSources はプロセス内の Map なので
+// 再読込で消える。復元の runId（セッション ID 由来）を名乗る要求のときだけ記録から取り直し、
+// **1 回だけ** cache へ入れる（part 要求のたびに読み直すと、以後の発言や再 compact で
+// 要約と part 境界が変わる）
+// 飛行中の読み直し。要約と発言の展開を同時に開くと 2 本の要求が同じ tick で届くので、
+// 合流させないと数 MB の記録を 2 回読んで 2 回 parse する
+const handoffDetailRestores = new Map<string, Promise<{ runId: string; detail: HandoffDetail } | undefined>>();
+
+async function restoreHandoffDetailSource(
+  st: SessionStore,
+  tabId: string,
+  runId: string
+): Promise<{ runId: string; detail: HandoffDetail } | undefined> {
+  const session = st.sessions.get(tabId);
+  const forkSessionId = session?.resumeSessionId;
+  if (session === undefined || forkSessionId === undefined || session.resumeFilePath === undefined) return undefined;
+  if (runId !== restoredHandoffRunId(forkSessionId)) return undefined;
+  const key = `${tabId} ${runId}`;
+  const inFlight = handoffDetailRestores.get(key);
+  if (inFlight !== undefined) return inFlight;
+  const filePath = session.resumeFilePath;
+  const started = (async () => {
+    let detail: HandoffDetail | undefined;
+    try {
+      detail = extractHandoffDetail((await readHandoffRecords(filePath)).records, forkSessionId);
+    } catch (error) {
+      output.appendLine(`[handoff] detail restore failed: ${forkSessionId}: ${String(error)}`);
+      return undefined;
+    }
+    if (detail === undefined) return undefined;
+    const entry = { runId, detail };
+    handoffDetailSources.set(tabId, entry);
+    // 1 回の復元につき 1 行。同時要求が合流できていなければ行が増える
+    output.appendLine(`[handoff] detail restored from record: ${forkSessionId}`);
+    return entry;
+  })().finally(() => {
+    handoffDetailRestores.delete(key);
+  });
+  handoffDetailRestores.set(key, started);
+  return started;
+}
+
 // 状態カードの展開部を 1 part 返す。応答は要求元の面だけへ送る（st.post で全可視面へ
 // 配ると、各面が次の part を要求して要求数が part ごとに倍化する）
 async function sendHandoffDetailPart(
@@ -252,8 +315,9 @@ async function sendHandoffDetailPart(
     total: 0,
     utterances: [],
   };
-  const sourceRef = handoffDetailSources.get(tabId);
-  if (sourceRef === undefined || sourceRef.runId !== runId) {
+  const cached = handoffDetailSources.get(tabId);
+  const sourceRef = cached?.runId === runId ? cached : await restoreHandoffDetailSource(st, tabId, runId);
+  if (sourceRef === undefined) {
     await st.postTo(sender, empty);
     return;
   }
@@ -261,7 +325,8 @@ async function sendHandoffDetailPart(
   const parts = buildHandoffDetailParts(
     sourceRef.detail.summary,
     sourceRef.detail.utterances,
-    HANDOFF_DETAIL_MAX_BYTES - base
+    HANDOFF_DETAIL_MAX_BYTES - base,
+    sourceRef.detail.decisions
   );
   const chunk = parts[part];
   if (chunk === undefined) {
@@ -275,6 +340,7 @@ async function sendHandoffDetailPart(
     part,
     total: parts.length,
     ...(chunk.summary !== undefined ? { summary: chunk.summary } : {}),
+    ...(chunk.decisions !== undefined ? { decisions: chunk.decisions } : {}),
     utterances: chunk.utterances,
   });
 }

@@ -1,4 +1,5 @@
 import { getLaisoraConfiguration } from "./claude-settings";
+import { configuredSystemAppExtensions } from "./gateway-host-actions";
 import * as vscode from "vscode";
 import * as l10n from "@vscode/l10n";
 
@@ -7,7 +8,7 @@ import type { AnalysisStorage } from "./analysis-persistence";
 import { ClaudeConversation } from "./claudeHost";
 import { postAttachments } from "./composer-io";
 import { releaseConversationHistory } from "./conversation-history";
-import { warmup } from "./conversation-lifecycle";
+import { postOrchestrationView, warmup } from "./conversation-lifecycle";
 import { handoffDetailSources } from "./handoff-wiring";
 import { releaseHistoryWindow } from "./history-window";
 import { extensionContext, output, sinceActivation, store } from "./host-context";
@@ -106,6 +107,13 @@ export class SessionStore {
     // snapshot を丸ごと送り直すので、ここで送らなくても表示は復帰する。
     if (this.surfaces.get(webview)?.visible === false) return Promise.resolve(false);
     return Promise.resolve(webview.postMessage(msg)).then((delivered) => {
+      if (delivered && (msg.type === "init" || msg.type === "tabRestored")) {
+        const tabIds = msg.type === "init" ? msg.tabs.map((tab) => tab.tabId) : [msg.tab.tabId];
+        for (const tabId of tabIds) {
+          const session = this.sessions.get(tabId);
+          if (session) postOrchestrationView(session);
+        }
+      }
       if (!delivered) output.appendLine(`[webview] postMessage dropped: ${msg.type}`);
       return delivered === true;
     }, (error: unknown) => {
@@ -187,6 +195,7 @@ export class SessionStore {
         type: "init",
         protocolVersion: PROTOCOL_VERSION,
         hostWindows: process.platform === "win32",
+        systemAppExtensions: configuredSystemAppExtensions(),
         tabs: plan?.tabs ?? this.snapshotAll(),
       });
       if (delivered) surface.readyInitAt = Date.now();
@@ -244,6 +253,7 @@ export class SessionStore {
       type: "init",
       protocolVersion: PROTOCOL_VERSION,
       hostWindows: process.platform === "win32",
+      systemAppExtensions: configuredSystemAppExtensions(),
       tabs: plan.tabs,
     }).then((delivered) => {
       // 配送できなかった init で ready 由来を抑止すると、面が初期化されないまま残る
@@ -426,7 +436,12 @@ export async function handleSurfaceMessage(
       // warmup は init を束ねても必ず通す（多重呼び出しは warmup 自身が弾く独立経路）。
       // Claude拡張と同様、開いた時点でCLIセッションを事前起動する
       // （初回送信前から /コマンドサジェスト・認証実測を有効にするため）
-      for (const s of st.sessions.values()) warmup(s);
+      // hydration 設置前の resuming セッションは起こさない（復元経路が自分で warmup する）。
+      // ここで起こすと、起動 cwd の確定（AUDIT-02）と観測時刻の種の確定より前に会話が作られる
+      for (const s of st.sessions.values()) {
+        if (s.resuming && s.hydration === null) continue;
+        warmup(s);
+      }
       break;
     }
     case "webviewDiagnostic":

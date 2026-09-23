@@ -2,8 +2,23 @@
   "name": "laisora",
   "displayName": "LAISORA",
   "description": "%extension.description%",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "publisher": "az-llc",
+  "categories": [
+    "AI",
+    "Chat"
+  ],
+  "keywords": [
+    "claude",
+    "claude code",
+    "agent",
+    "ai",
+    "orchestration",
+    "subagent",
+    "codex",
+    "work log",
+    "analysis"
+  ],
   "engines": {
     "vscode": "^1.90.0"
   },
@@ -122,11 +137,35 @@
           "default": true,
           "description": "%config.laisora.restoreTabsOnStartup.description%"
         },
+        "laisora.claude.planInstruction": {
+          "type": "boolean",
+          "default": true,
+          "scope": "application",
+          "description": "%config.laisora.claude.planInstruction.description%"
+        },
         "laisora.claude.fileLinkInstruction": {
           "type": "boolean",
           "default": true,
           "scope": "application",
           "description": "%config.laisora.claude.fileLinkInstruction.description%"
+        },
+        "laisora.fileLinks.openWithSystemApp": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "pattern": "^\\.[a-z0-9_-]+$"
+          },
+          "default": [
+            ".xlsx",
+            ".xls",
+            ".docx",
+            ".doc",
+            ".pptx",
+            ".ppt",
+            ".pdf"
+          ],
+          "scope": "application",
+          "description": "%config.laisora.fileLinks.openWithSystemApp.description%"
         },
         "laisora.fileLinks.revealInExplorer": {
           "type": "boolean",
@@ -194,6 +233,165 @@
           "default": false,
           "description": "%config.laisora.claude.remoteControlAtStartup.description%",
           "scope": "machine"
+        },
+        "laisora.orchestration.enabled": {
+          "type": "boolean",
+          "default": false,
+          "scope": "application",
+          "description": "%config.laisora.orchestration.enabled.description%"
+        },
+        "laisora.learning.enabled": {
+          "type": "boolean",
+          "default": false,
+          "scope": "application",
+          "description": "%config.laisora.learning.enabled.description%"
+        },
+        "laisora.orchestration.agents": {
+          "type": "array",
+          "default": [
+            {
+              "role": "worker",
+              "enabled": true,
+              "description": "Implementation and mechanical edits",
+              "rows": [
+                {
+                  "executor": "claude",
+                  "model": "haiku",
+                  "efforts": []
+                },
+                {
+                  "executor": "claude",
+                  "model": "sonnet",
+                  "efforts": [
+                    "low",
+                    "high"
+                  ]
+                },
+                {
+                  "executor": "claude",
+                  "model": "opus",
+                  "efforts": [
+                    "high"
+                  ]
+                }
+              ]
+            },
+            {
+              "role": "explorer",
+              "enabled": true,
+              "description": "Read-only search and fact finding",
+              "rows": [
+                {
+                  "executor": "claude",
+                  "model": "haiku",
+                  "efforts": []
+                },
+                {
+                  "executor": "claude",
+                  "model": "sonnet",
+                  "efforts": [
+                    "low"
+                  ]
+                }
+              ]
+            },
+            {
+              "role": "reviewer",
+              "enabled": true,
+              "description": "Independent review of a finished change; reports findings, does not edit",
+              "rows": [
+                {
+                  "executor": "claude",
+                  "model": "opus",
+                  "efforts": [
+                    "high"
+                  ]
+                }
+              ]
+            }
+          ],
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "role",
+              "enabled",
+              "description",
+              "rows"
+            ],
+            "properties": {
+              "role": {
+                "type": "string",
+                "pattern": "^[a-z][a-z0-9-]*$"
+              },
+              "enabled": {
+                "type": "boolean"
+              },
+              "description": {
+                "type": "string"
+              },
+              "rows": {
+                "type": "array",
+                "maxItems": 12,
+                "default": [],
+                "items": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "required": [
+                    "executor",
+                    "model",
+                    "efforts"
+                  ],
+                  "properties": {
+                    "executor": {
+                      "type": "string",
+                      "enum": [
+                        "claude",
+                        "agy",
+                        "codex"
+                      ]
+                    },
+                    "model": {
+                      "type": "string",
+                      "pattern": "^$|^[A-Za-z0-9][A-Za-z0-9._:-]*$"
+                    },
+                    "efforts": {
+                      "type": "array",
+                      "uniqueItems": true,
+                      "items": {
+                        "type": "string",
+                        "enum": [
+                          "low",
+                          "medium",
+                          "high",
+                          "xhigh",
+                          "max",
+                          "ultra"
+                        ]
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "scope": "application",
+          "description": "%config.laisora.orchestration.agents.description%"
+        },
+        "laisora.orchestration.conductorPolicy": {
+          "type": "string",
+          "default": "If nothing requires orchestration, complete the work yourself.\nDelegate to the roles needed when separating work, isolating context, or obtaining independent judgment helps.\nChoose the model and effort using the required quality, difficulty, and available model characteristics.\nFor generation, exploration, and selection, judge content quality as well as compliance with the format.\nChoose the need and scope of review according to impact, and keep independent reviewers separate from implementers.\nGive delegated work a clear objective, scope, and conditions for verifying completion.\nAccept results through the artifacts and suitable external checks; resolve material findings through verification or explicit user acceptance of the risk before release.",
+          "editPresentation": "multilineText",
+          "scope": "application",
+          "description": "%config.laisora.orchestration.conductorPolicy.description%"
+        },
+        "laisora.orchestration.externalTimeoutMinutes": {
+          "type": "number",
+          "scope": "application",
+          "default": 10,
+          "minimum": 1,
+          "maximum": 120,
+          "description": "%config.orchestration.externalTimeoutMinutes%"
         }
       }
     }
@@ -204,7 +402,7 @@
     "typecheck": "tsc --noEmit"
   },
   "devDependencies": {
-    "@anthropic-ai/claude-agent-sdk": "^0.3.272",
+    "@anthropic-ai/claude-agent-sdk": "^0.3.280",
     "@types/node": "^24.0.0",
     "@types/vscode": "^1.90.0",
     "@vscode/l10n": "0.0.18",

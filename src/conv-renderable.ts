@@ -6,7 +6,8 @@ import type { NormalizedEvent } from "./protocol";
 // DOM に触れないのでこのモジュールは Host からも読める（webview/tab.ts に置くと読めない）
 export function isConvRenderableEvent(ev: NormalizedEvent): boolean {
   if (ev.kind === "replayed_message" || ev.kind === "model_observed") return true;
-  if (ev.kind === "compact_boundary") return true;
+  // 世代境界より前の圧縮は当世代の会話ではない（R-HND-13）。印は Host が付ける
+  if (ev.kind === "compact_boundary") return ev.priorGeneration !== true;
   if (ev.kind === "user_message" || ev.kind === "assistant_text_delta") {
     return ev.provenance?.path !== "history";
   }

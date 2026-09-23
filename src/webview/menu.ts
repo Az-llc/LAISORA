@@ -399,10 +399,10 @@ function renderEffortRow(row: HTMLElement, level: string | null, source?: "confi
   row.append(name, buildEffortDots(idx));
 }
 
-// 観測値、明示指定値、起動時に取得した設定値、CLI の既定値の順で表示する。
+// 観測値、明示指定値、起動時に取得した設定値、CLI の既定値、CLI の適用値の順で表示する。
 function currentEffort(t: Tab | null): string | null {
   if (t?.auth?.effort !== undefined) return t.auth.effort;
-  return t?.effortOverride ?? t?.configEffort ?? t?.defaultEffort ?? null;
+  return t?.effortOverride ?? t?.configEffort ?? t?.defaultEffort ?? t?.appliedEffort ?? null;
 }
 
 // effort をその段へ直接設定する（ドットのクリック）。送りと同じ即時反映経路を通る

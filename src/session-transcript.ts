@@ -45,9 +45,10 @@ export interface ReplayedTool {
 
 export interface SessionTranscript {
   title: string;
+  recordedModel?: string;
   // uuid は会話の遡り（Phase 2）で重複を弾くための表示専用の識別子。
   // 無いレコードもありうるので optional（無い場合は重複判定の対象外になる）
-  messages: Array<{ role: "user" | "assistant"; text: string; uuid?: string; imageRefs?: ImageRefInfo[]; model?: string }>;
+  messages: Array<{ role: "user" | "assistant"; text: string; uuid?: string; imageRefs?: ImageRefInfo[]; model?: string; timestamp: number }>;
   tools: ReplayedTool[];
   summaryInput: {
     messages: Array<{ role: "user" | "assistant"; text: string }>;
@@ -71,6 +72,7 @@ const RESUME_CAPTURE_CHUNK_BYTES = 64 * 1024;
 export interface ResumeReadSet {
   parentEndOffset: number;
   lastCompleteParentTimestamp: number | undefined;
+  recordedModel?: string;
   subagents: Array<{ path: string; size: number }>;
 }
 
@@ -107,19 +109,27 @@ function parsedTimestamp(value: unknown): number | undefined {
   return Number.isFinite(parsed) ? parsed : undefined;
 }
 
-function timestampFromJsonLine(line: Buffer): number | undefined {
-  const record = parseRecord(line.toString("utf8"));
-  return record ? parsedTimestamp(record.timestamp) : undefined;
-}
-
 async function captureParentBoundary(
   handle: import("node:fs/promises").FileHandle,
   size: number
-): Promise<{ parentEndOffset: number; lastCompleteParentTimestamp: number | undefined }> {
+): Promise<Omit<ResumeReadSet, "subagents">> {
   let position = size;
   let boundaryFound = false;
   let parentEndOffset = 0;
   let suffix = Buffer.alloc(0);
+  let lastCompleteParentTimestamp: number | undefined;
+  let recordedModel: string | undefined;
+  let assistantFound = false;
+  const observeLine = (line: Buffer): void => {
+    const record = parseRecord(line.toString("utf8"));
+    if (!record) return;
+    lastCompleteParentTimestamp ??= parsedTimestamp(record.timestamp);
+    if (!assistantFound && record.type === "assistant" && record.isSidechain !== true) {
+      assistantFound = true;
+      const model = asRecord(record.message)?.model;
+      recordedModel = typeof model === "string" && model.length > 0 && !model.startsWith("<") ? model : undefined;
+    }
+  };
   // FP-1: timestamp 探索は preview と同じ 1MiB を上限とし、末尾に timestamp 欠落レコードが
   // 続くファイルで Phase 1 前の走査が O(size) 化するのを防ぐ。超過時は undefined へ縮退。
   // parentEndOffset の境界探索自体は打ち切らない（0 に縮退すると捕捉履歴が空になり、
@@ -128,7 +138,7 @@ async function captureParentBoundary(
 
   while (position > 0) {
     if (boundaryFound && position <= scanFloor) {
-      return { parentEndOffset, lastCompleteParentTimestamp: undefined };
+      return { parentEndOffset, lastCompleteParentTimestamp, recordedModel };
     }
     const start = Math.max(0, position - RESUME_CAPTURE_CHUNK_BYTES);
     const chunk = await readHandleRange(handle, start, position - start);
@@ -150,8 +160,10 @@ async function captureParentBoundary(
     for (let i = combined.length - 1; i >= 0; i--) {
       if (combined[i] !== 0x0a) continue;
       if (i + 1 < lineEnd) {
-        const timestamp = timestampFromJsonLine(combined.subarray(i + 1, lineEnd));
-        if (timestamp !== undefined) return { parentEndOffset, lastCompleteParentTimestamp: timestamp };
+        observeLine(combined.subarray(i + 1, lineEnd));
+        if (lastCompleteParentTimestamp !== undefined && assistantFound) {
+          return { parentEndOffset, lastCompleteParentTimestamp, recordedModel };
+        }
       }
       lineEnd = i;
     }
@@ -160,16 +172,15 @@ async function captureParentBoundary(
   }
 
   if (boundaryFound && suffix.length > 0) {
-    const timestamp = timestampFromJsonLine(suffix);
-    if (timestamp !== undefined) return { parentEndOffset, lastCompleteParentTimestamp: timestamp };
+    observeLine(suffix);
   }
-  return { parentEndOffset, lastCompleteParentTimestamp: undefined };
+  return { parentEndOffset, lastCompleteParentTimestamp, recordedModel };
 }
 
 export async function captureResumeReadSet(parentPath: string): Promise<ResumeReadSet> {
   const { open, readdir, stat } = await import("node:fs/promises");
   const handle = await open(parentPath, "r");
-  let boundary: { parentEndOffset: number; lastCompleteParentTimestamp: number | undefined };
+  let boundary: Omit<ResumeReadSet, "subagents">;
   try {
     boundary = await captureParentBoundary(handle, (await handle.stat()).size);
   } finally {
@@ -199,7 +210,7 @@ export async function captureResumeReadSet(parentPath: string): Promise<ResumeRe
   return { ...boundary, subagents };
 }
 
-function createParseYielder(): () => Promise<void> | undefined {
+export function createParseYielder(): () => Promise<void> | undefined {
   let recordCount = 0;
   let startedAt = Date.now();
   return () => {
@@ -214,7 +225,27 @@ function createParseYielder(): () => Promise<void> | undefined {
   };
 }
 
-export async function readResumePreviewTail(parentPath: string): Promise<ResumePreviewMessage[]> {
+// 世代境界の述語（R-HND-09）。preview / replay / 裏読み / 要約詳細の再抽出が共有する。
+// **配列 index を読み手の外へ出さないこと**: uuid を持たないレコードを readConversationMessages は
+// push せず readSessionTranscript は push するので、index を共有すると片方で前世代が漏れるか
+// 当世代が削れる。共有してよいのは「どのレコードで真になるか」だけ
+export function isHandoffGenerationBoundary(
+  record: Record<string, unknown>,
+  sessionId: string | undefined
+): boolean {
+  if (sessionId === undefined || sessionId.length === 0) return false;
+  if (record.type !== "user") return false;
+  // sidechain は子エージェントの実行。ここで弾かないと、sidechain を先に落とす読み手と
+  // 述語を先に呼ぶ読み手で境界がずれる（片方だけ前世代を返す）
+  if (record.isSidechain === true) return false;
+  const parsed = parseHandoffEnvelope(verbatimTextOf(record));
+  return parsed.ok && parsed.version === "2" && parsed.envelope.snapshot.forkSessionId === sessionId;
+}
+
+export async function readResumePreviewTail(
+  parentPath: string,
+  sessionId?: string
+): Promise<ResumePreviewMessage[]> {
   const { open } = await import("node:fs/promises");
   const handle = await open(parentPath, "r");
   let buffer: Buffer;
@@ -253,7 +284,9 @@ export async function readResumePreviewTail(parentPath: string): Promise<ResumeP
     const pendingYield = maybeYield();
     if (pendingYield) await pendingYield;
     const obj = parseRecord(line);
-    if (!obj || !acceptRecord(obj) || obj.isSidechain === true) continue;
+    if (!obj) continue;
+    if (isHandoffGenerationBoundary(obj, sessionId)) break;
+    if (!acceptRecord(obj) || obj.isSidechain === true) continue;
     const uuid = typeof obj.uuid === "string" ? obj.uuid : "";
     if (!uuid) continue;
     if (obj.type === "user") {
@@ -346,11 +379,14 @@ function findTurnIdForTimestamp(
 export async function readSessionHistory(
   parentFilePath: string,
   isAllowedPath: (p: string) => boolean,
-  opts?: { subagentsDir?: string; resumeReadSet?: ResumeReadSet }
+  opts?: { subagentsDir?: string; resumeReadSet?: ResumeReadSet; generationSessionId?: string }
 ): Promise<{
   events: HistoryEvent[];
   coverage: WorkCoverage;
   claudeCodeVersion?: string;
+  // 引き継ぎ封筒（forkSessionId === generationSessionId）のレコード時刻。
+  // 呼び出し側が当世代だけを取り出すための境界で、events 自体は切っていない
+  generationStartAt?: number;
   malformedLineCount: number;
   // ゲートで捨てた task-notification の計数（T0 レビュー M-2）。破棄は fold 到達前で
   // EvidenceIndex からは観測できないため、Adapter 側の hash 非入力カウンタとして持つ
@@ -374,6 +410,8 @@ export async function readSessionHistory(
   let claudeCodeVersion: string | undefined;
   let cwd = "";
   let boundaryPartialExcludedCount = 0;
+  const generationSessionId = opts?.generationSessionId;
+  let generationStartAt: number | undefined;
 
   if (!isAllowedPath(parentFilePath)) {
     return {
@@ -392,6 +430,9 @@ export async function readSessionHistory(
   }
 
   const rawEvents: RawHistoryItem[] = [];
+  // 世代境界より前に現れた compact_boundary。events は切らない（作業ログ・集計は全世代）ので、
+  // 会話面が落とせるよう印だけを付ける対象（R-HND-13）
+  const preBoundaryCompacts = new Set<RawHistoryItem>();
   const parentTurns: ParentTurnSpan[] = [];
   const seenToolUseIds = new Set<string>();
   const seenToolResultIds = new Set<string>();
@@ -548,6 +589,12 @@ export async function readSessionHistory(
       const rawTs = typeof obj.timestamp === "string" ? Date.parse(obj.timestamp) : NaN;
       const recordTime = Number.isFinite(rawTs) ? rawTs : lastParentTimestamp;
       lastParentTimestamp = recordTime;
+
+      // 世代境界の時刻だけを控える。ここでイベントを落とさない: 作業ログと集計は前世代を含める。
+      // 切るかどうかは呼び出し側が決める（会話の書き出しだけが切る）
+      if (generationSessionId !== undefined && isHandoffGenerationBoundary(obj, generationSessionId)) {
+        generationStartAt = recordTime;
+      }
 
       const message = asRecord(obj.message);
       const content = message?.content;
@@ -777,6 +824,19 @@ export async function readSessionHistory(
             sourcePriority: 0,
             fileOrder: parentOrderCounter++,
           });
+          if (typeof obj.uuid === "string" && obj.uuid.length > 0) {
+            rawEvents.push({
+              body: {
+                kind: "assistant_message_uuid",
+                turnId,
+                uuid: obj.uuid,
+                provenance: { path: "history" },
+              },
+              timestamp: recordTime,
+              sourcePriority: 0,
+              fileOrder: parentOrderCounter++,
+            });
+          }
         }
 
         if (Array.isArray(content)) {
@@ -826,7 +886,7 @@ export async function readSessionHistory(
       } else if (obj.type === "system" && obj.subtype === "compact_boundary") {
         const compactMeta = asRecord(obj.compactMetadata);
         const preTokens = compactMeta?.preTokens;
-        rawEvents.push({
+        const item: RawHistoryItem = {
           body: {
             kind: "compact_boundary",
             trigger: compactMeta?.trigger === "auto" ? "auto" : "manual",
@@ -836,7 +896,13 @@ export async function readSessionHistory(
           timestamp: recordTime,
           sourcePriority: 0,
           fileOrder: parentOrderCounter++,
-        });
+        };
+        // 境界はこの先のレコードで見つかるので、印はここでは付けられない（封筒が無い記録で
+        // 全件が前世代になる）。候補として控え、境界が実在したときだけ events 組み立てで印を付ける
+        if (generationSessionId !== undefined && generationStartAt === undefined) {
+          preBoundaryCompacts.add(item);
+        }
+        rawEvents.push(item);
       } else if (obj.type === "system") {
         const notice = parseRefusalNotice(obj);
         if (notice) {
@@ -1153,7 +1219,12 @@ export async function readSessionHistory(
   // 単調性は直前の timestamp 昇順ソート自体が保証する（累積 max クランプは不要 — レビュー M-6）
   const events: HistoryEvent[] = rawEvents.map((item) => {
     const ev: HistoryEvent = {
-      body: item.body,
+      body:
+        generationStartAt !== undefined &&
+        preBoundaryCompacts.has(item) &&
+        item.body.kind === "compact_boundary"
+          ? { ...item.body, priorGeneration: true as const }
+          : item.body,
       timestamp: item.timestamp,
     };
     if (item.hostArtifacts && item.hostArtifacts.length > 0) {
@@ -1197,6 +1268,7 @@ export async function readSessionHistory(
     events,
     coverage,
     claudeCodeVersion,
+    ...(generationStartAt !== undefined ? { generationStartAt } : {}),
     malformedLineCount,
     droppedTaskNotificationCount,
     ...(opts?.resumeReadSet ? { boundaryPartialExcludedCount } : {}),
@@ -1215,7 +1287,8 @@ export async function readSessionHistory(
 export async function readConversationMessages(
   filePath: string,
   isAllowedPath: (filePath: string) => boolean,
-  resumeReadSet?: ResumeReadSet
+  resumeReadSet?: ResumeReadSet,
+  sessionId?: string
 ): Promise<{
   messages: Array<{ uuid: string; role: "user" | "assistant"; text: string; timestamp: number; imageRefs?: ImageRefInfo[] }>;
   malformedLineCount: number;
@@ -1236,6 +1309,7 @@ export async function readConversationMessages(
   let droppedWithoutUuidCount = 0;
   let boundaryPartialExcludedCount = 0;
   let handoffEnvelope: HandoffEnvelopeV2 | undefined;
+  let cutFrom = 0;
 
   if (!isAllowedPath(filePath)) {
     return {
@@ -1293,6 +1367,7 @@ export async function readConversationMessages(
     }
     if (!acceptRecord(obj)) continue;
     if (obj.isSidechain === true) continue;
+    if (isHandoffGenerationBoundary(obj, sessionId)) cutFrom = messages.length;
     lastTimestamp = recordTimestamp(obj.timestamp, lastTimestamp);
     const uuid = typeof obj.uuid === "string" ? obj.uuid : "";
     if (obj.type === "user") {
@@ -1342,7 +1417,7 @@ export async function readConversationMessages(
     }
   }
   return {
-    messages,
+    messages: messages.slice(cutFrom),
     malformedLineCount,
     droppedWithoutUuidCount,
     ...(resumeReadSet ? { boundaryPartialExcludedCount } : {}),
@@ -1353,14 +1428,16 @@ export async function readConversationMessages(
 export async function readSessionTranscript(
   filePath: string,
   isAllowedPath: (filePath: string) => boolean,
-  resumeReadSet?: ResumeReadSet
+  resumeReadSet?: ResumeReadSet,
+  sessionId?: string
 ): Promise<SessionTranscript> {
-  const messages: Array<{ role: "user" | "assistant"; text: string; uuid?: string; imageRefs?: ImageRefInfo[]; model?: string }> = [];
+  const messages: Array<{ role: "user" | "assistant"; text: string; uuid?: string; imageRefs?: ImageRefInfo[]; model?: string; timestamp: number }> = [];
   const tools: Array<ReplayedTool & { toolUseId: string }> = [];
   const results = new Map<string, { isError: boolean; preview: string }>();
   let lastTimestamp = 0;
   let cwd = "";
   let claudeCodeVersion: string | undefined;
+  let recordedModel: string | undefined;
   const coverage: WorkCoverage = {
     summary: "complete",
     details: "complete",
@@ -1372,6 +1449,7 @@ export async function readSessionTranscript(
   let malformedLineCount = 0;
   let boundaryPartialExcludedCount = 0;
   let readError: string | undefined;
+  let cutFrom = 0;
 
   if (!isAllowedPath(filePath)) {
     readError = "outside-session-store";
@@ -1415,6 +1493,7 @@ export async function readSessionTranscript(
         const message = asRecord(obj.message);
         const content = message?.content;
         lastTimestamp = recordTimestamp(obj.timestamp, lastTimestamp);
+        if (isHandoffGenerationBoundary(obj, sessionId)) cutFrom = messages.length;
         if (obj.type === "user") {
           const text = extractHumanUserText(obj);
           if (text) {
@@ -1426,6 +1505,7 @@ export async function readSessionTranscript(
               text,
               uuid,
               ...(imageRefs ? { imageRefs } : {}),
+              timestamp: lastTimestamp,
             });
           }
           if (Array.isArray(content)) {
@@ -1448,6 +1528,10 @@ export async function readSessionTranscript(
             }
           }
         } else if (obj.type === "assistant") {
+          if (obj.isSidechain !== true) {
+            const model = message?.model;
+            recordedModel = typeof model === "string" && model.length > 0 && !model.startsWith("<") ? model : undefined;
+          }
           const text = extractText(content);
           if (text && !isRefusalErrorProse(obj, message)) {
             const rawModel = message?.model;
@@ -1457,6 +1541,7 @@ export async function readSessionTranscript(
               text,
               uuid: typeof obj.uuid === "string" ? obj.uuid : undefined,
               ...(model ? { model } : {}),
+              timestamp: lastTimestamp,
             });
           }
           if (Array.isArray(content)) {
@@ -1481,7 +1566,10 @@ export async function readSessionTranscript(
     coverage.details = "prefix-truncated";
   }
   const allTools = tools.map((tool) => withResult(tool, results));
-  const omittedMessageCount = Math.max(0, messages.length - REPLAY_MESSAGE_MAX);
+  // 窓取りは世代の切り出しより後ろ（R-HND-09）。先に窓を取ると前世代のぶんで 80 件が埋まる。
+  // summaryInput は切らない（分析・要約の入力は分析の契約側）
+  const generationMessages = messages.slice(cutFrom);
+  const omittedMessageCount = Math.max(0, generationMessages.length - REPLAY_MESSAGE_MAX);
   const omittedToolCount = Math.max(0, allTools.length - REPLAY_TOOL_MAX);
   if (omittedMessageCount > 0 || omittedToolCount > 0) {
     coverage.details = "prefix-truncated";
@@ -1494,7 +1582,7 @@ export async function readSessionTranscript(
   }
   return {
     title,
-    messages: messages.slice(-REPLAY_MESSAGE_MAX),
+    messages: generationMessages.slice(-REPLAY_MESSAGE_MAX),
     tools: allTools.slice(-REPLAY_TOOL_MAX),
     summaryInput: { messages, tools: allTools },
     coverage,
@@ -1502,6 +1590,7 @@ export async function readSessionTranscript(
     ...(resumeReadSet ? { boundaryPartialExcludedCount } : {}),
     readError,
     claudeCodeVersion,
+    recordedModel,
   };
 }
 

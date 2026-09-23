@@ -19,13 +19,15 @@ export function agentLabel(a: { description?: string }): string {
 type WorkCoverageView = WorkModelPayload["coverage"];
 
 // 表示側だけの付記（protocol の WorkCoverage には無い。main.ts が添える）。
-// droppedEventCount のうち裏読みで戻る分と、その裏読みが止まっているか。
-// 残り（droppedEventCount - backfillPendingCount）は Host が保持しておらず、遡っても届かない
+// この画面に出ていない件数を、裏読みで戻る分と記録からも戻らない分に分けて運ぶ。
+// **描き手が droppedEventCount から引き算で導かない**: あの値は live の切り詰めで増え続け、
+// 増えた分は画面に描き終えている（R-DSP-01）
 export interface CoverageBackfillHint {
   backfillPendingCount?: number;
   backfillStalled?: boolean;
   backfillPhase?: "events" | "transcript";
   backfillDone?: boolean;
+  backfillUnreachableCount?: number;
 }
 
 export interface CoverageRow {
@@ -121,7 +123,7 @@ export function coverageRows(coverage: WorkCoverageView & CoverageBackfillHint, 
   }
   // droppedEventCount を summaryGaps へ入れない。Host は reduceWorkModel と evidenceIndex を全イベントに
   // 当ててから trimEventLog するので、概要の数字は先頭を含む（実測: 13,004 件 fold → ツール 6,500 = 全件）。
-  // 欠けるのは実行ログの行と LLM 分析の入力だけで、それは details 側の文が担う（R-51 / R-DSP-01。G-COV-6）
+  // 欠けるのは実行ログの行と LLM 分析の入力だけで、それは details 側の文が担う（R-DSP-01。G-COV-6）
   // 欠落を並べながら「セッション全体」と名乗らない（R-DSP-01）
   const summaryParts = [
     coverage.summary !== "complete"
@@ -133,7 +135,20 @@ export function coverageRows(coverage: WorkCoverageView & CoverageBackfillHint, 
         : l10n.t("Summary: whole session"),
     ...summaryGaps,
   ];
-  const detailParts = [coverage.details === "complete" ? l10n.t("Details: all shown") : l10n.t("Details: recent only")];
+  const backfillPending = coverage.backfillPendingCount ?? 0;
+  // 記録からも読めなかった件数。遡りが尽きるまでは 0 で、尽きた後だけ確定する（R-TAB-08）
+  const unreachable = coverage.backfillUnreachableCount ?? 0;
+  // 読み終わって欠けだけが残った画面を「直近のみ」と呼ばない（出ている範囲は直近ではない）。
+  // 概要行と同じ「一部欠け」にして、欠けの件数を下の文で出す（R-DSP-01 / R-DSP-23）
+  // 欠けの判定を details より先に見る。Host の details が complete でも、この画面に出せなかった
+  // 行があるなら「すべて表示」とは言えない（R-DSP-01）
+  const detailParts = [
+    backfillPending === 0 && unreachable > 0
+      ? l10n.t("Details: partially missing")
+      : coverage.details === "complete"
+        ? l10n.t("Details: all shown")
+        : l10n.t("Details: recent only"),
+  ];
   // この 2 件数は初期表示から外した総数であり、現在の未読込件数ではない。
   // 読み込みの進行・停止は下の backfill 行に任せ、完了後は「すべて表示」と矛盾するため出さない。
   if (!coverage.backfillDone && coverage.omittedToolCount !== undefined) {
@@ -142,32 +157,25 @@ export function coverageRows(coverage: WorkCoverageView & CoverageBackfillHint, 
   if (!coverage.backfillDone && coverage.omittedMessageCount !== undefined) {
     detailParts.push(l10n.t("{0} messages are not shown in the initial view", coverage.omittedMessageCount));
   }
-  // 「破棄」と書かない。落ちたのは画面の実行ログの行だけで、集計は落とす前に畳んである（R-DSP-01 / R-DSP-23）。
-  // 裏読みで戻る分（この画面の窓落ち）と Host が保持していない分（EVENT_LOG_MAX）を同じ文にしない（R-48）
-  if (coverage.droppedEventCount !== undefined) {
-    if (!coverage.backfillDone) {
-      const pending = coverage.backfillPendingCount ?? 0;
-      if (coverage.backfillPhase === "transcript") {
-        if (pending > 0) {
-          detailParts.push(
-            coverage.backfillStalled === true
-              ? l10n.t("Loading {0} older events into the run log has stalled", pending)
-              : l10n.t("Loading {0} older events into the run log (from the record)", pending)
-          );
-        }
-      } else {
-        const unreachable = coverage.droppedEventCount - pending;
-        if (pending > 0) {
-          detailParts.push(
-            coverage.backfillStalled === true
-              ? l10n.t("Loading {0} older events into the run log has stalled", pending)
-              : l10n.t("Loading {0} older events into the run log", pending)
-          );
-        }
-        if (unreachable > 0) {
-          detailParts.push(l10n.t("{0} older events are not shown in the run log (not retained by the host)", unreachable));
-        }
-      }
+  // 「破棄」と書かない（落ちたのは実行ログの行だけで、集計は落とす前に畳んである。R-DSP-01 / R-DSP-23）。
+  // 裏読みで戻る分と記録からも読めなかった分を同じ文にしない（R-TAB-08）
+  if (!coverage.backfillDone) {
+    // 止まったときは残件を 1 文にまとめる（画面に出ていない件数は同じものなので二度数えない）
+    const stalled = coverage.backfillStalled === true ? Math.max(backfillPending, unreachable) : 0;
+    if (stalled > 0) {
+      detailParts.push(l10n.t("Loading {0} older events into the run log has stalled", stalled));
+    } else if (backfillPending > 0) {
+      detailParts.push(
+        coverage.backfillPhase === "transcript"
+          ? l10n.t("Loading {0} older events into the run log (from the record)", backfillPending)
+          : l10n.t("Loading {0} older events into the run log", backfillPending)
+      );
+    }
+    // 読めなかった欠けは黙って隠さない（R-DSP-03）
+    if (unreachable > 0 && stalled === 0) {
+      detailParts.push(
+        l10n.t("{0} older events could not be read from the record, so they are not shown in the run log", unreachable)
+      );
     }
   }
   if (coverage.untrackedApprovalCount !== undefined) {

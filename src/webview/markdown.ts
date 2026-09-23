@@ -1,6 +1,7 @@
 import * as l10n from "@vscode/l10n";
 import { vscode } from "./dom";
-import { parseHostFileLinkTarget, parseMarkdown, type MdNode } from "./markdown-ast";
+import { renderAsk, renderGoal, type AskRenderContext } from "./ask-view";
+import { fileLinkDisplayKind, parseHostFileLinkTarget, parseMarkdown, type MdNode } from "./markdown-ast";
 
 const artifactIds = new WeakMap<HTMLElement, string[]>();
 const SVG_NS = "http://www.w3.org/2000/svg";
@@ -27,9 +28,69 @@ function svgElement<K extends keyof SVGElementTagNameMap>(name: K): SVGElementTa
   return document.createElementNS(SVG_NS, name);
 }
 
-function linkKindIcon(kind: "file" | "web" | "mail"): SVGSVGElement {
+const COPY_REVERT_MS = 2000;
+
+// コピーボタンの唯一の作り方。コードブロック・返信フッター・発言フッターが同じ作法を通る
+// （アイコン差し替え + role=status の視覚的非表示テキスト + 2 秒で元へ戻す）。
+// source は呼び出しのたびに評価する: 返信の原文は後続 chunk の統合で伸びるため、
+// 生成時の文字列を捕まえると古い本文をコピーする。
+export function createCopyButton(
+  className: string,
+  idleTitle: string,
+  source: () => string
+): { button: HTMLButtonElement; status: HTMLElement } {
+  const button = document.createElement("button");
+  button.type = "button";
+  button.className = className;
+  button.appendChild(codeActionIcon("copy"));
+  button.title = idleTitle;
+  button.setAttribute("aria-label", idleTitle);
+  const status = document.createElement("span");
+  status.className = "code-copy-status";
+  status.setAttribute("role", "status");
+  let revertTimer: ReturnType<typeof setTimeout> | undefined;
+  const revert = (): void => {
+    revertTimer = undefined;
+    button.replaceChildren(codeActionIcon("copy"));
+    delete button.dataset.copyState;
+    status.textContent = "";
+    button.title = idleTitle;
+    button.setAttribute("aria-label", idleTitle);
+  };
+  // 実行中でも disabled にしない。押した直後に disabled にするとフォーカスが body へ落ち、
+  // キーボードだけで操作している利用者が戻り先を失う。二重押しは in-flight で弾く
+  let inFlight = false;
+  button.addEventListener("click", async () => {
+    if (inFlight) return;
+    inFlight = true;
+    if (revertTimer !== undefined) clearTimeout(revertTimer);
+    button.setAttribute("aria-busy", "true");
+    try {
+      await navigator.clipboard.writeText(source());
+      button.replaceChildren(codeActionIcon("check"));
+      button.dataset.copyState = "copied";
+      status.textContent = l10n.t("Copied");
+      button.title = l10n.t("Copied");
+    } catch {
+      button.replaceChildren(codeActionIcon("error"));
+      button.dataset.copyState = "failed";
+      status.textContent = l10n.t("Copy failed");
+      button.title = l10n.t("Copy failed") + ". " + l10n.t("Select the text and copy it manually, or try again.");
+    } finally {
+      button.setAttribute("aria-label", button.title);
+      button.removeAttribute("aria-busy");
+      inFlight = false;
+      revertTimer = setTimeout(revert, COPY_REVERT_MS);
+    }
+  });
+  return { button, status };
+}
+
+function linkKindIcon(kind: "file" | "folder" | "app" | "web" | "mail"): SVGSVGElement {
   const paths = {
     file: "M3 1.75h6l4 4v8.5H3zM9 1.75v4h4",
+    folder: "M1.75 4V2.75h4.5l1.5 1.5h6.5v9H1.75z",
+    app: "M3 6V1.75h6l4 4v8.5H8M9 1.75v4h4M1.75 10h6m-2.5-2.5L7.75 10l-2.5 2.5",
     web: "M8 1.75a6.25 6.25 0 1 0 0 12.5 6.25 6.25 0 0 0 0-12.5ZM1.9 8h12.2M8 1.75c1.55 1.7 2.35 3.78 2.35 6.25S9.55 12.55 8 14.25M8 1.75C6.45 3.45 5.65 5.53 5.65 8s.8 4.55 2.35 6.25",
     mail: "M2 3.25h12v9.5H2zM2.5 4 8 8.25 13.5 4",
   } as const;
@@ -49,7 +110,7 @@ function linkKindIcon(kind: "file" | "web" | "mail"): SVGSVGElement {
   return svg;
 }
 
-export function renderMarkdownInto(container: HTMLElement, src: string, tabId?: string): void {
+export function renderMarkdownInto(container: HTMLElement, src: string, tabId?: string, askContext?: AskRenderContext): void {
   container.textContent = "";
   const containerArtifactIds = artifactIds.get(container) ?? [];
   artifactIds.set(container, containerArtifactIds);
@@ -59,6 +120,16 @@ export function renderMarkdownInto(container: HTMLElement, src: string, tabId?: 
 
   function renderNode(node: MdNode, target: HTMLElement): void {
     switch (node.type) {
+      case "plan": {
+        target.appendChild(renderGoal(node.goal, node.offset, askContext));
+        fencedIndex++;
+        break;
+      }
+      case "ask": {
+        target.appendChild(renderAsk(node.ask, node.offset, askContext));
+        fencedIndex++;
+        break;
+      }
       case "heading": {
         const div = document.createElement("div");
         const level = Math.min(Math.max(node.level, 1), 6);
@@ -133,33 +204,7 @@ export function renderMarkdownInto(container: HTMLElement, src: string, tabId?: 
           wrap.setAttribute("aria-label", wrap.title);
         });
         actions.appendChild(wrap);
-        const copy = document.createElement("button");
-        copy.type = "button";
-        copy.className = "code-copy-button";
-        copy.appendChild(codeActionIcon("copy"));
-        copy.title = l10n.t("Copy code block");
-        copy.setAttribute("aria-label", copy.title);
-        const status = document.createElement("span");
-        status.className = "code-copy-status";
-        status.setAttribute("role", "status");
-        copy.addEventListener("click", async () => {
-          copy.disabled = true;
-          try {
-            await navigator.clipboard.writeText(content);
-            copy.replaceChildren(codeActionIcon("check"));
-            copy.dataset.copyState = "copied";
-            status.textContent = l10n.t("Copied");
-            copy.title = l10n.t("Copied");
-          } catch {
-            copy.replaceChildren(codeActionIcon("error"));
-            copy.dataset.copyState = "failed";
-            status.textContent = l10n.t("Copy failed");
-            copy.title = l10n.t("Copy failed") + ". " + l10n.t("Select the text and copy it manually, or try again.");
-          } finally {
-            copy.setAttribute("aria-label", copy.title);
-            copy.disabled = false;
-          }
-        });
+        const { button: copy, status } = createCopyButton("code-copy-button", l10n.t("Copy code block"), () => content);
         actions.appendChild(copy);
         actions.appendChild(status);
         pre.appendChild(actions);
@@ -247,7 +292,9 @@ export function renderMarkdownInto(container: HTMLElement, src: string, tabId?: 
           button.addEventListener("click", () => {
             vscode.postMessage({ type: "openFile", tabId, target: node.href });
           });
-          button.appendChild(linkKindIcon("file"));
+          const kind = fileLinkDisplayKind(node.href);
+          button.dataset.linkKind = kind;
+          button.appendChild(linkKindIcon(kind));
           for (const child of node.children) renderNode(child, button);
           target.appendChild(button);
         } else {

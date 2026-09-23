@@ -6,7 +6,7 @@
 // 再現条件がタブ数依存で、最古のタブでしか出ないため単体では気づけない。
 export const TAB_LIMIT_DEFAULT = 20;
 // package.json の contributes（laisora.tabLimit.minimum）と対の有効範囲の下端。
-// 片方だけ動かすと設定 UI が通す値をコードが弾く（verify-history-wiring の W-18 が一致を固定）
+// 片方だけ動かすと設定 UI が通す値をコードが弾く（W-18 が一致を固定）
 export const TAB_LIMIT_MIN = 1;
 export const SCOPE_MAX_PER_TAB = 2;
 

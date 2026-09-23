@@ -180,6 +180,7 @@ export function foldEventState(
       });
     }
     effects.push({ type: "schedule_guardrail_refresh" });
+    if (!meta?.suppressPost) effects.push({ type: "schedule_work_model_post" });
     if (partial.provenance?.path === "live") effects.push({ type: "schedule_guardrail_tick" });
     return { draft, normalizedEvent: null, effects };
   }

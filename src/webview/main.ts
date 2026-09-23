@@ -62,7 +62,7 @@ import {
   syncMenuCursor,
 } from "./menu";
 import { closeSuggest, handleFilesResponse, initSuggest, insertFilePaths } from "./suggest";
-import { setFileLinkHostPlatform } from "./markdown-ast";
+import { setFileLinkHostPlatform, setFileLinkSystemAppExtensions } from "./markdown-ast";
 import type { ScrollCarry, ViewMode } from "./tab";
 import {
   Tab,
@@ -72,7 +72,6 @@ import {
   isScrollCarry,
   setOnConvViewShown,
   setOnTabActivity,
-  setOnWorkViewRequest,
 } from "./tab";
 import { isConvRenderableEvent } from "../conv-renderable";
 import { WorkOverview, type WorkViewMode } from "./work-overview";
@@ -107,10 +106,12 @@ const tabs = new Map<string, Tab>();
 const overviews = new Map<string, WorkOverview>();
 setOnTabActivity((tabId, active) => overviews.get(tabId)?.setActive(active));
 setOnConvViewShown((tabId) => resumeConversationChase(tabId));
-setOnWorkViewRequest((tabId, mode) => overviews.get(tabId)?.setMode(mode));
 // 同期再生上限でこの画面が落とした詳細イベント数。Host の coverage は Host 側の切り詰めしか
 // 知らないので、以後の workModel 更新にもこの分を合流させ続ける
 const localEventDrops = new Map<string, number>();
+// タブを組んだ時点で Host が既に落としていた件数。この画面に一度も描かれていない行はこれだけで、
+// 以後 live で増える切り詰めは画面に描き終えている。タブを作り直すたびに取り直す
+const hostDroppedAtInstall = new Map<string, number>();
 export let activeTabId: string | null = vscode.getState()?.activeTabId ?? null;
 // init が選んだ活性タブ。tabCreated が init 済みのタブを作り直すとき、利用者がその後に別タブへ移っていなければ activate を当てる
 let activeTabAfterInit: string | null = null;
@@ -178,24 +179,23 @@ export function persistState(): void {
   const views: Record<string, ViewMode> = { ...(vscode.getState()?.views ?? {}) };
   const workViews: Record<string, WorkViewMode> = { ...(vscode.getState()?.workViews ?? {}) };
   const analysisViews: Record<string, "script" | "ai"> = { ...(vscode.getState()?.analysisViews ?? {}) };
-  const stripCards: Record<string, boolean> = { ...(vscode.getState()?.stripCards ?? {}) };
   const scrollAnchors = { ...savedScrollAnchors() };
+  const askChecks = { ...(vscode.getState()?.askChecks ?? {}) };
   const out = Object.fromEntries(drafts);
   // 閉じたタブは views / drafts の両方から落とす（AR6-L1）
   for (const id of forgottenTabIds) {
     delete views[id];
     delete workViews[id];
     delete analysisViews[id];
-    delete stripCards[id];
+    delete askChecks[id];
     delete scrollAnchors[id];
     delete out[id];
   }
   for (const [id, t] of tabs) views[id] = t.viewMode;
   for (const [id, t] of tabs) workViews[id] = t.workViewMode;
   for (const [id, overview] of overviews) analysisViews[id] = overview.analysisSubtab;
-  for (const [id, t] of tabs) { const open = t.stripSegmentOpen; if (open !== undefined) stripCards[id] = open; }
   for (const [id, t] of tabs) scrollAnchors[id] = t.captureScrollCarry(false);
-  const next: PersistedState = { activeTabId, drafts: out, views, workViews, analysisViews, stripCards, scrollAnchors };
+  const next: PersistedState = { activeTabId, drafts: out, views, workViews, analysisViews, scrollAnchors, askChecks };
   vscode.setState(next);
 }
 
@@ -249,22 +249,22 @@ function abandonAwaitedScrollAnchor(): void {
 // 保持キーは sessionId（裁定A2）。タブや Webview の init を跨いで残し、resume で同じ
 // セッションを開いたタブへ引き継ぐ。描画は各タブの WorkOverview が行う
 const analysisReports = new Map<string, { filePath: string; report: AnalysisReport }>();
-// WorkOverview が analysis モードかどうか（コールバック注入で通知される）。tabId キー
-const analysisModeTabs = new Map<string, boolean>();
-
-// 分析が「表示されている」= アクティブタブが作業ログ表示かつ分析タブ選択中。
-// 会話表示や他の作業ログタブへ切り替えたら送信可能に戻る
-function composerLocked(): boolean {
-  const t = activeTab();
-  return t !== null && t.viewMode === "work" && analysisModeTabs.get(t.tabId) === true;
+// ANALYSIS は自前の入力を持たないので、表示中もコンポーザは会話へ送る（SUMMARY・GRAPH・LOG と同じ）
+export function refreshComposer(): void {
+  inputEl.placeholder = composerPlaceholder();
+  refreshChrome();
 }
 
-// 分析表示中は会話への送信を無効化する（仕様: コンポーザの送信は無効化）。
-export function updateComposerLock(): void {
-  const locked = composerLocked();
-  inputEl.disabled = locked;
-  inputEl.placeholder = locked ? l10n.t("Viewing analysis") : composerPlaceholder();
-  refreshChrome();
+// 切替の最中は #logs の位置がまだ復元前（離れるタブのもの）なので、reflowComposer に
+// 張り付きとして記録させない。記録すると restoreScroll が新しいタブを末尾へ飛ばす。
+// 世代は、タブ・表示面の切替をまたいで遅れて走る張り付け直し（遅延・画像の読み込み完了）が
+// 復元済みの位置を上書きしないために見る
+let tabActivationDepth = 0;
+let surfaceGeneration = 0;
+
+// 表示面の切替（Tab.setViewMode）からも呼ぶ。切替より前に積まれた張り付け直しを無効にする
+export function noteSurfaceChange(): void {
+  surfaceGeneration += 1;
 }
 
 export function setActiveTab(tabId: string): void {
@@ -283,27 +283,33 @@ export function setActiveTab(tabId: string): void {
   }
   if (activeTabId !== tabId) inputEl.value = drafts.get(tabId) ?? "";
   activeTabId = tabId;
-  // 下書きと同じく添付欄も切り替える。ここを落とすと前のタブのサムネイルが残り、
-  // 「どのタブに添付したか」が画面から読めなくなる（R-CNV-11）
-  renderAttachments();
-  persistState();
-  // 復帰の init で見ているタブを先に積ませる。Host は可視化の時点で init を送るので、
-  // document が作り直されてから伝えても間に合わない
-  vscode.postMessage({ type: "activeTab", tabId });
-  for (const [id, t] of tabs) {
-    t.tabBtn.classList.toggle("active", id === tabId);
-    t.tabBtn.setAttribute("aria-selected", id === tabId ? "true" : "false");
-    t.logEl.classList.toggle("active", id === tabId);
-    t.setSessionMenuActive(id === tabId);
+  tabActivationDepth += 1;
+  noteSurfaceChange();
+  try {
+    // 下書きと同じく添付欄も切り替える。ここを落とすと前のタブのサムネイルが残り、
+    // 「どのタブに添付したか」が画面から読めなくなる（R-CNV-11）
+    renderAttachments();
+    persistState();
+    // 復帰の init で見ているタブを先に積ませる。Host は可視化の時点で init を送るので、
+    // document が作り直されてから伝えても間に合わない
+    vscode.postMessage({ type: "activeTab", tabId });
+    for (const [id, t] of tabs) {
+      t.tabBtn.classList.toggle("active", id === tabId);
+      t.tabBtn.setAttribute("aria-selected", id === tabId ? "true" : "false");
+      t.logEl.classList.toggle("active", id === tabId);
+      t.setSessionMenuActive(id === tabId);
+    }
+    refreshComposer();
+    resumeConversationChase(tabId);
+    resumeWorklogBackfill(tabId);
+    // restoreScroll は scrollHeight / clientHeight から scrollTop を決めるので、
+    // コンポーザの高さ確定を先に済ませる（後にすると古い #logs 高さで復元される）
+    autosizeComposer();
+    // タブごとの表示モードとスクロール位置を復元する（混線させない）
+    tabs.get(tabId)!.restoreScroll();
+  } finally {
+    tabActivationDepth -= 1;
   }
-  updateComposerLock();
-  resumeConversationChase(tabId);
-  resumeWorklogBackfill(tabId);
-  // restoreScroll は scrollHeight / clientHeight から scrollTop を決めるので、
-  // コンポーザの高さ確定を先に済ませる（後にすると古い #logs 高さで復元される）
-  autosizeComposer();
-  // タブごとの表示モードとスクロール位置を復元する（混線させない）
-  tabs.get(tabId)!.restoreScroll();
 }
 
 export function findTabBySessionId(sessionId: string): Tab | undefined {
@@ -328,8 +334,11 @@ function showAnalysis(sessionId: string, filePath: string, report: AnalysisRepor
   const tabId = analysisTargetTab(sessionId);
   if (!tabId) return;
   setActiveTab(tabId);
-  tabs.get(tabId)?.setViewMode("work");
-  overviews.get(tabId)?.showAnalysis(sessionId, filePath, report);
+  const tab = tabs.get(tabId);
+  tab?.withViewChange(() => {
+    overviews.get(tabId)?.showAnalysis(sessionId, filePath, report);
+    tab.selectPane("analysis");
+  });
 }
 
 // 分析の失敗理由は、結果が出るはずだった分析画面（要求したタブ）へ出す。script は成功時と同じく
@@ -340,40 +349,56 @@ function showAnalysisFailure(msg: Extract<HostToWebview, { type: "analysisFailed
   if (!tabId || !tabs.has(tabId)) return;
   if (msg.kind === "script") {
     setActiveTab(tabId);
-    tabs.get(tabId)?.setViewMode("work");
   }
-  overviews.get(tabId)?.showAnalysisFailure(msg.reason);
+  const tab = tabs.get(tabId)!;
+  tab.withViewChange(() => {
+    overviews.get(tabId)?.showAnalysisFailure(msg.reason!);
+    if (msg.kind === "script") tab.selectPane("analysis");
+  });
 }
 
 export function activeTab(): Tab | null {
   return activeTabId ? tabs.get(activeTabId) ?? null : null;
 }
 
-// TODO パネルの上限は #logs の実高から決まる（tab.ts の syncStripPanelCap）。DOM が変わらず
+// ナビの高さと --log-head-h は #logs の実高から決まる（tab.ts の syncHeadLayout）。DOM が変わらず
 // ポート高だけが変わる経路（ウィンドウ/パネル境界のドラッグ・コンポーザの伸長）は Tab 側の
-// イベントに現れないので、ここで拾わないと上限が過大なまま陳腐化し、最下部で .log-head ごと
-// タブバーが画面外へ押し上げられる
-let stripCapPending = false;
-function syncActiveStripPanelCap(): void {
-  if (stripCapPending) return;
-  stripCapPending = true;
+// イベントに現れないので、ここで拾わないとナビがポートより高いまま陳腐化する
+let headLayoutPending = false;
+function syncActiveHeadLayout(): void {
+  if (headLayoutPending) return;
+  headLayoutPending = true;
   setTimeout(() => {
-    stripCapPending = false;
-    activeTab()?.syncStripPanelCap();
+    headLayoutPending = false;
+    activeTab()?.syncHeadLayout();
   }, 0);
 }
-window.addEventListener("resize", syncActiveStripPanelCap);
+window.addEventListener("resize", syncActiveHeadLayout);
 
 // コンポーザの高さを現在の内容から導出し直す（1〜8行）。
 // height="auto" を挟まないと scrollHeight が伸びた側に張り付いて縮まない。
 // textarea はタブ間で共有なので、value を差し替える経路すべてから呼ばないと
 // 離れたタブの高さを継承する。
-// コンポーザが伸びると #logs が縮む。TODO パネルの上限は #logs の実高から出しているので
-// ここで測り直さないと .log-head がポートより高いまま残る
+// コンポーザが伸びると #logs が縮む。ナビの高さは #logs の実高から出しているのでここで測り直す
 function autosizeComposer(): void {
+  const previous = inputEl.style.height;
   inputEl.style.height = "auto";
-  inputEl.style.height = `${Math.min(inputEl.scrollHeight, 8 * 20)}px`;
-  syncActiveStripPanelCap();
+  const next = `${Math.min(inputEl.scrollHeight, 8 * 20)}px`;
+  inputEl.style.height = previous;
+  if (next === previous) {
+    syncActiveHeadLayout();
+    return;
+  }
+  reflowComposer(() => {
+    inputEl.style.height = next;
+  });
+}
+
+// 入力を空にすると高さが戻る＝ #logs の容器高が変わる。生の style.height で戻すと
+// 張り付け直しとパネル上限の測り直しを飛ばす
+function clearComposerInput(): void {
+  inputEl.value = "";
+  autosizeComposer();
 }
 
 // ステータスバー・ボタン類をアクティブタブの状態で更新
@@ -396,8 +421,6 @@ export function refreshChrome(): void {
     actionBtn.setAttribute("aria-label", l10n.t("Stop"));
     actionBtn.disabled = state === "interrupting";
   }
-  // 分析表示中のロックは turnState 由来の状態より優先する（updateComposerLock と対）
-  if (composerLocked()) actionBtn.disabled = true;
   // 会話面の移動操作。どちらの面を見ていても押せる。「1 つ前の自分の発言」は
   // 会話面へ切り替えてから遡る（scrollToPreviousUserBlock 側）ので飛び先は常にある。
   // 「最新の位置へ」は見ている面の最新へ飛ぶ
@@ -428,21 +451,21 @@ function findModelRow(t: Tab | null, value: string): ModelInfo | undefined {
 }
 
 // setModel の応答(modelChanged)はホストが auth_status を再送しないため、表示は
-// modelOverride を最優先し、無ければ実測 auth.model → CLI の applied model → configModel の順。
-// configModel を applied model より先にしない: resume の CLI は settings の model ではなく記録の model で走る。
+// modelOverride を最優先し、無ければ auth.model → appliedModel → recordedModel → configModel の順。
 export function displayModelName(t: Tab | null): string | undefined {
   const override = t?.modelOverride;
   if (override) {
-    return findModelRow(t, override)?.label ?? override;
+    const label = findModelRow(t, override)?.label;
+    return label && label !== override ? label : t?.modelDisplayName(override) ?? override;
   }
   // 空白だけの値（settings.json の `"model": "   "`）は未設定として扱う。trim しないと truthy のまま
   // 通り、行にも当たらず空文字がそのまま出てチップが無言で空になる。照合も trim 後の値で行う
-  const raw = override === null ? "default" : (t?.auth?.model ?? t?.appliedModel ?? t?.configModel)?.trim();
+  const raw = override === null ? "default" : (t?.auth?.model ?? t?.appliedModel ?? t?.recordedModel ?? t?.configModel)?.trim();
   if (!raw) return undefined;
   const info = findModelRow(t, raw);
   // "default" は指し先であって表示できる名前ではない。行が無ければ何も出さない（文字列 "default" を出さない）
   if (raw === "default") return info?.label;
-  return info?.label ?? raw;
+  return info?.label && info.label !== raw ? info.label : t?.modelDisplayName(raw) ?? raw;
 }
 
 export function renderAuth(t: Tab | null): void {
@@ -450,11 +473,11 @@ export function renderAuth(t: Tab | null): void {
   const effort = auth?.effort === null ? l10n.t("Not used")
     : auth?.effort ?? (t?.effortOverride ? l10n.t("{0} (requested)", t.effortOverride)
       : t?.configEffort ? l10n.t("{0} (configured)", t.configEffort)
-        : t?.defaultEffort ? l10n.t("{0} (default)", t.defaultEffort) : l10n.t("Unconfirmed"));
+        : t?.defaultEffort ? l10n.t("{0} (default)", t.defaultEffort)
+          : t?.appliedEffort === null ? l10n.t("Not used") : t?.appliedEffort ?? l10n.t("Unconfirmed"));
   const modelName = displayModelName(t);
 
   if (!auth) {
-    // 接続前は CLI の applied model、無ければ設定上の予定値を表示（実測の auth が来たら置き換わる）
     const model = modelName || l10n.t("Model unconfirmed");
     authEl.textContent = `${model} / effort: ${effort}`;
     authEl.className = "chip";
@@ -462,14 +485,13 @@ export function renderAuth(t: Tab | null): void {
     return;
   }
 
-  // 「サブスク認証」等の課金区分ラベルは文字数を食う割に常時は要らない。チップの色
-  // （緑=サブスク / 橙=それ以外）で区別し、詳細は tooltip に回して横幅を空ける。
+  // 課金区分はサブスクなら出さない（他のチップと同じ地色）。それ以外は区分名を前置し、warn 色で従量課金を見落とさせない。詳細は tooltip。
   const model = modelName ?? auth.model ?? "?";
   authEl.textContent =
     auth.billingRealm === "subscription"
       ? `${model} / effort: ${effort}`
       : `${auth.billingRealm} ${model} / effort: ${effort}`;
-  authEl.className = auth.billingRealm === "subscription" ? "chip ok" : "chip warn";
+  authEl.className = auth.billingRealm === "subscription" ? "chip" : "chip warn";
   authEl.title = `${auth.credentialSource} / ${auth.billingRealm} · apiKeySource=${
     auth.apiKeySource ?? "?"
   } session=${auth.sessionId ?? "?"}`;
@@ -723,6 +745,10 @@ interface HistoryPager {
   backfillBudget?: number;
   // 作業ログ側だけが使う。進行バーの分母（開始時点の省略件数）
   backfillTotal?: number;
+  // 作業ログ側だけが使う。transcript 位相で記録側に残っている件数（Host 申告の remainingOlderCount）。
+  // 読了の判定はこの値で行う（位相に入った事実で判定すると、渡されなかった分が「すべて表示」になる）。
+  // Host の切り詰め件数との引き算で代用しない: 記録の fold と live の fold は件数が一致しない
+  transcriptRemaining?: number;
   // 作業ログ側だけが使う。直前に観測した作業ログ面の張り付き状態。false→true の遷移で再開する
   wasAtBottom?: boolean;
   timer?: ReturnType<typeof setTimeout>;
@@ -764,13 +790,59 @@ export function swapPreservingConvView(tabId: string, target: Element, replaceme
     const nodeTop = target.getBoundingClientRect().top;
     // noteScroll と同じ式・同じ閾値で測り直す。Tab.atBottom は scroll イベントでしか更新されず、
     // 直前の追記で末尾へ張り付いた状態がまだ入っていないことがある
-    const atBottom = logsEl.scrollHeight - logsEl.scrollTop - logsEl.clientHeight <= 24;
+    const atBottom = logsEl.scrollHeight - logsEl.scrollTop - logsEl.clientHeight <= SCROLL_BOTTOM_GAP_PX;
     const heightBeforeSwap = logsEl.scrollHeight;
     target.replaceWith(replacement);
     const heightAfterSwap = logsEl.scrollHeight;
     if (atBottom) logsEl.scrollTop = logsEl.scrollHeight;
     else if (nodeTop < portTop) logsEl.scrollTop += heightAfterSwap - heightBeforeSwap;
   });
+}
+
+export const SCROLL_BOTTOM_GAP_PX = 24;
+
+function convStuckToBottom(): boolean {
+  const t = activeTab();
+  if (t === null || t.viewMode !== "conv") return false;
+  return logsEl.scrollHeight - logsEl.scrollTop - logsEl.clientHeight <= SCROLL_BOTTOM_GAP_PX;
+}
+
+function restickConv(stuck: boolean): void {
+  if (!stuck) return;
+  const t = activeTab();
+  if (t === null || t.viewMode !== "conv") return;
+  logsEl.scrollTop = logsEl.scrollHeight;
+  t.noteScroll();
+}
+
+function reflowComposer(mutate: (settle: () => void) => void): void {
+  if (tabActivationDepth > 0) {
+    mutate(() => {});
+    return;
+  }
+  const stuck = convStuckToBottom();
+  const generation = surfaceGeneration;
+  let placedTop = logsEl.scrollTop;
+  let placedHeight = logsEl.scrollHeight;
+  // 遅れて走る分（cap の反映後・画像の読み込み完了）だけの条件。容器の縮小では scrollTop は
+  // 下がらないが、上にある .log-head が縮むと scroll anchoring が同じだけ下げる。縮んだ分で
+  // 説明できない下げ幅があるときだけ「利用者が遡った」とみなして諦める
+  const settleLater = (): void => {
+    if (generation !== surfaceGeneration) return;
+    const shrank = Math.max(placedHeight - logsEl.scrollHeight, 0);
+    if (placedTop - logsEl.scrollTop - shrank > SCROLL_BOTTOM_GAP_PX) return;
+    restickConv(stuck);
+    placedTop = logsEl.scrollTop;
+    placedHeight = logsEl.scrollHeight;
+  };
+  mutate(settleLater);
+  syncActiveHeadLayout();
+  restickConv(stuck);
+  placedTop = logsEl.scrollTop;
+  placedHeight = logsEl.scrollHeight;
+  // syncActiveHeadLayout は setTimeout(0) でヘッダ寸法を測り直し、scrollHeight がこの同期の張り付けより
+  // 後に動きうる。FIFO なのでここで積む分はその後に走り、末尾へ戻し直せる
+  setTimeout(settleLater, 0);
 }
 
 const historyPagers = new Map<string, HistoryPager>();
@@ -1545,7 +1617,7 @@ function worklogBackfillContinues(
 }
 
 // 作業ログの pager は「窓から落ちた全件を裏で読む」だけ。手動の「さらに読み込む」は置かない
-// （R-TAB-07。押されるまで N 件が出ず、被覆行が部分被覆を主張し続ける — R-48）。
+// （R-TAB-07。押されるまで N 件が出ず、被覆行が部分被覆を主張し続ける — R-TAB-08）。
 // タブの種別（履歴から開いた・復帰の headOmitted・このセッションで作った）で分けない。
 // armed にするだけで要求は出さない（起動はアクティブ化のとき。init が開いている全タブぶん
 // addTab を呼ぶので、ここで出すと対象タブの数だけ連鎖が同時に走る）。
@@ -1572,27 +1644,56 @@ function installHistoryPager(
   if (coord) coord.workPager = "running";
 }
 
-// 概要・グラフへ渡す coverage の付記。droppedEventCount のうち、この画面の窓落ち（裏読みで戻る）と
-// Host が保持していない分（EVENT_LOG_MAX。遡っても届かない）を別の文で出すために添える
+// 概要・グラフへ渡す coverage の付記。この画面に出ていない件数を、裏読みで戻る分と
+// 記録からも戻らない分に分けて添える
 // Host が最後に送った素の coverage（localEventDrops 合流前）。窓落ちを足した表示用の値と混ぜない
 function hostCoverage(tabId: string): WorkModelPayload["coverage"] | undefined {
   return lastWorkModels.get(tabId)?.coverage ?? lastSemanticModels.get(tabId)?.model?.coverage.base;
 }
 
+// この画面を組んだ時点で Host が既に落としていた件数。**現在値（coverage.droppedEventCount）を
+// 使ってはならない**: 再生より後に落ちた分は live で描き終えており、画面には出ている。
+// 現在値で数えると「出していません」が出ている行について出る（R-DSP-01）
+function coverageUnreachableBase(tabId: string): number {
+  return hostDroppedAtInstall.get(tabId) ?? 0;
+}
+
 function coverageBackfillHint(tabId: string): CoverageBackfillHint {
   const pending = localEventDrops.get(tabId) ?? 0;
   const pager = historyPagers.get(tabId);
-  const hostDropped = hostCoverage(tabId)?.droppedEventCount ?? 0;
+  const base = coverageUnreachableBase(tabId);
+  // pager が無いのは (a) 窓落ちが無く遡る先が無い (b) hydration がまだ終わっていない・失敗した、の 2 つ。
+  // (a) は読了と同じ（これを読了にしないと、live の切り詰めで「詳細: 直近のみ」が永久に残る）。
+  // (b) は coordinator の状態で見分ける
+  const coord = resumeCoordinators.get(tabId);
+  const settled =
+    pager === undefined ? coord === undefined || coord.workPager === "exhausted" : pager.status === "exhausted";
+  // 止まった遡りも件数は確定している。出さないと欠けが黙って消える（R-DSP-03）
+  const stopped = pager?.status === "error";
+  const unreachable =
+    !settled && !stopped
+      ? 0
+      : pager?.phase === "transcript"
+        ? pager.transcriptRemaining ?? base
+        : base;
+  // 裏読みが一度も走っていないタブ（pager 不在）では、復元時の上限で初期表示から外した件数
+  // （omitted*）は解消していない。ここで complete を名乗ると、その申告ごと画面から消える（R-DSP-03）
+  const host = hostCoverage(tabId);
+  const restoreCapped =
+    host !== undefined &&
+    (host.omittedToolCount !== undefined ||
+      host.omittedMessageCount !== undefined ||
+      host.untrackedApprovalCount !== undefined ||
+      host.depthLimitedAgentCount !== undefined);
   const backfillDone =
-    pager?.status === "exhausted" &&
-    pending === 0 &&
-    (hostDropped === 0 || pager.phase === "transcript");
-  if (pending <= 0 && !backfillDone) return {};
+    settled && pending === 0 && unreachable === 0 && (pager !== undefined || !restoreCapped);
+  if (pending <= 0 && unreachable <= 0 && !backfillDone) return {};
   return {
     backfillPendingCount: pending,
     backfillStalled: pager === undefined || pager.status === "error",
     backfillPhase: pager?.phase,
     backfillDone,
+    ...(unreachable > 0 ? { backfillUnreachableCount: unreachable } : {}),
   };
 }
 
@@ -1626,7 +1727,14 @@ function displaySemanticModel(tabId: string, model: SemanticModelPayload | undef
     };
     return { ...model, coverage: { ...model.coverage, base } };
   }
-  if (model === undefined || dropped <= 0) return model;
+  if (model === undefined) return model;
+  // 窓落ちが無くても付記は載せる。載せないと、記録から読めなかった欠落が semanticView=on の
+  // 画面にだけ出ない（申告の有無が表示モードで変わる。R-DSP-03）
+  if (dropped <= 0) {
+    if (hint.backfillUnreachableCount === undefined) return model;
+    const onlyHint: WorkModelPayload["coverage"] & CoverageBackfillHint = { ...model.coverage.base, ...hint };
+    return { ...model, coverage: { ...model.coverage, base: onlyHint } };
+  }
   const base: WorkModelPayload["coverage"] & CoverageBackfillHint = {
     ...model.coverage.base,
     details: "prefix-truncated",
@@ -1769,10 +1877,12 @@ function onHistoryChunkResult(
     return;
   }
   const host = hostCoverage(tabId);
-  const hostDropped = host?.droppedEventCount ?? 0;
+  // 遡る先はこの画面を組んだ時点の切り詰めだけ。現在値を使うと、遡っている間に live で増えた分
+  // （画面には描き終えている）まで読みに行き、scope に無いので終端が矛盾して止まる（R-TAB-08）
+  const hostDropped = coverageUnreachableBase(tabId);
   // transcript 位相へ入るのは hydration で JSONL を fold したタブ（resumeSessionId を持つ）だけ。
   // live で作ったタブは記録の fold と generation:seq の対応が無く、Host も history-unavailable で拒む。
-  // 入れない場合は「Host が保持していない」の文が残る（HP-R48-3）
+  // 入れない場合は記録から読めなかった件数として残る（HP-R48-3）
   if (hostDropped > 0 && host?.source === "provider-transcript" && t.resumeSessionId !== undefined) {
     pager.phase = "transcript";
     pager.cursor = undefined;
@@ -1780,6 +1890,7 @@ function onHistoryChunkResult(
     pager.backfillBudget = undefined;
     pager.lastRemainingOlder = undefined;
     pager.receivedTranscriptChunk = false;
+    pager.transcriptRemaining = hostDropped;
     localEventDrops.set(tabId, hostDropped);
     refreshLocalDropViews(tabId);
     pager.status = "idle";
@@ -1810,7 +1921,6 @@ function onHistoryChunkError(tabId: string, requestId: string, reason: string): 
   pager.status = "error";
   // 取り直さない経路は失敗表示に「再開」を残す。黙って止めない（R-TAB-08）
   failWorklogBackfill(tabId, reason);
-  // addBlock を使うと未読バッジが上がる。ユーザー自身の操作の失敗通知でバッジを立てない
   t?.addHistoryNotice(l10n.t("Could not load earlier history ({0})", reason));
 }
 
@@ -1887,6 +1997,8 @@ function onWorklogTranscriptResult(
   }
   // anchor は「描画済みの連続した並びの最古」を指し続ける。
   pager.anchor = resolveContiguousHistoryAnchor(pager.anchor, page.items);
+  // 記録側の残件は Host の申告をそのまま持つ。終端まで来なかったときはこの値が欠落の件数になる
+  pager.transcriptRemaining = Math.max(0, page.coverage.remainingOlderCount);
   if (page.hasMore && page.nextCursor !== undefined) {
     const chase = worklogBackfillContinues(tabId, pager, usedCursor, page, page.items.length);
     pager.cursor = page.nextCursor;
@@ -1897,6 +2009,7 @@ function onWorklogTranscriptResult(
     failWorklogBackfill(tabId, "stalled");
     return;
   }
+  // 残件（transcriptRemaining）を終端で 0 へ上書きしない。渡されなかった分が読了として隠れる
   localEventDrops.set(tabId, 0);
   pager.status = "exhausted";
   finishWorklogBackfill(tabId);
@@ -1975,7 +2088,7 @@ function initialHistoryAnchor(
 // 描画済みイベントの連続した並びの最古を anchor として解決する。
 // 単一巨大ターンで先頭に戻された turn_started（飛び地）で anchor を上書きすると、
 // 後続の transcript 要求や再 anchor 時に Host が hasMore:false を返し、
-// 窓外の区間が silent に落ちる（契約 C10 / R-49）。
+// 窓外の区間が silent に落ちる（契約 C10 / R-TAB-07）。
 function resolveContiguousHistoryAnchor(
   currentAnchor: { generation: number; seq: number } | undefined,
   items: readonly NormalizedEvent[]
@@ -2050,14 +2163,24 @@ function addTab(snap: TabSnapshot, scrollCarry?: ScrollCarry): Tab {
   // 診断パネルは Webview に1つだが、明示off を運ぶ経路は snapshot しかない
   // （設定変更で Host が init を送り直す）。再生で投げる前に処置する
   applyLlmDiagnosticsMode(snap.state.llmDiagnostics);
+  // タブは作り直される（/clear の tabCleared・復帰の tabRestored）。前の中身で作った状態を
+  // 持ち越すと、新しいセッションの被覆をひとつ前のセッションの数字で判定する（R-DSP-01）
+  hostDroppedAtInstall.set(snap.tabId, snap.state.workModel?.coverage.droppedEventCount ?? 0);
+  if (snap.state.workModel === undefined) lastWorkModels.delete(snap.tabId);
+  lastSemanticModels.delete(snap.tabId);
   const t = new Tab(snap.tabId, snap.title);
+  t.observeSessionTime(snap.state.semanticModel?.timeBuckets?.firstAt, "session");
+  t.observeSessionTime(snap.state.events[0]?.timestamp, "fallback");
   tabs.set(snap.tabId, t);
+  t.planPanel.setUsage(snap.state.planUsage);
   tabsAddedInDocument.add(snap.tabId);
   t.auth = snap.state.auth;
   t.configModel = snap.state.configModel;
   t.configEffort = snap.state.configEffort;
   t.defaultEffort = snap.state.defaultEffort;
   t.appliedModel = snap.state.appliedModel;
+  t.appliedEffort = snap.state.appliedEffort;
+  t.recordedModel = snap.state.recordedModel;
   t.permissionMode = snap.state.permissionMode;
   t.commands = snap.state.commands ?? [];
   t.models = snap.state.models ?? [];
@@ -2104,7 +2227,7 @@ function addTab(snap: TabSnapshot, scrollCarry?: ScrollCarry): Tab {
   const installPagers = (windowed: ReturnType<typeof windowEvents>, droppedNoticeEl: HTMLElement | undefined): void => {
     // 窓落ちはタブの種別（resume / headOmitted / このセッションで作った）を見ずに裏読みで埋める。
     // 種別で分けると、このセッションで作ったタブが再読み込みで窓に落ちたとき「N 件は実行ログに
-    // 出していません」が消えなくなる（R-48 / R-TAB-07 / R-TAB-08）
+    // 出していません」が消えなくなる（R-TAB-07 / R-TAB-08）
     installHistoryPager(snap.tabId, windowed, droppedNoticeEl);
     const keptKeys = new Set(windowed.events.map((e) => `${e.generation}:${e.seq}`));
     // 復帰で Host が落とした先頭側は snap.state.events に入っていないので、この面では
@@ -2193,7 +2316,7 @@ function addTab(snap: TabSnapshot, scrollCarry?: ScrollCarry): Tab {
   if (savedView === "work") t.setViewMode("work", false, false);
   // 再生中は viewMode が "conv" のため注意表示が付かない。復元後に貼り直す（AR6-M1）
   t.syncConvAttention();
-  // 履歴由来の未読バッジと旧 DOM 参照は作り直しでも消す。位置を初期値（会話は最新 — レビューAR5-M1）へ戻すのは
+  // 旧 DOM 参照は作り直しでも消す。位置を初期値（会話は最新 — レビューAR5-M1）へ戻すのは
   // 持ち越す位置が無いときだけ。持ち越す位置は applyScrollCarry が入れ、活性化の restoreScroll が最後に当てる
   // （上の setViewMode が途中で #logs を動かしても最終位置にはならない）
   t.resetReplayArtifacts();
@@ -2203,24 +2326,24 @@ function addTab(snap: TabSnapshot, scrollCarry?: ScrollCarry): Tab {
   let restoringWorkView = true;
   const savedWorkView = vscode.getState()?.workViews?.[snap.tabId];
   const savedAnalysisView = vscode.getState()?.analysisViews?.[snap.tabId];
-  const overview = new WorkOverview(t.workEl, t.workSwitchSlot, snap.tabId, (analysisActive) => {
-    analysisModeTabs.set(snap.tabId, analysisActive);
-    updateComposerLock();
-  }, {
+  const overview = new WorkOverview(t.workEl, snap.tabId, {
     has: (toolUseId) => t.hasToolEvidence(toolUseId),
     navigate: (toolUseId) => t.navigateToToolEvidence(toolUseId),
   }, (prev, next) => {
     const after = t.switchWorkViewScroll(prev, next);
     return () => {
       after();
-      if (!restoringWorkView) persistState();
+      if (!restoringWorkView) t.persistViewState();
     };
   }, {
     has: (turnId) => t.hasConversationTurn(turnId),
     navigate: (turnId) => t.navigateToConversationTurn(turnId),
   }, t.graphScrollPort(), () => {
-    if (!restoringWorkView) persistState();
-  });
+    if (!restoringWorkView) t.persistViewState();
+  }, (moveFocus) => t.syncViewTabs(moveFocus), (action) => t.withViewChange(action));
+  t.setWorkViewMode = (mode) => overview.setMode(mode);
+  overview.setYou(t.summaryYou.element);
+  overview.setPlanUsage(snap.state.planUsage);
   overview.mount();
   overview.update(displayWorkModel(snap.tabId, snap.state.workModel));
   // semanticView=false（明示off）もそのまま渡す（3値契約。「未着」と同一視しない — 裁定A3）
@@ -2271,7 +2394,6 @@ function rebuildTabInPlace(snap: TabSnapshot, preserveScroll: boolean): void {
   old.destroy();
   tabs.delete(snap.tabId);
   overviews.delete(snap.tabId);
-  analysisModeTabs.delete(snap.tabId);
   const t = addTab(snap, scrollCarry);
   tabbarEl.insertBefore(t.tabBtn, btnNext);
   logsEl.insertBefore(t.logEl, logNext);
@@ -2284,8 +2406,8 @@ function discardTab(tabId: string): void {
   const broken = tabs.get(tabId);
   tabs.delete(tabId);
   overviews.delete(tabId);
-  analysisModeTabs.delete(tabId);
   localEventDrops.delete(tabId);
+  hostDroppedAtInstall.delete(tabId);
   lastWorkModels.delete(tabId);
   lastSemanticModels.delete(tabId);
   resumeCoordinators.delete(tabId);
@@ -2332,13 +2454,14 @@ function initMessageBus(): void {
         for (const t of tabs.values()) t.destroy();
         tabs.clear();
         overviews.clear();
-        analysisModeTabs.clear();
         // cursor・描画済み同一性・退避中の finish はタブの DOM と同じ寿命。
         // 残すと作り直したタブへ旧世代の応答と終端が当たる（契約 C9）
         for (const tabId of [...historyPagers.keys()]) dropHistoryPager(tabId);
         for (const tabId of [...convPagers.keys()]) dropConvPager(tabId);
         lastWorkModels.clear();
         lastSemanticModels.clear();
+        localEventDrops.clear();
+        hostDroppedAtInstall.clear();
         initReceived = true;
         if (initRetryTimer) clearTimeout(initRetryTimer);
         // 版が食い違う Host からのイベントには配置情報が無く、詳細ログが黙って空になる。
@@ -2346,6 +2469,7 @@ function initMessageBus(): void {
         const versionMismatch = msg.protocolVersion !== PROTOCOL_VERSION;
         // タブを描く前に入れる。後から入れると描画済みの本文が Windows 前提の拒否のまま残る（R-CNV-12）
         setFileLinkHostPlatform(msg.hostWindows ?? true);
+        setFileLinkSystemAppExtensions(msg.systemAppExtensions);
         for (const snap of msg.tabs) {
           try {
             addTab(snap, scrollCarries.get(snap.tabId) ?? savedScrollCarry(snap.tabId));
@@ -2397,6 +2521,7 @@ function initMessageBus(): void {
       }
       case "events": {
         const t = tabs.get(msg.tabId);
+        if (msg.events.some((event) => event.kind === "conversation_opened")) overviews.get(msg.tabId)?.setOrchestration(undefined);
         if (t) for (const ev of msg.events) t.handleEvent(ev);
         // tab.ts が workEl へ追加した行に表示切替を反映する（概要表示中に新着だけが見えないように）
         if (t) overviews.get(msg.tabId)?.syncVisibility();
@@ -2479,7 +2604,18 @@ function initMessageBus(): void {
         tabs.get(msg.tabId)?.applyWorkModel(model);
         break;
       }
+      case "orchestrationView": {
+        tabs.get(msg.tabId)?.planPanel.setOrchestration(msg.state);
+        overviews.get(msg.tabId)?.setOrchestration(msg.state);
+        break;
+      }
+      case "planUsage": {
+        tabs.get(msg.tabId)?.planPanel.setUsage(msg.state);
+        overviews.get(msg.tabId)?.setPlanUsage(msg.state);
+        break;
+      }
       case "semanticModel": {
+        tabs.get(msg.tabId)?.observeSessionTime(msg.model?.timeBuckets?.firstAt, "session");
         // Host は semanticView=on のときだけこのメッセージを送る（extension.ts の設定ガード）
         lastSemanticModels.set(msg.tabId, { model: msg.model, view: true });
         overviews.get(msg.tabId)?.updateSemantic(displaySemanticModel(msg.tabId, msg.model), true);
@@ -2493,7 +2629,7 @@ function initMessageBus(): void {
       }
       case "userSettings": {
         applyUserSettings(msg);
-        updateComposerLock();
+        refreshComposer();
         break;
       }
       case "tabNotice": {
@@ -2655,6 +2791,7 @@ function initMessageBus(): void {
           t.configEffort = msg.effort ?? undefined;
           t.defaultEffort = msg.defaultEffort ?? undefined;
           t.appliedModel = msg.appliedModel ?? undefined;
+          t.appliedEffort = msg.appliedEffort;
           if (msg.model !== undefined) t.configModel = msg.model ?? undefined;
           if (activeTabId === msg.tabId) {
             renderAuth(t);
@@ -2763,8 +2900,8 @@ function initMessageBus(): void {
           t.destroy();
           tabs.delete(msg.tabId);
           overviews.delete(msg.tabId);
-          analysisModeTabs.delete(msg.tabId);
           localEventDrops.delete(msg.tabId);
+          hostDroppedAtInstall.delete(msg.tabId);
           lastWorkModels.delete(msg.tabId);
           lastSemanticModels.delete(msg.tabId);
           resumeCoordinators.delete(msg.tabId);
@@ -2780,9 +2917,7 @@ function initMessageBus(): void {
           persistState();
           const next = [...tabs.keys()][0] ?? null;
           if (!activeTabId && next) setActiveTab(next);
-          // 最後のタブを分析表示中に閉じた場合、setActiveTab を経ないためここで解除する
-          // （レビューT4-r1 L1: disabled と「分析表示中」placeholder が残置される）
-          else if (!activeTabId) updateComposerLock();
+          else if (!activeTabId) refreshChrome();
         }
         break;
       }
@@ -2803,24 +2938,31 @@ function attachmentsOf(tabId: string | null): PendingAttachmentInfo[] {
 }
 
 function renderAttachments(): void {
-  attachmentsEl.textContent = "";
-  const tabId = activeTabId;
-  attachmentsOf(tabId).forEach((im, idx) => {
-    const wrap = document.createElement("div");
-    wrap.className = "attachment";
-    const img = document.createElement("img");
-    img.src = `data:${im.mediaType};base64,${im.data}`;
-    img.alt = l10n.t("Attachment {0}", idx + 1);
-    const rm = document.createElement("button");
-    rm.className = "attachment-remove";
-    rm.textContent = "×";
-    rm.title = l10n.t("Remove attachment");
-    rm.onclick = () => {
-      if (!tabId) return;
-      vscode.postMessage({ type: "removeAttachment", tabId, attachmentId: im.id });
-    };
-    wrap.append(img, rm);
-    attachmentsEl.appendChild(wrap);
+  reflowComposer((settle) => {
+    attachmentsEl.textContent = "";
+    const tabId = activeTabId;
+    attachmentsOf(tabId).forEach((im, idx) => {
+      const wrap = document.createElement("div");
+      wrap.className = "attachment";
+      const img = document.createElement("img");
+      // 折り返しは実寸の幅が決まるまで起きない。読み込み完了の時点ではまだ折り返し後の
+      // レイアウトが読めないので、次のタスクまで待ってから測る
+      const settleAfterLayout = (): void => { setTimeout(settle, 0); };
+      img.onload = settleAfterLayout;
+      img.onerror = settleAfterLayout;
+      img.src = `data:${im.mediaType};base64,${im.data}`;
+      img.alt = l10n.t("Attachment {0}", idx + 1);
+      const rm = document.createElement("button");
+      rm.className = "attachment-remove";
+      rm.textContent = "×";
+      rm.title = l10n.t("Remove attachment");
+      rm.onclick = () => {
+        if (!tabId) return;
+        vscode.postMessage({ type: "removeAttachment", tabId, attachmentId: im.id });
+      };
+      wrap.append(img, rm);
+      attachmentsEl.appendChild(wrap);
+    });
   });
 }
 
@@ -2887,7 +3029,6 @@ function onPickedFiles(reqId: number, paths: string[], images: ImageAttachment[]
 // 文の並びがリスナの登録順なので、入れ替えてはならない。
 function initComposer(): void {
   actionBtn.onclick = () => {
-    if (composerLocked()) return;
     const t = activeTab();
     if (!t) return;
     if (t.turnState === "idle") send();
@@ -3033,26 +3174,28 @@ function ctxLabel(ctx: { path: string; startLine: number; endLine: number }): st
 }
 
 function renderCtxChip(): void {
-  ctxChipEl.textContent = "";
-  if (!editorContext) {
-    ctxChipEl.classList.add("hidden");
-    return;
-  }
-  const label = document.createElement("span");
-  label.textContent = ctxLabel(editorContext);
-  // 狭い幅では省略記号で切るため、全文は title に残す（R-DSP-03）
-  label.title = ctxLabel(editorContext);
-  const rm = document.createElement("button");
-  rm.className = "ctx-chip-remove";
-  rm.textContent = "×";
-  rm.title = l10n.t("Remove reference");
-  rm.setAttribute("aria-label", l10n.t("Remove reference"));
-  rm.onclick = () => {
-    editorContext = null;
-    renderCtxChip();
-  };
-  ctxChipEl.append(label, rm);
-  ctxChipEl.classList.remove("hidden");
+  reflowComposer(() => {
+    ctxChipEl.textContent = "";
+    if (!editorContext) {
+      ctxChipEl.classList.add("hidden");
+      return;
+    }
+    const label = document.createElement("span");
+    label.textContent = ctxLabel(editorContext);
+    // 狭い幅では省略記号で切るため、全文は title に残す（R-DSP-03）
+    label.title = ctxLabel(editorContext);
+    const rm = document.createElement("button");
+    rm.className = "ctx-chip-remove";
+    rm.textContent = "×";
+    rm.title = l10n.t("Remove reference");
+    rm.setAttribute("aria-label", l10n.t("Remove reference"));
+    rm.onclick = () => {
+      editorContext = null;
+      renderCtxChip();
+    };
+    ctxChipEl.append(label, rm);
+    ctxChipEl.classList.remove("hidden");
+  });
 }
 
 // 実測で応答0文字だった端末TUI系コマンド（/doctor は応答があるため対象外）。
@@ -3076,8 +3219,6 @@ const UNSUPPORTED_TERMINAL_COMMANDS = new Map<string, string>(
 );
 
 function send(): void {
-  // 分析表示中は送信不可（コンポーザは disabled だが、念のためショートカット経路も塞ぐ）
-  if (composerLocked()) return;
   // 実行中の Enter は steering（実行中ターンへの追加入力として即時投入。新ターンにはしない）
   const running = activeTab()?.turnState !== "idle";
   // M-3: 中断中は投入しない（中断で終端しようとしているターンへ入力を混ぜない）。
@@ -3095,22 +3236,19 @@ function send(): void {
       ct.addBlock("system warn", l10n.t("Cannot use /clear during a turn. Wait for completion or interrupt, then try again."));
       return;
     }
-    inputEl.value = "";
-    inputEl.style.height = "auto";
+    clearComposerInput();
     persistState();
     if (activeTabId) vscode.postMessage({ type: "clearTab", tabId: activeTabId });
     return;
   }
   if (text === "/export") {
-    inputEl.value = "";
-    inputEl.style.height = "auto";
+    clearComposerInput();
     persistState();
     if (activeTabId) vscode.postMessage({ type: "exportTab", tabId: activeTabId });
     return;
   }
   if (text === "/model") {
-    inputEl.value = "";
-    inputEl.style.height = "auto";
+    clearComposerInput();
     persistState();
     const t = activeTab();
     if (t && t.models.length === 0) {
@@ -3127,8 +3265,7 @@ function send(): void {
   // （~/.claude.json の color。複数セッションの見分け用）が変わるだけで、拡張の見た目には
   // 何も起きない。VS Code 拡張なのだから配色は VS Code のテーマ選択へ繋ぐ。
   if (text === "/color" || text === "/theme") {
-    inputEl.value = "";
-    inputEl.style.height = "auto";
+    clearComposerInput();
     persistState();
     vscode.postMessage({ type: "openThemePicker" });
     return;
@@ -3136,8 +3273,7 @@ function send(): void {
   // /resume は LAISORA の履歴パネルを開く。素通しすると CLI 側が端末用の対話ピッカーを
   // 出そうとして何も起きないため（LAISORA では 🕘 の履歴一覧が同じ役割を担う）。
   if (text === "/resume" || text === "/history") {
-    inputEl.value = "";
-    inputEl.style.height = "auto";
+    clearComposerInput();
     persistState();
     queueMicrotask(openHistPanel); // ▶クリックの気泡で即閉じされるのを避ける（M-1と同じ理由）
     return;
@@ -3145,8 +3281,7 @@ function send(): void {
   // /effort もローカル処理する。素通しすると CLI が「このセッションのみ」で適用してしまい、
   // LAISORA 側の状態・チップ・settings.json のいずれも更新されず食い違う。
   if (text === "/effort" || text.startsWith("/effort ")) {
-    inputEl.value = "";
-    inputEl.style.height = "auto";
+    clearComposerInput();
     persistState();
     const arg = text.slice("/effort".length).trim();
     const t = activeTab();
@@ -3165,8 +3300,7 @@ function send(): void {
   // /usage は既存の使用量ポップアップを開く。素通しすると CLI が端末用の画面を出そうとして
   // 応答が0文字になり何も起きないため（実測済み）。
   if (text === "/usage" || text.startsWith("/usage ")) {
-    inputEl.value = "";
-    inputEl.style.height = "auto";
+    clearComposerInput();
     persistState();
     queueMicrotask(openUsagePanel); // ▶クリックの気泡で即閉じされるのを避ける（M-1と同じ理由）
     return;
@@ -3177,8 +3311,7 @@ function send(): void {
   if (rename !== null) {
     const t = activeTab();
     if (!t) return;
-    inputEl.value = "";
-    inputEl.style.height = "auto";
+    clearComposerInput();
     persistState();
     const title = (rename[1] ?? "").split("\n")[0].trim();
     if (!title) {
@@ -3198,17 +3331,15 @@ function send(): void {
     // 出力先が無いまま入力だけ消さない（タブ全閉・snapshot未着でも起こりうる）
     const t = activeTab();
     if (!t) return;
-    inputEl.value = "";
-    inputEl.style.height = "auto";
+    clearComposerInput();
     persistState();
     t.addBlock("system warn", unsupportedTerminalCommand);
     return;
   }
   if ((!text && attachmentsOf(activeTabId).length === 0) || !activeTabId) return;
-  inputEl.style.height = "auto";
   // ローカル描画はしない。host が user_message イベントとしてログに記録し再送してくる
   // （snapshot 復元でユーザー発言が消えないように — レビューR1-5）
-  inputEl.value = "";
+  clearComposerInput();
   persistState();
   // turn_started 往復までの間に2通目が受理されたように見えて消える穴を塞ぐ（codexレビューC1-6）。
   // 実行中の追加送信では state を触らない（既に running。楽観 running 上書きで interrupting が消える）
@@ -3256,9 +3387,11 @@ function send(): void {
 // 都度参照する方式にしている（要件4: 閉鎖済みタブはtabsから除去済みなので自然に対象外になる）。
 function initTicker(): void {
   setInterval(() => {
+    const nowMs = Date.now();
     activeTab()?.tickStrip();
+    activeTab()?.planPanel.tick(nowMs);
     if (activeTabId) {
-      overviews.get(activeTabId)?.tick(Date.now());
+      overviews.get(activeTabId)?.tick(nowMs);
     }
   }, 1000);
 }

@@ -1,15 +1,19 @@
+import type { PlanUsage } from "../plan-usage";
+import { derivePlanView, normalizePlanContent } from "./plan-view";
+import { renderPlanSection, planDuration, planTokens } from "./plan-panel";
+import { EXECUTORS } from "../orchestration-executors";
 // 状況パネル（概要 / グラフ / 分析 / 実行ログ の 4 タブ）と概要タブ・分析タブの描画。
 // 値は Host の payload（WorkModelPayload / SemanticModelPayload.timeBuckets / execLogMarks）の写しだけを描き、
 // ツール名から操作分類を起こしたり、作業を帰属させたり、時間を再計算したりはしない。
 import type {
   HostToWebview,
+  OrchestrationView,
   SemanticModelPayload,
   TimeBucketsCoverage,
   WorkModelPayload,
-  WorkTaskItemView,
 } from "../protocol";
 import type { AnalysisReport } from "../analysis";
-import type { AgentSpanView, BackgroundTaskSpanView, RequestBlockView, TimeBucketView } from "../time-buckets";
+import type { AgentSpanView, TimeBucketView } from "../time-buckets";
 import type { ExecLogFindingView, ExecLogMark } from "../exec-log-marks";
 import { renderAnalysisView } from "./analysis-view";
 import { renderAnalysisFactsView } from "./analysis-facts-view";
@@ -33,12 +37,7 @@ function llmElapsedText(ms: number): string {
 
 export type WorkViewMode = "summary" | "graph" | "analysis" | "log";
 
-const WORK_VIEW_MODES: WorkViewMode[] = ["summary", "graph", "analysis", "log"];
-
-// 終了セッションの流れは直近だけを見せ、残りは「前の N 往復を表示」で開く
-const FLOW_LIMIT = 14;
-// 30 文字以下の発言には開く印を出さない。開いても何も増えない（R-DSP-05）
-const SHORT_TEXT_MAX = 30;
+const EARLIER_LIMIT = 3;
 // 状態 C（スクリプトで何も拾えなかったとき）の文言。所有者が決めた文言なので言い換えない
 const NO_FINDINGS_TEXT = l10n.t(
   "Script analysis found no classifiable failures and no operations matching the rule table. This does not mean LLM analysis would find no candidates either; a script can only count events that fit predefined patterns."
@@ -73,15 +72,9 @@ function div(className: string): HTMLElement {
   return el;
 }
 
-// 「作業の流れ」の行の日付（月日のみ）。年は行の title（フルの日時）に持たせる
 function monthDay(ms: number): string {
   const d = new Date(ms);
   return `${d.getMonth() + 1}/${d.getDate()}`;
-}
-
-function dayKey(ms: number): string {
-  const d = new Date(ms);
-  return `${d.getFullYear()}-${d.getMonth() + 1}-${d.getDate()}`;
 }
 
 
@@ -96,10 +89,10 @@ type AnalysisSubtab = "script" | "ai";
 const ANALYSIS_SUBTABS: readonly AnalysisSubtab[] = ["script", "ai"];
 
 export class WorkOverview {
-  private readonly switchEl: HTMLElement;
   private readonly rootEl: HTMLElement;
   private readonly coverageEl: HTMLElement;
   private readonly bodyEl: HTMLElement;
+  private orchestrationEl: HTMLElement | undefined;
   private readonly analysisEl: HTMLElement;
   // セッションの実測（R-DSP-15 / R-DSP-16 / R-DSP-17）
   private readonly measuredEl: HTMLElement;
@@ -112,7 +105,6 @@ export class WorkOverview {
   private readonly l3El: HTMLElement;
   private readonly referenceHeadEl: HTMLElement;
   private readonly referenceEl: HTMLElement;
-  private readonly tabs: Record<WorkViewMode, HTMLButtonElement>;
   private readonly graph: WorkGraph;
   private readonly inspector: AgentInspector;
   private mode: WorkViewMode = "summary";
@@ -150,7 +142,11 @@ export class WorkOverview {
   private renderedAnalysisEvidenceKey: string | undefined;
   private lastTickMs: number | undefined;
   private flowExpanded = false;
-  private readonly openBlocks = new Set<string>();
+  private readonly planSection = document.createElement("section");
+  private readonly youSection = div("wo-you");
+  private planUsage: PlanUsage | undefined;
+  private planOrchestration: OrchestrationView | undefined;
+
   private execLogMarks: ExecLogMark[] | undefined;
   private execLogFindings: ExecLogFindingView[] | undefined;
   // 印を貼り終えた行。全行を毎イベント貼り直さない
@@ -161,21 +157,10 @@ export class WorkOverview {
   private summaryRunning = false;
   // 直近の要約実行が終えられなかった理由（sessionSummary.failure）。既存の要約は消さない（R-DSP-25）
   private summaryFailure: string | undefined;
-  // 前回 onAnalysisModeChange へ通知した値。applyMode は syncVisibility 経由で毎イベント
-  // バッチ呼ばれるため、無条件発火だと非アクティブタブのイベントでも共有 chrome の
-  // 再描画（updateComposerLock→refreshChrome）が走る（レビューT4-r1 M1）
-  private notifiedAnalysisActive: boolean | undefined;
 
   constructor(
     private readonly workEl: HTMLElement,
-    // .log-head 内のタブバー置き場（tab.ts が用意する）。ここへ入れることで、作業ログを
-    // どこまでスクロールしてもタブバーが見える。workEl の中へ戻すと包含ブロックの下端に
-    // 縛られ、最下部でヘッダの裏へ押し上げられる
-    private readonly switchHost: HTMLElement,
     private readonly tabId: string,
-    // コンポーザ無効化は main.ts の責務のまま、可視状態の通知だけをここが担う（裁定A1:
-    // コールバック注入。work-overview → main の import 辺を作らない）
-    private readonly onAnalysisModeChange?: (analysisActive: boolean) => void,
     private readonly toolEvidence?: {
       has(toolUseId: string): boolean;
       navigate(toolUseId: string): void;
@@ -190,13 +175,10 @@ export class WorkOverview {
     },
     // グラフの窓が #logs の可視帯を測り、行の増減で scrollTop を補正する口（tab.ts が用意する）
     private readonly graphScrollPort?: GraphScrollPort,
-    private readonly onAnalysisSubChange?: () => void
+    private readonly onAnalysisSubChange?: () => void,
+    private readonly onModeApplied?: (moveFocus: boolean) => void,
+    private readonly onViewChange: (action: () => void) => void = (action) => action()
   ) {
-    this.switchEl = document.createElement("div");
-    this.switchEl.className = "work-view-switch";
-    this.switchEl.setAttribute("role", "tablist");
-    this.switchEl.setAttribute("aria-label", l10n.t("Status views"));
-
     this.rootEl = document.createElement("div");
     this.rootEl.className = "work-overview";
     this.rootEl.id = `wo-panel-${this.tabId}`;
@@ -258,43 +240,9 @@ export class WorkOverview {
     this.inspector = new AgentInspector(this.tabId, () => this.graph.onInspectorClosed());
     this.graph = new WorkGraph(this.tabId, this.inspector, this.graphScrollPort);
 
-    this.tabs = {
-      summary: this.buildTab("summary", l10n.t("Summary"), this.rootEl.id),
-      graph: this.buildTab("graph", l10n.t("Graph"), this.graph.rootEl.id),
-      analysis: this.buildTab("analysis", l10n.t("Analysis"), this.analysisEl.id),
-      log: this.buildTab("log", l10n.t("Execution log"), this.workEl.id),
-    };
-    this.switchEl.append(this.tabs.summary, this.tabs.graph, this.tabs.analysis, this.tabs.log);
-
     // 検査が DOM 経由で直接呼ぶ外部駆動点。本番の印は updateSemantic が渡す
     (this.rootEl as HTMLElement & { laisoraSetExecLogMarks?: (marks: ExecLogMark[] | undefined) => void })
       .laisoraSetExecLogMarks = (marks) => this.setExecLogMarks(marks);
-  }
-
-  private buildTab(mode: WorkViewMode, label: string, controls: string): HTMLButtonElement {
-    const btn = document.createElement("button");
-    btn.type = "button";
-    btn.className = "work-view-tab";
-    btn.id = `wotab-${mode}-${this.tabId}`;
-    btn.setAttribute("role", "tab");
-    btn.setAttribute("aria-controls", controls);
-    btn.textContent = label;
-    btn.onclick = () => this.setMode(mode);
-    btn.addEventListener("keydown", (e) => {
-      const at = WORK_VIEW_MODES.indexOf(this.mode);
-      if (e.key === "ArrowRight" || e.key === "ArrowLeft") {
-        e.preventDefault();
-        const step = e.key === "ArrowRight" ? 1 : WORK_VIEW_MODES.length - 1;
-        this.setMode(WORK_VIEW_MODES[(at + step) % WORK_VIEW_MODES.length], true);
-      } else if (e.key === "Home") {
-        e.preventDefault();
-        this.setMode(WORK_VIEW_MODES[0], true);
-      } else if (e.key === "End") {
-        e.preventDefault();
-        this.setMode(WORK_VIEW_MODES[WORK_VIEW_MODES.length - 1], true);
-      }
-    });
-    return btn;
   }
 
   private buildSubTab(sub: AnalysisSubtab, label: string, controls: string): HTMLButtonElement {
@@ -350,7 +298,6 @@ export class WorkOverview {
     this.workEl.insertBefore(this.rootEl, this.logHeadEl.nextSibling);
     this.workEl.insertBefore(this.graph.rootEl, this.rootEl.nextSibling);
     this.workEl.insertBefore(this.analysisEl, this.graph.rootEl.nextSibling);
-    this.switchHost.appendChild(this.switchEl);
     this.applyMode();
   }
 
@@ -524,6 +471,40 @@ export class WorkOverview {
     this.setMode("analysis");
   }
 
+  setYou(element: HTMLElement): void { this.youSection.replaceChildren(element); }
+
+  setPlanUsage(usage: PlanUsage | undefined): void {
+    this.planUsage = usage;
+    this.summaryDirty = true;
+    if (this.mode === "summary") this.render();
+  }
+
+  private renderPlan(): void {
+    this.planSection.className = "plan-section";
+    const time = this.activeSemantic()?.timeBuckets;
+    const block = time?.blocks.at(-1);
+    const context = this.payload?.planContext ?? (block ? {
+      blockId: block.blockId, text: block.text, start: block.start, end: block.end, running: this.turnRunning,
+    } : undefined);
+    const view = derivePlanView(this.payload, this.planOrchestration, this.planUsage, this.lastTickMs ?? 0, context);
+    // R-DSP-20: semantic snapshots can predate completion; only legacy payloads need their NOW fallback.
+    for (const agent of time?.agents ?? []) {
+      if (this.payload?.planTools !== undefined) continue;
+      if (!agent.open || !this.turnRunning) continue;
+      const lanes = [...view.now, ...view.steps.flatMap(step => step.lanes)];
+      if (lanes.some(lane => lane.id === `agent:${agent.transcriptAgentId ?? agent.toolUseId}`)) continue;
+      view.now.push({ id: `agent:${agent.toolUseId}`, agent: agent.subagentType ?? "Claude", title: agent.description,
+        start: agent.start, elapsed: (this.nowMs(time) ?? agent.end) - agent.start, status: "running", tokens: null, cacheRead: 0, external: false });
+    }
+    for (const task of time?.backgroundTasks ?? []) {
+      if (this.payload?.planTools !== undefined) continue;
+      if (!task.open || !this.turnRunning) continue;
+      view.now.push({ id: `background:${task.taskId}`, agent: "Claude", title: task.description,
+        start: task.start, elapsed: (this.nowMs(time) ?? task.end) - task.start, status: "running", tokens: null, cacheRead: 0, external: false });
+    }
+    renderPlanSection(this.planSection, view);
+  }
+
   update(payload: WorkModelPayload | undefined): void {
     const previousToolCount = this.payload === undefined ? undefined : this.totalToolCount(this.payload);
     const previousFailCount = this.payload === undefined ? undefined : this.totalFailCount(this.payload);
@@ -593,12 +574,16 @@ export class WorkOverview {
     if (mode === "summary" && this.summaryDirty) this.render();
     if (mode === "analysis" && !this.l3Dirty && !this.analysisMatchesRendered()) this.l3Dirty = true;
     if (mode === "analysis" && this.l3Dirty) this.renderAnalysisPanel();
+    this.onModeApplied?.(moveFocus);
     if (typeof after === "function") after();
-    if (moveFocus) this.tabs[mode].focus();
   }
 
   // tab.ts が新しい詳細行を append したあとに呼ぶ。呼ばないと概要表示のまま新着だけが見える
   syncVisibility(): void {
+    for (const row of Array.from(this.bodyEl.querySelectorAll<HTMLButtonElement>(".earlier-row"))) {
+      const turns: string[] = JSON.parse(row.dataset.turnIds ?? "[]");
+      row.disabled = !turns.some(id => this.conversation?.has(id));
+    }
     this.applyMode();
     if (this.execLogMarks !== undefined) this.decorateExecLog(false);
     if (this.analysisEvidenceKey() !== this.renderedAnalysisEvidenceKey) {
@@ -616,6 +601,7 @@ export class WorkOverview {
   tick(nowMs: number): void {
     this.lastTickMs = nowMs;
     this.graph.tick(nowMs);
+    if (this.mode === "summary") this.renderPlan();
     if (this.mode === "summary" && this.turnRunning) this.refreshLive(nowMs);
     // 進行中だけ描き直す。終端の便で llmProgress を落としているので、終端の後は
     // 何度 tick が来ても「分析中…」は復活しない
@@ -631,11 +617,14 @@ export class WorkOverview {
   }
 
   private applyMode(): void {
-    for (const mode of WORK_VIEW_MODES) {
-      const btn = this.tabs[mode];
-      btn.classList.toggle("active", mode === this.mode);
-      btn.setAttribute("aria-selected", String(mode === this.mode));
-      btn.tabIndex = mode === this.mode ? 0 : -1;
+    if (this.mode === "log") {
+      this.workEl.setAttribute("role", "tabpanel");
+      this.workEl.setAttribute("aria-labelledby", `wotab-log-${this.tabId}`);
+      this.workEl.tabIndex = 0;
+    } else {
+      this.workEl.removeAttribute("role");
+      this.workEl.removeAttribute("aria-labelledby");
+      this.workEl.removeAttribute("tabindex");
     }
     this.rootEl.hidden = this.mode !== "summary";
     this.graph.rootEl.hidden = this.mode !== "graph";
@@ -643,11 +632,6 @@ export class WorkOverview {
     if (this.mode !== "graph" && this.inspector.isOpen()) this.inspector.close();
     this.analysisEl.hidden = this.mode !== "analysis";
     this.logHeadEl.hidden = this.mode !== "log" || this.logSumEl.childElementCount === 0;
-    const analysisActive = this.mode === "analysis";
-    if (analysisActive !== this.notifiedAnalysisActive) {
-      this.notifiedAnalysisActive = analysisActive;
-      this.onAnalysisModeChange?.(analysisActive);
-    }
     for (const child of Array.from(this.workEl.children)) {
       if (child === this.rootEl || child === this.graph.rootEl ||
           child === this.analysisEl || child === this.logHeadEl) continue;
@@ -730,8 +714,10 @@ export class WorkOverview {
           has: (toolUseId: string) => this.toolEvidence?.has(toolUseId) === true,
           navigate: (toolUseId: string) => {
             if (this.toolEvidence?.has(toolUseId) === true) {
-              this.setMode("log");
-              this.toolEvidence.navigate(toolUseId);
+              this.onViewChange(() => {
+                this.setMode("log");
+                this.toolEvidence?.navigate(toolUseId);
+              });
             }
           },
         }
@@ -996,10 +982,10 @@ export class WorkOverview {
           chip.className = "wa-chip";
           chip.textContent = l10n.t("Execution log line ›");
           chip.title = m.toolUseId;
-          chip.onclick = () => {
+          chip.onclick = () => this.onViewChange(() => {
             this.setMode("log");
             nav.navigate(m.toolUseId);
-          };
+          });
           chips.appendChild(chip);
         }
         if (marks.length > 12) chips.appendChild(span("wa-sm", l10n.t("{0} more", marks.length - 12)));
@@ -1011,14 +997,101 @@ export class WorkOverview {
 
   // 実行ログの印から分析タブの所見へ。確認は出さない
   private revealFinding(anchor: string): void {
-    this.setMode("analysis", true);
-    this.setAnalysisSub("script");
-    for (const old of Array.from(this.findingsEl.querySelectorAll<HTMLElement>(".wa-find.wa-hit"))) old.classList.remove("wa-hit");
-    const target = this.findingsEl.querySelector<HTMLElement>(`.wa-find[data-finding-anchor="${CSS.escape(anchor)}"]`);
-    if (target === null) return;
-    target.classList.add("wa-hit");
-    target.scrollIntoView({ block: "start" });
-    target.focus({ preventScroll: true });
+    this.onViewChange(() => {
+      this.setMode("analysis", true);
+      this.setAnalysisSub("script");
+      for (const old of Array.from(this.findingsEl.querySelectorAll<HTMLElement>(".wa-find.wa-hit"))) old.classList.remove("wa-hit");
+      const target = this.findingsEl.querySelector<HTMLElement>(`.wa-find[data-finding-anchor="${CSS.escape(anchor)}"]`);
+      if (target === null) return;
+      target.classList.add("wa-hit");
+      target.scrollIntoView({ block: "start" });
+      target.focus({ preventScroll: true });
+    });
+  }
+
+  setOrchestration(state: OrchestrationView | undefined): void {
+    this.planOrchestration = state;
+    this.renderPlan();
+    if (state === undefined) { // R-ORC-01, R-ORC-21
+      this.orchestrationEl?.remove();
+      this.orchestrationEl = undefined;
+      return;
+    }
+    if (this.orchestrationEl === undefined) {
+      this.orchestrationEl = document.createElement("section");
+      this.orchestrationEl.className = "wo-flow orchestration-roster";
+      this.orchestrationEl.tabIndex = 0;
+      this.orchestrationEl.setAttribute("aria-label", l10n.t("Agent roster"));
+      this.rootEl.appendChild(this.orchestrationEl);
+    }
+    const group = this.orchestrationEl;
+    group.replaceChildren();
+    const heading = document.createElement("h3");
+    heading.className = "wo-flow-h";
+    heading.textContent = l10n.t("Agent roster");
+    group.appendChild(heading);
+    if (state.settingsChanged) { // R-ORC-21
+      const notice = div("wo-note orchestration-notice");
+      notice.setAttribute("role", "status");
+      notice.textContent = l10n.t("Orchestration settings changed. They apply from the next session; this conversation keeps its starting roster.");
+      group.appendChild(notice);
+    }
+    const conductor = div("orchestration-conductor");
+    conductor.appendChild(span("wi-kind", l10n.t("Conductor (main thread)")));
+    group.appendChild(conductor);
+    const unknown = l10n.t("unknown");
+    const list = (title: string, kind: string): HTMLUListElement => {
+      const label = document.createElement("h4");
+      label.className = "wo-flow-h";
+      label.textContent = title;
+      const rows = document.createElement("ul");
+      rows.className = "wo-list";
+      rows.dataset.orchestrationList = kind;
+      rows.setAttribute("aria-label", title);
+      group.append(label, rows);
+      return rows;
+    };
+    const row = (rows: HTMLElement, title: string, detail: string, badge: string): HTMLElement => {
+      const entry = document.createElement("li");
+      entry.append(span("wi-kind", badge), document.createTextNode(" "), span("wo-it-t", title), span("wo-note", detail));
+      rows.appendChild(entry);
+      return entry;
+    };
+    const usageLabels: Record<string, string> = {
+      input_tokens: l10n.t("Input tokens"), output_tokens: l10n.t("Output tokens"),
+      cached_input_tokens: l10n.t("Cached input tokens"), reasoning_output_tokens: l10n.t("Reasoning output tokens"),
+      cache_read_input_tokens: l10n.t("Cache read input tokens"), cache_creation_input_tokens: l10n.t("Cache creation input tokens"),
+      total_tokens: l10n.t("Total tokens"), thinking_tokens: l10n.t("Thinking tokens"), cache_read_tokens: l10n.t("Cache read tokens"),
+    };
+    const usage = (value: OrchestrationView["agents"][number]["usage"]): string => value === null ? unknown
+      : Object.entries(value).map(([key, count]) => `${usageLabels[key]}: ${count}`).join(" · ");
+    const children = list(l10n.t("Observed agents"), "agents");
+    const recentAgents = [...state.agents].sort((a, b) => b.lastActivityAt.localeCompare(a.lastActivityAt)).slice(0, 50); // R-ORC-23
+    for (const agent of recentAgents) {
+      const appliedModel = agent.model ?? unknown; // R-ORC-22
+      const appliedEffort = agent.effort ?? unknown; // R-ORC-22
+      const entry = row(children, agent.role ?? agent.agentType ?? unknown,
+        l10n.t("Applied Model: {0} · Applied Effort: {1}", appliedModel, appliedEffort), l10n.t("Child agent"));
+      entry.appendChild(span("wo-note", l10n.t("First seen: {0} · Last activity: {1} · Tokens: {2}",
+        formatDateTime(Date.parse(agent.firstSeenAt)), formatDateTime(Date.parse(agent.lastActivityAt)), usage(agent.usage))));
+    }
+    const externalRuns = list(l10n.t("External runs"), "runs");
+    const recentRuns = [...state.runs].sort((a, b) => b.startedAt.localeCompare(a.startedAt)).slice(0, 50); // R-ORC-23
+    for (const run of recentRuns) {
+      const outcome = run.outcome === "ok" ? l10n.t("Succeeded") : run.outcome === "failed" ? l10n.t("Failed")
+        : run.outcome === "timeout" ? l10n.t("Timed out") : l10n.t("Refused");
+      row(externalRuns, `${run.role} · ${EXECUTORS[run.executor].displayName}${run.model ? ` · ${run.model}` : ""}${run.effort ? ` · ${run.effort}` : ""}`, l10n.t("{0} · Duration: {1} · Tokens: {2}",
+        outcome, formatDuration(run.durationMs), usage(run.usage)), l10n.t("External executor"));
+    }
+    const requested = list(l10n.t("Starting roster (requested settings)"), "roster");
+    for (const member of state.roster.agents) {
+      row(requested, `${member.role} → ${member.agentKey}`,
+        l10n.t("Requested Model: {0} · Requested Effort: {1}", member.model, member.effort ?? unknown), l10n.t("Child agent"));
+    }
+    for (const member of state.roster.external) {
+      row(requested, `${member.role} → ${EXECUTORS[member.executor].displayName}`,
+        l10n.t("Requested Model: {0} · Requested Effort: {1}", member.model ?? unknown, member.effort ?? unknown), l10n.t("External executor"));
+    }
   }
 
   private render(): void {
@@ -1046,11 +1119,12 @@ export class WorkOverview {
     if (!hasFlow && tasks.length === 0 && (payload === undefined || this.totalToolCount(payload) === 0)) {
       // 中身が無い区画は骨組みごと出さない。無いときは 1 行で済ませる（R-DSP-05）
       this.bodyEl.appendChild(span("wo-empty", NO_WORK_SUMMARY_TEXT));
+      this.bodyEl.appendChild(this.renderPlanYou(view));
       return;
     }
     this.bodyEl.appendChild(this.renderHead(semantic, view));
     this.bodyEl.appendChild(this.renderCards(view, payload));
-    this.bodyEl.appendChild(this.renderFlow(view, tasks));
+    this.bodyEl.appendChild(this.renderPlanYou(view));
   }
 
   private renderCoverageRows(coverage: WorkModelPayload["coverage"], timeBuckets?: TimeBucketsCoverage): void {
@@ -1273,194 +1347,69 @@ export class WorkOverview {
     return box;
   }
 
-  // 作業の流れ。1 行 = 1 往復（依頼ブロック）、新しいものが上。
-  // Todo があれば入れ子、無ければ 1 行だけ（R-DSP-20 / R-DSP-04 / R-DSP-05）
-  private renderFlow(view: TimeBucketView | undefined, tasks: readonly WorkTaskItemView[]): HTMLElement {
-    const flow = div("wo-flow");
-    const blocks = view?.blocks ?? [];
-    const h = div("wo-flow-h");
-    h.appendChild(document.createTextNode(l10n.t("Flow of work")));
-    if (blocks.length > 0) {
-      h.appendChild(span("wo-c", this.turnRunning ? l10n.t("Round trip {0}", blocks.length) : l10n.t("{0} round trips", blocks.length)));
-    }
-    flow.appendChild(h);
-    if (blocks.length === 0) {
-      // 意味モデル未着・明示 off では流れの材料が無い。測っていない値を置かない（R-DSP-11）
-      flow.appendChild(span("wo-note", view === undefined ? l10n.t("The flow of work cannot be shown because the semantic model is disabled.") : l10n.t("No user messages yet.")));
-      if (tasks.length > 0) flow.appendChild(this.renderTodo(tasks));
-    } else {
-      const newestFirst = [...blocks].reverse();
-      const hidden = !this.flowExpanded && !this.turnRunning && newestFirst.length > FLOW_LIMIT ? newestFirst.length - FLOW_LIMIT : 0;
-      if (hidden > 0) {
-        const fold = document.createElement("button");
-        fold.type = "button";
-        fold.className = "wo-fold";
-        fold.textContent = l10n.t("↑ Show the previous {0} round trips", hidden);
-        fold.onclick = () => {
-          this.flowExpanded = true;
-          this.render();
-        };
-        flow.appendChild(fold);
+  private renderPlanYou(view: TimeBucketView | undefined): HTMLElement {
+    const layout = div("wo-plan-you");
+    layout.lang = document.documentElement.lang;
+    const left = div("wo-plan-column");
+    this.renderPlan();
+    left.append(this.planSection);
+    const earlier = document.createElement("section");
+    earlier.className = "earlier-requests";
+    const blocks = [...(view?.blocks ?? [])].reverse();
+    const heading = document.createElement("h3");
+    heading.className = "earlier-label";
+    heading.textContent = `EARLIER REQUESTS · ${blocks.length}`;
+    earlier.append(heading);
+    if (!blocks.length) earlier.append(span("earlier-empty", l10n.t("No earlier requests available.")));
+    const shown = this.flowExpanded ? blocks : blocks.slice(0, EARLIER_LIMIT);
+    for (const block of shown) {
+      const row = document.createElement("button");
+      row.type = "button";
+      row.className = "earlier-row";
+      row.dataset.blockId = block.blockId;
+      row.dataset.turnIds = JSON.stringify(block.turnIds);
+      row.title = block.text;
+      const at = span("earlier-at", block.anchorAt > 0 ? `${monthDay(block.anchorAt)} ${clock(block.anchorAt)}` : "—");
+      at.title = formatDateTime(block.anchorAt);
+      const history = this.payload?.planHistory?.filter(entry => entry.kind === "todos" && entry.at >= block.start && (entry.at < block.end || block === view?.blocks.at(-1) && entry.at === block.end));
+      const steps = new Set(history?.flatMap(entry => entry.kind === "todos" ? entry.items.map(item => normalizePlanContent(item.description)) : []));
+      const count = history?.length ? String(steps.size) : "—";
+      const usage = this.planUsage?.blocks.find(value => value.blockId === block.blockId);
+      const elapsed = span("earlier-elapsed", planDuration(block.durationMs));
+      if (block.durationMs !== null && block.running && this.turnRunning) {
+        elapsed.dataset.liveElapsed = "block";
+        elapsed.dataset.start = String(block.start);
+        elapsed.textContent = planDuration(Math.max(block.durationMs, (this.nowMs(view) ?? block.end) - block.start));
       }
-      const list = document.createElement("ul");
-      list.className = "wo-list";
-      const shown = hidden > 0 ? newestFirst.slice(0, FLOW_LIMIT) : newestFirst;
-      const runningAgents = (view?.agents ?? []).filter((a) => a.open && this.turnRunning);
-      const runningBgTasks = (view?.backgroundTasks ?? []).filter((b) => b.open && this.turnRunning);
-      let prevDay: string | undefined;
-      for (let i = 0; i < shown.length; i++) {
-        const block = shown[i];
-        const day = dayKey(block.anchorAt);
-        const li = this.renderBlockRow(block, view, day !== prevDay);
-        prevDay = day;
-        list.appendChild(li);
-        if (i === 0 && this.turnRunning) {
-          for (const agent of runningAgents) list.appendChild(this.renderRunningAgent(agent, view));
-          for (const bg of runningBgTasks) list.appendChild(this.renderRunningBackgroundTask(bg, view));
-          if (tasks.length > 0) list.appendChild(this.renderTodo(tasks));
-        }
-      }
-      flow.appendChild(list);
-      if (!list.querySelector(".wo-todo") && tasks.length > 0) flow.appendChild(this.renderTodo(tasks));
-    }
-    if (tasks.length === 0) {
-      // Todo が無いときは入れ子の骨組みを出さず 1 行だけ（R-DSP-04）
-      flow.appendChild(span("wo-todo-n", l10n.t("Todo is not used")));
-    }
-    return flow;
-  }
-
-  // showDate: 日をまたぐセッションで行の時刻が曖昧にならないよう、日付（月日）を先頭行と日付が変わる行に出す。
-  // フルの日時は毎行 title に持つ
-  private renderBlockRow(block: RequestBlockView, view: TimeBucketView | undefined, showDate = true): HTMLElement {
-    const li = document.createElement("li");
-    li.className = "wo-it";
-    li.dataset.blockId = block.blockId;
-    const marks = this.marksInBlock(block);
-    const isNow = this.turnRunning && block.running;
-    if (isNow) li.classList.add("now");
-    if (block.failCount > 0 || marks > 0) li.classList.add("m");
-    else if (block.toolCount > 0) li.classList.add("w");
-    if (block.text.length <= SHORT_TEXT_MAX) li.classList.add("wo-short");
-    if (this.openBlocks.has(block.blockId)) li.classList.add("open");
-    const at = span("wo-it-at", showDate ? `${monthDay(block.anchorAt)} ${clock(block.anchorAt)}` : clock(block.anchorAt));
-    at.title = formatDateTime(block.anchorAt);
-    if (showDate) at.dataset.date = monthDay(block.anchorAt);
-    li.append(
-      at,
-      span("wo-it-bar", ""),
-      span("wo-it-t", block.text)
-    );
-    const stats = span("wo-it-s", "");
-    const parts: (string | HTMLElement)[] = [];
-    if (block.toolCount > 0) parts.push(l10n.t("Tools {0}", block.toolCount));
-    if (block.agentCount > 0) parts.push(l10n.t("Agents {0}", block.agentCount));
-    if (marks > 0) parts.push(span("wo-mk", l10n.t("Flagged {0}", marks)));
-    if (parts.length === 0) {
-      // 起点が継承値（durationMs=null）なら数字を出さず、実行中の刻みも付けない（R-DSP-11。グラフの blockDuration と同じ規則）
-      if (block.durationMs === null) {
-        parts.push(span("wo-it-e", l10n.t("Not measured")));
-      } else {
-        const end = isNow ? (this.nowMs(view) ?? block.end) : block.end;
-        const elapsed = span("wo-it-e", formatDuration(Math.max(block.durationMs, end - block.start)));
-        if (isNow) {
-          elapsed.dataset.liveElapsed = "block";
-          elapsed.dataset.start = String(block.start);
-        }
-        parts.push(elapsed);
-      }
-    }
-    parts.forEach((p, i) => {
-      if (i > 0) stats.appendChild(document.createTextNode(l10n.t(" · ")));
-      stats.appendChild(typeof p === "string" ? document.createTextNode(p) : p);
-    });
-    const convTurn = this.conversation !== undefined ? block.turnIds.find((id) => this.conversation!.has(id)) : undefined;
-    if (convTurn !== undefined) {
-      const btn = document.createElement("button");
-      btn.type = "button";
-      btn.className = "wo-conv";
-      btn.textContent = l10n.t("Conversation");
-      btn.title = l10n.t("Go to this exchange in the Conversation tab");
-      btn.onclick = (e) => {
-        e.stopPropagation();
-        this.conversation!.navigate(convTurn);
+      const stats = span("earlier-stats", `${l10n.t("{0} steps", count)} · `);
+      stats.append(elapsed, document.createTextNode(` · ${planTokens(usage?.slices.length ? usage.tokens : null)}`));
+      stats.title = l10n.t("Claude tokens. Cache read: {0}", planTokens(usage?.slices.length ? usage.cacheRead : null));
+      const title = span("earlier-title", block.text.split(/\r?\n/, 1)[0]);
+      if (/[\u3040-\u30ff\u3400-\u9fff]/.test(title.textContent ?? "")) title.lang = "ja";
+      row.append(at, title, stats);
+      row.onclick = () => {
+        const turn = block.turnIds.find(id => this.conversation?.has(id));
+        if (turn) this.conversation?.navigate(turn);
       };
-      stats.appendChild(btn);
+      row.disabled = !block.turnIds.some(id => this.conversation?.has(id));
+      earlier.append(row);
     }
-    li.appendChild(stats);
-    li.addEventListener("click", () => {
-      if (block.text.length <= SHORT_TEXT_MAX) return;
-      const open = li.classList.toggle("open");
-      if (open) this.openBlocks.add(block.blockId);
-      else this.openBlocks.delete(block.blockId);
-    });
-    return li;
-  }
-
-  // 往復に属する印の数。印は turnId を持ち、往復は turnIds を持つ
-  private marksInBlock(block: RequestBlockView): number {
-    const marks = this.execLogMarks;
-    if (marks === undefined || block.turnIds.length === 0) return 0;
-    const turns = new Set(block.turnIds);
-    let n = 0;
-    for (const m of marks) if (turns.has(m.turnId)) n++;
-    return n;
-  }
-
-  private renderRunningAgent(agent: AgentSpanView, view: TimeBucketView | undefined): HTMLElement {
-    const li = document.createElement("li");
-    li.className = "wo-run";
-    li.dataset.toolUseId = agent.toolUseId;
-    const elapsed = span("wo-run-e", formatDuration((this.nowMs(view) ?? agent.end) - agent.start));
-    elapsed.dataset.liveElapsed = "agent";
-    elapsed.dataset.start = String(agent.start);
-    li.append(
-      span("wo-dot", ""),
-      span("wo-run-n", agentLabel(agent)),
-      span("wo-run-m", agent.subagentType ?? ""),
-      elapsed
-    );
-    return li;
-  }
-
-  private renderRunningBackgroundTask(task: BackgroundTaskSpanView, view: TimeBucketView | undefined): HTMLElement {
-    const li = document.createElement("li");
-    li.className = "wo-run";
-    li.dataset.toolUseId = task.toolUseId;
-    li.dataset.taskId = task.taskId;
-    const desc = task.description || task.taskId;
-    const elapsed = span("wo-run-e", l10n.t("· Elapsed {0}", formatDuration((this.nowMs(view) ?? task.end) - task.start)));
-    elapsed.dataset.liveElapsed = "bg";
-    elapsed.dataset.start = String(task.start);
-    li.append(
-      span("wo-run-n", `🔄 ${desc}`),
-      elapsed
-    );
-    return li;
-  }
-
-  private renderTodo(tasks: readonly WorkTaskItemView[]): HTMLElement {
-    const li = document.createElement("li");
-    li.className = "wo-todo-wrap";
-    const ul = document.createElement("ul");
-    ul.className = "wo-todo";
-    for (const task of tasks) {
-      const item = document.createElement("li");
-      item.dataset.taskKey = task.taskKey;
-      item.dataset.status = task.status;
-      const mark = span("wo-s", task.status === "completed" ? "✓" : task.status === "in_progress" ? "▸" : "·");
-      if (task.status === "completed") {
-        mark.classList.add("done");
-        item.classList.add("wo-doneli");
-      } else if (task.status === "in_progress") {
-        mark.classList.add("now");
-        item.classList.add("wo-onnow");
-      }
-      item.append(mark, span("wo-todo-t", task.status === "in_progress" && task.activeForm ? task.activeForm : task.description));
-      ul.appendChild(item);
+    if (!this.flowExpanded && blocks.length > EARLIER_LIMIT) {
+      const expand = document.createElement("button");
+      expand.type = "button";
+      expand.className = "earlier-expand";
+      expand.textContent = l10n.t("Previous {0} ▸", blocks.length - EARLIER_LIMIT);
+      expand.setAttribute("aria-expanded", "false");
+      expand.onclick = () => {
+        this.flowExpanded = true;
+        this.render();
+        this.bodyEl.querySelector<HTMLButtonElement>(`.earlier-row[data-block-id="${CSS.escape(blocks[EARLIER_LIMIT].blockId)}"]`)?.focus({ preventScroll: true });
+      };
+      earlier.append(expand);
     }
-    li.append(ul, span("wo-todo-n", l10n.t("Todo {0} items", tasks.length)));
-    return li;
+    left.append(earlier);
+    layout.append(left, this.youSection);
+    return layout;
   }
 
   private refreshLive(nowMs: number): void {
@@ -1470,7 +1419,7 @@ export class WorkOverview {
         if (el.dataset.liveElapsed === "bg") {
           el.textContent = l10n.t("· Elapsed {0}", formatDuration(nowMs - start));
         } else {
-          el.textContent = formatDuration(nowMs - start);
+          el.textContent = el.classList.contains("earlier-elapsed") ? planDuration(nowMs - start) : formatDuration(nowMs - start);
         }
       }
     }

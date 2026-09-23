@@ -6,11 +6,11 @@ An AI agent runs command after command and rewrites code. Watching the log does 
 
 I wanted the everyday view to focus on the conversation: what I want to achieve and how to move forward. When I need the details, I can ask the agent to explain or open the execution log. LAISORA is a VS Code extension built around that way of working.
 
-Commands and file operations appear in a separate Status view, making your instructions and the agent's replies easier to follow in Conversation. The two screenshots below are the same turn: first the Conversation view, then the Status view with the commands it ran, the files it read and edited, the tests, and the subagent.
+Commands and file operations appear in LOG, making your instructions and the agent's replies easier to follow in CHAT. The two screenshots below are the same turn: first CHAT with PLAN and YOU beside the conversation, then LOG with the commands it ran, the files it read and edited, the tests, and the subagent.
 
-<img src="media/screenshots/conversation.png" alt="The Conversation view shows the agent's summary with file links; the linked file is open in the editor beside it" width="734">
+<img src="media/screenshots/conversation.png" alt="CHAT with the agent's reply, PLAN showing steps and progress, and YOU showing requests waiting on you" width="734">
 
-<img src="media/screenshots/execution-log.png" alt="The Status view's execution log for that turn, with the subagent card expanded to show the report it sent back to the main agent" width="734">
+<img src="media/screenshots/execution-log.png" alt="LOG for the same turn, with commands, file operations, tests, and an expanded subagent report" width="734">
 
 ## Turn work logs into improvements for the next task
 
@@ -22,7 +22,7 @@ LAISORA uses an LLM to analyze work logs and suggest improvements to the workflo
 
 Analysis uses the model selected for the conversation, so the capabilities of newer models can also support reviewing the work and suggesting improvements.
 
-<img src="media/screenshots/llm-analysis.png" alt="LLM analysis findings with links to the records they are based on" width="734">
+<img src="media/screenshots/llm-analysis.png" alt="ANALYSIS showing LLM findings with links to the records they are based on" width="734">
 
 ## What you can do
 
@@ -32,34 +32,52 @@ Each conversation is a tab (20 by default; `laisora.tabLimit`). Tabs keep their 
 
 ### Read the reply without the noise
 
-Every tab has two views: **Conversation** and **Status**.
+Every conversation has one vertical navigation with five views: **CHAT**, **SUMMARY**, **GRAPH**, **ANALYSIS**, and **LOG**. The composer stays available in every view.
 
-The Conversation view primarily shows what the model says to you, along with approval requests, failures, and relevant system notices. Tool activity — shell commands (Bash, PowerShell), file reads and edits, searches, subagents, TODO lists — is routed to the Status view instead, so a long run of commands does not break a reply into pieces. When a turn that used tools finishes, the Conversation view shows a short "✓ Work completed · N tools · elapsed" chip that jumps to the matching place in the execution log.
+CHAT shows what the model says to you, along with approval requests, failures, and relevant system notices. Tool activity — commands, file reads and edits, searches, and subagents — goes to LOG, so a long run of commands does not break a reply into pieces. Replies stay steady as they stream. Each reply has a footer with a copy button and its time; older footers appear on hover or keyboard focus. You can copy your own messages too.
 
 ### See what the agent is actually doing
 
-The Status view has four sub-tabs:
+**PLAN** beside CHAT shows the goal the agent declared, its steps and their status, who is working on each, elapsed time, and tokens. It stays for the whole goal, across messages, and completed steps fold away. Without declared steps, it shows the work observed under NOW. In a narrow window, a one-line bar under the title opens PLAN and YOU as a drawer.
 
-- **Summary** — the request blocks in the session, subagents and background commands that are still running, and the time split into model generation, tool execution, waiting for your answer to a question, and waiting for your next message.
-- **Graph** — a timeline of the main agent, its subagents, and background tasks, with a zoomable time window. Open a subagent to read the full instruction it was given.
-- **Analysis** — script-based statistics and findings (failure rate, failure loops, subagent ratio, turn duration) compared against your own past sessions, and optional LLM analysis whose findings link back to their evidence.
-- **Execution log** — tool calls with the available input and output previews, duration, and marks for failures and convention violations.
+The other views let you look more closely:
+
+- **SUMMARY** — PLAN on the left and YOU on the right, earlier requests with their step count, time, and tokens, and the agents that were observed. In a narrow window, YOU comes first in a single column.
+- **GRAPH** — a timeline of the main agent, its subagents, and background tasks, with a zoomable time window. Open a subagent to read the full instruction it was given.
+- **ANALYSIS** — script-based statistics and findings (failure rate, failure loops, subagent ratio, turn duration) compared against your own past sessions, and optional LLM analysis whose findings link back to their evidence.
+- **LOG** — tool calls with the available input and output previews, duration, and marks for failures and convention violations.
 
 Some information may be unavailable when session records are incomplete; the views say so instead of showing partial numbers as complete.
 
-The two screenshots below show the graph, then the instruction given to a subagent opened from it.
+The screenshots below show SUMMARY, GRAPH, and the instruction given to a subagent opened from GRAPH.
 
-<img src="media/screenshots/graph.png" alt="The Graph sub-tab: a timeline of the main agent and its subagent" width="734">
+<img src="media/screenshots/summary.png" alt="SUMMARY with PLAN and YOU side by side, earlier requests with step counts, time and tokens, and observed agents" width="734">
 
-<img src="media/screenshots/subagent-instruction.png" alt="A subagent opened from the graph, with its Instruction tab showing the full instruction the main agent gave it" width="734">
+<img src="media/screenshots/graph.png" alt="GRAPH showing a timeline of the main agent and its subagent" width="734">
+
+<img src="media/screenshots/subagent-instruction.png" alt="A subagent opened from GRAPH, with its Instruction tab showing the full instruction the main agent gave it" width="734">
 
 ### Stay in control while it runs
 
-Approve or deny each tool request from the Conversation view. If you are looking at the Status view when an approval arrives, the Conversation tab is highlighted so you do not miss it. Send additional instructions during a turn, interrupt, search within the conversation (Ctrl+F), and choose the model, reasoning effort, and permission mode from the controls beside the message box. Enter sends and Shift+Enter inserts a new line; swap them with `laisora.composer.sendKey` or on the LAISORA settings page.
+**YOU** collects approvals, decisions, and checks on your machine, each linking back to where it was asked in CHAT. Decisions in replies appear as cards with options, pros and cons, a recommendation, and the default if you do not answer. By default, LAISORA asks Claude to maintain plans and present decisions and checks this way (`laisora.claude.planInstruction`; applies to conversations started or resumed afterwards).
+
+Approve or deny tool requests in CHAT. Send additional instructions during a turn, interrupt, search within the conversation (Ctrl+F), and choose the model, reasoning effort, and permission mode beside the message box. The model chip shows the effort the CLI actually applies. Enter sends and Shift+Enter inserts a new line; swap them with `laisora.composer.sendKey` or on the LAISORA settings page.
+
+### Choose who the agent can delegate to
+
+The agent roster on the LAISORA settings page lets you configure worker, explorer, and reviewer roles, with model and effort per row (`laisora.orchestration.enabled`, `laisora.orchestration.agents`). Codex and Antigravity are optional external executors when their CLIs are installed. Roster changes apply from the next session.
+
+### Keep lessons for later work
+
+The learning ledger is off by default (`laisora.learning.enabled`). When enabled, the main agent can record model-specific or general lessons, and active rules are passed to later sessions. Records stay on your machine; text containing absolute paths or credentials is refused. Learning works with or without the agent roster, and setting changes apply from the next session.
 
 ### Carry long work forward
 
-Hand off a conversation to a new session using a summary and captured user messages, while preserving the original. Export a conversation to Markdown. Open supported Markdown file links at a specified location in the editor, within the workspace or session directory boundary. Files VS Code cannot show as text, such as images, open in their default editor. When LAISORA is open in an editor tab, the linked file is also selected in Explorer (`laisora.fileLinks.revealInExplorer`); links clicked in the side bar leave the side bar showing the conversation. By default LAISORA asks Claude to write local files as such links (`laisora.claude.fileLinkInstruction`; takes effect when a conversation is started or resumed, not in a running one, because changing the system prompt mid-conversation would make the next reply resend the whole conversation). To open links to files outside the workspace, turn on `laisora.fileLinks.allowOutsideWorkspace` (user setting); such files open after a confirmation and in a read-only editor unless you turn off `laisora.fileLinks.confirmOutsideWorkspace` or `laisora.fileLinks.openOutsideReadOnly`. Network shares (UNC paths) and device paths are always refused and never become links. These settings are also on the LAISORA settings page.
+Hand off a conversation to a new session using a summary and captured user messages, while preserving the original. The continuation starts with its summary card and carries recorded decisions forward. You can also export a conversation to Markdown.
+
+Follow Markdown file links to a location in the editor. Within the workspace or conversation folder, Office documents, PDFs, and other file types you choose open in their default app (`laisora.fileLinks.openWithSystemApp`); folder links open in the file manager. For files opened in VS Code, links from the LAISORA editor tab also select the file in Explorer (`laisora.fileLinks.revealInExplorer`); links from the side bar keep the conversation visible. By default Claude is asked to write local files as links (`laisora.claude.fileLinkInstruction`; applies to conversations started or resumed afterwards).
+
+To open files outside the workspace and conversation folder, enable `laisora.fileLinks.allowOutsideWorkspace` in user settings. These files open after confirmation and in a read-only editor unless you turn off `laisora.fileLinks.confirmOutsideWorkspace` or `laisora.fileLinks.openOutsideReadOnly`. Network shares (UNC paths) and device paths are always refused. File-link settings are also on the LAISORA settings page.
 
 ## Supported SDKs
 
@@ -67,6 +85,8 @@ Hand off a conversation to a new session using a summary and captured user messa
 | --- | --- |
 | Claude Agent SDK | Supported through a local Claude Code installation. |
 | Codex SDK | Planned. Not available in the current version. |
+
+Optional Codex delegation through its CLI is available in the agent roster; it does not provide Codex SDK conversations.
 
 ## Requirements
 
@@ -84,7 +104,7 @@ The main interface supports English and Japanese; some diagnostic messages remai
 
 ## LAISORA settings
 
-The send shortcut, tab restore, API key handling, and file links are on the LAISORA settings page (**Settings** in the ☰ menu of a conversation, or **LAISORA: Open Settings**). For other settings, such as the tab limit, default working directory, and work-log analysis, search for `laisora.*` in VS Code Settings. Extension preferences and UI state are saved in VS Code.
+The send shortcut, tab restore, API key handling, file links, agent roster, and learning switch are on the LAISORA settings page (**Settings** in the ☰ menu of a conversation, or **LAISORA: Open Settings**). For other settings, such as the tab limit, default working directory, and work-log analysis, search for `laisora.*` in VS Code Settings. Extension preferences and UI state are saved in VS Code.
 
 ## SDK-specific setup and behavior
 
@@ -99,9 +119,9 @@ If Claude Code cannot be found, set `laisora.claude.executablePath` in your user
 
 #### Settings and permissions
 
-Choose a model and effort level from the conversation view. Model selections are saved in the shared `~/.claude/settings.json` and affect subsequent Claude Code sessions. Effort is saved per supported model, including 1M-context variants such as Opus 1M, so new sessions start with it; `max` and selections without a known settings key remain session-only.
+Choose a model and effort level beside the composer in any view. Model selections are saved in the shared `~/.claude/settings.json` and affect subsequent Claude Code sessions. Effort is saved per supported model, including 1M-context variants such as Opus 1M, so new sessions start with it; `max` and selections without a known settings key remain session-only.
 
-The effort display distinguishes runtime-reported, requested, and configured values. The applied value follows Claude Code's setting precedence and model capabilities.
+The model chip shows the applied effort, following Claude Code's setting precedence and model capabilities; the details distinguish runtime-reported, requested, and configured values.
 
 Permission mode changes in LAISORA do not rewrite Claude Code's shared default permission mode. The extension saves the selected mode except for `bypassPermissions`, which is not saved for future sessions. Choosing that mode allows file edits and commands without the usual permission prompts.
 

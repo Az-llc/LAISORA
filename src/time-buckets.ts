@@ -18,6 +18,10 @@ export const MAX_TIME_BLOCKS = 500;
 export const MAX_BLOCK_TEXT = 600;
 const TASK_NOTIFICATION_MARKER = "A task-notification fires each time this agent stops";
 
+export function isRequestMessageText(text: string): boolean {
+  return !isPureCommandWrapper(text) && !text.includes(TASK_NOTIFICATION_MARKER);
+}
+
 export interface TurnSpan {
   turnId: string;
   start: number;
@@ -228,9 +232,8 @@ export function foldTimeBuckets(state: TimeBucketState, event: NormalizedEvent):
     case "user_message": {
       // 引数無しのスラッシュコマンドは往復に数えない。history 経路では同じ入力が user_message を生まないので、
       // live との差はここで吸収する
-      if (isPureCommandWrapper(event.text)) return next;
       // バックグラウンド委任の完了通知を往復にしない。user 記録だが人の発言ではない（R-DSP-10）
-      if (event.text.includes(TASK_NOTIFICATION_MARKER)) return next;
+      if (!isRequestMessageText(event.text)) return next;
       if (ts === undefined) return next;
       const n = touch();
       const text = redactAbsolutePaths(event.text.trim()).slice(0, MAX_BLOCK_TEXT);
@@ -380,9 +383,11 @@ export function foldTimeBuckets(state: TimeBucketState, event: NormalizedEvent):
     }
     case "subagent_info": {
       const d = state.delegations[event.toolUseId];
-      if (d === undefined || d.model === event.model) return next;
+      if (d === undefined || (event.model === undefined || d.model === event.model) &&
+        (event.agentId === undefined || d.transcriptAgentId === event.agentId)) return next;
       const n = touch();
-      n.delegations = { ...state.delegations, [event.toolUseId]: { ...d, model: event.model } };
+      n.delegations = { ...state.delegations, [event.toolUseId]: { ...d,
+        model: event.model ?? d.model, transcriptAgentId: event.agentId ?? d.transcriptAgentId } };
       return n;
     }
     default:

@@ -1,0 +1,292 @@
+import { spawn, type ChildProcess, type SpawnOptions } from "node:child_process";
+import { accessSync, constants, existsSync, readFileSync } from "node:fs";
+import { appendFile, mkdir } from "node:fs/promises";
+import { delimiter, dirname, isAbsolute, join, resolve } from "node:path";
+import { buildClaudeEnv } from "./claude-env";
+import { EXTERNAL_CAPABILITIES, externalExecutorName, isExternalRows, isExternalTimeout, type ExternalRow, type ExternalDetection, type ExternalModel, type ExternalModelList } from "./orchestration-roster";
+import type { ApiKeyPolicy } from "./protocol";
+
+export { isExternalRows, isExternalTimeout } from "./orchestration-roster";
+export type { ExternalRow } from "./orchestration-roster";
+import { EXECUTORS, EXTERNAL_EXECUTORS, tokenUsage, type TokenUsage, type ExecutorProbe } from "./orchestration-executors";
+export { tokenUsage, parseAgyModels, parseCodexModels } from "./orchestration-executors";
+export type { TokenUsage } from "./orchestration-executors";
+export interface ExternalRunRecord {
+  readonly kind: "external";
+  readonly role: string;
+  readonly executor: ExternalRow["executor"];
+  readonly model?: string;
+  readonly effort?: ExternalRow["effort"];
+  readonly startedAt: string;
+  readonly endedAt: string;
+  readonly durationMs: number;
+  readonly outcome: "ok" | "failed" | "timeout" | "refused";
+  readonly reason?: string;
+  readonly usage?: TokenUsage;
+}
+export interface AgentRunRecord {
+  readonly kind: "agent";
+  readonly agent_id: string;
+  readonly firstSeenAt: string;
+  readonly lastActivityAt: string;
+  readonly outcome?: "failed";
+  readonly reason?: string;
+  readonly usage?: TokenUsage;
+}
+export type OrchestrationRunRecord = ExternalRunRecord | AgentRunRecord;
+export type ExternalSpawn = (executable: string, args: string[], options: SpawnOptions) => ChildProcess;
+export interface ExternalDependencies {
+  spawn?: ExternalSpawn;
+  resolve?: (executor: ExternalRow["executor"]) => string | undefined;
+  killTree?: (pid: number) => Promise<void>;
+  timeoutMs?: number;
+}
+export interface ExternalInput { target: string; prompt: string; files?: string[]; diff?: string }
+
+export function observeAgentRun(previous: AgentRunRecord | undefined, input: unknown, now = new Date().toISOString()): AgentRunRecord | undefined {
+  if (!input || typeof input !== "object") return undefined; // R-ORC-15
+  const value = input as Record<string, unknown>;
+  if (typeof value.agent_id !== "string" || !value.agent_id) return undefined; // R-ORC-15
+  return Object.freeze({ kind: "agent", agent_id: value.agent_id, firstSeenAt: previous?.firstSeenAt ?? now,
+    lastActivityAt: now, usage: tokenUsage(value.usage) ?? previous?.usage });
+}
+
+export async function appendRunRecord(directory: string, record: OrchestrationRunRecord): Promise<void> {
+  await mkdir(directory, { recursive: true });
+  await appendFile(join(directory, "runs.jsonl"), `${JSON.stringify(record)}\n`, "utf8");
+}
+
+export function resolveExternalExecutable(executor: ExternalRow["executor"], env = process.env, platform = process.platform): string | undefined {
+  const get = (key: string) => Object.entries(env).find(([name]) => platform === "win32" ? name.toUpperCase() === key : name === key)?.[1];
+  const names = platform === "win32" ? [`${executor}.exe`, `${executor}.cmd`, executor] : [executor];
+  const directories = (get("PATH") ?? "").split(platform === "win32" ? ";" : delimiter).filter((dir) => isAbsolute(dir));
+  const candidates = names.flatMap((name) => directories.map((dir) => join(dir, name)));
+  const local = get("LOCALAPPDATA");
+  if (platform === "win32" && local) candidates.push(...names.map((name) => join(local, ...EXECUTORS[executor].localPath!, name)));
+  return candidates.find((candidate) => existsSync(candidate));
+}
+
+export function runFailureReason(reason: string, error: unknown): string {
+  const code = (error as NodeJS.ErrnoException | undefined)?.code;
+  // R-ORC-14: process errors can contain argv, including the private prompt.
+  return typeof code === "string" && /^[A-Z0-9_]+$/.test(code) ? `${reason} (${code})` : reason;
+}
+
+export function externalDescription(rows: readonly ExternalRow[]): string {
+  return [`Run an external target using its exact target key. ${EXTERNAL_EXECUTORS.map((definition) => definition.displayName).join(" and ")} cost no Claude usage. ${EXTERNAL_CAPABILITIES}`, ...rows.filter((row) => row.enabled)
+    .map(({ target, role, executor, model, effort, description }) => JSON.stringify({ target, role, executor: externalExecutorName(executor), model, effort, description }))].join("\n");
+}
+
+export function externalPrompt(executor: ExternalRow["executor"], input: ExternalInput, role?: string): string {
+  if (input.files?.some((file) => !isAbsolute(file))) throw new Error("R-ORC-12: files must be absolute paths");
+  const preamble = executor === "codex" && role === "worker"
+    ? "You may edit files under the current directory. Do not commit, push, stash, or checkout. Do not run the build. Report the files you changed."
+    : EXECUTORS[executor].preamble;
+  return `${preamble}\nAllowed absolute file paths:\n${(input.files ?? []).map((file) => JSON.stringify(file)).join("\n")}\nDiff:\n${input.diff ?? ""}\nTask:\n${input.prompt}`;
+}
+
+export function externalArgv(row: ExternalRow, cwd: string, minutes: number, prompt: string): string[] {
+  if (!isExternalRows([row]) || !isExternalTimeout(minutes) || !isAbsolute(cwd)) throw new Error("R-ORC-12: invalid executor settings");
+  return EXECUTORS[row.executor].argv!(row.model, row.effort, cwd, minutes, prompt, row.role);
+}
+export function parseExternalOutput(executor: ExternalRow["executor"], output: string, exitCode: number | null): { outcome: ExternalRunRecord["outcome"]; answer: string; usage?: TokenUsage } {
+  return EXECUTORS[executor].parseOutput!(output, exitCode);
+}
+
+export async function killExternalTree(pid: number, spawnChild: ExternalSpawn = spawn, platform = process.platform, killGroup = process.kill): Promise<void> {
+  if (platform !== "win32") { try { killGroup(-pid, "SIGKILL"); } catch (error) { if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw error; } return; }
+  await new Promise<void>((resolve, reject) => {
+    const killer = spawnChild("taskkill", ["/PID", String(pid), "/T", "/F"], { shell: false, windowsHide: true, stdio: "ignore", timeout: 5000 });
+    killer.once("error", reject);
+    killer.once("close", (code) => code === 0 ? resolve() : reject(new Error("Process tree termination failed")));
+  });
+}
+
+export function externalLaunch(executable: string, args: string[], env: NodeJS.ProcessEnv, platform = process.platform) {
+  if (platform !== "win32" || !executable.toLowerCase().endsWith(".cmd")) return { executable, args, env };
+  // R-ORC-12: unwrap Node CLI shims without executing their shell text or interpolating the prompt.
+  const script = readFileSync(executable, "utf8").match(/"%(?:dp0%|~dp0)[\\/]([^"\r\n]+\.(?:[cm]?js))"/i)?.[1];
+  if (!script) throw new Error("R-ORC-12: unsupported executable shim");
+  const entry = resolve(dirname(executable), script.replace(/\\/g, "/"));
+  accessSync(entry, constants.F_OK);
+  return { executable: process.execPath, args: [entry, ...args], env: { ...env, ELECTRON_RUN_AS_NODE: "1" } };
+}
+
+async function capture(executable: string, args: string[], cwd: string | undefined, env: NodeJS.ProcessEnv, limit: number, deps: ExternalDependencies, maxOutput = Infinity) {
+  return new Promise<{ output: string; code: number | null; timeout: boolean; reason?: string; spawnCode?: string }>((resolve) => {
+    let output = "", settled = false, expired = false;
+    let spawnCode: string | undefined;
+    const captureSpawnCode = (error: unknown) => {
+      const code = (error as NodeJS.ErrnoException)?.code;
+      spawnCode = typeof code === "string" && /^[A-Z0-9_]+$/.test(code) ? code : "UNKNOWN";
+    };
+    let child: ChildProcess;
+    let timer: ReturnType<typeof setTimeout>;
+    let drainTimer: ReturnType<typeof setTimeout> | undefined;
+    const finish = (code: number | null, reason?: string) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      clearTimeout(drainTimer);
+      child?.stdout?.destroy();
+      child?.stderr?.destroy();
+      resolve({ output, code, timeout: expired, reason, spawnCode });
+    };
+    try {
+      const launch = externalLaunch(executable, args, env);
+      child = (deps.spawn ?? spawn)(launch.executable, launch.args, { cwd, env: launch.env, shell: false, windowsHide: true,
+        detached: process.platform !== "win32", stdio: ["ignore", "pipe", "pipe"] });
+    } catch (error) { captureSpawnCode(error); finish(null, runFailureReason("R-ORC-13: external executor launch failed", error)); return; }
+    child.stdout?.setEncoding("utf8");
+    child.stdout?.on("data", (data) => { output = (output + data.toString()).slice(0, maxOutput); }); // R-ORC-12
+    child.stderr?.on("data", () => {});
+    child.once("error", (error) => { if (!expired) { captureSpawnCode(error); finish(null, runFailureReason("R-ORC-13: external executor process failed", error)); } });
+    child.once("exit", (code) => {
+      if (expired || settled) return; // R-ORC-13
+      clearTimeout(timer);
+      // R-ORC-13: descendants may keep pipes open after the executor has exited.
+      if (!child.stdout || child.stdout.readableEnded) finish(code);
+      else {
+        child.stdout.once("end", () => finish(code));
+        drainTimer = setTimeout(() => finish(code), 250);
+      }
+    });
+    timer = setTimeout(() => {
+      expired = true;
+      void (async () => {
+        try { if (child.pid) await (deps.killTree ?? killExternalTree)(child.pid); }
+        catch (error) { finish(null, runFailureReason("R-ORC-11: external executor timed out; process tree termination failed", error)); return; }
+        finish(null, "R-ORC-11: external executor timed out.");
+      })();
+    }, limit);
+  });
+}
+
+export async function listExternalModels(executor: ExternalRow["executor"], policy?: ApiKeyPolicy, deps: ExternalDependencies = {}): Promise<ExternalModelList> {
+  try {
+    const executable = (deps.resolve ?? resolveExternalExecutable)(executor);
+    if (!executable) return { state: "failed", reason: "not-installed" }; // R-ORC-12
+    const env = buildClaudeEnv(process.env, policy).env; // R-GW-05
+    const limit = Math.min(deps.timeoutMs ?? 10_000, 10_000);
+    return await EXECUTORS[executor].listModels!(executorProbe(executable, env, limit, deps));
+  } catch (error) { return { state: "failed", reason: runFailureReason("model-list-failed", error) }; }
+}
+function executorProbe(executable: string, env: NodeJS.ProcessEnv, limit: number, deps: ExternalDependencies): ExecutorProbe {
+  return { path: executable, version: (require("../package.json") as { version: string }).version,
+    capture: (args) => capture(executable, args, undefined, env, limit, deps, 1_000_001),
+    rpc: (args, initialize, initialized, method, parse) => captureModelRpc(executable, env, limit, deps, args, initialize, initialized, method, parse) };
+}
+export async function detectExternalExecutor(executor: ExternalRow["executor"], policy?: ApiKeyPolicy, deps: ExternalDependencies = {}): Promise<ExternalDetection> {
+  const path = (deps.resolve ?? resolveExternalExecutable)(executor);
+  if (!path) return { state: "notInstalled" }; // R-ORC-20
+  return EXECUTORS[executor].detect!(executorProbe(path, buildClaudeEnv(process.env, policy).env, deps.timeoutMs ?? 10_000, deps));
+}
+async function captureModelRpc(executable: string, env: NodeJS.ProcessEnv, limit: number, deps: ExternalDependencies,
+  args: string[], initialize: object, initialized: object, method: string, parse: Parameters<ExecutorProbe["rpc"]>[4]): Promise<ExternalModelList> {
+    return await new Promise<ExternalModelList>((resolveList) => {
+      let child: ChildProcess | undefined, timer: ReturnType<typeof setTimeout> | undefined;
+      let settled = false, buffer = "", received = 0, requestId = 1, pages = 0;
+      const models: ExternalModel[] = [];
+      const finishList = (result: ExternalModelList) => {
+        if (settled) return; // R-ORC-12
+        settled = true;
+        clearTimeout(timer);
+        void (async () => {
+          try {
+            if (child?.pid) await (deps.killTree ?? killExternalTree)(child.pid);
+            resolveList(result);
+          } catch (error) {
+            let reason = runFailureReason("model-list-termination-failed", error);
+            try { child?.kill?.(); } // R-ORC-12: still close the server when tree termination fails.
+            catch (killError) { reason = runFailureReason(reason, killError); }
+            resolveList({ state: "failed", reason });
+          } finally {
+            child?.stdin?.destroy();
+            child?.stdout?.destroy();
+            child?.stderr?.destroy();
+          }
+        })();
+      };
+      const failedList = (reason: string) => finishList({ state: "failed", reason });
+      const sendList = (message: object) => {
+        if (!child?.stdin?.writable) throw new Error("R-ORC-12: model-list stdin unavailable");
+        child.stdin.write(`${JSON.stringify(message)}\n`, (error) => { if (error) failedList("model-list-write-failed"); });
+      };
+      try {
+        const launch = externalLaunch(executable, args, env);
+        child = (deps.spawn ?? spawn)(launch.executable, launch.args, { env: launch.env, shell: false, windowsHide: true,
+          detached: process.platform !== "win32", stdio: ["pipe", "pipe", "pipe"] });
+        timer = setTimeout(() => failedList("timeout"), limit);
+        child.once("error", () => failedList("model-list-process-failed"));
+        child.once("close", () => failedList("model-list-closed"));
+        child.stdin?.on("error", () => failedList("model-list-write-failed"));
+        child.stdout?.on("error", () => failedList("model-list-read-failed"));
+        child.stderr?.on("error", () => failedList("model-list-read-failed"));
+        child.stderr?.on("data", () => {});
+        child.stdout?.setEncoding("utf8");
+        child.stdout?.on("data", (chunk) => {
+          if (settled) return; // R-ORC-12
+          buffer += chunk.toString();
+          received += chunk.toString().length;
+          if (received > 1_000_000) { failedList("model-list-too-large"); return; } // R-ORC-12
+          try {
+            let newline: number;
+            while (!settled && (newline = buffer.indexOf("\n")) >= 0) {
+              const line = buffer.slice(0, newline);
+              buffer = buffer.slice(newline + 1);
+              if (!line.trim()) continue;
+              const response = JSON.parse(line);
+              if (!response || typeof response !== "object") throw new Error("R-ORC-12: invalid response");
+              if (response.id !== requestId) continue;
+              if (response.error || !response.result) { failedList("model-list-rpc-failed"); return; } // R-ORC-12
+              if (requestId === 1) {
+                requestId = 2;
+                sendList(initialized);
+                sendList({ id: requestId, method, params: {} });
+              } else {
+                const page = parse(response.result);
+                if (page.state === "failed") { finishList(page); return; } // R-ORC-12
+                for (const model of page.models) if (models.length < 100 && !models.some((entry) => entry.id === model.id)) models.push(model);
+                pages++;
+                if (page.nextCursor !== null && pages < 5 && models.length < 100) {
+                  sendList({ id: ++requestId, method, params: { cursor: page.nextCursor } });
+                } else finishList(models.length ? { state: "ok", models } : { state: "failed", reason: "empty-model-list" });
+              }
+            }
+          } catch (error) { failedList(runFailureReason("invalid-model-list-response", error)); }
+        });
+        sendList({ id: 1, ...initialize });
+      } catch (error) { failedList(runFailureReason("model-list-launch-failed", error)); }
+    });
+}
+
+export async function runExternal(row: ExternalRow, input: ExternalInput, options: { cwd: string; timeoutMinutes: number; apiKeyPolicy?: ApiKeyPolicy }, deps: ExternalDependencies = {}) {
+  const started = Date.now();
+  let parsed: ReturnType<typeof parseExternalOutput> = { outcome: "failed", answer: "R-ORC-13: external executor not found." };
+  let args: string[];
+  try {
+    args = externalArgv(row, options.cwd, options.timeoutMinutes, externalPrompt(row.executor, input, row.role));
+  } catch (error) {
+    parsed = { outcome: "failed", answer: runFailureReason("R-ORC-12: invalid external executor input or settings.", error) };
+    return completedRun();
+  }
+  try {
+    const executable = (deps.resolve ?? resolveExternalExecutable)(row.executor);
+    if (executable) {
+      const result = await capture(executable, args, options.cwd, buildClaudeEnv(process.env, options.apiKeyPolicy).env,
+        deps.timeoutMs ?? options.timeoutMinutes * 60_000, deps);
+      parsed = result.timeout ? { outcome: "timeout", answer: result.reason ?? "External executor timed out." }
+        : result.reason ? { outcome: "failed", answer: result.reason } : parseExternalOutput(row.executor, result.output, result.code);
+    }
+  } catch (error) {
+    parsed = { outcome: "failed", answer: runFailureReason("R-ORC-13: external executor failed.", error) };
+  }
+  return completedRun();
+  function completedRun() {
+    const ended = Date.now();
+    const record: ExternalRunRecord = Object.freeze({ kind: "external", role: row.role, executor: row.executor, ...(row.model ? { model: row.model } : {}),
+      ...(row.effort === undefined ? {} : { effort: row.effort }), startedAt: new Date(started).toISOString(), endedAt: new Date(ended).toISOString(), durationMs: ended - started,
+      outcome: parsed.outcome, reason: parsed.outcome === "ok" ? undefined : parsed.answer, usage: parsed.usage });
+    return { record, result: { isError: parsed.outcome !== "ok", content: [{ type: "text" as const, text: parsed.answer }] } };
+  }
+}
