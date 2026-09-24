@@ -20,7 +20,7 @@ function hostDisplayLocale(): string {
 
 export async function handleAnalysisMessage(
   st: SessionStore,
-  msg: Extract<WebviewToHost, { type: "analyzeCurrent" | "analyzeSession" | "llmAnalysisRequest" | "summarizeSession" | "setLlmAnalysisEnabled" | "startFindingSession" | "prepareHistoricalDraft" | "selectAnalysisArtifact" }>,
+  msg: Extract<WebviewToHost, { type: "analyzeCurrent" | "analyzeSession" | "llmAnalysisRequest" | "summarizeSession" | "suggestSessionName" | "setLlmAnalysisEnabled" | "startFindingSession" | "prepareHistoricalDraft" | "selectAnalysisArtifact" }>,
   sender: vscode.Webview,
   target: Session | undefined
 ): Promise<void> {
@@ -105,6 +105,9 @@ export async function handleAnalysisMessage(
     }
     case "llmAnalysisRequest":
       await target!.llmRunner.requestLlmAnalysis();
+      break;
+    case "suggestSessionName":
+      await target!.summaryRunner.requestSessionNameSuggestion();
       break;
     case "summarizeSession":
       await target!.summaryRunner.requestSessionSummary();

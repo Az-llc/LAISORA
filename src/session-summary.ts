@@ -2,7 +2,7 @@
 import type { Options as ClaudeCodeOptions } from "@anthropic-ai/claude-agent-sdk" with { "resolution-mode": "import" };
 import type * as ClaudeCodeSdk from "@anthropic-ai/claude-agent-sdk" with { "resolution-mode": "import" };
 import { buildClaudeEnv, describeSdkErrorResult } from "./claude-env";
-import type { ApiKeyPolicy } from "./protocol";
+import { RENAME_TITLE_MAX, type ApiKeyPolicy } from "./protocol";
 import { resolveClaudeCodeStartup } from "./claudeCliResolver";
 import * as l10n from "@vscode/l10n";
 
@@ -15,6 +15,23 @@ export function buildSummaryPrompt(digest: string): string {
     l10n.t("--- Record excerpt ---"),
     digest,
   ].join("\n");
+}
+
+export function buildSessionNamePrompt(digest: string): string {
+  return [
+    l10n.t("Suggest a short session name for this conversation in its own language. Return only the name in the summary field."),
+    l10n.t("Use one line, at most {0} characters, preferably under 60. Do not use quotes, explanations, or handoff arrow chains (→).", RENAME_TITLE_MAX),
+    l10n.t("Do not add anything that is not in the record."),
+    "",
+    l10n.t("--- Record excerpt ---"),
+    digest,
+  ].join("\n");
+}
+
+export function sanitizeSessionName(value: string): string {
+  const line = value.trim().split(/[\r\n]/, 1)[0].split("→", 1)[0].trim();
+  const unquoted = line.replace(/^["'`\u201c\u201d\u2018\u2019\u300c\u300d\u300e\u300f]+|["'`\u201c\u201d\u2018\u2019\u300c\u300d\u300e\u300f]+$/gu, "").trim();
+  return unquoted.slice(0, RENAME_TITLE_MAX).replace(/[\uD800-\uDBFF]$/, "").trimEnd();
 }
 
 export function buildSessionDigest(userTexts: readonly string[], toolCallCount: number, agentCount: number): string {

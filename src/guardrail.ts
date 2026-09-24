@@ -21,6 +21,16 @@ export const OUTPUT_OVERRUN_TURN_TOKENS = 100_000;
 // Claude Code が人間の拒否・中断で tool_result に入れる定型文（corpus と E2E 実測。SDK/CLI 更新時に再確認）
 export const HUMAN_REJECTED_TOOL_RESULT_RE =
   /^(?:The user doesn't want to proceed with this tool use\b|\[Request interrupted by user(?: for tool use)?\])/;
+const USAGE_LIMIT_TOOL_RESULT_RE = /^(?:You've (?:hit|reached) your\b|You're out of (?:usage credits|extra usage)\b|Your org is out of usage \u00b7 (?:add funds to continue|contact your admin)\b|Your seat type doesn't include (?:extra usage|usage(?: credits)?)\b|Your usage allocation has been disabled by your admin\b|Your group's usage limit is set to \$0\b|Fable 5 requires usage credits\b|You have hit your limit\b|Usage limit reached\b|Rate limit reached\b)/;
+
+function isUsageLimitResult(text: string): boolean {
+  if (USAGE_LIMIT_TOOL_RESULT_RE.test(text)) return true;
+  try {
+    const value = JSON.parse(text);
+    const type = value?.error?.type ?? value?.type;
+    return type === "rate_limit" || type === "usage_limit" || type === "rate_limit_error" || type === "usage_limit_error";
+  } catch { return false; }
+}
 
 export type GuardrailSubjectId = string;
 
@@ -75,6 +85,7 @@ export interface GuardrailSubjectState {
     at: number;
   }[];
   signatureCounts: Record<string, number>;
+  recoveryCounts?: { turnId: string; tools: Record<string, Record<string, number>> };
   // root のみ。turn_started でリセット（R-TK2）
   turnOutput?: { turnId: string; outputTokens: number };
 }
@@ -330,21 +341,41 @@ function foldEvent(state: GuardrailState, ev: NormalizedEvent): GuardrailState {
       }
     }
 
+    if (targetSubjectId === undefined && !ev.isError) {
+      for (const [subId, subState] of Object.entries(state.subjects)) {
+        const previous = subState.recentFinished.find((entry) => entry.toolUseId === ev.toolUseId && entry.isError);
+        if (previous) {
+          targetSubjectId = subId;
+          toolName = previous.toolName;
+          break;
+        }
+      }
+    }
     if (targetSubjectId === undefined) {
       return state;
     }
     // 人間の拒否・中断による is_error はモデルの失敗ではない（E2E 実測 2026-08-25: 中断で拒否された
     // tool_result が 3 連続失敗の窓に入り別 fingerprint の 2 件目の failure_loop を作った）。窓にも署名にも入れない
-    if (ev.isError && HUMAN_REJECTED_TOOL_RESULT_RE.test(ev.resultPreview ?? "")) {
+    const usageLimit = ev.isError && isUsageLimitResult(ev.resultPreview ?? "");
+    if (usageLimit && state.subjects[`agent:${ev.toolUseId}`]) {
+      discardRecoveredFailures(state, `agent:${ev.toolUseId}`, ev.turnId);
+    }
+    if (ev.isError && (HUMAN_REJECTED_TOOL_RESULT_RE.test(ev.resultPreview ?? "") || usageLimit)) {
       return state;
     }
 
     const sub = getOrCreateSubject(state, targetSubjectId);
+    if (!ev.isError) {
+      discardRecoveredFailures(state, targetSubjectId, ev.turnId, toolName);
+    }
     let fingerprintHash: string | undefined;
     if (ev.isError) {
       fingerprintHash = computeErrorFingerprintHash(toolName, ev.resultPreview);
       if (fingerprintHash !== undefined) {
         sub.signatureCounts[fingerprintHash] = (sub.signatureCounts[fingerprintHash] ?? 0) + 1;
+        if (sub.recoveryCounts?.turnId !== ev.turnId) sub.recoveryCounts = { turnId: ev.turnId, tools: {} };
+        const counts = sub.recoveryCounts.tools[toolName] ??= {};
+        counts[fingerprintHash] = (counts[fingerprintHash] ?? 0) + 1;
       }
     }
 
@@ -492,6 +523,12 @@ function foldEvent(state: GuardrailState, ev: NormalizedEvent): GuardrailState {
     ev.kind === "turn_failed" ||
     ev.kind === "conversation_closed"
   ) {
+    if (ev.kind === "turn_failed" && (ev.errorKind === "usage_limit" || isUsageLimitResult(ev.reason))) {
+      for (const subjectId of Object.keys(state.subjects)) {
+        discardRecoveredFailures(state, subjectId, ev.turnId);
+      }
+    }
+    for (const sub of Object.values(state.subjects)) delete sub.recoveryCounts;
     delete state.openTurn;
     return state;
   }
@@ -519,6 +556,26 @@ function foldEvent(state: GuardrailState, ev: NormalizedEvent): GuardrailState {
   }
 
   return state;
+}
+
+function discardRecoveredFailures(state: GuardrailState, subjectId: string, turnId: string, toolName?: string): void {
+  const sub = state.subjects[subjectId];
+  const removed = sub.recentFinished.filter((entry) => entry.isError && entry.turnId === turnId && (toolName === undefined || entry.toolName === toolName));
+  const recovery = sub.recoveryCounts;
+  if (recovery?.turnId === turnId) {
+    for (const [name, counts] of Object.entries(recovery.tools)) {
+      if (toolName !== undefined && name !== toolName) continue;
+      for (const [hash, recovered] of Object.entries(counts)) {
+        const count = (sub.signatureCounts[hash] ?? 0) - recovered;
+        if (count > 0) sub.signatureCounts[hash] = count;
+        else delete sub.signatureCounts[hash];
+      }
+      delete recovery.tools[name];
+    }
+  }
+  const ids = new Set(removed.map((entry) => entry.toolUseId));
+  sub.recentFinished = sub.recentFinished.filter((entry) => !ids.has(entry.toolUseId));
+
 }
 
 // observed-only signal（stagnation / output_overrun）の作成・更新。count を渡さないと既存は +1

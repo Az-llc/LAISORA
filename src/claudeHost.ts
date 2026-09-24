@@ -1,3 +1,5 @@
+import { UsageLimitResume, SDK_AUTO_CONTINUE_SETTINGS } from "./usage-limit-resume";
+import { readClaudeCodeSettings, onAutoContinueSettingChange } from "./claude-code-settings";
 import { modelLabelWithVersion } from "./model-display-name";
 export { modelLabelWithVersion } from "./model-display-name";
 import { appendRunRecord, externalDescription, isExternalTimeout, observeAgentRun, runExternal, runFailureReason, type ExternalRow, type OrchestrationRunRecord, type AgentRunRecord } from "./orchestration-external";
@@ -70,6 +72,7 @@ type SDKUserMessage = {
   // SDK 仕様には「次に query する user message へマージされる」とあるが、実測では
   // 連続2通でもマージされず別レコードになる（実測 2026-08-25）
   shouldQuery?: boolean;
+  isMeta?: boolean;
 };
 
 type PermissionResult = ClaudeCodePermissionResult;
@@ -543,6 +546,8 @@ export class ClaudeConversation {
   readonly conversationId = randomUUID();
   lastRecordReceivedAt: number | undefined;
   private normalizer: ClaudeLiveNormalizer;
+  private readonly usageLimitResume: UsageLimitResume;
+  private readonly unsubscribeAutoContinue: () => void;
   private inputQueue: SDKUserMessage[] = [];
   private inputWaiter: (() => void) | null = null;
   private closed = false;
@@ -559,6 +564,19 @@ export class ClaudeConversation {
   private cliCapabilities: string[] | null = null;
 
   constructor(private readonly opts: ClaudeHostOptions) {
+    this.usageLimitResume = new UsageLimitResume({
+      now: Date.now,
+      random: Math.random,
+      setTimer: (callback, delay) => setTimeout(callback, delay),
+      clearTimer: (timer) => clearTimeout(timer as ReturnType<typeof setTimeout>),
+      enabled: () => readClaudeCodeSettings(true).autoContinueAtUsageLimit !== false,
+      live: () => this.q !== null && !this.closed && this.state === "idle" && this.inputQueue.length === 0,
+      send: (text) => this.send(text, undefined, undefined, true),
+      notify: (event) => this.emit(event),
+    });
+    this.unsubscribeAutoContinue = onAutoContinueSettingChange(() => {
+      if (readClaudeCodeSettings(true).autoContinueAtUsageLimit === false) this.cancelAutoResume();
+    });
     this.initialOrchestrationSettings = { settings: structuredClone(this.orchestrationSettings(opts)), deliveredSetHash: undefined };
     this.orchestrationEnabled = opts.orchestrationEnabled === true;
     const resolved = resolveOrchestrationRoster(this.orchestrationEnabled ? opts.orchestrationAgents : []);
@@ -713,7 +731,7 @@ ${ctxJson}`
       settingSources: this.opts.settingSources,
       // flag settings 層（利用者設定より優先）へ載せる。~/.claude/settings.json は変更しないので
       // LAISORA 以外のセッションの Remote Control には影響しない
-      settings: { remoteControlAtStartup: this.opts.remoteControlAtStartup === true },
+      settings: { remoteControlAtStartup: this.opts.remoteControlAtStartup === true, ...SDK_AUTO_CONTINUE_SETTINGS },
       includePartialMessages: true,
       pathToClaudeCodeExecutable: resolvedExecutable.path,
       canUseTool,
@@ -800,7 +818,7 @@ ${ctxJson}`
       options.mcpServers = { ...(options.mcpServers ?? {}), laisora_external: sdk.createSdkMcpServer({
         name: "laisora_external", timeout: this.externalTimeoutMinutes * 60_000 + 10_000,
         tools: [sdk.tool("run", externalDescription(this.externalRows), {
-          target: z.string(), prompt: z.string(), files: z.array(z.string()).optional(), diff: z.string().optional(),
+          target: z.string(), prompt: z.string(), files: z.array(z.string()).optional(), diff: z.string().optional(), cwd: z.string().optional(),
         }, async (input) => {
           const row = this.externalRows.find((entry) => entry.target === input.target);
           if (!row) return { isError: true, content: [{ type: "text" as const, text: "R-ORC-10: target is not in the conversation snapshot." }] };
@@ -903,7 +921,10 @@ ${ctxJson}`
     return { ok: true };
   }
 
-  send(text: string, images?: ImageAttachment[], observedTimestampSeed?: number): void {
+  cancelAutoResume(): void { this.usageLimitResume.cancel(); }
+
+  send(text: string, images?: ImageAttachment[], observedTimestampSeed?: number, automatic = false): void {
+    if (!automatic) this.usageLimitResume.manualSend();
     if (this.closed) {
       // interrupt強制終了直後の追加送信等。user_messageは記録済みのため無言ドロップにしない
       // （レビューAR2-4: 返答もエラーも来ない幽霊バブル化を防ぐ）
@@ -932,7 +953,7 @@ ${ctxJson}`
     const runningAlready = this.normalizer.turnState !== "idle";
     if (!runningAlready) {
       this.normalizer.seedObservedTimestamp(observedTimestampSeed);
-      this.normalizer.startTurn();
+      this.normalizer.startTurn(undefined, undefined, automatic);
     }
     // 画像は本文より前に置く。Anthropic API は画像を先に置いたほうが指示の解釈が安定する
     // （テキストが画像を参照する順序になる）。
@@ -948,6 +969,7 @@ ${ctxJson}`
     this.inputQueue.push({
       type: "user",
       message: { role: "user", content },
+      ...(automatic ? { isMeta: true } : {}),
       parent_tool_use_id: null,
       session_id: "",
     });
@@ -959,6 +981,7 @@ ${ctxJson}`
   // タイマー解除は interrupt() RPC の ack ではなく「ターンが実際に終端した時」（endTurn）に行う。
   // ack はターン停止を意味しない（レビューR1-3）。
   async interrupt(): Promise<void> {
+    this.cancelAutoResume();
     if (!this.q || this.normalizer.turnState !== "running") return;
     // 直接代入にする: メソッド経由だと TS が直前の turnState 判定の narrowing を保持し、
     // 後続の "interrupting" 比較を到達不能と誤判定する
@@ -1119,9 +1142,13 @@ ${ctxJson}`
       void this.recordLearningDeliveryR31(false);
     }
     this.opts.onEvent(ev, this.conversationId, meta);
+    this.usageLimitResume.observe(ev);
+    if (ev.kind === "conversation_closed") this.unsubscribeAutoContinue();
   }
 
   async dispose(): Promise<void> {
+    this.cancelAutoResume();
+    this.unsubscribeAutoContinue();
     if (this.inputQueue.length > 0) {
       this.opts.log(`dispose: ${this.inputQueue.length} unsent inputs remain`);
     }

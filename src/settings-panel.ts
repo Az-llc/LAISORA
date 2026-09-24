@@ -1,12 +1,14 @@
 import * as vscode from "vscode";
 import * as l10n from "@vscode/l10n";
 import { randomBytes } from "node:crypto";
+import { updateClaudeCodeSettings } from "./claude-settings";
 import { output } from "./host-context";
 import { isSettingsPageToHost } from "./protocol";
 import {
   settingsStateMessage,
   refreshExternalDetection,
   writeApiKeyPolicy,
+  writeAccentSetting,
   writeLearningEnabled,
   writeComposerSendKey,
   writeFileLinkSetting,
@@ -19,6 +21,7 @@ let settingsPanel: vscode.WebviewPanel | null = null;
 export function openSettingsPanel(context: vscode.ExtensionContext, detect?: Parameters<typeof refreshExternalDetection>[0]): void {
   if (settingsPanel) {
     settingsPanel.reveal();
+    postSettingsState();
     return;
   }
   const panel = vscode.window.createWebviewPanel("laisora.settings", l10n.t("LAISORA Settings"), vscode.ViewColumn.One, {
@@ -39,6 +42,7 @@ export function openSettingsPanel(context: vscode.ExtensionContext, detect?: Par
     // 判定は src/webview/l10n-boot.ts#selectWebviewL10nBundle と同一（ja 前方一致だけが ja）
     lang: String(vscode.env.language ?? "").toLowerCase().startsWith("ja") ? "ja" : "en",
   });
+  panel.onDidChangeViewState(() => { if (panel.visible) postSettingsState(); });
   panel.onDidDispose(() => {
     if (settingsPanel === panel) settingsPanel = null;
   });
@@ -62,11 +66,19 @@ export async function handleSettingsPageMessage(webview: vscode.Webview, raw: un
     case "settingsPageReady":
     case "recheckExternalExecutors":
       break;
+    case "setAccentSetting":
+      await writeAccentSetting(raw.setting, raw.value);
+      break;
     case "setComposerSendKey":
       await writeComposerSendKey(raw.sendKey);
       break;
     case "setApiKeyPolicy":
       await writeApiKeyPolicy(raw.policy);
+      break;
+    case "setAutoContinueAtUsageLimit":
+      if (!updateClaudeCodeSettings({ autoContinueAtUsageLimit: raw.enabled }).ok) {
+        void vscode.window.showWarningMessage(l10n.t("LAISORA: Could not save the setting."));
+      }
       break;
     case "setRestoreTabsOnStartup":
       await writeRestoreTabsOnStartup(raw.enabled);

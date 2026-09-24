@@ -1,3 +1,5 @@
+@import url("./tokens.css");
+
 :root {
   --settings-gap-1: 4px;
   --settings-gap-2: 8px;
@@ -359,3 +361,12 @@ html, body {
 .settings-extension-control { max-width: 100%; }
 .settings-row:has(.settings-extension-control) { flex-direction: column; align-items: stretch; gap: var(--settings-gap-3); }
 .settings-row:has(.settings-extension-control) > .settings-row-control { flex: 1 1 auto; width: 100%; }
+
+.settings-accent-control, .settings-accent-input { display: flex; align-items: center; gap: var(--settings-gap-2); }
+.settings-accent-swatch { display: inline-block; width: 7px; height: 7px; flex-shrink: 0; }
+.settings-accent-custom { display: flex; gap: var(--settings-gap-3); }
+.settings-accent-custom .l-label { display: block; margin-bottom: var(--settings-gap-1); }
+.settings-accent-input .settings-input { min-width: 0; width: 96px; }
+@media (max-width: 480px) {
+  .settings-row:has(.settings-accent-custom) { flex-wrap: wrap; }
+}

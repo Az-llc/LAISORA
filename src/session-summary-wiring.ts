@@ -2,10 +2,10 @@ import * as l10n from "@vscode/l10n";
 import { getLaisoraConfiguration } from "./claude-settings";
 
 import { sdkClaudeCodeVersion } from "./claudeHost";
-import { configuredClaudeExecutablePath, readClaudeCodeSettings, resolveSessionCwd } from "./claude-settings";
+import { configuredClaudeExecutablePath, resolveSessionCwd } from "./claude-settings";
 import { extensionContext, output } from "./host-context";
 import { normalizeApiKeyPolicy, type NormalizedEventBody } from "./protocol";
-import { buildSessionDigest, buildSummaryPrompt, generateSessionSummaryViaSdk } from "./session-summary";
+import { buildSessionDigest, buildSummaryPrompt, buildSessionNamePrompt, sanitizeSessionName, generateSessionSummaryViaSdk } from "./session-summary";
 import { isInSessionStore, inspectorSessionFile } from "./session-files";
 import { readSessionHistory } from "./session-transcript";
 import type { Session } from "./extension";
@@ -56,6 +56,7 @@ function summaryInputFromEvents(
 
 export class SessionSummaryWiring {
   private summaryHydrated = false;
+  private nameRun: AbortController | null = null;
 
   constructor(
     private readonly host: Session,
@@ -76,6 +77,8 @@ export class SessionSummaryWiring {
   // resetLogicalSession 専用。写しと hydration 済みフラグを落とさないと、旧会話の要約が
   // 新しい世代の snapshot に載り続ける（保存先の鍵は世代とともに変わる）
   resetForLogicalSession(): void {
+    this.nameRun?.abort();
+    this.nameRun = null;
     this.host.summaryRun?.abort();
     this.host.summaryRun = null;
     this.host.sessionSummary = null;
@@ -117,20 +120,29 @@ export class SessionSummaryWiring {
   }
 
   async requestSessionSummary(): Promise<void> {
-    if (this.host.summaryRun !== null) return;
+    await this.requestSummary("summary");
+  }
+
+  async requestSessionNameSuggestion(): Promise<void> {
+    await this.requestSummary("name");
+  }
+
+  private async requestSummary(purpose: "summary" | "name"): Promise<void> {
+    const naming = purpose === "name";
+    if (naming ? this.nameRun !== null : this.host.summaryRun !== null) return;
     const logicalGenerationAtStart = this.host.logicalGeneration;
     const abort = new AbortController();
-    this.host.summaryRun = abort;
-    this.postSessionSummaryState(true);
+    if (naming) this.nameRun = abort;
+    else {
+      this.host.summaryRun = abort;
+      this.postSessionSummaryState(true);
+    }
+    let suggestion: string | undefined;
     let saveFailed = false;
     let failure: string | undefined;
     try {
-      // R-DSP-25
-      let modelId: string | undefined = this.host.modelOverride ?? this.host.effectiveModel ?? undefined;
-      if (!modelId) {
-        modelId = readClaudeCodeSettings().model ?? undefined;
-      }
-      const effort = this.host.effortOverride ?? this.host.effectiveEffort;
+      // R-DSP-25 / R-ANL-21. R-ORC-04: haiku takes no effort.
+      const modelId = "haiku";
 
       const { userTexts, toolCalls, agentCount, readFailure } = await this.collectSummaryInput();
       if (this.supersededSince(logicalGenerationAtStart)) return;
@@ -153,21 +165,25 @@ export class SessionSummaryWiring {
               );
         return;
       }
-      output.appendLine(`[${this.host.title}] 要約を開始します（トークンを消費します${modelId ? `・モデル: ${modelId}` : ""}）`);
+      output.appendLine(`[${this.host.title}] 要約を開始します（トークンを消費します・モデル: ${modelId}）`);
       const result = await generateSessionSummaryViaSdk({
-        ...(modelId !== undefined ? { modelId } : {}),
+        modelId,
         apiKeyPolicy: normalizeApiKeyPolicy(getLaisoraConfiguration().get("claude.apiKeyPolicy", "inherit")), // R-GW-05
-        ...(effort !== undefined ? { effort } : {}),
         cwd: resolveSessionCwd(this.host) ?? process.cwd(),
-        prompt: buildSummaryPrompt(buildSessionDigest(userTexts, toolCalls, agentCount)),
+        prompt: (naming ? buildSessionNamePrompt : buildSummaryPrompt)(buildSessionDigest(userTexts, toolCalls, agentCount)),
         signal: abort.signal,
         pathToClaudeCodeExecutable: configuredClaudeExecutablePath(getLaisoraConfiguration()),
         sdkClaudeCodeVersion: sdkClaudeCodeVersion(),
       });
       if (this.supersededSince(logicalGenerationAtStart)) return;
       if (result.summary !== undefined) {
-        this.host.sessionSummary = { text: result.summary, model: result.model ?? modelId ?? "default" };
-        saveFailed = !(await this.persistSessionSummary());
+        if (naming) {
+          suggestion = sanitizeSessionName(result.summary) || undefined;
+          if (suggestion === undefined) failure = l10n.t("Could not generate a session name.");
+        } else {
+          this.host.sessionSummary = { text: result.summary, model: result.model ?? modelId ?? "default" };
+          saveFailed = !(await this.persistSessionSummary());
+        }
       } else {
         output.appendLine(`[${this.host.title}] 要約を生成できませんでした（応答が空）`);
         failure = l10n.t("LAISORA: Could not generate the summary.");
@@ -183,7 +199,12 @@ export class SessionSummaryWiring {
     } finally {
       // 同一性で見る。世代交代後に始まった新しい実行の running 表示を、中断された旧実行が消さない。
       // 失敗理由も同じ便に載せるので、旧実行の失敗が新しい実行の状態を巻き戻さない
-      if (this.host.summaryRun === abort) {
+      if (naming && this.nameRun === abort) {
+        this.nameRun = null;
+        this.store.post(suggestion !== undefined
+          ? { type: "sessionNameSuggestion", tabId: this.host.tabId, title: suggestion }
+          : { type: "sessionNameSuggestion", tabId: this.host.tabId, reason: failure ?? l10n.t("Could not generate a session name.") });
+      } else if (!naming && this.host.summaryRun === abort) {
         this.host.summaryRun = null;
         // 保存に失敗した要約を「保存済み」と表示させない（R-DSP-01 / R-DSP-25）
         this.postSessionSummaryState(false, saveFailed, failure);

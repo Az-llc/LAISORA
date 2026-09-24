@@ -2,7 +2,7 @@
   "name": "laisora",
   "displayName": "LAISORA",
   "description": "%extension.description%",
-  "version": "1.1.0",
+  "version": "1.1.1",
   "publisher": "az-llc",
   "categories": [
     "AI",
@@ -392,6 +392,44 @@
           "minimum": 1,
           "maximum": 120,
           "description": "%config.orchestration.externalTimeoutMinutes%"
+        },
+        "laisora.appearance.accentColor": {
+          "type": "string",
+          "enum": [
+            "theme",
+            "blue",
+            "orange",
+            "pink",
+            "green",
+            "custom"
+          ],
+          "default": "theme",
+          "scope": "application",
+          "description": "%config.laisora.appearance.accentColor.description%",
+          "enumDescriptions": [
+            "%config.laisora.appearance.accentColor.theme%",
+            "%config.laisora.appearance.accentColor.blue%",
+            "%config.laisora.appearance.accentColor.orange%",
+            "%config.laisora.appearance.accentColor.pink%",
+            "%config.laisora.appearance.accentColor.green%",
+            "%config.laisora.appearance.accentColor.custom%"
+          ]
+        },
+        "laisora.appearance.accentCustomLight": {
+          "type": "string",
+          "default": "#A84B00",
+          "pattern": "^#[0-9a-fA-F]{6}$",
+          "scope": "application",
+          "description": "%config.laisora.appearance.accentCustomLight.description%",
+          "patternErrorMessage": "%config.laisora.appearance.accentCustom.validation%"
+        },
+        "laisora.appearance.accentCustomDark": {
+          "type": "string",
+          "default": "#F5A35C",
+          "pattern": "^#[0-9a-fA-F]{6}$",
+          "scope": "application",
+          "description": "%config.laisora.appearance.accentCustomDark.description%",
+          "patternErrorMessage": "%config.laisora.appearance.accentCustom.validation%"
         }
       }
     }

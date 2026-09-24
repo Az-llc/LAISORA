@@ -1,7 +1,8 @@
-import { spawn, type ChildProcess, type SpawnOptions } from "node:child_process";
+import { pathIsInside, realPathOrNearestSync } from "./path-containment";
+import { execFile, spawn, type ChildProcess, type SpawnOptions } from "node:child_process";
 import { accessSync, constants, existsSync, readFileSync } from "node:fs";
 import { appendFile, mkdir } from "node:fs/promises";
-import { delimiter, dirname, isAbsolute, join, resolve } from "node:path";
+import { basename, delimiter, dirname, isAbsolute, join, resolve } from "node:path";
 import { buildClaudeEnv } from "./claude-env";
 import { EXTERNAL_CAPABILITIES, externalExecutorName, isExternalRows, isExternalTimeout, type ExternalRow, type ExternalDetection, type ExternalModel, type ExternalModelList } from "./orchestration-roster";
 import type { ApiKeyPolicy } from "./protocol";
@@ -13,6 +14,7 @@ export { tokenUsage, parseAgyModels, parseCodexModels } from "./orchestration-ex
 export type { TokenUsage } from "./orchestration-executors";
 export interface ExternalRunRecord {
   readonly kind: "external";
+  readonly cwd?: string;
   readonly role: string;
   readonly executor: ExternalRow["executor"];
   readonly model?: string;
@@ -37,11 +39,13 @@ export type OrchestrationRunRecord = ExternalRunRecord | AgentRunRecord;
 export type ExternalSpawn = (executable: string, args: string[], options: SpawnOptions) => ChildProcess;
 export interface ExternalDependencies {
   spawn?: ExternalSpawn;
+  worktrees?: (cwd: string) => Promise<string[]>;
+  commonDir?: (dir: string) => Promise<string | undefined>;
   resolve?: (executor: ExternalRow["executor"]) => string | undefined;
   killTree?: (pid: number) => Promise<void>;
   timeoutMs?: number;
 }
-export interface ExternalInput { target: string; prompt: string; files?: string[]; diff?: string }
+export interface ExternalInput { target: string; prompt: string; files?: string[]; diff?: string; cwd?: string }
 
 export function observeAgentRun(previous: AgentRunRecord | undefined, input: unknown, now = new Date().toISOString()): AgentRunRecord | undefined {
   if (!input || typeof input !== "object") return undefined; // R-ORC-15
@@ -73,7 +77,7 @@ export function runFailureReason(reason: string, error: unknown): string {
 }
 
 export function externalDescription(rows: readonly ExternalRow[]): string {
-  return [`Run an external target using its exact target key. ${EXTERNAL_EXECUTORS.map((definition) => definition.displayName).join(" and ")} cost no Claude usage. ${EXTERNAL_CAPABILITIES}`, ...rows.filter((row) => row.enabled)
+  return [`Run an external target using its exact target key. Optional cwd must be inside the conversation directory or a registered worktree of its repository. ${EXTERNAL_EXECUTORS.map((definition) => definition.displayName).join(" and ")} cost no Claude usage. ${EXTERNAL_CAPABILITIES}`, ...rows.filter((row) => row.enabled)
     .map(({ target, role, executor, model, effort, description }) => JSON.stringify({ target, role, executor: externalExecutorName(executor), model, effort, description }))].join("\n");
 }
 
@@ -260,12 +264,65 @@ async function captureModelRpc(executable: string, env: NodeJS.ProcessEnv, limit
     });
 }
 
+export async function registeredWorktrees(cwd: string): Promise<string[]> {
+  return new Promise((resolveList) => {
+    execFile("git", ["worktree", "list", "--porcelain", "-z"],
+      { cwd, shell: false, windowsHide: true, encoding: "utf8", timeout: 5000 }, (error, stdout) => {
+        resolveList(error ? [] : stdout.split("\0").filter((field) => field.startsWith("worktree ")).map((field) => field.slice(9)));
+      });
+  });
+}
+
+export async function gitCommonDir(dir: string): Promise<string | undefined> {
+  let existing = dir;
+  while (!existsSync(existing) && dirname(existing) !== existing) existing = dirname(existing);
+  return new Promise((done) => {
+    execFile("git", ["rev-parse", "--path-format=absolute", "--git-common-dir"],
+      { cwd: existing, shell: false, windowsHide: true, encoding: "utf8", timeout: 5000 }, (error, stdout) => {
+        done(error ? undefined : stdout.trim() || undefined);
+      });
+  });
+}
+
+export async function resolveExternalCwd(conversationCwd: string, requested: string | undefined,
+  worktrees = registeredWorktrees, commonDir = gitCommonDir): Promise<string> {
+  if (requested !== undefined && (typeof requested !== "string" || !requested.trim())) {
+    throw new Error("R-ORC-35: cwd must be a non-empty path.");
+  }
+  const candidate = realPathOrNearestSync(resolve(conversationCwd, requested ?? "."));
+  const root = realPathOrNearestSync(conversationCwd);
+  if (!candidate || !root) throw new Error("R-ORC-35: cwd real path could not be resolved.");
+  if (pathIsInside(root, candidate)) return candidate;
+  for (const registered of await worktrees(root)) {
+    const real = realPathOrNearestSync(registered);
+    if (real && pathIsInside(real, candidate)) return candidate;
+  }
+  // R-ORC-35: the conversation directory may hold nested repositories whose worktrees live elsewhere.
+  const common = await commonDir(candidate);
+  const main = common && basename(common).toLowerCase() === ".git" ? realPathOrNearestSync(dirname(common)) : undefined;
+  if (main && pathIsInside(root, main)) {
+    for (const registered of await worktrees(main)) {
+      const real = realPathOrNearestSync(registered);
+      if (real && pathIsInside(real, candidate)) return candidate;
+    }
+  }
+  throw new Error("R-ORC-35: cwd is outside the conversation directory, its registered git worktrees, and worktrees of repositories inside it.");
+}
+
 export async function runExternal(row: ExternalRow, input: ExternalInput, options: { cwd: string; timeoutMinutes: number; apiKeyPolicy?: ApiKeyPolicy }, deps: ExternalDependencies = {}) {
   const started = Date.now();
   let parsed: ReturnType<typeof parseExternalOutput> = { outcome: "failed", answer: "R-ORC-13: external executor not found." };
   let args: string[];
+  let cwd: string | undefined;
   try {
-    args = externalArgv(row, options.cwd, options.timeoutMinutes, externalPrompt(row.executor, input, row.role));
+    cwd = await resolveExternalCwd(options.cwd, input.cwd, deps.worktrees, deps.commonDir);
+  } catch (error) {
+    parsed = { outcome: "refused", answer: error instanceof Error && error.message.startsWith("R-ORC-35:")
+      ? error.message : "R-ORC-35: registered git worktrees could not be read." };
+    return completedRun();
+  }
+  try {
+    args = externalArgv(row, cwd, options.timeoutMinutes, externalPrompt(row.executor, input, row.role));
   } catch (error) {
     parsed = { outcome: "failed", answer: runFailureReason("R-ORC-12: invalid external executor input or settings.", error) };
     return completedRun();
@@ -273,7 +330,7 @@ export async function runExternal(row: ExternalRow, input: ExternalInput, option
   try {
     const executable = (deps.resolve ?? resolveExternalExecutable)(row.executor);
     if (executable) {
-      const result = await capture(executable, args, options.cwd, buildClaudeEnv(process.env, options.apiKeyPolicy).env,
+      const result = await capture(executable, args, cwd, buildClaudeEnv(process.env, options.apiKeyPolicy).env,
         deps.timeoutMs ?? options.timeoutMinutes * 60_000, deps);
       parsed = result.timeout ? { outcome: "timeout", answer: result.reason ?? "External executor timed out." }
         : result.reason ? { outcome: "failed", answer: result.reason } : parseExternalOutput(row.executor, result.output, result.code);
@@ -284,7 +341,7 @@ export async function runExternal(row: ExternalRow, input: ExternalInput, option
   return completedRun();
   function completedRun() {
     const ended = Date.now();
-    const record: ExternalRunRecord = Object.freeze({ kind: "external", role: row.role, executor: row.executor, ...(row.model ? { model: row.model } : {}),
+    const record: ExternalRunRecord = Object.freeze({ kind: "external", ...(cwd ? { cwd } : {}), role: row.role, executor: row.executor, ...(row.model ? { model: row.model } : {}),
       ...(row.effort === undefined ? {} : { effort: row.effort }), startedAt: new Date(started).toISOString(), endedAt: new Date(ended).toISOString(), durationMs: ended - started,
       outcome: parsed.outcome, reason: parsed.outcome === "ok" ? undefined : parsed.answer, usage: parsed.usage });
     return { record, result: { isError: parsed.outcome !== "ok", content: [{ type: "text" as const, text: parsed.answer }] } };

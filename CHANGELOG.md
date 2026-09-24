@@ -1,5 +1,27 @@
 # Changelog
 
+## 1.1.1
+
+- **Works without an open folder.** With no folder open and no `laisora.defaultCwd`, a new
+  conversation failed with "The working directory could not be determined" and the model list
+  stayed empty. It now starts in your home folder, like the official Claude Code extension.
+- **Several decisions in one reply.** Choosing an option no longer replaces the whole message box.
+  Each choice adds its own line (`question → A: option`); choosing again in the same question
+  replaces only that line, and what you were typing is kept.
+- **Resume after the usage limit.** When the claude.ai usage limit stops a conversation, LAISORA
+  continues it automatically after the limit resets, with a line showing when and a Cancel
+  button. The switch is in Settings > General and is shared with Claude Code in the terminal.
+- **Session name: Rename or Suggest.** The title's pencil and the ☰ menu offer Rename and Suggest.
+  Suggest drafts a name from the conversation for you to confirm with Enter.
+- **Accent colour.** Settings > General > Appearance: follow the theme, blue, orange, pink, green
+  or a custom colour, each with separate values for light and dark themes. Buttons and keyboard
+  focus keep the theme's colours.
+- **Summaries run on haiku,** like name suggestions — faster and cheaper than the conversation's
+  model.
+- Fixes: the saved-results list in ANALYSIS is readable in dark themes; subagent reports in LOG no
+  longer start with the CLI's hand-back preamble; the stuck-loop warning no longer counts usage-limit
+  stops or failures that were retried successfully.
+
 ## 1.1.0
 
 - **Five views in one vertical navigation.** CHAT, SUMMARY, GRAPH, ANALYSIS and LOG sit on a

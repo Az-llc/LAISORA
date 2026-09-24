@@ -1,3 +1,4 @@
+import { DEFAULT_ACCENT_SETTINGS, isAccentColor, isAccentSettingValue, type AccentSetting, type AccentSettings } from "./accent";
 import { homedir } from "node:os";
 import { listClaudeModels, detectClaudeExecutor } from "./orchestration-claude";
 import { EXECUTORS, executorMap, type ExecutorId } from "./orchestration-executors";
@@ -17,14 +18,31 @@ import {
   type WebviewToHost,
 } from "./protocol";
 import * as l10n from "@vscode/l10n";
-import { configuredClaudeExecutablePath, getLaisoraConfiguration } from "./claude-settings";
+import { configuredClaudeExecutablePath, getLaisoraConfiguration, readClaudeCodeSettings } from "./claude-settings";
 import { extensionContext, output, store } from "./host-context";
 import { ADDITIONAL_MODELS_KEY, CLAUDE_VERSION_ID, additionalClaudeModelIds, recomputeModelRows, modelsMessage } from "./gateway-models";
 import { restoreTabsOnStartupEnabled } from "./session-list-wiring";
 
+export function accentSettings(): AccentSettings {
+  const cfg = getLaisoraConfiguration();
+  const color = cfg.get<unknown>("appearance.accentColor", "theme");
+  const light = cfg.get<unknown>("appearance.accentCustomLight", DEFAULT_ACCENT_SETTINGS.accentCustomLight);
+  const dark = cfg.get<unknown>("appearance.accentCustomDark", DEFAULT_ACCENT_SETTINGS.accentCustomDark);
+  return {
+    accentColor: isAccentColor(color) ? color : "theme",
+    accentCustomLight: typeof light === "string" ? light : "",
+    accentCustomDark: typeof dark === "string" ? dark : "",
+  };
+}
+
+export async function writeAccentSetting(setting: AccentSetting, value: string): Promise<void> {
+  if (isAccentSettingValue(setting, value)) await updateUserSetting(`appearance.${setting}`, value);
+}
+
 export function userSettingsMessage(): Extract<HostToWebview, { type: "userSettings" }> {
   return {
     type: "userSettings",
+    appearance: accentSettings(),
     composerSendKey: normalizeComposerSendKey(getLaisoraConfiguration().get("composer.sendKey", "enter")),
   };
 }
@@ -107,6 +125,7 @@ export function settingsStateMessage(): Extract<HostToSettingsPage, { type: "set
   const timeout = cfg.get("orchestration.externalTimeoutMinutes", 10);
   return {
     type: "settingsState",
+    appearance: accentSettings(),
     openWithSystemApp: configuredSystemAppExtensions(),
     externalTimeoutMinutes: isExternalTimeout(timeout) ? timeout : 10,
     externalDetection: structuredClone(externalDetection),
@@ -120,6 +139,7 @@ export function settingsStateMessage(): Extract<HostToSettingsPage, { type: "set
     composerSendKey: normalizeComposerSendKey(cfg.get("composer.sendKey", "enter")),
     apiKeyPolicy: normalizeApiKeyPolicy(cfg.get("claude.apiKeyPolicy", "inherit")),
     restoreTabsOnStartup: restoreTabsOnStartupEnabled(),
+    autoContinueAtUsageLimit: readClaudeCodeSettings(true).autoContinueAtUsageLimit !== false,
     // 読み手（conversation-lifecycle.ts / composer-io.ts）と同じ既定と判定で読む。ずれると画面の表示と実際の動作が食い違う（R-DSP-01）
     fileLinkInstruction: cfg.get<boolean>(FILE_LINK_SETTING_KEYS.fileLinkInstruction, true) !== false,
     planInstruction: cfg.get<boolean>(FILE_LINK_SETTING_KEYS.planInstruction, true) !== false,

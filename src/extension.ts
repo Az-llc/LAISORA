@@ -175,8 +175,9 @@ function activateReady(context: vscode.ExtensionContext): void {
       for (const session of store?.sessions.values() ?? []) postOrchestrationView(session);
     }
     // settings.json を直接編集した変更も設定画面と入力欄へ届ける（R-DSP-01）
-    if (affectsProductConfiguration(e, "composer.sendKey")) store?.post(userSettingsMessage());
+    if (affectsProductConfiguration(e, "composer.sendKey") || affectsProductConfiguration(e, "appearance")) store?.post(userSettingsMessage());
     if (
+      affectsProductConfiguration(e, "appearance") ||
       affectsProductConfiguration(e, "composer.sendKey") ||
       affectsProductConfiguration(e, "claude.apiKeyPolicy") ||
       affectsProductConfiguration(e, "restoreTabsOnStartup") ||
@@ -247,7 +248,8 @@ function activateReady(context: vscode.ExtensionContext): void {
         resolveWebviewView(view: vscode.WebviewView): void {
           const guard = guardMessage();
           if (guard) {
-            view.webview.html = `<html><body><p>${guard}</p></body></html>`;
+            const tokensUri = view.webview.asWebviewUri(vscode.Uri.joinPath(context.extensionUri, "media", "tokens.css"));
+            view.webview.html = `<html><head><link rel="stylesheet" href="${tokensUri}"></head><body class="l-surface"><p>${guard}</p></body></html>`;
             return;
           }
           const st = store ?? new SessionStore();

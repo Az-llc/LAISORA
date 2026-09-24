@@ -36,7 +36,7 @@ export interface AskRenderContext {
   replyId: string;
   offset?: number;
   register(ask: AskBlock, offset: number): string;
-  choose(text: string): void;
+  choose(text: string, askKey: string, title: string): void;
   checked(id: string, step: number): boolean;
   check(id: string, step: number, checked: boolean): void;
 }
@@ -61,7 +61,7 @@ export function renderAsk(ask: AskBlock, offset: number, context?: AskRenderCont
       button.type = "button";
       button.append(...askOptionContent(index, option.label, option.effect, option));
       button.disabled = !context;
-      button.onclick = () => context?.choose(`${button.querySelector(".ask-letter")!.textContent}: ${option.label}`);
+      button.onclick = () => context?.choose(`${ask.title} → ${button.querySelector(".ask-letter")!.textContent}: ${option.label}`, id!, ask.title);
       options.append(button);
     });
     block.append(options);

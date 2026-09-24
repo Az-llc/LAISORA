@@ -1,3 +1,5 @@
+@import url("./tokens.css");
+
 /* LAISORA — VS Code テーマトークンに整合したチャットUI（フェーズ3 可視化）
    方針: 装飾はターン構造の可視化（ユーザー/アシスタント/ツールの区別）に集中し、
    色はテーマ変数から導出する。署名要素はツールカードのステータスインジケータ。 */
@@ -183,7 +185,7 @@ html, body {
 .tab.active {
   background: var(--vscode-tab-activeBackground, var(--vscode-editor-background));
   color: var(--vscode-tab-activeForeground, var(--vscode-foreground));
-  border-bottom: 2px solid var(--vscode-focusBorder);
+  border-bottom: 2px solid var(--laisora-accent);
 }
 .tab-label {
   overflow: hidden;
@@ -382,11 +384,11 @@ button#auth.chip:hover { filter: brightness(1.15); }
 .you-section, .wo-plan-you { font-size: 13px; line-height: 1.7; word-break: auto-phrase; text-wrap: pretty; font-variant-numeric: tabular-nums; }
 .you-section { border-bottom: 1px solid var(--vscode-panel-border); }
 .you-label, .you-kind, .earlier-label { font-size: 10px; font-weight: 600; line-height: 1.4; letter-spacing: .08em; font-feature-settings: "palt"; color: var(--vscode-descriptionForeground); }
-.you-label { color: var(--vscode-textLink-foreground); }
+.you-label { color: var(--laisora-accent); }
 .you-heading { font-size: 14px; font-weight: 700; line-height: 1.4; margin: 4px 0; text-wrap: balance; font-feature-settings: "palt"; }
 .you-lede, .you-empty, .you-summary { font-size: 11.5px; line-height: 1.5; color: var(--vscode-descriptionForeground); margin: 0 0 12px; }
 .you-item { display: grid; grid-template-columns: 44px minmax(0, 1fr); padding: 12px 0; border-top: 1px solid var(--vscode-panel-border); }
-.you-square { width: 7px; height: 7px; margin-top: 8px; box-sizing: border-box; background: var(--vscode-textLink-foreground); }
+.you-square { width: 7px; height: 7px; margin-top: 8px; box-sizing: border-box; background: var(--laisora-accent); }
 .you-title { display: flex; align-items: baseline; gap: 8px; }
 .you-title-text { min-width: 0; overflow-wrap: anywhere; }
 .you-link, .earlier-expand { border: 0; padding: 0; background: none; color: var(--vscode-descriptionForeground); cursor: pointer; font-family: inherit; }
@@ -395,12 +397,12 @@ button#auth.chip:hover { filter: brightness(1.15); }
 .you-summary { margin: 4px 0 0; overflow-wrap: anywhere; }
 .you-resolved .you-square { background: none; border: 1px solid var(--vscode-descriptionForeground); }
 .you-resolved .you-title-text { color: var(--vscode-descriptionForeground); text-decoration: line-through; }
-.laisora-ask.flash, .block.approval.flash { outline: 2px solid var(--vscode-textLink-foreground); outline-offset: 4px; }
+.laisora-ask.flash, .block.approval.flash { outline: 2px solid var(--laisora-accent); outline-offset: 4px; }
 .work-overview { container: summary / inline-size; }
 .wo-plan-you { display: grid; grid-template-columns: minmax(0, 1.35fr) minmax(0, 1fr); grid-template-rows: auto auto minmax(20px, auto) auto auto; column-gap: 44px; padding: 16px 0 16px var(--conv-gutter); }
 .wo-plan-column, .wo-you { min-width: 0; }
 .plan-section-head { display: grid; grid-template-rows: auto auto minmax(20px, auto); position: relative; padding-top: 12px; }
-.plan-section-head::before { content: ""; position: absolute; top: 0; left: 0; width: 24px; height: 2px; background: var(--vscode-textLink-foreground); }
+.plan-section-head::before { content: ""; position: absolute; top: 0; left: 0; width: 24px; height: 2px; background: var(--laisora-accent); }
 .plan-section-head > .plan-top { min-height: 20px; }
 .plan-section-head > p { align-self: start; }
 .you-empty { border-top: 1px solid var(--vscode-panel-border); padding-top: 12px; }
@@ -442,8 +444,8 @@ button#auth.chip:hover { filter: brightness(1.15); }
 .plan-item { display: grid; grid-template-columns: 44px minmax(0, 1fr); padding: 12px 0; border-top: 1px solid var(--vscode-panel-border); position: relative; }
 .plan-number { font-size: 28px; font-weight: 300; line-height: 1; color: var(--vscode-descriptionForeground); padding-top: 0; }
 .plan-done .plan-number { opacity: .45; }
-.plan-current .plan-number { color: var(--vscode-textLink-foreground); }
-.plan-current::before, .plan-ahead::before { content: ""; position: absolute; left: -12px; top: 12px; bottom: 12px; border-left: 2px solid var(--vscode-textLink-foreground); }
+.plan-current .plan-number { color: var(--laisora-accent); }
+.plan-current::before, .plan-ahead::before { content: ""; position: absolute; left: -12px; top: 12px; bottom: 12px; border-left: 2px solid var(--laisora-accent); }
 .plan-ahead:not(.plan-current)::before { border-left: 2px dotted var(--vscode-descriptionForeground); }
 .plan-ahead::before { border-left-style: dotted; }
 .plan-title { display: flex; align-items: baseline; flex-wrap: wrap; gap: 4px 8px; font-size: 13px; font-weight: 700; overflow-wrap: anywhere; }
@@ -462,7 +464,7 @@ button#auth.chip:hover { filter: brightness(1.15); }
 .log-head[data-view="work"] .plan-bar, .plan-empty { display: none; }
 .plan-bar-count { font-size: 11.5px; color: var(--vscode-descriptionForeground); font-variant-numeric: tabular-nums; white-space: nowrap; }
 .plan-bar-count:empty, .plan-bar-number:empty, .plan-bar-stats:empty { display: none; }
-.plan-bar-number { font-size: 18px; font-weight: 300; line-height: 1; font-variant-numeric: tabular-nums; color: var(--vscode-textLink-foreground); }
+.plan-bar-number { font-size: 18px; font-weight: 300; line-height: 1; font-variant-numeric: tabular-nums; color: var(--laisora-accent); }
 .plan-bar-current { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 13px; font-weight: 600; }
 .plan-bar-stats { white-space: nowrap; font-size: 11.5px; }
 .plan-bar-waiting { margin-left: auto; white-space: nowrap; }
@@ -500,7 +502,7 @@ button#auth.chip:hover { filter: brightness(1.15); }
 .session-heading-block { flex: 1 1 0; min-width: 0; }
 .session-heading { display: flex; align-items: center; gap: 8px; min-width: 0; padding: 3px 12px 0 var(--conv-gutter); min-height: 26px; }
 .session-heading-title { flex: 0 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 18px; line-height: 1.4; font-weight: 700; }
-.session-heading-title::before { content: ""; display: block; width: 24px; height: 2px; margin-bottom: 8px; background: var(--vscode-textLink-foreground); }
+.session-heading-title::before { content: ""; display: block; width: 24px; height: 2px; margin-bottom: 8px; background: var(--laisora-accent); }
 .session-rename-icon { flex: none; opacity: 0; padding: 2px 4px; border: 0; border-radius: 3px; background: transparent; color: var(--vscode-descriptionForeground); cursor: pointer; }
 .session-heading:hover .session-rename-icon, .session-heading:focus-within .session-rename-icon { opacity: 1; }
 .session-rename-icon:hover { background: var(--vscode-toolbar-hoverBackground); }
@@ -509,9 +511,19 @@ button#auth.chip:hover { filter: brightness(1.15); }
 .session-actions summary { cursor: pointer; list-style: none; padding: 3px 6px; border-radius: 3px; }
 .session-actions summary::-webkit-details-marker { display: none; }
 .session-actions summary:hover { background: var(--vscode-toolbar-hoverBackground); }
-.session-actions-panel { position: absolute; right: 0; top: 100%; z-index: 10; width: max-content; max-width: calc(100vw - 40px); padding: 4px; background: var(--vscode-menu-background, var(--vscode-editor-background)); color: var(--vscode-menu-foreground, var(--vscode-foreground)); border: 1px solid var(--vscode-panel-border); border-radius: 4px; box-shadow: 0 3px 8px var(--vscode-widget-shadow); }
-.session-actions-panel button { display: flex; align-items: center; gap: 8px; width: 100%; border: 0; padding: 6px 8px; text-align: left; color: inherit; background: transparent; cursor: pointer; }
-.session-actions-panel button:hover { background: var(--vscode-menu-selectionBackground); color: var(--vscode-menu-selectionForeground); }
+.session-menu-surface { position: absolute; right: 0; top: 100%; z-index: 10; width: max-content; max-width: calc(100vw - 40px); padding: 4px; background: var(--vscode-menu-background, var(--vscode-editor-background)); color: var(--vscode-menu-foreground, var(--vscode-foreground)); border: 1px solid var(--vscode-panel-border); border-radius: 4px; box-shadow: 0 3px 8px var(--vscode-widget-shadow); }
+.session-menu-surface button { display: flex; align-items: center; gap: 8px; width: 100%; border: 0; padding: 6px 8px; text-align: left; color: inherit; background: transparent; cursor: pointer; }
+.session-menu-surface button:hover, .session-menu-surface button:focus-visible { background: var(--vscode-menu-selectionBackground); color: var(--vscode-menu-selectionForeground); }
+.session-name-pencil { position: relative; flex: none; }
+.session-name-dropdown { left: 0; right: auto; top: 100%; z-index: 50; }
+.session-name-item { position: relative; }
+.session-name-parent span { margin-left: auto; }
+.session-name-submenu { top: 0; left: 100%; right: auto; }
+.session-name-submenu[data-side="left"] { left: auto; right: 100%; }
+.session-name-submenu[data-side="inline"] { position: static; width: auto; max-width: none; margin-left: 12px; box-shadow: none; }
+.session-menu-surface [hidden] { display: none; }
+.session-name-loading { flex: none; color: var(--vscode-foreground); }
+.session-name-failure { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--vscode-descriptionForeground); font-size: 12px; }
 .session-rename-form { display: flex; flex: 1; min-width: 0; gap: 4px; flex-wrap: wrap; }
 .session-rename-form input { flex: 1; min-width: 80px; color: var(--vscode-input-foreground); background: var(--vscode-input-background); border: 1px solid var(--vscode-input-border, var(--vscode-panel-border)); }
 .session-rename-form button { color: var(--vscode-button-foreground); background: var(--vscode-button-background); border: 0; cursor: pointer; }
@@ -700,9 +712,9 @@ button#auth.chip:hover { filter: brightness(1.15); }
 .view-switch-number { font-variant-numeric: tabular-nums; }
 .view-switch-label { text-transform: uppercase; }
 .view-switch-tab.active {
-  color: var(--vscode-textLink-foreground, var(--vscode-focusBorder));
+  color: var(--laisora-accent);
   font-weight: 600;
-  box-shadow: inset -2px 0 var(--vscode-textLink-foreground, var(--vscode-focusBorder));
+  box-shadow: inset -2px 0 var(--laisora-accent);
 }
 .view-switch-tab:focus-visible {
   outline: 1px solid var(--vscode-focusBorder);
@@ -749,18 +761,18 @@ button#auth.chip:hover { filter: brightness(1.15); }
 .worklog-turn > span { flex: 0 0 auto; font-variant-numeric: tabular-nums; }
 .worklog-turn .wl-rep { font-size: 10.5px; }
 .worklog-turn.flash {
-  color: var(--vscode-focusBorder);
+  color: var(--laisora-accent);
   font-weight: 600;
 }
 .block.user.flash,
 .block.assistant-turn.flash {
-  outline: 2px solid var(--vscode-focusBorder);
+  outline: 2px solid var(--laisora-accent);
   outline-offset: 2px;
 }
 
 .tool-row.flash,
 .agent-card.flash {
-  outline: 2px solid var(--vscode-focusBorder);
+  outline: 2px solid var(--laisora-accent);
   outline-offset: 2px;
 }
 
@@ -1280,7 +1292,7 @@ hr.md-hr {
 }
 .todocard-icon { flex: 0 0 auto; }
 .todocard-completed .todocard-icon { color: var(--vscode-testing-iconPassed, #2d7d46); }
-.todocard-in_progress .todocard-icon { color: var(--vscode-progressBar-background, #0e70c0); }
+.todocard-in_progress .todocard-icon { color: var(--laisora-accent); }
 .todocard-pending .todocard-icon { color: var(--vscode-descriptionForeground); }
 .todocard-in_progress .todocard-label { font-weight: 600; }
 .todocard-completed .todocard-label { color: var(--vscode-descriptionForeground); text-decoration: line-through; }
@@ -1646,7 +1658,7 @@ hr.md-hr {
   top: 10px;
   bottom: 12px;
   width: 2px;
-  background: var(--vscode-textLink-foreground);
+  background: var(--laisora-accent);
 }
 .ask-rail {
   position: absolute;
@@ -1654,10 +1666,10 @@ hr.md-hr {
   top: 15px;
   width: 7px;
   height: 7px;
-  background: var(--vscode-textLink-foreground);
+  background: var(--laisora-accent);
 }
 .ask-heading { display: flex; gap: 8px; align-items: baseline; }
-.ask-label { color: var(--vscode-textLink-foreground); font-size: 10px; font-weight: 600; letter-spacing: .08em; }
+.ask-label { color: var(--laisora-accent); font-size: 10px; font-weight: 600; letter-spacing: .08em; }
 .ask-topic { font-size: 10px; color: var(--vscode-descriptionForeground); }
 .ask-counter { margin-left: auto; flex-shrink: 0; font-size: 10px; font-variant-numeric: tabular-nums; color: var(--vscode-descriptionForeground); }
 .ask-title { font-size: 14px; font-weight: 700; margin: 2px 0 4px; }
@@ -1681,9 +1693,9 @@ hr.md-hr {
 }
 .ask-option:hover, .ask-option.recommended, .askq-option.ask-option.selected { border-color: var(--vscode-textLink-foreground); }
 .ask-option:focus-visible { outline: 1px solid var(--vscode-focusBorder); outline-offset: 2px; }
-.ask-letter { font-size: 11px; font-weight: 700; color: var(--vscode-textLink-foreground); }
+.ask-letter { font-size: 11px; font-weight: 700; color: var(--laisora-accent); }
 .ask-option-label { font-weight: 600; }
-.ask-recommended { font-size: 9.5px; letter-spacing: .08em; color: var(--vscode-textLink-foreground); margin-left: 6px; }
+.ask-recommended { font-size: 9.5px; letter-spacing: .08em; color: var(--laisora-accent); margin-left: 6px; }
 .ask-effect, .ask-detail { grid-column: 2; font-size: 11px; color: var(--vscode-descriptionForeground); }
 .ask-default { font-size: 10.5px; color: var(--vscode-descriptionForeground); margin-top: 6px; }
 .ask-step { display: grid; grid-template-columns: 18px minmax(0, 1fr); gap: 4px; padding: 3px 0; font-size: 12.5px; cursor: pointer; }
@@ -2868,10 +2880,10 @@ mark.find-match-current {
   left: calc(3px - var(--conv-gutter));
   width: 1px;
   z-index: 1;
-  background: var(--vscode-textLink-foreground, var(--vscode-focusBorder));
+  background: var(--laisora-accent);
   pointer-events: none;
 }
-.panel-conv .block.user::before { background: var(--vscode-textLink-foreground, var(--vscode-focusBorder)); }
+.panel-conv .block.user::before { background: var(--laisora-accent); }
 .panel-conv .block.assistant::before,
 .panel-conv .block.assistant-turn::before {
   border: 1px solid var(--vscode-descriptionForeground);
@@ -2894,7 +2906,7 @@ mark.find-match-current {
   text-overflow: ellipsis;
   color: var(--vscode-descriptionForeground);
 }
-.block.user > .turn-label { color: var(--vscode-textLink-foreground, var(--vscode-focusBorder)); }
+.block.user > .turn-label { color: var(--laisora-accent); }
 
 .turn-label-name { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
 .conv-title-date { padding: 4px 12px 0 var(--conv-gutter); font-size: 10px; line-height: 14px; letter-spacing: 0.08em; font-variant: small-caps; color: var(--vscode-descriptionForeground); }
@@ -2922,3 +2934,17 @@ mark.find-match-current {
   .loader .loader-c { transform: translate(0,10px); }
   .loader .loader-d { transform: scale(0); }
 }
+
+.llm-history-select, .llm-history-select option {
+  color: var(--vscode-dropdown-foreground);
+  background: var(--vscode-dropdown-background);
+}
+.llm-history-select { border: 1px solid var(--vscode-dropdown-border); }
+.auto-resume button {
+  margin-inline-start: 8px;
+  color: var(--vscode-button-secondaryForeground);
+  background: var(--vscode-button-secondaryBackground);
+  border: 1px solid var(--vscode-contrastBorder, transparent);
+  cursor: pointer;
+}
+.auto-resume button:hover { background: var(--vscode-button-secondaryHoverBackground); }

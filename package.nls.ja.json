@@ -32,5 +32,15 @@
   "config.laisora.orchestration.agents.description": "コンダクターが使うエージェント構成。次のセッションから有効。",
   "config.laisora.orchestration.conductorPolicy.description": "生成されたコンダクター指示の後に追加する利用者の方針。次のセッションから有効。",
   "config.orchestration.externalTimeoutMinutes": "外部実行の待ち時間（分）。次のセッションから有効になります。",
-  "config.laisora.fileLinks.openWithSystemApp.description": "ワークスペースと会話フォルダ内で OS の既定アプリで開く拡張子。先頭にドットを付けた小文字で指定します。実行ファイルやスクリプトの拡張子は無視されます。ユーザー設定のみ。"
+  "config.laisora.fileLinks.openWithSystemApp.description": "ワークスペースと会話フォルダ内で OS の既定アプリで開く拡張子。先頭にドットを付けた小文字で指定します。実行ファイルやスクリプトの拡張子は無視されます。ユーザー設定のみ。",
+  "config.laisora.appearance.accentColor.description": "現在位置、YOU、強調のアクセントカラー。ボタンとキーボードのフォーカス枠はテーマ色を使い、ハイコントラストでは常にテーマに従います。",
+  "config.laisora.appearance.accentColor.theme": "テーマに合わせる（既定）",
+  "config.laisora.appearance.accentColor.blue": "青",
+  "config.laisora.appearance.accentColor.orange": "橙",
+  "config.laisora.appearance.accentColor.pink": "桃",
+  "config.laisora.appearance.accentColor.green": "緑",
+  "config.laisora.appearance.accentColor.custom": "任意の色",
+  "config.laisora.appearance.accentCustomLight.description": "ライト用の任意のアクセントカラー（#RRGGBB）。無効な値はテーマのアクセントに戻ります。",
+  "config.laisora.appearance.accentCustomDark.description": "ダーク用の任意のアクセントカラー（#RRGGBB）。無効な値はテーマのアクセントに戻ります。",
+  "config.laisora.appearance.accentCustom.validation": "#RRGGBB 形式で入力してください。"
 }

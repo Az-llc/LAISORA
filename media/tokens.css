@@ -1,0 +1,111 @@
+:root {
+  --laisora-accent: var(--vscode-focusBorder, var(--vscode-textLink-foreground));
+  --l-title: 18px;
+  --l-heading: 14px;
+  --l-body: 13px;
+  --l-note: 11.5px;
+  --l-label: 10px;
+  --l-step-number: 28px;
+  --l-space-1: 4px;
+  --l-space-2: 8px;
+  --l-space-3: 12px;
+  --l-space-4: 16px;
+  --l-space-5: 20px;
+  --l-space-6: 24px;
+  --l-space-8: 32px;
+  --l-space-11: 44px;
+  --conv-gutter: var(--l-space-11);
+}
+
+.l-surface {
+  color: var(--vscode-foreground);
+  background: var(--vscode-editor-background);
+  font-size: var(--l-body);
+  line-height: 1.7;
+  text-wrap: pretty;
+}
+.l-surface:lang(ja) { word-break: auto-phrase; }
+
+.l-column { padding-inline-start: var(--conv-gutter); min-width: 0; }
+.l-title, .l-heading, .l-section-head__heading {
+  font-weight: 700;
+  text-wrap: balance;
+  font-feature-settings: "palt";
+}
+.l-title { margin: 0; font-size: var(--l-title); }
+.l-heading, .l-section-head__heading {
+  margin: var(--l-space-1) 0;
+  font-size: var(--l-heading);
+}
+.l-label {
+  color: var(--vscode-descriptionForeground);
+  font-size: var(--l-label);
+  font-weight: 600;
+  line-height: 1.4;
+  letter-spacing: .08em;
+  text-transform: uppercase;
+  font-feature-settings: "palt";
+}
+
+.l-label--you { color: var(--laisora-accent); }
+.l-section-head { padding-block: var(--l-space-1) var(--l-space-3); }
+.l-section-head::before {
+  content: "";
+  display: block;
+  width: 24px;
+  height: 2px;
+  margin-block-end: var(--l-space-2);
+  background: var(--laisora-accent);
+}
+.l-section-head__line {
+  display: flex;
+  align-items: baseline;
+  gap: var(--l-space-2);
+}
+.l-section-head__metrics {
+  margin-inline-start: auto;
+  color: var(--vscode-descriptionForeground);
+  font-size: var(--l-label);
+  line-height: 1.4;
+  white-space: nowrap;
+}
+.l-note, .l-section-head__lede {
+  margin: 0;
+  color: var(--vscode-descriptionForeground);
+  font-size: var(--l-note);
+  line-height: 1.5;
+}
+.l-rule {
+  height: 0;
+  margin: 0;
+  border: 0;
+  border-block-start: 1px solid var(--vscode-panel-border);
+}
+.l-num { font-variant-numeric: tabular-nums; text-align: right; }
+.l-step { position: relative; padding-block: var(--l-space-3); }
+.l-step__number {
+  position: absolute;
+  inset-inline-start: calc(0px - var(--conv-gutter));
+  top: var(--l-space-3);
+  width: var(--l-space-8);
+  font-size: var(--l-step-number);
+  font-weight: 300;
+  line-height: 1;
+  font-variant-numeric: tabular-nums;
+  color: var(--vscode-descriptionForeground);
+}
+.l-step--done .l-step__number { opacity: .5; }
+.l-step--current .l-step__number { color: var(--laisora-accent); }
+.l-step--current::before {
+  content: "";
+  position: absolute;
+  inset-inline-start: calc(0px - var(--l-space-2));
+  top: var(--l-space-3);
+  bottom: var(--l-space-3);
+  border-inline-start: 2px solid var(--laisora-accent);
+}
+.l-status, .l-agent { color: var(--vscode-descriptionForeground); }
+.l-failure { color: var(--vscode-errorForeground); }
+.l-you-mark { width: 8px; height: 8px; background: var(--laisora-accent); }
+.l-emphasis { color: var(--laisora-accent); }
+.l-loading { color: var(--vscode-foreground); }

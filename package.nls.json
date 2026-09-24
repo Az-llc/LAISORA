@@ -32,5 +32,15 @@
   "config.laisora.orchestration.agents.description": "Agent roster used by the conductor; takes effect from the next session.",
   "config.laisora.orchestration.conductorPolicy.description": "Additional user policy appended after the generated conductor instruction; takes effect from the next session.",
   "config.orchestration.externalTimeoutMinutes": "External executor wait limit in minutes; takes effect from the next session.",
-  "config.laisora.fileLinks.openWithSystemApp.description": "Extensions opened with the OS default app inside the workspace and conversation folder. Use lowercase extensions with a leading dot. Executable and script extensions are ignored. User setting only."
+  "config.laisora.fileLinks.openWithSystemApp.description": "Extensions opened with the OS default app inside the workspace and conversation folder. Use lowercase extensions with a leading dot. Executable and script extensions are ignored. User setting only.",
+  "config.laisora.appearance.accentColor.description": "Accent colour for current position, YOU and emphasis. Buttons and keyboard focus keep theme colours. High contrast always follows the theme.",
+  "config.laisora.appearance.accentColor.theme": "Follow theme (default)",
+  "config.laisora.appearance.accentColor.blue": "Blue",
+  "config.laisora.appearance.accentColor.orange": "Orange",
+  "config.laisora.appearance.accentColor.pink": "Pink",
+  "config.laisora.appearance.accentColor.green": "Green",
+  "config.laisora.appearance.accentColor.custom": "Custom colour",
+  "config.laisora.appearance.accentCustomLight.description": "Custom accent for light themes (#RRGGBB). Invalid values fall back to the theme accent.",
+  "config.laisora.appearance.accentCustomDark.description": "Custom accent for dark themes (#RRGGBB). Invalid values fall back to the theme accent.",
+  "config.laisora.appearance.accentCustom.validation": "Enter a colour in #RRGGBB format."
 }

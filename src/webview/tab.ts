@@ -1,4 +1,5 @@
 import { createLoader } from "./loader";
+import { mergeAskChoice } from "./ask-choice";
 import { createSessionHeader } from "./session-header";
 import { PlanPanel } from "./plan-panel";
 import { YouList } from "./you-list";
@@ -736,6 +737,8 @@ export class Tab {
     if (ev.kind === "assistant_text_delta") this.askReplyEvents.set(ev.turnId, ev);
   }
 
+  private readonly askChoiceLines = new Map<string, string>();
+
   private renderReplyMarkdown(container: HTMLElement, text: string, replyId = this.currentAssistantBlock?.dataset.askSource ?? this.currentSegTurnId ?? this.currentTurnId ?? "", offset = 0, at?: number, order?: number, generation?: number): void {
     const event = this.askReplyEvents.get(replyId) ?? this.askReplyEvents.get(this.currentSegTurnId ?? "");
     const ids = new Set<string>();
@@ -746,11 +749,14 @@ export class Tab {
         ids.add(`ask:${replyId}:${position}`);
         return this.youStore.ask(ask, { replyId, offset: position, createdAt: at ?? event?.timestamp ?? 0, order: order ?? event?.seq, generation: generation ?? event?.generation });
       },
-      choose: (value) => {
+      choose: (value, askKey, title) => {
         setActiveTab(this.tabId);
-        inputEl.value = value;
+        const merged = mergeAskChoice(inputEl.value, askKey, title, value, this.askChoiceLines.get(askKey));
+        inputEl.value = merged.text;
+        this.askChoiceLines.set(merged.askKey, value);
         inputEl.dispatchEvent(new Event("input", { bubbles: true }));
         inputEl.focus();
+        inputEl.setSelectionRange(merged.caret, merged.caret);
         persistState();
       },
       checked: (id, step) => vscode.getState()?.askChecks?.[this.tabId]?.[id]?.[step] === true,
@@ -887,6 +893,10 @@ export class Tab {
   readonly tabBtn: HTMLElement;
   labelEl!: HTMLElement;
   private sessionHeader!: ReturnType<typeof createSessionHeader>;
+
+  receiveSessionNameSuggestion(message: Extract<HostToWebview, { type: "sessionNameSuggestion" }>): void {
+    this.sessionHeader.receiveSuggestion(message);
+  }
   private sessionFirstAt: number | undefined;
   private sessionObservedAt: number | undefined;
   private sessionFallbackAt: number | undefined;
@@ -3423,6 +3433,9 @@ export class Tab {
       case "context_usage":
         this.onContextUsage(ev);
         break;
+      case "auto_resume":
+        this.onAutoResume(ev);
+        break;
       case "rate_limit":
         this.onRateLimit(ev);
         break;
@@ -3439,6 +3452,8 @@ export class Tab {
   }
 
   private onConversationClosed(ev: Extract<NormalizedEvent, { kind: "conversation_closed" }>): void {
+    this.autoResumeBlock?.remove();
+    this.autoResumeBlock = null;
     // turn_failed を経ない突然死でも streaming ブロックを終端する（レビューP2R2-3a）
     this.endAssistantTurn();
     // 実行中表示の終端は WorkModel の遷移に従う（どの toolUseId を畳むかは reducer が決める）。
@@ -3542,6 +3557,26 @@ export class Tab {
     this.stripStartedAt = null;
     this.addBlock("system warn", l10n.t("Turn interrupted"));
     this.setTurnState("idle");
+  }
+
+  private autoResumeBlock: HTMLElement | null = null;
+
+  private onAutoResume(ev: Extract<NormalizedEvent, { kind: "auto_resume" }>): void {
+    this.autoResumeBlock?.remove();
+    this.autoResumeBlock = null;
+    if (ev.state === "pending") {
+      const line = this.addBlock("system auto-resume", l10n.t("Resuming automatically at {0}", monthDayClock(ev.at)));
+      const cancel = document.createElement("button");
+      cancel.type = "button";
+      cancel.textContent = l10n.t({ message: "Cancel", comment: ["Cancel automatic resume"] });
+      cancel.addEventListener("click", () => vscode.postMessage({ type: "cancelAutoResume", tabId: this.tabId }));
+      line.appendChild(cancel);
+      this.autoResumeBlock = line;
+    } else if (ev.state === "fired") {
+      this.addBlock("system", l10n.t("Resumed automatically because the usage limit reset."));
+    } else if (ev.state === "exhausted") {
+      this.addBlock("system", l10n.t("Automatic resume stopped after three consecutive usage-limit retries."));
+    }
   }
 
   private onTurnFailed(ev: Extract<NormalizedEvent, { kind: "turn_failed" }>): void {

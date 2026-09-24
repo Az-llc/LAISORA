@@ -1,3 +1,4 @@
+import { subagentResultForDisplay } from "./subagent-result";
 import type { HostArtifactAccess } from "./artifact-access";
 import type { AssistantUsage, EventProvenance, ImageRefInfo, NormalizedEventBody, RestoredAgent, ResumePreviewMessage } from "./protocol";
 import { assistantUsageFromRaw, RESUME_PREVIEW_MESSAGE_MAX, summarizeToolInput } from "./protocol";
@@ -715,7 +716,7 @@ export async function readSessionHistory(
               : typeof toolResult.content === "string"
                 ? toolResult.content
                 : "";
-            const preview = redactAbsolutePaths(raw).slice(0, 2000);
+            const preview = redactAbsolutePaths(subagentResultForDisplay(raw)).slice(0, 2000);
             const isError = toolResult.is_error === true;
             const turnId = currentTurnId ?? "replay-turn-1";
             lastTurnActivityTimestamp = recordTime;
@@ -1108,7 +1109,7 @@ export async function readSessionHistory(
                     : typeof toolResult.content === "string"
                       ? toolResult.content
                       : "";
-                  const preview = redactAbsolutePaths(raw).slice(0, 2000);
+                  const preview = redactAbsolutePaths(subagentResultForDisplay(raw)).slice(0, 2000);
                   const isError = toolResult.is_error === true;
                   const resumeSignals = extractResumeSignals(resumeSignalToolNames.get(toolUseId), raw);
                   if (resumeSignals?.asyncLaunchedAgentId) observedAsyncAgentIds.add(resumeSignals.asyncLaunchedAgentId);
@@ -1522,7 +1523,7 @@ export async function readSessionTranscript(
                 : typeof toolResult.content === "string"
                   ? toolResult.content
                   : "";
-              const preview = redactAbsolutePaths(raw).slice(0, 2000);
+              const preview = redactAbsolutePaths(subagentResultForDisplay(raw)).slice(0, 2000);
               const isError = toolResult.is_error === true;
               results.set(toolResult.tool_use_id, { isError, preview });
             }

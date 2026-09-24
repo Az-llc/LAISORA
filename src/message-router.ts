@@ -44,6 +44,7 @@ export async function handleWebviewMessage(
         if (msg.type === "ready") void st.postTo(sender, userSettingsMessage());
         break;
       case "send":
+      case "cancelAutoResume":
       case "interrupt":
       case "approvalDecision":
       case "setMode":
@@ -88,6 +89,7 @@ export async function handleWebviewMessage(
       case "analyzeCurrent":
       case "analyzeSession":
       case "llmAnalysisRequest":
+      case "suggestSessionName":
       case "summarizeSession":
       case "setLlmAnalysisEnabled":
       case "startFindingSession":

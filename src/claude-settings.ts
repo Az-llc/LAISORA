@@ -2,6 +2,7 @@ import * as vscode from "vscode";
 
 import { readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
+import { homedir } from "node:os";
 
 import { claudeConfigDir } from "./claude-env";
 import { extensionContext, output } from "./host-context";
@@ -10,35 +11,8 @@ import type { ModelInfo } from "./protocol";
 import type { Session } from "./extension";
 import type * as ClaudeCodeSdk from "@anthropic-ai/claude-agent-sdk" with { "resolution-mode": "import" };
 
-type ClaudeCodeSettings = { model?: string; defaultMode?: string };
-
-// 設定ファイルの読み値はキャッシュする。毎回ファイルを読むとホットリロードになり、
-// 別ウィンドウや本体CLIの変更が実行中セッションの表示へ勝手に混ざる（表示と実体の乖離）。
-// ユーザー確定方針: ファイルを読むのは拡張起動時と会話開始時だけ。実行中はメモリ値に従う。
-let claudeCodeSettingsCache: ClaudeCodeSettings | null = null;
-
-export function invalidateClaudeCodeSettingsCache(): void {
-  claudeCodeSettingsCache = null;
-}
-
-// ユーザー設定の保存値。上位設定や実行中セッションの実効値ではない。
-function readClaudeCodeSettingsUncached(): ClaudeCodeSettings {
-  try {
-    const raw = JSON.parse(readFileSync(join(claudeConfigDir(), "settings.json"), "utf8"));
-    return {
-      model: typeof raw.model === "string" ? raw.model : undefined,
-      defaultMode:
-        typeof raw.permissions?.defaultMode === "string" ? raw.permissions.defaultMode : undefined,
-    };
-  } catch {
-    return {};
-  }
-}
-
-export function readClaudeCodeSettings(): ClaudeCodeSettings {
-  if (claudeCodeSettingsCache === null) claudeCodeSettingsCache = readClaudeCodeSettingsUncached();
-  return claudeCodeSettingsCache;
-}
+import { readClaudeCodeSettings, invalidateClaudeCodeSettingsCache, notifyAutoContinueSettingChange } from "./claude-code-settings";
+export { readClaudeCodeSettings, invalidateClaudeCodeSettingsCache, onAutoContinueSettingChange } from "./claude-code-settings";
 
 // Claude Code のユーザー設定へキーを書き戻す（独自設定を作らない方針の帰結: モデル/effort の
 // 選択は本体と同じ ~/.claude/settings.json に保存し、再起動後も他セッションとも同期させる）。
@@ -48,7 +22,7 @@ export function readClaudeCodeSettings(): ClaudeCodeSettings {
 // オブジェクトは指定された末端キーだけを更新し、他モデルの設定や未知のキーを保持する。
 // 破壊防止: 既存ファイルのパースに失敗したら**書かない**（コメント付きJSON等を消さない）。
 // 書き込みは一時ファイル経由の置換にして、途中で落ちても設定を半端な状態にしない。
-type SettingsPatch = { [key: string]: string | null | undefined | SettingsPatch };
+type SettingsPatch = { [key: string]: string | boolean | null | undefined | SettingsPatch };
 
 function mergeSettingsPatch(current: Record<string, unknown>, patch: SettingsPatch): void {
   for (const [key, value] of Object.entries(patch)) {
@@ -104,6 +78,7 @@ export function updateClaudeCodeSettings(patch: SettingsPatch): SettingsWriteRes
     renameSync(tmp, file);
     output.appendLine(`[settings] 保存: ${JSON.stringify(patch)}`);
     invalidateClaudeCodeSettingsCache();
+    if ("autoContinueAtUsageLimit" in patch) notifyAutoContinueSettingChange();
     return { ok: true };
   } catch (e) {
     // 解析失敗時だけ返して書き込み失敗を黙って落とすと、UI は「切り替わった」表示のまま
@@ -348,7 +323,8 @@ export function resolveSessionCwd(s: Session): string | undefined {
   const cfg = getLaisoraConfiguration();
   const configured = cfg.get<string>("defaultCwd") || vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
   const pinnedByResume = s.resumeFilePath !== undefined && s.cwd.length > 0 ? s.cwd : undefined;
-  const cwd = pinnedByResume || configured || s.cwd || undefined;
+  // R-CNV-34: with no folder open, fall back to the home directory like the official Claude Code extension.
+  const cwd = pinnedByResume || configured || s.cwd || homedir() || undefined;
   return cwd === undefined ? undefined : normalizeDriveLetter(cwd);
 }
 

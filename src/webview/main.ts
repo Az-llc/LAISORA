@@ -1,5 +1,8 @@
+import { installAccent } from "./accent";
 import { prependPreservingView } from "./history-scroll";
 import * as l10n from "@vscode/l10n";
+
+const applyAccent = installAccent();
 
 // LAISORA Webview のエントリ（表示専用・プレーンTS。Conversation の実体は Node 側）
 // ここに残るのはタブ管理・chrome描画・usageパネル・composer・分析レポートの sessionId キー保持と
@@ -2628,12 +2631,17 @@ function initMessageBus(): void {
         break;
       }
       case "userSettings": {
+        applyAccent(msg.appearance);
         applyUserSettings(msg);
         refreshComposer();
         break;
       }
       case "tabNotice": {
         tabs.get(msg.tabId)?.addBlock("system", msg.text);
+        break;
+      }
+      case "sessionNameSuggestion": {
+        tabs.get(msg.tabId)?.receiveSessionNameSuggestion(msg);
         break;
       }
       case "sessionSummary": {

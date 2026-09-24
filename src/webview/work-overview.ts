@@ -1081,7 +1081,7 @@ export class WorkOverview {
       const outcome = run.outcome === "ok" ? l10n.t("Succeeded") : run.outcome === "failed" ? l10n.t("Failed")
         : run.outcome === "timeout" ? l10n.t("Timed out") : l10n.t("Refused");
       row(externalRuns, `${run.role} · ${EXECUTORS[run.executor].displayName}${run.model ? ` · ${run.model}` : ""}${run.effort ? ` · ${run.effort}` : ""}`, l10n.t("{0} · Duration: {1} · Tokens: {2}",
-        outcome, formatDuration(run.durationMs), usage(run.usage)), l10n.t("External executor"));
+        outcome, formatDuration(run.durationMs), usage(run.usage)) + (run.cwd ? ` ? ${run.cwd}` : ""), l10n.t("External executor"));
     }
     const requested = list(l10n.t("Starting roster (requested settings)"), "roster");
     for (const member of state.roster.agents) {
@@ -1226,7 +1226,7 @@ export class WorkOverview {
     }
     btn.textContent = hasSummary ? l10n.t("Regenerate") : l10n.t("Summarize");
     // R-DSP-25
-    const rule = l10n.t("The summary runs with the same model and effort as this tab");
+    const rule = l10n.t("The summary runs on haiku (fast, low cost)");
     btn.title = hasSummary
       ? l10n.t("Regenerates the summary and saves it. Consumes tokens. {0}", rule)
       : l10n.t("Creates a summary and saves it. Consumes tokens. {0}", rule);

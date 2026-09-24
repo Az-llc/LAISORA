@@ -1,3 +1,4 @@
+import { createAccentSettings } from "./accent-settings";
 import { normalizeSystemAppExtension } from "../file-link-open-mode";
 import { EXECUTORS, DEFAULT_EXECUTOR, canonicalExecutorEfforts, executorModelList, isExecutorId, isExternalExecutorId, rowEfforts, rowComplete, type ExecutorRow } from "../orchestration-executors";
 import { conductorInstruction, estimateTokens, emptyOrchestrationRole, externalExecutorName, isExternalModel, isExternalTimeout, orchestrationVariants, orchestrationExternalTargets } from "../orchestration-roster";
@@ -147,6 +148,12 @@ activateSettingsCategory(settingsCategories.some((category) => category.key === 
 settingsShell.append(settingsNav, settingsContent);
 root.appendChild(settingsShell);
 const [generalCategory, fileCategory, rosterCategory] = settingsCategories.map((category) => category.panel);
+const accentCard = section(generalCategory, l10n.t("Appearance"));
+const renderAccent = createAccentSettings(accentCard, (setting, value) => {
+  const requestId = nextRequestId();
+  vscode.postMessage({ type: "setAccentSetting", requestId, setting, value });
+  return requestId;
+}, { row, rowNote, select });
 const chatCard = section(generalCategory, l10n.t("Chat"));
 const learningCard = section(generalCategory, l10n.t("Learning"));
 const learningSwitch = switchButton("setting-learning-enabled");
@@ -171,6 +178,8 @@ row(
   l10n.t("Reopen the conversation tabs that were open when the window was last closed or reloaded. Tabs that never sent a message are not restored."),
   restoreSwitch
 );
+const autoContinueSwitch = switchButton("setting-auto-continue-usage-limit");
+row(chatCard, l10n.t("Resume automatically when the usage limit resets"), l10n.t("When the claude.ai usage limit stops a conversation, continue it automatically after the limit resets. The same setting is used by Claude Code in the terminal."), autoContinueSwitch);
 
 const apiKeyGroup = element("div", "settings-segmented");
 apiKeyGroup.id = "setting-api-key-policy";
@@ -722,7 +731,7 @@ const nextRequestId = (): number => ++requestSerial;
 // 自分の要求への返送（replyTo が一致。失敗時の返送を含む）が届くまで、同じ操作の再押下を捨てる。current は返送でしか
 // 変わらないため、捨てないと 2 回目も 1 回目と同じ値を送り、戻したい意図が失われる。構成変更の通知や別の要求への返送では
 // 解かない（それらは自分の書込みの完了を意味しない）（R-DSP-01）
-const pending: { restore: number | null; apiKey: number | null; learning: number | null } = { restore: null, apiKey: null, learning: null };
+const pending: { autoContinue: number | null; restore: number | null; apiKey: number | null; learning: number | null } = { autoContinue: null, restore: null, apiKey: null, learning: null };
 const pendingFileLink: Record<FileLinkBooleanSetting, number | null> = {
   fileLinkInstruction: null,
   planInstruction: null,
@@ -734,6 +743,10 @@ const pendingFileLink: Record<FileLinkBooleanSetting, number | null> = {
 
 function render(state: SettingsState): void {
   current = state;
+  renderAccent(state.appearance, state.replyTo);
+  if (pending.autoContinue === state.replyTo) pending.autoContinue = null;
+  autoContinueSwitch.setAttribute("aria-checked", String(state.autoContinueAtUsageLimit));
+  autoContinueSwitch.disabled = pending.autoContinue !== null;
   renderSystemAppExtensions(state);
   renderOrchestration(state);
   if (pending.learning === state.replyTo) pending.learning = null;
@@ -796,6 +809,14 @@ apiKeyGroup.addEventListener("keydown", (e) => {
   const target = apiKeyRadios[(from + step + apiKeyRadios.length) % apiKeyRadios.length];
   target.focus();
   requestApiKeyPolicy(target.dataset.value as ApiKeyPolicy);
+});
+
+autoContinueSwitch.addEventListener("click", () => {
+  if (current === null || pending.autoContinue !== null) return;
+  const requestId = nextRequestId();
+  pending.autoContinue = requestId;
+  autoContinueSwitch.disabled = true;
+  vscode.postMessage({ type: "setAutoContinueAtUsageLimit", requestId, enabled: !current.autoContinueAtUsageLimit });
 });
 
 restoreSwitch.addEventListener("click", () => {

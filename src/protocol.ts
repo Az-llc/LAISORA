@@ -1,3 +1,4 @@
+import { isAccentSettings, isAccentSettingValue, type AccentSettings, type AccentSetting } from "./accent";
 import { normalizeSystemAppExtension } from "./file-link-open-mode";
 import { isPlanUsage } from "./plan-usage";
 import type { ExecutorId } from "./orchestration-executors";
@@ -143,6 +144,8 @@ export type NormalizedEventBody =
     // cliInserted: このターンを開いたのは CLI が書いた user レコード（`isMeta`）で、利用者は何も打っていない。
     // 本文は user_message にしない（発言として集計・タイトル・逐語へ入る）ので、表示はこの印だけを見る
     | { kind: "turn_started"; turnId: string; cliInserted?: true }
+    | { kind: "auto_resume"; state: "pending"; at: number }
+    | { kind: "auto_resume"; state: "cancelled" | "fired" | "exhausted" }
     | { kind: "turn_completed"; turnId: string; usage?: UsageSnapshot }
     | { kind: "turn_interrupted"; turnId: string }
     | {
@@ -339,6 +342,7 @@ export type NormalizedEventBody =
         utilization: number;
         resetsAt: number | null;
         isUsingOverage: boolean;
+        overageInUse?: boolean;
       }
   );
 
@@ -602,8 +606,10 @@ export type FileLinkSetting = (typeof FILE_LINK_SETTINGS)[number];
 export type SettingsPageToHost =
   | { type: "settingsPageReady" }
   | { type: "recheckExternalExecutors" }
+  | { type: "setAccentSetting"; requestId: number; setting: AccentSetting; value: string }
   | { type: "setComposerSendKey"; requestId: number; sendKey: ComposerSendKey }
   | { type: "setApiKeyPolicy"; requestId: number; policy: ApiKeyPolicy }
+  | { type: "setAutoContinueAtUsageLimit"; requestId: number; enabled: boolean }
   | { type: "setRestoreTabsOnStartup"; requestId: number; enabled: boolean }
   | { type: "setLearningEnabled"; requestId: number; enabled: boolean }
   | { type: "setOrchestrationSetting"; requestId: number; setting: "enabled" | "agents" | "conductorPolicy" | "externalTimeoutMinutes"; value: unknown }
@@ -614,7 +620,7 @@ export type SettingsPageToHost =
 export type HostToSettingsPage =
   // 構成から読み直した実効値。書込みの後も要求値ではなくこれを返す（R-DSP-01）。
   // replyTo は書込み要求への返送だけが持つ。構成変更・ready への送信は持たない
-  | ({ type: "settingsState"; composerSendKey: ComposerSendKey; apiKeyPolicy: ApiKeyPolicy; restoreTabsOnStartup: boolean; learningEnabled: boolean; replyTo?: number }
+  | ({ type: "settingsState"; appearance?: AccentSettings; composerSendKey: ComposerSendKey; apiKeyPolicy: ApiKeyPolicy; restoreTabsOnStartup: boolean; autoContinueAtUsageLimit: boolean; learningEnabled: boolean; replyTo?: number }
     & Record<FileLinkBooleanSetting, boolean> & { openWithSystemApp: string[] } & { orchestrationEnabled: boolean; orchestrationAgents: OrchestrationSettingRow[]; orchestrationDefaults: OrchestrationSettingRow[]; conductorPolicy: string; conductorPolicyDefault: string; externalTimeoutMinutes: number; externalDetection: Record<ExecutorId, ExternalDetection>; externalModels: ExternalModels });
 
 function isSettingsRequestId(v: unknown): v is number {
@@ -626,6 +632,9 @@ export function isSettingsPageToHost(v: unknown): v is SettingsPageToHost {
   const m = v as Record<string, unknown>;
   const t = m.type as SettingsPageToHost["type"];
   if (t === "settingsPageReady" || t === "recheckExternalExecutors" || t === "openVsCodeSettings") return hasOnlyKeys(m, ["type"]);
+  if (t === "setAccentSetting") {
+    return isSettingsRequestId(m.requestId) && isAccentSettingValue(m.setting, m.value) && hasOnlyKeys(m, ["type", "requestId", "setting", "value"]);
+  }
   if (t === "setComposerSendKey") {
     return isSettingsRequestId(m.requestId)
       && (COMPOSER_SEND_KEYS as readonly string[]).includes(m.sendKey as string) && hasOnlyKeys(m, ["type", "requestId", "sendKey"]);
@@ -634,7 +643,7 @@ export function isSettingsPageToHost(v: unknown): v is SettingsPageToHost {
     return isSettingsRequestId(m.requestId)
       && (API_KEY_POLICIES as readonly string[]).includes(m.policy as string) && hasOnlyKeys(m, ["type", "requestId", "policy"]);
   }
-  if (t === "setRestoreTabsOnStartup" || t === "setLearningEnabled") {
+  if (t === "setAutoContinueAtUsageLimit" || t === "setRestoreTabsOnStartup" || t === "setLearningEnabled") {
     return isSettingsRequestId(m.requestId) && typeof m.enabled === "boolean" && hasOnlyKeys(m, ["type", "requestId", "enabled"]);
   }
   if (t === "setOrchestrationSetting") {
@@ -659,10 +668,11 @@ export function isHostToSettingsPage(v: unknown): v is HostToSettingsPage {
   const m = v as Record<string, unknown>;
   const t = m.type as HostToSettingsPage["type"];
   if (t === "settingsState") {
-    return (COMPOSER_SEND_KEYS as readonly string[]).includes(m.composerSendKey as string)
+    return (m.appearance === undefined || isAccentSettings(m.appearance))
+      && (COMPOSER_SEND_KEYS as readonly string[]).includes(m.composerSendKey as string)
       && (API_KEY_POLICIES as readonly string[]).includes(m.apiKeyPolicy as string)
       && typeof m.restoreTabsOnStartup === "boolean"
-      && typeof m.learningEnabled === "boolean"
+      && typeof m.autoContinueAtUsageLimit === "boolean" && typeof m.learningEnabled === "boolean"
       && typeof m.orchestrationEnabled === "boolean" && typeof m.conductorPolicy === "string"
       && typeof m.conductorPolicyDefault === "string"
       && isOrchestrationSettingRoster(m.orchestrationAgents) && isOrchestrationSettingRoster(m.orchestrationDefaults)
@@ -670,7 +680,7 @@ export function isHostToSettingsPage(v: unknown): v is HostToSettingsPage {
       && FILE_LINK_BOOLEAN_SETTINGS.every((key) => typeof m[key] === "boolean")
       && Array.isArray(m.openWithSystemApp) && m.openWithSystemApp.every((item) => typeof item === "string")
       && (m.replyTo === undefined || isSettingsRequestId(m.replyTo))
-      && hasOnlyKeys(m, ["type", "composerSendKey", "apiKeyPolicy", "restoreTabsOnStartup", "learningEnabled", ...FILE_LINK_SETTINGS, "orchestrationEnabled", "orchestrationAgents", "orchestrationDefaults", "conductorPolicy", "conductorPolicyDefault", "externalTimeoutMinutes", "externalDetection", "externalModels", "replyTo"]);
+      && hasOnlyKeys(m, ["type", "appearance", "composerSendKey", "apiKeyPolicy", "restoreTabsOnStartup", "autoContinueAtUsageLimit", "learningEnabled", ...FILE_LINK_SETTINGS, "orchestrationEnabled", "orchestrationAgents", "orchestrationDefaults", "conductorPolicy", "conductorPolicyDefault", "externalTimeoutMinutes", "externalDetection", "externalModels", "replyTo"]);
   }
   t satisfies never;
   return false;
@@ -691,6 +701,7 @@ export type WebviewToHost =
   | { type: "getHandoffDetail"; tabId: string; runId: string; part: number }
   | { type: "openHandoffSource"; tabId: string; sourceSessionId: string }
   | { type: "interrupt"; tabId: string }
+  | { type: "cancelAutoResume"; tabId: string }
   | {
       type: "approvalDecision";
       tabId: string;
@@ -721,6 +732,7 @@ export type WebviewToHost =
   | { type: "analyzeCurrent"; tabId: string }
   // セッション概要の要約（R-DSP-25）。そのタブの model・effort で生成し、Host が保存する
   | { type: "summarizeSession"; tabId: string }
+  | { type: "suggestSessionName"; tabId: string }
   // VS Code 標準の配色テーマ選択を開く（/color の受け皿）
   | { type: "openThemePicker" }
   | { type: "runHostAction"; action: "openSettings" }
@@ -2906,7 +2918,7 @@ export type HostToWebview =
   | { type: "semanticModel"; tabId: string; model: SemanticModelPayload }
   | { type: "llmAnalysisSetting"; enabled: boolean }
   // 利用者設定の現在値。ready 応答と設定変更後に送る（snapshot には載せない）
-  | { type: "userSettings"; composerSendKey: ComposerSendKey }
+  | { type: "userSettings"; appearance?: AccentSettings; composerSendKey: ComposerSendKey }
   // 会話面へ出す 1 行の system 表示。イベントログには残らない（modelChanged.notice と同じ性質）
   | { type: "tabNotice"; tabId: string; text: string }
   // LLM 分析の飛行中フラグ。開始/終了で post。snapshot の llmAnalysisRunning と同じ真偽値
@@ -2935,6 +2947,8 @@ export type HostToWebview =
   // failure は実行しなかった / 生成できなかった理由（running:false にだけ載る）。summary は既存の要約を
   // そのまま運ぶので、失敗の通知が保存済みの要約を消さない（R-DSP-25）
   | { type: "sessionSummary"; tabId: string; running: boolean; summary?: { text: string; model: string }; saveFailed?: boolean; failure?: string }
+  | { type: "sessionNameSuggestion"; tabId: string; title: string }
+  | { type: "sessionNameSuggestion"; tabId: string; reason: string }
   // 棄却された LLM finding の診断面。Host はオプトイン時のみ送る。
   // 通常 UI が読む SemanticModelPayload / L3ReportPayload からは到達できない別経路にする。
   | { type: "llmFindingDiagnostics"; tabId: string; payload: LlmFindingDiagnosticsPayload }
@@ -3177,6 +3191,8 @@ export function isWebviewToHost(v: unknown): v is WebviewToHost {
     return typeof tabId === "string" && typeof title === "string" && title.trim().length > 0 && title.length <= RENAME_TITLE_MAX;
   }
   if (t === "analyzeCurrent") return typeof tabId === "string";
+  if (t === "suggestSessionName") return typeof tabId === "string" &&
+    Object.keys(v).every(key => key === "type" || key === "tabId");
   if (t === "summarizeSession") return typeof tabId === "string";
   if (t === "openThemePicker") return true;
   if (t === "runHostAction") {
@@ -3473,6 +3489,7 @@ export function isWebviewToHost(v: unknown): v is WebviewToHost {
       ATTACHMENT_ID_RE.test(message.attachmentId)
     );
   }
+  if (t === "cancelAutoResume") return typeof tabId === "string" && hasOnlyKeys(v as Record<string, unknown>, ["type", "tabId"]);
   if (t === "interrupt") return typeof tabId === "string";
   if (t === "approvalDecision") {
     const m = v as { requestId?: unknown; behavior?: unknown; answers?: unknown };
@@ -4445,7 +4462,9 @@ export function isHostToWebview(v: unknown): v is HostToWebview {
     return typeof (v as { enabled?: unknown }).enabled === "boolean";
   }
   if (t === "userSettings") {
-    return (COMPOSER_SEND_KEYS as readonly string[]).includes((v as { composerSendKey?: unknown }).composerSendKey as string);
+    const appearance = (v as { appearance?: unknown }).appearance;
+    return (appearance === undefined || isAccentSettings(appearance))
+      && (COMPOSER_SEND_KEYS as readonly string[]).includes((v as { composerSendKey?: unknown }).composerSendKey as string);
   }
   if (t === "tabNotice") {
     const text = (v as { text?: unknown }).text;
@@ -4484,6 +4503,13 @@ export function isHostToWebview(v: unknown): v is HostToWebview {
       (refusal === undefined ||
         (typeof refusal === "string" && refusal.length > 0 && m.running === false && failure === undefined))
     );
+  }
+  if (t === "sessionNameSuggestion") {
+    const message = v as { title?: unknown; reason?: unknown };
+    return typeof tabId === "string" && Object.keys(v).every(key => ["type", "tabId", "title", "reason"].includes(key)) &&
+      ((typeof message.title === "string" && message.title.trim().length > 0 && message.title.length <= RENAME_TITLE_MAX &&
+        !/[\r\n→]/.test(message.title) && message.reason === undefined) ||
+       (typeof message.reason === "string" && message.reason.trim().length > 0 && message.title === undefined));
   }
   if (t === "sessionSummary") {
     const summary = (v as { summary?: unknown }).summary;

@@ -160,7 +160,7 @@ export function estimateTokens(text: string): number {
   }
   return Math.ceil(asciiChars / 4 + nonAsciiChars / 1.5);
 }
-export const EXTERNAL_CAPABILITIES = "Explorer and reviewer external targets are read-only and return only text. Worker Codex targets may edit files under the conversation folder, never commit, and cannot run the build; the conductor runs checks and commits.";
+export const EXTERNAL_CAPABILITIES = "Explorer and reviewer external targets are read-only and return only text. Worker Codex targets may edit files under the chosen working directory, never commit, and cannot run the build; the conductor runs checks and commits.";
 export function conductorInstruction(roster: readonly OrchestrationRow[], policy: string, external = orchestrationExternalTargets(roster), deliverySection = ""): string {
   const variants = orchestrationVariants(roster);
   const generated = [

@@ -1,3 +1,4 @@
+import { subagentResultForDisplay } from "./subagent-result";
 import { createHash, randomUUID } from "node:crypto";
 import * as l10n from "@vscode/l10n";
 import type { Hash } from "node:crypto";
@@ -266,7 +267,9 @@ export class ClaudeLiveNormalizer {
     this.turnState = state;
   }
 
-  startTurn(turnId?: string, meta?: NormalizedOutMeta): string {
+  private latestRateLimitReset: number | null = null;
+
+  startTurn(turnId?: string, meta?: NormalizedOutMeta, automatic = false): string {
     const id = turnId ?? randomUUID();
     this.currentTurnId = id;
     this.turnState = "running";
@@ -285,7 +288,7 @@ export class ClaudeLiveNormalizer {
       meta?.timestamp === undefined && this.lastObservedTimestamp !== undefined
         ? { ...meta, timestamp: this.lastObservedTimestamp }
         : meta;
-    this.emit({ kind: "turn_started", turnId: id }, startMeta);
+    this.emit({ kind: "turn_started", turnId: id, ...(automatic ? { cliInserted: true as const } : {}) }, startMeta);
     return id;
   }
 
@@ -873,7 +876,7 @@ export class ClaudeLiveNormalizer {
                   turnId: resultTurnId,
                   toolUseId,
                   isError: block.is_error === true,
-                  resultPreview: redactAbsolutePaths(text).slice(0, 2000),
+                  resultPreview: redactAbsolutePaths(subagentResultForDisplay(text)).slice(0, 2000),
                   ...(resumeSignals ?? {}),
                 },
                 defaultMeta
@@ -886,6 +889,7 @@ export class ClaudeLiveNormalizer {
 
       case "rate_limit_event": {
         const info = (record.rate_limit_info as Record<string, unknown> | undefined) ?? {};
+        this.latestRateLimitReset = typeof info.resetsAt === "number" && Number.isFinite(info.resetsAt) ? info.resetsAt * 1000 : null;
         this.emit(
           {
             kind: "rate_limit",
@@ -894,6 +898,7 @@ export class ClaudeLiveNormalizer {
             utilization: typeof info.utilization === "number" ? info.utilization : 0,
             resetsAt: typeof info.resetsAt === "number" ? info.resetsAt * 1000 : null,
             isUsingOverage: info.isUsingOverage === true,
+            overageInUse: info.overageInUse === true,
           },
           defaultMeta
         );
@@ -957,7 +962,7 @@ export class ClaudeLiveNormalizer {
               {
                 reason: "usage_limit",
                 errorKind: "usage_limit",
-                resetsAt,
+                resetsAt: this.latestRateLimitReset ?? resetsAt,
                 detail: resultText.split("|")[0].trim().slice(0, 300) || undefined,
               },
               defaultMeta

@@ -323,11 +323,12 @@ async function applyModelChange(
 
 export async function handleConversationMessage(
   st: SessionStore,
-  msg: Extract<WebviewToHost, { type: "send" | "interrupt" | "approvalDecision" | "setMode" | "setEffort" | "setModel" }>,
+  msg: Extract<WebviewToHost, { type: "send" | "cancelAutoResume" | "interrupt" | "approvalDecision" | "setMode" | "setEffort" | "setModel" }>,
   target: Session | undefined
 ): Promise<void> {
   switch (msg.type) {
     case "send": {
+      target!.conversation?.cancelAutoResume();
       // Webview は hydration 中だけ clientToken 付きで送る。Host は受理結果を
       // 同じ token で返し、楽観バブルの確定・撤去を決める
       const clientToken = msg.clientToken;
@@ -423,6 +424,9 @@ export async function handleConversationMessage(
       target!.conversation!.send(msg.text, msg.images, sessionObservedTimestampSeed(target!));
       break;
     }
+    case "cancelAutoResume":
+      target!.conversation?.cancelAutoResume();
+      break;
     case "interrupt":
       await target!.conversation?.interrupt();
       break;

@@ -11,7 +11,7 @@ export interface OrchestrationView {
   settingsChanged: boolean;
   agents: Array<{ agentId: string; role: string | null; agentType: string | null; model: string | null; effort: string | null;
     firstSeenAt: string; lastActivityAt: string; usage: TokenUsage | null }>;
-  runs: Array<{ role: string; executor: ExternalExecutorId; model?: string; effort?: string; outcome: ExternalRunRecord["outcome"];
+  runs: Array<{ cwd?: string; role: string; executor: ExternalExecutorId; model?: string; effort?: string; outcome: ExternalRunRecord["outcome"];
     startedAt: string; endedAt: string; durationMs: number; usage: TokenUsage | null }>;
 }
 
@@ -57,8 +57,8 @@ export function projectOrchestrationView(
         model: observed(applied?.model), effort: observed(applied?.effort),
         firstSeenAt: agent.firstSeenAt, lastActivityAt: agent.lastActivityAt, usage: usageView(agent.usage) };
     }).sort((a, b) => b.lastActivityAt.localeCompare(a.lastActivityAt)).slice(0, 50), // R-ORC-23
-    runs: runs.map(({ role, executor, model, effort, outcome, startedAt, endedAt, durationMs, usage }) =>
-      ({ role, executor, ...(metadata(model) ? { model } : {}), ...(metadata(effort) ? { effort } : {}), outcome, startedAt, endedAt, durationMs, usage: usageView(usage) }))
+    runs: runs.map(({ cwd, role, executor, model, effort, outcome, startedAt, endedAt, durationMs, usage }) =>
+      ({ ...(typeof cwd === "string" ? { cwd } : {}), role, executor, ...(metadata(model) ? { model } : {}), ...(metadata(effort) ? { effort } : {}), outcome, startedAt, endedAt, durationMs, usage: usageView(usage) }))
       .sort((a, b) => b.startedAt.localeCompare(a.startedAt)).slice(0, 50), // R-ORC-23
   };
 }
@@ -93,7 +93,8 @@ export function isOrchestrationView(value: unknown): value is OrchestrationView 
       && nullableMetadata(row.model) && nullableMetadata(row.effort) && isoTimestampShape(row.firstSeenAt)
       && isoTimestampShape(row.lastActivityAt) && usageShape(row.usage))
     && Array.isArray(value.runs) && value.runs.every((row) =>
-      object(row, ["role", "executor", "outcome", "startedAt", "endedAt", "durationMs", "usage", ...(row?.model === undefined ? [] : ["model"]), ...(row?.effort === undefined ? [] : ["effort"])])
+      object(row, ["role", "executor", "outcome", "startedAt", "endedAt", "durationMs", "usage", ...(row?.cwd === undefined ? [] : ["cwd"]), ...(row?.model === undefined ? [] : ["model"]), ...(row?.effort === undefined ? [] : ["effort"])])
+      && (row.cwd === undefined || typeof row.cwd === "string")
       && (row.model === undefined || metadata(row.model)) && (row.effort === undefined || metadata(row.effort))
       && metadata(row.role) && executor(row.executor) && ["ok", "failed", "timeout", "refused"].includes(row.outcome as string)
       && isoTimestampShape(row.startedAt) && isoTimestampShape(row.endedAt) && finite(row.durationMs) && usageShape(row.usage));
