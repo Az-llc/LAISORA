@@ -110,6 +110,7 @@ export class SessionGuardrail {
       confidence: s.confidence,
       firstAt: s.firstAt,
       lastAt: s.lastAt,
+      ...(s.evidence.lostMs !== undefined ? { lostMs: s.evidence.lostMs } : {}),
     }));
     const key = decisionKey(decision);
     const envelope = buildSteeringEnvelope({

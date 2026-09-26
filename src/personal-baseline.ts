@@ -61,7 +61,7 @@ async function mapWithConcurrency<T, R>(values: readonly T[], concurrency: numbe
 
 // The 90-day window is based on the JSONL's first-record timestamp, not its mtime.
 // readFailed は timestamp===null の 3 通り（読取失敗・走査上限・時刻が無い）を分けるためにある。
-// 全部を「読めなかった」に数えると、読めているのに欠落件数が水増しされる（R-34）
+// 全部を「読めなかった」に数えると、読めているのに欠落件数が水増しされる（R-DSP-01）
 async function firstSessionTimestamp(path: string): Promise<{ timestamp: number | null; readFailed: boolean }> {
   let file: FileHandle | undefined;
   let readFailed = false;
@@ -142,7 +142,7 @@ async function baselineSourceFiles(previousFirstTimestamps: Record<string, numbe
     return { files, firstTimestamps, scan: { rootFailed, unreadableProjects, unreadableSessions, readSessions: files.length } };
   } catch {
     // 保存先を読めなかったことを 0 件へ畳まない。畳むと「比較できるベースラインがない」と
-    // 断言することになる（R-34）
+    // 断言することになる（R-DSP-01）
     rootFailed = true;
     return { files: [], firstTimestamps, scan: { rootFailed, unreadableProjects, unreadableSessions, readSessions: 0 } };
   }
@@ -169,7 +169,7 @@ const NO_BASELINE_SCAN: BaselineScanDegradation = {
 };
 
 // baseline===null は「比較できるものが無い」ではなく「揃わなかった」。理由の内訳を
-// scan で一緒に返し、断言の前に注記へ写せるようにする（R-34）
+// scan で一緒に返し、断言の前に注記へ写せるようにする（R-DSP-03）
 let onPersonalBaselineChanged: (() => void) | undefined;
 // 走査は activate 後も続くので、完了時に開いている画面へ描き直しを依頼する口
 export function setPersonalBaselineListener(listener: () => void): void {
@@ -219,7 +219,7 @@ async function personalBaselineSerialized(excludePath?: string): Promise<{ basel
     if (cached && cached.mtime === file.mtime && cached.size === file.size) continue;
     try { entries[key] = packMetrics(file.mtime, file.size, baselineSessionMetrics(await analyzeSessionFileAsync(file.path))); }
     // 母集団から黙って外さない。外した件数を数えないと「20 件未満」「比較できるものが無い」の
-    // 断言が、実際は読めなかっただけの状態を覆い隠す（R-34 E-04）
+    // 断言が、実際は読めなかっただけの状態を覆い隠す（R-DSP-01 E-04）
     catch { unparsedSessions++; delete entries[key]; }
     // 1 記録ごとにイベントループへ戻す。activate から撃たれるので、続けて回すと拡張ホストが止まる
     await new Promise<void>((resolve) => setImmediate(resolve));

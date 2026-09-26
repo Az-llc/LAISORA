@@ -141,7 +141,7 @@ export class SessionLlm {
 
   // transcript 層で欠けた分（読めなかった子・上限で読まなかった子・読み取りの途中失敗・破損行）を
   // 分析入力の被覆へ載せる。窓落ちと予算切りだけを申告すると、欠けた母集合の上で
-  // 「検証を通った」と名乗る（R-24。W-R24-1 / W-R24-2）
+  // 「検証を通った」と名乗る（R-DSP-01。W-R24-1 / W-R24-2）
   // 親 transcript の読取失敗・破損行は、実際に入力へ使った読み（読み直しならその結果、保持分なら hydration の
   // coverage）から立てる。hydration 時の値を読み直し成功後にも名乗ると、直った欠落を申告し続ける（M-3。W-R24-3）
   private transcriptGapSummary(historyRead: AnalysisHistoryRead): TranscriptGapSummary | undefined {
@@ -244,7 +244,7 @@ export class SessionLlm {
     const l3 = base?.l3;
     if (base === undefined || l3 === undefined) {
       // 導出の例外を「記録がまだありません」へすり替えない。内部の失敗を利用者の状態否定に
-      // 読み替えると、待っても直らない状態を「まだ」と説明することになる（R-31）
+      // 読み替えると、待っても直らない状態を「まだ」と説明することになる（R-DSP-01）
       const failure = this.host.semantic.semanticDerivationFailure();
       const reason =
         failure === null
@@ -514,11 +514,14 @@ export class SessionLlm {
   private llmAnalysisRefusal(): string | null {
     if (!semanticViewEnabled()) return l10n.t("LAISORA: The semantic model is disabled (setting laisora.workLog.semanticView).");
     if (!llmAnalysisEnabled()) return l10n.t("LAISORA: LLM analysis is disabled (setting laisora.workLog.llmAnalysis).");
+    // ターン中に始めた実行は fold が進んだ後に着地し、fold 後の着地を捨てる規則で支払い済みの結果を
+    // 捨てることになる（R-ANL-05 / R-ANL-06）。
     // streamOpen()（会話の生存）で拒むと、warmup が送信前から会話を作るため全タブで常に拒否される
     // 拒むのは起動中とターン実行中だけ
     if (this.host.starting !== null || (this.host.conversation !== null && !this.host.conversation.isClosed && this.host.conversation.state !== "idle")) {
       return l10n.t("LAISORA: LLM analysis cannot start while a turn is running (wait for it to finish and try again).");
     }
+    // single flight（R-ANL-22）
     if (this.host.llmRun !== null) return l10n.t("LAISORA: LLM analysis is already running in this tab.");
     if (this.store.llmAnalysisInFlightCount() > 0) return l10n.t("LAISORA: LLM analysis is running in another tab.");
     return null;

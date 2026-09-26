@@ -394,6 +394,9 @@ button#auth.chip:hover { filter: brightness(1.15); }
 .you-link, .earlier-expand { border: 0; padding: 0; background: none; color: var(--vscode-descriptionForeground); cursor: pointer; font-family: inherit; }
 .you-link { margin-left: auto; flex: none; font-size: 11.5px; line-height: 1.5; }
 .you-link:hover, .earlier-expand:hover { text-decoration: underline; }
+.you-dismiss { flex: none; border: 0; padding: 0 2px; background: none; color: var(--vscode-descriptionForeground); cursor: pointer; font: inherit; font-size: 13px; line-height: 1.2; }
+.you-dismiss:hover { color: var(--vscode-foreground); }
+.you-dismiss:focus-visible { outline: 1px solid var(--vscode-focusBorder); outline-offset: 2px; }
 .you-summary { margin: 4px 0 0; overflow-wrap: anywhere; }
 .you-resolved .you-square { background: none; border: 1px solid var(--vscode-descriptionForeground); }
 .you-resolved .you-title-text { color: var(--vscode-descriptionForeground); text-decoration: line-through; }
@@ -467,6 +470,8 @@ button#auth.chip:hover { filter: brightness(1.15); }
 .plan-bar-number { font-size: 18px; font-weight: 300; line-height: 1; font-variant-numeric: tabular-nums; color: var(--laisora-accent); }
 .plan-bar-current { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 13px; font-weight: 600; }
 .plan-bar-stats { white-space: nowrap; font-size: 11.5px; }
+.plan-bar-loader { display: inline-flex; align-self: center; flex: none; color: var(--vscode-descriptionForeground); }
+.plan-bar-loader[hidden] { display: none; }
 .plan-bar-waiting { margin-left: auto; white-space: nowrap; }
 .plan-bar-waiting:empty { display: none; }
 .plan-bar-chevron { color: var(--vscode-descriptionForeground); }
@@ -496,7 +501,7 @@ button#auth.chip:hover { filter: brightness(1.15); }
   .plan-side:has(> .plan-section:not([hidden])) .plan-section-head { grid-row: 1 / span 3; grid-template-rows: subgrid; }
   .plan-side:has(> .plan-section:not([hidden])) .plan-section-body, .plan-side:has(> .plan-section:not([hidden])) .you-section-body { align-self: start; }
 }
-.plan-done-toggle { display: block; box-sizing: border-box; width: 100%; padding: 12px 0; border: 0; border-top: 1px solid var(--vscode-panel-border); background: none; color: var(--vscode-descriptionForeground); font: inherit; font-size: 11.5px; line-height: 1.5; font-variant-numeric: tabular-nums; text-align: left; cursor: pointer; }
+.plan-done-toggle { display: block; box-sizing: border-box; width: 100%; padding: 12px 0; border: 0; border-top: 1px solid var(--vscode-panel-border); background: none; color: var(--vscode-descriptionForeground); font: inherit; font-size: 11.5px; line-height: 1.5; font-variant-numeric: tabular-nums; text-align: left; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; cursor: pointer; }
 .plan-done-toggle:focus-visible { outline: 1px solid var(--vscode-focusBorder); outline-offset: -1px; }
 .session-header { display: flex; align-items: center; min-width: 0; }
 .session-heading-block { flex: 1 1 0; min-width: 0; }
@@ -822,8 +827,8 @@ button[data-analysis-trigger]:disabled.is-analysis-pending { opacity: 1; }
   gap: 6px;
   font-size: 11px;
   color: var(--vscode-descriptionForeground);
+  justify-content: flex-end;
   margin: 0 0 8px;
-  padding: 0 12px 0 0;
   opacity: 0;
   pointer-events: none;
 }
@@ -859,6 +864,20 @@ button[data-analysis-trigger]:disabled.is-analysis-pending { opacity: 1; }
 @media (hover: none) {
   .msg-foot,
   .reply-footer { opacity: 1; pointer-events: auto; }
+}
+/* 本文の下余白（.block の margin 8px）を埋める当たり判定。無いと本文からボタンへ動かす途中で
+   hover が切れ、pointer-events: none のフッターへは二度と入れない。高さを本文の下余白より
+   小さくしない。レイアウトを動かさないよう疑似要素で持つ */
+.block + .reply-footer,
+.block.user + .msg-foot { position: relative; }
+.block + .reply-footer::before,
+.block.user + .msg-foot::before {
+  content: "";
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 100%;
+  height: 8px;
 }
 .msg-copy-button {
   display: inline-flex;
@@ -1083,6 +1102,10 @@ hr.md-hr {
   border: 1px solid var(--vscode-panel-border);
   padding: 3px 8px;
   text-align: left;
+  /* R-CNV-37: .block の word-break: break-word が min-content を 1 文字幅にし、狭い幅で列が潰れる */
+  min-width: 6em;
+  word-break: normal;
+  overflow-wrap: normal;
 }
 .md-table th {
   font-weight: 600;
@@ -1552,7 +1575,7 @@ hr.md-hr {
 }
 .approval-field-value { word-break: break-word; }
 /* 承認対象の本文は折り返す。折り返さないと長い1行コマンドの末尾が横スクロールの
-   向こうに隠れ、「要約だけで許可させない」原則が崩れる（レビューAR3-M2） */
+   向こうに隠れ、「要約だけで許可させない」原則が崩れる */
 .approval-pre {
   white-space: pre-wrap;
   word-break: break-word;
@@ -1984,7 +2007,7 @@ hr.md-hr {
 .mode-menu-item.mode-danger.cursor { outline-color: var(--vscode-errorForeground); }
 /* mode-danger かつ適用中かつカーソル: .selected.cursor が赤塗りを打ち消してしまい
    文字色・枠色（editor-background）だけが残って判読不能になるため、全プロパティを
-   明示して赤塗りを復元する（レビューAR2-M2） */
+   明示して赤塗りを復元する */
 .mode-menu-item.mode-danger.selected.cursor {
   background: var(--vscode-errorForeground);
   color: var(--vscode-editor-background);
@@ -2220,25 +2243,77 @@ button:disabled { opacity: 0.4; cursor: default; }
 
 /* LLM 区画（検証通過分のみ）と診断面（棄却分・オプトイン）。
    診断面は4タブの外の要素で、既定では生成されない */
+.llm-entry {
+  align-items: center;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px 16px;
+}
+.llm-entry > .llm-toggle { margin-inline-start: auto; }
 .llm-findings {
-  border: 1px solid var(--vscode-panel-border, rgba(128, 128, 128, 0.3));
-  border-radius: 5px;
   display: flex;
   flex-direction: column;
-  gap: 3px;
-  padding: 6px 10px;
+  gap: 4px;
+  margin-top: 8px;
 }
-.llm-head-row {
+.llm-history {
+  color: var(--vscode-descriptionForeground);
   display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 8px;
+  flex-wrap: wrap;
+  font-size: 11.5px;
+  font-variant-numeric: tabular-nums;
+  gap: 2px 17px;
+  line-height: 18px;
+  list-style: none;
+  margin: 0;
+  /* 折り返した行頭の区切りは左の余白ごと切り落とす。padding を 0 にすると行頭のフォーカス枠も切れる */
+  overflow: hidden;
+  padding: 2px 0 2px 3px;
+}
+.llm-history-item { flex: 0 1 auto; min-width: 0; position: relative; }
+.llm-history-freshness::before {
+  content: "·" / "";
+  margin: 0 6px;
+  opacity: 0.6;
+}
+.llm-history-item + .llm-history-item::before {
+  content: "|" / "";
+  inset-inline-start: -11px;
+  opacity: 0.6;
+  position: absolute;
+}
+.llm-history-btn {
+  background: none;
+  border: 0;
+  color: inherit;
+  cursor: pointer;
+  font: inherit;
+  padding: 0;
+}
+.llm-history-btn:hover { color: var(--vscode-foreground); }
+.llm-history-btn:focus-visible { outline: 1px solid var(--vscode-focusBorder); outline-offset: 1px; }
+.llm-history-btn[aria-current="true"] { cursor: default; }
+.llm-history-current {
+  border-bottom: 2px solid var(--laisora-accent);
+  color: var(--vscode-foreground);
+  font-weight: 600;
+}
+.llm-completion {
+  color: var(--vscode-descriptionForeground);
+  font-size: 11.5px;
+  font-variant-numeric: tabular-nums;
+  line-height: 18px;
+}
+.llm-completion > * + *::before {
+  content: "·" / "";
+  margin: 0 8px;
+  opacity: 0.6;
 }
 .llm-head {
-  color: var(--vscode-descriptionForeground);
-  font-size: 11px;
-  font-weight: 600;
-  letter-spacing: 0.04em;
+  font-size: 14px;
+  font-weight: 700;
+  line-height: 20px;
+  margin-top: 16px;
 }
 .llm-toggle {
   align-items: center;
@@ -2248,7 +2323,7 @@ button:disabled { opacity: 0.4; cursor: default; }
   color: var(--vscode-button-secondaryForeground, var(--vscode-badge-foreground));
   cursor: pointer;
   display: inline-flex;
-  font-size: 11px;
+  font-size: 11.5px;
   gap: 6px;
   padding: 2px 8px 2px 6px;
   user-select: none;
@@ -2277,60 +2352,37 @@ button:disabled { opacity: 0.4; cursor: default; }
   cursor: wait;
   opacity: 0.6;
 }
-.llm-state-note {
-  color: var(--vscode-descriptionForeground);
-  font-size: 11px;
-  margin-top: 2px;
-}
-.llm-summary {
-  display: block;
-  font-weight: 600;
-  margin: 2px 0;
-}
-.llm-attached-meta {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: baseline;
-  gap: 2px 12px;
-}
-
-.llm-run-targets {
-  display: block;
-  color: var(--vscode-descriptionForeground);
-  font-size: 11px;
-  margin-top: 2px;
-}
 
 .llm-run[data-run-state="in-flight"] .llm-run-btn {
   cursor: progress;
 }
 
-.llm-none, .llm-provenance {
+.llm-none {
   color: var(--vscode-descriptionForeground);
-  font-size: 12px;
+  font-size: 13px;
 }
 .llm-finding { display: flex; flex-wrap: wrap; gap: 6px; font-size: 12px; }
 .llm-run {
   align-items: center;
   display: flex;
   flex-wrap: wrap;
-  gap: 8px;
+  gap: 8px 12px;
 }
 .llm-run-btn {
-  background: var(--vscode-button-secondaryBackground, var(--vscode-badge-background));
+  background: var(--vscode-button-background);
   border: none;
-  border-radius: 10px;
-  color: var(--vscode-button-secondaryForeground, var(--vscode-badge-foreground));
+  border-radius: 2px;
+  color: var(--vscode-button-foreground);
   cursor: pointer;
   flex: 0 0 auto;
-  font-size: 11px;
-  padding: 3px 10px;
+  font-size: 13px;
+  padding: 3px 12px;
   white-space: nowrap;
 }
-.llm-run-btn:hover:enabled { filter: brightness(1.15); }
-.llm-run-btn:focus-visible { outline: 1px solid var(--vscode-focusBorder); }
+.llm-run-btn:hover:enabled { background: var(--vscode-button-hoverBackground); }
+.llm-run-btn:focus-visible { outline: 1px solid var(--vscode-focusBorder); outline-offset: 1px; }
 .llm-run-btn:disabled { cursor: default; opacity: 0.5; }
-.llm-run-note { color: var(--vscode-descriptionForeground); font-size: 11px; }
+.llm-run-note { color: var(--vscode-descriptionForeground); font-size: 11.5px; }
 .llm-run-note.llm-run-refusal { color: var(--vscode-editorWarning-foreground); }
 .llm-run-note.analysis-failure { display: block; color: var(--vscode-errorForeground); margin-top: 6px; white-space: pre-wrap; overflow-wrap: anywhere; }
 .llm-diagnostics {
@@ -2376,145 +2428,153 @@ button:disabled { opacity: 0.4; cursor: default; }
 .llm-finding-cards {
   display: flex;
   flex-direction: column;
-  gap: 12px;
-  margin-top: 10px;
+  margin-top: 8px;
 }
 
 .llm-finding-card {
-  border: 1px solid var(--vscode-panel-border, rgba(128, 128, 128, 0.3));
-  border-radius: 6px;
-  padding: 10px 12px;
-  background: var(--vscode-editorWidget-background, rgba(128, 128, 128, 0.05));
-  font-size: 12px;
-  line-height: 1.5;
-}
-
-.llm-finding-title-row {
-  flex-wrap: wrap;
-  display: flex;
-  align-items: baseline;
-  justify-content: space-between;
-  gap: 8px;
-  margin-bottom: 6px;
-}
-
-.llm-finding-title-left {
-  min-width: 0;
-  display: flex;
-  align-items: baseline;
-  gap: 8px;
-  flex: 1 1 auto;
+  border-top: 1px solid;
+  border-top-color: var(--vscode-panel-border);
+  column-gap: 24px;
+  display: grid;
+  font-size: 13px;
+  grid-template-columns: minmax(56px, max-content) minmax(0, 38em) minmax(220px, 1fr);
+  padding-block: 24px;
 }
 
 .llm-finding-num {
-  font-weight: 700;
-  color: var(--vscode-foreground);
+  color: var(--vscode-descriptionForeground);
+  font-size: 13px;
+  font-variant-numeric: tabular-nums;
+  font-weight: 600;
+  line-height: 25px;
   white-space: nowrap;
 }
 
+.llm-finding-num.llm-finding-digits {
+  font-size: 28px;
+  font-weight: 200;
+  line-height: 28px;
+}
+
+.llm-finding-body { min-width: 0; }
+
 .llm-finding-title {
-  overflow-wrap: anywhere;
-  font-weight: 600;
   color: var(--vscode-foreground);
-}
-
-.llm-finding-badge {
-  flex: 0 0 auto;
-  font-size: 10px;
-  padding: 1px 6px;
-  border-radius: 3px;
-  background: var(--vscode-badge-background, rgba(128, 128, 128, 0.2));
-  color: var(--vscode-badge-foreground, var(--vscode-foreground));
-  border: 1px solid var(--vscode-panel-border, rgba(128, 128, 128, 0.3));
-}
-
-.llm-finding-observed {
-  margin-bottom: 4px;
-  color: var(--vscode-descriptionForeground);
-}
-
-.llm-finding-impact {
-  margin-bottom: 4px;
-  font-weight: 500;
-}
-
-.llm-finding-action {
-  margin-bottom: 6px;
-}
-
-.llm-finding-evidence {
-  display: flex;
-  align-items: center;
-  flex-wrap: wrap;
-  gap: 6px;
+  font-size: 18px;
+  font-weight: 700;
+  line-height: 1.4;
   margin-bottom: 8px;
-  font-size: 11px;
+  overflow-wrap: anywhere;
 }
 
-.llm-evidence-label {
-  color: var(--vscode-descriptionForeground);
-  font-weight: 600;
-}
-
-.llm-evidence-chips {
-  display: inline-flex;
-  flex-wrap: wrap;
-  gap: 4px;
-  align-items: center;
-}
-
-.llm-evidence-chip {
-  display: inline-flex;
-  align-items: center;
-  font-size: 11px;
-  padding: 1px 6px;
-  border-radius: 3px;
-  background: var(--vscode-badge-background, rgba(128, 128, 128, 0.15));
+.llm-finding-observed,
+.llm-finding-action {
   color: var(--vscode-foreground);
-  border: 1px solid var(--vscode-panel-border, rgba(128, 128, 128, 0.3));
-}
-
-button.llm-evidence-chip,
-.llm-evidence-btn {
-  cursor: pointer;
-  color: var(--vscode-textLink-foreground, #3794ff);
-  background: transparent;
-  padding: 1px 6px;
-  border: 1px solid var(--vscode-panel-border, rgba(128, 128, 128, 0.3));
-}
-
-button.llm-evidence-chip:hover,
-.llm-evidence-btn:hover {
-  text-decoration: underline;
-  background: var(--vscode-toolbar-hoverBackground, rgba(128, 128, 128, 0.2));
+  font-size: 13px;
+  line-height: 1.7;
+  margin: 0 0 8px;
+  overflow-wrap: anywhere;
 }
 
 .llm-finding-footer {
-  display: flex;
   align-items: center;
-  gap: 10px;
-  margin-top: 6px;
-  padding-top: 6px;
-  border-top: 1px solid var(--vscode-panel-border, rgba(128, 128, 128, 0.15));
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px 12px;
+  margin-top: 12px;
 }
 
 .llm-start-session-btn {
-  padding: 4px 10px;
-  font-size: 11px;
-  border-radius: 4px;
-  background: var(--vscode-button-background);
-  color: var(--vscode-button-foreground);
-  border: none;
+  background: var(--vscode-button-secondaryBackground, var(--vscode-badge-background));
+  border: 1px solid var(--vscode-button-border, transparent);
+  border-radius: 2px;
+  color: var(--vscode-button-secondaryForeground, var(--vscode-badge-foreground));
   cursor: pointer;
+  font-size: 13px;
+  padding: 4px 12px;
 }
 
 .llm-start-session-btn:hover {
-  background: var(--vscode-button-hoverBackground);
+  background: var(--vscode-button-secondaryHoverBackground, var(--vscode-toolbar-hoverBackground));
 }
 
+.llm-start-session-btn:focus-visible { outline: 1px solid var(--vscode-focusBorder); outline-offset: 1px; }
+
 .llm-start-session-note {
-  font-size: 10px;
   color: var(--vscode-descriptionForeground);
+  font-size: 11.5px;
+}
+
+.llm-finding-margin {
+  border-inline-start: 1px solid;
+  border-inline-start-color: var(--vscode-panel-border);
+  color: var(--vscode-descriptionForeground);
+  font-size: 11.5px;
+  line-height: 1.6;
+  min-width: 0;
+  padding-inline-start: 16px;
+}
+
+.llm-finding-impact {
+  color: var(--vscode-foreground);
+  font-size: 28px;
+  font-variant-numeric: tabular-nums;
+  font-weight: 200;
+  line-height: 32px;
+  overflow-wrap: anywhere;
+}
+
+.llm-finding-impact-caption {
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  line-height: 16px;
+  margin: 4px 0 12px;
+}
+
+.llm-finding-destination,
+.llm-finding-target {
+  margin-top: 4px;
+  overflow-wrap: anywhere;
+}
+
+.llm-finding-evidence {
+  align-items: baseline;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 2px 8px;
+  margin-top: 4px;
+}
+
+.llm-evidence-chip {
+  font-size: 11.5px;
+  overflow-wrap: anywhere;
+}
+
+button.llm-evidence-chip {
+  background: none;
+  border: 0;
+  color: var(--vscode-textLink-foreground);
+  cursor: pointer;
+  font: inherit;
+  padding: 0;
+  text-align: start;
+}
+
+button.llm-evidence-chip:hover {
+  color: var(--vscode-textLink-activeForeground);
+  text-decoration: underline;
+}
+
+button.llm-evidence-chip:focus-visible { outline: 1px solid var(--vscode-focusBorder); outline-offset: 1px; }
+
+@media (max-width: 1200px) {
+  .llm-finding-card { grid-template-columns: minmax(56px, max-content) minmax(0, 32em) minmax(220px, 1fr); }
+}
+
+@media (max-width: 720px) {
+  .llm-finding-card { column-gap: 12px; grid-template-columns: minmax(44px, max-content) minmax(0, 1fr); }
+  .llm-finding-margin { border-inline-start: 0; grid-column: 2; padding: 12px 0 0; }
 }
 
 /* ---------- 状況タブ（概要 / グラフ / インスペクター / 実行ログ） ---------- */
@@ -2702,64 +2762,131 @@ button.llm-evidence-chip:hover,
 .wl-chip { cursor: pointer; border: 1px solid rgba(176, 139, 87, 0.5); }
 .wl-chip:focus-visible { outline: 1px solid var(--vscode-focusBorder); outline-offset: 1px; }
 
-/* 分析タブ: サブタブ（スクリプト分析 / LLM 分析）・セッションの実測・スクリプト分析の所見（R-TAB-06） */
+/* 分析タブ: サブタブ（スクリプト分析 / LLM 分析）・分析の指標・スクリプト分析の所見（R-TAB-06） */
 .wa-tabs { display: flex; gap: 2px; margin: 0 0 12px; border-bottom: 1px solid var(--vscode-editorWidget-border, var(--vscode-panel-border)); }
 .wa-tab { font-size: 12.5px; padding: 6px 14px; border: none; border-bottom: 2px solid transparent; background: none; color: var(--vscode-descriptionForeground); cursor: pointer; }
 .wa-tab:hover { color: var(--vscode-foreground); }
 .wa-tab.active { color: var(--vscode-foreground); font-weight: 600; border-bottom-color: #a8783a; }
 .wa-tab:focus-visible { outline: 1px solid var(--vscode-focusBorder); outline-offset: -1px; }
 .wa-sub[hidden] { display: none; }
-.wa-sec-h { display: block; font-size: 12px; font-weight: 600; margin: 8px 0 4px; border-bottom: 1px dashed var(--vscode-descriptionForeground); width: max-content; cursor: help; }
-.wa-head, .wa-findings { padding: 0 0 12px; margin-bottom: 10px; border-bottom: 1px solid var(--vscode-editorWidget-border, var(--vscode-panel-border)); }
-.wa-head-t { display: block; font-size: 12.5px; font-weight: 600; margin-bottom: 7px; }
-.wa-when { display: flex; flex-wrap: wrap; align-items: baseline; gap: 6px; font-size: 12px; color: var(--vscode-descriptionForeground); font-variant-numeric: tabular-nums; }
-.wa-when b, .wa-strong { color: var(--vscode-foreground); font-weight: 600; }
-.wa-arrow { padding: 0 2px; }
-.wa-elapsed { margin-left: 10px; }
-.wa-idle { font-size: 11.5px; color: var(--vscode-descriptionForeground); margin: 4px 0 8px; }
-.wa-cap { display: flex; align-items: baseline; gap: 8px; margin: 6px 0 4px; font-size: 12px; }
-.wa-cap-n { color: var(--vscode-descriptionForeground); }
-.wa-cap-v { font-size: 15px; font-weight: 600; }
-.wa-rows { display: grid; grid-template-columns: minmax(96px, auto) minmax(0, 1fr) minmax(80px, auto); gap: 6px 10px; align-items: center; margin: 4px 0 6px; }
-.wa-rn { font-size: 11.5px; color: var(--vscode-descriptionForeground); white-space: nowrap; }
-.wa-rn.wa-total { font-weight: 600; color: var(--vscode-foreground); }
-.wa-c { font-size: 10.5px; margin-left: 5px; }
-.wa-bar { display: flex; height: 18px; border-radius: 3px; overflow: hidden; background: rgba(128, 128, 128, 0.12); }
-.wa-bar.wa-total { height: 22px; }
-.wa-bar.unmeasured { background: repeating-linear-gradient(45deg, rgba(128, 128, 128, 0.08), rgba(128, 128, 128, 0.08) 4px, transparent 4px, transparent 8px); }
-.wa-seg { display: flex; align-items: center; justify-content: center; overflow: hidden; white-space: nowrap; font-size: 10.5px; color: #fff; }
-.wa-seg.wa-gen, .wa-sw.wa-gen { background: #4a6a8a; }
-.wa-seg.wa-tool, .wa-sw.wa-tool { background: #a8783a; }
-.wa-seg-v { padding: 0 4px; }
-.wa-rt { font-size: 12px; font-variant-numeric: tabular-nums; white-space: nowrap; }
-.wa-sm { font-size: 10.5px; color: var(--vscode-descriptionForeground); margin-left: 5px; }
-.wa-key { display: flex; gap: 14px; list-style: none; margin: 4px 0 8px; padding: 0; font-size: 11px; color: var(--vscode-descriptionForeground); }
-.wa-key li { display: flex; align-items: center; gap: 5px; }
-.wa-sw { display: inline-block; width: 10px; height: 10px; border-radius: 2px; }
-.wa-facts { display: flex; flex-wrap: wrap; gap: 6px 22px; font-size: 12px; margin-bottom: 6px; }
-.wa-lbl { color: var(--vscode-descriptionForeground); font-size: 11.5px; }
-.wa-more { font-size: 12px; }
-.wa-more > summary { cursor: pointer; color: var(--vscode-descriptionForeground); font-size: 11.5px; }
-.wa-types { margin-top: 6px; }
-.wa-thead, .wa-trow > summary, .wa-runs li { display: grid; grid-template-columns: minmax(0, 1fr) 40px 74px 74px 48px 40px; gap: 6px; align-items: baseline; }
-.wa-thead { font-size: 10.5px; color: var(--vscode-descriptionForeground); padding: 2px 0; border-bottom: 1px solid var(--vscode-editorWidget-border, var(--vscode-panel-border)); }
-.wa-trow > summary { cursor: pointer; padding: 3px 0; list-style: none; }
-.wa-trow > summary::-webkit-details-marker { display: none; }
-.wa-ty { font-weight: 600; }
-.wa-runs { list-style: none; margin: 0 0 4px; padding: 0 0 0 12px; font-size: 11.5px; color: var(--vscode-descriptionForeground); }
-.wa-num { text-align: right; font-variant-numeric: tabular-nums; }
-.wa-num.wa-zero { opacity: 0.55; }
-.wa-num.wa-fail { color: var(--vscode-errorForeground); font-weight: 600; }
+.wa-findings { display: flex; flex-direction: column; gap: 28px; margin: 4px 0 28px; }
+.wa-findings[hidden] { display: none; }
+.wa-fsec > .wa-code { margin-bottom: 4px; }
+.wa-sec-h { cursor: help; }
+.wa-sec-h:focus-visible { outline: 1px solid var(--vscode-focusBorder); outline-offset: 1px; }
+/* 分析の指標（TIME / ROLES / ERR）。アクセントの濃淡は図の印（.wa-tone-c1..c4・.wa-ratio-f）だけに使う（R-CNV-36） */
+.wa-head { container: wa-metrics / inline-size; margin: 0 0 16px; }
+.wa-head[hidden] { display: none; }
+.wa-grid {
+  --wa-c1: var(--laisora-accent);
+  --wa-c2: color-mix(in srgb, var(--laisora-accent) 70%, var(--vscode-editor-background));
+  --wa-c3: color-mix(in srgb, var(--laisora-accent) 45%, var(--vscode-editor-background));
+  --wa-c4: color-mix(in srgb, var(--laisora-accent) 25%, var(--vscode-editor-background));
+  --wa-tool: color-mix(in srgb, var(--vscode-descriptionForeground) 45%, var(--vscode-editor-background));
+  --wa-unobserved: color-mix(in srgb, var(--vscode-descriptionForeground) 22%, var(--vscode-editor-background));
+  --wa-track: color-mix(in srgb, var(--vscode-descriptionForeground) 12%, var(--vscode-editor-background));
+  display: grid; grid-template-columns: repeat(12, minmax(0, 1fr)); gap: 1px; background: var(--vscode-panel-border); font-variant-numeric: tabular-nums;
+}
+.wa-mod { min-width: 0; padding: 20px; background: var(--vscode-editor-background); }
+.wa-mod:first-child { padding-left: 0; }
+.wa-mod:last-child { padding-right: 0; }
+.wa-time { grid-column: span 4; }
+.wa-roles { grid-column: span 5; }
+.wa-err { grid-column: span 3; }
+.wa-grid:not(:has(> .wa-roles)) > .wa-time { grid-column: span 8; }
+.wa-grid:not(:has(> .wa-roles)) > .wa-err { grid-column: span 4; }
+.wa-grid:not(:has(> .wa-time)) > .wa-roles { grid-column: span 9; }
+.wa-grid:not(:has(> .wa-err)) > .wa-roles { grid-column: span 8; }
+.wa-grid > .wa-mod:only-child { grid-column: 1 / -1; }
+.wa-code { display: flex; align-items: baseline; gap: 8px; margin-bottom: 12px; font-size: 10px; line-height: 16px; color: var(--vscode-descriptionForeground); }
+.wa-code b { font-weight: 600; letter-spacing: .16em; color: var(--vscode-foreground); }
+.wa-tone-c1 { background: var(--wa-c1); }
+.wa-tone-c2 { background: var(--wa-c2); }
+.wa-tone-c3 { background: var(--wa-c3); }
+.wa-tone-c4 { background: var(--wa-c4); }
+.wa-tone-tool { background: var(--wa-tool); }
+.wa-tone-unobserved { background: var(--wa-unobserved); }
+.wa-tm { display: flex; align-items: center; gap: 16px; }
+.wa-ring { position: relative; flex: none; width: 104px; height: 104px; border-radius: 50%; background: var(--wa-track); }
+.wa-ring::before { content: ""; position: absolute; inset: 16px; border-radius: 50%; background: var(--vscode-editor-background); }
+.wa-ring-v { position: absolute; inset: 0; display: grid; place-content: center; font-size: 18px; font-weight: 300; line-height: 1.4; }
+.wa-tl { flex: 1; min-width: 0; max-width: 440px; }
+.wa-lr { display: grid; grid-template-columns: 8px minmax(0, 1fr) max-content 36px; gap: 8px; align-items: baseline; font-size: 11.5px; line-height: 20px; }
+.wa-dot { width: 8px; height: 8px; border-radius: 50%; align-self: center; }
+.wa-ln { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.wa-lp { text-align: right; color: var(--vscode-descriptionForeground); }
+.wa-fx { display: flex; flex-wrap: wrap; gap: 0 12px; margin-top: 8px; padding-top: 6px; border-top: 1px solid var(--vscode-panel-border); font-size: 10px; line-height: 16px; color: var(--vscode-descriptionForeground); }
+.wa-rh, .wa-rr { display: grid; grid-template-columns: 56px minmax(0, 1fr) 104px minmax(0, 1fr) 56px; column-gap: 8px; align-items: center; }
+.wa-rh { margin-bottom: 4px; font-size: 10px; line-height: 16px; letter-spacing: .16em; color: var(--vscode-descriptionForeground); }
+.wa-rh-t { grid-column: 1 / 3; text-align: right; }
+.wa-rh-k { grid-column: 4 / 6; }
+.wa-rr { width: 100%; padding: 4px 0; border: 0; border-top: 1px solid var(--vscode-panel-border); background: none; color: var(--vscode-foreground); font: inherit; font-size: 11.5px; line-height: 20px; text-align: left; cursor: pointer; }
+.wa-rr:hover .wa-rname b { text-decoration: underline; }
+.wa-rr:focus-visible { outline: 1px solid var(--vscode-focusBorder); outline-offset: -1px; }
+.wa-tv { text-align: right; white-space: nowrap; }
+.wa-kv { white-space: nowrap; }
+.wa-running { display: inline-flex; vertical-align: middle; margin-right: 4px; color: var(--vscode-descriptionForeground); }
+.wa-v.wa-unmeasured { color: var(--vscode-descriptionForeground); }
+.wa-sb { display: flex; height: 8px; background: var(--wa-track); }
+.wa-sb-t { justify-content: flex-end; }
+.wa-fill { display: flex; height: 100%; }
+.wa-seg { flex: none; height: 100%; min-width: 2px; box-sizing: border-box; }
+.wa-seg + .wa-seg { border-left: 2px solid var(--vscode-editor-background); }
+.wa-rname { padding-left: 8px; overflow-wrap: anywhere; }
+.wa-rname b { font-size: 10px; font-weight: 600; letter-spacing: .14em; text-transform: uppercase; }
+.wa-rcount { margin-left: 4px; font-size: 10px; color: var(--vscode-descriptionForeground); }
+.wa-rr[aria-expanded="false"] .wa-rname::after { content: " ▸"; font-size: 10px; color: var(--vscode-descriptionForeground); }
+.wa-rr[aria-expanded="true"] .wa-rname::after { content: " ▾"; font-size: 10px; }
+.wa-rl { padding: 2px 0 8px 16px; }
+.wa-rl[hidden] { display: none; }
+.wa-ri { display: grid; grid-template-columns: 8px minmax(0, 1fr) minmax(0, 1fr) 56px 56px; gap: 8px; align-items: baseline; padding: 2px 0; font-size: 10px; line-height: 16px; color: var(--vscode-descriptionForeground); }
+.wa-ri .wa-dot { align-self: start; margin-top: 4px; border-radius: 0; }
+.wa-rn, .wa-mx { overflow-wrap: anywhere; }
+.wa-rn { color: var(--vscode-foreground); }
+.wa-req { display: inline-block; margin-left: 3px; white-space: nowrap; border-bottom: 1px dotted var(--vscode-descriptionForeground); font-size: 10px; cursor: help; }
+.wa-v { text-align: right; white-space: nowrap; color: var(--vscode-foreground); }
+.wa-note { margin-top: 8px; font-size: 10px; line-height: 16px; color: var(--vscode-descriptionForeground); }
+.wa-gv { display: flex; flex-wrap: wrap; align-items: baseline; gap: 0 6px; }
+.wa-gv-n { font-size: 28px; font-weight: 200; line-height: 32px; }
+.wa-gv-d { font-size: 10px; letter-spacing: .08em; color: var(--vscode-descriptionForeground); }
+.wa-ratio { height: 4px; margin-top: 6px; background: var(--wa-track); }
+.wa-ratio-f { display: block; height: 100%; background: var(--wa-c1); }
+.wa-ctr { display: grid; grid-template-columns: minmax(0, 1fr) max-content; gap: 2px 8px; align-items: baseline; margin-top: 8px; padding-top: 6px; border-top: 1px solid var(--vscode-panel-border); font-size: 10px; line-height: 16px; color: var(--vscode-descriptionForeground); }
+.wa-ctr[hidden] { display: none; }
+.wa-ctr-rest { margin-top: 0; padding-top: 0; border-top: 0; }
+.wa-kn { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.wa-kc { font-size: 14px; font-weight: 300; text-align: right; color: var(--vscode-foreground); }
+.wa-more { margin-top: 4px; padding: 0; border: 0; background: none; color: var(--vscode-textLink-foreground); font: inherit; font-size: 10px; line-height: 16px; cursor: pointer; }
+.wa-more[aria-expanded="false"]::after { content: " ▸"; }
+.wa-more[aria-expanded="true"]::after { content: " ▾"; }
+.wa-more:focus-visible { outline: 1px solid var(--vscode-focusBorder); outline-offset: 1px; }
+@container wa-metrics (width < 760px) {
+  .wa-grid > .wa-mod.wa-mod { grid-column: 1 / -1; padding: 16px 0; }
+}
 .wa-quiet { display: block; font-size: 12px; line-height: 1.6; color: var(--vscode-descriptionForeground); }
-.wa-find { border: 1px solid var(--vscode-editorWidget-border, var(--vscode-panel-border)); border-radius: 5px; padding: 7px 10px; margin-bottom: 7px; scroll-margin-top: 12px; }
+/* スクリプト分析の所見は LLM 所見（.llm-finding-*）の記事組みを共用し、ここで字の大きさと欄の幅だけを詰める */
+.llm-finding-card.wa-find { grid-template-columns: 44px minmax(0, 38em) minmax(120px, 1fr); column-gap: 16px; padding-block: 12px; align-items: start; scroll-margin-top: 12px; }
 .wa-find:focus { outline: none; }
-.wa-find.wa-hit { border-color: #a8783a; box-shadow: 0 0 0 2px rgba(168, 120, 58, 0.22); }
-.wa-find-n { font-size: 12.5px; font-weight: 600; }
-.wa-badge { display: inline-block; font-size: 10.5px; font-weight: 400; padding: 1px 6px; border-radius: 3px; margin-right: 6px; background: rgba(176, 139, 87, 0.16); color: var(--vscode-descriptionForeground); border: 1px solid rgba(176, 139, 87, 0.4); vertical-align: 1px; }
-.wa-find-c { font-size: 11.5px; color: var(--vscode-descriptionForeground); font-variant-numeric: tabular-nums; margin-left: 10px; }
-.wa-chips { display: flex; flex-wrap: wrap; gap: 5px; margin-top: 6px; }
-.wa-chip { font-size: 10.5px; padding: 1px 7px; border-radius: 3px; cursor: pointer; background: rgba(176, 139, 87, 0.18); color: var(--vscode-foreground); border: 1px solid rgba(176, 139, 87, 0.5); }
-.wa-chip:focus-visible { outline: 1px solid var(--vscode-focusBorder); outline-offset: 1px; }
+.wa-find.wa-hit { outline: 1px solid var(--vscode-focusBorder); outline-offset: -1px; }
+/* 番号と件数（28px・行高 1）の字面の上端を、題（13px・行高 1.5）の 1 行目の字面の上端へ揃える（O-83 が実測する） */
+.wa-find .llm-finding-digits { margin-top: -2px; font-size: 28px; font-weight: 300; line-height: 1; }
+.wa-find .llm-finding-title { font-size: 13px; font-weight: 700; line-height: 1.5; margin-bottom: 4px; }
+.wa-find .llm-finding-action { margin: 0; font-size: 11.5px; line-height: 1.6; color: var(--vscode-descriptionForeground); }
+.wa-ev-toggle { margin-top: 6px; padding: 0; border: 0; background: none; color: var(--vscode-textLink-foreground); font: inherit; font-size: 11.5px; cursor: pointer; }
+.wa-ev-toggle:hover { text-decoration: underline; }
+.wa-ev-toggle[aria-expanded="false"]::after { content: " ▸"; }
+.wa-ev-toggle[aria-expanded="true"]::after { content: " ▾"; }
+.wa-ev-toggle:focus-visible { outline: 1px solid var(--vscode-focusBorder); outline-offset: 1px; }
+.wa-ev { margin-top: 6px; }
+.wa-ev[hidden] { display: none; }
+.wa-ev-more { font-size: 11.5px; color: var(--vscode-descriptionForeground); }
+.wa-find .llm-finding-margin { border-inline-start: 0; padding-inline-start: 0; }
+.wa-find .llm-finding-impact { margin-top: -2px; font-size: 28px; font-weight: 300; line-height: 1; }
+.wa-find-unit { margin-inline-start: 2px; font-size: 11.5px; font-weight: 400; color: var(--vscode-descriptionForeground); }
+@media (max-width: 720px) {
+  .llm-finding-card.wa-find { grid-template-columns: 44px minmax(0, 1fr); }
+}
+.af-learning-note, .af-learning-line, .wa-fsec-empty { font-size: 11.5px; line-height: 1.6; color: var(--vscode-descriptionForeground); }
 .af-llm-section { margin-top: 10px; padding-top: 10px; border-top: 1px solid var(--vscode-editorWidget-border, var(--vscode-panel-border)); }
 @media (forced-colors: active) {
   .wi-pop, .wi-max, .wi-close, .wl-tag > button, .wo-card { border: 1px solid CanvasText; forced-color-adjust: none; background: Canvas; color: CanvasText; }
@@ -2838,10 +2965,6 @@ mark.find-match-current {
   background: var(--vscode-editor-findMatchBackground);
   color: inherit;
 }
-
-/* One destination tag per finding; reuse existing badge tokens. */
-.llm-finding-routing { margin-bottom: 6px; }
-.llm-destination-badge { display: inline-block; max-width: 100%; overflow-wrap: anywhere; }
 
 /* Conversation timeline: reserve a fixed gutter for the rail and turn markers. */
 .panel-conv { --turn-marker-top: 7.5px; --turn-marker-size: 7px; position: relative; padding-left: var(--conv-gutter); }
@@ -2935,11 +3058,6 @@ mark.find-match-current {
   .loader .loader-d { transform: scale(0); }
 }
 
-.llm-history-select, .llm-history-select option {
-  color: var(--vscode-dropdown-foreground);
-  background: var(--vscode-dropdown-background);
-}
-.llm-history-select { border: 1px solid var(--vscode-dropdown-border); }
 .auto-resume button {
   margin-inline-start: 8px;
   color: var(--vscode-button-secondaryForeground);

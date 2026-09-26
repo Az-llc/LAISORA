@@ -34,6 +34,7 @@ import { createHydrationDraft, foldHistoryEvents } from "./resume-hydration";
 import { isInSessionStore, sessionTranscriptRef } from "./session-files";
 import { readSessionHistory } from "./session-transcript";
 import type { SessionStore } from "./store-surfaces";
+import { recordSeparator } from "./webview/commit-boundary";
 
 // 会話ログのMarkdown書き出し（/export相当）。assistantのストリーミングdeltaはターン単位に結合する。
 // 1 行ずつ積む入れ物。記録経路と保持分経路で同じ描き方にする（別実装にすると片方だけ形式が変わる）
@@ -42,9 +43,11 @@ function createExportSink(lines: string[]): {
   flush: () => void;
 } {
   let assistantBuf = "";
+  let recordEnded = false;
   const flush = () => {
     if (assistantBuf.trim()) lines.push("## Assistant", "", assistantBuf.trim(), "");
     assistantBuf = "";
+    recordEnded = false;
   };
   const push = (ev: NormalizedEventBody): void => {
     switch (ev.kind) {
@@ -59,7 +62,11 @@ function createExportSink(lines: string[]): {
         lines.push(ev.role === "user" ? "## User" : "## Assistant", "", ev.text, "");
         break;
       case "assistant_text_delta":
-        assistantBuf += ev.text;
+        assistantBuf += (recordEnded ? recordSeparator(assistantBuf) : "") + ev.text;
+        recordEnded = false;
+        break;
+      case "assistant_message_uuid":
+        recordEnded = true;
         break;
       case "tool_call_started":
         flush();

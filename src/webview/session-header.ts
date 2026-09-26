@@ -97,8 +97,11 @@ export function createSessionHeader(tabId: string, title: string, send: (message
   const receiveSuggestion = (message: Extract<HostToWebview, { type: "sessionNameSuggestion" }>) => {
     if (!pending) return;
     setPending(false);
-    if ("title" in message) beginEdit(message.title);
-    else {
+    if ("title" in message) {
+      const value = message.title.trim();
+      // R-ANL-21: an edit opened before arrival cleared `pending`, so manual typing is never overwritten.
+      if (value) send({type: "renameTab", tabId, title: value});
+    } else {
       failure.textContent = message.reason.replace(/\s+/g, " ").trim();
       failure.title = failure.textContent;
       failure.hidden = false;

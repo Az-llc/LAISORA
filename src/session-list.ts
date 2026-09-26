@@ -54,7 +54,7 @@ export function rankSessionCandidates(
 
 // 行の filePath は畳んだ後の候補（stat 成功・mtime 最大）から引く。走査中に見た順で
 // 上書きした索引を使うと、同じ sessionId が複数プロジェクトにあるとき行が最新でない側や
-// stat に失敗した側のパスを掴み、再開と分析がそこで失敗する（R-36。SL-40 / SL-41）
+// stat に失敗した側のパスを掴み、再開と分析がそこで失敗する（SL-40 / SL-41）
 export function candidatePathIndex(candidates: readonly SessionCandidate[]): Map<string, string> {
   return new Map(candidates.map((c) => [c.sessionId, c.filePath]));
 }

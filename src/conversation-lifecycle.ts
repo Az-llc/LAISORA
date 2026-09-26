@@ -1,7 +1,9 @@
 import { join } from "node:path";
 import * as vscode from "vscode";
 import { getLaisoraConfiguration } from "./claude-settings";
-import { cachedExternalModels } from "./gateway-host-actions";
+import { flushModelProfileResearch } from "./learning-research";
+import { postSettingsState } from "./settings-panel";
+import { cachedExternalModels, configuredProfileRoster } from "./gateway-host-actions";
 
 import {
   PERMISSION_MODE_KEY,
@@ -18,6 +20,7 @@ import {
 import { createBackgroundActivityState } from "./background-activity";
 import { ClaudeConversation } from "./claudeHost";
 import { OrchestrationViewPublisher, orchestrationViewForConversation } from "./orchestration-view";
+import { orchestrationRunsDirectoryOf } from "./orchestration-external";
 import { postAttachments } from "./composer-io";
 import { pendingAttachments } from "./pending-attachments";
 import * as l10n from "@vscode/l10n";
@@ -36,7 +39,7 @@ const orchestrationPublishers = new WeakMap<ClaudeConversation, OrchestrationVie
 
 export function postOrchestrationView(s: Session): void {
   const conv = s.conversation;
-  if (!conv?.orchestrationActive || s.closed) return; // R-ORC-01
+  if (!conv?.orchestrationActive || s.closed) return; // R-ORC-38
   let publisher = orchestrationPublishers.get(conv);
   if (publisher === undefined) {
     publisher = new OrchestrationViewPublisher(() => {
@@ -342,7 +345,7 @@ export async function handleConversationMessage(
           sendDisposition: { clientToken, disposition: value },
         });
       };
-      // /clear 処理中は受け付けない（レビューAR-C1: クリア対象の会話へ投入・再生成しない）
+      // /clear 処理中は受け付けない（R-SES-08: クリア対象の会話へ投入・再生成しない）
       if (target!.clearing) {
         target!.pushEvent({
           kind: "error",
@@ -352,7 +355,7 @@ export async function handleConversationMessage(
         disposition("rejected");
         break;
       }
-      // 予約タグ（非人間 allowlist）で始まる人間入力は拒否する。
+      // 予約タグ（非人間 allowlist）で始まる人間入力は拒否する（R-HND-05）。
       // history 側は同じ本文を非人間として落とすため、live で通すと経路が割れる
       if (HUMAN_INPUT_INJECTED_TAG_RE.test(msg.text.trimStart())) {
         target!.pushEvent({
@@ -371,8 +374,8 @@ export async function handleConversationMessage(
         disposition("rejected");
         throw e;
       }
-      // 起動待ちの間にタブが閉じられていたら投入しない（codexレビューC1-2）
-      // /clear が割り込んだ場合も投入しない（レビューAR-C1）
+      // 起動待ちの間にタブが閉じられていたら投入しない
+      // /clear が割り込んだ場合も投入しない（R-SES-08）
       if (target!.closed || target!.clearing) {
         disposition("rejected");
         break;
@@ -478,7 +481,7 @@ function sessionObservedTimestampSeed(s: Session): number | undefined {
 }
 
 async function ensureConversation(s: Session): Promise<void> {
-  // 並行 send による二重生成防止（レビューP2-1: 後勝ち上書きで孤児CLIプロセスが残留する）
+  // 並行 send による二重生成防止（後勝ち上書きで孤児CLIプロセスが残留する）
   while (s.starting) await s.starting;
   const p = ensureConversationInner(s);
   s.starting = p.catch(() => {}).then(() => {
@@ -494,7 +497,7 @@ async function ensureConversationInner(s: Session): Promise<void> {
   // 同じ session ID を保つのか新しい ID へ fork するのかが未確定なため。書くと fork 側の挙動では
   // 古い ID に固着し、2 回目以降の復帰で新しい ID に積まれた会話を黙って捨てる
   let crashResumeSessionId: string | undefined;
-  // 死んだ Conversation は捨てて再生成する（abort/クラッシュ後の恒久沈黙防止 — レビューR1-2）
+  // 死んだ Conversation は捨てて再生成する（abort/クラッシュ後の恒久沈黙防止）
   if (s.conversation?.isClosed) {
     s.guardrailRunner.settleConversationLost();
     void s.conversation.dispose();
@@ -562,8 +565,9 @@ async function ensureConversationInner(s: Session): Promise<void> {
     orchestrationAgents: cfg.get<unknown>("orchestration.agents", []),
     externalModels: cachedExternalModels(),
     externalTimeoutMinutes: cfg.get<number>("orchestration.externalTimeoutMinutes", 10),
-    orchestrationRunsDirectory: extensionContext?.globalStorageUri?.fsPath ? join(extensionContext.globalStorageUri.fsPath, "orchestration") : undefined,
+    orchestrationRunsDirectory: orchestrationRunsDirectoryOf(extensionContext?.globalStorageUri?.fsPath),
     conductorPolicy: cfg.get<string>("orchestration.conductorPolicy", ""),
+    onLearningRecorded: postSettingsState,
     onOrchestrationChanged: () => {
       if (s.conversation === conv) postOrchestrationView(s); // R-ORC-21
     },
@@ -581,6 +585,9 @@ async function ensureConversationInner(s: Session): Promise<void> {
         rederiveConfiguredEffort(store, s);
       }
       s.pushEvent(ev, conversationId, meta);
+      if (["turn_completed", "turn_failed", "turn_interrupted"].includes(ev.kind)) {
+        setTimeout(() => flushModelProfileResearch(s, getLaisoraConfiguration().get<boolean>("learning.enabled", false), cachedExternalModels(), configuredProfileRoster()), 0);
+      }
       if (ev.kind === "auth_status" && conversationId === s.expectedConversationId && ev.auth?.billingRealm === "api") {
         store?.post({
           type: "tabNotice",
@@ -597,7 +604,7 @@ async function ensureConversationInner(s: Session): Promise<void> {
       }),
     log: (m) => output.appendLine(`[${s.title}] ${m}`),
   });
-  // start 成功後に公開する（失敗時に壊れた Conversation が残留しないように — レビューR1-8）
+  // start 成功後に公開する（失敗時に壊れた Conversation が残留しないように）
   try {
     // ここで expected を切り替える（旧世代の遅延イベントは以後 pushEvent で落ちる）
     s.expectedConversationId = conv.conversationId;
@@ -614,6 +621,7 @@ async function ensureConversationInner(s: Session): Promise<void> {
       throw new Error(l10n.t("The logical session of this tab changed while the conversation was starting (restore or clear)."));
     }
     s.conversation = conv;
+    setTimeout(() => flushModelProfileResearch(s, getLaisoraConfiguration().get<boolean>("learning.enabled", false), cachedExternalModels(), configuredProfileRoster()), 0);
     postOrchestrationView(s);
     refreshConfiguredEffort(store, s, cwd, settingSources, conv);
     // スラッシュコマンド/モデル一覧をサジェスト・ピッカー用にWebviewへ供給（非同期・失敗しても無視）

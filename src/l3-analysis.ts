@@ -757,7 +757,7 @@ export function deriveL3(model: SemanticModel, evidence: SemanticEvidenceIndex):
 
   // failureCount（原始集計の写し）。L1 は 1 件の失敗を段落側に 1 回だけ記帳する（自レーンは failCount、
   // 委任配下は深さを問わず childFailCount）。委任 Attempt の failCount / childFailCount は同じ失敗を
-  // Agent 単位で見直した値なので、段落 Attempt と合算すると二重になる（HANDOFF R-45）。
+  // Agent 単位で見直した値なので、段落 Attempt と合算すると二重になる（HANDOFF）。
   // 委任 Attempt を足すのは、その段落が段落 Attempt に束ねられていない（dispatch だけの段落は L2 が落とす）ときだけ。
   // segmentIds が空の委任 Attempt はどの段落の代役でもないので足さない（空配列では some() が常に false になり、
   // 交差判定だけでは「束ねられていない段落」と同じ扱いで素通りする）

@@ -160,20 +160,20 @@ export class Session {
   seq = 0;
   generation = 1;
   conversation: ClaudeConversation | null = null;
-  // ensureConversation の並行呼び出しで CLI が二重起動しないよう直列化（レビューP2-1）
+  // ensureConversation の並行呼び出しで CLI が二重起動しないよう直列化
   starting: Promise<void> | null = null;
-  // closeTab 後に進行中の send がプロンプトを投入しないための閉鎖フラグ（codexレビューC1-2）
+  // closeTab 後に進行中の send がプロンプトを投入しないための閉鎖フラグ
   closed = false;
-  // /clear 処理中フラグ。並行 send がクリア中の会話へ投入・再生成しないためのガード（レビューAR-C1）
+  // /clear 処理中フラグ。並行 send がクリア中の会話へ投入・再生成しないためのガード
   clearing = false;
-  // 現在有効な Conversation の ID。旧世代の遅延イベント混入防止（codexレビューC3-1）
+  // 現在有効な Conversation の ID。旧世代の遅延イベント混入防止
   expectedConversationId: string | null = null;
-  // このセッションから切り離した Conversation の ID（FP-1 / codexレビューC3-1）。
+  // このセッションから切り離した Conversation の ID（FP-1）。
   // resetLogicalSession で消してはいけない: resume 再利用は破棄の完了を待たずに進むため、
   // expectedConversationId が null の窓で瀕死の旧 CLI のイベントが世代ガードを素通りする
   readonly detachedConversationIds = new Set<string>();
   cwd = "";
-  // trim で auth_status イベントが消えても snapshot が退行しないよう別途退避（レビューR2-4）
+  // trim で auth_status イベントが消えても snapshot が退行しないよう別途退避
   auth: AuthStatus | null = null;
   lastContextTotalTokens: number | null = null;
 
@@ -241,7 +241,7 @@ export class Session {
   // その1件がたまたま集合の差に当たると遡りが恒久的に行き止まりになるため。
   // 空配列は「resume していない」= 会話の遡りの対象外
   conversationAnchorUuids: string[] = [];
-  // 会話履歴を登録したときに読めなかった行・uuid の無い発言。全 page の coverage に載せる（R-32）
+  // 会話履歴を登録したときに読めなかった行・uuid の無い発言。全 page の coverage に載せる（R-DSP-03）
   conversationHistoryGaps: { malformedLineCount: number; droppedWithoutUuidCount: number } | undefined = undefined;
 
   constructor(private readonly store: SessionStore, index: number) {
@@ -487,14 +487,14 @@ export class Session {
     meta?: EventMeta,
     clientToken?: string
   ): void {
-    // FP-1 / codexレビューC3-1: 切り離した Conversation のイベントは journal にも積まない。
+    // FP-1: 切り離した Conversation のイベントは journal にも積まない。
     // journal は meta.gapBoundaries を replay へ運ぶ唯一の経路なので、破棄側へ倒しても
     // entry を積むと別会話の境界が新しい論理セッションの longGap 集計へ入る
     if (conversationId !== undefined && this.detachedConversationIds.has(conversationId)) {
       output.appendLine(`[${this.title}] [drop] detached conversation event: ${partial.kind}`);
       return;
     }
-    // 旧 Conversation の遅延イベントを新世代へ混入させない（codexレビューC3-1）。
+    // 旧 Conversation の遅延イベントを新世代へ混入させない。
     // hydration 中の CLI 再起動は継続扱いなので expectedConversationId は buffering 中に
     // 入れ替わりうる。判定を replay へ残すと再起動の前後どちらかが丸ごと消える
     const stale = Boolean(
@@ -973,7 +973,7 @@ export class Session {
   }
 
   async disposeConversation(): Promise<void> {
-    // 起動中なら完了を待ってから破棄（レビューP2R2-1a: start中のcloseTabで孤児CLIが残る）
+    // 起動中なら完了を待ってから破棄（start中のcloseTabで孤児CLIが残る）
     while (this.starting) await this.starting;
     const conv = this.detachConversation();
     if (conv) await conv.dispose();
@@ -997,9 +997,9 @@ export class Session {
 
   async disposeDetachedConversation(conv: ClaudeConversation | null): Promise<void> {
     if (conv) await conv.dispose();
-    // 起動中なら完了を待ってから破棄（レビューP2R2-1a: start中の破棄で孤児CLIが残る）
+    // 起動中なら完了を待ってから破棄（start中の破棄で孤児CLIが残る）
     while (this.starting) await this.starting;
-    // レビューAR-C1: 待機中に旧世代の start が完了して掴まれていたら破棄する。
+    // 待機中に旧世代の start が完了して掴まれていたら破棄する。
     // 切り離し後に新しい論理セッションが作った Conversation は生かす必要があるので、
     // 切り離し済み ID のものだけを対象にする
     const adopted = this.conversation;

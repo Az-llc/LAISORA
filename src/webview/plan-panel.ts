@@ -2,6 +2,7 @@ import * as l10n from "@vscode/l10n";
 import type { OrchestrationView, WorkModelPayload } from "../protocol";
 import type { PlanUsage } from "../plan-usage";
 import { derivePlanView, type PlanLane, type PlanView } from "./plan-view";
+import { createLoader } from "./loader";
 
 function node<K extends keyof HTMLElementTagNameMap>(tag: K, className: string, text?: string): HTMLElementTagNameMap[K] {
   const element = document.createElement(tag);
@@ -43,6 +44,7 @@ export class PlanPanel {
   private readonly barTitle = node("span", "plan-bar-current");
   private readonly barCount = node("span", "plan-bar-count");
   private readonly barNumber = node("span", "plan-bar-number");
+  private readonly barLoader = node("span", "plan-bar-loader");
   private readonly barStats = node("span", "plan-bar-stats");
   private readonly barRunning = node("span", "plan-bar-running");
   private model?: WorkModelPayload;
@@ -71,11 +73,12 @@ export class PlanPanel {
     });
     this.dialog.addEventListener("click", event => { if (event.target === this.dialog) this.close(); });
     this.dialog.addEventListener("cancel", event => { event.preventDefault(); this.close(); });
+    this.barLoader.append(createLoader(12));
     this.bar.type = "button";
     this.bar.setAttribute("aria-controls", this.aside.id);
     this.bar.setAttribute("aria-expanded", "false");
     this.bar.setAttribute("aria-haspopup", "dialog");
-    this.bar.append(node("span", "plan-label", "PLAN"), this.barCount, this.barNumber, this.barTitle, this.barStats, this.barRunning, this.waiting, node("span", "plan-bar-chevron", "▸"));
+    this.bar.append(node("span", "plan-label", "PLAN"), this.barCount, this.barNumber, this.barTitle, this.barLoader, this.barStats, this.barRunning, this.waiting, node("span", "plan-bar-chevron", "▸"));
     this.bar.onclick = () => {
       this.returnFocus = document.activeElement instanceof HTMLElement ? document.activeElement : this.bar;
       this.dialog.append(this.aside);
@@ -119,6 +122,7 @@ export class PlanPanel {
     this.barTitle.textContent = current?.title ?? "";
     const running = [...view.now, ...view.steps.flatMap(step => step.lanes)].filter(lane => lane.status === "running").length;
     this.barRunning.textContent = running ? l10n.t("Working {0}", running) : "";
+    this.barLoader.hidden = !(running || current?.status === "in_progress") || !view.steps.length;
     this.barStats.textContent = view.steps.length ? `${planDuration(view.elapsed)} · ${view.claude ? "≈" : ""}${planTokens(view.claude?.tokens ?? null)}` : "";
     renderPlanSection(this.section, view);
   }
@@ -150,22 +154,21 @@ export function renderPlanSection(section: HTMLElement, view: PlanView): void {
   const head = node("header", "plan-section-head");
   head.append(top, goal, lede);
   const children: HTMLElement[] = [];
-  if (view.partial) children.push(node("p", "plan-lede", l10n.t("Some earlier plan details are unavailable.")));
-  const firstOpen = view.steps.findIndex(step => step.removed || step.status !== "completed");
-  const done = view.steps.slice(0, firstOpen < 0 ? view.steps.length : firstOpen);
-  const collapsed = done.length > 4 && section.dataset.doneOpen !== "true";
+  if (view.partial) lede.append(document.createElement("br"), node("span", "plan-partial", l10n.t("Some earlier plan details are unavailable.")));
+  const done = view.steps.filter(step => !step.removed && step.status === "completed");
+  const collapsed = done.length > 1 && section.dataset.doneOpen !== "true";
+  if (done.length > 1) {
+    const toggle = node("button", "plan-done-toggle", `✓ ${l10n.t("{0} steps done", String(done.length))} ${collapsed ? "▸" : "▾"}`);
+    toggle.type = "button";
+    toggle.setAttribute("aria-expanded", String(!collapsed));
+    toggle.onclick = () => {
+      section.dataset.doneOpen = String(collapsed);
+      renderPlanSection(section, view);
+      section.querySelector<HTMLElement>(".plan-done-toggle")?.focus();
+    };
+    children.push(toggle);
+  }
   for (const step of view.steps) {
-    if (done.length > 4 && step === done[0]) {
-      const toggle = node("button", "plan-done-toggle", `✓ ${l10n.t("{0}–{1} done", String(done[0].number).padStart(2, "0"), String(done[done.length - 1].number).padStart(2, "0"))} ${collapsed ? "▸" : "▾"}`);
-      toggle.type = "button";
-      toggle.setAttribute("aria-expanded", String(!collapsed));
-      toggle.onclick = () => {
-        section.dataset.doneOpen = String(collapsed);
-        renderPlanSection(section, view);
-        section.querySelector<HTMLElement>(".plan-done-toggle")?.focus();
-      };
-      children.push(toggle);
-    }
     if (collapsed && done.includes(step)) continue;
     const item = node("div", "plan-item");
     item.classList.toggle("plan-current", step.number === view.current);

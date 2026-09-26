@@ -46,7 +46,7 @@ export function coverageRows(coverage: WorkCoverageView & CoverageBackfillHint, 
   const summaryGaps: string[] = [];
   const reasons: string[] = [];
   // 時間軸の読み直しで読めなかったもの。読めなかった subagents/ を 0 本として描くと
-  // 並列していたセッションが「直列」に見える（R-23）
+  // 並列していたセッションが「直列」に見える（R-DSP-01）
   if (timeBuckets?.sessionReadError !== undefined) {
     summaryGaps.push(l10n.t("Could not fully read the session record, so measured times are not shown"));
     reasons.push(timeBuckets.sessionReadError);
@@ -71,7 +71,7 @@ export function coverageRows(coverage: WorkCoverageView & CoverageBackfillHint, 
     summaryGaps.push(l10n.t("{0} subagents are unreadable", coverage.unreadableAgentCount));
   }
   // 上限超過・読取失敗で丸ごと読めなかった子の記録。遡っても戻らない欠落なので、
-  // 表示を絞っただけの「直近のみ」と別の言葉で説明する（R-27）
+  // 表示を絞っただけの「直近のみ」と別の言葉で説明する（R-DSP-03）
   if (coverage.omittedTranscriptCount !== undefined) {
     summaryGaps.push(l10n.t("Records for {0} subagents were not read and are not included in the totals", coverage.omittedTranscriptCount));
   }

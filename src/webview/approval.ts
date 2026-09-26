@@ -68,7 +68,7 @@ export function buildApprovalBody(toolName: string, inputJson?: string, inputSum
       const fp = str(obj.file_path);
       if (fp) out.push(approvalField(l10n.t("File"), fp));
       // 空文字は「ファイルを空にする」という重要な操作なので、値の有無ではなくキーの
-      // 存在で判定して必ず出す（レビューAR3-L3）
+      // 存在で判定して必ず出す
       if (typeof obj.content === "string") {
         out.push(approvalField(l10n.t("Content"), clip(obj.content, 1500) || l10n.t("(Empty — the file will be emptied)"), true));
       }
@@ -84,7 +84,7 @@ export function buildApprovalBody(toolName: string, inputJson?: string, inputSum
         out.push(approvalField(l10n.t("Before"), clip(obj.old_string, 800) || l10n.t("(Empty)"), true));
       }
       if (typeof obj[newKey] === "string") {
-        // 空文字＝削除。欄ごと消すと「何が起きるか」が伝わらない（レビューAR3-L3）
+        // 空文字＝削除。欄ごと消すと「何が起きるか」が伝わらない
         out.push(approvalField(l10n.t("After"), clip(obj[newKey] as string, 800) || l10n.t("(Empty — delete)"), true));
       }
       if (obj.replace_all === true) out.push(approvalField(l10n.t("Scope"), l10n.t("Replace all matching occurrences")));
@@ -131,7 +131,7 @@ export function buildApprovalBody(toolName: string, inputJson?: string, inputSum
       // - 件数上限（MCPツール等で数百キー来てもDOMが膨らまない）
       // - 資格情報らしきキーは伏せる（原データ側は折りたたみで保護されているのに、
       //   既定表示だけ無防備になるのを防ぐ）
-      // - 非文字列は欠落させず存在だけ示す（レビューAR3-L2）
+      // - 非文字列は欠落させず存在だけ示す
       const SECRET_RE = /(key|token|secret|password|passwd|credential|auth)/i;
       let shown = 0;
       const entries = Object.entries(obj);

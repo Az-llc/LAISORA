@@ -1,7 +1,7 @@
 import { pathIsInside, realPathOrNearestSync } from "./path-containment";
 import { execFile, spawn, type ChildProcess, type SpawnOptions } from "node:child_process";
 import { accessSync, constants, existsSync, readFileSync } from "node:fs";
-import { appendFile, mkdir } from "node:fs/promises";
+import { appendFile, mkdir, readFile } from "node:fs/promises";
 import { basename, delimiter, dirname, isAbsolute, join, resolve } from "node:path";
 import { buildClaudeEnv } from "./claude-env";
 import { EXTERNAL_CAPABILITIES, externalExecutorName, isExternalRows, isExternalTimeout, type ExternalRow, type ExternalDetection, type ExternalModel, type ExternalModelList } from "./orchestration-roster";
@@ -9,7 +9,7 @@ import type { ApiKeyPolicy } from "./protocol";
 
 export { isExternalRows, isExternalTimeout } from "./orchestration-roster";
 export type { ExternalRow } from "./orchestration-roster";
-import { EXECUTORS, EXTERNAL_EXECUTORS, tokenUsage, type TokenUsage, type ExecutorProbe } from "./orchestration-executors";
+import { EXECUTORS, EXTERNAL_EXECUTORS, isExternalExecutorId, isExternalModel, tokenUsage, type TokenUsage, type ExecutorProbe } from "./orchestration-executors";
 export { tokenUsage, parseAgyModels, parseCodexModels } from "./orchestration-executors";
 export type { TokenUsage } from "./orchestration-executors";
 export interface ExternalRunRecord {
@@ -25,6 +25,8 @@ export interface ExternalRunRecord {
   readonly outcome: "ok" | "failed" | "timeout" | "refused";
   readonly reason?: string;
   readonly usage?: TokenUsage;
+  readonly runId?: string;
+  readonly sessionId?: string;
 }
 export interface AgentRunRecord {
   readonly kind: "agent";
@@ -34,6 +36,8 @@ export interface AgentRunRecord {
   readonly outcome?: "failed";
   readonly reason?: string;
   readonly usage?: TokenUsage;
+  readonly runId?: string;
+  readonly sessionId?: string;
 }
 export type OrchestrationRunRecord = ExternalRunRecord | AgentRunRecord;
 export type ExternalSpawn = (executable: string, args: string[], options: SpawnOptions) => ChildProcess;
@@ -55,9 +59,66 @@ export function observeAgentRun(previous: AgentRunRecord | undefined, input: unk
     lastActivityAt: now, usage: tokenUsage(value.usage) ?? previous?.usage });
 }
 
+export function orchestrationRunsDirectoryOf(globalStoragePath: string | undefined): string | undefined {
+  return globalStoragePath ? join(globalStoragePath, "orchestration") : undefined;
+}
+
 export async function appendRunRecord(directory: string, record: OrchestrationRunRecord): Promise<void> {
   await mkdir(directory, { recursive: true });
   await appendFile(join(directory, "runs.jsonl"), `${JSON.stringify(record)}\n`, "utf8");
+}
+
+const OUTCOMES: readonly ExternalRunRecord["outcome"][] = ["ok", "failed", "timeout", "refused"];
+const timestamp = (value: unknown): value is string => typeof value === "string" && Number.isFinite(Date.parse(value));
+
+// 既知のフィールドだけを取り出す。記録にある他のキーを素通しすると表示経路へ任意の値が載る（R-ORC-14）
+export function decodeExternalRunRecord(raw: unknown): ExternalRunRecord | undefined {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return undefined;
+  const r = raw as Record<string, unknown>;
+  if (r.kind !== "external" || typeof r.role !== "string" || !/^[a-z][a-z0-9-]*$/.test(r.role) || !isExternalExecutorId(r.executor)) return undefined;
+  if (!timestamp(r.startedAt) || !timestamp(r.endedAt) || typeof r.durationMs !== "number" || !Number.isFinite(r.durationMs) || r.durationMs < 0) return undefined;
+  if (!OUTCOMES.includes(r.outcome as ExternalRunRecord["outcome"])) return undefined;
+  if (r.model !== undefined && (!isExternalModel(r.model) || r.model === "")) return undefined;
+  if (r.effort !== undefined && (typeof r.effort !== "string" || !/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(r.effort))) return undefined;
+  if ((r.cwd !== undefined && typeof r.cwd !== "string") || (r.reason !== undefined && typeof r.reason !== "string")) return undefined;
+  if ((r.runId !== undefined && typeof r.runId !== "string") || (r.sessionId !== undefined && typeof r.sessionId !== "string")) return undefined;
+  const usage = tokenUsage(r.usage);
+  return Object.freeze({ kind: "external", ...(r.cwd !== undefined ? { cwd: r.cwd } : {}), role: r.role, executor: r.executor,
+    ...(r.model !== undefined ? { model: r.model } : {}), ...(r.effort !== undefined ? { effort: r.effort as ExternalRunRecord["effort"] } : {}),
+    startedAt: r.startedAt, endedAt: r.endedAt, durationMs: r.durationMs, outcome: r.outcome as ExternalRunRecord["outcome"],
+    ...(r.reason !== undefined ? { reason: r.reason } : {}), ...(usage ? { usage } : {}),
+    ...(r.runId !== undefined ? { runId: r.runId } : {}), ...(r.sessionId !== undefined ? { sessionId: r.sessionId } : {}) });
+}
+
+export interface SessionExternalRuns {
+  runs: ExternalRunRecord[];
+  // 解析できない行と、この sessionId を名乗るのに形の合わない行。解析できない行はどのセッションのものか
+  // 分からないので、読む全セッションで数える（R-DSP-01）
+  unreadableLines: number;
+  readError: boolean;
+}
+
+// sessionId を持たない行（キー導入前の記録）はどのセッションにも帰属させない
+export async function readSessionExternalRuns(directory: string, sessionId: string): Promise<SessionExternalRuns> {
+  let text: string;
+  try {
+    text = await readFile(join(directory, "runs.jsonl"), "utf8");
+  } catch (error) {
+    return { runs: [], unreadableLines: 0, readError: (error as NodeJS.ErrnoException).code !== "ENOENT" };
+  }
+  const runs: ExternalRunRecord[] = [];
+  let unreadableLines = 0;
+  for (const line of text.split("\n")) {
+    if (!line.trim()) continue;
+    let raw: unknown;
+    try { raw = JSON.parse(line); } catch { unreadableLines++; continue; }
+    if (!raw || typeof raw !== "object" || (raw as { sessionId?: unknown }).sessionId !== sessionId) continue;
+    if ((raw as { kind?: unknown }).kind === "agent") continue;
+    const run = decodeExternalRunRecord(raw);
+    if (run) runs.push(run);
+    else unreadableLines++;
+  }
+  return { runs, unreadableLines, readError: false };
 }
 
 export function resolveExternalExecutable(executor: ExternalRow["executor"], env = process.env, platform = process.platform): string | undefined {
@@ -221,7 +282,7 @@ async function captureModelRpc(executable: string, env: NodeJS.ProcessEnv, limit
         child = (deps.spawn ?? spawn)(launch.executable, launch.args, { env: launch.env, shell: false, windowsHide: true,
           detached: process.platform !== "win32", stdio: ["pipe", "pipe", "pipe"] });
         timer = setTimeout(() => failedList("timeout"), limit);
-        child.once("error", () => failedList("model-list-process-failed"));
+        child.once("error", error => failedList((error as NodeJS.ErrnoException).code === "ENOENT" ? "not-installed" : "model-list-process-failed"));
         child.once("close", () => failedList("model-list-closed"));
         child.stdin?.on("error", () => failedList("model-list-write-failed"));
         child.stdout?.on("error", () => failedList("model-list-read-failed"));
@@ -260,7 +321,7 @@ async function captureModelRpc(executable: string, env: NodeJS.ProcessEnv, limit
           } catch (error) { failedList(runFailureReason("invalid-model-list-response", error)); }
         });
         sendList({ id: 1, ...initialize });
-      } catch (error) { failedList(runFailureReason("model-list-launch-failed", error)); }
+      } catch (error) { failedList((error as NodeJS.ErrnoException).code === "ENOENT" ? "not-installed" : runFailureReason("model-list-launch-failed", error)); }
     });
 }
 

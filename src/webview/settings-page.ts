@@ -1,11 +1,15 @@
 import { createAccentSettings } from "./accent-settings";
 import { normalizeSystemAppExtension } from "../file-link-open-mode";
-import { EXECUTORS, DEFAULT_EXECUTOR, canonicalExecutorEfforts, executorModelList, isExecutorId, isExternalExecutorId, rowEfforts, rowComplete, type ExecutorRow } from "../orchestration-executors";
-import { conductorInstruction, estimateTokens, emptyOrchestrationRole, externalExecutorName, isExternalModel, isExternalTimeout, orchestrationVariants, orchestrationExternalTargets } from "../orchestration-roster";
+import { EXECUTORS, DEFAULT_EXECUTOR, canonicalExecutorEfforts, executorModelList, modelSelectionState, isExecutorId, isExternalExecutorId, rowEfforts, rowComplete, type ExecutorRow } from "../orchestration-executors";
+import { modelListStatusText } from "../model-display-name";
+import { emptyOrchestrationRole, externalExecutorName, isExternalModel, isExternalTimeout, orchestrationVariants, orchestrationExternalTargets } from "../orchestration-roster";
 import { type OrchestrationSettingRow } from "../orchestration-roster";
 import * as l10n from "@vscode/l10n";
 import {
   FILE_LINK_BOOLEAN_SETTINGS,
+  normalizeProfileSources,
+  PROFILE_SOURCES,
+  type ProfileSource,
   isHostToSettingsPage,
   type ApiKeyPolicy,
   type ComposerSendKey,
@@ -369,6 +373,47 @@ const policyCounter = element("p", "settings-muted");
 policyCounter.id = "setting-conductor-policy-counter";
 policyCounter.setAttribute("aria-live", "polite");
 policyInput.setAttribute("aria-describedby", `${policyHelp.id} ${policyProposal.id} ${policyCounter.id}`);
+const researchBlock = element("div", "settings-research");
+researchBlock.setAttribute("role", "group");
+researchBlock.setAttribute("aria-labelledby", "setting-research-text");
+const researchText = element("p", "settings-research-text");
+researchText.id = "setting-research-text";
+const researchMissing = element("button", "settings-segment", l10n.t("Research"));
+researchMissing.id = "setting-research-missing";
+researchMissing.type = "button";
+researchMissing.addEventListener("click", () => requestResearch(current?.missingProfiles ?? []));
+const researchActions = element("div", "settings-detection-header");
+researchActions.append(researchText, researchMissing);
+const researchReason = element("p", "settings-muted");
+researchReason.id = "setting-research-reason";
+const researchUsage = element("p", "settings-muted", l10n.t("Research uses the model usage of the current conversation."));
+researchUsage.id = "setting-research-usage";
+const researchSources = element("div", "settings-research-sources");
+researchSources.setAttribute("role", "group");
+const researchSourcesLabel = element("span", "settings-muted", l10n.t("Research sources"));
+researchSourcesLabel.id = "setting-research-sources-label";
+researchSources.setAttribute("aria-labelledby", researchSourcesLabel.id);
+const researchSourcesNote = element("p", "settings-muted", l10n.t("At least one source is required, so the last source cannot be turned off."));
+researchSourcesNote.id = "setting-research-sources-note";
+let pendingSources: number | null = null;
+const sourceLabels: Record<ProfileSource, string> = { official: l10n.t("Official material"), artificialAnalysis: "Artificial Analysis" };
+const sourceChips = PROFILE_SOURCES.map(source => {
+  const chip = element("button", "settings-segment settings-chip");
+  chip.id = `setting-research-source-${source}`;
+  chip.type = "button";
+  chip.dataset.source = source;
+  chip.addEventListener("click", () => {
+    if (!current || pendingSources !== null) return;
+    const sources = normalizeProfileSources(current.profileSources);
+    if (sources.length === 1 && sources.includes(source)) return; // R-LRN-13: retain one source without an alert.
+    const next = sources.includes(source) ? sources.filter(item => item !== source) : [...sources, source];
+    pendingSources = nextRequestId();
+    vscode.postMessage({ type: "setProfileSources", requestId: pendingSources, sources: next });
+    renderProfileResearch(current);
+  });
+  return chip;
+});
+researchSources.append(researchSourcesLabel, ...sourceChips);
 policyCard.append(policyHeader, policyHelp, policyInput, policyProposal, policyCounter);
 renderPolicyCounter();
 const instructionDetails = element("details", "settings-instruction-details");
@@ -377,7 +422,7 @@ instructionPreview.id = "setting-conductor-preview";
 instructionPreview.tabIndex = 0;
 const instructionTokens = element("p", "settings-muted");
 instructionTokens.id = "setting-conductor-tokens";
-instructionDetails.append(element("summary", "", l10n.t("Review what the conductor receives")), instructionTokens, instructionPreview);
+instructionDetails.append(element("summary", "", l10n.t("Review what the conductor receives")), element("p", "settings-muted", l10n.t("This preview omits learned rules that depend on the conversation. Changes apply at the next normal connection start.")), instructionTokens, instructionPreview);
 rosterCategory.append(policyCard, instructionDetails);
 const externalBlock = element("section", "settings-section settings-environment");
 externalBlock.id = "orchestration-environment";
@@ -392,12 +437,46 @@ externalRecheck.type = "button";
 externalRecheck.disabled = true;
 externalRecheck.addEventListener("click", () => vscode.postMessage({ type: "recheckExternalExecutors" }));
 detectionHeader.append(externalHeading, externalRecheck);
+function requestResearch(targets: string[]): void {
+  if (targets.length) vscode.postMessage({ type: "researchModelProfiles", targets });
+}
+function renderProfileResearch(state: SettingsState): void {
+  if (pendingSources === state.replyTo) pendingSources = null;
+  const sources = normalizeProfileSources(state.profileSources);
+  sourceChips.forEach((chip, index) => {
+    const source = PROFILE_SOURCES[index], pressed = sources.includes(source);
+    chip.textContent = (pressed ? "✓ " : "") + sourceLabels[source];
+    chip.setAttribute("aria-pressed", String(pressed));
+    chip.disabled = pendingSources !== null;
+    if (pressed && sources.length === 1) {
+      chip.setAttribute("aria-disabled", "true");
+      chip.setAttribute("aria-describedby", researchSourcesNote.id);
+    } else {
+      chip.removeAttribute("aria-disabled");
+      chip.removeAttribute("aria-describedby");
+    }
+  });
+  researchBlock.setAttribute("aria-labelledby", state.researchText ? researchText.id : researchSourcesLabel.id);
+  researchText.textContent = state.researchText ?? "";
+  researchMissing.disabled = !!state.researchUnavailable || !(state.missingProfiles?.length) || Object.values(state.externalModels).some(list => list.state === "checking");
+  if (state.researchUnavailable) researchMissing.title = state.researchUnavailable;
+  else researchMissing.removeAttribute("title");
+  researchMissing.setAttribute("aria-describedby", [researchText.id,
+    state.researchUnavailable ? researchReason.id : !researchMissing.disabled ? researchUsage.id : ""].filter(Boolean).join(" "));
+  researchReason.textContent = state.researchUnavailable ?? "";
+  researchBlock.replaceChildren(...(state.researchText
+    ? [researchActions, ...(state.researchUnavailable ? [researchReason] : !researchMissing.disabled ? [researchUsage] : [])] : []),
+    researchSources, ...(sources.length === 1 ? [researchSourcesNote] : []));
+  policyCard.appendChild(researchBlock);
+}
 const detectionControls = Object.values(EXECUTORS).map(({ id: executor }) => {
   const badge = element("span", "settings-detection-badge");
   badge.id = `external-status-${executor}`;
   const text = row(detectionCard, externalExecutorName(executor), "", badge);
   text.parentElement!.id = `external-detection-${executor}`;
-  return { executor, badge, description: text.querySelector<HTMLElement>(".settings-row-description")! };
+  const modelNote = element("div", "settings-row-description settings-model-list-note");
+  text.appendChild(modelNote);
+  return { executor, badge, description: text.querySelector<HTMLElement>(".settings-row-description")!, modelNote };
 });
 const timeoutGroup = element("div", "settings-timeout-control");
 timeoutGroup.id = "setting-timeout-group";
@@ -428,7 +507,7 @@ function settingsProbeReason(reason: string): string {
   return l10n.t("cannot start ({0})", reason.slice("spawn-error:".length));
 }
 function renderExternal(state: SettingsState): void {
-  for (const { executor, badge, description } of detectionControls) {
+  for (const { executor, badge, description, modelNote } of detectionControls) {
     const detected = state.externalDetection[executor];
     badge.textContent = detected.state === "checking" ? l10n.t("… Checking") : detected.state === "notInstalled" ? l10n.t("– Not installed")
       : detected.state === "failed" ? l10n.t("! Check failed") : l10n.t("✓ Found");
@@ -441,8 +520,13 @@ function renderExternal(state: SettingsState): void {
         if (detected.versionNote) description.textContent += ` ${l10n.t("(version check failed: {0})", settingsProbeReason(detected.versionNote))}`;
       }
     }
+    const list = state.externalModels[executor];
+    modelNote.textContent = modelListStatusText(list, detected);
+    modelNote.hidden = !modelNote.textContent;
   }
-  externalRecheck.disabled = Object.values(EXECUTORS).some(({ id }) => state.externalDetection[id].state === "checking");
+  externalRecheck.disabled = Object.values(EXECUTORS).some(({ id }) => state.externalDetection[id].state === "checking"
+    || state.externalModels[id].state === "checking" || state.externalModels[id].state === "ok" && state.externalModels[id].refresh === "checking");
+  renderProfileResearch(state);
   externalTimeout.disabled = false;
   externalTimeout.value = String(state.externalTimeoutMinutes);
 }
@@ -481,13 +565,16 @@ function renderPolicyCounter(text = policyInput.value): void {
 function renderPolicyDefaults(state: SettingsState): void {
   policyDefaultsButton.disabled = !state.orchestrationEnabled || pendingOrchestration !== null || policyInput.value === state.conductorPolicyDefault;
 }
+let previewRequest = 0;
 function renderInstructionPreview(state: SettingsState): void {
-  const roster = state.orchestrationAgents.filter((entry) => entry.enabled);
-  instructionPreview.textContent = state.orchestrationEnabled
-    ? conductorInstruction(roster, policyInput.value, orchestrationExternalTargets(roster, state.externalModels))
-    : l10n.t("The agent roster is disabled, so no instruction is added.");
-  instructionTokens.textContent = l10n.t("≈ {0} tokens", estimateTokens(instructionPreview.textContent));
+  instructionPreview.textContent = state.conductorPreview?.text ?? "";
+  instructionTokens.textContent = l10n.t("≈ {0} tokens", state.conductorPreview?.tokens ?? 0);
 }
+function requestInstructionPreview(): void {
+  previewRequest = nextRequestId();
+  vscode.postMessage({ type: "previewConductorInstruction", requestId: previewRequest, policy: policyInput.value });
+}
+
 function renderOrchestration(state: SettingsState): void {
   if (pendingOrchestration === state.replyTo) pendingOrchestration = null;
   for (const role of settingsRosterDrafts.keys()) {
@@ -572,18 +659,20 @@ function renderOrchestration(state: SettingsState): void {
       cascade.appendChild(placeholder);
       for (const candidate of Object.values(EXECUTORS)) {
         const detected = isExternalExecutorId(candidate.id) ? state.externalDetection[candidate.id] : undefined;
-        if (detected?.state === "notInstalled") continue; // R-ORC-20
+        const list = executorModelList(candidate.id, state.externalModels);
+        if (detected?.state === "notInstalled" && list?.state !== "ok") continue; // R-ORC-20
         const group = element("optgroup", "");
         group.label = candidate.displayName;
-        const list = executorModelList(candidate.id, state.externalModels);
-        const choices = candidate.models(list);
+        group.disabled = detected?.state === "notInstalled"; // R-ORC-39: keep remembered choices visible even when the CLI is missing.
+        const selection = modelSelectionState(candidate.id, list, state.externalDetection[candidate.id]);
+        const choices = selection.choices;
         const option = (model: string, label: string) => {
           const item = element("option", "", label);
           item.value = `${candidate.id}/${model}`;
           item.disabled = entry.rows.some((value, i) => i !== rowIndex && value.executor === candidate.id && value.model === model); // R-ORC-20
           group.appendChild(item);
         };
-        if (candidate.kind === "external" && (detected?.state === "checking" || list?.state === "checking")) { // R-ORC-25
+        if (selection.checking) { // R-ORC-39: a remembered list remains selectable during refresh.
           group.disabled = true;
           option("", l10n.t("checking…"));
           group.firstElementChild?.setAttribute("disabled", "");
@@ -592,6 +681,12 @@ function renderOrchestration(state: SettingsState): void {
         } else option("", l10n.t("model list unavailable — type a model ID"));
         if (!group.disabled && candidate.id === executorRow.executor && executorRow.model && !choices?.some((choice) => choice.model === executorRow.model)) {
           option(executorRow.model, executorRow.model + l10n.t(" (not in list)")); // R-ORC-20
+        }
+        if (selection.refreshFailed) {
+          const unavailable = element("option", "", l10n.t("List not obtained (use Recheck to try again)"));
+          unavailable.value = "";
+          unavailable.disabled = true;
+          group.appendChild(unavailable);
         }
         cascade.appendChild(group);
       }
@@ -609,7 +704,7 @@ function renderOrchestration(state: SettingsState): void {
       });
       modelField.append(settingsHiddenLabel(cascade, `${entry.role} Model`), cascade);
       const list = executorModelList(executorRow.executor, state.externalModels);
-      if (isExternalExecutorId(executorRow.executor) && (!definition.models(list) || state.externalDetection[executorRow.executor].state === "notInstalled")) {
+      if (modelSelectionState(executorRow.executor, list, state.externalDetection[executorRow.executor]).manual) {
         const input = element("input", "settings-input");
         input.id = `roster-${index}-row-${rowIndex}-model-id`;
         input.type = "text";
@@ -638,7 +733,7 @@ function renderOrchestration(state: SettingsState): void {
           button.dataset.chip = effort;
           button.dataset.column = String(column + 2);
           button.setAttribute("aria-pressed", String(pressed));
-          button.setAttribute("aria-label", `${entry.role} ${definition.displayName} ${executorRow.model} ${effort}`);
+          button.setAttribute("aria-label", `${entry.role} ${definition.displayName} ${cascade.selectedOptions[0]?.textContent ?? executorRow.model} ${effort}`);
           button.disabled = controlsDisabled || !supported.includes(effort); // R-ORC-12
           if (!supported.includes(effort)) {
             button.classList.add("settings-unsupported");
@@ -689,6 +784,7 @@ function renderOrchestration(state: SettingsState): void {
   policyInput.value = state.conductorPolicy;
   renderPolicyCounter(state.conductorPolicy);
   renderPolicyDefaults(state);
+  previewRequest = 0;
   renderInstructionPreview(state);
   renderExternal(state);
   lockOrchestration();
@@ -717,7 +813,7 @@ roleInput.addEventListener("keydown", (event) => {
 defaultsButton.addEventListener("click", () => { if (current) writeRoster(current.orchestrationDefaults); });
 policyDefaultsButton.addEventListener("click", () => { if (current) writeOrchestration("conductorPolicy", current.conductorPolicyDefault); });
 policyInput.addEventListener("change", () => writeOrchestration("conductorPolicy", policyInput.value));
-policyInput.addEventListener("input", () => { renderPolicyCounter(); if (current) { renderPolicyDefaults(current); renderInstructionPreview(current); } });
+policyInput.addEventListener("input", () => { renderPolicyCounter(); if (current) { renderPolicyDefaults(current); requestInstructionPreview(); } });
 
 const footer = element("div", "settings-footer");
 const moreLink = element("button", "settings-link", l10n.t("Open other settings in VS Code Settings"));
@@ -844,6 +940,11 @@ for (const key of FILE_LINK_BOOLEAN_SETTINGS) {
 moreLink.addEventListener("click", () => vscode.postMessage({ type: "openVsCodeSettings" }));
 
 window.addEventListener("message", (event: MessageEvent<unknown>) => {
-  if (isHostToSettingsPage(event.data)) render(event.data);
+  if (!isHostToSettingsPage(event.data)) return;
+  if (event.data.type === "conductorPreview") {
+    if (event.data.requestId !== previewRequest) return; // R-ORC-37: an older preview must not replace the current draft.
+    instructionPreview.textContent = event.data.text;
+    instructionTokens.textContent = l10n.t("≈ {0} tokens", event.data.tokens);
+  } else render(event.data);
 });
 vscode.postMessage({ type: "settingsPageReady" });

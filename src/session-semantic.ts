@@ -1,6 +1,17 @@
 import { getLaisoraConfiguration } from "./claude-settings";
-import { projectPlanUsage } from "./plan-usage";
+import { projectPlanUsage, summarizeMainTokens } from "./plan-usage";
 import * as l10n from "@vscode/l10n";
+import { deriveFailureSummary } from "./exec-log-marks";
+import { readSessionExternalRuns, type ExternalRunRecord, type SessionExternalRuns } from "./orchestration-external";
+import { deriveRoleSummary, type ExternalRunsCoverage } from "./role-summary";
+import {
+  emptyRosterEvidence,
+  hasInjectedRoster,
+  mergeRosterEvidence,
+  readRosterEvidence,
+  writeRosterEvidence,
+  type RosterEvidence,
+} from "./roster-evidence";
 
 import { projectAnalysisFactsView } from "./analysis-facts-view";
 import type { SemanticEvidenceIndex } from "./evidence-index";
@@ -78,6 +89,24 @@ export function llmDiagnosticsAudience(): LlmDiagnosticsAudience {
 }
 
 
+function externalOf(conv: Session["conversation"]): ExternalRunRecord[] {
+  return (conv?.orchestrationRuns ?? []).filter((run): run is ExternalRunRecord => run.kind === "external");
+}
+
+// runId が同じ記録は 1 件に数える（前側を残す）。runId の無い記録は突き合わせられないので全て残す
+function mergeExternalRuns(first: readonly ExternalRunRecord[], second: readonly ExternalRunRecord[]): ExternalRunRecord[] {
+  const seen = new Set<string>();
+  const out: ExternalRunRecord[] = [];
+  for (const run of [...first, ...second]) {
+    if (run.runId !== undefined) {
+      if (seen.has(run.runId)) continue;
+      seen.add(run.runId);
+    }
+    out.push(run);
+  }
+  return out;
+}
+
 // 裁定A1/M4: L3 の導出はこの1点だけ（webview 側で数え直さない）。
 // evidence は model と同じ fold のものを渡す（longGap 入力は evidence 側にしかない）
 function deriveL3Payload(
@@ -119,7 +148,7 @@ export class SessionSemantic {
   private workModelPostTimer: ReturnType<typeof setTimeout> | null = null;
   private semanticModelPostTimer: ReturnType<typeof setTimeout> | null = null;
   // 自セッションの JSONL から導出した時間 4 区分（U-1 案 b）。live のターン境界は継承時刻なので fold 由来の
-  // 値は inherited になる。ターン境界のたびに JSONL を読み直して差し替える（R-DSP-15 / R-TAB-07）
+  // 値は inherited になる。ターン境界のたびと resume の hydration 完了時に JSONL を読み直して差し替える（R-DSP-15 / R-TAB-07）
   transcriptTimeBuckets: TimeBucketView | undefined = undefined;
   transcriptTimeBucketsCoverage: TimeBucketsCoverage | undefined = undefined;
   private transcriptTimeBucketsTimer: ReturnType<typeof setTimeout> | null = null;
@@ -146,7 +175,7 @@ export class SessionSemantic {
       divergenceReport?: DivergenceReport;
     } | undefined;
     // derivation が欠けた理由。memo に同居させないと、再導出しない 2 回目以降で理由が消え、
-    // 例外由来の欠落が「記録がまだありません」へ倒れる（R-31）
+    // 例外由来の欠落が「記録がまだありません」へ倒れる（R-DSP-01）
     derivationError: DerivationFailure | null;
   } | null = null;
   // 直近の導出が model 段で例外だったか。真の間、workModel の射影と semantic の再送に
@@ -177,7 +206,7 @@ export class SessionSemantic {
     }
   }
 
-  // 毎イベントで読まない（14MB の transcript を秒単位で舐める）。ターン境界に限り、連続する境界は 1 回にまとめる
+  // 毎イベントで読まない（14MB の transcript を秒単位で舐める）。ターン境界と hydration 完了に限り、連続する予約は 1 回にまとめる
   scheduleTranscriptTimeBuckets(): void {
     if (this.host.closed) return;
     if (this.transcriptTimeBucketsReading) {
@@ -212,15 +241,17 @@ export class SessionSemantic {
       this.transcriptTimeBucketsReading = false;
     }
     // /clear・resume で論理セッションが変わっていたら旧セッションの値を載せない
-    if (this.host.closed || logicalGeneration !== this.host.logicalGeneration) return;
-    if (coverage !== undefined) {
-      output.appendLine(`[${this.host.title}] transcript time buckets degraded: ${JSON.stringify(coverage)}`);
+    if (!this.host.closed && logicalGeneration === this.host.logicalGeneration) {
+      if (coverage !== undefined) {
+        output.appendLine(`[${this.host.title}] transcript time buckets degraded: ${JSON.stringify(coverage)}`);
+      }
+      // 読めなかった事実は view の有無に依らず webview へ運ぶ（欠落が消えたときも載せ直す）
+      const coverageChanged = JSON.stringify(coverage) !== JSON.stringify(this.transcriptTimeBucketsCoverage);
+      this.transcriptTimeBucketsCoverage = coverage;
+      if (view !== undefined) this.transcriptTimeBuckets = view;
+      if (view !== undefined || coverageChanged) this.scheduleSemanticModelPost();
     }
-    // 読めなかった事実は view の有無に依らず webview へ運ぶ（欠落が消えたときも載せ直す）
-    const coverageChanged = JSON.stringify(coverage) !== JSON.stringify(this.transcriptTimeBucketsCoverage);
-    this.transcriptTimeBucketsCoverage = coverage;
-    if (view !== undefined) this.transcriptTimeBuckets = view;
-    if (view !== undefined || coverageChanged) this.scheduleSemanticModelPost();
+    // 旧世代の読みを捨てるときも回収する。読みの最中に新しい世代が予約した分は dirty にしか残らない
     if (this.transcriptTimeBucketsDirty) {
       this.transcriptTimeBucketsDirty = false;
       this.scheduleTranscriptTimeBuckets();
@@ -364,7 +395,7 @@ export class SessionSemantic {
     return this.semanticDerivation()?.payload;
   }
 
-  // 導出が例外で欠けたのか、まだ何も無いのかを分けるための理由（R-31）。
+  // 導出が例外で欠けたのか、まだ何も無いのかを分けるための理由（R-DSP-01）。
   // semanticDerivation() が memo を埋めるので、必ず先に通してから読む
   semanticDerivationFailure(): DerivationFailure | null {
     this.semanticDerivation();
@@ -389,7 +420,98 @@ export class SessionSemantic {
       overlaid !== undefined && this.transcriptTimeBucketsCoverage !== undefined
         ? { ...overlaid, timeBucketsCoverage: this.transcriptTimeBucketsCoverage }
         : overlaid;
-    return this.attachLlm(withCoverage);
+    const payload = this.attachLlm(withCoverage, base);
+    if (payload === undefined) return undefined;
+    const work = projectWorkModel(this.host.workModel, this.host.restoredAgents);
+    const conv = this.host.conversation;
+    return {
+      ...payload,
+      roleSummary: deriveRoleSummary({
+        phases: work.phases,
+        unlinkedAgents: work.unlinkedAgents,
+        ...this.externalRuns(conv),
+        rosterEvidence: this.rosterEvidence(),
+      }),
+      failureSummary: deriveFailureSummary(payload.execLogFindings ?? [], work.phases),
+      mainTokens: summarizeMainTokens(this.host.sessionFacts.planUsage),
+    };
+  }
+
+  private externalRunsCache: {
+    ownerId: string;
+    conversation: Session["conversation"];
+    persisted: readonly ExternalRunRecord[];
+    coverage: ExternalRunsCoverage | undefined;
+  } | undefined;
+
+  // 会話の記録はその CLI プロセスの分だけ。再開・CLI の作り直しの後は、保存域の runs.jsonl から同じセッションの記録を
+  // 読み戻して足す（R-ANL-24）。読むのは owner か会話が変わったときに一度だけ、非同期で。読み終えたら送り直す。
+  // 読み終えるまでは前の会話が持っていた分で埋める（CLI を作り直した直後に一覧から消えないように）
+  externalRuns(conv: Session["conversation"]): { externalRuns: ExternalRunRecord[]; externalRunsCoverage?: ExternalRunsCoverage } {
+    const live = externalOf(conv);
+    const owner = this.host.ownerState?.kind === "pinned" ? this.host.ownerState.ownerId : undefined;
+    const directory = this.store.orchestrationRunsDirectory;
+    if (owner === undefined || directory === undefined) return { externalRuns: live };
+    let cache = this.externalRunsCache;
+    if (cache?.ownerId !== owner || cache.conversation !== conv) {
+      const carried = cache?.ownerId === owner ? mergeExternalRuns(externalOf(cache.conversation), cache.persisted) : [];
+      const next = { ownerId: owner, conversation: conv, persisted: carried, coverage: cache?.ownerId === owner ? cache.coverage : undefined };
+      this.externalRunsCache = cache = next;
+      this.externalRunsRead = readSessionExternalRuns(directory, owner)
+        .catch((error: unknown): SessionExternalRuns => {
+          output.appendLine(`[${this.host.title}] [orchestration-runs] read failed: ${String(error)}`);
+          return { runs: [], unreadableLines: 0, readError: true };
+        })
+        .then((read) => {
+          if (this.externalRunsCache !== next || this.host.closed) return;
+          next.persisted = mergeExternalRuns(read.runs, next.persisted);
+          next.coverage = read.unreadableLines > 0 || read.readError ? { unreadableLines: read.unreadableLines, readError: read.readError } : undefined;
+          this.scheduleSemanticModelPost();
+        });
+    }
+    const externalRuns = mergeExternalRuns(live, cache.persisted);
+    return cache.coverage !== undefined ? { externalRuns, externalRunsCoverage: cache.coverage } : { externalRuns };
+  }
+
+  private externalRunsRead: Promise<void> = Promise.resolve();
+
+  flushExternalRuns(): Promise<void> {
+    return this.externalRunsRead;
+  }
+
+  private rosterEvidenceCache: { ownerId: string; persisted: RosterEvidence; serialized: string } | undefined;
+  private rosterEvidenceWrite: Promise<void> = Promise.resolve();
+
+  // 保存済みの記録（セッション ID ごと）と、この会話が起動時・起動フックで記録したものの和。
+  // 注入の記録が一度も無いセッションには書かない（注入していない起動の空記録だけでファイルを作らない）
+  rosterEvidence(): RosterEvidence {
+    const live = this.host.conversation?.rosterEvidence ?? emptyRosterEvidence();
+    const owner = this.host.ownerState?.kind === "pinned" ? this.host.ownerState.ownerId : undefined;
+    const directory = this.store.rosterEvidenceDirectory;
+    if (owner === undefined || directory === undefined) return live;
+    if (this.rosterEvidenceCache?.ownerId !== owner) {
+      const persisted = readRosterEvidence(directory, owner, (line) => output.appendLine(`[${this.host.title}] ${line}`));
+      this.rosterEvidenceCache = { ownerId: owner, persisted, serialized: JSON.stringify(persisted) };
+    }
+    const cache = this.rosterEvidenceCache;
+    const merged = mergeRosterEvidence(cache.persisted, live);
+    const serialized = JSON.stringify(merged);
+    if (serialized !== cache.serialized && hasInjectedRoster(merged)) {
+      cache.persisted = merged;
+      cache.serialized = serialized;
+      this.rosterEvidenceWrite = this.rosterEvidenceWrite
+        .then(() => writeRosterEvidence(directory, owner, merged))
+        .catch((error: unknown) => {
+          // 次の導出で書き直す。記録はメモリに残るので、この起動中の役割付けは変わらない
+          cache.serialized = "";
+          output.appendLine(`[${this.host.title}] [roster-evidence] write failed: ${String(error)}`);
+        });
+    }
+    return merged;
+  }
+
+  flushRosterEvidence(): Promise<void> {
+    return this.rosterEvidenceWrite;
   }
 
   // webview へ送る semantic。導出が失敗している間は最後に送れたものに stale を付けて送り直す。
@@ -418,22 +540,27 @@ export class SessionSemantic {
   // l3.llm を書く唯一の場所。base と base.l3 へ代入しないこと: memo が返すのは
   // 分析を検証したその同一オブジェクトなので、代入すると過去に配った payload まで
   // 遡って書き換わり、同一性で守っている「検証済みの組」が壊れる
-  private attachLlm(base: SemanticModelPayload | undefined): SemanticModelPayload | undefined {
-    if (base?.l3 === undefined) return base;
+  // 鮮度判定は freshnessBase（semanticBasePayload の memo）との同一性で行う。表示用の base は読み直しの重ね・
+  // 被覆の付記で複製になりうるので、それで比べると分析後に何も変わっていなくても「更新あり」になる
+  private attachLlm(
+    base: SemanticModelPayload | undefined,
+    freshnessBase: SemanticModelPayload | undefined
+  ): SemanticModelPayload | undefined {
+    if (base?.l3 === undefined || freshnessBase === undefined) return base;
     if (!llmAnalysisEnabled()) {
       return { ...base, l3: { ...base.l3, llm: { state: "disabled" } } };
     }
     let panelView: AnalysisPanelView;
     if (this.host.llmRun !== null) {
-      const attached = this.host.analysisStore.buildAttachedAnalysisView(base);
+      const attached = this.host.analysisStore.buildAttachedAnalysisView(freshnessBase);
       panelView = attached ? { state: "running", attached } : { state: "running" };
     } else if (this.host.lastAttemptFailedReason !== null) {
-      const attached = this.host.analysisStore.buildAttachedAnalysisView(base);
+      const attached = this.host.analysisStore.buildAttachedAnalysisView(freshnessBase);
       panelView = attached
         ? { state: "attemptFailed", reason: this.host.lastAttemptFailedReason, attached }
         : { state: "attemptFailed", reason: this.host.lastAttemptFailedReason };
     } else if (this.host.persistedArtifacts.length > 0) {
-      const attached = this.host.analysisStore.buildAttachedAnalysisView(base);
+      const attached = this.host.analysisStore.buildAttachedAnalysisView(freshnessBase);
       panelView = attached ? { state: "attached", attached } : { state: "idle" };
     } else {
       panelView = { state: "idle" };

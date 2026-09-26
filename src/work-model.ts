@@ -104,7 +104,7 @@ export interface WorkTotals {
   staleCount: number;
   runningCount: number;
   // 背景 Bash（run_in_background）の実行中数。委任ではないので runningCount（agent の状態数）とは別に持つ。
-  // phase の実行状態はこれも見る。無いと背景 Bash だけが動く phase が「done」と出る（R-19）
+  // phase の実行状態はこれも見る。無いと背景 Bash だけが動く phase が「done」と出る（R-DSP-01）
   backgroundRunningCount?: number;
   // 追跡中の未解決な承認要求。上限で追跡をやめた分はここからも外し、
   // coverage.untrackedApprovalCount へ出す（外さないと解決しても減らせず永久に承認待ちになる）
@@ -232,6 +232,8 @@ export interface WorkTool {
   declaredBackground?: true;
   // Agent の reopen（SendMessage 成功）時刻。経過は直近の開始から数える
   resumedAt?: number;
+  // 直近の通知が運んだ tokens。再通知は置き換えなので、合計へは前回との差だけを入れる（合算すると二重計上）
+  notifiedTokens?: number;
 }
 
 // 背景タスクの相関索引。task id → 元の placement。通知は合成 toolUseId で届くので、これ無しでは
@@ -255,9 +257,11 @@ export interface ToolPlacementIndex {
 
 export interface WorkModelState {
   planDeclaration?: { goal: string; at: number };
+  planBoundaryAt?: number;
   planText?: { turnId: string; text: string; declaredThrough: number; recordEnded?: true };
   planHistory?: PlanHistoryEntry[];
   planHistoryTruncated?: boolean;
+  planHistoryLostThrough?: number;
   revision: number;
   phases: WorkPhase[];
   rollup?: WorkRollup;
@@ -293,6 +297,9 @@ export interface WorkModelState {
 export type WorkModel = WorkModelState;
 export type PlanHistoryEntry = { at: number; kind: "user" } | {
   at: number; kind: "todos"; source?: "tasks"; created?: boolean; removed?: boolean; items: Extract<TaskIntent, { kind: "todo" }>["items"];
+} | {
+  // status / endedAt are the agent's state just before this resume; reopen overwrites them on the agent
+  at: number; kind: "resume"; agentId: string; description: string; status: WorkStatus; endedAt?: number;
 };
 export type WorkSignal = Readonly<NormalizedEvent>;
 
@@ -1610,16 +1617,39 @@ function finishBackground(
   }
 }
 
+// background 委任の tokens は ACK の結果本文に無く、通知だけが運ぶ
+function recordNotifiedTokens(d: Draft, toolUseId: string, tokens: number): void {
+  const placement = draftPlacement(d, toolUseId);
+  if (!placement || placement.agentId === undefined) return;
+  const target = draftTotals(d, placement.phaseRef);
+  if (target) {
+    target.totals.agentTokens += tokens - (placement.notifiedTokens ?? 0);
+    const agent = target.phase ? draftAgent(d, target.phase, placement.agentId) : undefined;
+    if (agent) agent.tokens = tokens;
+  }
+  placement.notifiedTokens = tokens;
+}
+
 // task_notification（合成 toolUseId）。task id で元の placement を引いて閉じる。
-// 観測外・重複・退避後・終端済みは無視する（completed と断言しない）
-function closeBackgroundByNotification(d: Draft, taskId: string, status: string | undefined, timestamp: number): void {
+// 観測外・重複・退避後・終端済みは無視する（completed と断言しない）。tokens だけは終端済みでも
+// 最新の通知で置き換える: 実行中に届いた SendMessage は reopen を経ずに再通知を起こす
+function closeBackgroundByNotification(
+  d: Draft,
+  taskId: string,
+  status: string | undefined,
+  timestamp: number,
+  tokens: number | undefined
+): void {
   const entry = d.next.backgroundTasks[taskId];
-  if (entry === undefined || entry.terminal !== undefined) return;
-  const terminal: "completed" | "failed" | "stale" =
-    status === "completed" ? "completed" : status === "failed" ? "failed" : "stale";
-  draftBackgroundTasks(d)[taskId] = { toolUseId: entry.toolUseId, kind: entry.kind, terminal };
-  const placement = findToolPlacement(d.next, entry.toolUseId);
-  if (placement) finishBackground(d, placement, timestamp, terminal);
+  if (entry === undefined) return;
+  if (entry.terminal === undefined) {
+    const terminal: "completed" | "failed" | "stale" =
+      status === "completed" ? "completed" : status === "failed" ? "failed" : "stale";
+    draftBackgroundTasks(d)[taskId] = { toolUseId: entry.toolUseId, kind: entry.kind, terminal };
+    const placement = findToolPlacement(d.next, entry.toolUseId);
+    if (placement) finishBackground(d, placement, timestamp, terminal);
+  }
+  if (entry.kind === "agent" && tokens !== undefined) recordNotifiedTokens(d, entry.toolUseId, tokens);
 }
 
 // SendMessage 成功（resumedAgentId）: 終端済みの Agent を running へ戻す。running なら何もしない。
@@ -1648,6 +1678,8 @@ function reopenBackground(d: Draft, taskId: string, timestamp: number): void {
     if (wasStale) target.totals.staleCount--;
     const agent = target.phase ? draftAgent(d, target.phase, placement.agentId) : undefined;
     if (agent) {
+      recordPlanHistory(d, { kind: "resume", at: timestamp, agentId: agent.agentId, description: agent.description,
+        status: agent.status, ...(agent.endedAt === undefined ? {} : { endedAt: agent.endedAt }) });
       agent.status = "running";
       agent.endedAt = undefined;
     }
@@ -1704,7 +1736,7 @@ export function markBackgroundUnconfirmed(state: WorkModelState, timestamp: numb
 function handleToolFinish(d: Draft, e: ToolFinishedSignal): void {
   // 通知（合成 toolUseId）は placement を持たない。placement 検索より先に task id で解決する
   if (e.taskNotification !== undefined) {
-    closeBackgroundByNotification(d, e.taskNotification.agentId, e.taskNotification.status, e.timestamp);
+    closeBackgroundByNotification(d, e.taskNotification.agentId, e.taskNotification.status, e.timestamp, e.taskNotification.tokens);
     return;
   }
   // SendMessage の成功結果は「同じ Agent が再び動き出した」観測。SendMessage 自身の終端処理は続ける
@@ -1880,9 +1912,14 @@ function handleSubagentInfo(d: Draft, e: Extract<NormalizedEvent, { kind: "subag
 
 function recordPlanHistory(d: Draft, entry: PlanHistoryEntry): void {
   const history = [...(d.next.planHistory ?? []), entry];
-  // R-DSP-03: bound retained declaration events like tasks, and disclose the missing prefix in PLAN.
-  if (history.length > MAX_TASKS) d.next.planHistoryTruncated = true;
-  d.next.planHistory = history.slice(-MAX_TASKS);
+  while (history.length > MAX_TASKS) {
+    // R-DSP-29: spend the bound on visible steps and requests before hidden generations.
+    const earlier = history.findIndex(row => row.kind !== "user" && row.at < (d.next.planBoundaryAt ?? Number.NEGATIVE_INFINITY));
+    const [lost] = history.splice(earlier < 0 ? 0 : earlier, 1);
+    d.next.planHistoryTruncated = true;
+    d.next.planHistoryLostThrough = Math.max(d.next.planHistoryLostThrough ?? Number.NEGATIVE_INFINITY, lost.at);
+  }
+  d.next.planHistory = history;
 }
 
 function applySignal(d: Draft, signal: WorkSignal): void {
@@ -1954,6 +1991,13 @@ function applySignal(d: Draft, signal: WorkSignal): void {
     case "user_message":
       if (isRequestMessageText(signal.text)) recordPlanHistory(d, { kind: "user", at: signal.timestamp });
       closeSegment(d, signal.timestamp);
+      return;
+    case "compact_boundary":
+      // R-DSP-43: the handoff cuts PLAN; history is not reset because EARLIER REQUESTS counts every generation (R-HND-13).
+      // priorGeneration is the only handoff signal: a plain /compact or auto compact must keep the plan (R-DSP-36).
+      if (signal.priorGeneration !== true) return;
+      d.next.planDeclaration = undefined;
+      d.next.planBoundaryAt = signal.timestamp;
       return;
     default:
       return;

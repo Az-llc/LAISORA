@@ -244,7 +244,7 @@ export class ClaudeLiveNormalizer {
   private resumeSignalToolNames = new Map<string, string>();
   private emittedAssistantUsageMessageIds = new Set<string>();
   private rootAssistantUsage: ReturnType<typeof assistantUsageFromRaw> = {};
-  // ゲートで捨てた task_notification の計数（T0 レビュー M-2）。破棄は fold 到達前で
+  // ゲートで捨てた task_notification の計数。破棄は fold 到達前で
   // EvidenceIndex からは観測できないため、Adapter 側の hash 非入力カウンタとして持つ
   droppedTaskNotificationCount = 0;
 
@@ -452,6 +452,8 @@ export class ClaudeLiveNormalizer {
           // この system メッセージが唯一の搬送形。history 側は注入 user record の XML を
           // parseTaskNotification で読む — 経路ごとに入力の形は違うが出力イベントは同一
           if (typeof record.task_id === "string" && record.task_id.length > 0) {
+            const usage = record.usage as { total_tokens?: unknown } | null | undefined;
+            const tokens = usage?.total_tokens;
             this.emitTaskNotification(
               {
                 agentId: record.task_id,
@@ -461,6 +463,7 @@ export class ClaudeLiveNormalizer {
                 ...(typeof record.status === "string" && record.status
                   ? { status: record.status }
                   : {}),
+                ...(typeof tokens === "number" && Number.isSafeInteger(tokens) && tokens >= 0 ? { tokens } : {}),
               },
               this.taskEndTimes.has(record.task_id)
                 ? { timestamp: this.taskEndTimes.get(record.task_id) }
@@ -661,6 +664,10 @@ export class ClaudeLiveNormalizer {
               );
             }
           }
+          // 別 message の遅延 final が本文を足さずに届いたとき、未ラベルの本文は進行中の message のもの。
+          // ここでラベルを出すと進行中の本文が遅延側の uuid を名乗り、webview はその時点で記録が
+          // 閉じたとみなす（R-CNV-09: 実行中送信の後ろで進行中の記録が割れる）
+          let foreignFinalWithoutText = false;
           if (finalText.length > 0 && !refusalIsErrorProse) {
             const messageId = typeof msgObj?.id === "string" && msgObj.id.length > 0 ? msgObj.id : null;
             // 進行中の message と別の id を名乗る final（＝前ターンの遅延 final が新ターンの
@@ -733,6 +740,7 @@ export class ClaudeLiveNormalizer {
               }
               this.emit({ kind: "assistant_text_delta", turnId, text: localizeLocalCommandReply(record, fallbackText) }, defaultMeta);
             }
+            foreignFinalWithoutText = !isActiveMessage && fallbackText.length === 0;
           }
           // 撤回は「退去させてから、このフレームを正本の置き換えとして扱う」順（sdk.d.ts）。
           // このフレーム自身のラベルより先に出す
@@ -740,7 +748,7 @@ export class ClaudeLiveNormalizer {
           const wireUuid = parseWireUuid(record);
           // 拒否フレームは本文を抑止するが、ストリームで出した本文はもう画面にある。
           // ここでラベルを付けないと、その本文を後から名指しで撤回できない
-          if (wireUuid !== null && this.unlabeledAssistantText && this.currentTurnId !== null) {
+          if (wireUuid !== null && this.unlabeledAssistantText && this.currentTurnId !== null && !foreignFinalWithoutText) {
             this.unlabeledAssistantText = false;
             this.emit(
               { kind: "assistant_message_uuid", turnId: this.currentTurnId, uuid: wireUuid },

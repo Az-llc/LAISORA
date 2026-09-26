@@ -118,8 +118,8 @@ const hostDroppedAtInstall = new Map<string, number>();
 export let activeTabId: string | null = vscode.getState()?.activeTabId ?? null;
 // init が選んだ活性タブ。tabCreated が init 済みのタブを作り直すとき、利用者がその後に別タブへ移っていなければ activate を当てる
 let activeTabAfterInit: string | null = null;
-// タブ毎の下書き退避（レビューP2-3: 共有textareaのままだと誤タブ送信が起きる）。
-// Webviewコンテキスト破棄でも消えないよう vscode state に永続化（codexレビューC1-7）
+// タブ毎の下書き退避（共有textareaのままだと誤タブ送信が起きる）。
+// Webviewコンテキスト破棄でも消えないよう vscode state に永続化
 const drafts = new Map<string, string>(Object.entries(vscode.getState()?.drafts ?? {}));
 // 閉じたタブのID。views はマージ保存なので、明示的に落とさないとエントリが永久に残る。
 const forgottenTabIds = new Set<string>();
@@ -178,12 +178,13 @@ export function persistState(): void {
   if (activeTabId) drafts.set(activeTabId, inputEl.value);
   // 表示モードはWebviewコンテキスト破棄後も維持する（下書きと同じ扱い）。
   // 保存済みの値へ現在のタブ分を上書きマージする。全置換にすると、復元途中など
-  // tabs が揃っていない時点の呼び出しで未登録タブの設定が消える（レビューAR5-C2）。
+  // tabs が揃っていない時点の呼び出しで未登録タブの設定が消える。
   const views: Record<string, ViewMode> = { ...(vscode.getState()?.views ?? {}) };
   const workViews: Record<string, WorkViewMode> = { ...(vscode.getState()?.workViews ?? {}) };
   const analysisViews: Record<string, "script" | "ai"> = { ...(vscode.getState()?.analysisViews ?? {}) };
   const scrollAnchors = { ...savedScrollAnchors() };
   const askChecks = { ...(vscode.getState()?.askChecks ?? {}) };
+  const askDismissed = { ...(vscode.getState()?.askDismissed ?? {}) };
   const out = Object.fromEntries(drafts);
   // 閉じたタブは views / drafts の両方から落とす（AR6-L1）
   for (const id of forgottenTabIds) {
@@ -191,6 +192,7 @@ export function persistState(): void {
     delete workViews[id];
     delete analysisViews[id];
     delete askChecks[id];
+    delete askDismissed[id];
     delete scrollAnchors[id];
     delete out[id];
   }
@@ -198,7 +200,8 @@ export function persistState(): void {
   for (const [id, t] of tabs) workViews[id] = t.workViewMode;
   for (const [id, overview] of overviews) analysisViews[id] = overview.analysisSubtab;
   for (const [id, t] of tabs) scrollAnchors[id] = t.captureScrollCarry(false);
-  const next: PersistedState = { activeTabId, drafts: out, views, workViews, analysisViews, scrollAnchors, askChecks };
+  const { askDismissedMessages, askCheckedMessages } = vscode.getState() ?? {};
+  const next: PersistedState = { activeTabId, drafts: out, views, workViews, analysisViews, scrollAnchors, askChecks, askDismissed, askDismissedMessages, askCheckedMessages };
   vscode.setState(next);
 }
 
@@ -558,7 +561,7 @@ function renderUsage(u: UsageSnapshot | null, contextUsage: Tab["contextUsage"] 
 let cachedUsageFetchedAt = 0;
 // 利用率の枠。utilization の単位は **0-100 のパーセント** に統一する。
 // 生産者が2つ（ライブの rate_limit_event と ~/.claude.json のキャッシュ）あり、どちらも 0-100 で格納する。
-// 片方だけ /100 すると同じ Map に2つのスケールが混在し、表示側の `* 100` で100倍ずれる（敵対レビュー R2）。
+// 片方だけ /100 すると同じ Map に2つのスケールが混在し、そのまま百分率として表示する側で100倍ずれる。
 // SDK型定義は同じ枠(five_hour/seven_day)の兄弟構造に "Percentage of the window used, 0-100"
 // と明記しており、実データ(~/.claude.json)も 0-100。よって 0-100 を正とする。
 export const rateLimits = new Map<string, { utilization: number; resetsAt: number | null; isUsingOverage: boolean }>();
@@ -697,7 +700,7 @@ function applyLlmDiagnosticsMode(mode: boolean | undefined): void {
   }
 }
 
-const REPLAY_MAX = 1500; // 再接続時の同期再生上限（レビューP2-2実害分: 巨大ログでのフリーズ防止）
+const REPLAY_MAX = 1500; // 再接続時の同期再生上限（巨大ログでのフリーズ防止）
 // 応答が来ないままボタンが永久 disabled にならないための保険。Host 側の例外や postMessage の
 // 取りこぼしで inflight が固着する経路が塞げない以上、時間で降ろすしかない
 const HISTORY_REQUEST_TIMEOUT_MS = 30_000;
@@ -779,7 +782,7 @@ function withoutScrollAnchoring<T>(fn: () => T): T {
 }
 
 // 会話面の節点を、視界を保ったまま差し替える（画像スロット → 実画像）。
-// 見えていない面では scrollHeight が動かず計算が成立しないので補正だけ落とす（契約 C8 / R-TAB-07）。
+// 見えていない面では scrollHeight が動かず計算が成立しないので補正だけ落とす（R-TAB-07）。
 // 補正を「差し替える節点が視界の上端より上」に限るのは prepend との違い: prepend は必ず先頭へ挿す
 // ので全量が視界より上だが、画像スロットは視界より下でも差し替わる（drainImageLoadQueue は末尾の
 // スロットから解決する）。下で伸びた分まで足すと、遡って読んでいる利用者の視界がその分だけ飛ぶ。
@@ -989,7 +992,7 @@ export function worklogRenderFailureNote(failedTotal: number): string {
   return l10n.t("⚠ {0} past events failed to render and could not be shown in the execution log", failedTotal);
 }
 
-// 先頭へ積んだ分で検索の件数を数え直す。末尾追記（addBlock）だけで数えると過去の一致が出ない（R-26）
+// 先頭へ積んだ分で検索の件数を数え直す。末尾追記（addBlock）だけで数えると過去の一致が出ない
 function refreshFindAfterPrepend(tabId: string): void {
   if (tabId === activeTabId) refreshFind("end");
 }
@@ -1195,7 +1198,7 @@ function onConvEventChunkResult(
         `expected=${result.expectedConnected} (tab=${tabId})`
     );
   }
-  // 描けなかった件数は進行表示が消える前に会話面へ出す（E-36）。検索の件数も先頭へ積んだ分で数え直す（R-26）
+  // 描けなかった件数は進行表示が消える前に会話面へ出す（E-36）。検索の件数も先頭へ積んだ分で数え直す
   if (result.failed > 0) {
     pager.renderFailedTotal = (pager.renderFailedTotal ?? 0) + result.failed;
     const renderNote = conversationRenderFailureNote(pager.renderFailedTotal);
@@ -1310,14 +1313,14 @@ function onConversationHistoryResult(
     );
   }
   // 読めなかった行の申告は終端（進行表示が消える）より前に出す。消えてからでは
-  // 「読み終わった」が「全部出た」に読まれる（R-32）
+  // 「読み終わった」が「全部出た」に読まれる（R-DSP-03）
   const gapNote = conversationHistoryGapNote(page.coverage);
   // 描画例外で落とした分も同じ注記に並べる（E-36）。events 位相で落ちた分も pager が累計している
   if (result.failed > 0) pager.renderFailedTotal = (pager.renderFailedTotal ?? 0) + result.failed;
   const renderNote = conversationRenderFailureNote(pager.renderFailedTotal ?? 0);
   const historyNote = [gapNote, renderNote].filter((n): n is string => n !== undefined).join(" ");
   if (historyNote.length > 0) t.setConvHistoryNote(historyNote);
-  // 先頭へ積んだ分で検索の件数を数え直す。末尾追記だけで数えると過去の一致が出ない（R-26）
+  // 先頭へ積んだ分で検索の件数を数え直す。末尾追記だけで数えると過去の一致が出ない
   refreshFindAfterPrepend(tabId);
   t.realignScrollAnchor();
   // 描画済みの最古を控える。cursor が無効になったときはここから取り直すので、
@@ -1398,7 +1401,7 @@ function onConversationHistoryError(tabId: string, requestId: string, reason: st
   // これが無いと Host は resume 時点の起点から返し直すので、遡った位置が黙って巻き戻る。
   // events 側（onConvEventChunkError）と同じく追走の状態は落とさない（R-CNV-01）
   // session-scan-failed は「有無を確かめられなかった」。同期ロックや競合は解けるので
-  // 取り直す。終端（exhausted）にすると進行表示が「読み終わった」として消える（R-17）
+  // 取り直す。終端（exhausted）にすると進行表示が「読み終わった」として消える
   const transient =
     reason === "invalid-cursor" ||
     reason === "history-unavailable" ||
@@ -1409,7 +1412,7 @@ function onConversationHistoryError(tabId: string, requestId: string, reason: st
     // （上限 CONV_FIRST_CHUNK_RETRY_MAX）。再読込直後は Host 側で世代更新・登録し直しが重なり、
     // 一過性失敗が連続して「再開」へ落ちる。
     // 0ms の取り直し（下の retried 経路）を先に撃たない: 初回 chunk 前に失う cursor は無く、
-    // 同期ロックが原因なら 0ms 後もロックは解けていないので、その 1 本は必ず無駄になる（R-38）
+    // 同期ロックが原因なら 0ms 後もロックは解けていないので、その 1 本は必ず無駄になる
     if ((pager.firstChunkRetries ?? 0) < CONV_FIRST_CHUNK_RETRY_MAX) {
       pager.firstChunkRetries = (pager.firstChunkRetries ?? 0) + 1;
       pager.cursor = undefined;
@@ -1440,7 +1443,7 @@ function onConversationHistoryError(tabId: string, requestId: string, reason: st
     return;
   }
   pager.status = "error";
-  // 一過性の理由で取り直しを使い切ったことを本文に出す。理由だけだと行き止まりに見える（R-14）
+  // 一過性の理由で取り直しを使い切ったことを本文に出す。理由だけだと行き止まりに見える
   const attempts = pager.receivedTranscriptChunk !== true ? (pager.firstChunkRetries ?? 0) : 1;
   const label = CONV_HISTORY_ERROR_LABELS[reason as ConversationHistoryErrorReason] ?? l10n.t("a failure whose reason could not be determined");
   failConvChaseProgress(
@@ -1461,7 +1464,7 @@ function dropHistoryPager(tabId: string): void {
 
 // 作業ログの履歴ブロックが実際に見えているか。#logs はタブ横断の単一コンテナで、
 // 非表示パネルは display:none なので、見えていないところへ prepend しても
-// scrollHeight が動かず視界維持の計算が成立しない（契約 C8）。視界補正の可否にだけ使い、
+// scrollHeight が動かず視界維持の計算が成立しない。視界補正の可否にだけ使い、
 // 要求の発行条件にはしない（見えていなくても裏で読み進める）
 function historyPaneVisible(tabId: string): boolean {
   const t = tabs.get(tabId);
@@ -1485,7 +1488,7 @@ function mayRequestBackfill(tabId: string): boolean {
   return true;
 }
 
-// 視界補正の可否。見えていないパネルでは scrollHeight が動かず補正の計算が成立しない（契約 C8）
+// 視界補正の可否。見えていないパネルでは scrollHeight が動かず補正の計算が成立しない
 function mayCorrectScroll(tabId: string): boolean {
   return historyPaneVisible(tabId);
 }
@@ -1806,7 +1809,7 @@ function onHistoryChunkResult(
   const usedCursor = pager.cursor;
   // 見えていない面へも描く（概要サブタブ・会話面の間も読み進める）。
   // 見えていないパネルでは scrollHeight が動かず視界維持の計算が成立しないので、
-  // 描画は行い補正だけを落とす（契約 C8 / R-TAB-07）
+  // 描画は行い補正だけを落とす（R-TAB-07）
   const correct = mayCorrectScroll(tabId);
   let result;
   try {
@@ -2311,15 +2314,15 @@ function addTab(snap: TabSnapshot, scrollCarry?: ScrollCarry): Tab {
   // analysis メッセージの行き先解決（analysisTargetTab）に使う
   if (snap.state.resumeSessionId) t.resumeSessionId = snap.state.resumeSessionId;
   // イベント再生が turnState を上書きするため、snapshot の状態を最後に再適用
-  // （レビューP2-5: interrupting が running に退行して二度目の中断が効かなくなる）
+  // （interrupting が running に退行して二度目の中断が効かなくなる）
   t.setTurnState(snap.state.turnState);
   // 表示モードを復元する（Webview再読み込みでも会話/作業ログの選択を維持する）。
-  // persist=false: 復元途中の setState は下書き・他タブの設定を壊す（レビューAR5-C1/C2）
+  // persist=false: 復元途中の setState は下書き・他タブの設定を壊す
   const savedView = vscode.getState()?.views?.[snap.tabId];
   if (savedView === "work") t.setViewMode("work", false, false);
   // 再生中は viewMode が "conv" のため注意表示が付かない。復元後に貼り直す（AR6-M1）
   t.syncConvAttention();
-  // 旧 DOM 参照は作り直しでも消す。位置を初期値（会話は最新 — レビューAR5-M1）へ戻すのは
+  // 旧 DOM 参照は作り直しでも消す。位置を初期値（会話は最新）へ戻すのは
   // 持ち越す位置が無いときだけ。持ち越す位置は applyScrollCarry が入れ、活性化の restoreScroll が最後に当てる
   // （上の setViewMode が途中で #logs を動かしても最終位置にはならない）
   t.resetReplayArtifacts();
@@ -2443,7 +2446,7 @@ function initMessageBus(): void {
     try {
     const raw = e.data;
     // Host からのメッセージも runtime 検証する。isWebviewToHost 側は extension.ts の handleWebviewMessage が
-    // 拒否時に output へ [drop] ログを出すので、ここも同じ扱いにする（無言で捨てない。レビューR2-10）。
+    // 拒否時に output へ [drop] ログを出すので、ここも同じ扱いにする（無言で捨てない）。
     if (!isHostToWebview(raw)) {
       console.warn("[drop] invalid host message", (raw as { type?: unknown })?.type);
       return;
@@ -2501,8 +2504,8 @@ function initMessageBus(): void {
         }
         const first = tabs.keys().next().value ?? null;
         const chosen = activeTabId && tabs.has(activeTabId) ? activeTabId : first;
-        // 再接続時、アクティブタブの下書きを復元してから activate する（codexレビューC2-7:
-        // setActiveTab は同一タブへの切替では textarea を書き換えないため、ここで直接復元する）
+        // 再接続時、アクティブタブの下書きを復元してから activate する。
+        // setActiveTab は同一タブへの切替では textarea を書き換えないため、ここで直接復元する。
         if (chosen) {
           inputEl.value = drafts.get(chosen) ?? "";
           autosizeComposer();
@@ -2920,7 +2923,7 @@ function initMessageBus(): void {
           forgottenTabIds.add(msg.tabId);
           // 閉じたタブがアクティブのままだと、persistState 冒頭の
           // drafts.set(activeTabId, inputEl.value) が直前の delete を打ち消して
-          // ゾンビの下書きを永続化する（レビューAR6-L1）。先に参照を切る。
+          // ゾンビの下書きを永続化する。先に参照を切る。
           if (activeTabId === msg.tabId) activeTabId = null;
           persistState();
           const next = [...tabs.keys()][0] ?? null;
@@ -3041,7 +3044,7 @@ function initComposer(): void {
     if (!t) return;
     if (t.turnState === "idle") send();
     else if (activeTabId) {
-      // 楽観的に interrupting へ（codexレビューC1-3: ホストは interrupting 遷移をイベントで通知しない）
+      // 楽観的に interrupting へ（ホストは interrupting 遷移をイベントで通知しない）
       t.setTurnState("interrupting");
       vscode.postMessage({ type: "interrupt", tabId: activeTabId });
     }
@@ -3080,7 +3083,7 @@ function initComposer(): void {
 
   attachBtn.onclick = () => openFilePicker();
 
-  // 入力量に応じて高さを自動調整（1〜8行）+ 下書きの永続化（codexレビューC1-7）
+  // 入力量に応じて高さを自動調整（1〜8行）+ 下書きの永続化
   inputEl.addEventListener("input", () => {
     autosizeComposer();
     persistState();
@@ -3104,7 +3107,7 @@ function cycleTab(direction: 1 | -1): void {
   const ids = [...tabs.keys()];
   if (ids.length < 2) return;
   const idx = activeTabId ? ids.indexOf(activeTabId) : -1;
-  // current不明時は方向に応じて先頭/末尾へ（レビューAR-L4: -1のままだと-1方向で非対称になる）
+  // current不明時は方向に応じて先頭/末尾へ（-1のままだと-1方向で非対称になる）
   const next =
     idx === -1
       ? direction === 1
@@ -3158,7 +3161,7 @@ function initGlobalShortcuts(): void {
   });
 }
 
-// 矢印キーでのタブ切替（レビューP2-6: tablist セマンティクス）
+// 矢印キーでのタブ切替（tablist セマンティクス）
 function initTabbarKeys(): void {
   tabbarEl.addEventListener("keydown", (e) => {
     if (e.key !== "ArrowLeft" && e.key !== "ArrowRight") return;
@@ -3238,7 +3241,7 @@ function send(): void {
   const text = inputEl.value.trim();
   if (text === "/clear") {
     // /clear はモデルへ送らずローカル処理（CLI組み込みコマンド相当。ホストがセッションを作り直す）
-    // 実行中はローカルで先に拒否し、入力欄は消さない（レビューAR-L3）
+    // R-SES-08: 実行中はローカルで先に拒否し、入力欄は消さない
     const ct = activeTab();
     if (ct && ct.turnState !== "idle") {
       ct.addBlock("system warn", l10n.t("Cannot use /clear during a turn. Wait for completion or interrupt, then try again."));
@@ -3346,10 +3349,10 @@ function send(): void {
   }
   if ((!text && attachmentsOf(activeTabId).length === 0) || !activeTabId) return;
   // ローカル描画はしない。host が user_message イベントとしてログに記録し再送してくる
-  // （snapshot 復元でユーザー発言が消えないように — レビューR1-5）
+  // （snapshot 復元でユーザー発言が消えないように）
   clearComposerInput();
   persistState();
-  // turn_started 往復までの間に2通目が受理されたように見えて消える穴を塞ぐ（codexレビューC1-6）。
+  // turn_started を待たず新規送信を楽観的 running にし、続く送信は実行中ターンへの追加入力として扱う。
   // 実行中の追加送信では state を触らない（既に running。楽観 running 上書きで interrupting が消える）
   const t = activeTab();
   if (t && !running) {

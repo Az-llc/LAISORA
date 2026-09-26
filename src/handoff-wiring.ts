@@ -273,7 +273,7 @@ async function restoreHandoffDetailSource(
   const forkSessionId = session?.resumeSessionId;
   if (session === undefined || forkSessionId === undefined || session.resumeFilePath === undefined) return undefined;
   if (runId !== restoredHandoffRunId(forkSessionId)) return undefined;
-  const key = `${tabId} ${runId}`;
+  const key = `${tabId}\u0000${runId}`;
   const inFlight = handoffDetailRestores.get(key);
   if (inFlight !== undefined) return inFlight;
   const filePath = session.resumeFilePath;

@@ -6,10 +6,14 @@ import { output } from "./host-context";
 import { isSettingsPageToHost } from "./protocol";
 import {
   settingsStateMessage,
+  loadSettingsProfiles,
+  projectConductorPreview,
+  requestModelProfileResearch,
   refreshExternalDetection,
   writeApiKeyPolicy,
   writeAccentSetting,
   writeLearningEnabled,
+  writeProfileSources,
   writeComposerSendKey,
   writeFileLinkSetting,
   writeOrchestrationSetting,
@@ -17,6 +21,7 @@ import {
 } from "./gateway-host-actions";
 
 let settingsPanel: vscode.WebviewPanel | null = null;
+const refreshedPages = new WeakSet<vscode.Webview>();
 
 export function openSettingsPanel(context: vscode.ExtensionContext, detect?: Parameters<typeof refreshExternalDetection>[0]): void {
   if (settingsPanel) {
@@ -51,7 +56,7 @@ export function openSettingsPanel(context: vscode.ExtensionContext, detect?: Par
 
 export function postSettingsState(): void {
   const panel = settingsPanel;
-  if (panel) void panel.webview.postMessage(settingsStateMessage());
+  if (panel) void loadSettingsProfiles().then(() => { if (settingsPanel === panel) void panel.webview.postMessage(settingsStateMessage()); });
 }
 
 export async function handleSettingsPageMessage(webview: vscode.Webview, raw: unknown, detect?: Parameters<typeof refreshExternalDetection>[0]): Promise<void> {
@@ -60,6 +65,13 @@ export async function handleSettingsPageMessage(webview: vscode.Webview, raw: un
     return;
   }
   switch (raw.type) {
+    case "previewConductorInstruction":
+      await loadSettingsProfiles();
+      void webview.postMessage({ type: "conductorPreview", requestId: raw.requestId, ...projectConductorPreview(raw.policy) });
+      return;
+    case "researchModelProfiles":
+      requestModelProfileResearch(raw.targets);
+      break;
     case "openVsCodeSettings":
       await vscode.commands.executeCommand("workbench.action.openSettings", "laisora");
       return;
@@ -86,6 +98,9 @@ export async function handleSettingsPageMessage(webview: vscode.Webview, raw: un
     case "setLearningEnabled":
       await writeLearningEnabled(raw.enabled);
       break;
+    case "setProfileSources":
+      await writeProfileSources(raw.sources);
+      break;
     case "setOrchestrationSetting":
       await writeOrchestrationSetting(raw.setting, raw.value);
       break;
@@ -96,17 +111,27 @@ export async function handleSettingsPageMessage(webview: vscode.Webview, raw: un
   // 書込みを待つ間に閉じられた画面へは送らない（R-DSP-01）
   // 書込みが失敗しても、上位の層が値を持っていても、画面は構成から読み直した値へ戻る（R-DSP-01）。
   // 値が変わらない書込みでは構成変更の通知が出ないことがあるので、成功時もこの返送を省かない。画面の押下ロックは replyTo でだけ解ける
+  if (raw.type === "settingsPageReady" && settingsPanel?.webview === webview) {
+    void webview.postMessage(settingsStateMessage());
+  }
+  if (settingsPanel?.webview !== webview) return; // R-DSP-01
+  if (raw.type === "recheckExternalExecutors" || raw.type === "settingsPageReady" && !refreshedPages.has(webview)) {
+    // R-ORC-39: consume the page's automatic attempt before any await, including failures.
+    refreshedPages.add(webview);
+    const pending = refreshExternalDetection(detect, () => {
+      if (settingsPanel?.webview === webview) void webview.postMessage(settingsStateMessage());
+    });
+    void webview.postMessage(settingsStateMessage());
+    void pending.then(async () => {
+      await loadSettingsProfiles();
+      if (settingsPanel?.webview === webview) void webview.postMessage(settingsStateMessage()); // R-ORC-20: completion belongs to the requesting page.
+    });
+  }
+  await loadSettingsProfiles();
   const reply = settingsStateMessage();
   if (settingsPanel?.webview !== webview) return; // R-DSP-01
   if ("requestId" in raw) reply.replyTo = raw.requestId;
   void webview.postMessage(reply);
-  if (raw.type === "settingsPageReady" || raw.type === "recheckExternalExecutors") {
-    const pending = refreshExternalDetection(detect);
-    void webview.postMessage(settingsStateMessage());
-    void pending.then(() => {
-      if (settingsPanel?.webview === webview) void webview.postMessage(settingsStateMessage()); // R-ORC-20: completion belongs to the requesting page.
-    });
-  }
 }
 
 export function settingsPageHtml(page: { cspSource: string; nonce: string; scriptUri: string; cssUri: string; lang: "ja" | "en" }): string {

@@ -161,13 +161,14 @@ export function estimateTokens(text: string): number {
   return Math.ceil(asciiChars / 4 + nonAsciiChars / 1.5);
 }
 export const EXTERNAL_CAPABILITIES = "Explorer and reviewer external targets are read-only and return only text. Worker Codex targets may edit files under the chosen working directory, never commit, and cannot run the build; the conductor runs checks and commits.";
-export function conductorInstruction(roster: readonly OrchestrationRow[], policy: string, external = orchestrationExternalTargets(roster), deliverySection = ""): string {
+export function conductorInstruction(roster: readonly OrchestrationRow[], policy: string, external = orchestrationExternalTargets(roster), deliverySection = "", modelProfileSection = ""): string {
   const variants = orchestrationVariants(roster);
   const generated = [
-    "Act as the conductor. Pick the role by the kind of work and the variant by difficulty: use the cheapest variant that can do the task, and escalate only after a failed attempt. Delegate using the exact agent key or external target. Model and Effort below are requested settings, not observations of applied values.",
+    "Act as the conductor. Delegate using the exact agent key or external target. Model and Effort below are requested settings, not observations of applied values.",
     ...roster.map((entry) => JSON.stringify({ role: entry.role, description: entry.description,
       agents: variants.filter((variant) => variant.role === entry.role).map(({ agentKey, model, effort }) => ({ agentKey, model, ...(effort ? { effort } : {}) })),
       external: external.filter((target) => target.role === entry.role).map(({ target, executor, model, effort }) => ({ target, executor: externalExecutorName(executor), model, ...(effort ? { effort } : {}) })) })),
+    ...(modelProfileSection ? [modelProfileSection] : []),
     ...(external.length ? [`External targets (${EXTERNAL_EXECUTORS.map((definition) => definition.displayName).join(" and ")}) cost no Claude usage. ${EXTERNAL_CAPABILITIES} Call the run tool of laisora_external with the exact target key.`] : []),
   ].join("\n");
   const instruction = [generated, deliverySection].filter(Boolean).join("\n\n");
@@ -181,7 +182,11 @@ export function isExternalModels(value: unknown): value is ExternalModels {
   return Object.values(value).every((entry) => {
     if (rosterObject(entry, ["state"])) return entry.state === "checking";
     if (rosterObject(entry, ["state", "reason"])) return entry.state === "failed" && typeof entry.reason === "string";
-    return rosterObject(entry, ["state", "models"]) && entry.state === "ok" && Array.isArray(entry.models) && entry.models.length <= 100
+    return rosterObject(entry, ["state", "models", ...(entry && typeof entry === "object" ? ["fetchedAt", "refresh", "refreshReason"].filter(key => key in entry) : [])]) && entry.state === "ok"
+      && (entry.fetchedAt === undefined || typeof entry.fetchedAt === "number" && Number.isFinite(entry.fetchedAt) && entry.fetchedAt > 0)
+      && (entry.refresh === undefined || entry.refresh === "checking" || entry.refresh === "failed")
+      && (entry.refreshReason === undefined || entry.refresh === "failed" && typeof entry.refreshReason === "string")
+      && Array.isArray(entry.models) && entry.models.length <= 100
       && entry.models.every((model) => model && typeof model === "object" && isExternalModel(model.id) && model.id !== ""
         && typeof model.label === "string" && (model.efforts === undefined || rosterEfforts(model.efforts, CODEX_EFFORTS))
         && Object.keys(model).every((key) => ["id", "label", "efforts", "resolvedModel"].includes(key))

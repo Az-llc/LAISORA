@@ -16,7 +16,7 @@ export interface OrchestrationView {
 }
 
 export function orchestrationViewForConversation(conv: ClaudeConversation, current: Partial<ClaudeHostOptions>): OrchestrationView | undefined {
-  if (!conv.orchestrationActive) return undefined; // R-ORC-01
+  if (!conv.orchestrationActive) return undefined; // R-ORC-38
   return projectOrchestrationView(conv.orchestrationRoster, conv.orchestrationExternalRoster,
     conv.orchestrationSettingsChanged(current), conv.observedAgentSettings, conv.observedAgentRuns,
     conv.orchestrationRuns.filter((run) => run.kind === "external"));
@@ -115,7 +115,7 @@ export class OrchestrationViewPublisher {
 
   private flush(): void {
     const view = this.read();
-    if (view === undefined) return; // R-ORC-01
+    if (view === undefined) return; // R-ORC-38
     this.lastPost = Date.now();
     this.post(view);
   }

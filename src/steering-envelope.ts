@@ -23,6 +23,7 @@ export interface SteeringSignalSummary {
   confidence: string;
   firstAt: number;
   lastAt: number;
+  lostMs?: number;
 }
 
 export interface SteeringEnvelopeBody {
@@ -70,7 +71,7 @@ function isRecord(v: unknown): v is Record<string, unknown> {
 
 const ROOT_KEYS = new Set(["schema", "mode", "level", "issuedAt", "trigger", "decision", "signals", "instruction"]);
 const DECISION_KEYS = new Set(["key", "signalIds", "taskId", "recommendedLevel", "autoLevel"]);
-const SIGNAL_KEYS = new Set(["signalId", "kind", "target", "subjectId", "taskId", "count", "confidence", "firstAt", "lastAt"]);
+const SIGNAL_KEYS = new Set(["signalId", "kind", "target", "subjectId", "taskId", "count", "confidence", "firstAt", "lastAt", "lostMs"]);
 const SIGNAL_KINDS = new Set([
   "failure_loop",
   "unsupported_completion",
@@ -85,9 +86,13 @@ const isLevel = (v: unknown): boolean => v === 0 || v === 1 || v === 2 || v === 
 const isFiniteNumber = (v: unknown): v is number => typeof v === "number" && Number.isFinite(v);
 const isOptionalString = (v: unknown): boolean => v === undefined || typeof v === "string";
 
+function lostTimeNote(s: SteeringSignalSummary): string {
+  return s.lostMs !== undefined && s.lostMs >= 60_000 ? `, about ${Math.round(s.lostMs / 60_000)} min lost` : "";
+}
+
 function describeSignals(signals: readonly SteeringSignalSummary[]): string {
   return signals
-    .map((s) => `${s.kind} on ${s.subjectId} (count ${s.count})${s.taskId ? ` task ${s.taskId}` : ""}`)
+    .map((s) => `${s.kind} on ${s.subjectId} (count ${s.count}${lostTimeNote(s)})${s.taskId ? ` task ${s.taskId}` : ""}`)
     .join("; ");
 }
 
@@ -97,7 +102,7 @@ export function steeringInstruction(mode: SteeringMode, signals: readonly Steeri
     const observed = signals
       .map((s) => {
         const onWhat = s.target === "root" ? "the root conversation" : s.subjectId;
-        return `${s.kind} on ${onWhat} (count ${s.count})${s.taskId ? ` task ${s.taskId}` : ""}`;
+        return `${s.kind} on ${onWhat} (count ${s.count}${lostTimeNote(s)})${s.taskId ? ` task ${s.taskId}` : ""}`;
       })
       .join("; ");
     return (
@@ -218,7 +223,8 @@ export function parseSteeringEnvelope(text: string): SteeringParseResult {
       typeof s.confidence !== "string" ||
       !CONFIDENCES.has(s.confidence) ||
       !isFiniteNumber(s.firstAt) ||
-      !isFiniteNumber(s.lastAt)
+      !isFiniteNumber(s.lastAt) ||
+      (s.lostMs !== undefined && (!isFiniteNumber(s.lostMs) || s.lostMs < 0))
     ) {
       return { ok: false, reason: "schema_mismatch" };
     }

@@ -10,6 +10,7 @@ import { postAttachments } from "./composer-io";
 import { releaseConversationHistory } from "./conversation-history";
 import { postOrchestrationView, warmup } from "./conversation-lifecycle";
 import { handoffDetailSources } from "./handoff-wiring";
+import { orchestrationRunsDirectoryOf } from "./orchestration-external";
 import { releaseHistoryWindow } from "./history-window";
 import { extensionContext, output, sinceActivation, store } from "./host-context";
 import { handleWebviewMessage } from "./message-router";
@@ -64,6 +65,10 @@ interface WebviewSurface {
 export class SessionStore {
   readonly sessions = new Map<string, Session>();
   readonly analysisStorage: AnalysisStorage;
+  // ROLES の根拠の保存先（src/roster-evidence.ts）。undefined = 保存しない（検証ハーネス等）
+  readonly rosterEvidenceDirectory: string | undefined;
+  // 外部実行の記録（runs.jsonl）の保存先。ROLES が再開後に読み戻す（R-ANL-24）。undefined = 読まない
+  readonly orchestrationRunsDirectory: string | undefined;
   // 最後に接続したUI面。previousWebview の決定にだけ使う。イベントの配信先ではない
   // （どの面からでも操作できる以上、結果を1面だけへ返すと操作元に何も返らない面ができる）。
   activeWebview: vscode.Webview | null = null;
@@ -91,6 +96,10 @@ export class SessionStore {
     this.analysisStorage = !storage && extensionContext?.globalStorageUri?.fsPath
       ? createAnalysisFileStorage(vscode.Uri.joinPath(extensionContext.globalStorageUri, "analysis-results").fsPath, (line) => output.appendLine(line))
       : fallback;
+    this.rosterEvidenceDirectory = !storage && extensionContext?.globalStorageUri?.fsPath
+      ? vscode.Uri.joinPath(extensionContext.globalStorageUri, "roster-evidence").fsPath
+      : undefined;
+    this.orchestrationRunsDirectory = !storage ? orchestrationRunsDirectoryOf(extensionContext?.globalStorageUri?.fsPath) : undefined;
   }
 
   private readonly surfaces = new Map<vscode.Webview, WebviewSurface>();
@@ -463,11 +472,6 @@ export async function handleSurfaceMessage(
       break;
     }
     case "closeTab": {
-      // 最後の1枚は消さない（空UIを作らない）— 理由をユーザーに通知（レビューP2-7a）
-      if (st.sessions.size <= 1) {
-        void vscode.window.showWarningMessage(l10n.t("LAISORA: The last tab cannot be closed."));
-        break;
-      }
       target!.closed = true;
       pendingAttachments.release(msg.tabId);
       handoffDetailSources.delete(target!.tabId);
@@ -479,17 +483,21 @@ export async function handleSurfaceMessage(
       releaseConversationHistory(historyScopeKey(target!));
       st.sessions.delete(msg.tabId);
       void persistOpenTabs();
+      // R-SES-07: 置き換えの tabCreated は tabClosed より先に送る。逆順だと webview がタブ 0 枚の画面を挟む
+      const replacement = st.sessions.size === 0 ? st.createSession() : null;
+      if (replacement) st.post({ type: "tabCreated", tab: replacement.snapshot(), activate: true });
       st.post({ type: "tabClosed", tabId: msg.tabId });
-      // dispose の完了/失敗は Output に残す（閉鎖後イベントはUIに届かないため — レビューP2-7b）
+      // dispose の完了/失敗は Output に残す（閉鎖後イベントはUIに届かないため）
       void target!
         .disposeConversation()
         .then(() => output.appendLine(`[${target!.title}] タブ閉鎖: dispose 完了`))
         .catch((e) => output.appendLine(`[${target!.title}] タブ閉鎖: dispose 失敗 ${String(e)}`));
+      if (replacement) warmup(replacement);
       break;
     }
     case "clearTab": {
       // /clear: 会話履歴とCLIセッションを破棄し、同タブで新規セッションを開始する。
-      // 実行中・起動中は不可（現在ターンの帰属が曖昧になるため。レビューAR-C1:
+      // 実行中・起動中は不可（現在ターンの帰属が曖昧になるため。R-SES-08:
       // starting 中は send が直後にターンを開始しうるので「実行中」と同等に扱う）
       const s = target!;
       if (s.starting || (s.conversation && s.conversation.state !== "idle")) {
@@ -505,7 +513,7 @@ export async function handleSurfaceMessage(
         await s.disposeConversation();
         // dispose 待ちの間に閉じられていたら何もしない
         if (s.closed) break;
-        // レビューAR-C1: dispose 待機中に並行 send の ensureConversation が新会話を
+        // dispose 待機中に並行 send の ensureConversation が新会話を
         // 生成していた場合、参照切りだけだとCLIプロセスがリークする。ここで破棄する。
         if (s.conversation) {
           const orphan: ClaudeConversation = s.conversation;

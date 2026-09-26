@@ -53,7 +53,7 @@ export function updateClaudeCodeSettings(patch: SettingsPatch): SettingsWriteRes
   } catch (e) {
     // 「ファイルが無い」以外の読み取り失敗（EACCES/EBUSY/EMFILE 等）を空ファイル扱いにすると、
     // hooks・permissions・env などを載せた既存の設定を patch だけの内容で丸ごと消してしまう。
-    // 読めなかったのか、そもそも無いのかを必ず区別する（敵対レビュー R2-HIGH）。
+    // 読めなかったのか、そもそも無いのかを必ず区別する。
     const code = (e as NodeJS.ErrnoException | undefined)?.code;
     if (code !== "ENOENT") {
       output.appendLine(`[settings] 読み取り/解析に失敗したため書き込みを中止: ${String(e)}`);

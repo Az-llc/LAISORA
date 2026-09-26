@@ -14,7 +14,7 @@ import { progressSubjectKey } from "./progress-protocol";
 import type { TaskStatus, WorkCoverage, WorkModelState, WorkStatus } from "./work-model";
 import { findToolPlacement, type WorkAgent, type WorkSegment } from "./work-model";
 import { deriveTimeBuckets, type ChildTranscriptSpan, type TimeBucketView } from "./time-buckets";
-import { deriveExecLogFindings, type ExecLogFindingView, type ExecLogMark } from "./exec-log-marks";
+import { deriveExecLogFindings, execLogFindingsEmptyLabel, type ExecLogFindingView, type ExecLogMark } from "./exec-log-marks";
 
 export const SEMANTIC_MODEL_SPEC_VERSION = 2;
 
@@ -247,6 +247,7 @@ export interface SemanticModel {
   // 実行ログの印と、その飛び先になる所見の見出し（R-TAB-06）。semanticHash 非入力。省略可能（undefined = 未着）
   execLogMarks?: ExecLogMark[];
   execLogFindings?: ExecLogFindingView[];
+  execLogFindingsEmptyLabel?: string;
 }
 
 // baseDir / writes[].canonicalPath は Host-only（流出防止）
@@ -2084,7 +2085,6 @@ export function deriveSemanticModel(
   // evidence.hash 射影外だがモデル出力に影響する入力
   // （humanMessageTimes=cause / firstHumanMessageLine=Goal title / conversationId=Goal nodeId /
   // longGaps=longGapMs・longGapCount）は semanticHash 側の入力列に含める
-  // （r1 M18・r2 M-R2・T1 レビュー r1 H2）
   // fh はユーザー文なので JSON 化で区切り文字インジェクションを封じる（r3 L-R3-1）
   const semanticHash = createHash("sha256")
     .update(
@@ -2140,6 +2140,7 @@ export function deriveSemanticModel(
     ...(evidence.firstHumanMessageText !== undefined ? { firstPromptText: evidence.firstHumanMessageText } : {}),
     execLogMarks: evidence.execLogMarks.marks,
     execLogFindings: deriveExecLogFindings(evidence.execLogMarks.marks),
+    execLogFindingsEmptyLabel: execLogFindingsEmptyLabel(),
   };
   return model;
 }

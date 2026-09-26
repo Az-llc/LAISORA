@@ -406,7 +406,10 @@ export async function openResumedSession(
     if (s.recordedModel === undefined) {
       transcript = await readSessionTranscript(req.filePath, isInSessionStore, readSet, req.sessionId);
       if (s.closed || st.sessions.get(s.tabId) !== s || s.hydration !== hydration || s.logicalGeneration !== hydration.logicalGeneration) {
+        output.appendLine(`[${s.title}] resume aborted: the session changed while reading the recorded model`);
         if (s.hydration === hydration) s.finalizeHydrationFailure(hydration, "cancelled", false);
+        // v4 F-3: /clear（resetLogicalSession）で所有ごと消えた場合は誰も resuming を降ろさない
+        else if (s.hydration === null) s.resuming = false;
         return { tabPosted, session: undefined };
       }
       s.recordedModel = transcript.recordedModel;
@@ -511,7 +514,6 @@ interface DraftEffectSink {
   resolveOwner: { sessionId: string; logicalGeneration: number } | null;
   commandsTouched: boolean;
   liveTurnCompleted: boolean;
-  liveTurnBoundary: boolean;
 }
 
 // draft の fold から出た intent のうち、Session の状態を触らないもの（log）だけを即実行し、
@@ -541,7 +543,7 @@ function applyDraftEffects(effects: readonly FoldEffect[], sink: DraftEffectSink
       case "refresh_tab_title":
       case "schedule_transcript_time_buckets":
         // draft.resuming=true なので foldEventState はこの 2 つを出さない。Phase 3 の
-        // catch-up は sink.liveTurnCompleted / liveTurnBoundary が担う
+        // catch-up は sink.liveTurnCompleted（title）と完了時の無条件の読み直し（time buckets）が担う
         break;
       case "post_events":
       case "schedule_work_model_post":
@@ -684,16 +686,8 @@ function replayJournalInto(
   let dropped = 0;
   for (let i = from; i < to; i++) {
     const entry = journal[i];
-    if (entry.partial.provenance?.path === "live") {
-      if (entry.partial.kind === "turn_completed") sink.liveTurnCompleted = true;
-      if (
-        entry.partial.kind === "turn_started" ||
-        entry.partial.kind === "turn_completed" ||
-        entry.partial.kind === "turn_interrupted" ||
-        entry.partial.kind === "turn_failed"
-      ) {
-        sink.liveTurnBoundary = true;
-      }
+    if (entry.partial.provenance?.path === "live" && entry.partial.kind === "turn_completed") {
+      sink.liveTurnCompleted = true;
     }
     if (entry.verdict !== "accepted") {
       // 破棄する entry でも境界は引き取る。捨てると委任待ちが longGap として
@@ -784,7 +778,6 @@ async function runResumeHydration(st: SessionStore, s: Session, h: ResumeHydrati
     resolveOwner: null,
     commandsTouched: false,
     liveTurnCompleted: false,
-    liveTurnBoundary: false,
   };
   const folded = await foldHistoryEvents(
     draft,
@@ -1001,8 +994,10 @@ async function runResumeHydration(st: SessionStore, s: Session, h: ResumeHydrati
   if (sink.resolveOwner !== null) {
     s.analysisStore.resolveOwnerFromAuthStatus(sink.resolveOwner.sessionId, sink.resolveOwner.logicalGeneration);
   }
-  // buffer 中に抑止した live 境界を一度だけ回収する
-  if (sink.liveTurnBoundary) s.semantic.scheduleTranscriptTimeBuckets();
+  // live 境界の有無に依らず一度読み直す。モデル別の内訳（mainByModel）は読み直しだけが作るので、
+  // 境界を条件にすると再起動後に新しいターンが来ない復元タブは内訳を持たない（R-DSP-39 / R-TAB-07）。
+  // buffer 中に抑止した live 境界もこれで回収される
+  s.semantic.scheduleTranscriptTimeBuckets();
   if (sink.liveTurnCompleted && !s.titleRefreshed && !s.titleRefreshing && !s.closed) {
     s.titleRefreshing = true;
     void refreshTabTitle(s);

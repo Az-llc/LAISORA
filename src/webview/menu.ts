@@ -143,7 +143,7 @@ function menuItems(container: HTMLElement): HTMLElement[] {
 // カーソルを現在の cursorKey から再解決し、クラス・id・aria を貼り直す。
 // メニューを開いた直後と、再構築（renderAuthPicker）の直後に必ず呼ぶ。
 export function syncMenuCursor(container: HTMLElement, idPrefix: string): void {
-  // キー操作の対象でないメニューにカーソルだけ光らせない（レビューAR2-L4の防御）
+  // キー操作の対象でないメニューにカーソルだけ光らせない
   if (menuKbd?.container !== container) return;
   const items = menuItems(container);
   for (const el of items) {
@@ -232,7 +232,7 @@ function onMenuKeydown(e: KeyboardEvent): void {
   if (!menuKbd || menuKbd.container.classList.contains("hidden")) return;
   if (e.isComposing) return; // IME変換確定のEnterを決定として拾わない
   // 修飾キー付きはグローバルショートカット（Ctrl+Tab等）に譲る。ここで拾って
-  // stopPropagation するとメニュー表示中だけタブ切替が死ぬ（レビューAR2-M1）
+  // R-SES-01: stopPropagation するとメニュー表示中だけタブ切替が死ぬ
   if (e.ctrlKey || e.metaKey || e.altKey) return;
   switch (e.key) {
     case "ArrowDown":
@@ -315,7 +315,7 @@ function onMenuKeydown(e: KeyboardEvent): void {
 
 export function closeModeMenu(): void {
   // 閉じる時点でフォーカスがメニュー内にあるならopenerへ戻す。これが無いと
-  // マウスで項目/外側をクリックして閉じた際にフォーカスがbodyへ落ちる（レビューAR2-L1）
+  // マウスで項目/外側をクリックして閉じた際にフォーカスがbodyへ落ちる
   if (menuKbd?.container === modeMenuEl && modeMenuEl.contains(document.activeElement)) {
     menuKbd.opener.focus();
   }

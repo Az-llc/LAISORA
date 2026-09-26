@@ -21,6 +21,21 @@ import type {
 import type { Session } from "./extension";
 import type { SessionStore } from "./store-surfaces";
 
+export function artifactModelLabels(
+  art: PersistedAnalysisArtifact
+): { requestedModel: string; requestedEffort: string; executedModels: string } {
+  return {
+    requestedModel: art.requestedModel.kind === "explicit" ? art.requestedModel.value : l10n.t("Default"),
+    requestedEffort: art.requestedEffort.kind === "explicit" ? art.requestedEffort.value : l10n.t("Default"),
+    executedModels:
+      art.executedModels === null
+        ? l10n.t("Not observable")
+        : art.executedModels.length > 0
+        ? art.executedModels.join("+")
+        : l10n.t("none"),
+  };
+}
+
 // 保存の状態フィールド（persistedArtifacts / baseRefByArtifactId / ownerState 等）は Session に残す。
 // ここは関数だけを持ち、状態は host 経由で読む
 export class SessionAnalysisStore {
@@ -223,8 +238,7 @@ export class SessionAnalysisStore {
     }
 
     const generatedAtLabel = formatGeneratedAtLabel(selectedArt.generatedAt);
-    const reqModel = selectedArt.requestedModel.kind === "explicit" ? selectedArt.requestedModel.value : l10n.t("Default");
-    const reqEffort = selectedArt.requestedEffort.kind === "explicit" ? selectedArt.requestedEffort.value : l10n.t("Default");
+    const { requestedModel: reqModel, requestedEffort: reqEffort, executedModels: modelsLabel } = artifactModelLabels(selectedArt);
     const requestedModelLabel = l10n.t("Requested: {0} / effort: {1}", reqModel, reqEffort);
 
     let executedModelsLabel: string;
@@ -243,17 +257,12 @@ export class SessionAnalysisStore {
     const findingsCount = selectedArt.report.findings.length;
     const rejectedCount = selectedArt.report.rejectedCount;
     const slicesCount = selectedArt.report.slices;
+    // usage の無い結果を 0 tok と書かない（R-DSP-11）
     const tokLabel = selectedArt.report.usage
       ? `${((selectedArt.report.usage.inputTokens + selectedArt.report.usage.outputTokens) / 1000).toFixed(1)}k tok`
-      : "0k tok";
-    const modelsLabel =
-      selectedArt.executedModels === null
-        ? l10n.t("Not observable")
-        : selectedArt.executedModels.length > 0
-        ? selectedArt.executedModels.join("+")
-        : l10n.t("none");
+      : null;
 
-    const summaryLabel = l10n.t("Completed: {0} findings / {1} rejected / {2} / {3} / {4} slices", findingsCount, rejectedCount, modelsLabel, tokLabel, slicesCount);
+    const summaryLabel = l10n.t("Completed: {0} findings / {1} rejected / {2} / {3} / {4} slices", findingsCount, rejectedCount, modelsLabel, tokLabel ?? l10n.t("Tokens not observed"), slicesCount);
     const emptyStateLabel = findingsCount === 0 ? l10n.t("0 verified findings") : undefined;
     const inputCoverageLabel = this.host.inputCoverageLabelByArtifactId.get(selectedArt.artifactId);
 
@@ -277,6 +286,10 @@ export class SessionAnalysisStore {
       return {
         artifactId: a.artifactId,
         label: l10n.t("{0} / {1} findings / {2}", genLabel, a.report.findings.length, shortFreshness),
+        generatedAtLabel: genLabel,
+        freshnessLabel: shortFreshness,
+        findingsCount: a.report.findings.length,
+        ...artifactModelLabels(a),
       };
     });
 
@@ -290,7 +303,7 @@ export class SessionAnalysisStore {
       }
     }
 
-    const findings: AttachedFindingView[] = selectedArt.report.findings.map((f) => {
+    const findings: AttachedFindingView[] = selectedArt.report.findings.map((f, index) => {
       let action: FindingAction;
       if (isCurrent) {
         action = { kind: "startCurrentFinding", label: l10n.t("Start working on this fix") };
@@ -314,6 +327,7 @@ export class SessionAnalysisStore {
       return {
         findingId: f.findingId,
         numberLabel: f.numberLabel,
+        numberDigits: String(index + 1).padStart(2, "0"),
         title: f.title,
         observed: f.observed,
         impactLabel: f.impactLabel,
@@ -338,6 +352,11 @@ export class SessionAnalysisStore {
       persistence,
       persistenceLabel,
       summaryLabel,
+      findingsCount,
+      rejectedCount,
+      modelsLabel,
+      tokensLabel: tokLabel,
+      slicesCount,
       emptyStateLabel,
       ...(inputCoverageLabel !== undefined ? { inputCoverageLabel } : {}),
       historyOptions,

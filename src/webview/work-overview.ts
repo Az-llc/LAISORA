@@ -1,6 +1,8 @@
-import type { PlanUsage } from "../plan-usage";
-import { derivePlanView, normalizePlanContent } from "./plan-view";
+import type { MainTokenTotal, PlanUsage } from "../plan-usage";
+import type { RoleRunView, RoleSummaryView } from "../role-summary";
+import { derivePlanView, planStepKey } from "./plan-view";
 import { renderPlanSection, planDuration, planTokens } from "./plan-panel";
+import { createLoader } from "./loader";
 import { EXECUTORS } from "../orchestration-executors";
 // 状況パネル（概要 / グラフ / 分析 / 実行ログ の 4 タブ）と概要タブ・分析タブの描画。
 // 値は Host の payload（WorkModelPayload / SemanticModelPayload.timeBuckets / execLogMarks）の写しだけを描き、
@@ -13,14 +15,14 @@ import type {
   WorkModelPayload,
 } from "../protocol";
 import type { AnalysisReport } from "../analysis";
-import type { AgentSpanView, TimeBucketView } from "../time-buckets";
-import type { ExecLogFindingView, ExecLogMark } from "../exec-log-marks";
+import type { TimeBucketView } from "../time-buckets";
+import type { ExecLogFindingView, ExecLogMark, FailureKindView, FailureSummaryView } from "../exec-log-marks";
 import { renderAnalysisView } from "./analysis-view";
 import { renderAnalysisFactsView } from "./analysis-facts-view";
 import { vscode } from "./dom";
 import { formatDateTime, formatDuration, clock, dayClock } from "./format";
 import { termSpan, type TermKey } from "./term";
-import { WorkGraph, coverageRows, NO_WORK_SUMMARY_TEXT, agentLabel, type GraphScrollPort } from "./work-graph";
+import { WorkGraph, coverageRows, NO_WORK_SUMMARY_TEXT, type GraphScrollPort } from "./work-graph";
 import { AgentInspector } from "./agent-inspector";
 import * as l10n from "@vscode/l10n";
 
@@ -46,14 +48,16 @@ const NO_FINDINGS_TEXT = l10n.t(
 // 見出しと注記は exec-log-marks.ts の実装（FAILURE_RULES / CONVENTION_RULES）が支えられる範囲だけを言う。
 // 規則表は手選び 3 件の固定配列で、利用者の CLAUDE.md を読まない。
 // 検出の仕組みを変えたら文も直す（R-DSP-01: 実体より強い主張をしない）
-const FINDING_SECTIONS: readonly { family: "failure" | "convention"; title: string; note: string }[] = [
+const FINDING_SECTIONS: readonly { family: "failure" | "convention"; code: string; title: string; note: string }[] = [
   {
     family: "failure",
+    code: "FAIL",
     title: l10n.t("Failure classification"),
     note: l10n.t("Observations of lines where a tool execution returned an error, classified by rules over fixed patterns in the result body. Failures that match no rule are not counted. This is not a determination of cause, so the fix target is attached as a candidate"),
   },
   {
     family: "convention",
+    code: "RULE",
     title: l10n.t("Observed convention violations"),
     note: l10n.t("Observations of whether tool inputs matched the three conventions written in the rule table. CLAUDE.md and rule bodies are not read, so other decisions written there are not judged"),
   },
@@ -84,6 +88,11 @@ function sameMarks(a: readonly ExecLogMark[] | undefined, b: readonly ExecLogMar
   return a.every((m, i) => m.toolUseId === b[i].toolUseId && m.findingAnchor === b[i].findingAnchor && m.label === b[i].label);
 }
 
+// 分析の指標の色。CSS の --wa-<tone> と .wa-tone-<tone> に対応する（R-CNV-36: アクセントの濃淡は図の印だけ）
+type ChartTone = "c1" | "c2" | "c3" | "c4" | "tool" | "unobserved";
+const MODEL_TONES: readonly ChartTone[] = ["c1", "c2", "c3"];
+const ROLE_TONES: readonly ChartTone[] = ["c1", "c2", "c3", "c4"];
+
 // 分析タブのサブタブ。既定はスクリプト分析
 type AnalysisSubtab = "script" | "ai";
 const ANALYSIS_SUBTABS: readonly AnalysisSubtab[] = ["script", "ai"];
@@ -94,8 +103,13 @@ export class WorkOverview {
   private readonly bodyEl: HTMLElement;
   private orchestrationEl: HTMLElement | undefined;
   private readonly analysisEl: HTMLElement;
-  // セッションの実測（R-DSP-15 / R-DSP-16 / R-DSP-17）
+  // 分析の指標（TIME / ROLES / ERR）。スクリプト分析と LLM 分析の両方の上に置く
   private readonly measuredEl: HTMLElement;
+  // 描き直しで開閉を戻さない。キーは役割（other は ""）
+  private readonly expandedRoles = new Set<string>();
+  private errExpanded = false;
+  // 根拠リンクを開いた所見の anchor。描き直しで開閉を戻さない
+  private readonly expandedFindings = new Set<string>();
   // スクリプト分析の所見（実行ログの印の飛び先。R-TAB-06）
   private readonly findingsEl: HTMLElement;
   private readonly logHeadEl: HTMLElement;
@@ -149,6 +163,7 @@ export class WorkOverview {
 
   private execLogMarks: ExecLogMark[] | undefined;
   private execLogFindings: ExecLogFindingView[] | undefined;
+  private execLogFindingsEmptyLabel: string | undefined;
   // 印を貼り終えた行。全行を毎イベント貼り直さない
   private readonly decoratedToolUseIds = new Set<string>();
   // 要約（R-DSP-25）。undefined = 未生成（1 つ目のプロンプトを出す）。
@@ -206,7 +221,7 @@ export class WorkOverview {
     this.referenceEl = div("l3-reference");
     this.referenceEl.appendChild(span("wo-empty", l10n.t("Statistical analysis has not been run yet (use the Analyze button in the history panel 🕘).")));
     this.syncReferenceVisibility();
-    // 実測ヘッダの下にサブタブ 2 枚。同時に見えるのは片方だけ
+    // 分析の指標の下にサブタブ 2 枚。同時に見えるのは片方だけ
     this.subSwitchEl = document.createElement("div");
     this.subSwitchEl.className = "wa-tabs";
     this.subSwitchEl.setAttribute("role", "tablist");
@@ -505,20 +520,12 @@ export class WorkOverview {
     renderPlanSection(this.planSection, view);
   }
 
+  // 分析面は payload を読まない（ERR の件数は semanticModel.failureSummary）。
+  // ここで分析面を描き直すと 120ms ごとに開いた内訳が閉じる
   update(payload: WorkModelPayload | undefined): void {
-    const previousToolCount = this.payload === undefined ? undefined : this.totalToolCount(this.payload);
-    const previousFailCount = this.payload === undefined ? undefined : this.totalFailCount(this.payload);
     this.payload = payload;
     this.summaryDirty = true;
     if (this.mode === "summary") this.render();
-    // 実測ヘッダのツール操作数だけが payload 由来。所見・L3 まで描き直すと 120ms ごとに details の開閉が戻る
-    const measuredChanged =
-      previousToolCount !== (payload === undefined ? undefined : this.totalToolCount(payload)) ||
-      previousFailCount !== (payload === undefined ? undefined : this.totalFailCount(payload));
-    if (this.mode === "analysis" && measuredChanged) {
-      this.renderMeasured();
-    }
-    else if (this.mode !== "analysis" && measuredChanged) this.l3Dirty = true;
     this.graph.update(payload);
   }
 
@@ -531,6 +538,9 @@ export class WorkOverview {
     // 同じ revision でも新しい分析入力を取りこぼさない。
     const shallowAnalysisChanged =
       previous?.timeBuckets !== active?.timeBuckets ||
+      previous?.roleSummary !== active?.roleSummary ||
+      previous?.failureSummary !== active?.failureSummary ||
+      previous?.mainTokens !== active?.mainTokens ||
       previous?.l3 !== active?.l3 ||
       previous?.execLogFindings !== active?.execLogFindings ||
       !sameMarks(this.execLogMarks, active?.execLogMarks);
@@ -539,6 +549,7 @@ export class WorkOverview {
     this.summaryDirty = true;
     this.syncReferenceVisibility();
     this.execLogFindings = active?.execLogFindings;
+    this.execLogFindingsEmptyLabel = active?.execLogFindingsEmptyLabel;
     this.setExecLogMarks(active?.execLogMarks);
     const evidenceChanged = this.analysisEvidenceKey() !== this.renderedAnalysisEvidenceKey;
     if (this.renderedAnalysisValueKey === undefined) {
@@ -663,11 +674,13 @@ export class WorkOverview {
     const semantic = this.activeSemantic();
     return JSON.stringify([
       semantic?.timeBuckets,
+      semantic?.roleSummary,
+      semantic?.failureSummary,
+      semantic?.mainTokens,
       this.execLogFindings,
+      this.execLogFindingsEmptyLabel,
       this.execLogMarks,
       semantic?.l3,
-      this.payload === undefined ? undefined : this.totalToolCount(this.payload),
-      this.payload === undefined ? undefined : this.totalFailCount(this.payload),
       this.llmAnalysisEnabled,
       this.turnRunning,
       this.llmRunning,
@@ -741,191 +754,280 @@ export class WorkOverview {
     return this.semanticView === false ? undefined : this.semanticPayload;
   }
 
-  // セッションの実測。棒 3 本は同一目盛りで、返信待ちは棒に入れない（R-DSP-17）。
-  // 継承時刻の値（null）は棒にも数字にもしない（R-DSP-11）
+  // 値・並び・百分率は Host が決めた形のまま描く。null は測れていない値なので何も描かない
+  // （0 や — で埋めると「無かった」を主張する。R-DSP-11）
   private renderMeasured(): void {
     const head = this.measuredEl;
-    // 描き直しの前に、利用者が開いた details の開閉をツリー順で退避する
-    const prevOpen = Array.from(head.querySelectorAll("details")).map((d) => d.open);
     head.textContent = "";
-    try {
-      this.renderMeasuredBody(head);
-    } finally {
-      const details = Array.from(head.querySelectorAll("details"));
-      if (details.length === prevOpen.length) details.forEach((d, i) => (d.open = prevOpen[i]));
-    }
+    const semantic = this.activeSemantic();
+    const modules = [
+      this.renderTimeModule(semantic?.timeBuckets, semantic?.mainTokens ?? null),
+      this.renderRolesModule(semantic?.roleSummary),
+      this.renderErrModule(semantic?.failureSummary),
+    ].filter((m): m is HTMLElement => m !== null);
+    head.hidden = modules.length === 0;
+    if (modules.length === 0) return;
+    const grid = div("wa-grid");
+    grid.append(...modules);
+    head.appendChild(grid);
   }
 
-  private renderMeasuredBody(head: HTMLElement): void {
-    const view = this.activeSemantic()?.timeBuckets;
-    if (view === undefined || view.firstAt === null || view.lastAt === null) {
-      head.hidden = true;
-      return;
-    }
-    head.hidden = false;
-    head.appendChild(span("wa-head-t", l10n.t("Session measurements")));
-    const when = div("wa-when");
-    const start = document.createElement("b");
-    start.textContent = dayClock(view.firstAt);
-    const end = document.createElement("b");
-    end.textContent = dayClock(view.lastAt);
-    when.append(document.createTextNode(`${l10n.t("Start")} `), start, span("wa-arrow", "→"), document.createTextNode(`${l10n.t("Last")} `), end);
-    const elapsed = span("wa-elapsed", "");
-    elapsed.append(document.createTextNode(`${l10n.t("Elapsed")} `), span("wa-strong", view.spanMs === null ? l10n.t("Not measured") : formatDuration(view.spanMs)));
-    when.appendChild(elapsed);
-    head.appendChild(when);
-    if (view.main.replyMs !== null || view.main.confirmMs !== null) {
-      const idle = div("wa-idle");
-      if (view.main.replyMs !== null) {
-        idle.append(termSpan("Waiting for reply"), document.createTextNode(" "), span("wa-strong", formatDuration(view.main.replyMs)));
-      }
-      if (view.main.confirmMs !== null) {
-        if (view.main.replyMs !== null) idle.appendChild(document.createTextNode(l10n.t(" · ")));
-        idle.append(termSpan("Waiting for your answer"), document.createTextNode(" "), span("wa-strong", formatDuration(view.main.confirmMs)));
-      }
-      head.appendChild(idle);
-    }
-    head.appendChild(this.renderMeasuredFacts(view));
-    const cap = div("wa-cap");
-    cap.append(span("wa-cap-n", l10n.t("Processing time")), span("wa-cap-v", view.bars.totalMs === null ? l10n.t("Not measured") : formatDuration(view.bars.totalMs)));
-    head.appendChild(cap);
+  private metricsModule(kind: "time" | "roles" | "err", code: string, subtitle: string): HTMLElement {
+    const mod = document.createElement("section");
+    mod.className = `wa-mod wa-${kind}`;
+    const head = div("wa-code");
+    head.id = `wa-${kind}-h-${this.tabId}`;
+    const label = document.createElement("b");
+    label.textContent = code;
+    head.append(label, span("wa-code-s", subtitle));
+    mod.setAttribute("aria-labelledby", head.id);
+    mod.appendChild(head);
+    return mod;
+  }
 
-    const mainGen = view.main.generateMs;
-    const mainTool = view.bars.mainMs === null || mainGen === null ? null : Math.max(0, view.bars.mainMs - mainGen);
-    const total = view.bars.totalMs;
-    const rows = div("wa-rows");
-    const bar = (
-      label: Node[],
-      gen: number | null,
-      tool: number | null,
-      sum: number | null,
-      cls: string
-    ) => {
-      const name = div(`wa-rn${cls}`);
-      name.append(...label);
-      const track = div(`wa-bar${cls}`);
-      track.setAttribute("role", "img");
-      if (gen === null || tool === null || sum === null || total === null) {
-        track.classList.add("unmeasured");
-        track.setAttribute("aria-label", l10n.t("Not measured"));
-      } else {
-        const scale = Math.max(1, total);
-        const g = span("wa-seg wa-gen", "");
-        g.style.width = `${Math.round((gen / scale) * 1000) / 10}%`;
-        g.dataset.ms = String(gen);
-        if (gen > 0) g.appendChild(span("wa-seg-v", formatDuration(gen)));
-        const t = span("wa-seg wa-tool", "");
-        t.style.width = `${Math.round((tool / scale) * 1000) / 10}%`;
-        t.dataset.ms = String(tool);
-        if (tool > 0) t.appendChild(span("wa-seg-v", formatDuration(tool)));
-        track.append(g, t);
-        track.setAttribute("aria-label", l10n.t("LLM generation {0}, tool execution {1}", formatDuration(gen), formatDuration(tool)));
-      }
-      const value = div("wa-rt");
-      value.appendChild(span("wa-strong", sum === null ? l10n.t("Not measured") : formatDuration(sum)));
-      if (sum !== null && total !== null && total > 0 && cls !== " wa-total") {
-        value.appendChild(span("wa-sm", `${Math.round((sum / total) * 100)}%`));
-      }
-      rows.append(name, track, value);
+  // 本体だけ（委任は ROLES）。輪の区切りは Host の百分率を CSS の calc で積むだけで、ここで比を計算しない
+  private renderTimeModule(view: TimeBucketView | undefined, tokens: MainTokenTotal | null): HTMLElement | null {
+    if (view === undefined || view.firstAt === null || view.lastAt === null) return null;
+    const mod = this.metricsModule("time", "TIME", l10n.t("Main processing time"));
+    // isTimeBucketsPayload は mainByModel の欠落（旧 payload）を通す
+    const byModel = view.mainByModel ?? null;
+    const totalMs = byModel !== null ? byModel.totalMs : view.bars.mainMs;
+    const totalText = totalMs === null ? l10n.t("Not measured") : formatDuration(totalMs);
+    const segments: { tone: ChartTone; label: Node; ms: number; percent: number | null }[] = [];
+    if (byModel !== null) {
+      byModel.models.forEach((m, i) => {
+        const tone: ChartTone = m.kind === "model" ? MODEL_TONES[i] ?? "c4" : m.kind === "other" ? "c4" : "unobserved";
+        segments.push({ tone, label: document.createTextNode(m.label), ms: m.generateMs, percent: m.percent });
+      });
+      segments.push({ tone: "tool", label: termSpan("Tool execution"), ms: byModel.toolMs, percent: byModel.toolPercent });
+    }
+    const ring = div("wa-ring");
+    ring.setAttribute("role", "img");
+    ring.setAttribute("aria-label", l10n.t("Main processing time {0}", totalText));
+    let at = "";
+    const stops: string[] = [];
+    for (const s of segments) {
+      if (s.percent === null) continue;
+      const from = at === "" ? "0%" : `calc(${at})`;
+      at = at === "" ? `${s.percent}%` : `${at} + ${s.percent}%`;
+      stops.push(`var(--wa-${s.tone}) ${from} calc(${at})`);
+    }
+    if (stops.length > 0) ring.style.background = `conic-gradient(${stops.join(", ")})`;
+    ring.appendChild(span("wa-ring-v", totalText));
+    const legend = div("wa-tl");
+    for (const s of segments) {
+      const row = div("wa-lr");
+      row.dataset.tone = s.tone;
+      const dot = span(`wa-dot wa-tone-${s.tone}`, "");
+      dot.setAttribute("aria-hidden", "true");
+      const name = span("wa-ln", "");
+      name.appendChild(s.label);
+      name.title = name.textContent ?? "";
+      row.append(dot, name, span("wa-lv", formatDuration(s.ms)), span("wa-lp", s.percent === null ? "" : `${s.percent}%`));
+      legend.appendChild(row);
+    }
+    const facts = div("wa-fx");
+    if (tokens !== null) facts.appendChild(span("wa-fx-i", l10n.t("Main ≈{0} tok", planTokens(tokens.tokens))));
+    const start = dayClock(view.firstAt);
+    const end = dayClock(view.lastAt);
+    facts.appendChild(span("wa-fx-i", `${start} → ${start.slice(0, 5) === end.slice(0, 5) ? clock(view.lastAt) : end}`));
+    const wait = (term: TermKey, ms: number | null) => {
+      if (ms === null) return;
+      const item = span("wa-fx-i", "");
+      item.dataset.wait = term;
+      item.append(termSpan(term), document.createTextNode(` ${formatDuration(ms)}`));
+      facts.appendChild(item);
     };
-    const subGen = view.sub.generateMs;
-    const subTool = view.sub.toolMs;
-    bar([document.createTextNode(l10n.t("Total"))], mainGen === null ? null : mainGen + subGen, mainTool === null ? null : mainTool + subTool, total, " wa-total");
-    bar([document.createTextNode(l10n.t("Main"))], mainGen, mainTool, view.bars.mainMs, "");
-    bar([termSpan("Subagent"), span("wa-c", l10n.t("{0} runs", view.agentCount))], subGen, subTool, view.bars.subMs, "");
-    head.appendChild(rows);
-    const key = document.createElement("ul");
-    key.className = "wa-key";
-    for (const [cls, label] of [["wa-gen", "LLM generation"], ["wa-tool", "Tool execution"]] as const) {
-      const li = document.createElement("li");
-      const sw = span(`wa-sw ${cls}`, "");
-      sw.setAttribute("aria-hidden", "true");
-      li.append(sw, termSpan(label));
-      key.appendChild(li);
-    }
-    head.appendChild(key);
-    if (view.agents.length > 0) head.appendChild(this.renderAgentBreakdown(view));
+    wait("Waiting for reply", view.main.replyMs);
+    wait("Waiting for your answer", view.main.confirmMs);
+    legend.appendChild(facts);
+    const body = div("wa-tm");
+    body.append(ring, legend);
+    mod.appendChild(body);
+    return mod;
   }
 
-  private renderMeasuredFacts(view: TimeBucketView): HTMLElement {
-    const facts = div("wa-facts");
-    const concurrency = div("");
-    concurrency.append(
-      span("wa-lbl", l10n.t("Max concurrency")),
-      document.createTextNode(" "),
-      span("wa-strong", String(view.maxConcurrency)),
-      document.createTextNode(l10n.t(" (subagents ")),
-      span("wa-strong", String(view.maxParallelAgents)),
-      document.createTextNode(l10n.t(")"))
-    );
-    facts.appendChild(concurrency);
-    const payload = this.payload;
-    if (payload !== undefined) {
-      const ops = div("");
-      ops.append(
-        span("wa-lbl", l10n.t("Tool operations (errors/total)")),
-        document.createTextNode(" "),
-        span("wa-strong", String(this.totalFailCount(payload))),
-        span("wa-lbl", ` / ${this.totalToolCount(payload)}`)
-      );
-      facts.appendChild(ops);
+  // R-ANL-23: 役割は Host が記録から決めたもの。委任が無ければ区画ごと出さない
+  private renderRolesModule(summary: RoleSummaryView | undefined): HTMLElement | null {
+    if (summary === undefined || (summary.roles.length === 0 && summary.omittedSubagentCount === 0 && summary.externalRunsCoverage === undefined)) return null;
+    const mod = this.metricsModule("roles", "ROLES", l10n.t("By delegated role (press a row for its runs)"));
+    if (summary.roles.length > 0) {
+      const grid = div("wa-rg");
+      const columns = div("wa-rh");
+      columns.setAttribute("aria-hidden", "true");
+      columns.append(span("wa-rh-t", "TIME"), span("wa-rh-k", "TOKENS"));
+      grid.appendChild(columns);
+      summary.roles.forEach((role, i) => {
+        const key = role.role ?? "";
+        const open = this.expandedRoles.has(key);
+        const list = div("wa-rl");
+        list.id = `wa-rl-${this.tabId}-${i}`;
+        list.hidden = !open;
+        for (const run of role.runs) list.appendChild(this.renderRoleRun(run));
+        const row = document.createElement("button");
+        row.type = "button";
+        row.className = "wa-rr";
+        row.dataset.role = key;
+        row.setAttribute("aria-expanded", String(open));
+        row.setAttribute("aria-controls", list.id);
+        const name = span("wa-rname", "");
+        const label = document.createElement("b");
+        label.textContent = role.role === null ? l10n.t("other") : role.label;
+        name.append(label, span("wa-rcount", `×${role.count}`));
+        row.append(
+          this.roleTotal("wa-tv", role.totalMs === null ? null : formatDuration(role.totalMs), role.totalMsPartial, role.running, true),
+          this.roleBar("wa-sb-t", role.timeWidthPercent, role.runs, (run) => run.timePercent),
+          name,
+          this.roleBar("wa-sb-k", role.tokenWidthPercent, role.runs, (run) => run.tokenPercent),
+          this.roleTotal("wa-kv", role.totalTokens === null ? null : planTokens(role.totalTokens), role.totalTokensPartial, role.running, false)
+        );
+        row.onclick = () => {
+          const next = list.hidden;
+          list.hidden = !next;
+          row.setAttribute("aria-expanded", String(next));
+          if (next) this.expandedRoles.add(key);
+          else this.expandedRoles.delete(key);
+        };
+        grid.append(row, list);
+      });
+      mod.appendChild(grid);
     }
-    return facts;
+    if (summary.omittedSubagentCount > 0) {
+      mod.appendChild(div("wa-note")).textContent = l10n.t("{0} subagents folded into the summary are not listed", summary.omittedSubagentCount);
+    }
+    // R-ANL-24 / R-DSP-01: 読めなかった記録があるとき、一覧を外部実行の全件として出さない
+    const external = summary.externalRunsCoverage;
+    if (external !== undefined) {
+      mod.appendChild(div("wa-note wa-note-external")).textContent = external.readError
+        ? l10n.t("The saved external run records could not be read; external runs may be missing")
+        : l10n.t("{0} saved external run records could not be read; external runs may be missing", external.unreadableLines);
+    }
+    return mod;
   }
 
-  // サブエージェントを種別ごと → 体ごとの 2 段で開く（体ごとの開始時刻は出さない — S-4）
-  private renderAgentBreakdown(view: TimeBucketView): HTMLElement {
-    const more = document.createElement("details");
-    more.className = "wa-more";
-    const summary = document.createElement("summary");
-    summary.textContent = l10n.t("View {0} subagent runs by type", view.agents.length);
-    more.appendChild(summary);
-    const byType = new Map<string, AgentSpanView[]>();
-    for (const a of view.agents) {
-      const key = a.subagentType ?? l10n.t("(no type)");
-      const list = byType.get(key) ?? [];
-      list.push(a);
-      byType.set(key, list);
-    }
-    const table = div("wa-types");
-    const head = div("wa-thead");
-    const columns: readonly [string, string][] = [
-      ["", l10n.t("Type")],
-      [" wa-num", l10n.t("Runs")],
-      [" wa-num", l10n.t("LLM generation")],
-      [" wa-num", l10n.t("Tool execution")],
-      [" wa-num", l10n.t("Operations")],
-      [" wa-num", l10n.t("Failures")],
-    ];
-    for (const [cls, text] of columns) {
-      head.appendChild(div(`wa-th${cls}`)).textContent = text;
-    }
-    table.appendChild(head);
-    const num = (n: number) => span(`wa-num${n === 0 ? " wa-zero" : ""}`, String(n));
-    const dur = (ms: number) => span(`wa-num${ms === 0 ? " wa-zero" : ""}`, formatDuration(ms));
-    for (const [type, agents] of byType) {
-      const row = document.createElement("details");
-      row.className = "wa-trow";
-      const rs = document.createElement("summary");
-      const sum = (f: (a: AgentSpanView) => number) => agents.reduce((acc, a) => acc + f(a), 0);
-      rs.append(span("wa-ty", type), num(agents.length), dur(sum((a) => a.generateMs)), dur(sum((a) => a.toolMs)), num(sum((a) => a.toolCount)), (() => {
-        const f = sum((a) => a.failCount);
-        return span(`wa-num${f === 0 ? " wa-zero" : " wa-fail"}`, String(f));
-      })());
-      row.appendChild(rs);
-      const runs = document.createElement("ul");
-      runs.className = "wa-runs";
-      for (const a of agents) {
-        const li = document.createElement("li");
-        li.dataset.toolUseId = a.toolUseId;
-        li.append(span("", agentLabel(a)), dur(a.generateMs), dur(a.toolMs), num(a.toolCount), span(`wa-num${a.failCount === 0 ? " wa-zero" : " wa-fail"}`, String(a.failCount)));
-        runs.appendChild(li);
+  // R-DSP-03: 実行中を含む合計はまだ増える。終わった実行に測れていないものを含む合計は測れた分の和
+  // ローダーは行に 1 つ（時間の側）。トークン側にも置くと同じ印が左右に並ぶ
+  private roleTotal(className: string, text: string | null, partial: boolean, running: boolean, withLoader: boolean): HTMLElement {
+    const el = span(className, "");
+    if (text === null) return el;
+    if (running) {
+      if (withLoader) {
+        const loader = span("wa-running", "");
+        loader.setAttribute("aria-hidden", "true");
+        loader.appendChild(createLoader(12));
+        el.appendChild(loader);
       }
-      row.appendChild(runs);
-      table.appendChild(row);
+      el.appendChild(document.createTextNode(text));
+      el.title = l10n.t("Still running; the value will grow");
+      return el;
     }
-    more.appendChild(table);
-    return more;
+    if (!partial) {
+      el.textContent = text;
+      return el;
+    }
+    const note = span("term-note", text);
+    note.title = l10n.t("Includes runs that were not measured; the value is the total of the measured runs");
+    el.appendChild(note);
+    return el;
+  }
+
+  private roleBar(className: string, widthPercent: number | null, runs: readonly RoleRunView[], percentOf: (run: RoleRunView) => number | null): HTMLElement {
+    const track = span(`wa-sb ${className}`, "");
+    track.setAttribute("aria-hidden", "true");
+    if (widthPercent === null) return track;
+    const fill = span("wa-fill", "");
+    fill.style.width = `${widthPercent}%`;
+    for (const run of runs) {
+      const percent = percentOf(run);
+      if (percent === null) continue;
+      const seg = span(`wa-seg wa-tone-${ROLE_TONES[run.shade] ?? "c4"}`, "");
+      seg.style.width = `${percent}%`;
+      seg.title = `${run.name} · ${run.variantLabel}`;
+      fill.appendChild(seg);
+    }
+    track.appendChild(fill);
+    return track;
+  }
+
+  // 要求値（観測していない値）は「要求」を添えて実測と区別する（R-ANL-23）
+  private renderRoleRun(run: RoleRunView): HTMLElement {
+    const row = div("wa-ri");
+    const dot = span(`wa-dot wa-tone-${ROLE_TONES[run.shade] ?? "c4"}`, "");
+    dot.setAttribute("aria-hidden", "true");
+    const variant = span("wa-mx", "");
+    variant.title = run.variantLabel;
+    const part = (text: string, requested: boolean) => {
+      if (variant.childNodes.length > 0) variant.appendChild(document.createTextNode(" · "));
+      variant.appendChild(document.createTextNode(text));
+      if (!requested) return;
+      const mark = span("wa-req", l10n.t("requested"));
+      mark.title = l10n.t("Requested value; the applied value was not observed");
+      variant.appendChild(mark);
+    };
+    part(run.executor, false);
+    if (run.model !== null) part(run.model, run.modelSource === "requested");
+    if (run.effort !== null) part(run.effort, run.effortSource === "requested");
+    row.append(
+      dot,
+      span("wa-rn", run.name),
+      variant,
+      run.durationMs === null ? this.unmeasuredCell() : span("wa-v", formatDuration(run.durationMs)),
+      run.tokens === null ? this.unmeasuredCell() : span("wa-v", planTokens(run.tokens))
+    );
+    return row;
+  }
+
+  // R-DSP-11: 測れていない実行の値は 0 にせず — で示す
+  private unmeasuredCell(): HTMLElement {
+    const el = span("wa-v wa-unmeasured", "—");
+    el.title = l10n.t("Not measured");
+    return el;
+  }
+
+  // R-DSP-40: 上位 3 種と残りの分割・並びは Host が決める
+  private renderErrModule(summary: FailureSummaryView | undefined): HTMLElement | null {
+    if (summary === undefined) return null;
+    const mod = this.metricsModule("err", "ERR", l10n.t("Failures"));
+    const figure = div("wa-gv");
+    figure.append(span("wa-gv-n", String(summary.failCount)), span("wa-gv-d", l10n.t("/ {0} tool calls", summary.toolCount)));
+    const ratio = div("wa-ratio");
+    ratio.setAttribute("aria-hidden", "true");
+    if (summary.failPercent !== null) {
+      const fill = span("wa-ratio-f", "");
+      fill.style.width = `${summary.failPercent}%`;
+      ratio.appendChild(fill);
+    }
+    mod.append(figure, ratio);
+    const counters = (kinds: readonly FailureKindView[]): HTMLElement => {
+      const box = div("wa-ctr");
+      for (const kind of kinds) {
+        const label = span("wa-kn", kind.label);
+        label.title = kind.label;
+        label.dataset.anchor = kind.anchor;
+        box.append(label, span("wa-kc", String(kind.count)));
+      }
+      return box;
+    };
+    if (summary.top.length > 0) mod.appendChild(counters(summary.top));
+    if (summary.restCount > 0) {
+      const rest = counters(summary.rest);
+      rest.classList.add("wa-ctr-rest");
+      rest.id = `wa-err-rest-${this.tabId}`;
+      rest.hidden = !this.errExpanded;
+      const more = document.createElement("button");
+      more.type = "button";
+      more.className = "wa-more";
+      more.textContent = l10n.t("+{0} kinds", summary.restCount);
+      more.setAttribute("aria-expanded", String(this.errExpanded));
+      more.setAttribute("aria-controls", rest.id);
+      more.onclick = () => {
+        this.errExpanded = rest.hidden;
+        rest.hidden = !this.errExpanded;
+        more.setAttribute("aria-expanded", String(this.errExpanded));
+      };
+      mod.append(more, rest);
+    }
+    return mod;
   }
 
   // スクリプト分析の所見（実行ログの印の飛び先。R-TAB-06）。今回の件数だけを出す。累計は数えていないので出さない（R-DSP-11）
@@ -942,56 +1044,97 @@ export class WorkOverview {
       box.appendChild(span("wa-quiet", NO_FINDINGS_TEXT));
       return;
     }
-    for (const { family, title, note } of FINDING_SECTIONS) {
+    for (const { family, code, title, note } of FINDING_SECTIONS) {
       const rows = findings.filter((f) => f.family === family);
-      if (rows.length === 0) continue;
-      const headEl = span("wa-sec-h", title);
+      const section = document.createElement("section");
+      section.className = "wa-fsec";
+      section.dataset.family = family;
+      const head = div("wa-code");
+      head.id = `wa-fsec-${family}-${this.tabId}`;
+      const label = document.createElement("b");
+      label.textContent = code;
+      const headEl = span("wa-code-s wa-sec-h", title);
       headEl.title = note;
       headEl.setAttribute("aria-description", note);
       headEl.tabIndex = 0;
-      box.appendChild(headEl);
-      this.renderFindingRows(box, rows);
+      head.append(label, headEl);
+      section.setAttribute("aria-labelledby", head.id);
+      section.appendChild(head);
+      // R-DSP-10: 印が 0 件の family も見出しを残し、Host の「該当なし」を置く
+      if (rows.length === 0) {
+        if (this.execLogFindingsEmptyLabel !== undefined) section.appendChild(div("wa-fsec-empty")).textContent = this.execLogFindingsEmptyLabel;
+      } else {
+        const list = div("llm-finding-cards");
+        this.renderFindingRows(list, rows);
+        section.appendChild(list);
+      }
+      box.appendChild(section);
     }
   }
 
-  private renderFindingRows(box: HTMLElement, findings: readonly ExecLogFindingView[]): void {
+  // 番号・件数の単位・根拠の開閉の文言・リンクの #n は Host（exec-log-marks.ts）が組んだ値をそのまま置く
+  private renderFindingRows(list: HTMLElement, findings: readonly ExecLogFindingView[]): void {
     for (const f of findings) {
-      const row = div("wa-find");
+      const row = document.createElement("article");
+      row.className = "llm-finding-card wa-find";
       row.dataset.findingAnchor = f.anchor;
       row.dataset.family = f.family;
       row.tabIndex = -1;
-      // 行の主語は観測した事象。直す先はタグ（プロジェクト / ルール / 設定 / skill）付きの候補として
-      // 後ろに添える（R-DSP-01）。累計は数えていないので出さない（R-DSP-11）
-      const nameEl = span("wa-find-n", f.label);
-      row.append(nameEl, span("wa-find-c", l10n.t("This time {0}", f.count)));
+      row.appendChild(div("llm-finding-num llm-finding-digits wa-find-num")).textContent = f.numberDigits;
+      const body = div("llm-finding-body");
+      // 行の主語は観測した事象。直す先は候補として添える（R-DSP-01）。置き場所のタグ（category）は出さない
+      body.appendChild(div("llm-finding-title wa-find-n")).textContent = f.label;
       if (f.fixCandidate !== undefined) {
-        // .wa-sm はチップ側の「ほか N 件」と共用。候補だけを引ける class を必ず持たせる
-        const fix = span("wa-sm wa-find-fix", "");
-        if (f.category !== undefined) fix.appendChild(span("wa-badge", f.category));
-        fix.appendChild(document.createTextNode(l10n.t("Candidate: {0}", f.fixCandidate)));
+        const fix = document.createElement("p");
+        fix.className = "llm-finding-action wa-find-fix";
+        fix.textContent = l10n.t("Candidate: {0}", f.fixCandidate);
         fix.title = l10n.t("A common fix target for this classification. It has not been confirmed that this line was caused by it");
-        row.appendChild(fix);
+        body.appendChild(fix);
       }
       const nav = this.toolEvidence;
       const marks = (this.execLogMarks ?? []).filter((m) => m.findingAnchor === f.anchor && nav?.has(m.toolUseId) === true);
       if (marks.length > 0 && nav !== undefined) {
-        const chips = div("wa-chips");
+        const links = div("llm-finding-evidence wa-ev");
+        links.id = `wa-ev-${this.tabId}-${f.anchor}`;
+        links.hidden = !this.expandedFindings.has(f.anchor);
+        const lineLabel = l10n.t("Execution log line");
         for (const m of marks.slice(0, 12)) {
-          const chip = document.createElement("button");
-          chip.type = "button";
-          chip.className = "wa-chip";
-          chip.textContent = l10n.t("Execution log line ›");
-          chip.title = m.toolUseId;
-          chip.onclick = () => this.onViewChange(() => {
+          const link = document.createElement("button");
+          link.type = "button";
+          link.className = "llm-evidence-chip wa-ev-link";
+          link.textContent = `${m.ordinalLabel} ›`;
+          link.title = lineLabel;
+          link.setAttribute("aria-label", l10n.t("Execution log line {0}", m.ordinalLabel));
+          link.onclick = () => this.onViewChange(() => {
             this.setMode("log");
             nav.navigate(m.toolUseId);
           });
-          chips.appendChild(chip);
+          links.appendChild(link);
         }
-        if (marks.length > 12) chips.appendChild(span("wa-sm", l10n.t("{0} more", marks.length - 12)));
-        row.appendChild(chips);
+        if (marks.length > 12) links.appendChild(span("wa-ev-more", l10n.t("{0} more", marks.length - 12)));
+        const toggle = document.createElement("button");
+        toggle.type = "button";
+        toggle.className = "wa-ev-toggle";
+        toggle.textContent = f.evidenceLabel;
+        toggle.setAttribute("aria-expanded", String(!links.hidden));
+        toggle.setAttribute("aria-controls", links.id);
+        toggle.onclick = () => {
+          const open = links.hidden;
+          links.hidden = !open;
+          toggle.setAttribute("aria-expanded", String(open));
+          if (open) this.expandedFindings.add(f.anchor);
+          else this.expandedFindings.delete(f.anchor);
+        };
+        body.append(toggle, links);
       }
-      box.appendChild(row);
+      row.appendChild(body);
+      const margin = document.createElement("aside");
+      margin.className = "llm-finding-margin wa-find-margin";
+      const figure = div("llm-finding-impact wa-find-c");
+      figure.append(document.createTextNode(String(f.count)), span("wa-find-unit", f.countUnit));
+      margin.appendChild(figure);
+      row.appendChild(margin);
+      list.appendChild(row);
     }
   }
 
@@ -1012,7 +1155,7 @@ export class WorkOverview {
   setOrchestration(state: OrchestrationView | undefined): void {
     this.planOrchestration = state;
     this.renderPlan();
-    if (state === undefined) { // R-ORC-01, R-ORC-21
+    if (state === undefined) { // R-ORC-38, R-ORC-21
       this.orchestrationEl?.remove();
       this.orchestrationEl = undefined;
       return;
@@ -1360,6 +1503,7 @@ export class WorkOverview {
     heading.className = "earlier-label";
     heading.textContent = `EARLIER REQUESTS · ${blocks.length}`;
     earlier.append(heading);
+    if (this.payload?.planHistoryTruncated) earlier.append(span("plan-lede earlier-partial", l10n.t("Some earlier request details are unavailable.")));
     if (!blocks.length) earlier.append(span("earlier-empty", l10n.t("No earlier requests available.")));
     const shown = this.flowExpanded ? blocks : blocks.slice(0, EARLIER_LIMIT);
     for (const block of shown) {
@@ -1372,7 +1516,8 @@ export class WorkOverview {
       const at = span("earlier-at", block.anchorAt > 0 ? `${monthDay(block.anchorAt)} ${clock(block.anchorAt)}` : "—");
       at.title = formatDateTime(block.anchorAt);
       const history = this.payload?.planHistory?.filter(entry => entry.kind === "todos" && entry.at >= block.start && (entry.at < block.end || block === view?.blocks.at(-1) && entry.at === block.end));
-      const steps = new Set(history?.flatMap(entry => entry.kind === "todos" ? entry.items.map(item => normalizePlanContent(item.description)) : []));
+      // R-DSP-34: 手順数は宣言（kind "todos"）だけ。委任の再開（kind "resume"）は宣言ではないので数えない。同一性は PLAN と同じ planStepKey
+      const steps = new Set(history?.flatMap(entry => entry.kind === "todos" ? entry.items.map(item => planStepKey(entry, item)) : []));
       const count = history?.length ? String(steps.size) : "—";
       const usage = this.planUsage?.blocks.find(value => value.blockId === block.blockId);
       const elapsed = span("earlier-elapsed", planDuration(block.durationMs));

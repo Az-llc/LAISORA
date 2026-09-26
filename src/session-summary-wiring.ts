@@ -147,8 +147,8 @@ export class SessionSummaryWiring {
       const { userTexts, toolCalls, agentCount, readFailure } = await this.collectSummaryInput();
       if (this.supersededSince(logicalGenerationAtStart)) return;
       if (userTexts.length === 0) {
-        // 「記録が無い」と「記録を確かめられなかった」を分ける。読み直しに失敗しただけのときに
-        // 前者を名乗ると、発言が多数あるセッションについて存在の否定を断言する（R-30）
+        // R-SES-09。「記録が無い」と「記録を確かめられなかった」を分ける。読み直しに失敗しただけのときに
+        // 前者を名乗ると、発言が多数あるセッションについて存在の否定を断言する
         const reason =
           readFailure === undefined
             ? "要約する記録がまだありません"
@@ -216,8 +216,8 @@ export class SessionSummaryWiring {
   // 切り詰めが起きているセッションでは JSONL（全期間の集計と同じ出所 — R-TAB-07 の whole-session 経路）
   // から読み直す。JSONL が読めなければ切り詰め済みイベント列で代用し、readFailure に理由を載せる。
   // 分類は「どこで失敗したか」だけで決める。例外文の部分一致で原因を名乗ると、OS の別の失敗まで
-  // 同じ対処へ誘導する（R-28 と同型）。readFailure を「読めたが空だった」ときに立てないこと。
-  // 立てると、発言の無いセッションについて「読めませんでした」と逆向きの誤りを断言する（R-30）
+  // 同じ対処へ誘導する（R-DSP-01 と同型）。readFailure を「読めたが空だった」ときに立てないこと。
+  // 立てると、発言の無いセッションについて「読めませんでした」と逆向きの誤りを断言する（R-DSP-01）
   private async collectSummaryInput(): Promise<{
     userTexts: string[];
     toolCalls: number;

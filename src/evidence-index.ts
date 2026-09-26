@@ -552,7 +552,7 @@ function foldGapScan(
 }
 
 // gap 走査は本体の後に置く: foldEvidenceBody が throw したときに、記録済み gap を
-// 失ったまま lastAt だけ進んだ index を残さない（T1 レビュー r1 M1）
+// 失ったまま lastAt だけ進んだ index を残さない
 export function foldEvidence(
   index: SemanticEvidenceIndex,
   event: NormalizedEvent,

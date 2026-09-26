@@ -9,8 +9,13 @@ export interface ExternalModel {
   readonly efforts?: readonly string[];
 }
 export type ExternalModelList = { state: "ok"; models: readonly ExternalModel[] } | { state: "failed"; reason: string };
-export type ExternalModelsState = ExternalModelList | { state: "checking" };
+export type ExternalModelsState = (Extract<ExternalModelList, { state: "ok" }> & { fetchedAt?: number; refresh?: "checking" | "failed"; refreshReason?: string })
+  | Extract<ExternalModelList, { state: "failed" }> | { state: "checking" };
 export type ExternalModels = Record<ExecutorId, ExternalModelsState>;
+
+export function claudeModelIdLabel(model: string): string {
+  return model.replace(/\[1m\]$/, "").replace(/-\d{8}$/, "");
+}
 
 export const AGY_EFFORTS = ["low", "medium", "high"] as const;
 export function splitAgyModel(id: string): { model: string; effort: string } {
@@ -167,7 +172,7 @@ export const EXECUTORS: Record<ExecutorId, ExecutorDefinition> = {
     }),
     listModels: async (probe) => {
       const result = await probe.capture(["models"]);
-      if (result.timeout || result.code !== 0 || result.reason || result.output.length > 1_000_000) return { state: "failed", reason: result.timeout ? "timeout" : "model-list-failed" }; // R-ORC-12
+      if (result.timeout || result.code !== 0 || result.reason || result.output.length > 1_000_000) return { state: "failed", reason: result.timeout ? "timeout" : result.spawnCode === "ENOENT" ? "not-installed" : "model-list-failed" }; // R-ORC-12
       return parseAgyModels(result.output);
     },
   },
@@ -197,6 +202,15 @@ export const EXTERNAL_EXECUTORS = Object.values(EXECUTORS).filter((definition): 
 export const DEFAULT_EXECUTOR = Object.values(EXECUTORS).find((definition) => definition.kind === "agent")!.id;
 export function executorModelList(executor: ExecutorId, lists?: ExternalModels): ExternalModelsState | undefined {
   return lists?.[executor];
+}
+export function modelSelectionState(executor: ExecutorId, list: ExternalModelsState | undefined, detection: ExternalDetection) {
+  const missing = detection.state === "notInstalled";
+  return {
+    choices: EXECUTORS[executor].models(list),
+    checking: executor !== "claude" && list?.state !== "ok" && (detection.state === "checking" || list?.state === "checking"),
+    manual: executor !== "claude" && (missing || list?.state !== "ok"),
+    refreshFailed: !missing && (list?.state === "failed" || list?.state === "ok" && list.refresh === "failed"),
+  };
 }
 export function rowEfforts(row: ExecutorRow, lists?: ExternalModels): readonly string[] {
   const definition = EXECUTORS[row.executor];

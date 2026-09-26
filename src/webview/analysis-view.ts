@@ -21,7 +21,7 @@ function toolTable(tools: ToolStat[]): HTMLTableElement {
   ]), tools.map((tool) => tool.elapsedMs));
 }
 
-// 未計測だけ「—」、測れた 0 は 0（R-25 / R-DSP-11）
+// 未計測だけ「—」、測れた 0 は 0（R-DSP-11）
 function spanAgentTokensText(span: SpanStat): string {
   if (span.agentTokensUnmeasured === "all") return "—";
   return span.agentTokensUnmeasured === "partial" ? l10n.t("{0} (partially not measured)", formatTokenCount(span.agentTokens)) : formatTokenCount(span.agentTokens);
@@ -103,7 +103,7 @@ function baselineLegend(report: AnalysisReport): HTMLElement | null {
 }
 // 読めなかった行があることを、判定と同じ画面に出す。判定そのものは格上げしない
 // （観測していないシグナルを主張しないため）。注記が無いと、破損した記録が
-// 「通常どおり」という肯定的な安全宣言になる（R-29。R-DSP-01 / R-DSP-03）
+// 「通常どおり」という肯定的な安全宣言になる（R-DSP-01 / R-DSP-03）
 function appendCoverageNote(container: HTMLElement, report: AnalysisReport): void {
   const text = report.coverage?.note;
   if (!text) return;
@@ -118,7 +118,7 @@ function scopedNoneText(report: AnalysisReport, whole: string, scoped: string): 
   return report.coverage?.note ? scoped : whole;
 }
 
-// 走査の失敗を「比較できるベースラインがない」と言い換えない（R-34）。文言は Host が
+// 走査の失敗を「比較できるベースラインがない」と言い換えない（R-DSP-01）。文言は Host が
 // baselineNote に組み立てて渡す。ここで baselineMode を見て分岐すると、読めなかった件数を
 // 知らないまま否定を断言することになる
 function appendBaselineNote(container: HTMLElement, report: AnalysisReport): void {

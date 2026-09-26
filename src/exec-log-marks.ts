@@ -15,21 +15,32 @@ export interface ExecLogMark {
   label: string;
   // 分析タブ側の所見の anchor。producer は必ず付ける。無い印は表示側が貼らない
   findingAnchor?: string;
+  // 同じ findingAnchor の印の中での出現順（"#3"）。分析タブの根拠リンクの表示文字で、webview は採番しない（VND-S6）
+  ordinalLabel: string;
 }
 
 // 分析タブに出す所見の見出し（印の飛び先）。count は今回のセッションで印が付いた行数。
 // label は観測した事象、fixCandidate は「その事象でよくある直す先」の候補で、断定ではない（R-DSP-01）。
-// category は候補の置き場所のタグ（プロジェクト / ルール / 設定 / skill）で、候補の無い分類には付けない
+// category は候補の置き場所のタグ（プロジェクト / ルール / 設定 / skill）で、候補の無い分類には付けない。画面には出さない。
+// numberDigits は family ごとの 01 始まりの番号。番号・単位・根拠の開閉の文言は webview で組まない（VND-S6）
 export interface ExecLogFindingView {
   anchor: string;
   family: ExecLogMarkFamily;
   label: string;
   count: number;
+  numberDigits: string;
+  countUnit: string;
+  evidenceLabel: string;
   category?: string;
   fixCandidate?: string;
 }
 
 export const MAX_EXEC_LOG_MARKS = 4096;
+
+// 所見が導出できたうえで印が 0 件の family に置く 1 行。未着（導出前・失敗）には使わない（R-DSP-10）
+export function execLogFindingsEmptyLabel(): string {
+  return l10n.t("No matching records");
+}
 
 interface FailureRule {
   anchor: string;
@@ -48,12 +59,12 @@ interface ConventionRule {
   matches(input: string): boolean;
 }
 
-// 失敗の分類。label は結果本文から観測できる事象だけを言い、原因は fixCandidate へ落とす（R-DSP-01。R-53 D-4 / D-6 / D-11）。
+// 失敗の分類。label は結果本文から観測できる事象だけを言い、原因は fixCandidate へ落とす（R-DSP-01。D-4 / D-6 / D-11）。
 // **並び順が判定の一部**: 複数の規則に当たる行には先頭の 1 つだけが付く。特異な規則が先。
 // 特に fail:script は fail:syntax より前に置く。Python の Traceback は末尾が SyntaxError のことがあり、
-// 後ろに置くと実行時エラー 18 件（実測）に「シェル引数の書き方」が候補として付く（R-53 D-4 の欠陥そのもの）。
+// 後ろに置くと実行時エラー 18 件（実測）に「シェル引数の書き方」が候補として付く（D-4 の欠陥そのもの）。
 // パターンはハーネス／ツールが出す定型文に固定する。一般英単語（permission・not allowed 等）へ広げると
-// diff 出力中のソース識別子にまで当たる（R-53 D-6 実測 5/13 が偽）
+// diff 出力中のソース識別子にまで当たる（D-6 実測 5/13 が偽）
 const FAILURE_RULES: readonly FailureRule[] = [
   { anchor: "fail:rejected", get label() { return l10n.t("A human stopped the execution"); }, pattern: HUMAN_REJECTED_TOOL_RESULT_RE },
   { anchor: "fail:guard", get label() { return l10n.t("A guard stopped the execution"); }, pattern: /This agent is isolated in the worktree|Refusing to use|Blocked: / },
@@ -77,7 +88,7 @@ const CONVENTION_RULES: readonly ConventionRule[] = [
 ];
 
 // 規約の趣旨は「別セッションが同一ワークツリーで作業しうるので、commit へ全ツリーを巻き込まない」。
-// `-A` の字面ではなく pathspec の有無で判定する（実測 40 件中 38 件は範囲限定・1 件は --dry-run。R-53 D-8）。
+// `-A` の字面ではなく pathspec の有無で判定する（実測 40 件中 38 件は範囲限定・1 件は --dry-run。D-8）。
 // inputPreview は input の JSON なので、コマンド中の改行は `\n` の 2 文字で入る。区切りに直さないと
 // 次のコマンド名が pathspec に見えて、唯一の真の違反（`git add -A\ngit status`）が落ちる
 function stagesWholeTree(input: string): boolean {
@@ -100,9 +111,11 @@ export function createExecLogMarkState(): ExecLogMarkState {
   return { marks: [], droppedCount: 0 };
 }
 
-function push(state: ExecLogMarkState, mark: ExecLogMark): ExecLogMarkState {
+function push(state: ExecLogMarkState, mark: Omit<ExecLogMark, "ordinalLabel">): ExecLogMarkState {
   if (state.marks.length >= MAX_EXEC_LOG_MARKS) return { ...state, droppedCount: state.droppedCount + 1 };
-  return { ...state, marks: [...state.marks, mark] };
+  let ordinal = 1;
+  for (const m of state.marks) if (m.findingAnchor === mark.findingAnchor) ordinal += 1;
+  return { ...state, marks: [...state.marks, { ...mark, ordinalLabel: `#${ordinal}` }] };
 }
 
 export function foldExecLogMarks(state: ExecLogMarkState, event: NormalizedEvent): ExecLogMarkState {
@@ -137,21 +150,71 @@ export function deriveExecLogFindings(marks: readonly ExecLogMark[]): ExecLogFin
     counts.set(m.findingAnchor, (counts.get(m.findingAnchor) ?? 0) + 1);
   }
   const out: ExecLogFindingView[] = [];
-  const view = (rule: FailureRule | ConventionRule, family: ExecLogMarkFamily, count: number): ExecLogFindingView => ({
+  const view = (rule: FailureRule | ConventionRule, family: ExecLogMarkFamily, count: number, index: number): ExecLogFindingView => ({
     anchor: rule.anchor,
     family,
     label: rule.label,
     count,
+    numberDigits: String(index).padStart(2, "0"),
+    countUnit: count === 1 ? l10n.t("time") : l10n.t("times"),
+    evidenceLabel: count === 1 ? l10n.t("1 execution log line") : l10n.t("{0} execution log lines", count),
     ...(rule.category !== undefined ? { category: rule.category } : {}),
     ...(rule.fixCandidate !== undefined ? { fixCandidate: rule.fixCandidate } : {}),
   });
+  let failureIndex = 0;
   for (const rule of FAILURE_RULES) {
     const count = counts.get(rule.anchor);
-    if (count !== undefined) out.push(view(rule, "failure", count));
+    if (count !== undefined) out.push(view(rule, "failure", count, ++failureIndex));
   }
+  let conventionIndex = 0;
   for (const rule of CONVENTION_RULES) {
     const count = counts.get(rule.anchor);
-    if (count !== undefined) out.push(view(rule, "convention", count));
+    if (count !== undefined) out.push(view(rule, "convention", count, ++conventionIndex));
   }
   return out;
+}
+
+export const FAILURE_SUMMARY_TOP_COUNT = 3;
+
+export interface FailureKindView {
+  anchor: string;
+  label: string;
+  count: number;
+}
+
+export interface FailureSummaryView {
+  failCount: number;
+  toolCount: number;
+  // failCount / toolCount の百分率（小数のまま）。toolCount が 0 なら null
+  failPercent: number | null;
+  top: FailureKindView[];
+  rest: FailureKindView[];
+  restCount: number;
+}
+
+// 件数と母数は概要の「失敗 n / ツール m」と同じ集計（phase の直下と子ツールの和）。
+// 種類は失敗の分類だけ（規約違反は失敗ではなく、成功した行にも付く）。件数の多い順で、同数は規則表の順を保つ
+export function deriveFailureSummary(
+  findings: readonly ExecLogFindingView[],
+  phases: ReadonlyArray<{ toolCount: number; childToolCount: number; failCount: number; childFailCount: number }>
+): FailureSummaryView {
+  let toolCount = 0;
+  let failCount = 0;
+  for (const p of phases) {
+    toolCount += p.toolCount + p.childToolCount;
+    failCount += p.failCount + p.childFailCount;
+  }
+  const kinds = findings
+    .filter((f) => f.family === "failure")
+    .map((f): FailureKindView => ({ anchor: f.anchor, label: f.label, count: f.count }))
+    .sort((a, b) => b.count - a.count);
+  const rest = kinds.slice(FAILURE_SUMMARY_TOP_COUNT);
+  return {
+    failCount,
+    toolCount,
+    failPercent: toolCount > 0 ? (failCount / toolCount) * 100 : null,
+    top: kinds.slice(0, FAILURE_SUMMARY_TOP_COUNT),
+    rest,
+    restCount: rest.length,
+  };
 }

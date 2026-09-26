@@ -42,5 +42,6 @@
   "config.laisora.appearance.accentColor.custom": "任意の色",
   "config.laisora.appearance.accentCustomLight.description": "ライト用の任意のアクセントカラー（#RRGGBB）。無効な値はテーマのアクセントに戻ります。",
   "config.laisora.appearance.accentCustomDark.description": "ダーク用の任意のアクセントカラー（#RRGGBB）。無効な値はテーマのアクセントに戻ります。",
-  "config.laisora.appearance.accentCustom.validation": "#RRGGBB 形式で入力してください。"
+  "config.laisora.appearance.accentCustom.validation": "#RRGGBB 形式で入力してください。",
+  "config.laisora.learning.profileSources.description": "モデルの性質の調査に使う情報源です。少なくとも 1 つ必要です。不明な値は無視し、空の場合は両方を使います。"
 }

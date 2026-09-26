@@ -32,6 +32,10 @@ export function askOptionContent(index: number, label: string, effect?: string, 
   return out;
 }
 
+export function askAnswerLine(title: string, choice: string, answer: string): string {
+  return `${title} → ${choice}: ${answer}`;
+}
+
 export interface AskRenderContext {
   replyId: string;
   offset?: number;
@@ -39,6 +43,16 @@ export interface AskRenderContext {
   choose(text: string, askKey: string, title: string): void;
   checked(id: string, step: number): boolean;
   check(id: string, step: number, checked: boolean): void;
+}
+
+function renderOtherChoice(title: string, id: string | undefined, context?: AskRenderContext): HTMLElement {
+  const choice = l10n.t("Other");
+  const button = part("button", "ask-option ask-other");
+  button.type = "button";
+  button.append(part("span", "ask-letter"), part("span", "ask-option-label", choice), part("span", "ask-effect", l10n.t("After choosing, continue typing in the chat input")));
+  button.disabled = !context;
+  button.onclick = () => { if (id) context?.choose(askAnswerLine(title, choice, ""), id, title); };
+  return button;
 }
 
 export function renderGoal(goal: string, offset: number, context?: AskRenderContext): HTMLElement {
@@ -61,9 +75,10 @@ export function renderAsk(ask: AskBlock, offset: number, context?: AskRenderCont
       button.type = "button";
       button.append(...askOptionContent(index, option.label, option.effect, option));
       button.disabled = !context;
-      button.onclick = () => context?.choose(`${ask.title} → ${button.querySelector(".ask-letter")!.textContent}: ${option.label}`, id!, ask.title);
+      button.onclick = () => context?.choose(askAnswerLine(ask.title, button.querySelector(".ask-letter")!.textContent!, option.label), id!, ask.title);
       options.append(button);
     });
+    options.append(renderOtherChoice(ask.title, id, context));
     block.append(options);
   } else {
     const steps = part("div", "ask-steps");

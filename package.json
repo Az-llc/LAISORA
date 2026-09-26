@@ -2,7 +2,7 @@
   "name": "laisora",
   "displayName": "LAISORA",
   "description": "%extension.description%",
-  "version": "1.1.1",
+  "version": "1.2.0",
   "publisher": "az-llc",
   "categories": [
     "AI",
@@ -240,6 +240,15 @@
           "scope": "application",
           "description": "%config.laisora.orchestration.enabled.description%"
         },
+        "laisora.learning.profileSources": {
+          "type": "array",
+          "scope": "application",
+          "items": { "type": "string", "enum": ["official", "artificialAnalysis"] },
+          "uniqueItems": true,
+          "minItems": 1,
+          "default": ["official", "artificialAnalysis"],
+          "description": "%config.laisora.learning.profileSources.description%"
+        },
         "laisora.learning.enabled": {
           "type": "boolean",
           "default": false,
@@ -440,7 +449,7 @@
     "typecheck": "tsc --noEmit"
   },
   "devDependencies": {
-    "@anthropic-ai/claude-agent-sdk": "^0.3.280",
+    "@anthropic-ai/claude-agent-sdk": "^0.3.281",
     "@types/node": "^24.0.0",
     "@types/vscode": "^1.90.0",
     "@vscode/l10n": "0.0.18",

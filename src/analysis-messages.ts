@@ -30,7 +30,7 @@ export async function handleAnalysisMessage(
       // sessionId からホスト側で解決する（webview から任意パスを渡させない）。
       const sid = target!.resumeSessionId ?? target!.auth?.sessionId;
       if (!sid) {
-        // 理由は要求元の面の、操作したタブの分析画面へ返す（toast にすると操作対象から離れた場所に出る。R-ANL-11）
+        // R-SES-09。理由は要求元の面の、操作したタブの分析画面へ返す（toast にすると操作対象から離れた場所に出る。R-ANL-11）
         void st.postTo(sender, {
           type: "analysisFailed",
           kind: "script",
@@ -45,7 +45,7 @@ export async function handleAnalysisMessage(
           `[analysis] ${found.reason} session=${sid}` + (found.reason === "scan_failed" ? ` — ${found.detail}` : "")
         );
         // 走査に失敗しただけのときに「まだ書き出されていません」と言わない。
-        // 待っても直らないので、利用者を存在しない待ちへ誘導することになる（R-33）
+        // 待っても直らないので、利用者を存在しない待ちへ誘導することになる（R-DSP-01）
         void st.postTo(sender, {
           type: "analysisFailed",
           kind: "script",
@@ -74,7 +74,7 @@ export async function handleAnalysisMessage(
       // セッションストア外のパスは拒否（readSessionTranscriptと同じガード）
       if (!isInSessionStore(msg.filePath)) {
         // 理由なしで返すと webview は何も描かない（無言の失敗）。記録の有無は唯一の解決器で引き、
-        // 走査の失敗を「無い」と言わない（R-33 / R-37 / R-ANL-11）
+        // 走査の失敗を「無い」と言わない（R-ANL-11）
         const found = lookupSessionFile(msg.sessionId);
         output.appendLine(
           `[analysis] outside_store session=${msg.sessionId} lookup=${found.reason ?? "found"}` +

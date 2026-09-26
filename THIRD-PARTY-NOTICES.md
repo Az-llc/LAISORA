@@ -6,7 +6,7 @@ LAISORA is distributed under the MIT License (see `LICENSE`). The VSIX bundles t
 
 | Package | Version | License | Bundled into | Source |
 | --- | --- | --- | --- | --- |
-| @anthropic-ai/claude-agent-sdk | 0.3.280 | SEE LICENSE IN README.md | dist/extension.js | https://github.com/anthropics/claude-agent-sdk-typescript |
+| @anthropic-ai/claude-agent-sdk | 0.3.281 | SEE LICENSE IN README.md | dist/extension.js | https://github.com/anthropics/claude-agent-sdk-typescript |
 | @vscode/l10n | 0.0.18 | MIT | dist/extension.js, dist/settings.js, dist/webview.js | https://github.com/Microsoft/vscode-l10n |
 | entities | 8.0.0 | BSD-2-Clause | dist/extension.js, dist/settings.js, dist/webview.js | https://github.com/fb55/entities |
 | linkify-it | 6.1.0 | MIT | dist/extension.js, dist/settings.js, dist/webview.js | https://github.com/markdown-it/linkify-it |
@@ -34,7 +34,7 @@ Listed for completeness; their code is not bundled and they are not installed by
 
 ## License texts
 
-### @anthropic-ai/claude-agent-sdk@0.3.280
+### @anthropic-ai/claude-agent-sdk@0.3.281
 
 - License: SEE LICENSE IN README.md
 - Homepage: https://github.com/anthropics/claude-agent-sdk-typescript

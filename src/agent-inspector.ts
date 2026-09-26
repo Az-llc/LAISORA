@@ -36,7 +36,7 @@ export class AgentInspectorReadError extends Error {
 }
 
 // ENOENT だけが「無い」。それ以外（EACCES・EPERM・同期ロック等）は有無を確かめられなかった
-// ので read-failed に detail を付ける。同じ理由へ畳むと「まだ利用できません」（待てば出る）へ誘導する（R-37）
+// ので read-failed に detail を付ける。同じ理由へ畳むと「まだ利用できません」（待てば出る）へ誘導する（R-DSP-01）
 function notFoundOrReadFailed(notFound: AgentInspectorErrorReason): (err: unknown) => never {
   return (err) => {
     if ((err as { code?: unknown })?.code === "ENOENT") throw new AgentInspectorReadError(notFound);

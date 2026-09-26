@@ -22,6 +22,29 @@ export function joinRecordTexts(texts: readonly string[]): string {
   return joined;
 }
 
+export interface RecordTextPart {
+  text: string;
+  uuid: string | null;
+}
+
+// A page can end inside a record or contain only its trailing UUID. Keep that
+// marker until the older page arrives; a tool call is never a record boundary.
+export function appendRecordPart(parts: RecordTextPart[], part: RecordTextPart): void {
+  const last = parts.at(-1);
+  if (last !== undefined && last.uuid === null) {
+    last.text += part.text;
+    last.uuid = part.uuid;
+  } else {
+    parts.push({ ...part });
+  }
+}
+
+export function prependRecordParts(older: readonly RecordTextPart[], newer: readonly RecordTextPart[]): RecordTextPart[] {
+  const parts: RecordTextPart[] = [];
+  for (const part of [...older, ...newer]) appendRecordPart(parts, part);
+  return parts;
+}
+
 // committedLen ではコードフェンスが閉じていることを呼び出し側が保証する。破ると誤答になる。
 export function findCommitBoundary(buf: string, committedLen: number): number {
   let boundary = -1;

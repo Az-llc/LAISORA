@@ -1,6 +1,8 @@
 import { isAccentSettings, isAccentSettingValue, type AccentSettings, type AccentSetting } from "./accent";
 import { normalizeSystemAppExtension } from "./file-link-open-mode";
-import { isPlanUsage } from "./plan-usage";
+import { isPlanUsage, type MainTokenTotal } from "./plan-usage";
+import type { FailureSummaryView } from "./exec-log-marks";
+import type { RoleSummaryView } from "./role-summary";
 import type { ExecutorId } from "./orchestration-executors";
 import { isExternalTimeout, isExternalDetection, isExternalModels, type ExternalModels, type ExternalDetection } from "./orchestration-roster";
 import { isOrchestrationSettingRoster, type OrchestrationSettingRow } from "./orchestration-roster";
@@ -80,6 +82,9 @@ export interface TaskNotificationInfo {
   agentId: string;
   toolUseId?: string;
   status?: string;
+  // history は本文の <usage><subagent_tokens>、live は system/task_notification の usage.total_tokens。
+  // 同じ task-id の再通知（SendMessage 後）は新しい値で置き換える量で、足し合わせない
+  tokens?: number;
 }
 
 // Progress Protocol pp1。
@@ -244,7 +249,8 @@ export type NormalizedEventBody =
     // effort は無く、セッションJSONLでは永続化エンベロープにのみ現れる。SDK hooks 入力には
     // 載るが表示のためだけの hooks 配線は不採用（claudeHost.ts 参照）。宣言値は tool_call_started 側で運ぶ
     | { kind: "subagent_info"; turnId: string | null; toolUseId: string; model?: string; agentId?: string }
-    // root message.model の変化ごとに1回 emit（表示専用。work-model / evidence-index / semantic-model / l3-analysis は読まない）
+    // root message.model の変化ごとに1回 emit（表示専用。work-model / evidence-index / semantic-model / l3-analysis / time-buckets は読まない。
+    // 本体時間の model 別内訳は transcript-time-buckets が読み直しの側で拾う）
     | { kind: "model_observed"; turnId: string | null; model: string }
     // CLI のコンテキスト圧縮地点（表示専用。model_observed と同じ扱い。turn 境界ではない）
     // priorGeneration: 世代境界より前の圧縮（`src/session-transcript.ts#readSessionHistory` だけが立てる）。
@@ -601,27 +607,51 @@ export const FILE_LINK_SETTINGS = [...FILE_LINK_BOOLEAN_SETTINGS, "openWithSyste
 export type FileLinkBooleanSetting = (typeof FILE_LINK_BOOLEAN_SETTINGS)[number];
 export type FileLinkSetting = (typeof FILE_LINK_SETTINGS)[number];
 
+export const PROFILE_SOURCES = ["official", "artificialAnalysis"] as const;
+export type ProfileSource = typeof PROFILE_SOURCES[number];
+
+export function normalizeProfileSources(value: unknown): ProfileSource[] {
+  const sources = PROFILE_SOURCES.filter(source => Array.isArray(value) && value.includes(source));
+  return sources.length ? sources : [...PROFILE_SOURCES];
+}
+
+export function isProfileSources(value: unknown): value is ProfileSource[] {
+  return Array.isArray(value) && value.length > 0 && value.length <= PROFILE_SOURCES.length
+    && new Set(value).size === value.length && value.every(source => PROFILE_SOURCES.includes(source));
+}
+
 // 設定エディタ（src/settings-panel.ts が開く WebviewPanel）との境界。会話面の WebviewToHost / HostToWebview とは受信口が別
 // requestId は画面が書込み要求ごとに採番し、Host は書込み後の返送に replyTo として写す
 export type SettingsPageToHost =
   | { type: "settingsPageReady" }
   | { type: "recheckExternalExecutors" }
+  | { type: "researchModelProfiles"; targets: string[] }
+  | { type: "previewConductorInstruction"; requestId: number; policy: string }
   | { type: "setAccentSetting"; requestId: number; setting: AccentSetting; value: string }
   | { type: "setComposerSendKey"; requestId: number; sendKey: ComposerSendKey }
   | { type: "setApiKeyPolicy"; requestId: number; policy: ApiKeyPolicy }
   | { type: "setAutoContinueAtUsageLimit"; requestId: number; enabled: boolean }
   | { type: "setRestoreTabsOnStartup"; requestId: number; enabled: boolean }
   | { type: "setLearningEnabled"; requestId: number; enabled: boolean }
+  | { type: "setProfileSources"; requestId: number; sources: ProfileSource[] }
   | { type: "setOrchestrationSetting"; requestId: number; setting: "enabled" | "agents" | "conductorPolicy" | "externalTimeoutMinutes"; value: unknown }
   | { type: "setFileLinkSetting"; requestId: number; setting: FileLinkBooleanSetting; enabled: boolean }
   | { type: "setFileLinkSetting"; requestId: number; setting: "openWithSystemApp"; value: string[] }
   | { type: "openVsCodeSettings" };
 
+export interface SettingsProfileProjection {
+  profileSources?: ProfileSource[];
+  missingProfiles?: string[];
+  researchUnavailable?: string;
+  researchText?: string;
+  conductorPreview?: { text: string; tokens: number };
+}
 export type HostToSettingsPage =
+  | { type: "conductorPreview"; requestId: number; text: string; tokens: number }
   // 構成から読み直した実効値。書込みの後も要求値ではなくこれを返す（R-DSP-01）。
   // replyTo は書込み要求への返送だけが持つ。構成変更・ready への送信は持たない
   | ({ type: "settingsState"; appearance?: AccentSettings; composerSendKey: ComposerSendKey; apiKeyPolicy: ApiKeyPolicy; restoreTabsOnStartup: boolean; autoContinueAtUsageLimit: boolean; learningEnabled: boolean; replyTo?: number }
-    & Record<FileLinkBooleanSetting, boolean> & { openWithSystemApp: string[] } & { orchestrationEnabled: boolean; orchestrationAgents: OrchestrationSettingRow[]; orchestrationDefaults: OrchestrationSettingRow[]; conductorPolicy: string; conductorPolicyDefault: string; externalTimeoutMinutes: number; externalDetection: Record<ExecutorId, ExternalDetection>; externalModels: ExternalModels });
+    & SettingsProfileProjection & Record<FileLinkBooleanSetting, boolean> & { openWithSystemApp: string[] } & { orchestrationEnabled: boolean; orchestrationAgents: OrchestrationSettingRow[]; orchestrationDefaults: OrchestrationSettingRow[]; conductorPolicy: string; conductorPolicyDefault: string; externalTimeoutMinutes: number; externalDetection: Record<ExecutorId, ExternalDetection>; externalModels: ExternalModels });
 
 function isSettingsRequestId(v: unknown): v is number {
   return typeof v === "number" && Number.isSafeInteger(v) && v > 0;
@@ -632,6 +662,9 @@ export function isSettingsPageToHost(v: unknown): v is SettingsPageToHost {
   const m = v as Record<string, unknown>;
   const t = m.type as SettingsPageToHost["type"];
   if (t === "settingsPageReady" || t === "recheckExternalExecutors" || t === "openVsCodeSettings") return hasOnlyKeys(m, ["type"]);
+  if (t === "researchModelProfiles") return hasOnlyKeys(m, ["type", "targets"]) && isProfileTargetIds(m.targets) && m.targets.length > 0;
+  if (t === "setProfileSources") return hasOnlyKeys(m, ["type", "requestId", "sources"]) && isSettingsRequestId(m.requestId) && isProfileSources(m.sources);
+  if (t === "previewConductorInstruction") return hasOnlyKeys(m, ["type", "requestId", "policy"]) && isSettingsRequestId(m.requestId) && typeof m.policy === "string";
   if (t === "setAccentSetting") {
     return isSettingsRequestId(m.requestId) && isAccentSettingValue(m.setting, m.value) && hasOnlyKeys(m, ["type", "requestId", "setting", "value"]);
   }
@@ -663,12 +696,27 @@ export function isSettingsPageToHost(v: unknown): v is SettingsPageToHost {
   return false;
 }
 
+function isProfileTargetIds(value: unknown): value is string[] {
+  return Array.isArray(value) && value.length <= 300 && value.every(id => typeof id === "string" && /^(claude|codex|agy)\/[A-Za-z0-9][A-Za-z0-9_.:@-]*$/.test(id));
+}
+function isProfileObject(value: unknown): value is Record<string, unknown> { return !!value && typeof value === "object" && !Array.isArray(value); }
+function isSettingsProfiles(m: Record<string, unknown>): boolean {
+  const preview = m.conductorPreview as Record<string, unknown> | undefined;
+  return (m.missingProfiles === undefined || isProfileTargetIds(m.missingProfiles))
+    && (m.researchUnavailable === undefined || typeof m.researchUnavailable === "string")
+    && (m.researchText === undefined || typeof m.researchText === "string")
+    && (m.profileSources === undefined || isProfileSources(m.profileSources))
+    && (preview === undefined || isProfileObject(preview) && hasOnlyKeys(preview, ["text", "tokens"]) && typeof preview.text === "string" && typeof preview.tokens === "number" && Number.isFinite(preview.tokens));
+}
+
 export function isHostToSettingsPage(v: unknown): v is HostToSettingsPage {
   if (typeof v !== "object" || v === null) return false;
   const m = v as Record<string, unknown>;
   const t = m.type as HostToSettingsPage["type"];
+  if (t === "conductorPreview") return hasOnlyKeys(m, ["type", "requestId", "text", "tokens"]) && isSettingsRequestId(m.requestId)
+    && typeof m.text === "string" && typeof m.tokens === "number" && Number.isFinite(m.tokens);
   if (t === "settingsState") {
-    return (m.appearance === undefined || isAccentSettings(m.appearance))
+    return isSettingsProfiles(m) && (m.appearance === undefined || isAccentSettings(m.appearance))
       && (COMPOSER_SEND_KEYS as readonly string[]).includes(m.composerSendKey as string)
       && (API_KEY_POLICIES as readonly string[]).includes(m.apiKeyPolicy as string)
       && typeof m.restoreTabsOnStartup === "boolean"
@@ -680,7 +728,7 @@ export function isHostToSettingsPage(v: unknown): v is HostToSettingsPage {
       && FILE_LINK_BOOLEAN_SETTINGS.every((key) => typeof m[key] === "boolean")
       && Array.isArray(m.openWithSystemApp) && m.openWithSystemApp.every((item) => typeof item === "string")
       && (m.replyTo === undefined || isSettingsRequestId(m.replyTo))
-      && hasOnlyKeys(m, ["type", "appearance", "composerSendKey", "apiKeyPolicy", "restoreTabsOnStartup", "autoContinueAtUsageLimit", "learningEnabled", ...FILE_LINK_SETTINGS, "orchestrationEnabled", "orchestrationAgents", "orchestrationDefaults", "conductorPolicy", "conductorPolicyDefault", "externalTimeoutMinutes", "externalDetection", "externalModels", "replyTo"]);
+      && hasOnlyKeys(m, ["type", "appearance", "composerSendKey", "apiKeyPolicy", "restoreTabsOnStartup", "autoContinueAtUsageLimit", "learningEnabled", ...FILE_LINK_SETTINGS, "orchestrationEnabled", "orchestrationAgents", "orchestrationDefaults", "conductorPolicy", "conductorPolicyDefault", "externalTimeoutMinutes", "externalDetection", "externalModels", "replyTo", "profileSources", "missingProfiles", "researchUnavailable", "researchText", "conductorPreview"]);
   }
   t satisfies never;
   return false;
@@ -998,7 +1046,7 @@ export type AgentInspectorErrorReason =
   // 「記録が無い（まだ書き出されていない）」。待てば出る
   | "session-unavailable"
   // 「記録があるかどうかを確かめられなかった」（保存先の走査が失敗）。待っても直らない。
-  // session-unavailable や read-failed へ畳むと、待つ／読み直すという別の対処へ誘導する（R-37）
+  // session-unavailable や read-failed へ畳むと、待つ／読み直すという別の対処へ誘導する（R-DSP-01）
   | "session-scan-failed"
   | "agent-unavailable"
   | "transcript-unavailable"
@@ -1063,7 +1111,7 @@ export interface ConversationHistoryPagePayload {
     remainingOlderCount: number;
     oldestReached: boolean;
     // 登録した transcript 全体の値（page ごとではない）。読めなかった行と、uuid が無く
-    // 運べなかった発言。数えるだけで運ばないと、会話が欠けたまま「読み終わった」になる（R-32）
+    // 運べなかった発言。数えるだけで運ばないと、会話が欠けたまま「読み終わった」になる（R-DSP-03）
     malformedLineCount?: number;
     droppedWithoutUuidCount?: number;
   };
@@ -1078,7 +1126,7 @@ export type ConversationHistoryErrorReason =
   | "session-unavailable"
   // 「記録があるかどうかを確かめられなかった」。同期ロック・権限・競合で走査自体が失敗した。
   // session-unavailable と同じ扱いにすると、読めなかっただけの状態が「読み終わった」として
-  // 進行表示から消える（R-17）。これは終端ではなく一過性の失敗として扱う
+  // 進行表示から消える（R-CNV-02）。これは終端ではなく一過性の失敗として扱う
   | "session-scan-failed"
   | "read-failed"
   | "stale-request"
@@ -1210,8 +1258,10 @@ export interface PlanContext {
 
 export interface WorkModelPayload {
   planDeclaration?: { goal: string; at: number };
+  planBoundaryAt?: number;
   planHistory?: import("./work-model").PlanHistoryEntry[];
   planHistoryTruncated?: boolean;
+  planHistoryLostThrough?: number;
   planContext?: PlanContext;
   planTools?: Array<{ id: string; name: string; description: string; startedAt: number }>;
   version: number;
@@ -1303,6 +1353,8 @@ export type FindingAction =
 export interface AttachedFindingView {
   findingId: string;
   numberLabel: string;
+  // 番号列に出す数字だけの番号（Host が 0 埋めする）。webview は採番しない（VND-S6）
+  numberDigits?: string;
   title: string;
   observed: string;
   impactLabel: string;
@@ -1319,6 +1371,13 @@ export interface AttachedFindingView {
 export interface HistoryOption {
   artifactId: string;
   label: string;
+  // 選択中の結果の requestedModelLabel / executedModelsLabel と同じ導出（R-ANL-13）。実行 effort は記録に無い
+  generatedAtLabel?: string;
+  findingsCount?: number;
+  requestedModel?: string;
+  requestedEffort?: string;
+  executedModels?: string;
+  freshnessLabel?: string;
 }
 
 export interface AttachedAnalysisView {
@@ -1331,6 +1390,13 @@ export interface AttachedAnalysisView {
   persistence: PersistenceState;
   persistenceLabel: string;
   summaryLabel: string;
+  // summaryLabel を組む値そのもの
+  findingsCount?: number;
+  rejectedCount?: number;
+  modelsLabel?: string;
+  // null = 分析の使用量を観測していない（R-DSP-11）
+  tokensLabel?: string | null;
+  slicesCount?: number;
   emptyStateLabel?: string;
   // 分析入力の被覆行（Host が組む）。再起動前の artifact には無い
   inputCoverageLabel?: string;
@@ -1384,8 +1450,13 @@ export interface SemanticModelPayload extends Omit<SemanticModel, "nodes" | "pro
   l3?: L3ReportPayload;
   // timeBuckets の読み直し（src/transcript-time-buckets.ts）で読めなかったもの。省略 = 欠落なし。
   // 読めなかった subagents/ を 0 本として timeBuckets に畳むと、並列していたセッションが
-  // 「直列 100%」で描かれる（R-23）。任意フィールドは全て webview に描き手を持つ（G-COV-4）
+  // 「直列 100%」で描かれる（R-DSP-01）。任意フィールドは全て webview に描き手を持つ（G-COV-4）
   timeBucketsCoverage?: TimeBucketsCoverage;
+  // 分析の ROLES / ERR / 本体トークン。並び・合計・百分率は Host が決める（webview は集計しない。VND-S6 / VND-S6b）
+  roleSummary?: RoleSummaryView;
+  failureSummary?: FailureSummaryView;
+  // null = メインの使用量を 1 件も観測していない（R-DSP-11）
+  mainTokens?: MainTokenTotal | null;
 }
 
 export interface TimeBucketsCoverage {
@@ -1625,8 +1696,10 @@ export function projectWorkModel(
   return {
     version: WORK_MODEL_VERSION,
     planDeclaration: state.planDeclaration,
+    planBoundaryAt: state.planBoundaryAt,
     planHistory: state.planHistory,
     planHistoryTruncated: state.planHistoryTruncated,
+    planHistoryLostThrough: state.planHistoryLostThrough,
     planTools: state.runningToolUseIds.flatMap(id => {
       const tool = findToolPlacement(state, id);
       return tool && !tool.stale && tool.parentToolUseId === null
@@ -1947,10 +2020,14 @@ export function isWorkModelPayload(v: unknown): v is WorkModelPayload {
       if (!entry || typeof entry !== "object") return false;
       const row = entry as Record<string, unknown>;
       return isNumber(row.at) && (row.kind === "user" || row.kind === "todos" &&
-        (row.source === undefined || row.source === "tasks") && (row.created === undefined || typeof row.created === "boolean") && (row.removed === undefined || typeof row.removed === "boolean") && isArrayOf(row.items, isWorkTaskItemView));
+        (row.source === undefined || row.source === "tasks") && (row.created === undefined || typeof row.created === "boolean") && (row.removed === undefined || typeof row.removed === "boolean") && isArrayOf(row.items, isWorkTaskItemView) ||
+        row.kind === "resume" && typeof row.agentId === "string" && typeof row.description === "string" &&
+        WORK_STATUSES.includes(row.status as string) && (row.endedAt === undefined || isNumber(row.endedAt)));
     })) &&
     (m.planDeclaration === undefined || isPlanDeclaration(m.planDeclaration)) &&
+    (m.planBoundaryAt === undefined || isNumber(m.planBoundaryAt)) &&
     (m.planHistoryTruncated === undefined || typeof m.planHistoryTruncated === "boolean") &&
+    (m.planHistoryLostThrough === undefined || isNumber(m.planHistoryLostThrough)) &&
     (m.planContext === undefined || isPlanContext(m.planContext)) &&
     (m.planTools === undefined || isArrayOf(m.planTools, tool => {
       if (!tool || typeof tool !== "object") return false;
@@ -2454,7 +2531,13 @@ function isHistoryOption(v: unknown): v is HistoryOption {
     h.artifactId.length > 0 &&
     h.artifactId.length <= 200 &&
     typeof h.label === "string" &&
-    h.label.length > 0
+    h.label.length > 0 &&
+    isOptionalString(h.generatedAtLabel) &&
+    (h.findingsCount === undefined || isNumber(h.findingsCount)) &&
+    isOptionalString(h.requestedModel) &&
+    isOptionalString(h.requestedEffort) &&
+    isOptionalString(h.executedModels) &&
+    isOptionalString(h.freshnessLabel)
   );
 }
 
@@ -2494,6 +2577,7 @@ function isAttachedFindingView(v: unknown): v is AttachedFindingView {
     f.findingId.length <= 64 &&
     typeof f.numberLabel === "string" &&
     f.numberLabel.length > 0 &&
+    isOptionalString(f.numberDigits) &&
     typeof f.title === "string" &&
     f.title.length > 0 &&
     typeof f.observed === "string" &&
@@ -2535,6 +2619,11 @@ function isAttachedAnalysisView(v: unknown): v is AttachedAnalysisView {
     a.persistenceLabel.length > 0 &&
     typeof a.summaryLabel === "string" &&
     a.summaryLabel.length > 0 &&
+    (a.findingsCount === undefined || isNumber(a.findingsCount)) &&
+    (a.rejectedCount === undefined || isNumber(a.rejectedCount)) &&
+    isOptionalString(a.modelsLabel) &&
+    (a.tokensLabel === null || isOptionalString(a.tokensLabel)) &&
+    (a.slicesCount === undefined || isNumber(a.slicesCount)) &&
     (a.emptyStateLabel === undefined ||
       (typeof a.emptyStateLabel === "string" && a.emptyStateLabel.length > 0)) &&
     (a.inputCoverageLabel === undefined ||
@@ -2671,11 +2760,13 @@ export function isLlmFindingDiagnosticsPayload(v: unknown): v is LlmFindingDiagn
 function isAnalysisLearningRANL20(v: unknown): boolean {
   if (typeof v !== "object" || v === null || Array.isArray(v)) return false;
   const learning = v as Record<string, unknown>;
-  return hasOnlyKeys(learning, ["state", "note", "lines"])
+  return hasOnlyKeys(learning, ["state", "note", "lines", "empty"])
     && (learning.state === "unobserved" || learning.state === "observed")
     && typeof learning.note === "string" && Array.isArray(learning.lines)
     && learning.lines.every(line => typeof line === "string")
-    && (learning.state === "unobserved" ? learning.note.length > 0 && learning.lines.length === 0 : learning.lines.length > 0);
+    && (learning.state === "unobserved" ? learning.note.length > 0 && learning.lines.length === 0 : learning.lines.length > 0)
+    // R-LRN-09: 未観測に「該当なし」を付けない
+    && (learning.empty === undefined || (learning.empty === true && learning.state === "observed" && learning.lines.length === 1));
 }
 
 function isAnalysisFactsView(v: unknown): boolean {
@@ -2724,8 +2815,113 @@ export function isSemanticModelPayload(v: unknown): v is SemanticModelPayload {
     isArrayOf(m.reworkCandidates, isSemanticReworkCandidate) &&
     (m.assignments === undefined || isArrayOf(m.assignments, isSemanticAssignment)) &&
     (m.l3 === undefined || isL3ReportPayload(m.l3)) &&
-    (m.timeBucketsCoverage === undefined || isTimeBucketsCoverage(m.timeBucketsCoverage))
+    (m.timeBucketsCoverage === undefined || isTimeBucketsCoverage(m.timeBucketsCoverage)) &&
+    (m.timeBuckets === undefined || isTimeBucketsPayload(m.timeBuckets)) &&
+    (m.roleSummary === undefined || isRoleSummaryView(m.roleSummary)) &&
+    (m.failureSummary === undefined || isFailureSummaryView(m.failureSummary)) &&
+    (m.mainTokens === undefined || m.mainTokens === null || isMainTokenTotal(m.mainTokens))
   );
+}
+
+const isNullableNumber = (v: unknown): boolean => v === null || isNumber(v);
+const isNullableString = (v: unknown): boolean => v === null || typeof v === "string";
+
+// timeBuckets の他の項目は既存の webview 検査の合成 payload が部分形で送るため、ここでは形を問わない
+function isTimeBucketsPayload(v: unknown): boolean {
+  if (typeof v !== "object" || v === null || Array.isArray(v)) return false;
+  const byModel = (v as Record<string, unknown>).mainByModel;
+  return byModel === undefined || byModel === null || isMainTimeByModelView(byModel);
+}
+
+function isMainModelTimeEntry(v: unknown): boolean {
+  if (typeof v !== "object" || v === null) return false;
+  const e = v as Record<string, unknown>;
+  return (
+    (e.kind === "model" || e.kind === "other" || e.kind === "unknown") &&
+    typeof e.label === "string" &&
+    isNullableString(e.model) &&
+    (e.kind === "model") === (typeof e.model === "string") &&
+    isNullableNumber(e.foldedModelCount) &&
+    (e.kind === "other") === (typeof e.foldedModelCount === "number") &&
+    isNumber(e.generateMs) && (e.generateMs as number) >= 0 &&
+    isNullableNumber(e.share) && isNullableNumber(e.percent)
+  );
+}
+
+function isMainTimeByModelView(v: unknown): boolean {
+  if (typeof v !== "object" || v === null) return false;
+  const b = v as Record<string, unknown>;
+  return (
+    isNumber(b.totalMs) && isNumber(b.generateMs) && isNumber(b.toolMs) &&
+    isNullableNumber(b.toolShare) && isNullableNumber(b.toolPercent) &&
+    isArrayOf(b.models, isMainModelTimeEntry)
+  );
+}
+const isValueSource = (v: unknown): boolean => v === null || v === "measured" || v === "requested";
+
+function isRoleRunView(v: unknown): boolean {
+  if (typeof v !== "object" || v === null) return false;
+  const r = v as Record<string, unknown>;
+  return (
+    (r.source === "subagent" || r.source === "external") &&
+    typeof r.name === "string" &&
+    typeof r.executor === "string" &&
+    isNullableString(r.model) && isValueSource(r.modelSource) &&
+    isNullableString(r.effort) && isValueSource(r.effortSource) &&
+    typeof r.variantLabel === "string" &&
+    isNumber(r.shade) &&
+    isNullableNumber(r.startedAt) &&
+    typeof r.running === "boolean" &&
+    (r.outcome === null || ["ok", "failed", "timeout", "refused"].includes(r.outcome as string)) &&
+    isNullableNumber(r.durationMs) && isNullableNumber(r.tokens) &&
+    isNullableNumber(r.timePercent) && isNullableNumber(r.tokenPercent)
+  );
+}
+
+function isRoleSummaryView(v: unknown): v is RoleSummaryView {
+  if (typeof v !== "object" || v === null) return false;
+  const s = v as Record<string, unknown>;
+  const coverage = s.externalRunsCoverage as Record<string, unknown> | undefined;
+  return (
+    isNumber(s.omittedSubagentCount) &&
+    (coverage === undefined || (typeof coverage === "object" && coverage !== null &&
+      isNumber(coverage.unreadableLines) && (coverage.unreadableLines as number) >= 0 && typeof coverage.readError === "boolean")) &&
+    isArrayOf(s.roles, (role) => {
+      if (typeof role !== "object" || role === null) return false;
+      const r = role as Record<string, unknown>;
+      return (
+        isNullableString(r.role) && typeof r.label === "string" && isNumber(r.count) &&
+        isNullableNumber(r.totalMs) && typeof r.totalMsPartial === "boolean" &&
+        isNullableNumber(r.totalTokens) && typeof r.totalTokensPartial === "boolean" && typeof r.running === "boolean" &&
+        isNullableNumber(r.timeWidthPercent) && isNullableNumber(r.tokenWidthPercent) &&
+        isArrayOf(r.runs, isRoleRunView)
+      );
+    })
+  );
+}
+
+function isFailureKindView(v: unknown): boolean {
+  if (typeof v !== "object" || v === null) return false;
+  const k = v as Record<string, unknown>;
+  return typeof k.anchor === "string" && typeof k.label === "string" && isNumber(k.count);
+}
+
+function isFailureSummaryView(v: unknown): v is FailureSummaryView {
+  if (typeof v !== "object" || v === null) return false;
+  const f = v as Record<string, unknown>;
+  return (
+    isNumber(f.failCount) && isNumber(f.toolCount) && isNullableNumber(f.failPercent) &&
+    isArrayOf(f.top, isFailureKindView) &&
+    isArrayOf(f.rest, isFailureKindView) &&
+    isNumber(f.restCount)
+  );
+}
+
+function isMainTokenTotal(v: unknown): v is MainTokenTotal {
+  if (typeof v !== "object" || v === null) return false;
+  const t = v as Record<string, unknown>;
+  return isNumber(t.tokens) && isNumber(t.cacheRead) && isNumber(t.messageCount) &&
+    isNumber(t.unmeasuredMessageCount) && typeof t.partial === "boolean";
 }
 
 export type ResumeHydrationPhase = "loading" | "complete" | "failed";
@@ -3129,7 +3325,7 @@ export function isWebviewToHost(v: unknown): v is WebviewToHost {
   const tabId = (v as { tabId?: unknown }).tabId;
 
   if (t === "ready") {
-    // cursor は null または {generation, seq}（レビューP2-2: 型検証の抜けを塞ぐ）
+    // cursor は未指定・undefined・null または数値の {generation, seq}（型検証の抜けを塞ぐ）
     const c = (v as { cursor?: unknown }).cursor;
     if (c === null || c === undefined) return true;
     return (

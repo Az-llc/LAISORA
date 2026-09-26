@@ -206,7 +206,7 @@ function sessionInfoSdk(): Pick<typeof ClaudeCodeSdk, "getSessionInfo"> {
 // セッションを掴む — session-list.ts の toSessionListItems 参照）
 // onError は「例外で解決できなかった」と「要約を持たないので読み飛ばす」を呼び出し側で
 // 区別するためにある。区別しないと、解決が全滅した一覧が 0 件として complete し、
-// 画面が「セッションが見つかりません」と断言する（R-21）
+// 画面が「セッションが見つかりません」と断言する（R-DSP-01）
 async function sessionInfoOf(
   sessionId: string,
   onError?: (err: unknown) => void
@@ -281,7 +281,7 @@ async function listPastSessions(
   const offset = continuation ? cursorParts![1] : 0;
 
   // 読めなかったものを種類別に数える。ここを数えないと、走査が失敗しても complete=true・
-  // 0 件で返り、画面が「セッションが見つかりません」と断言する（R-21。Google Drive 同期下で
+  // 0 件で返り、画面が「セッションが見つかりません」と断言する（R-DSP-01。Google Drive 同期下で
   // 現実に起こる）。emit へ渡すこと自体を消すと検査 W-F0-DEG が落ちる
   const degradation: SessionScanDegradation = {
     rootFailed: false,
@@ -423,6 +423,7 @@ export async function handleSessionFileMessage(
       // Host が CLI と同じレコードを書き、タブ名は履歴一覧と同じ解決器（displayTitleFromSummary）を通す（R-SES-05）
       const s = target!;
       const ref = sessionTranscriptRef(s);
+      // R-SES-09
       if (ref === null) {
         s.pushEvent({
           kind: "error",

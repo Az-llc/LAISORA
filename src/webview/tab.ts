@@ -33,8 +33,8 @@ import { buildApprovalBody } from "./approval";
 import { clock, formatDuration, formatTokenCount, monthDayClock, toolSummary, uiLocale } from "./format";
 import { createCopyButton, renderMarkdownInto } from "./markdown";
 import { askHeading, askOptionContent, updateAskCounters } from "./ask-view";
-import { createYouItems, youAnchor, type YouItemsReader } from "./you-items";
-import { findCommitBoundary, joinRecordTexts, recordSeparator } from "./commit-boundary";
+import { createYouItems, encodeAskDismissal, youAnchor, type AskIdentity, type YouItemsReader } from "./you-items";
+import { appendRecordPart, findCommitBoundary, joinRecordTexts, prependRecordParts, recordSeparator, type RecordTextPart } from "./commit-boundary";
 import { isPureCommandWrapper } from "../human-input-vocabulary";
 import { isConvRenderableEvent } from "../conv-renderable";
 import {
@@ -391,7 +391,7 @@ function handoffRunningText(msg: HandoffStatusMessage): string {
   return l10n.t("Handing off…{0}", HANDOFF_PHASE_TEXTS[msg.phase ?? ""] ?? "");
 }
 
-// 装飾の行（R-67）。事実の行と分け、compacting の心拍が届いている間だけ出す。
+// 装飾の行。事実の行と分け、compacting の心拍が届いている間だけ出す。
 // 進行が HANDOFF_QUIET_MS 途絶えたら真顔の 1 本へ替える。Host の 120 秒アイドル猶予とは
 // 別物で、protocol には載せない（webview のローカルタイマーだけで閉じる）
 const HANDOFF_QUIET_MS = 90_000;
@@ -439,7 +439,7 @@ function handoffSummaryHeading(summary: string | undefined): string {
 // 詳細カード1枚分。集計は持たない。数値は WorkModel（イベントに載る WorkEventInfo）から来る。
 // カードの同定は reducer が開始時に固定した segmentId で行う。「その時点のカレント」で同定すると、
 // カードが切り替わったあとに前カードのツールが終了したとき集計が次のカードへ混入し、
-// 実行中のツールが残っているのにスピナーが止まる（敵対レビュー R1-F2）。
+// 実行中のツールが残っているのにスピナーが止まる。
 interface SegmentCard {
   segmentId: string;
   el: HTMLDetailsElement;
@@ -721,10 +721,45 @@ export function setOnConvViewShown(fn: typeof onConvViewShown): void {
   onConvViewShown = fn;
 }
 
+// Record-keyed ask state is tab-independent and never pruned by tab close, so it is bounded here.
+const ASK_MESSAGE_STATE_MAX = 500;
+
 export class Tab {
   private youStoreValue?: ReturnType<typeof createYouItems>;
   private get youStore(): ReturnType<typeof createYouItems> {
-    return this.youStoreValue ??= createYouItems(this.tabId);
+    if (this.youStoreValue === undefined) {
+      const state = vscode.getState();
+      this.youStoreValue = createYouItems(this.tabId,
+        { tab: state?.askDismissed?.[this.tabId] ?? [], messages: state?.askDismissedMessages ?? [] },
+        (replyId, offset) => this.locateAsk(replyId, offset));
+    }
+    return this.youStoreValue;
+  }
+  // Record uuids used as the reply ID of history-rendered assistant messages.
+  private readonly recordReplyIds = new Set<string>();
+
+  private locateAsk(replyId: string, offset: number): { message: string; start: number } | undefined {
+    if (this.recordReplyIds.has(replyId)) return { message: replyId, start: 0 };
+    const past = this.pastConvRecords.get(replyId);
+    let joined = "";
+    for (const run of past ?? this.assistantRuns.filter((run) => run.seg.dataset.askSource === replyId)) {
+      joined += recordSeparator(joined);
+      const start = joined.length;
+      joined += run.text;
+      if (offset < joined.length) return offset >= start && run.uuid !== null ? { message: run.uuid, start } : undefined;
+    }
+    return undefined;
+  }
+
+  private persistAskDismissals(identities: readonly AskIdentity[]): void {
+    if (identities.length === 0) return;
+    const state = vscode.getState() ?? { activeTabId: null };
+    const askDismissed = { ...state.askDismissed };
+    const superseded = new Set(identities.filter((i) => i.message !== undefined).map((i) => encodeAskDismissal({ content: i.content })));
+    askDismissed[this.tabId] = [...new Set([...(askDismissed[this.tabId] ?? []).filter((e) => !superseded.has(e)), ...identities.map(encodeAskDismissal)])];
+    const messages = identities.flatMap((i) => (i.message === undefined ? [] : [i.message]));
+    const askDismissedMessages = [...new Set([...(state.askDismissedMessages ?? []), ...messages])].slice(-ASK_MESSAGE_STATE_MAX);
+    vscode.setState({ ...state, askDismissed, askDismissedMessages });
   }
   get youItems(): YouItemsReader { return this.youStore.reader; }
   private askReplyEvents = new Map<string, NormalizedEvent>();
@@ -759,7 +794,12 @@ export class Tab {
         inputEl.setSelectionRange(merged.caret, merged.caret);
         persistState();
       },
-      checked: (id, step) => vscode.getState()?.askChecks?.[this.tabId]?.[id]?.[step] === true,
+      checked: (id, step) => {
+        const state = vscode.getState();
+        const message = this.youStore.messageOf(id);
+        const byMessage = message === undefined ? undefined : state?.askCheckedMessages?.[message]?.[step];
+        return (byMessage ?? state?.askChecks?.[this.tabId]?.[id]?.[step]) === true;
+      },
       check: (id, step, checked) => {
         const state = vscode.getState() ?? { activeTabId: null };
         const askChecks = { ...state.askChecks };
@@ -768,7 +808,15 @@ export class Tab {
         values[step] = checked;
         tabChecks[id] = values;
         askChecks[this.tabId] = tabChecks;
-        vscode.setState({ ...state, askChecks });
+        const message = this.youStore.messageOf(id);
+        let askCheckedMessages = state.askCheckedMessages;
+        if (message !== undefined) {
+          const { [message]: previous, ...rest } = askCheckedMessages ?? {};
+          const next = [...(previous ?? [])];
+          next[step] = checked;
+          askCheckedMessages = Object.fromEntries([...Object.entries(rest), [message, next]].slice(-ASK_MESSAGE_STATE_MAX));
+        }
+        vscode.setState({ ...state, askChecks, askCheckedMessages });
       },
     });
     this.youStore.retain(replyId, offset, Math.max(offset + text.length, this.askRenderEnds.get(container) ?? 0), ids);
@@ -1255,14 +1303,20 @@ export class Tab {
   // 再生しない経路（hydration loading）でも必ず呼ぶので、これが再生中かどうかの唯一の目印になる。
   // 再生窓が turn_started を切り落としただけの採用を live の異常として診断に出さない（OA-8）
   private replayDone = false;
-  // 楽観的 running 中（turn_started 未着）フラグ。error 到着で idle へ戻す（codexレビューC2-6）
+  // 楽観的 running 中（turn_started 未着）フラグ。APIキー除去警告以外の error 到着で idle へ戻す
   pendingSend = false;
   private currentAssistantBlock: HTMLElement | null = null;
   private assistantBuffer = "";
+  // live の本文記録が uuid・root のツール開始・ターン境界のどれかで閉じるまで true
+  private liveRecordOpen = false;
+  // 開いた記録の後ろへ会話ブロックを置いたときのコンテナ。その記録が閉じたらこれを閉じる
+  private convBlockAfterRecordIn: HTMLElement | null = null;
+  // 現在ターンで最後に作った assistant コンテナ。返信フッターはこの直後に置く（R-CNV-15）
+  private replyFooterAnchor: HTMLElement | null = null;
   // api_retry の更新先ブロック（ターン毎にリセット）
   private retryBlock: HTMLElement | null = null;
 
-  // ターン終端でリトライ表示をDOMごと撤去する（レビューAR1-3: 回復後・replay後に
+  // R-DSP-01: ターン終端でリトライ表示をDOMごと撤去する（回復後・replay後に
   // 「再試行中」の警告が恒久残留する）
   private clearRetryBlock(): void {
     this.retryBlock?.remove();
@@ -1278,7 +1332,7 @@ export class Tab {
   // 会話面の最上部にある確定済みセグメントの turnId と原文。裏読みが同じ turnId のデルタを
   // 積むとき、原文を連結して描き直すために 1 つだけ持つ（R-CNV-09）。上に別の発言が
   // 乗った時点でそのセグメントは伸びないので、保持はこの 1 件で足りる
-  private topConvSeg: { turnId: string; el: HTMLElement; text: string } | null = null;
+  private topConvSeg: { turnId: string; el: HTMLElement; text: string; records: RecordTextPart[] } | null = null;
   private toolCards = new Map<string, HTMLElement>();
   // 作業カード(toolgroup)。key = reducer の segmentId。過去カードのツールが遅れて終了しても、
   // イベントに載った配置がそのカードを指すので混入しない。
@@ -1302,6 +1356,8 @@ export class Tab {
   // 遡りで作った過去ターンの本文。chunk を跨いだ同一 turnId を1ブロックへ統合するために持つ。
   // Tab インスタンスと寿命を共にするので clearTab / 再 resume では作り直される
   private pastConvTurns = new Map<string, { el: HTMLElement; text: string }>();
+  private pastConvRecords = new Map<string, RecordTextPart[]>();
+  private assistantLeadingRecord: { turnId: string; uuid: string } | null = null;
   // 遡りで作った過去ターンの返信フッターと、その日時の出所。EventLog 位相の chunk では
   // 本文（assistant_text_delta）と完了時刻（turn_completed）が別の chunk に割れうるので、
   // 両方を turnId で持ち越して後から突き合わせる
@@ -1431,14 +1487,14 @@ export class Tab {
     chat.append(this.convEl);
     content.append(chat, this.workEl);
     this.planPanel = new PlanPanel(chat, this.headEl, this.tabId);
-    this.chatYou = new YouList(this.youItems, item => this.navigateToYou(item), (count, total) => this.planPanel.setWaiting(count, total), false);
-    this.summaryYou = new YouList(this.youItems, item => this.navigateToYou(item));
+    this.chatYou = new YouList(this.youItems, item => this.navigateToYou(item), (count, total) => this.planPanel.setWaiting(count, total), item => this.dismissYou(item));
+    this.summaryYou = new YouList(this.youItems, item => this.navigateToYou(item), undefined, item => this.dismissYou(item));
     this.planPanel.you.append(this.chatYou.element);
     this.logEl.appendChild(content);
     logsEl.appendChild(this.logEl);
     this.observeTurnRails();
 
-    // button 入れ子は HTML/ARIA 違反のため div[role=tab] にする（レビューP2R2-6a）
+    // button 入れ子は HTML/ARIA 違反のため div[role=tab] にする
     this.tabBtn = document.createElement("div");
     this.tabBtn.className = "tab";
     this.tabBtn.setAttribute("role", "tab");
@@ -1458,7 +1514,7 @@ export class Tab {
     this.labelEl = label;
     const dot = document.createElement("span");
     dot.className = "tab-dot";
-    // 閉じるはキーボード到達可能な button にする（レビューP2-6）
+    // 閉じるはキーボード到達可能な button にする
     const close = document.createElement("button");
     close.className = "tab-close";
     close.textContent = "×";
@@ -1700,7 +1756,7 @@ export class Tab {
     // 読み終わったら消す。完了状態は出さない（R-CNV-02）
     this.convLoadState = state.phase === "done" ? null : state;
     this.renderLoadSlot();
-    // 検索の件数注記は読み込み状態に連動する。ここで描き直さないと終端後も「読み込み中」が残る（R-26）
+    // 検索の件数注記は読み込み状態に連動する。ここで描き直さないと終端後も「読み込み中」が残る（R-DSP-03）
     if (this.tabId === activeTabId) refreshFindCount();
   }
 
@@ -1744,7 +1800,7 @@ export class Tab {
       this.convLoadRetryEl.onclick = null;
     } else {
       this.convLoadIconEl.textContent = "✕";
-      // 一過性の失敗が続いて止まったことは本文に出す。title だけだと「行き止まり」に読まれる（R-14）
+      // 一過性の失敗が続いて止まったことは本文に出す。title だけだと「行き止まり」に読まれる
       this.convLoadTextEl.textContent =
         state.detail === undefined ? l10n.t("History loading stopped") : l10n.t("History loading stopped ({0})", state.detail);
       this.convLoadEl.title = state.reason;
@@ -1761,7 +1817,7 @@ export class Tab {
   // moveFocus=true はキーボード操作時（ロービングtabindexの移動先へフォーカスを送る）。
   // persist=false は復元中に使う。復元ループの途中で persistState() を走らせると、
   // まだ tabs へ登録されていないタブの views が欠落し、未入力の inputEl で下書きを
-  // 空に上書きしてしまう（レビューAR5-C1/C2）。
+  // 空に上書きしてしまう。
   setViewMode(mode: ViewMode, moveFocus = false, persist = true): void {
     if (mode !== this.viewMode && activeTabId === this.tabId) noteSurfaceChange();
     if (mode !== this.viewMode) {
@@ -1812,6 +1868,11 @@ export class Tab {
     target.querySelector<HTMLElement>("summary")?.focus();
     this.atBottom.work = false;
     this.scrollPos.work = logsEl.scrollTop;
+  }
+
+  dismissYou(item: YouItem): void {
+    const identity = this.youStore.dismiss(item.id);
+    if (identity !== undefined) this.persistAskDismissals([identity]);
   }
 
   navigateToYou(item: YouItem): void {
@@ -2000,12 +2061,12 @@ export class Tab {
 
   // 復元後に注意表示を貼り直す。再生中は viewMode がまだ "conv" なので flagConvAttention は何もせず、
   // 作業ログ表示で復元したタブに未応答の承認が残っていても赤字が出ない
-  // （レビューAR6-M1）。過去の失敗は復元しない（応答待ちではないため）。
+  // 過去の失敗は復元しない（応答待ちではないため）。
   syncConvAttention(): void {
     if (this.hasPendingApproval()) this.flagConvAttention();
   }
 
-  // 未解決の承認があるか。件数は WorkModel が持つ。DOM を走査して数えない（ヘッダのミラーまで拾って誤検知する — レビューAR6-M1）。
+  // 未解決の承認があるか。件数は WorkModel が持つ。DOM を走査して数えない（ヘッダのミラーまで拾って誤検知する）。
   private hasPendingApproval(): boolean {
     return this.pendingApprovalCount > 0;
   }
@@ -2121,11 +2182,12 @@ export class Tab {
   // target で表示先パネルを選ぶ。既定は会話（ユーザーの判断・読解に関わるもの）。
   // 内部進行ログ（リトライ・診断など）は "work" を明示する。
   addBlock(cls: string, text: string, markdown = false, target: ViewMode = "conv", model: string | null = null): HTMLElement {
-    // 会話へブロックを差し込むときは、進行中のassistantコンテナを必ず閉じる。
+    // 会話へブロックを差し込むときは、進行中のassistantコンテナを閉じる。
     // 閉じないと、このブロックの後に再開した本文が「このブロックより上のコンテナ」へ
-    // 追加され、時系列が逆転する。クラス名の前方一致で除外しない（"assistant replayed" も startsWith("assistant") に一致する — レビューAR5-M2）。
+    // 追加され、時系列が逆転する。クラス名の前方一致で除外しない（"assistant replayed" も startsWith("assistant") に一致する）。
     // ライブ本文は appendAssistantSegment 経由で addBlock を通らないため影響しない。
-    if (target === "conv") this.endAssistantTurn();
+    // 例外は記録の途中（endAssistantTurnBeforeConvBlock）。
+    if (target === "conv") this.endAssistantTurnBeforeConvBlock();
     const div = document.createElement("div");
     div.className = `block ${cls}`;
     if (markdown) renderMarkdownInto(div, text, this.tabId);
@@ -2415,7 +2477,7 @@ export class Tab {
 
   // WorkModel が running から stale へ移したツール・エージェントの表示を止める。
   // 判断は reducer 側（ターン終端・ターン開始・会話終了）で、ここは指名された toolUseId の
-  // 表示だけを変える。DOM を走査して「実行中に見えるもの」を探さない（完了済みまで巻き込む。敵対レビュー R1-F1）。
+  // 表示だけを変える。DOM を走査して「実行中に見えるもの」を探さない（完了済みまで巻き込む）。
   private applyStaled(toolUseIds: readonly string[]): void {
     for (const toolUseId of toolUseIds) {
       const data = this.rowData.get(toolUseId);
@@ -2724,7 +2786,7 @@ export class Tab {
   }
 
   // segmentId ごとに1枚。カードはツールが最初に置かれた位置に留め、ログ末尾へは移動しない
-  // （レビューAR4-M1/M2）。移動案は
+  // 移動案は
   // (1) DOMの再挿入になるためカード内のテキスト選択とフォーカスが毎ツール破壊される
   //     （全再構築と同じく、テキスト選択が消える）
   // (2) TODOカードも末尾へ移動するため両者が末尾を奪い合い、TODO完了後に
@@ -2792,6 +2854,7 @@ export class Tab {
       if (this.currentTurnId !== null) turn.dataset.turnId = this.currentTurnId;
       this.convEl.appendChild(turn);
       this.currentAssistantTurn = turn;
+      this.replyFooterAnchor = turn;
     }
     const seg = document.createElement("div");
     seg.className = "assistant-seg streaming";
@@ -2836,10 +2899,15 @@ export class Tab {
     // 未ラベルの live run が記録側の uuid で名付けられ、live の撤回がそれを見つけられなくなる
     if (ev.provenance?.path === "history") return;
     this.flushDelta();
+    // The replay window may start at the UUID, with its text in the preceding page.
+    if (this.assistantRuns.length === 0) this.assistantLeadingRecord = { turnId: ev.turnId, uuid: ev.uuid };
     for (let i = this.assistantRuns.length - 1; i >= 0; i--) {
       if (this.assistantRuns[i].uuid !== null) break;
       this.assistantRuns[i].uuid = ev.uuid;
     }
+    // Before turn_started clears the runs, so asks keep their record identity (R-CNV-39).
+    this.persistAskDismissals(this.youStore.relabel());
+    this.closeLiveRecord();
   }
 
   // 撤回は冪等（未知・撤回済みの uuid は no-op）。turnId では絞らない——通知は
@@ -3100,8 +3168,9 @@ export class Tab {
 
   // 現在のassistantセグメントを確定する（markdown整形）。ターンのコンテナは閉じない
   // ＝ツール実行後に本文が再開したら同じコンテナへ次のセグメントが足され、連続して読める。
-  // 呼び出し元は endAssistantTurn の 1 箇所だけ＝確定が起きるのはターン境界のみ。
-  // ツール開始でここを呼ぶ経路を戻すと、表・箇条書き・単語がツール呼び出しをまたいで
+  // 呼び出し元は endAssistantTurn の 1 箇所だけ。確定はターン境界・会話ブロックの差し込みと、
+  // 開いた記録の後ろへ会話ブロックを置いた後の記録境界（closeLiveRecord）でだけ起きる。
+  // それ以外のツール開始でここを呼ぶ経路を足すと、表・箇条書き・単語がツール呼び出しをまたいで
   // 途中で切れる（R-DSP-24）。
   // 短い・単一段落のテキストを進行メモと推測して作業ログへ移さない。進行メモか回答かは後に何が来るかで決まり、
   // テキストからは判別できないので、回答本文を誤って隠す。
@@ -3119,6 +3188,11 @@ export class Tab {
             turnId: this.currentSegTurnId,
             el: this.currentAssistantBlock,
             text: this.assistantBuffer,
+            records: [
+              ...(this.assistantLeadingRecord?.turnId === this.currentSegTurnId
+                ? [{ text: "", uuid: this.assistantLeadingRecord.uuid }] : []),
+              ...this.assistantRuns.filter((run) => run.seg === this.currentAssistantBlock),
+            ],
           };
         }
         // 未確定の末尾だけを確定させる。確定済みDOMは触らない（選択を壊さない）
@@ -3143,8 +3217,31 @@ export class Tab {
     this.assistantBuffer = "";
   }
 
+  // R-CNV-09: 実行中の送信（steering）の発言・注記・承認は本文の記録の途中で届く。ここでコンテナを
+  // 閉じると同じ記録の残りが発言の後ろの別ブロックへ出て、laisora-ask 等のフェンスが割れる。
+  // 記録が開いている間はコンテナを開けたままブロックをその後ろへ置き、記録が閉じたときに閉じる
+  private endAssistantTurnBeforeConvBlock(): void {
+    if (!this.liveRecordOpen) {
+      this.endAssistantTurn();
+      return;
+    }
+    // 未描画のデルタが残っているとコンテナがまだ無く、ブロックより後ろに作られる
+    this.flushDelta();
+    this.convBlockAfterRecordIn = this.currentAssistantTurn;
+  }
+
+  // 閉じるのはブロックを後ろへ置いた時点のコンテナだけ。別のコンテナが進行中なら触らない
+  private closeLiveRecord(): void {
+    this.liveRecordOpen = false;
+    const placedIn = this.convBlockAfterRecordIn;
+    this.convBlockAfterRecordIn = null;
+    if (placedIn !== null && placedIn === this.currentAssistantTurn) this.endAssistantTurn();
+  }
+
   // ターン境界: assistantコンテナを閉じ、次の本文は新しい回答として始める。
   private endAssistantTurn(): void {
+    this.liveRecordOpen = false;
+    this.convBlockAfterRecordIn = null;
     this.endAssistantBlock();
     if (this.currentAssistantTurn && !this.currentAssistantTurn.querySelector(".assistant-seg")) {
       this.currentAssistantTurn.remove();
@@ -3283,13 +3380,14 @@ export class Tab {
   private buildReplyFooter(at: number | undefined, source: () => string): HTMLElement {
     const footer = document.createElement("div");
     footer.className = "reply-footer";
+    // 並び（日時 → ボタン）と右寄せは発言フッターと同じ。日時が後から分かる経路は applyFooterTime が先頭へ入れる
     const { button, status } = createCopyButton("msg-copy-button", l10n.t("Copy reply"), source);
-    footer.appendChild(button);
     const time = Tab.footerTime(at);
     if (time !== null) {
       time.className = "reply-footer-time";
       footer.appendChild(time);
     }
+    footer.appendChild(button);
     footer.appendChild(status);
     return footer;
   }
@@ -3300,14 +3398,17 @@ export class Tab {
     const time = Tab.footerTime(at);
     if (time === null) return;
     time.className = "reply-footer-time";
-    footer.insertBefore(time, footer.querySelector(".code-copy-status"));
+    footer.prepend(time);
   }
 
-  // live / 復元の追記は必ず会話面の末尾なので、「最新の返信」の印（R-CNV-15）は控えた要素から
-  // 付け替える。追記のたびに全走査すると、会話が伸びるほど 1 ターンの後始末が重くなる
-  private appendReplyFooter(at: number | undefined, source: () => string): void {
+  // live / 復元で足すフッターは常に最も新しい返信のものなので、「最新の返信」の印（R-CNV-15）は
+  // 控えた要素から付け替える。追記のたびに全走査すると、会話が伸びるほど 1 ターンの後始末が重くなる
+  // anchor は返信のコンテナ。記録の後ろへ実行中送信の発言が入ったターンでは末尾が発言なので、
+  // 末尾へ足すとフッターが返信から離れ、撤回時の後始末（直後の兄弟だけを見る）からも漏れる
+  private appendReplyFooter(at: number | undefined, source: () => string, anchor: HTMLElement | null = null): void {
     const footer = this.buildReplyFooter(at, source);
-    this.convEl.appendChild(footer);
+    if (anchor !== null && anchor.isConnected) anchor.after(footer);
+    else this.convEl.appendChild(footer);
     this.latestReplyFooter?.removeAttribute("data-latest");
     footer.dataset.latest = "1";
     this.latestReplyFooter = footer;
@@ -3333,6 +3434,7 @@ export class Tab {
   private buildUserFoot(at: number | undefined, text: string): HTMLElement {
     const foot = document.createElement("div");
     foot.className = "msg-foot";
+    // 並び（日時 → ボタン）と右寄せは返信フッターと同じにする。発言と返信でボタンの位置を変えない
     const time = Tab.footerTime(at);
     if (time !== null) {
       time.className = "msg-foot-time";
@@ -3454,7 +3556,7 @@ export class Tab {
   private onConversationClosed(ev: Extract<NormalizedEvent, { kind: "conversation_closed" }>): void {
     this.autoResumeBlock?.remove();
     this.autoResumeBlock = null;
-    // turn_failed を経ない突然死でも streaming ブロックを終端する（レビューP2R2-3a）
+    // turn_failed を経ない突然死でも streaming ブロックを終端する
     this.endAssistantTurn();
     // 実行中表示の終端は WorkModel の遷移に従う（どの toolUseId を畳むかは reducer が決める）。
     // H-3: runningChildTools のライフサイクルは終端イベントに一元化
@@ -3486,6 +3588,8 @@ export class Tab {
     // 前ターンのassistantコンテナを閉じる（次の本文は別回答として始める）
     this.endAssistantTurn();
     this.assistantRuns = [];
+    this.replyFooterAnchor = null;
+    if (this.assistantLeadingRecord?.turnId !== turnId) this.assistantLeadingRecord = null;
     // 作業ログ側にターンの区切りを打つ
     // CLI が開いたターンは見出しを取らない。持ち越しの消費もしない——消すと、その発言を待っている
     // 次の人間のターンが見出しを失う（復元タブは hydration 済み履歴をこの経路へ流すので実際に起こる）
@@ -3495,7 +3599,7 @@ export class Tab {
     // 前ターンのカードへ追記させないのは segmentId の切替が担う（reducer が turn_started で
     // segment を閉じるので、次のツールは別カードになる）。終端イベントを取りこぼしたときに
     // 「実行中」が残り続けるのを回収するのも reducer 側で、ここは指名された分の表示を止める
-    // だけにする（レビューAR4-M3 / 完了済みまで走査しない = R1-F1）。
+    // だけにする（完了済みまで走査しない）。
     this.applyWork(work);
     this.clearRetryBlock();
     // H-3: 新ターン開始時に前ターンの残留を確実にクリアする。
@@ -3538,7 +3642,11 @@ export class Tab {
       const holder = { turnId: ev.turnId, text: this.assistantRunsText() };
       if (holder.text.trim().length > 0) {
         this.liveReplyText = holder;
-        this.appendReplyFooter(ev.timestamp > 0 ? ev.timestamp : undefined, () => holder.text);
+        const top = this.topConvSeg?.turnId === ev.turnId ? this.topConvSeg : undefined;
+        this.appendReplyFooter(ev.timestamp > 0 ? ev.timestamp : undefined, () => {
+          const past = this.pastConvTurns.get(holder.turnId);
+          return past !== undefined && top !== undefined ? past.text + holder.text.slice(top.text.length) : holder.text;
+        }, this.replyFooterAnchor);
         this.scrollToBottom("conv");
       }
     }
@@ -3628,6 +3736,7 @@ export class Tab {
   private onAssistantTextDelta(ev: Extract<NormalizedEvent, { kind: "assistant_text_delta" }>): void {
     if (ev.provenance?.path === "history") return;
     if (ev.turnId !== this.currentTurnId && !this.adoptOrphanTurn(ev)) return;
+    if (ev.text.length > 0) this.liveRecordOpen = true;
     this.pendingDeltaText += ev.text;
     this.pendingDeltaTurnId = ev.turnId;
     if (!this.rafScheduled) {
@@ -3657,7 +3766,8 @@ export class Tab {
   }
 
   private onUserMessage(ev: Extract<NormalizedEvent, { kind: "user_message" }>): void {
-    this.endAssistantTurn();
+    // history の発言はここで描かないので、開いた live 記録の後ろへ置いた扱いにしない
+    if (ev.provenance?.path !== "history" || !this.liveRecordOpen) this.endAssistantTurnBeforeConvBlock();
     // プロンプト追加でカードを分けるのは reducer 側（user_message で segment を閉じる）
     this.applyWork(ev.work);
     this.noteHumanHeadline(ev.text, ev.turnId);
@@ -3702,6 +3812,7 @@ export class Tab {
         ? this.addBlock("user replayed", ev.text)
         : this.addBlock("assistant replayed", ev.text, false, "conv", ev.model ?? null);
     if (ev.role === "assistant") {
+      if (ev.uuid) this.recordReplyIds.add(ev.uuid);
       this.renderReplyMarkdown(block, ev.text, ev.uuid ?? `replay:${ev.generation}:${ev.seq}`, 0, ev.recordedAt ?? 0, ev.seq, ev.generation);
       this.prependTurnLabel(block, "assistant", ev.model ?? null);
       // addBlock が素の本文で検索した後に本文を描き直すので、ここで検索し直さないと印が外れたまま件数だけ残る（CH-U32b）
@@ -3802,6 +3913,9 @@ export class Tab {
 
   private onToolCallStarted(ev: Extract<NormalizedEvent, { kind: "tool_call_started" }>): void {
     const isHistory = ev.provenance?.path === "history";
+    // uuid が届かない記録（wire uuid 欠落）でもツール開始で閉じる。サブエージェントのツールは
+    // root の本文と並行して走るので境界にしない
+    if (!isHistory && ev.parentToolUseId === null) this.closeLiveRecord();
     if (isHistory && !this.workReplayMarkerShown) {
       this.workReplayMarkerShown = true;
       this.addBlock("system", l10n.t("── Restored previous session ──"), false, "work");
@@ -3825,7 +3939,7 @@ export class Tab {
     }
 
     if (!isHistory) {
-      // 入れ子エージェント（子がAgent/Task）も数える。下の agent 分岐がそこで return するため、その前に登録する（レビューAR3-L1）
+      // 入れ子エージェント（子がAgent/Task）も数える。下の agent 分岐がそこで return するため、その前に登録する
       if (placement.ownerToolUseId !== undefined) {
         this.runningChildTools.set(ev.toolUseId, {
           name: ev.inputSummary ?? ev.toolName,
@@ -4141,7 +4255,7 @@ export class Tab {
     if (this.lastObservedModel !== null && this.lastObservedModel !== ev.model) {
       // live では本文の delta が先に描かれ、model を持つ assistant record は後着する。
       // 進行中のコンテナがこのターンのものなら、その前（＝利用者の発言の直後）へ入れる。
-      // addBlock は endAssistantTurn でコンテナを閉じるのでここでは使わない
+      // addBlock はコンテナを閉じる（記録の途中なら記録の終わりで閉じる）のでここでは使わない
       const anchor =
         this.currentAssistantTurn !== null &&
         this.currentAssistantTurn.isConnected &&
@@ -4176,7 +4290,7 @@ export class Tab {
   private onApprovalRequest(ev: Extract<NormalizedEvent, { kind: "approval_request" }>): void {
     this.applyWork(ev.work);
     this.renderApproval(ev);
-    // バックグラウンドタブでも承認待ちが判別できるようタブ上に明示（レビューP2-9）
+    // バックグラウンドタブでも承認待ちが判別できるようタブ上に明示
     this.tabBtn.classList.add("needs-approval");
     // 作業ログを見ている最中でも気づけるように、会話タブ側にも注意表示を出す
     this.flagConvAttention();
@@ -4184,7 +4298,7 @@ export class Tab {
 
   private onApprovalResolved(ev: Extract<NormalizedEvent, { kind: "approval_resolved" }>): void {
     // 未解決件数は WorkModel から来る（末尾の hasPendingApproval）。
-    // カード本体は作った時に控えた参照で引く（DOM 検索は範囲を誤るとヘッダのミラーを掴む — レビューAR6-M1 / R1-F8）。
+    // カード本体は作った時に控えた参照で引く（DOM 検索は範囲を誤るとヘッダのミラーを掴む）。
     this.applyWork(ev.work);
     const el = this.approvalCards.get(ev.requestId);
     if (el) {
@@ -4212,7 +4326,7 @@ export class Tab {
       }
       // M-7: 回答の監査性。カード内に「回答: 質問→値」を textContent で追記する（replay でも再現）。
       // details の外に置くので、畳んだ状態でも何を答えたかが見える。
-      // 判定チップ側と同条件の二重付与ガード（レビューAR3-L5: 再生で2回処理されうる）
+      // 判定チップ側と同条件の二重付与ガード（再生で2回処理されうる）
       if (ev.answers && Object.keys(ev.answers).length > 0 && !el.querySelector(".askq-answers-summary")) {
         const summary = document.createElement("div");
         summary.className = "askq-answers-summary";
@@ -4255,9 +4369,9 @@ export class Tab {
     this.addBlock("error", ev.message);
     this.flagConvAttention();
     if (activeTabId === this.tabId) refreshChrome();
-    // 送信の楽観的 running 中にエラーが返ったら idle へ復帰させる（codexレビューC2-6:
-    // ensureConversation 失敗・連投ガード時に UI が running のまま固まる）。
-    // ただし起動時の APIキー除去警告は送信失敗ではないので復帰させない（codexレビューC3-4）
+    // 送信の楽観的 running 中にエラーが返ったら idle へ復帰させる。
+    // ensureConversation 失敗・連投ガード時に UI が running のまま固まるため。
+    // ただし起動時の APIキー除去警告は送信失敗ではないので復帰させない
     if (this.pendingSend && !ev.message.includes("ANTHROPIC_API_KEY")) {
       this.pendingSend = false;
       this.setTurnState("idle");
@@ -4266,7 +4380,8 @@ export class Tab {
 
   private renderApproval(ev: Extract<NormalizedEvent, { kind: "approval_request" }>): void {
     const { requestId, toolName, rawInputJson, questions } = ev;
-    this.endAssistantTurn();
+    // バックグラウンドのサブエージェントの承認は root の本文の途中にも届く
+    this.endAssistantTurnBeforeConvBlock();
     const div = document.createElement("div");
     div.className = "block approval";
     div.dataset.approval = requestId;
@@ -4511,7 +4626,8 @@ export class Tab {
     // pastConvTurns で引き継いで1枚に統合する。統合しないと、物理 chunk 境界が行の途中に
     // 落ちたとき markdown の意味境界として現れる（見出しが「## 併せて見」と
     // 「つかった検査の盲点」へ割れる）
-    const turns = new Map<string, { el: HTMLElement; text: string }>();
+    const turns = new Map<string, { el: HTMLElement }>();
+    const records = new Map<string, RecordTextPart[]>();
     for (const ev of events) {
       // turn_completed は会話面の白リストに無く描かれないが、返信フッターの日時の出所は
       // これしかない（assistant_text_delta の envelope timestamp は継承値）
@@ -4523,6 +4639,11 @@ export class Tab {
       }
       try {
         const outcome = this.renderPastConvEvent(ev, frag, turns);
+        if (ev.provenance?.path !== "history" && (ev.kind === "assistant_text_delta" || ev.kind === "assistant_message_uuid")) {
+          const parts = records.get(ev.turnId) ?? [];
+          appendRecordPart(parts, ev.kind === "assistant_text_delta" ? { text: ev.text, uuid: null } : { text: "", uuid: ev.uuid });
+          records.set(ev.turnId, parts);
+        }
         this.renderedConvEventKeys.add(key);
         if (outcome === "skipped") skipped++;
         else if (outcome === "duplicate") duplicates++;
@@ -4535,17 +4656,21 @@ export class Tab {
     }
     // 遡りは新しい chunk から古い chunk の順に届くので、既存ターンへは前へ結合する。
     // 結合後の全文を一度に render する（部分 render では意味境界が chunk 位置に依存する）
-    for (const [turnId, turn] of turns) {
+    for (const [turnId, parts] of records) {
       // 初回の統合先は窓の先頭で描いた live セグメント（topConvSeg）。統合後は pastConvTurns が
       // 同じ el と全文を持つので、以後はそちらから引く
       const top = this.topConvSeg;
       const carried =
         this.pastConvTurns.get(turnId) ??
-        (top !== null && top.turnId === turnId && top.el === turn.el ? top : undefined);
-      const merged = carried !== undefined && carried.el === turn.el ? turn.text + carried.text : turn.text;
+        (top !== null && top.turnId === turnId ? top : undefined);
+      const joined = prependRecordParts(parts, this.pastConvRecords.get(turnId) ?? (top !== null && carried === top ? top.records : []));
+      this.pastConvRecords.set(turnId, joined);
+      const turn = turns.get(turnId) ?? carried;
+      if (turn === undefined) continue;
+      const merged = joinRecordTexts(joined.map((part) => part.text));
       this.youStore.retain(turnId, 0, Infinity, new Set());
-      this.renderReplyMarkdown(turn.el, merged, turnId);
       this.pastConvTurns.set(turnId, { el: turn.el, text: merged });
+      this.renderReplyMarkdown(turn.el, merged, turnId);
     }
     for (const [turnId, footer] of this.pastConvFooters) {
       Tab.applyFooterTime(footer, this.pastTurnCompletedAt.get(turnId));
@@ -4574,7 +4699,7 @@ export class Tab {
   private renderPastConvEvent(
     ev: NormalizedEvent,
     frag: DocumentFragment,
-    turns: Map<string, { el: HTMLElement; text: string }>
+    turns: Map<string, { el: HTMLElement }>
   ): "created" | "duplicate" | "continued" | "skipped" {
     this.observeYouEvent(ev);
     if (!isConvRenderableEvent(ev)) return "skipped";
@@ -4588,7 +4713,10 @@ export class Tab {
         div.dataset.msgUuid = uuid;
         this.convMessageUuids.add(uuid);
       }
-      if (ev.role === "assistant") this.renderReplyMarkdown(div, ev.text, ev.uuid ?? `replay:${ev.generation}:${ev.seq}`, 0, ev.recordedAt ?? 0, ev.seq, ev.generation);
+      if (ev.role === "assistant") {
+        if (uuid) this.recordReplyIds.add(uuid);
+        this.renderReplyMarkdown(div, ev.text, ev.uuid ?? `replay:${ev.generation}:${ev.seq}`, 0, ev.recordedAt ?? 0, ev.seq, ev.generation);
+      }
       else div.textContent = ev.text;
       this.prependTurnLabel(div, ev.role, ev.model ?? null);
       this.observeSessionTime(ev.recordedAt ?? ev.sentAt);
@@ -4632,7 +4760,6 @@ export class Tab {
     if (ev.kind === "assistant_text_delta") {
       const existing = turns.get(ev.turnId);
       if (existing !== undefined) {
-        existing.text += ev.text;
         // 2件目以降は同じブロックへ足すだけなので新しい行は作っていない
         return "continued";
       }
@@ -4640,7 +4767,7 @@ export class Tab {
       // el が外れているのは clearTab 後などで、その場合は作り直す
       const carried = this.pastConvTurns.get(ev.turnId);
       if (carried !== undefined && carried.el.isConnected) {
-        turns.set(ev.turnId, { el: carried.el, text: ev.text });
+        turns.set(ev.turnId, { el: carried.el });
         return "continued";
       }
       // 再生窓の切れ目で割れたターン。窓の先頭で描いた最上部のセグメントが同じ turnId なら、
@@ -4649,7 +4776,7 @@ export class Tab {
       // 進行中のセグメントを候補にすると、増分描画の途中で描き直して進行中の応答が壊れる（R-CNV-08）
       const top = this.topConvSeg;
       if (top !== null && top.turnId === ev.turnId && top.el.isConnected) {
-        turns.set(ev.turnId, { el: top.el, text: ev.text });
+        turns.set(ev.turnId, { el: top.el });
         return "continued";
       }
       const turn = document.createElement("div");
@@ -4661,7 +4788,7 @@ export class Tab {
       seg.className = "assistant-seg";
       turn.appendChild(seg);
       frag.appendChild(turn);
-      turns.set(ev.turnId, { el: seg, text: ev.text });
+      turns.set(ev.turnId, { el: seg });
       const turnId = ev.turnId;
       const footer = this.buildReplyFooter(undefined, () => this.pastConvTurns.get(turnId)?.text ?? "");
       this.pastConvFooters.set(turnId, footer);
@@ -4698,8 +4825,8 @@ export class Tab {
   }
 
   // 会話の過去 chunk を prepend する。**addBlock を通さない**: addBlock は target が conv の
-  // とき endAssistantTurn() を呼ぶので、進行中の assistant ストリーミングが強制確定される
-  // （契約 P4・ユーザー裁定）。streaming state・EventLog・semantic ingestion には触れない
+  // とき末尾へ足し、進行中の assistant コンテナを閉じる（記録の途中なら記録の終わりで閉じる）ので、
+  // 進行中の assistant ストリーミングが確定される（契約 P4・ユーザー裁定）。streaming state・EventLog・semantic ingestion には触れない
   prependPastMessages(
     items: ReadonlyArray<{
       uuid: string;
@@ -4741,10 +4868,13 @@ export class Tab {
         div.className = m.role === "user" ? "block user replayed" : "block assistant replayed";
         div.dataset.msgUuid = m.uuid;
         div.dataset.convPast = "1";
-        if (m.role === "assistant") this.renderReplyMarkdown(div, m.text, m.uuid, 0, m.timestamp ?? 0);
+        if (m.role === "assistant") {
+          this.recordReplyIds.add(m.uuid);
+          this.renderReplyMarkdown(div, m.text, m.uuid, 0, m.timestamp ?? 0);
+        }
         else {
           div.textContent = m.text;
-          this.youStore.reply(m.uuid, m.timestamp ?? 0);
+          this.youStore.reply(m.uuid, m.timestamp ?? 0, undefined, undefined, m.text);
         }
         this.prependTurnLabel(div, m.role, m.model ?? null);
         this.observeSessionTime(m.timestamp);
@@ -4808,7 +4938,7 @@ export class Tab {
 
   // 履歴ブロックが実際に見えているか。作業ビューは既定が「概要」で、WorkOverview.applyMode が
   // workEl 直下の子を hidden にするため、詳細サブタブでないとボタンごと見えない。
-  // 見えていないところへ prepend すると scrollHeight が動かず視界維持が成立しない（契約 C8）
+  // 見えていないところへ prepend すると scrollHeight が動かず視界維持が成立しない
   historyPaneUsable(): boolean {
     return this.historyHeadEl !== null && this.historyHeadEl.isConnected && !this.historyHeadEl.hidden;
   }

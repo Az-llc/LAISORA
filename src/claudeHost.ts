@@ -51,8 +51,10 @@ import type { ProgressTrackingMode } from "./progress-protocol";
 import { PROGRESS_WIRE_TOOL_NAME } from "./artifact-access";
 import { z } from "zod";
 import { ClaudeLiveNormalizer, parseAliases } from "./claude-normalizer";
-import { conductorInstruction, orchestrationExternalTargets, orchestrationAgents, resolveOrchestrationRoster, type OrchestrationRow, type ExternalModels } from "./orchestration-roster";
+import { conductorInstruction, orchestrationExternalTargets, orchestrationAgents, orchestrationVariants, resolveOrchestrationRoster, type OrchestrationRow, type ExternalModels } from "./orchestration-roster";
+import { injectionOf, MAX_AGENT_STARTS, type AgentStartObservation, type RosterEvidence, type RosterInjection } from "./roster-evidence";
 import { admitTransition, textHash, selectDelivery, renderDeliverySection, learningFacts, type LearningFacts, type LearningRecord, type LearningState, type LearningTransition } from "./learning";
+import { renderModelProfileSection, resolveClaudeProfileModel, type ProfileTarget } from "./orchestration-profiles";
 import { sharedLearningService, type LearningResult, type LearningService } from "./learning-service";
 import { createLearningMcpServer, LearningRootGate, LEARNING_INSTRUCTION, LEARNING_TOOL_NAME } from "./learning-mcp";
 import { splitAgyModel, type ExecutorId } from "./orchestration-executors";
@@ -84,8 +86,13 @@ const CAP_INTERRUPT_CANCEL_QUEUED = "interrupt_cancel_queued_v1";
 
 // The link grammar must stay within src/file-link-target.ts#parseFileLinkTarget. Forward slashes are required:
 // a Markdown link destination treats a backslash before ASCII punctuation as an escape and drops it.
-export const FILE_LINK_INSTRUCTION =
-  "When you mention a local file or folder, write it as a Markdown link. The link target is the absolute path or the path relative to the working directory, with forward slashes, optionally followed by #L<line> or #L<line>C<column>. Use the path and line as the link text, for example [src/app.ts:42](src/app.ts#L42) or [app.ts](C:/work/src/app.ts). Folders end with a slash: [artifacts/](artifacts/). Files such as spreadsheets, documents and PDFs are linked the same way and open in their default app. If the path contains spaces, wrap the target in angle brackets: [notes.md](<docs/my notes.md>). Write web URLs with the https:// scheme.";
+// R-CNV-14: use the session cwd shared with composer-io, never the shell's moving working directory.
+export const FILE_LINK_INSTRUCTION = (cwd = ""): string => {
+  const base = cwd
+    ? `Relative targets resolve against the conversation folder ${JSON.stringify(cwd.replace(/\\/g, "/"))}, fixed at conversation start, not against the shell's current directory. Use absolute paths for files outside this folder.`
+    : "The conversation working directory is unknown; use absolute paths.";
+  return `When you mention a local file or folder, write it as a Markdown link. The link target is the absolute path or the path relative to the ${cwd ? "conversation folder" : "working directory"}, with forward slashes, optionally followed by #L<line> or #L<line>C<column>. ${base} Use the path and line as the link text, for example [src/app.ts:42](src/app.ts#L42) or [app.ts](C:/work/src/app.ts). Folders end with a slash: [artifacts/](artifacts/). Files such as spreadsheets, documents and PDFs are linked the same way and open in their default app. If the path contains spaces, wrap the target in angle brackets: [notes.md](<docs/my notes.md>). Write web URLs with the https:// scheme.`;
+};
 
 // SDK 0.3.270: an omitted systemPrompt is an empty custom prompt (not the claude_code preset), so OFF passes "" to keep that prompt.
 // snapshot:false is required on every launch: the default snapshot replays the prompt recorded when the session was
@@ -107,8 +114,8 @@ export const PLAN_INSTRUCTION = [
   "</format>",
 ].join("\n");
 
-export function conversationSystemPrompt(fileLinkInstruction: boolean, planInstruction = true): NonNullable<ClaudeCodeOptions["systemPrompt"]> {
-  return { type: "custom", prompt: [fileLinkInstruction ? FILE_LINK_INSTRUCTION : "", planInstruction ? PLAN_INSTRUCTION : ""].filter(Boolean).join("\n\n"), snapshot: false };
+export function conversationSystemPrompt(fileLinkInstruction: boolean, planInstruction = true, cwd = ""): NonNullable<ClaudeCodeOptions["systemPrompt"]> {
+  return { type: "custom", prompt: [fileLinkInstruction ? FILE_LINK_INSTRUCTION(cwd) : "", planInstruction ? PLAN_INSTRUCTION : ""].filter(Boolean).join("\n\n"), snapshot: false };
 }
 
 interface QueryHandle extends AsyncIterable<any> {
@@ -162,9 +169,10 @@ export interface ClaudeHostOptions {
   configuredResolvedModel?: string;
   conductorPolicy?: string;
   onOrchestrationChanged?: () => void;
+  onLearningRecorded?: () => void;
   interruptForceKillTimeoutMs: number;
   // テスト専用: provider interrupt を意図的にスキップし abort フォールバック経路を検証する。
-  // 拡張本体（extension.ts）からは決して設定しないこと（敵対レビュー指摘[8]: 環境変数方式は本番汚染リスク）。
+  // 拡張本体（extension.ts）からは決して設定しないこと（環境変数方式は本番汚染リスク）。
   testInterruptHang?: boolean;
   // 注入（記録させる側）のみを制御する。既に L1 に存在する
   // protocol event の抽出は設定非依存（tool-observation 側で常に行う）
@@ -309,13 +317,7 @@ export async function resolveHandoffRuntime(
 }
 
 function normalizeLearningModel(value: string | undefined, context: ClaudeHostOptions): string | undefined {
-  const clean = (model: string) => model.trim().toLowerCase().replace(/\[1m\]$/, "");
-  const known = value ? clean(value) : undefined;
-  const models = context.externalModels?.claude;
-  const resolved = models?.state === "ok" ? models.models.find(row => clean(row.id) === known)?.resolvedModel : undefined;
-  const model = resolved ?? (known && !/^(default|haiku|sonnet|opus)$/.test(known) ? known : context.configuredResolvedModel);
-  const normalized = model ? clean(model) : undefined;
-  return normalized && !/^(default|haiku|sonnet|opus)$/.test(normalized) ? normalized : undefined;
+  return resolveClaudeProfileModel(value, context.externalModels, context.configuredResolvedModel);
 }
 
 function learningModelsR12(context: ClaudeHostOptions, observed?: string) {
@@ -342,7 +344,10 @@ export class ClaudeConversation {
   private readonly agentRuns = new Map<string, AgentRunRecord>();
   get orchestrationRuns(): readonly OrchestrationRunRecord[] { return Object.freeze([...this.runs]); }
   get observedAgentRuns(): ReadonlyMap<string, AgentRunRecord> { return new Map(this.agentRuns); }
-  private async recordRun(record: OrchestrationRunRecord): Promise<OrchestrationRunRecord> {
+  // runId は読み戻した記録と会話の記録の重複除去、sessionId は読み戻す対象の絞り込みに使う（R-ANL-24）
+  private async recordRun(unstamped: OrchestrationRunRecord): Promise<OrchestrationRunRecord> {
+    const sessionId = this.learningSessionRef ?? this.opts.resumeSessionId;
+    let record: OrchestrationRunRecord = Object.freeze({ ...unstamped, runId: randomUUID(), ...(sessionId ? { sessionId } : {}) });
     const index = this.runs.length;
     this.runs.push(record);
     if (this.opts.orchestrationRunsDirectory) {
@@ -361,6 +366,11 @@ export class ClaudeConversation {
   private readonly orchestrationEnabled: boolean;
   private readonly conductorPolicy: string;
   private readonly initialOrchestrationSettings: { settings: unknown; deliveredSetHash?: string };
+  private modelProfileSection = "";
+  modelProfileOmittedCount = 0;
+  private readonly researchModels: ProfileTarget[] = [];
+  get learningToolAvailable(): boolean { return !!this.learningGate && !this.closed; }
+  allowResearchModels(targets: readonly ProfileTarget[]): void { this.researchModels.push(...targets); }
   private learningDelivery?: Extract<LearningRecord, { kind: "delivery" }>;
   private learningSessionRef?: string;
   private learningState?: LearningState;
@@ -387,7 +397,6 @@ export class ClaudeConversation {
       conversationRef: this.conversationId,
       sessionRef: this.learningSessionRef ?? this.opts.resumeSessionId ?? null,
       model: this.learningObservedModel ?? this.learningDelivery?.model ?? null,
-      scope: this.opts.learningScope ?? "global",
     });
   }
 
@@ -430,7 +439,6 @@ export class ClaudeConversation {
       if (this.learningService.skipped) this.opts.log(`R-LRN-07: learning skipped ${this.learningService.skipped} records`);
       const scope = this.opts.learningScope ?? "global";
       for (const [ruleId, rule] of state.rules) for (const version of rule.versions) {
-        if (version.record.scope !== scope) continue;
         for (const [model, qualification] of version.qualifications) {
           if (qualification.state === "quarantined" && qualification.reviewDueAt && Date.parse(qualification.reviewDueAt) <= Date.now()) {
             await this.appendLearningTransitionR33({ kind: "reviewDue", at: new Date().toISOString(),
@@ -438,10 +446,14 @@ export class ClaudeConversation {
           }
         }
       }
+      if ([...state.records.values()].filter(record => record.kind === "control").at(-1)?.autoApply === false) return "";
+      const profiles = renderModelProfileSection(state, this.roster, this.opts.externalModels);
+      this.modelProfileSection = profiles.text;
+      this.modelProfileOmittedCount = profiles.omitted;
+      if (profiles.omitted) this.opts.log(`R-LRN-11: model profile overflow ${profiles.omitted}`);
       const model = normalizeLearningModel(this.opts.model, this.opts);
       if (!model) return "";
-      if ([...state.records.values()].filter(record => record.kind === "control").at(-1)?.autoApply === false) return "";
-      const selection = selectDelivery(state, { model, scope });
+      const selection = selectDelivery(state, { model });
       this.learningDelivery = { kind: "delivery", at: new Date().toISOString(), opId: randomUUID(),
         conversationRef: this.conversationId, sessionRef: this.opts.resumeSessionId ?? null, model, scope,
         rules: selection.rules.map(({ ruleId, hash }) => ({ ruleId, hash })), setHash: selection.setHash, outcome: "sent" };
@@ -458,14 +470,16 @@ export class ClaudeConversation {
     }
   }
 
-  private recordLearningR12(input: unknown, rootVerified: boolean): Promise<LearningResult> {
+  private async recordLearningR12(input: unknown, rootVerified: boolean): Promise<LearningResult> {
     if (!rootVerified) this.opts.log("R-LRN-12: learning admission refused: caller-unverified");
     if (!this.learningService) return Promise.resolve(rootVerified ? { ok: false, code: "store-error", requirement: "R-LRN-07" }
       : { ok: false, code: "caller-unverified", requirement: "R-LRN-12" });
     const models = learningModelsR12(this.opts, this.learningObservedModel);
-    return this.learningService.record(input, { enabled: this.opts.learningEnabled === true, rootVerified,
+    const result = await this.learningService.record(input, { enabled: this.opts.learningEnabled === true, rootVerified,
       conversationRef: this.conversationId, scope: this.opts.learningScope ?? "global",
-      knownModels: models.known, unresolvedModels: models.unresolved, sourceRefs: [] });
+      knownModels: [...models.known, ...this.researchModels], unresolvedModels: models.unresolved, sourceRefs: [] });
+    if (result.ok) this.opts.onLearningRecorded?.();
+    return result;
   }
 
   private queueLearningR33(action: () => Promise<void>): Promise<void> {
@@ -501,7 +515,6 @@ export class ClaudeConversation {
     if (!state) return;
     const previousObserved = this.learningObservedModel;
     this.learningObservedModel = observed;
-    const scope = this.opts.learningScope ?? "global";
     const sessionRef = this.learningSessionRef ?? this.opts.resumeSessionId ?? null;
     const sent = this.learningDelivery;
     if (sent && observed !== sent.model && !this.learningMismatchRecorded) {
@@ -510,9 +523,9 @@ export class ClaudeConversation {
     }
     for (const [ruleId, rule] of state.rules) {
       const version = rule.versions.at(-1)!;
-      if (version.record.scope !== scope || ![...version.qualifications.values()].some(value => value.state === "active")) continue;
+      if (![...version.qualifications.values()].some(value => value.state === "active")) continue;
       const last = [...state.records.values()].reverse().find(record =>
-        record.kind === "delivery" && record.scope === scope && record.outcome === "sent"
+        record.kind === "delivery" && record.outcome === "sent"
           && record.rules.some(value => value.ruleId === ruleId && value.hash === version.record.hash)
         || record.kind === "quarantine" && record.rule_id === ruleId && record.hash === version.record.hash);
       const lastModel = last?.kind === "delivery" ? last.model : last?.kind === "quarantine" ? last.newModel : undefined;
@@ -528,6 +541,30 @@ export class ClaudeConversation {
 
   get observedAgentSettings(): ReadonlyMap<string, Readonly<{ agentType?: string; model?: string; effort?: string }>> {
     return new Map(this.observedAgents);
+  }
+
+  // ROLES の根拠（src/roster-evidence.ts）。注入した役割表と、注入中に起動フックが観測した agent_id → agentKey
+  private readonly rosterInjections: RosterInjection[] = [];
+  private readonly agentStarts = new Map<string, AgentStartObservation>();
+  get rosterEvidence(): RosterEvidence {
+    return { injections: [...this.rosterInjections], starts: [...this.agentStarts.values()] };
+  }
+
+  private observeAgentStart(input: unknown): void {
+    if (!input || typeof input !== "object") return;
+    const agentId = (input as Record<string, unknown>).agent_id;
+    if (typeof agentId !== "string" || !agentId) return;
+    const observed = this.observedAgents.get(agentId);
+    const agentKey = observed?.agentType;
+    const injected = this.rosterInjections[this.rosterInjections.length - 1];
+    if (agentKey === undefined || injected?.agents.some((agent) => agent.agentKey === agentKey) !== true) return;
+    const previous = this.agentStarts.get(agentId);
+    if (previous === undefined && this.agentStarts.size >= MAX_AGENT_STARTS) return;
+    this.agentStarts.set(agentId, {
+      agentId, agentKey, at: previous?.at ?? Date.now(),
+      ...(observed?.model !== undefined ? { model: observed.model } : {}),
+      ...(observed?.effort !== undefined ? { effort: observed.effort } : {}),
+    });
   }
 
   private observeAgentSettings(input: unknown): void {
@@ -660,8 +697,8 @@ export class ClaudeConversation {
       input: Record<string, unknown>,
       ctx
     ): Promise<PermissionResult> => {
-      // SDK が渡す文脈（blockedPath/decisionReason 等）も承認画面へ出す（codexレビューC1-8:
-      // 解決済みパスや拒否理由を見ずに許可させない）。関数・AbortSignal 等は落として安全に直列化。
+      // SDK が渡す文脈（blockedPath/decisionReason 等）も承認画面へ出す。
+      // 解決済みパスや拒否理由を見ずに許可させない。関数・AbortSignal 等は落として安全に直列化。
       const ctxJson = (() => {
         try {
           return JSON.stringify(
@@ -704,7 +741,7 @@ ${ctxJson}`
         questions,
       });
       // approval_resolved の emit は解決経路側（resolveApproval / endTurn / dispose）が単一責務で行う。
-      // ここで emit すると turn-end/dispose 解決時に "user" の偽レコードが重複する（レビューR2-1）。
+      // ここで emit すると turn-end/dispose 解決時に "user" の偽レコードが重複する。
       const learningCall = toolName === LEARNING_TOOL_NAME ? ctx.toolUseID : undefined;
       self.learningGate?.hold(learningCall);
       if (learningCall !== undefined) {
@@ -790,15 +827,18 @@ ${ctxJson}`
     if (this.opts.planInstruction !== false) {
       options.allowedTools = [...(options.allowedTools ?? []), "TaskCreate", "TaskGet", "TaskUpdate", "TaskList"];
     }
-    options.systemPrompt = conversationSystemPrompt(this.opts.fileLinkInstruction === true, this.opts.planInstruction !== false);
+    options.systemPrompt = conversationSystemPrompt(this.opts.fileLinkInstruction === true, this.opts.planInstruction !== false, this.opts.cwd);
     const deliverySection = await this.prepareLearningDeliveryR31();
+    // 注入しない起動も空の記録として残す。残さないと、前の起動の役割表がこの起動の委任にまで効く
+    this.rosterInjections.push(injectionOf(this.orchestrationEnabled ? orchestrationVariants(this.roster) : [], Date.now()));
     if (this.orchestrationEnabled) {
       options.agents = orchestrationAgents(this.roster);
-      const base = this.opts.fileLinkInstruction === true ? FILE_LINK_INSTRUCTION : "";
+      const base = this.opts.fileLinkInstruction === true ? FILE_LINK_INSTRUCTION(this.opts.cwd) : "";
       options.systemPrompt = { type: "custom", snapshot: false,
-        prompt: [base, this.opts.planInstruction !== false ? PLAN_INSTRUCTION : "", conductorInstruction(this.roster, this.conductorPolicy, this.externalRows, deliverySection)].filter(Boolean).join("\n\n") };
+        prompt: [base, this.opts.planInstruction !== false ? PLAN_INSTRUCTION : "", conductorInstruction(this.roster, this.conductorPolicy, this.externalRows, deliverySection, this.modelProfileSection)].filter(Boolean).join("\n\n") };
       const observe: ClaudeCodeSdk.HookCallback = async (input) => {
         this.observeAgentSettings(input);
+        this.observeAgentStart(input);
         const record = observeAgentRun(this.agentRuns.get((input as { agent_id?: string }).agent_id ?? ""), input);
         if (record) {
           this.agentRuns.set(record.agent_id, record);
@@ -824,7 +864,7 @@ ${ctxJson}`
           if (!row) return { isError: true, content: [{ type: "text" as const, text: "R-ORC-10: target is not in the conversation snapshot." }] };
           const run = await runExternal(row, input, { cwd: this.opts.cwd, timeoutMinutes: this.externalTimeoutMinutes, apiKeyPolicy: this.opts.apiKeyPolicy });
           const record = await this.recordRun(run.record);
-          if (record !== run.record) return { isError: true, content: [{ type: "text" as const, text: record.reason! }] }; // R-ORC-14
+          if (record.reason !== run.record.reason) return { isError: true, content: [{ type: "text" as const, text: record.reason! }] }; // R-ORC-14
           return run.result;
         })],
       }) };
@@ -926,8 +966,8 @@ ${ctxJson}`
   send(text: string, images?: ImageAttachment[], observedTimestampSeed?: number, automatic = false): void {
     if (!automatic) this.usageLimitResume.manualSend();
     if (this.closed) {
-      // interrupt強制終了直後の追加送信等。user_messageは記録済みのため無言ドロップにしない
-      // （レビューAR2-4: 返答もエラーも来ない幽霊バブル化を防ぐ）
+      // interrupt強制終了直後の追加送信等。user_messageは記録済みのため無言ドロップにしない。
+      // 返答もエラーも来ない幽霊バブル化を防ぐ。
       this.emit({
         kind: "error",
         message: l10n.t("The conversation has ended. Resend your message (a new connection will be started)"),
@@ -979,7 +1019,7 @@ ${ctxJson}`
 
   // 中断プロトコル: 第一選択 provider API → タイムアウトで abort 強制終了。
   // タイマー解除は interrupt() RPC の ack ではなく「ターンが実際に終端した時」（endTurn）に行う。
-  // ack はターン停止を意味しない（レビューR1-3）。
+  // ack はターン停止を意味しない。
   async interrupt(): Promise<void> {
     this.cancelAutoResume();
     if (!this.q || this.normalizer.turnState !== "running") return;
@@ -999,8 +1039,8 @@ ${ctxJson}`
         fatal: false,
       });
     }
-    // 中断開始時点で承認待ちを即deny失効させる（codexレビューC1-3:
-    // 中断後に「許可」が押せて中断したはずのツールが実行される穴を塞ぐ）
+    // 中断開始時点で承認待ちを即deny失効させる。
+    // 中断後に「許可」が押せて中断したはずのツールが実行される穴を塞ぐ。
     for (const [requestId, p] of this.pendingApprovals) {
       p.resolve({ behavior: "deny" });
       this.emit({ kind: "approval_resolved", requestId, behavior: "deny", resolvedBy: "interrupt" });
@@ -1011,9 +1051,9 @@ ${ctxJson}`
       if (this.normalizer.turnState === "interrupting" && this.normalizer.currentTurnId === turnId) {
         this.opts.log(`interrupt timeout (${timeoutMs}ms) → abort (force-kill fallback)`);
         this.abortController.abort();
-        // abort 後の SDK teardown を待たず即座にターンを終端し、Conversation を閉鎖済みにする
-        // （codexレビューC1-1/C2-1: 旧ターンの遅延 result が次ターンへ誤帰属する穴を、
-        //   closed=true で「次の send は新 Conversation で」に倒して塞ぐ。result 側にもガードあり）
+        // abort 後の SDK teardown を待たず即座にターンを終端し、Conversation を閉鎖済みにする。
+        // 旧ターンの遅延 result が次ターンへ誤帰属する穴を、
+        // closed=true で「次の send は新 Conversation で」に倒して塞ぐ。result 側にもガードあり。
         this.endTurn("turn_interrupted");
         this.closed = true;
       }
@@ -1043,7 +1083,7 @@ ${ctxJson}`
     } catch (e) {
       this.opts.log(`interrupt() error: ${String(e)} → abort fallback`);
       this.abortController.abort();
-      // タイマー満了を待たず即終端（codexレビューC2-1: この経路だけ最大5秒残留していた）
+      // タイマー満了を待たず即終端（この経路だけ最大5秒残留していた）
       if (this.normalizer.turnState === "interrupting" && this.normalizer.currentTurnId === turnId) {
         this.endTurn("turn_interrupted");
         this.closed = true;
@@ -1171,7 +1211,7 @@ ${ctxJson}`
     } finally {
       this.abortController.abort();
     }
-    // SDK が yield 中で inputWaiter を経由できない場合に備え generator を明示終了（レビューR1-9）
+    // SDK が yield 中で inputWaiter を経由できない場合に備え generator を明示終了
     try {
       await this.inputGen?.return(undefined as never);
     } catch {

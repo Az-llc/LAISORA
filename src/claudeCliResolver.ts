@@ -34,11 +34,11 @@ const WINDOWS_PATH_CANDIDATES = ["claude.exe", "claude.cmd", "claude.ps1", "clau
 const VERSION_TIMEOUT_MS = 10_000;
 
 function cliNotFoundError(detail?: string): Error {
-  return new Error(
+  return Object.assign(new Error(
     l10n.t(
       "Claude Code CLI was not found. Install Claude Code and add it to PATH, or set laisora.claude.executablePath to the absolute path of the executable."
     ) + (detail ? ` (${detail})` : "")
-  );
+  ), { code: "CLAUDE_CLI_NOT_FOUND" });
 }
 
 async function exists(file: string): Promise<boolean> {

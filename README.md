@@ -8,7 +8,7 @@ I wanted the everyday view to focus on the conversation: what I want to achieve 
 
 Commands and file operations appear in LOG, making your instructions and the agent's replies easier to follow in CHAT. The two screenshots below are the same turn: first CHAT with PLAN and YOU beside the conversation, then LOG with the commands it ran, the files it read and edited, the tests, and the subagent.
 
-<img src="media/screenshots/conversation.png" alt="CHAT with the agent's reply, PLAN showing steps and progress, and YOU showing requests waiting on you" width="734">
+<img src="media/screenshots/conversation.png" alt="CHAT with a decision the agent is asking for, YOU with the waiting decision and resolved items folded into one line, and PLAN with its goal and completed steps folded into one line" width="734">
 
 <img src="media/screenshots/execution-log.png" alt="LOG for the same turn, with commands, file operations, tests, and an expanded subagent report" width="734">
 
@@ -22,7 +22,7 @@ LAISORA uses an LLM to analyze work logs and suggest improvements to the workflo
 
 Analysis uses the model selected for the conversation, so the capabilities of newer models can also support reviewing the work and suggesting improvements.
 
-<img src="media/screenshots/llm-analysis.png" alt="ANALYSIS showing LLM findings with links to the records they are based on" width="734">
+<img src="media/screenshots/llm-analysis.png" alt="ANALYSIS with TIME, ROLES and ERR at the top and the start of the LLM findings below" width="734">
 
 ## What you can do
 
@@ -38,20 +38,20 @@ CHAT shows what the model says to you, along with approval requests, failures, a
 
 ### See what the agent is actually doing
 
-**PLAN** beside CHAT shows the goal the agent declared, its steps and their status, who is working on each, elapsed time, and tokens. It stays for the whole goal, across messages, and completed steps fold away. Without declared steps, it shows the work observed under NOW. In a narrow window, a one-line bar under the title opens PLAN and YOU as a drawer.
+**PLAN** beside CHAT shows the goal the agent declared, its steps and their status, who is working on each, elapsed time, and tokens. It stays for the whole goal, across messages, and completed steps fold into one counted line that you can expand. Without declared steps, it shows the work observed under NOW. In a narrow window, a one-line bar under the title opens PLAN and YOU as a drawer.
 
 The other views let you look more closely:
 
-- **SUMMARY** — PLAN on the left and YOU on the right, earlier requests with their step count, time, and tokens, and the agents that were observed. In a narrow window, YOU comes first in a single column.
+- **SUMMARY** — PLAN on the left and YOU on the right, and earlier requests with their step count, time, and tokens. With the agent roster enabled, it also lists the observed agents with their applied model and effort. In a narrow window, YOU comes first in a single column.
 - **GRAPH** — a timeline of the main agent, its subagents, and background tasks, with a zoomable time window. Open a subagent to read the full instruction it was given.
-- **ANALYSIS** — script-based statistics and findings (failure rate, failure loops, subagent ratio, turn duration) compared against your own past sessions, and optional LLM analysis whose findings link back to their evidence.
+- **ANALYSIS** — at the top, TIME (the main agent's time by model and in tools), ROLES (time and tokens by delegated role; open a row for its runs) and ERR (failures out of all tool calls, by kind). Below, script analysis lists failure classifications and convention violations linked to LOG, and optional LLM analysis shows findings as numbered articles that link back to their evidence. Analyzing a past session from the history list also compares it with your own past sessions.
 - **LOG** — tool calls with the available input and output previews, duration, and marks for failures and convention violations.
 
 Some information may be unavailable when session records are incomplete; the views say so instead of showing partial numbers as complete.
 
 The screenshots below show SUMMARY, GRAPH, and the instruction given to a subagent opened from GRAPH.
 
-<img src="media/screenshots/summary.png" alt="SUMMARY with PLAN and YOU side by side, earlier requests with step counts, time and tokens, and observed agents" width="734">
+<img src="media/screenshots/summary.png" alt="SUMMARY with PLAN and YOU side by side, completed steps and resolved items folded into counted lines, and earlier requests with step counts, time and tokens" width="734">
 
 <img src="media/screenshots/graph.png" alt="GRAPH showing a timeline of the main agent and its subagent" width="734">
 
@@ -59,7 +59,7 @@ The screenshots below show SUMMARY, GRAPH, and the instruction given to a subage
 
 ### Stay in control while it runs
 
-**YOU** collects approvals, decisions, and checks on your machine, each linking back to where it was asked in CHAT. Decisions in replies appear as cards with options, pros and cons, a recommendation, and the default if you do not answer. By default, LAISORA asks Claude to maintain plans and present decisions and checks this way (`laisora.claude.planInstruction`; applies to conversations started or resumed afterwards).
+**YOU** collects approvals, decisions, and checks on your machine, each linking back to where it was asked in CHAT. Resolved items fold into one counted line, and a decision or check you no longer need can be dismissed with ×. Decisions in replies appear as cards with options, pros and cons, a recommendation, and the default if you do not answer. By default, LAISORA asks Claude to maintain plans and present decisions and checks this way (`laisora.claude.planInstruction`; applies to conversations started or resumed afterwards).
 
 Approve or deny tool requests in CHAT. Send additional instructions during a turn, interrupt, search within the conversation (Ctrl+F), and choose the model, reasoning effort, and permission mode beside the message box. The model chip shows the effort the CLI actually applies. Enter sends and Shift+Enter inserts a new line; swap them with `laisora.composer.sendKey` or on the LAISORA settings page.
 

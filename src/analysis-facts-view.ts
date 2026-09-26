@@ -9,17 +9,29 @@ export interface AnalysisFactsView {
   // LLM 分析の対象件数（ツール実行数）とその表示文言
   llmTargets: { toolCalls: number; label: string };
   coverageNote?: string;
-  learning?: { state: "unobserved" | "observed"; note: string; lines: string[] };
+  // empty: 全量を観測して件数がすべて 0。lines は「該当なし」の 1 行
+  learning?: { state: "unobserved" | "observed"; note: string; lines: string[]; empty?: true };
 }
 
 const coverageNoteText = () => l10n.t("Not detected within the observed range");
 
+function learningIsEmpty(learning: LearningFacts): boolean {
+  return learning.delivered.outcome === "none" && learning.delivered.count === 0
+    && learning.observations === 0 && learning.evidenced === 0 && learning.recurrences === 0
+    && Object.values(learning.qualifications).every((n) => n === 0)
+    && Object.values(learning.generalQualifications).every((n) => n === 0);
+}
+
 function projectLearningRANL20(learning: LearningFacts | undefined): NonNullable<AnalysisFactsView["learning"]> {
   if (learning === undefined || learning.coverage === "model-unknown") {
     const note = learning === undefined
-      ? l10n.t("Learning was not observed for this conversation (disabled or not loaded).")
-      : l10n.t("Learning was not observed for this conversation (model unknown).");
+      ? l10n.t("Disabled (the learning record is not loaded)")
+      : l10n.t("Not matched yet (matched once this conversation's model is known)");
     return { state: "unobserved", note, lines: [] };
+  }
+  // R-LRN-09: 「該当なし」は全量を照合できたときだけ。セッション未確定は観測を結合していないので件数を並べる
+  if (learning.coverage !== "session-unknown" && learningIsEmpty(learning)) {
+    return { state: "observed", note: "", lines: [l10n.t("No matching records")], empty: true };
   }
   const delivered = learning.delivered;
   const hash = /^[a-f0-9]{64}$/.test(delivered.setHash) ? delivered.setHash.slice(0, 12) : l10n.t("None");
@@ -47,7 +59,7 @@ export function projectAnalysisFactsView(facts: SessionFacts, divergences: Diver
     label: l10n.t("Analysis targets: {0} executions / {1} divergences", facts.toolCalls, divergences.recordCount),
   };
 
-  // LLM 分析の入力被覆は llm-action-view の inputCoverageLabel が担う（R-52）。ここでは出さない
+  // LLM 分析の入力被覆は llm-action-view の inputCoverageLabel が担う。ここでは出さない
   let coverageNote: string | undefined;
   if (facts.coverage.longGapsDropped > 0) {
     coverageNote = l10n.t("{0} ({1} stalled intervals were discarded at the limit)", coverageNoteText(), facts.coverage.longGapsDropped);

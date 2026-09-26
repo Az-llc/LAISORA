@@ -1,44 +1,64 @@
 import { ClaudeConversation, sdkClaudeCodeVersion, type ClaudeHostOptions } from "./claudeHost";
 import { resolveClaudeCodeStartup } from "./claudeCliResolver";
 import { runFailureReason } from "./orchestration-external";
-import type { ExternalModel, ExternalModelsState, ExternalDetection } from "./orchestration-executors";
+import { claudeModelIdLabel, type ExternalModel, type ExternalModelsState, type ExternalDetection } from "./orchestration-executors";
 
 const CLAUDE_ALIASES = ["haiku", "sonnet", "opus"] as const;
 
 export function claudeAliasModels(rows: readonly { id: string; resolvedModel?: string }[]): ExternalModelsState {
-  const models: ExternalModel[] = CLAUDE_ALIASES.map((id) => {
-    const row = rows.find((entry) => entry.id.replace(/\[1m\]$/, "") === id);
-    if (!row?.resolvedModel) return { id, label: id }; // R-ORC-25: alias without version stays selectable
-    const resolvedModel = row.resolvedModel.replace(/\[1m\]$/, "");
-    return { id, label: `${id} — ${resolvedModel}`, resolvedModel };
-  });
+  const rank = (row: (typeof rows)[number]) => (row.resolvedModel ? 2 : 0) + (row.id === row.id.replace(/\[1m\]$/, "") ? 1 : 0);
+  // R-ORC-25: keep the CLI's order; a stripped ID keeps its first position and takes the best-ranked row.
   const uniqueRows = new Map<string, (typeof rows)[number]>();
   for (const row of rows) {
     const id = row.id.replace(/\[1m\]$/, "");
-    if (!uniqueRows.has(id) || row.id === id) uniqueRows.set(id, row);
+    const previous = uniqueRows.get(id);
+    if (!previous || rank(row) > rank(previous)) uniqueRows.set(id, row);
   }
-  const additional = [...uniqueRows.values()].map((row) => {
-    const id = row.id.replace(/\[1m\]$/, "");
-    return { id, label: id, resolvedModel: row.resolvedModel?.replace(/\[1m\]$/, "") };
-  }).filter((row) => row.id !== "default" && !CLAUDE_ALIASES.some((alias) => alias === row.id))
-    .sort((a, b) => a.id.localeCompare(b.id));
-  models.push(...additional);
-  return additional.length > 0 || models.some((model) => model.resolvedModel) ? { state: "ok", models } : { state: "failed", reason: "empty-model-list" };
+  const listed = [...uniqueRows.entries()].map(([id, row]): ExternalModel => {
+    const resolvedModel = row.resolvedModel?.replace(/\[1m\]$/, "");
+    if (!resolvedModel && CLAUDE_ALIASES.some((alias) => alias === id)) return { id, label: id }; // R-ORC-25: alias without version stays selectable
+    return { id, label: claudeModelIdLabel(resolvedModel ?? id), resolvedModel };
+  });
+  const models = listed.filter((model) => model.id !== "default"
+    || !listed.some((other) => other.id !== "default" && other.resolvedModel === model.resolvedModel));
+  for (const alias of CLAUDE_ALIASES) {
+    if (!models.some((model) => model.id === alias)) models.push({ id: alias, label: alias }); // R-ORC-25
+  }
+  return models.some((model) => model.resolvedModel) || listed.some((model) => !CLAUDE_ALIASES.some((alias) => alias === model.id))
+    ? { state: "ok", models } : { state: "failed", reason: "empty-model-list" };
 }
 
 type ClaudeListOptions = Pick<ClaudeHostOptions, "apiKeyPolicy" | "claudeCodeExecutablePath">;
 export async function listClaudeModels(cwd: string, log: (message: string) => void, options: ClaudeListOptions = {},
   create = (opts: ClaudeHostOptions): Pick<ClaudeConversation, "start" | "supportedModels" | "dispose"> => new ClaudeConversation(opts),
   timeoutMs = 10_000): Promise<ExternalModelsState> {
+  let failureReason: string | undefined;
   const failed = (error: unknown): ExternalModelsState => {
-    const reason = runFailureReason("model-list-failed", error);
+    const code = (error as { code?: unknown } | undefined)?.code;
+    const reason = failureReason ?? (code === "ENOENT" || code === "CLAUDE_CLI_NOT_FOUND" ? "not-installed" : runFailureReason("model-list-failed", error));
     log(`R-ORC-25: Claude ${reason}`);
     return { state: "failed", reason };
   };
+  // R-ORC-39: only use structured SDK error codes, never infer auth from arbitrary text or exit 1.
+  let stopForFailure: (result: ExternalModelsState) => void;
+  const terminalFailure = new Promise<ExternalModelsState>(resolve => { stopForFailure = resolve; });
   let conv: ReturnType<typeof create>;
   try {
-    conv = create({ ...options, cwd, settingSources: [], permissionMode: "default", interruptForceKillTimeoutMs: 5000,
-      onApprovalRequest: async () => ({ behavior: "deny" }), onEvent: () => {}, log: () => {} });
+    // R-ORC-25: a concrete startup model can remove opus[1m] from supportedModels; probe with the alias.
+    conv = create({ ...options, cwd, model: "opus[1m]", settingSources: [], permissionMode: "default", interruptForceKillTimeoutMs: 5000,
+      onApprovalRequest: async () => ({ behavior: "deny" }), onEvent: event => {
+        if (event.kind !== "api_retry") return;
+        const reason = event.errorType === "authentication_failed" ? "authentication-required"
+          : event.errorType === "oauth_org_not_allowed" ? "organization-not-allowed"
+          : event.errorType === "account_on_hold" ? "account-on-hold"
+          : event.errorType === "verification_required" ? "verification-required"
+          : event.errorType === "billing_error" ? "billing-error" : undefined;
+        if (reason && !failureReason) {
+          failureReason = reason;
+          log(`R-ORC-39: Claude ${reason}`);
+          stopForFailure({ state: "failed", reason });
+        }
+      }, log: () => {} });
   } catch (error) { return failed(error); }
   let disposing: Promise<void> | undefined;
   const dispose = (): Promise<void> => { // R-ORC-25: timeout and completion both dispose; run it once
@@ -48,10 +68,13 @@ export async function listClaudeModels(cwd: string, log: (message: string) => vo
   let timer: ReturnType<typeof setTimeout> | undefined;
   try {
     return await Promise.race([
+      terminalFailure.then(async result => { await dispose(); return result; }),
       (async (): Promise<ExternalModelsState> => {
         try {
           await conv.start();
+          if (failureReason) return { state: "failed", reason: failureReason };
           const result = claudeAliasModels(await conv.supportedModels());
+          if (failureReason) return { state: "failed", reason: failureReason };
           if (result.state === "failed") log(`R-ORC-25: Claude ${result.reason}`);
           return result;
         } catch (error) { return failed(error); }
@@ -60,8 +83,7 @@ export async function listClaudeModels(cwd: string, log: (message: string) => vo
       new Promise<ExternalModelsState>((resolve) => {
         timer = setTimeout(() => {
           log("R-ORC-25: Claude timeout");
-          void dispose();
-          resolve({ state: "failed", reason: "timeout" });
+          void dispose().then(() => resolve({ state: "failed", reason: "timeout" }));
         }, timeoutMs);
       }),
     ]);
@@ -69,6 +91,11 @@ export async function listClaudeModels(cwd: string, log: (message: string) => vo
 }
 
 export async function detectClaudeExecutor(configuredPath?: string): Promise<ExternalDetection> {
-  const startup = await resolveClaudeCodeStartup(configuredPath, sdkClaudeCodeVersion());
-  return { state: "found", path: startup.executable.path, version: startup.version.cliVersion, ...(startup.version.cliVersion ? {} : { versionNote: "version-unavailable" }) };
+  try {
+    const startup = await resolveClaudeCodeStartup(configuredPath, sdkClaudeCodeVersion());
+    return { state: "found", path: startup.executable.path, version: startup.version.cliVersion, ...(startup.version.cliVersion ? {} : { versionNote: "version-unavailable" }) };
+  } catch (error) {
+    if ((error as { code?: unknown })?.code === "CLAUDE_CLI_NOT_FOUND") return { state: "notInstalled" };
+    throw error;
+  }
 }

@@ -68,11 +68,6 @@ function llmRunControl(
   };
   box.appendChild(btn);
   box.appendChild(makeEl("span", "llm-run-note", note));
-  if (llmTargets !== undefined) {
-    const targets = makeEl("span", "llm-run-targets", llmTargets.label);
-    targets.dataset.toolCalls = String(llmTargets.toolCalls);
-    box.appendChild(targets);
-  }
   return box;
 }
 
@@ -94,9 +89,11 @@ export function renderAnalysisFactsView(
     // 入口は消さない（R-ANL-11: 実行入口は全状態で 1 つ存在する）。押せない理由は注記で出す。
     // view は渡さない（LLM 面の読み出しは 1 箇所の規律 — check-protocol-guards S5-T2-D4）
     const llmSection = makeEl("div", "af-llm-section");
-    llmSection.appendChild(
+    const entry = makeEl("div", "llm-entry");
+    entry.appendChild(
       llmRunControl(tabId, undefined, llmAnalysisEnabled, turnRunning, llmRunning, undefined)
     );
+    llmSection.appendChild(entry);
     llmContainer.appendChild(llmSection);
     return;
   }
@@ -111,8 +108,14 @@ export function renderAnalysisFactsView(
   }
 
   if (facts.learning) {
-    const learning = makeEl("div", "af-learning af-coverage-note");
+    const learning = makeEl("section", "af-learning wa-fsec");
     learning.dataset.state = facts.learning.state;
+    if (facts.learning.empty === true) learning.dataset.empty = "true";
+    const head = makeEl("div", "wa-code");
+    head.id = `af-learning-h-${tabId}`;
+    head.append(makeEl("b", undefined, "LEARN"), makeEl("span", "wa-code-s", l10n.t("Learning record")));
+    learning.setAttribute("aria-labelledby", head.id);
+    learning.appendChild(head);
     if (facts.learning.note) learning.appendChild(makeEl("div", "af-learning-note", facts.learning.note));
     for (const line of facts.learning.lines) learning.appendChild(makeEl("div", "af-learning-line", line));
     container.appendChild(learning);
@@ -120,7 +123,8 @@ export function renderAnalysisFactsView(
 
   // LLM 分析への導線（実行ボタン・所見）は LLM 側の区画にまとめる。スクリプト由来の値と同じ平坦な親に置かない（R-ANL-14）
   const llmSection = makeEl("div", "af-llm-section");
-  llmSection.appendChild(
+  const entry = makeEl("div", "llm-entry");
+  entry.appendChild(
     llmRunControl(
       tabId,
       llm,
@@ -130,8 +134,12 @@ export function renderAnalysisFactsView(
       facts.llmTargets
     )
   );
+  llmSection.appendChild(entry);
   const llmBox = makeEl("div", "llm-findings");
   llmSection.appendChild(llmBox);
   llmContainer.appendChild(llmSection);
-  renderLlmActionView(llmBox, llm, llmAnalysisEnabled, tabId, payload.analysis.semanticHash, evidenceNavigation);
+  renderLlmActionView(llmBox, llm, llmAnalysisEnabled, tabId, payload.analysis.semanticHash, evidenceNavigation, {
+    row: entry,
+    targets: facts.llmTargets,
+  });
 }

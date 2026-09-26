@@ -389,7 +389,7 @@ export async function readSessionHistory(
   // 呼び出し側が当世代だけを取り出すための境界で、events 自体は切っていない
   generationStartAt?: number;
   malformedLineCount: number;
-  // ゲートで捨てた task-notification の計数（T0 レビュー M-2）。破棄は fold 到達前で
+  // ゲートで捨てた task-notification の計数。破棄は fold 到達前で
   // EvidenceIndex からは観測できないため、Adapter 側の hash 非入力カウンタとして持つ
   droppedTaskNotificationCount: number;
   boundaryPartialExcludedCount?: number;
@@ -1217,7 +1217,7 @@ export async function readSessionHistory(
     return a.fileOrder - b.fileOrder;
   });
 
-  // 単調性は直前の timestamp 昇順ソート自体が保証する（累積 max クランプは不要 — レビュー M-6）
+  // 単調性は直前の timestamp 昇順ソート自体が保証する（累積 max クランプは不要）
   const events: HistoryEvent[] = rawEvents.map((item) => {
     const ev: HistoryEvent = {
       body:

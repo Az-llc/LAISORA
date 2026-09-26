@@ -109,7 +109,7 @@ export interface AnalysisCoverage {
 }
 
 // ベースライン母集団（~/.claude/projects の走査）で読めなかったものの内訳。
-// 読めなかったものを 0 件へ畳むと「比較できるベースラインがない」という否定の断言になる（R-34）。
+// 読めなかったものを 0 件へ畳むと「比較できるベースラインがない」という否定の断言になる（R-DSP-01）。
 // readSessions は 90 日窓に入り走査できた記録の件数で、母集団の分母ではない
 export interface BaselineScanDegradation {
   rootFailed: boolean;
@@ -120,7 +120,7 @@ export interface BaselineScanDegradation {
 }
 
 // 「他のセッションが無い」と「他のセッションを読めなかった」を分ける。この関数が知っているのは
-// 後者だけなので、走査が失敗しているときに前者を名乗らない（R-34。session-list.ts#sessionScanNote と同型）。
+// 後者だけなので、走査が失敗しているときに前者を名乗らない（R-DSP-01。session-list.ts#sessionScanNote と同型）。
 // 注記の文言は Host 側のここで組み立てる。分析ビューで件数を比較して合成しない（VND-S6）
 export function baselineScanNote(
   mode: AnalysisReport["baselineMode"],
@@ -170,7 +170,7 @@ export interface AnalysisReport {
   agentTokens: number;
   // agentTokens は結果本文の subagent_tokens を拾えた Agent 呼び出しの和。拾えなかった呼び出しは
   // 0 ではなく未計測なので、表示側が 0 を測定値として印字しないよう区分と注記を Host で作る
-  // （R-25 / R-DSP-11。同 repo の baseline 側は agentTokenRatio を null にして同じ扱い）
+  // （R-DSP-11。同 repo の baseline 側は agentTokenRatio を null にして同じ扱い）
   agentTokensUnmeasured: "all" | "partial" | null;
   agentTokensNote: string | null;
   model: string;
@@ -498,7 +498,7 @@ function* sessionAnalyzer(
     tools.set(u.name, t);
     if (u.skill) bump(skills, u.skill, dur, !!u.isError, tok, agentMeasured);
   }
-  // span 単位も全体と同じ区分。拾えなかった呼び出しの 0 を測定値として印字させない（R-25 / R-DSP-11）
+  // span 単位も全体と同じ区分。拾えなかった呼び出しの 0 を測定値として印字させない（R-DSP-11）
   for (const s of skills.values()) {
     const c = spanAgentCalls.get(s.name);
     s.agentTokensUnmeasured = c === undefined || c.measured === c.agents ? null : c.measured === 0 ? "all" : "partial";

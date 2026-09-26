@@ -345,8 +345,10 @@ html, body {
 .settings-chip,
 #setting-add-role,
 #setting-restore-roster,
+#setting-restore-policy,
+#setting-research-missing,
 #setting-recheck-external {
-  border-color: var(--vscode-contrastBorder, var(--vscode-dropdown-border, var(--vscode-widget-border, rgba(128, 128, 128, 0.35))));
+  border-color: var(--vscode-contrastBorder, var(--vscode-dropdown-border, var(--vscode-widget-border)));
   background: var(--vscode-dropdown-background, var(--vscode-input-background));
 }
 .settings-chip[aria-pressed="true"] { background: var(--vscode-button-background); }
@@ -370,3 +372,18 @@ html, body {
 @media (max-width: 480px) {
   .settings-row:has(.settings-accent-custom) { flex-wrap: wrap; }
 }
+
+.settings-research {
+  display: flex;
+  flex-direction: column;
+  gap: var(--settings-gap-1);
+  margin-top: var(--settings-gap-1);
+  padding-top: var(--settings-gap-3);
+  border-top: 1px solid var(--vscode-contrastBorder, var(--vscode-widget-border, var(--vscode-panel-border)));
+}
+.settings-research .settings-detection-header { align-items: baseline; }
+.settings-research-text { min-width: 0; overflow-wrap: anywhere; }
+.settings-research-sources { display: flex; flex-wrap: wrap; align-items: baseline; gap: var(--settings-gap-1) var(--settings-gap-2); }
+.settings-research-sources .settings-chip { width: auto; max-width: 100%; padding: 2px var(--settings-gap-2); white-space: normal; text-align: start; }
+.settings-research-sources .settings-chip[aria-disabled="true"] { cursor: default; }
+.settings-environment .settings-detection-header { flex-wrap: wrap; }

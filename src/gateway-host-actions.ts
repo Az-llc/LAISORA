@@ -1,14 +1,21 @@
 import { DEFAULT_ACCENT_SETTINGS, isAccentColor, isAccentSettingValue, type AccentSetting, type AccentSettings } from "./accent";
+import { join } from "node:path";
+import { latestModelProfile } from "./learning";
+import { sharedLearningService } from "./learning-service";
+import { listedProfileTargets, selectedProfileRows, profileTargetKey, resolveClaudeProfileModel, renderModelProfileSection, profileAutoApply } from "./orchestration-profiles";
+import { conductorInstruction, estimateTokens, resolveOrchestrationRoster, orchestrationExternalTargets } from "./orchestration-roster";
+import { queueModelProfileResearch, flushModelProfileResearch } from "./learning-research";
 import { homedir } from "node:os";
 import { listClaudeModels, detectClaudeExecutor } from "./orchestration-claude";
-import { EXECUTORS, executorMap, type ExecutorId } from "./orchestration-executors";
+import { EXECUTORS, claudeModelIdLabel, executorMap, type ExecutorId } from "./orchestration-executors";
 import { DEFAULT_SYSTEM_APP_EXTENSIONS, systemAppExtensions } from "./file-link-open-mode";
 import { detectExternalExecutor, listExternalModels } from "./orchestration-external";
-import { externalExecutorName, isExternalTimeout, type ExternalDetection, type ExternalModels, type ExternalModelsState } from "./orchestration-roster";
+import { externalExecutorName, isExternalModels, isExternalTimeout, type ExternalDetection, type ExternalModels, type ExternalModelsState } from "./orchestration-roster";
 import { DEFAULT_ORCHESTRATION_ROSTER, isOrchestrationSettingRoster, orchestrationSettingRows, type OrchestrationSettingRow } from "./orchestration-roster";
 import * as vscode from "vscode";
 import {
   normalizeApiKeyPolicy,
+  normalizeProfileSources,
   normalizeComposerSendKey,
   type ApiKeyPolicy,
   type ComposerSendKey,
@@ -59,8 +66,42 @@ const FILE_LINK_SETTING_KEYS: Record<FileLinkSetting, string> = {
 
 let externalDetection: Record<ExecutorId, ExternalDetection> = executorMap(() => ({ state: "checking" }));
 let detectionPending: Promise<void> | undefined;
+const detectionListeners = new Set<() => void>();
 let externalModels: ExternalModels = executorMap(() => ({ state: "checking" }));
-export function cachedExternalModels(): ExternalModels { return structuredClone(externalModels); }
+const MODEL_LIST_CACHE_KEY = "laisora.executorModelLists.v1";
+type RememberedModelList = { models: Extract<ExternalModelsState, { state: "ok" }>["models"]; fetchedAt: number };
+let rememberedModelLists: Partial<Record<ExecutorId, RememberedModelList>> = {};
+let modelListStorage: vscode.Memento | undefined;
+let modelListSave: Promise<void> = Promise.resolve();
+function saveRememberedModelLists(): Promise<void> {
+  const saved = structuredClone(rememberedModelLists), storage = modelListStorage;
+  // R-ORC-39: serialize snapshots so a slower write cannot replace a newer successful list.
+  modelListSave = modelListSave.then(async () => { await storage?.update(MODEL_LIST_CACHE_KEY, saved); })
+    .catch(() => { output.appendLine("R-ORC-39: model-list cache could not be saved"); });
+  return modelListSave;
+}
+function loadRememberedModelLists(): void {
+  const storage = extensionContext?.globalState;
+  if (!storage || modelListStorage === storage) return;
+  modelListStorage = storage;
+  rememberedModelLists = {};
+  const saved = storage.get<Partial<Record<ExecutorId, RememberedModelList>>>(MODEL_LIST_CACHE_KEY);
+  externalModels = executorMap(id => {
+    const entry = saved?.[id];
+    const list = entry && { state: "ok" as const, models: entry.models, fetchedAt: entry.fetchedAt };
+    // R-ORC-39: only validated successful lists can restore choices or research targets.
+    if (!list || !entry.fetchedAt || !isExternalModels(executorMap(() => list))) return { state: "checking" };
+    rememberedModelLists[id] = { models: structuredClone(entry.models), fetchedAt: entry.fetchedAt };
+    return list;
+  });
+}
+export function cachedExternalModels(): ExternalModels {
+  loadRememberedModelLists();
+  return structuredClone(externalModels);
+}
+export function configuredProfileRoster() {
+  return resolveOrchestrationRoster(getLaisoraConfiguration().get("orchestration.agents", DEFAULT_ORCHESTRATION_ROSTER)).roster;
+}
 
 let detectorOverride: typeof detectExternalExecutor | undefined;
 let claudeListerOverride: typeof listClaudeModels | undefined;
@@ -73,36 +114,52 @@ export function setExternalDetectorForTest(detect: typeof detectExternalExecutor
   claudeDetectorOverride = claudeDetect;
 }
 
-export function refreshExternalDetection(detect = detectorOverride ?? detectExternalExecutor): Promise<void> {
+export function refreshExternalDetection(detect = detectorOverride ?? detectExternalExecutor, onChange?: () => void): Promise<void> {
+  if (onChange) detectionListeners.add(onChange);
   if (detectionPending) return detectionPending; // R-ORC-20: coalesce concurrent page requests.
+  loadRememberedModelLists();
   const policy = normalizeApiKeyPolicy(getLaisoraConfiguration().get("claude.apiKeyPolicy", "inherit"));
   externalDetection = executorMap(() => ({ state: "checking" }));
-  externalModels = executorMap(() => ({ state: "checking" }));
+  externalModels = executorMap(id => {
+    const remembered = rememberedModelLists[id];
+    return remembered ? { state: "ok", ...remembered, refresh: "checking" } : { state: "checking" };
+  });
   const executors = Object.values(EXECUTORS).map(({ id }) => id);
   const configuredPath = configuredClaudeExecutablePath(getLaisoraConfiguration());
   const cwd = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ?? homedir();
-  detectionPending = Promise.all([
-    Promise.all(executors.map(async (executor): Promise<ExternalDetection> => {
+  detectionPending = Promise.all(executors.map(async (executor) => {
       const started = Date.now();
       let detected: ExternalDetection;
       try { detected = await (executor === "claude" ? (claudeDetectorOverride ?? detectClaudeExecutor)(configuredPath) : detect(executor, policy)); }
       catch { detected = { state: "failed", path: "", reason: "spawn-error:UNKNOWN" }; }
       const reason = detected.state === "failed" ? detected.reason : detected.state === "found" ? detected.versionNote : undefined;
       if (reason) output.appendLine(`R-ORC-20: ${externalExecutorName(executor)} detection ${reason} elapsed=${Date.now() - started}ms`);
-      return detected;
-    })),
-    Promise.allSettled(executors.map((executor) => Promise.resolve().then(() => executor === "claude"
-      ? (claudeListerOverride ?? listClaudeModels)(cwd, (message) => output.appendLine(message), { apiKeyPolicy: policy, claudeCodeExecutablePath: configuredPath })
-      : (externalListerOverride ?? listExternalModels)(executor, policy)))),
-  ]).then(([results, lists]) => {
-      externalDetection = executorMap((id) => results[executors.indexOf(id)]);
-      const listed = lists.map((result, index): ExternalModelsState => {
-        const list: ExternalModelsState = result.status === "fulfilled" ? result.value : { state: "failed", reason: "model-list-failed" };
-        if (list.state === "failed") output.appendLine(`R-ORC-12: ${externalExecutorName(executors[index])} ${list.reason}`);
-        return list;
-      });
-      externalModels = executorMap((id) => listed[executors.indexOf(id)]);
-    }).finally(() => { detectionPending = undefined; });
+      externalDetection[executor] = detected;
+      for (const listener of detectionListeners) listener();
+      // R-ORC-39: inspect then list, with at most one active CLI process per executor.
+      let list: ExternalModelsState;
+      try {
+        list = detected.state === "notInstalled" ? { state: "failed", reason: "not-installed" } : await (executor === "claude"
+          ? (claudeListerOverride ?? listClaudeModels)(cwd, (message) => output.appendLine(message), { apiKeyPolicy: policy, claudeCodeExecutablePath: configuredPath })
+          : (externalListerOverride ?? listExternalModels)(executor, policy));
+      } catch { list = { state: "failed", reason: "model-list-failed" }; }
+      if (list.state === "ok") {
+        const remembered = { models: structuredClone(list.models), fetchedAt: Date.now() };
+        rememberedModelLists[executor] = remembered;
+        externalModels[executor] = { state: "ok", ...remembered };
+      } else {
+        output.appendLine(`R-ORC-12: ${externalExecutorName(executor)} ${list.state === "failed" ? list.reason : "model-list-failed"}`);
+        const remembered = rememberedModelLists[executor];
+        externalModels[executor] = remembered ? { state: "ok", ...remembered, refresh: "failed", refreshReason: list.state === "failed" ? list.reason : "model-list-failed" }
+          : { state: "failed", reason: list.state === "failed" ? list.reason : "model-list-failed" };
+      }
+      for (const listener of detectionListeners) listener();
+      if (list.state === "ok") await saveRememberedModelLists();
+    })).then(async () => {
+      for (const session of store?.sessions.values() ?? []) {
+        flushModelProfileResearch(session, getLaisoraConfiguration().get<boolean>("learning.enabled", false), externalModels, configuredProfileRoster());
+      }
+    }).finally(() => { detectionPending = undefined; detectionListeners.clear(); });
   return detectionPending;
 }
 
@@ -120,11 +177,78 @@ export function configuredSystemAppExtensions(): string[] {
     () => output.appendLine(l10n.t("R-CNV-20: Invalid or blocked extensions in the default app setting were ignored.")));
 }
 
+function settingsLearningService() {
+  const directory = extensionContext?.globalStorageUri?.fsPath;
+  return directory && getLaisoraConfiguration().get<boolean>("learning.enabled", false)
+    ? sharedLearningService(join(directory, "laisora-learning", "records.jsonl")) : undefined;
+}
+
+export async function loadSettingsProfiles(): Promise<void> { await settingsLearningService()?.load(); }
+
+function settingsLearningState() {
+  const service = settingsLearningService();
+  return service?.consistent ? service.state : undefined;
+}
+
+export function projectConductorPreview(policy?: string): { text: string; tokens: number } {
+  const cfg = getLaisoraConfiguration();
+  const roster = resolveOrchestrationRoster(cfg.get("orchestration.agents", DEFAULT_ORCHESTRATION_ROSTER)).roster;
+  const state = settingsLearningState();
+  const profiles = profileAutoApply(state) ? renderModelProfileSection(state, roster, externalModels).text : "";
+  const text = cfg.get<boolean>("orchestration.enabled", false)
+    ? conductorInstruction(roster, policy ?? cfg.get<string>("orchestration.conductorPolicy", ""), orchestrationExternalTargets(roster, externalModels), "", profiles)
+    : l10n.t("The agent roster is disabled, so no instruction is added.");
+  return { text, tokens: estimateTokens(text) };
+}
+
+export function researchUnavailableReason(): string {
+  if (!getLaisoraConfiguration().get<boolean>("learning.enabled", false)) return l10n.t("Enable learning to research model characteristics.");
+  if (!currentResearchSession()) return l10n.t("Open a conversation to research model characteristics.");
+  return "";
+}
+
+function currentResearchSession() {
+  const activeId = store?.activeWebview ? store.activeTabIdOf(store.activeWebview) : undefined;
+  const session = activeId ? store?.sessions.get(activeId) : store?.sessions.size === 1 ? [...store.sessions.values()][0] : undefined;
+  return session && !session.closed && !session.clearing && (session.conversation || session.auth?.sessionId || session.resumeSessionId) ? session : undefined;
+}
+
+export function requestModelProfileResearch(ids: readonly string[]): void {
+  const reason = researchUnavailableReason();
+  if (reason) { void vscode.window.showInformationMessage(reason); return; }
+  const session = currentResearchSession()!;
+  if (Object.values(externalModels).some(list => list.state === "checking")) return; // R-LRN-13: wait for the complete settings model lists.
+  const known = listedProfileTargets(externalModels, configuredProfileRoster());
+  const targets = known.filter(target => ids.includes(profileTargetKey(target)));
+  if (!ids.length || ids.some(id => !targets.some(target => profileTargetKey(target) === id))) {
+    output.appendLine("R-LRN-13: rejected unknown model research targets");
+    return;
+  }
+  queueModelProfileResearch(session, targets, normalizeProfileSources(getLaisoraConfiguration().get("learning.profileSources")));
+  flushModelProfileResearch(session, true, externalModels, configuredProfileRoster());
+  void vscode.window.showInformationMessage(l10n.t("Research is queued for this conversation. If learning was just enabled, it waits for the next normal connection start."));
+}
+
+function projectSettingsProfiles() {
+  const state = settingsLearningState();
+  const selected = listedProfileTargets(externalModels, configuredProfileRoster());
+  const missing = selected.filter(target => !state || !latestModelProfile(state, target));
+  const unresolved = [...new Set(selectedProfileRows(configuredProfileRoster(), externalModels)
+    .filter(row => row.executor === "claude" && !resolveClaudeProfileModel(row.model, externalModels)).map(row => row.model))];
+  const names = [...missing.map(target => target.executor === "claude" ? claudeModelIdLabel(target.model) : target.model),
+    ...unresolved.map(alias => l10n.t("{0} (cannot research because the version could not be retrieved)", alias))];
+  return { missingProfiles: missing.map(profileTargetKey),
+    researchText: names.length ? l10n.t("Model characteristics not registered: {0}", names.join(l10n.t(", "))) : "",
+    researchUnavailable: researchUnavailableReason(), conductorPreview: projectConductorPreview() };
+}
+
 export function settingsStateMessage(): Extract<HostToSettingsPage, { type: "settingsState" }> {
+  loadRememberedModelLists();
   const cfg = getLaisoraConfiguration();
   const timeout = cfg.get("orchestration.externalTimeoutMinutes", 10);
   return {
     type: "settingsState",
+    ...projectSettingsProfiles(),
     appearance: accentSettings(),
     openWithSystemApp: configuredSystemAppExtensions(),
     externalTimeoutMinutes: isExternalTimeout(timeout) ? timeout : 10,
@@ -132,6 +256,7 @@ export function settingsStateMessage(): Extract<HostToSettingsPage, { type: "set
     externalModels: cachedExternalModels(),
     orchestrationEnabled: cfg.get<boolean>("orchestration.enabled", false) === true,
     learningEnabled: cfg.get<boolean>("learning.enabled", false) === true,
+    profileSources: normalizeProfileSources(cfg.get("learning.profileSources")),
     orchestrationAgents: readRoster(cfg.get("orchestration.agents", DEFAULT_ORCHESTRATION_ROSTER)),
     orchestrationDefaults: readRoster(cfg.inspect("orchestration.agents")?.defaultValue ?? DEFAULT_ORCHESTRATION_ROSTER),
     conductorPolicy: cfg.get<string>("orchestration.conductorPolicy", ""),
@@ -175,6 +300,10 @@ export async function writeApiKeyPolicy(policy: ApiKeyPolicy): Promise<void> {
 
 export async function writeLearningEnabled(enabled: boolean): Promise<void> {
   await updateUserSetting("learning.enabled", enabled);
+}
+
+export async function writeProfileSources(value: unknown): Promise<void> {
+  await updateUserSetting("learning.profileSources", normalizeProfileSources(value));
 }
 
 let normalizedRosterLogged = false;

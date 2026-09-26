@@ -118,7 +118,7 @@ export function foldEventState(
 ): FoldEventResult {
   const effects: FoldEffect[] = [];
 
-  // FP-1 / codexレビューC3-1: 切り離した Conversation のイベントは gapBoundaries も含めて
+  // FP-1: 切り離した Conversation のイベントは gapBoundaries も含めて
   // 引き取らない。expectedConversationId が null の窓（resetLogicalSession 後・warmup 前）は
   // 下の世代ガードでは塞がらない。境界の持ち越しより先に落とすのは、別会話の境界を
   // carriedGapBoundaries へ入れると新しい論理セッションの時間集計が動くため
@@ -138,7 +138,7 @@ export function foldEventState(
     draft.carriedGapBoundaries.push(...meta.gapBoundaries);
   }
   // 旧 Conversation の遅延イベント（auth_status/permission_denied 等）が新世代へ混入しない
-  // ようにする（codexレビューC3-1）。expected 未設定（初期化前）の間は通す。
+  // ようにする。expected 未設定（初期化前）の間は通す。
   // journal entry は到着時に判定済み（arrivalJudged）。draft の
   // expectedConversationId は Phase 2 開始時に凍結した値なので、hydration 中に CLI が
   // 再起動していると再判定は必ず片側を誤って落とす
@@ -343,7 +343,7 @@ export function foldEventState(
     draft.titleRefreshing = true;
     effects.push({ type: "refresh_tab_title" });
   }
-  // live のターン境界で JSONL を読み直す（U-1 案 b）。history 再生（resume）は fold 自体が record 忠実度なので読まない
+  // live のターン境界で JSONL を読み直す（U-1 案 b）。history 再生（resume）の境界ごとには読まず、hydration 完了時に 1 回読む
   if (
     (ev.kind === "turn_started" ||
       ev.kind === "turn_completed" ||

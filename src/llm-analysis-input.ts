@@ -36,7 +36,7 @@ export interface LlmAnalysisInputContext {
   // true = events は Host が保持する直近分だけで、セッション先頭を含まない（JSONL を読めなかった代用）
   sessionHeadMissing?: boolean;
   // transcript 層で欠けた分。省略 = 欠落を観測していない。窓落ちと予算切りだけを申告すると、
-  // 欠けた母集合の上で「検証を通った」と名乗る（R-24）
+  // 欠けた母集合の上で「検証を通った」と名乗る（R-DSP-01）
   transcriptGaps?: TranscriptGapSummary;
 }
 
@@ -121,7 +121,7 @@ export interface LlmAnalysisInput {
 export function formatInputCoverageLabel(stats: LlmAnalysisInput["stats"]): string {
   const all = stats.events >= stats.sessionEvents;
   const gapNote = formatTranscriptGapNote(stats.transcriptGaps);
-  // 「全件」は Host が読めた事象の全件であって、記録に欠落があればその外は含まない（R-24 / R-DSP-01）
+  // 「全件」は Host が読めた事象の全件であって、記録に欠落があればその外は含まない（R-DSP-01）
   const gapSuffix = gapNote === undefined ? "" : l10n.t(". Record gaps: {0}", gapNote);
   if (stats.sessionHeadMissing) {
     return all
@@ -454,7 +454,7 @@ export function buildNumericFactTable(
 
   // 6. 回避可能なコスト（W）。**対処すれば消えることが計算の定義から保証される時間だけ**を載せる。
   // E（所要時間）を impact に使うと「成功した処理にかかった時間」が影響として報告される
-  // （R-71）。
+  // （R-DSP-01）。
   // 事実に「無駄」が無い限りプロンプトをどう書いても直らないので、ここで引き算した値を作る。
   //
   // `discarded_attempt`: 失敗した呼び出しの所要時間。失敗そのものが無駄なので全額。
@@ -574,7 +574,7 @@ export function buildLlmAnalysisInput(context: LlmAnalysisInputContext): LlmAnal
   const totalEventsCount = items.length;
 
   const headNote = context.sessionHeadMissing ? "記録が読めないため Host が保持する直近分のみ。セッション先頭を含まない" : "セッション全件";
-  // transcript 層の欠落も被覆行に載せる。無いときは「なし」と明示し、書き忘れと区別する（R-24）
+  // transcript 層の欠落も被覆行に載せる。無いときは「なし」と明示し、書き忘れと区別する（R-DSP-03）
   const gapNote = formatTranscriptGapNote(context.transcriptGaps) ?? "なし";
   const coverageString = (range: string, dropped: number) =>
     `(カバレッジ: セッション事象 ${totalEventsCount} 件中 ${totalEventsCount - dropped} 件を入力${dropped > 0 ? "（予算で絞った）" : ""}, 当該スライス範囲 ${range} 件, 入力元: ${headNote}, 記録の欠落: ${gapNote}, contextFilesInSlices: ${contextFilesInSlices}, droppedEvents: ${dropped} 件)`;

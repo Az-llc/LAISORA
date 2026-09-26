@@ -1,3 +1,4 @@
+import * as l10n from "@vscode/l10n";
 import type { OrchestrationView, PlanContext, WorkAgentNode, WorkModelPayload } from "../protocol";
 import type { PlanUsage, PlanTokenTotal } from "../plan-usage";
 import type { TaskStatus, WorkStatus } from "../work-model";
@@ -10,7 +11,7 @@ export interface PlanStep {
   key: string; number: number; title: string; activeForm?: string; status: TaskStatus;
   removed: boolean; added: boolean; addedAt: number | null; ahead: boolean;
   startedAt: number | null; endedAt: number | null; elapsed: number | null;
-  tokens: PlanTokenTotal | null; lanes: PlanLane[];
+  tokens: PlanTokenTotal | null; lanes: PlanLane[]; resumeOf?: string;
 }
 export interface PlanView {
   goal: string; steps: PlanStep[]; now: PlanLane[]; current: number | null; completed: number;
@@ -33,11 +34,17 @@ export function externalTokens(usage: OrchestrationView["runs"][number]["usage"]
 export function derivePlanView(model: WorkModelPayload | undefined, orchestration: OrchestrationView | undefined,
   usage: PlanUsage | undefined, nowMs: number, context: PlanContext | undefined = model?.planContext): PlanView {
   const declaration = model?.planDeclaration;
-  if (context) context = { ...context, start: declaration?.at ?? Math.min(context.start,
-    model?.planHistory?.find(entry => entry.kind === "todos")?.at ?? context.start) };
+  // R-DSP-43: nothing recorded before the handoff enters the window; the Host already dropped the older declaration.
+  const floor = model?.planBoundaryAt ?? Number.NEGATIVE_INFINITY;
+  if (context) {
+    const start = Math.max(context.start, floor);
+    context = { ...context, start: declaration?.at ?? Math.min(start,
+      model?.planHistory?.find(entry => entry.kind === "todos" && entry.at >= floor)?.at ?? start) };
+  }
   const view: PlanView = { goal: declaration?.goal ?? "", steps: [], now: [], current: null,
     completed: 0, elapsed: context ? Math.max(0, (context.running ? Math.max(nowMs, context.end) : context.end) - context.start) : null,
-    claude: null, external: null, partial: model?.planHistoryTruncated === true || model?.coverage.summary === "prefix-truncated" };
+    claude: null, external: null, partial: model?.planHistoryLostThrough !== undefined &&
+      model.planHistoryLostThrough >= Math.max(floor, declaration?.at ?? Number.NEGATIVE_INFINITY) || model?.coverage.summary === "prefix-truncated" };
   if (!context) return view;
   const history = (model?.planHistory ?? []).filter(entry => entry.at >= context.start && entry.at <= context.end);
   const transitions = new Map<string, Array<{ at: number; active: boolean; order: number }>>();
@@ -46,13 +53,25 @@ export function derivePlanView(model: WorkModelPayload | undefined, orchestratio
   let userAfterPlan = false;
   let order = 0;
   const created = new Set<string>();
+  const resumes = new Map<string, Array<{ step: PlanStep; status: WorkStatus; endedAt?: number }>>();
   for (const entry of history) {
     if (entry.kind === "user") { if (hasPlan) userAfterPlan = true; continue; }
+    if (entry.kind === "resume") {
+      if (!view.steps.length) continue;
+      const key = `resume\n${entry.agentId}\n${entry.at}`;
+      const step: PlanStep = { key, number: view.steps.length + 1, title: l10n.t("Resumed: {0}", entry.description), status: "in_progress",
+        removed: false, added: true, addedAt: entry.at, ahead: false, startedAt: entry.at, endedAt: null, elapsed: null, tokens: null,
+        lanes: [], resumeOf: entry.agentId };
+      view.steps.push(step);
+      transitions.set(key, []);
+      resumes.set(entry.agentId, [...resumes.get(entry.agentId) ?? [], { step, status: entry.status, endedAt: entry.endedAt }]);
+      continue;
+    }
     const present = new Set<string>();
     for (const item of entry.items) {
       if (entry.created) created.add(item.taskKey);
       if (declaration && entry.source === "tasks" && !created.has(item.taskKey)) continue;
-      const key = normalizePlanContent(item.description);
+      const key = planStepKey(entry, item);
       if (present.has(key)) continue;
       present.add(key);
       let step = view.steps.find(value => value.key === key);
@@ -82,9 +101,10 @@ export function derivePlanView(model: WorkModelPayload | undefined, orchestratio
       step.status = item.status;
       step.activeForm = item.activeForm;
       step.removed = false;
+      if (entry.source === "tasks") step.title = item.description;
     }
     for (const step of view.steps) {
-      if (entry.source === "tasks" || present.has(step.key) || step.removed) continue;
+      if (entry.source === "tasks" || present.has(step.key) || step.removed || step.resumeOf !== undefined) continue;
       step.removed = true;
       if (step.startedAt !== null && step.endedAt === null) step.endedAt = entry.at;
       transitions.get(step.key)!.push({ at: entry.at, active: false, order: ++order });
@@ -92,6 +112,22 @@ export function derivePlanView(model: WorkModelPayload | undefined, orchestratio
     hasPlan = true;
     hasStartedPlan ||= entry.items.some(item => item.status === "in_progress" || item.status === "completed");
   }
+  const nodes = new Map<string, WorkAgentNode>();
+  const index = (agent: WorkAgentNode): void => { nodes.set(agent.agentId, agent); agent.children.forEach(index); };
+  for (const phase of model?.phases ?? []) phase.agents.forEach(index);
+  (model?.unlinkedAgents ?? []).forEach(index);
+  const segmentEnd = (agentId: string, position: number): { status: WorkStatus; endedAt?: number } => {
+    const next = resumes.get(agentId)![position + 1];
+    const node = nodes.get(agentId);
+    return next ?? (node ? { status: node.status, endedAt: node.endedAt } : { status: "unknown" });
+  };
+  for (const [agentId, list] of resumes) list.forEach(({ step }, position) => {
+    const end = segmentEnd(agentId, position);
+    step.status = end.status === "running" ? "in_progress" : end.status === "unknown" ? "unknown" : "completed";
+    step.endedAt = end.status === "running" ? null : end.endedAt ?? null;
+    const description = nodes.get(agentId)?.description;
+    if (description) step.title = l10n.t("Resumed: {0}", description);
+  });
   const stepAt = (at: number): PlanStep | undefined => {
     let winner: PlanStep | undefined;
     let latest = -1;
@@ -146,13 +182,29 @@ export function derivePlanView(model: WorkModelPayload | undefined, orchestratio
   };
   const visit = (agent: WorkAgentNode): void => {
     const observed = orchestration?.agents.find(value => value.agentId === (agent.transcriptAgentId ?? agent.agentId));
-    attach({ id: `agent:${agent.transcriptAgentId ?? agent.agentId}`, agent: observed?.role ?? agent.agentType ?? agent.modelMeasured ?? agent.modelDeclared ?? "Claude",
+    const lane: PlanLane = { id: `agent:${agent.transcriptAgentId ?? agent.agentId}`, agent: observed?.role ?? agent.agentType ?? agent.modelMeasured ?? agent.modelDeclared ?? "Claude",
       title: agent.description, start: agent.startedAt ?? null,
       elapsed: agent.status === "running" && agent.startedAt !== undefined && context.running
         ? Math.max(agent.elapsedMs, nowMs - agent.startedAt)
         : agent.origin === "restored" && (agent.startedAt === undefined || agent.endedAt === undefined) ? null : agent.elapsedMs,
       status: agent.status, tokens: agent.tokens ?? externalTokens(observed?.usage ?? null)?.tokens ?? null,
-      cacheRead: externalTokens(observed?.usage ?? null)?.cacheRead ?? 0, external: false });
+      cacheRead: externalTokens(observed?.usage ?? null)?.cacheRead ?? 0, external: false };
+    const resumed = resumes.get(agent.agentId);
+    if (!resumed) attach(lane);
+    else {
+      const first = resumed[0];
+      attach({ ...lane, status: first.status,
+        elapsed: first.endedAt === undefined || agent.startedAt === undefined ? null : Math.max(0, first.endedAt - agent.startedAt) });
+      resumed.forEach(({ step }, position) => {
+        const id = `${lane.id}:resume:${step.startedAt}`;
+        if (seen.has(id)) return;
+        seen.add(id);
+        const end = segmentEnd(agent.agentId, position);
+        const until = end.status === "running" ? (context.running ? Math.max(nowMs, context.end) : context.end) : end.endedAt;
+        step.lanes.push({ ...lane, id, start: step.startedAt, status: end.status,
+          elapsed: until === undefined ? null : Math.max(0, until - step.startedAt!), tokens: null, cacheRead: 0 });
+      });
+    }
     for (const child of agent.children) visit(child);
   };
   for (const phase of model?.phases ?? []) for (const agent of phase.agents) visit(agent);
@@ -176,4 +228,10 @@ export function derivePlanView(model: WorkModelPayload | undefined, orchestratio
   if (external.length && external.every(lane => lane.tokens !== null)) view.external = {
     tokens: external.reduce((sum, lane) => sum + lane.tokens!, 0), cacheRead: external.reduce((sum, lane) => sum + lane.cacheRead, 0) };
   return view;
+}
+
+// PLAN の手順の同一性。TaskCreate / TaskUpdate は task id（改名しても同じ手順）、TodoWrite は正規化した文面。
+// "\n" は normalizePlanContent を通らないので、task id と TodoWrite の文面は衝突しない
+export function planStepKey(entry: { source?: "tasks" }, item: { taskKey: string; description: string }): string {
+  return entry.source === "tasks" ? `task\n${item.taskKey}` : normalizePlanContent(item.description);
 }

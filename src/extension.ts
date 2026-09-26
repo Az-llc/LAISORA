@@ -74,7 +74,7 @@ function ensureInitialTabs(st: SessionStore): void {
 }
 
 // 前回開いていたタブを履歴からの再開と同じ経路（openResumedSession）で開き直す。
-// 記録の位置は lookupSessionFile だけで解き、「無い」と「確かめられなかった」を別の文で出す（R-37 / R-DSP-01）。
+// 記録の位置は lookupSessionFile だけで解き、「無い」と「確かめられなかった」を別の文で出す（R-DSP-01）。
 // 復元できなかった分は黙って落とさず、先頭のタブへ 1 行ずつ残す
 async function restorePersistedTabs(st: SessionStore, entries: PersistedOpenTab[]): Promise<void> {
   const notices: string[] = [];
@@ -181,6 +181,7 @@ function activateReady(context: vscode.ExtensionContext): void {
       affectsProductConfiguration(e, "composer.sendKey") ||
       affectsProductConfiguration(e, "claude.apiKeyPolicy") ||
       affectsProductConfiguration(e, "restoreTabsOnStartup") ||
+      affectsProductConfiguration(e, "learning.profileSources") ||
       affectsProductConfiguration(e, "claude.fileLinkInstruction") ||
       affectsProductConfiguration(e, "claude.planInstruction") ||
       affectsProductConfiguration(e, "fileLinks.openWithSystemApp") ||
@@ -292,7 +293,7 @@ export type { SessionStore } from "./store-surfaces";
 // 居ることが前提なので、束ねの入口が変わっても再 export を外さない
 export { sessionsForTest } from "./store-surfaces";
 
-// Remote / workspace trust ゲート。問題があれば理由文字列を返す。
+// Remote / workspace trust ゲート。問題があれば理由文字列を返す（R-CNV-35）。
 function guardMessage(): string | null {
   // 拒否理由だけでなく、利用者が次に取るべき操作まで文面に含める。
   if (vscode.env.remoteName) {

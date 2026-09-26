@@ -162,9 +162,16 @@ export function parseTaskNotification(text: string): TaskNotificationInfo | unde
   if (!agentId) return undefined;
   const toolUseId = /<tool-use-id>([^<]+)<\/tool-use-id>/.exec(t)?.[1]?.trim();
   const status = /<status>([^<]+)<\/status>/.exec(t)?.[1]?.trim();
+  // <result> は委任先の自由文で <usage> も </result> も含みうる。usage は最後の </result> より後ろ
+  // （閉じていない <result> があれば読まない）からだけ取る。外側に usage が無い通知は未計測のまま
+  const resultEnd = t.lastIndexOf("</result>");
+  const outside = resultEnd >= 0 ? t.slice(resultEnd + "</result>".length) : t.includes("<result>") ? "" : t;
+  const tokensText = /<usage>[^]*?<subagent_tokens>(\d+)<\/subagent_tokens>/.exec(outside)?.[1];
+  const tokens = tokensText === undefined ? undefined : Number(tokensText);
   return {
     agentId,
     ...(toolUseId ? { toolUseId } : {}),
     ...(status ? { status } : {}),
+    ...(tokens !== undefined && Number.isSafeInteger(tokens) ? { tokens } : {}),
   };
 }

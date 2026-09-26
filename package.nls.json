@@ -42,5 +42,6 @@
   "config.laisora.appearance.accentColor.custom": "Custom colour",
   "config.laisora.appearance.accentCustomLight.description": "Custom accent for light themes (#RRGGBB). Invalid values fall back to the theme accent.",
   "config.laisora.appearance.accentCustomDark.description": "Custom accent for dark themes (#RRGGBB). Invalid values fall back to the theme accent.",
-  "config.laisora.appearance.accentCustom.validation": "Enter a colour in #RRGGBB format."
+  "config.laisora.appearance.accentCustom.validation": "Enter a colour in #RRGGBB format.",
+  "config.laisora.learning.profileSources.description": "Sources used to research model characteristics. At least one source is required. Unknown values are ignored; an empty selection uses both sources."
 }

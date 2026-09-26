@@ -71,7 +71,7 @@ export async function parseHandoffRecords(text: string): Promise<HandoffRecordsR
   return { records, unreadableLineCount };
 }
 
-// 走査の失敗を「無い」へ潰さない（R-37）。潰すと、同期ロック・権限で確かめられなかっただけの
+// 走査の失敗を「無い」へ潰さない（R-DSP-01）。潰すと、同期ロック・権限で確かめられなかっただけの
 // 状態を「引き継ぎ先の会話が見つかりませんでした」と断言することになる。
 // detail は表示へ出るので絶対パスを載せない（生の例外文は deps.log へ）
 export type ForkFileLookup =

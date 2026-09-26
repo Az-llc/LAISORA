@@ -41,6 +41,30 @@ export function projectPlanUsage(state: PlanUsageAccumulator | undefined, blocks
   return result;
 }
 
+// messageCount は数値を持つ応答、unmeasuredMessageCount は usage はあるが数値を 1 つも持たない応答。
+// usage そのものが無い応答は assistant_usage を生まないので数えられない
+export interface MainTokenTotal extends PlanTokenTotal { messageCount: number; unmeasuredMessageCount: number; partial: boolean }
+
+// assistant_usage はメインの記録だけ（サブエージェントは発行しない）なので、これはセッション全体の本体分。
+// 数値の観測が 1 件も無ければ null（空の usage を測った 0 にしない。R-DSP-11）
+export function summarizeMainTokens(state: PlanUsageAccumulator | undefined): MainTokenTotal | null {
+  let tokens = 0;
+  let cacheRead = 0;
+  let messageCount = 0;
+  let unmeasuredMessageCount = 0;
+  for (const { usage } of Object.values(state?.messages ?? {})) {
+    if (usage.inputTokens === undefined && usage.cacheCreationInputTokens === undefined && usage.outputTokens === undefined) {
+      unmeasuredMessageCount++;
+      continue;
+    }
+    messageCount++;
+    tokens += (usage.inputTokens ?? 0) + (usage.cacheCreationInputTokens ?? 0) + (usage.outputTokens ?? 0);
+    cacheRead += usage.cacheReadInputTokens ?? 0;
+  }
+  if (messageCount === 0) return null;
+  return { tokens, cacheRead, messageCount, unmeasuredMessageCount, partial: unmeasuredMessageCount > 0 };
+}
+
 function exact(value: unknown, keys: string[]): value is Record<string, unknown> {
   return value !== null && typeof value === "object" && !Array.isArray(value)
     && Object.keys(value).length === keys.length && keys.every(key => Object.hasOwn(value, key));

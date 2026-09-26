@@ -11,11 +11,11 @@ import type { WebviewToHost } from "../protocol";
 type VsCodeWebviewApi = {
   postMessage(msg: WebviewToHost): void;
   getState():
-    | { activeTabId: string | null; drafts?: Record<string, string>; askChecks?: Record<string, Record<string, boolean[]>>; views?: Record<string, "conv" | "work">; analysisViews?: Record<string, "script" | "ai">; workViews?: Record<string, "summary" | "graph" | "analysis" | "log"> }
+    | { activeTabId: string | null; drafts?: Record<string, string>; askChecks?: Record<string, Record<string, boolean[]>>; askDismissed?: Record<string, string[]>; askDismissedMessages?: string[]; askCheckedMessages?: Record<string, boolean[]>; views?: Record<string, "conv" | "work">; analysisViews?: Record<string, "script" | "ai">; workViews?: Record<string, "summary" | "graph" | "analysis" | "log"> }
     | undefined;
   setState(s: {
     activeTabId: string | null;
-    drafts?: Record<string, string>; askChecks?: Record<string, Record<string, boolean[]>>;
+    drafts?: Record<string, string>; askChecks?: Record<string, Record<string, boolean[]>>; askDismissed?: Record<string, string[]>; askDismissedMessages?: string[]; askCheckedMessages?: Record<string, boolean[]>;
     views?: Record<string, "conv" | "work">;
     analysisViews?: Record<string, "script" | "ai">;
     workViews?: Record<string, "summary" | "graph" | "analysis" | "log">;

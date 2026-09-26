@@ -7,7 +7,9 @@ import {
   createTimeBucketState,
   deriveTimeBuckets,
   foldTimeBuckets,
+  pushModelMark,
   type ChildTranscriptSpan,
+  type ModelMark,
   type TimeBucketView,
 } from "./time-buckets";
 
@@ -33,8 +35,33 @@ export function timeBucketsFromHistory(
   ids: TranscriptIds
 ): TimeBucketView {
   let state = createTimeBucketState();
+  let modelMarks: ModelMark[] = [];
+  let currentModel: string | undefined;
+  let markedInTurn = false;
   let seq = 0;
   for (const e of events) {
+    const body = e.body;
+    if (body.kind === "turn_started") markedInTurn = false;
+    // model の観測は foldTimeBuckets（evidence-index 経由で semantic の導出に入る）へ渡さず、読み直しの側だけで拾う。
+    // model_observed は変化した記録にしか出ないので、応答ごとの model は「直前の変化の model」で、
+    // 応答記録ごとの観測はメインの本文・ツール呼び出しのイベントの時刻で取る。変化点だけで割ると、
+    // 同じターンで A の応答の後に B へ変わったとき A の生成まで B に数える
+    if (body.kind === "model_observed") {
+      if (e.timestamp > 0) {
+        currentModel = body.model;
+        modelMarks = pushModelMark(modelMarks, e.timestamp, body.model, markedInTurn);
+        markedInTurn = true;
+      }
+      continue;
+    }
+    if (
+      currentModel !== undefined &&
+      e.timestamp > 0 &&
+      (body.kind === "assistant_text_delta" || (body.kind === "tool_call_started" && body.parentToolUseId === null))
+    ) {
+      modelMarks = pushModelMark(modelMarks, e.timestamp, currentModel, markedInTurn);
+      markedInTurn = true;
+    }
     const ev = {
       ...e.body,
       timestamp: e.timestamp,
@@ -45,12 +72,12 @@ export function timeBucketsFromHistory(
     } as NormalizedEvent;
     state = foldTimeBuckets(state, ev);
   }
-  return deriveTimeBuckets(state, { childSpans });
+  return deriveTimeBuckets(state, { childSpans, modelMarks });
 }
 
 export interface TranscriptTimeBucketsRead {
   view: TimeBucketView | undefined;
-  // undefined = 欠落なし。読めなかった subagents/ を 0 本として view へ畳まない（R-23）
+  // undefined = 欠落なし。読めなかった subagents/ を 0 本として view へ畳まない（R-DSP-11）
   coverage: TimeBucketsCoverage | undefined;
 }
 
@@ -76,7 +103,7 @@ export async function readTranscriptTimeBucketsWithCoverage(
 ): Promise<TranscriptTimeBucketsRead> {
   const history = await readSessionHistory(file, isAllowedPath);
   // 読めなかった transcript から 0 件の 4 区分を作らない。fold 由来の値（inherited）に留める（R-DSP-11）
-  // subagents/ の一覧が読めない場合も view を作らない（子を 0 本として描くと直列に見える。R-23 / TB-41）
+  // subagents/ の一覧が読めない場合も view を作らない（子を 0 本として描くと直列に見える。TB-41）
   const sessionReadError = history.readError ?? history.subagentsReadError;
   if (sessionReadError !== undefined) return { view: undefined, coverage: { sessionReadError } };
   const restored = await readSubagentAgents(file, isAllowedPath);

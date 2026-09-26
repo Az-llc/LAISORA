@@ -1,6 +1,6 @@
 // webview へ渡す公開面の射影。Host-only 値（canonicalPath / baseDir / progress）は
 // ここで物理的に落とす。extension.ts に置いたままだと vscode 依存で検証ハーネスから
-// 実装を直接呼べず、テスト側が規則を再実装して漏れを見逃す（Step 5 レビュー指摘）
+// 実装を直接呼べず、テスト側が規則を再実装して漏れを見逃す
 import { projectArtifactAccess } from "./artifact-access";
 import type { DivergenceKind, DivergenceKindReport, DivergenceReport } from "./l3-divergence";
 import type { SemanticModel } from "./semantic-model";

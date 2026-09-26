@@ -174,7 +174,7 @@ function conversationHistoryGapFields(
 
 // 送出の全経路がここを通り、Output に reason と sessionId を 1 行残す。経路ごとに書くと
 // 一過性の理由（stale-request 等）が無言のまま再試行を使い切り、画面の「止まりました」だけが
-// 残って Output からは何も追えない（R-14）
+// 残って Output からは何も追えない
 async function postConversationHistoryError(
   st: SessionStore,
   sender: vscode.Webview,
@@ -403,7 +403,7 @@ export async function handleHistoryMessage(
           const filePath = lookup.path;
           if (filePath === null) {
             // 走査に失敗しただけのときに終端の理由を返さない。返すと webview が
-            // 「読み終わった」として進行表示を消す（R-17）
+            // 「読み終わった」として進行表示を消す（R-CNV-02）
             await postConversationHistoryError(
               st, sender, session, msg.requestId, generation,
               lookup.reason === "scan_failed" ? "session-scan-failed" : "session-unavailable",

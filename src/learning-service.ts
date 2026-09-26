@@ -123,14 +123,15 @@ export class LearningService {
     return this.serial(async () => {
       if (!writer.enabled) return { ok: false, code: "disabled", requirement: "R-LRN-07" };
       if (!writer.rootVerified) return { ok: false, code: "caller-unverified", requirement: "R-LRN-12" };
+      // R-LRN-15: retries must pass admission before any cached result can be returned.
+      const validated = validateLearningInput(submitted);
+      if (!validated.ok) return { ok: false, code: validated.code, requirement: validated.requirement, ...(validated.field ? { field: validated.field } : {}) };
       const requestId = submitted && typeof submitted === "object" && "requestId" in submitted ? submitted.requestId : undefined;
       const key = digest([writer.conversationRef, requestId]);
       const fingerprint = digest(submitted), prior = this.requests.get(key);
       if (prior && prior.fingerprint !== fingerprint) return { ok: false, code: "request-conflict", requirement: "R-LRN-12" };
       if (prior?.result) return structuredClone(prior.result);
       if (!this.current || this.uncertain) return storeError();
-      const validated = validateLearningInput(submitted);
-      if (!validated.ok) return { ok: false, code: validated.code, requirement: validated.requirement, ...(validated.field ? { field: validated.field } : {}) };
       const value = validated.input;
       const request = prior ?? { fingerprint };
       this.requests.set(key, request);
@@ -143,11 +144,12 @@ export class LearningService {
         request.result = { ok: false, code: admitted.code, requirement: admitted.requirement, ...(admitted.field ? { field: admitted.field } : {}) };
         return structuredClone(request.result);
       }
+      const { subject: _subject, ...content } = value;
       const model = value.kind === "candidate" && value.binding === "general" ? "*" : value.model!;
       const preview = restoreState([...this.current.records.values(), ...admitted.records]);
       const control = [...preview.records.values()].filter(record => record.kind === "control").at(-1);
       const result: LearningResult = { ok: true, status: admitted.records.length ? "recorded" : "unchanged", kind: value.kind, model,
-        hash: value.kind === "candidate" ? textHash(value.text) : modelProfileHash(value), opIds: admitted.records.map(record => record.opId),
+        hash: content.kind === "candidate" ? textHash(content.text) : modelProfileHash(content), opIds: admitted.records.map(record => record.opId),
         nextPrompt: control?.autoApply === false ? "withheld" : "next-start",
         ...(value.kind === "candidate" ? { qualification: preview.rules.get(value.ruleId)?.versions.at(-1)?.qualifications.get(model)?.state } : {}) };
       if (!await this.persist(admitted.records, request, result)) return storeError();

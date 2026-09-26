@@ -93,7 +93,7 @@ export function renderHistList(sessions: SessionListItem[]): void {
   const filtered = query ? sessions.filter((s) => s.title.includes(query)) : sessions;
   histListEl.textContent = "";
   // 注記は空分岐の外に置く。行があっても欠落は起こる（プロジェクト 1 個が読めない側の方が
-  // 踏みやすい）ので、空のときだけ出すと踏みやすい方が素通りする（R-DSP-03。R-21）
+  // 踏みやすい）ので、空のときだけ出すと踏みやすい方が素通りする（R-DSP-03）
   const note = sessionsPhase === "complete" ? sessionScanNote(latestDegraded) : undefined;
   if (note !== undefined) {
     const noteEl = document.createElement("div");
@@ -108,7 +108,7 @@ export function renderHistList(sessions: SessionListItem[]): void {
     // 確認が終わるまでは 0 件も「一致なし」も名乗らない。まだ届いていない行が
     // 検索に一致するかは分からない。
     // 読めなかったものがあるときは「無い」と断言しない。読めなかったことと存在しないことは
-    // 別で、走査が知っているのは前者だけ（R-DSP-01。R-21）
+    // 別で、走査が知っているのは前者だけ（R-DSP-01）
     empty.textContent =
       sessionsPhase !== "complete"
         ? l10n.t("Loading…")

@@ -4,6 +4,7 @@
 import type { NormalizedEvent } from "./protocol";
 import { redactAbsolutePaths } from "./path-redaction";
 import { isPureCommandWrapper } from "./human-input-vocabulary";
+import * as l10n from "@vscode/l10n";
 
 export type TimeBucket = "generate" | "tool" | "confirm" | "reply";
 export type TimeLane = "main" | "sub";
@@ -16,6 +17,8 @@ export const DELEGATION_TOOL_NAMES: ReadonlySet<string> = new Set(["Agent", "Tas
 export const MAX_TIME_TOOL_INTERVALS = 8192;
 export const MAX_TIME_BLOCKS = 500;
 export const MAX_BLOCK_TEXT = 600;
+export const MAX_MODEL_MARKS = 4096;
+export const MAIN_MODEL_TOP_COUNT = 3;
 const TASK_NOTIFICATION_MARKER = "A task-notification fires each time this agent stops";
 
 export function isRequestMessageText(text: string): boolean {
@@ -26,6 +29,25 @@ export interface TurnSpan {
   turnId: string;
   start: number;
   end: number;
+}
+
+// メインの応答記録 1 件の観測。at はその記録の時刻、model はその応答を出した model
+export interface ModelMark {
+  at: number;
+  model: string;
+}
+
+// sameTurn: 直前の地点と同じターン。同じターンで同じ model が続く地点は最後の 1 つだけ残しても割り当ては変わらない。
+// ターンをまたいで畳むと前のターンの地点が消えて unknown に落ちる。
+// 上限超過は古い側を捨てる。捨てた地点より前のターンは直前の model を持たず unknown に落ちる（R-DSP-01）
+export function pushModelMark(marks: ModelMark[], at: number, model: string, sameTurn = false): ModelMark[] {
+  const last = marks[marks.length - 1];
+  if (sameTurn && last !== undefined && last.model === model && at >= last.at) {
+    last.at = at;
+    return marks;
+  }
+  marks.push({ at, model });
+  return marks.length > MAX_MODEL_MARKS ? marks.slice(marks.length - MAX_MODEL_MARKS) : marks;
 }
 
 export interface ToolInterval {
@@ -518,6 +540,28 @@ export interface RequestBlockView {
   running: boolean;
 }
 
+export interface MainModelTimeEntry {
+  // unknown = model を観測する前のターン（R-DSP-01）。other = 上位 MAIN_MODEL_TOP_COUNT 以外を畳んだもの
+  kind: "model" | "other" | "unknown";
+  label: string;
+  model: string | null;
+  foldedModelCount: number | null;
+  generateMs: number;
+  // totalMs に対する比（0..1）と整数の百分率。totalMs が 0 なら null
+  share: number | null;
+  percent: number | null;
+}
+
+// 本体の処理時間 = LLM 生成 + 委任でないツール（R-DSP-17 のメイン棒と同じ母数）
+export interface MainTimeByModelView {
+  totalMs: number;
+  generateMs: number;
+  models: MainModelTimeEntry[];
+  toolMs: number;
+  toolShare: number | null;
+  toolPercent: number | null;
+}
+
 export interface TimeBucketView {
   fidelity: TimeFidelity;
   inheritedBoundaryCount: number;
@@ -529,6 +573,8 @@ export interface TimeBucketView {
   sub: { generateMs: number; toolMs: number; spanMs: number };
   // R-DSP-17 の 3 本。返信待ちと確認待ちは入れない
   bars: { totalMs: number | null; mainMs: number | null; subMs: number };
+  // null = model の地点を渡されていない（live の fold）か、継承時刻で生成時間を測っていない（R-DSP-11）
+  mainByModel: MainTimeByModelView | null;
   agentCount: number;
   maxParallelAgents: number;
   currentParallel: number;
@@ -568,6 +614,106 @@ function sweepMax(spans: readonly Span[]): number {
   return max;
 }
 
+// ターンごとに生成時間を model へ割り当てる。地点はメインの応答記録ごとの観測（その応答を出した model）。
+// ターン内の地点 m は前の地点（またはターン開始）から m までの生成を持ち、最後の地点の後はターン終端まで同じ model。
+// ターン内に地点が無ければ直前の地点の model が続いている。直前の地点が無いターンは unknown（R-DSP-01）
+export function deriveMainByModel(
+  turns: readonly TurnSpan[],
+  generate: readonly Span[],
+  toolMs: number,
+  marks: readonly ModelMark[]
+): MainTimeByModelView {
+  const sortedMarks = [...marks].sort((a, b) => a.at - b.at);
+  const byModel = new Map<string, number>();
+  let unknownMs = 0;
+  let covered = -Infinity;
+  // 割り当てる窓は時刻の昇順にしか進まないので、生成区間の走査位置を持ち越す（窓ごとに先頭から走査すると O(N²)）
+  let gi = 0;
+  const credit = (model: string | undefined, s0: number, s1: number): void => {
+    const start = Math.max(s0, covered);
+    if (s1 <= start) return;
+    covered = s1;
+    while (gi < generate.length && generate[gi][1] <= start) gi++;
+    let ms = 0;
+    for (let j = gi; j < generate.length && generate[j][0] < s1; j++) {
+      ms += Math.max(0, Math.min(s1, generate[j][1]) - Math.max(start, generate[j][0]));
+    }
+    if (ms <= 0) return;
+    if (model === undefined) unknownMs += ms;
+    else byModel.set(model, (byModel.get(model) ?? 0) + ms);
+  };
+  let mi = 0;
+  let current: string | undefined;
+  for (const t of [...turns].sort((a, b) => a.start - b.start)) {
+    while (mi < sortedMarks.length && sortedMarks[mi].at <= t.start) current = sortedMarks[mi++].model;
+    let cursor = t.start;
+    while (mi < sortedMarks.length && sortedMarks[mi].at <= t.end) {
+      const mark = sortedMarks[mi++];
+      credit(mark.model, cursor, mark.at);
+      cursor = mark.at;
+      current = mark.model;
+    }
+    credit(current, cursor, t.end);
+  }
+  const generateMs = measureSpans(generate);
+  const totalMs = generateMs + toolMs;
+  const ranked = [...byModel].sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]));
+  const models: MainModelTimeEntry[] = ranked.slice(0, MAIN_MODEL_TOP_COUNT).map(([model, ms]) => ({
+    kind: "model",
+    label: model.replace(/^claude-/, ""),
+    model,
+    foldedModelCount: null,
+    generateMs: ms,
+    share: null,
+    percent: null,
+  }));
+  const folded = ranked.slice(MAIN_MODEL_TOP_COUNT);
+  if (folded.length > 0) {
+    models.push({
+      kind: "other",
+      label: l10n.t("Other {0} models", folded.length),
+      model: null,
+      foldedModelCount: folded.length,
+      generateMs: folded.reduce((acc, [, v]) => acc + v, 0),
+      share: null,
+      percent: null,
+    });
+  }
+  if (unknownMs > 0) {
+    models.push({
+      kind: "unknown",
+      label: l10n.t("Model not observed"),
+      model: null,
+      foldedModelCount: null,
+      generateMs: unknownMs,
+      share: null,
+      percent: null,
+    });
+  }
+  if (totalMs <= 0) return { totalMs, generateMs, models, toolMs, toolShare: null, toolPercent: null };
+  // 同じ輪に並ぶ百分率は最大剰余で丸め、和を 100 に揃える
+  const parts = [...models.map((m) => m.generateMs), toolMs];
+  const percents = largestRemainderPercents(parts, totalMs);
+  models.forEach((m, i) => {
+    m.share = m.generateMs / totalMs;
+    m.percent = percents[i];
+  });
+  return { totalMs, generateMs, models, toolMs, toolShare: toolMs / totalMs, toolPercent: percents[parts.length - 1] };
+}
+
+function largestRemainderPercents(parts: readonly number[], total: number): number[] {
+  const raw = parts.map((p) => (p / total) * 100);
+  const floors = raw.map((r) => Math.floor(r));
+  let rest = 100 - floors.reduce((acc, v) => acc + v, 0);
+  const order = raw.map((r, i) => ({ i, frac: r - floors[i] })).sort((a, b) => b.frac - a.frac || a.i - b.i);
+  for (const { i } of order) {
+    if (rest <= 0) break;
+    floors[i]++;
+    rest--;
+  }
+  return floors;
+}
+
 export function deriveTimeBuckets(
   state: TimeBucketState,
   options?: {
@@ -579,6 +725,7 @@ export function deriveTimeBuckets(
     // 終了済みセッションの並列数が残る）
     streamOpen?: boolean;
     liveDelegationAgentIds?: ReadonlySet<string>;
+    modelMarks?: readonly ModelMark[];
   }
 ): TimeBucketView {
   const firstAt = state.firstAt ?? null;
@@ -736,6 +883,10 @@ export function deriveTimeBuckets(
   const replyMs = measureSpans(replySpans);
   const subOnlyMs = measureSpans(subOnlySpans);
   const mainBarMs = generateMs + measureSpans(intersectSpans(nonDelegationToolUnion, whole));
+  const mainByModel =
+    inherited || options?.modelMarks === undefined
+      ? null
+      : deriveMainByModel(turnSpansAll, intersectSpans(generateSpans, whole), mainBarMs - generateMs, options.modelMarks);
   const subGenerate = agents.reduce((acc, a) => acc + a.generateMs, 0);
   const subTool = agents.reduce((acc, a) => acc + a.toolMs, 0);
   const subSpan = agents.reduce((acc, a) => acc + Math.max(0, a.end - a.start), 0);
@@ -835,6 +986,7 @@ export function deriveTimeBuckets(
       subMs: subSpan,
       totalMs: inherited ? null : mainBarMs + subSpan,
     },
+    mainByModel,
     agentCount: agents.length,
     maxParallelAgents,
     currentParallel,

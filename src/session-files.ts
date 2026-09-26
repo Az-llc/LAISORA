@@ -184,14 +184,14 @@ export function readCachedUsage(): {
 // cwd のエンコード規則を推測せず、プロジェクトディレクトリを走査して実在するものを返す。
 // 「そのセッションが無い」と「有無を確かめられなかった」を区別する。同じ null に畳むと、同期ロック・権限・競合で
 // 走査に失敗しただけの状態が、分析では「まだ書き出されていません」（待っても直らない）、会話の遡りでは
-// 「読み終わった」（進行表示が黙って消える）として利用者に届き、Output にも出ない（R-17 / R-33）
+// 「読み終わった」（進行表示が黙って消える）として利用者に届き、Output にも出ない（R-CNV-02 / R-DSP-01）
 export type SessionFileLookup =
   | { path: string; reason: null }
   | { path: null; reason: "not_found" }
   | { path: null; reason: "scan_failed"; detail: string };
 
 // sessionId から JSONL の実体位置を解決する（cwd エンコード規則を推測せず全 project を走査）。
-// 探索はこの 1 本だけ。別実装を足すと、そちらだけ走査の失敗を「無い」へ潰す形へ戻る（E-18 / R-37）
+// 探索はこの 1 本だけ。別実装を足すと、そちらだけ走査の失敗を「無い」へ潰す形へ戻る（E-18 / R-DSP-01）
 export function lookupSessionFile(sessionId: string): SessionFileLookup {
   // join へ渡す前に絞る。`../..` を含む id は保存先の外を指すファイル名になる
   if (!SESSION_ID_RE.test(sessionId)) return { path: null, reason: "not_found" };

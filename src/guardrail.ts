@@ -13,6 +13,9 @@ export const MAX_REPORT_SIGNALS_PER_ENVELOPE = 20;
 export const MAX_PENDING_REPORT_SIGNALS = 200;
 export const FAILURE_LOOP_CONSECUTIVE_THRESHOLD = 3;
 export const FAILURE_LOOP_SIGNATURE_THRESHOLD = 5;
+// 長時間ステップでは失敗の件数より失った時間が効く（5 分 × 5 回を待ってから知らせても遅い）
+export const FAILURE_LOOP_LOST_MS_THRESHOLD = 5 * 60_000;
+export const FAILURE_LOOP_LOST_MIN_COUNT = 2;
 // evidence-index IDLE_GAP_MS と同値だが import しない（閾値は本ファイルにのみ置く）
 export const STAGNATION_IDLE_MS = 5 * 60_000;
 // 初期値。実測根拠は無く level 1 でしか使わない（token 量だけで停止しない）
@@ -71,6 +74,7 @@ export interface GuardrailSignal {
     turnId?: string;
     messageId?: string;
     outputTokens?: number;
+    lostMs?: number;
   };
 }
 
@@ -85,7 +89,12 @@ export interface GuardrailSubjectState {
     at: number;
   }[];
   signatureCounts: Record<string, number>;
-  recoveryCounts?: { turnId: string; tools: Record<string, Record<string, number>> };
+  signatureLostMs?: Record<string, number>;
+  recoveryCounts?: {
+    turnId: string;
+    tools: Record<string, Record<string, number>>;
+    lostMs?: Record<string, Record<string, number>>;
+  };
   // root のみ。turn_started でリセット（R-TK2）
   turnOutput?: { turnId: string; outputTokens: number };
 }
@@ -332,10 +341,12 @@ function foldEvent(state: GuardrailState, ev: NormalizedEvent): GuardrailState {
   if (ev.kind === "tool_call_finished") {
     let targetSubjectId: GuardrailSubjectId | undefined;
     let toolName = "";
+    let startedAt: number | undefined;
     for (const [subId, subState] of Object.entries(state.subjects)) {
       if (subState.openTools[ev.toolUseId]) {
         targetSubjectId = subId;
         toolName = subState.openTools[ev.toolUseId].toolName;
+        startedAt = subState.openTools[ev.toolUseId].startedAt;
         delete subState.openTools[ev.toolUseId];
         break;
       }
@@ -373,9 +384,16 @@ function foldEvent(state: GuardrailState, ev: NormalizedEvent): GuardrailState {
       fingerprintHash = computeErrorFingerprintHash(toolName, ev.resultPreview);
       if (fingerprintHash !== undefined) {
         sub.signatureCounts[fingerprintHash] = (sub.signatureCounts[fingerprintHash] ?? 0) + 1;
-        if (sub.recoveryCounts?.turnId !== ev.turnId) sub.recoveryCounts = { turnId: ev.turnId, tools: {} };
+        // 両端とも SDK message の任意項目 timestamp（CLI 側の同じ時計）。欠けた message は直前の message の時刻を継ぎ、
+        // 時刻を一度も観測していなければ 0 で届く。0 を時刻として引くと 1970 年からの経過が失った時間になる
+        const lostMs = isObservedTime(startedAt) && isObservedTime(ev.timestamp) && ev.timestamp > startedAt ? ev.timestamp - startedAt : 0;
+        const signatureLostMs = (sub.signatureLostMs ??= {});
+        signatureLostMs[fingerprintHash] = (signatureLostMs[fingerprintHash] ?? 0) + lostMs;
+        if (sub.recoveryCounts?.turnId !== ev.turnId) sub.recoveryCounts = { turnId: ev.turnId, tools: {}, lostMs: {} };
         const counts = sub.recoveryCounts.tools[toolName] ??= {};
         counts[fingerprintHash] = (counts[fingerprintHash] ?? 0) + 1;
+        const recoveryLost = (sub.recoveryCounts.lostMs ??= {})[toolName] ??= {};
+        recoveryLost[fingerprintHash] = (recoveryLost[fingerprintHash] ?? 0) + lostMs;
       }
     }
 
@@ -422,9 +440,16 @@ function foldEvent(state: GuardrailState, ev: NormalizedEvent): GuardrailState {
       }
     }
 
+    const signatureCount = fingerprintHash !== undefined ? sub.signatureCounts[fingerprintHash] ?? 0 : 0;
+    const signatureLostMs = fingerprintHash !== undefined ? sub.signatureLostMs?.[fingerprintHash] ?? 0 : 0;
+    const timeLossHit = signatureCount >= FAILURE_LOOP_LOST_MIN_COUNT && signatureLostMs >= FAILURE_LOOP_LOST_MS_THRESHOLD; // R-OPS-12
     const rFl2Hit =
       fingerprintHash !== undefined &&
-      (sub.signatureCounts[fingerprintHash] ?? 0) >= FAILURE_LOOP_SIGNATURE_THRESHOLD;
+      (signatureCount >= FAILURE_LOOP_SIGNATURE_THRESHOLD || timeLossHit);
+    const lostEvidence = (fp: string | undefined): { lostMs?: number } => {
+      const ms = fp !== undefined ? sub.signatureLostMs?.[fp] : undefined;
+      return ms !== undefined && ms > 0 ? { lostMs: ms } : {};
+    };
 
     if (rFl1Hit) {
       const rootKey = `${targetSubjectId}|${rFl1ToolName}|${rFl1FingerprintHash ?? "unfingerprinted"}`;
@@ -439,6 +464,7 @@ function foldEvent(state: GuardrailState, ev: NormalizedEvent): GuardrailState {
         if (rFl1FingerprintHash && !existing.evidence.fingerprintHash) {
           existing.evidence.fingerprintHash = rFl1FingerprintHash;
         }
+        Object.assign(existing.evidence, lostEvidence(rFl1FingerprintHash));
         if (!existing.evidence.toolUseIds) {
           existing.evidence.toolUseIds = [];
         }
@@ -464,6 +490,7 @@ function foldEvent(state: GuardrailState, ev: NormalizedEvent): GuardrailState {
             evidence: {
               toolUseIds: rFl1RecentToolUseIds.slice(-MAX_EVIDENCE_TOOL_USES),
               ...(rFl1FingerprintHash ? { fingerprintHash: rFl1FingerprintHash } : {}),
+              ...lostEvidence(rFl1FingerprintHash),
             },
           });
         }
@@ -476,6 +503,7 @@ function foldEvent(state: GuardrailState, ev: NormalizedEvent): GuardrailState {
         existing.count += 1;
         existing.lastAt = ev.timestamp;
         existing.confidence = "signature";
+        Object.assign(existing.evidence, lostEvidence(fingerprintHash));
         if (!existing.evidence.toolUseIds) {
           existing.evidence.toolUseIds = [];
         }
@@ -501,6 +529,7 @@ function foldEvent(state: GuardrailState, ev: NormalizedEvent): GuardrailState {
             evidence: {
               toolUseIds: [ev.toolUseId],
               fingerprintHash,
+              ...lostEvidence(fingerprintHash),
             },
           });
         }
@@ -558,6 +587,10 @@ function foldEvent(state: GuardrailState, ev: NormalizedEvent): GuardrailState {
   return state;
 }
 
+function isObservedTime(t: number | undefined): t is number {
+  return typeof t === "number" && Number.isFinite(t) && t > 0;
+}
+
 function discardRecoveredFailures(state: GuardrailState, subjectId: string, turnId: string, toolName?: string): void {
   const sub = state.subjects[subjectId];
   const removed = sub.recentFinished.filter((entry) => entry.isError && entry.turnId === turnId && (toolName === undefined || entry.toolName === toolName));
@@ -569,8 +602,14 @@ function discardRecoveredFailures(state: GuardrailState, subjectId: string, turn
         const count = (sub.signatureCounts[hash] ?? 0) - recovered;
         if (count > 0) sub.signatureCounts[hash] = count;
         else delete sub.signatureCounts[hash];
+        if (sub.signatureLostMs) {
+          const lost = (sub.signatureLostMs[hash] ?? 0) - (recovery.lostMs?.[name]?.[hash] ?? 0);
+          if (count > 0 && lost > 0) sub.signatureLostMs[hash] = lost;
+          else delete sub.signatureLostMs[hash];
+        }
       }
       delete recovery.tools[name];
+      delete recovery.lostMs?.[name];
     }
   }
   const ids = new Set(removed.map((entry) => entry.toolUseId));
@@ -938,6 +977,7 @@ export function planReportBatch(
       confidence: s.confidence,
       firstAt: s.firstAt,
       lastAt: s.lastAt,
+      ...(s.evidence.lostMs !== undefined ? { lostMs: s.evidence.lostMs } : {}),
     });
   }
 

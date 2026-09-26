@@ -305,6 +305,7 @@ export function renderMarkdownInto(container: HTMLElement, src: string, tabId?: 
       case "table": {
         const table = document.createElement("table");
         table.className = "md-table";
+        table.tabIndex = 0;
         const thead = document.createElement("thead");
         const headerTr = document.createElement("tr");
         node.head.children.forEach((cell, idx) => {

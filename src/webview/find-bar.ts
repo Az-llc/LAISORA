@@ -35,7 +35,7 @@ export function clearHighlights(): void {
   currentIndex = -1;
 }
 
-// 過去を読み込んでいる間の件数は母集合の途中。確定値に見せると「2 回しか出てこない」と結論される（R-26）
+// 過去を読み込んでいる間の件数は母集合の途中。確定値に見せると「2 回しか出てこない」と結論される（R-DSP-03）
 function countSuffix(): string {
   const state = activeTab()?.convHistoryLoadState() ?? null;
   if (state === "loading") return l10n.t(" (loading history)");

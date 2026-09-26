@@ -39,7 +39,9 @@ export interface Qualification {
   reviewDueAt?: string;
   retired_by?: "human" | "conductor";
   imported?: boolean;
-  reason?: "import_unverified";
+  reason?: "import_unverified" | "rule-change-scope";
+  scopeEligible?: boolean;
+  scopeMigrationFrom?: QualificationState;
 }
 export interface RuleVersionState { record: RecordOf<"ruleVersion">; qualifications: Map<string, Qualification> }
 export interface LearningRule { versions: RuleVersionState[] }
@@ -58,7 +60,7 @@ export interface LearningFacts {
   generalQualifications: LearningFacts["qualifications"];
 }
 
-export function learningFacts(state: LearningState, target: { conversationRef: string; sessionRef: string | null; model: string | null; scope: string }): LearningFacts {
+export function learningFacts(state: LearningState, target: { conversationRef: string; sessionRef: string | null; model: string | null }): LearningFacts {
   // R-LRN-09: a missing session must not join unrelated observations with a null session.
   const session = target.sessionRef?.trim().toLowerCase() || null;
   const facts: LearningFacts = {
@@ -89,7 +91,7 @@ export function learningFacts(state: LearningState, target: { conversationRef: s
   }
   for (const rule of state.rules.values()) {
     const version = rule.versions.at(-1);
-    if (version?.record.scope !== target.scope) continue;
+    if (!version) continue;
     for (const [model, counts] of [[target.model, facts.qualifications], ["*", facts.generalQualifications]] as const) {
       if (model === null || model === "*" && counts === facts.qualifications) continue;
       const qualification = version.qualifications.get(model);
@@ -147,6 +149,8 @@ function evidenceR29(value: unknown): value is EvidenceRefs {
     && refsR32(value.observations) && refsR32(value.recurrences);
 }
 function sessionsR29(sessions: string[]): Set<string> { return new Set(sessions.map(session => session.trim().toLowerCase()).filter(Boolean)); }
+// R-LRN-03: conservatively identify Windows folder labels without changing stored provenance.
+function scopeKeyR03(scope: string): string { return scope.trim().replace(/[. ]+$/, "").toLowerCase(); }
 function normalizeText(text: string): string { return text.replace(/^\uFEFF/, "").replace(/\r\n?/g, "\n").split("\n").map(line => line.trimEnd()).join("\n").replace(/\n+$/, ""); }
 export function textHash(text: string): string { return createHash("sha256").update(normalizeText(text), "utf8").digest("hex"); }
 
@@ -169,6 +173,11 @@ function secretValueR06(scheme: string | undefined, raw: string): boolean {
 }
 function rootedPathR06(text: string): boolean {
   for (const match of text.matchAll(PATH_ROOT_R06)) {
+    const slash = match.index + match[1].length;
+    const start = text.slice(0, slash).search(/[^\s,"'`;<>|]+$/u);
+    const token = start < 0 ? "" : text.slice(start).split(/[\s,"'`;<>|]/u)[0].replace(/\.$/, "");
+    // R-LRN-06: parentheses inside slash-separated words are not a path root.
+    if (/^[\p{L}\p{N}()]+(?:\/[\p{L}\p{N}()]+)+$/u.test(token)) continue;
     const rest = text.slice(match.index + match[1].length + match[2].length);
     const end = rest.search(/[,;"'`()<>|\n]|\.(?:\s|$)/);
     if (/[/\\]/.test(end < 0 ? rest : rest.slice(0, end))) return true;
@@ -219,13 +228,14 @@ export function latestModelProfile(state: LearningState, target: Pick<ModelProfi
   return modelProfileHistory(state, target).at(-1);
 }
 
-export type ModelProfileInput = Omit<ModelProfile, "at" | "opId" | "hash"> & { requestId: string };
+export type LearningSubject = "llm-orchestration" | "project" | "uncertain";
+export type ModelProfileInput = Omit<ModelProfile, "at" | "opId" | "hash"> & { requestId: string; subject: LearningSubject };
 export type CandidateInput = {
-  kind: "candidate"; requestId: string; ruleId: string; text: string; domain: LearningDomain;
+  kind: "candidate"; subject: LearningSubject; requestId: string; ruleId: string; text: string; domain: LearningDomain;
   sourceAt: string; source: { ref: string } | { url: string }; evidence: EvidenceRefs; expectHash?: string;
 } & ({ binding: "model"; model: string } | { binding: "general"; model?: never });
 export type LearningRecordInput = ModelProfileInput | CandidateInput;
-export type LearningRefusalCode = "missing-source" | "missing-date" | "invalid-date" | "invalid-source" | "unknown-model"
+export type LearningRefusalCode = "invalid-subject" | "out-of-scope" | "missing-source" | "missing-date" | "invalid-date" | "invalid-source" | "unknown-model"
   | "unresolved-alias" | "text-over-cap" | "private-content" | "unknown-field" | "unknown-reference" | "hash-conflict" | "qualification-exists" | "request-conflict";
 export type LearningAdmission = { ok: true; records: LearningRecord[] }
   | { ok: false; code: LearningRefusalCode; requirement: string; field?: string; reason: string };
@@ -245,9 +255,12 @@ function refuse(code: LearningRefusalCode, requirement: string, field?: string):
 }
 export function validateLearningInput(input: unknown): { ok: true; input: LearningRecordInput } | Extract<LearningAdmission, { ok: false }> {
   if (!objectR27(input)) return refuse("unknown-field", "R-LRN-06");
+  // R-LRN-15: reject declared project knowledge before either kind can produce records; never reflect input.
+  if (!["llm-orchestration", "project", "uncertain"].includes(input.subject as string)) return refuse("invalid-subject", "R-LRN-15");
+  if (input.subject !== "llm-orchestration") return refuse("out-of-scope", "R-LRN-15");
   const profile = input.kind === "modelProfile", requirement = profile ? "R-LRN-10" : "R-LRN-03";
-  const fields = profile ? ["kind", "requestId", "executor", "model", "sources", "strengths", "effort", "caveats"]
-    : ["kind", "requestId", "ruleId", "text", "domain", "binding", "sourceAt", "source", "evidence", "expectHash", ...(input.binding === "model" ? ["model"] : [])];
+  const fields = profile ? ["kind", "subject", "requestId", "executor", "model", "sources", "strengths", "effort", "caveats"]
+    : ["kind", "subject", "requestId", "ruleId", "text", "domain", "binding", "sourceAt", "source", "evidence", "expectHash", ...(input.binding === "model" ? ["model"] : [])];
   if ((!profile && input.kind !== "candidate") || Object.keys(input).some(key => !fields.includes(key)))
     return refuse("unknown-field", requirement);
   if (!refR32(input.requestId)) return refuse("unknown-reference", requirement, "requestId");
@@ -289,24 +302,25 @@ export function admitModelProfile(state: LearningState, input: unknown, context:
   const validated = validateLearningInput(input);
   if (!validated.ok) return validated;
   if (validated.input.kind !== "modelProfile") return refuse("unknown-field", "R-LRN-10", "kind");
-  const { requestId: _requestId, ...profile } = validated.input;
+  const { requestId: _requestId, subject: _subject, ...profile } = validated.input;
   if (!isoR28(context.at)) return refuse("invalid-date", "R-LRN-10", "at");
   if (!refR32(context.opId)) return refuse("unknown-reference", "R-LRN-10", "opId");
   const matches = (target: Pick<ModelProfile, "executor" | "model">) => target.executor === profile.executor && target.model === profile.model;
-  if (context.unresolvedModels?.some(matches)) return refuse("unresolved-alias", "R-LRN-10", "model");
+  if (profile.executor === "claude" && /^(default|haiku|sonnet|opus)(\[1m\])?$/i.test(profile.model)
+    || context.unresolvedModels?.some(matches)) return refuse("unresolved-alias", "R-LRN-10", "model");
   if (!context.knownModels.some(matches)) return refuse("unknown-model", "R-LRN-10", "model");
   const record: ModelProfile = { ...profile, at: context.at, opId: context.opId, hash: modelProfileHash(profile) };
   const existing = state.records.get(context.opId);
   if (existing && (existing.kind !== "modelProfile" || !matches(existing) || existing.hash !== record.hash))
     return refuse("request-conflict", "R-LRN-10");
-  if (modelProfileHistory(state, profile).some(prior => prior.hash === record.hash)) return { ok: true, records: [] };
+  if (existing || latestModelProfile(state, profile)?.hash === record.hash) return { ok: true, records: [] };
   return { ok: true, records: [structuredClone(record)] };
 }
 export function recordCandidate(state: LearningState, input: unknown, context: CandidateContext): LearningAdmission {
   const validated = validateLearningInput(input);
   if (!validated.ok) return validated;
   if (validated.input.kind !== "candidate") return refuse("unknown-field", "R-LRN-03", "kind");
-  const candidate = validated.input;
+  const { subject: _subject, ...candidate } = validated.input;
   if (!isoR28(context.at)) return refuse("invalid-date", "R-LRN-03", "at");
   if (!refR32(context.opId) || !scopeR32(context.scope)) return refuse("unknown-reference", "R-LRN-03");
   const model = candidate.binding === "general" ? "*" : candidate.model;
@@ -317,7 +331,7 @@ export function recordCandidate(state: LearningState, input: unknown, context: C
   if (candidate.evidence.observations.some(ref => state.records.get(ref)?.kind !== "observation")
     || candidate.evidence.recurrences.some(ref => state.records.get(ref)?.kind !== "recurrence")) return refuse("unknown-reference", "R-LRN-03", "evidence");
   const previous = latestVersion(state, candidate.ruleId), hash = textHash(candidate.text);
-  const changed = previous && (previous.record.hash !== hash || previous.record.domain !== candidate.domain || previous.record.scope !== context.scope);
+  const changed = previous && (previous.record.hash !== hash || previous.record.domain !== candidate.domain);
   if ((changed || candidate.expectHash !== undefined) && candidate.expectHash !== previous?.record.hash)
     return refuse("hash-conflict", "R-LRN-02", "expectHash");
   if (!changed && previous?.qualifications.has(model)) return refuse("qualification-exists", "R-LRN-03");
@@ -390,7 +404,39 @@ function latestVersion(state: LearningState, ruleId: string): RuleVersionState |
 function versionR28(state: LearningState, ruleId: string, hash: string): RuleVersionState | undefined {
   return state.rules.get(ruleId)?.versions.find(version => version.record.hash === hash);
 }
-function decisionFailureR29(state: LearningState, record: RecordOf<"decision">, version: RuleVersionState): string | undefined {
+function humanEvaluationR03(state: LearningState, record: RecordOf<"decision">, version: RuleVersionState, replay = false): boolean {
+  return record.evidence.observations.some(ref => {
+    const observation = state.records.get(ref);
+    return observation?.kind === "observation" && observation.type === "human-evaluation"
+      && (record.model === "*" || observation.model === record.model)
+      // R-LRN-02: legacy admission is used only to retain accepted history, never to grant current eligibility.
+      && (replay ? observation.scope === version.record.scope
+        : !!scopeKeyR03(observation.scope) && scopeKeyR03(observation.scope) === scopeKeyR03(version.record.scope)
+          && observation.refs.includes(version.record.opId));
+  });
+}
+
+function crossScopeEvidenceR03(state: LearningState, record: RecordOf<"decision">): boolean {
+  const recurrences = record.evidence.recurrences.map(ref => state.records.get(ref)).filter(
+    (observed): observed is RecordOf<"recurrence"> => observed?.kind === "recurrence"
+      && (record.model === "*" || observed.model === record.model) && observed.rule_id === record.rule_id && observed.hash === record.hash);
+  return sessionsR29(recurrences.map(record => record.sessionRef)).size >= 2
+    && new Set(recurrences.map(record => scopeKeyR03(record.scope)).filter(Boolean)).size >= 2;
+}
+
+function scopeCandidateR16(qualification: Qualification): Qualification {
+  // R-LRN-16: keep historical decisions and deadlines auditable while withholding unsupported qualifications.
+  return ["active", "quarantined", "review_due"].includes(qualification.state) && !qualification.scopeEligible
+    ? { ...qualification, state: "candidate", reason: qualification.reason ?? "rule-change-scope", scopeMigrationFrom: qualification.state } : qualification;
+}
+
+function applyScopeRuleR16(state: LearningState): void {
+  for (const rule of state.rules.values()) for (const version of rule.versions)
+    for (const [model, qualification] of version.qualifications)
+      version.qualifications.set(model, scopeCandidateR16(qualification));
+}
+
+function decisionFailureR29(state: LearningState, record: RecordOf<"decision">, version: RuleVersionState, replay = false): string | undefined {
   const qualification = version.qualifications.get(record.model);
   if (!qualification) return "R-LRN-03: target qualification missing";
   if (record.model === "*" && (record.action === "retire" || record.action === "reject") && record.by !== "user")
@@ -402,12 +448,10 @@ function decisionFailureR29(state: LearningState, record: RecordOf<"decision">, 
   switch (record.action) {
     case "promote": {
       if (qualification.state !== "candidate") return "R-LRN-03: promotion requires candidate";
-      const humanEvaluation = evidence.observations.some(ref => {
-        const observation = state.records.get(ref);
-        return observation?.kind === "observation" && observation.type === "human-evaluation"
-          && (record.model === "*" || observation.model === record.model) && observation.scope === version.record.scope;
-      });
+      const humanEvaluation = humanEvaluationR03(state, record, version) || replay && humanEvaluationR03(state, record, version, true);
       if (sessionsR29(evidence.sessions).size < 2 && !humanEvaluation) return "R-LRN-03: promotion evidence insufficient";
+      // R-LRN-16: replay retains past decisions; current admission enforces the new evidence rule.
+      if (!replay && !humanEvaluation && !crossScopeEvidenceR03(state, record)) return "R-LRN-03: two-scope recurrence evidence required";
       return undefined;
     }
     case "restore": {
@@ -416,7 +460,7 @@ function decisionFailureR29(state: LearningState, record: RecordOf<"decision">, 
       const recurrence = evidence.recurrences.some(ref => {
         const observed = state.records.get(ref);
         return observed?.kind === "recurrence" && observed.model === record.model && observed.rule_id === record.rule_id
-          && observed.hash === record.hash && observed.scope === version.record.scope;
+          && observed.hash === record.hash;
       });
       return recurrence ? undefined : "R-LRN-03: same-model recurrence required";
     }
@@ -435,9 +479,9 @@ function sameDeliveryRules(left: RecordOf<"delivery">["rules"], right: RecordOf<
   return left.length === right.length && a.size === b.size && [...a].every(pair => b.has(pair));
 }
 
-function recordFailureR28(state: LearningState, record: LearningRecord): string | undefined {
-  if (record.kind === "modelProfile") return modelProfileHistory(state, record).some(prior => prior.hash === record.hash)
-    ? "R-LRN-10: duplicate profile version" : undefined;
+function recordFailureR28(state: LearningState, record: LearningRecord, replay = false): string | undefined {
+  // R-LRN-10: distinct recorded operations can return to an earlier hash; replay preserves every version.
+  if (record.kind === "modelProfile") return undefined;
   if (record.kind === "ruleVersion") return record.expectHash !== undefined && record.expectHash !== latestVersion(state, record.rule_id)?.record.hash
     ? "R-LRN-02: expectHash mismatch" : undefined;
   if (record.kind === "observation" || record.kind === "control") return undefined;
@@ -446,15 +490,15 @@ function recordFailureR28(state: LearningState, record: LearningRecord): string 
   if (record.kind === "delivery") {
     if (record.outcome === "model-mismatch") {
       const sent = [...state.records.values()].find(prior => prior.kind === "delivery" && prior.outcome === "sent"
-        && prior.conversationRef === record.conversationRef && prior.scope === record.scope && prior.setHash === record.setHash
+        && prior.conversationRef === record.conversationRef && prior.setHash === record.setHash
         && prior.model !== record.model && sameDeliveryRules(prior.rules, record.rules));
       return sent ? undefined : "R-LRN-05: model mismatch requires the original sent delivery";
     }
     if (record.rules.some(rule => {
       const version = versionR28(state, rule.ruleId, rule.hash);
-      return version?.record.scope !== record.scope || (version.qualifications.get(record.model)?.state !== "active"
+      return !version || (version.qualifications.get(record.model)?.state !== "active"
         && version.qualifications.get("*")?.state !== "active");
-    })) return "R-LRN-05: delivery requires active target version and scope";
+    })) return "R-LRN-05: delivery requires active target version";
     return record.setHash === textHash(record.rules.map(rule => `${rule.ruleId}:${rule.hash}`).join("\n"))
       ? undefined : "R-LRN-05: delivery setHash mismatch";
   }
@@ -463,7 +507,7 @@ function recordFailureR28(state: LearningState, record: LearningRecord): string 
   switch (record.kind) {
     case "candidate": return version.qualifications.has(record.model) ? "R-LRN-03: qualification already exists" : undefined;
     case "decision": return record.expectHash !== undefined && record.expectHash !== version.record.hash
-      ? "R-LRN-02: expectHash mismatch" : decisionFailureR29(state, record, version);
+      ? "R-LRN-02: expectHash mismatch" : decisionFailureR29(state, record, version, replay);
     case "quarantine": {
       const target = version.qualifications.get(record.newModel);
       const oldState = version.qualifications.get(record.oldModel)?.state;
@@ -477,13 +521,14 @@ function recordFailureR28(state: LearningState, record: LearningRecord): string 
       return target?.state === "quarantined" && target.reviewDueAt && Date.parse(record.at) >= Date.parse(target.reviewDueAt)
         ? undefined : "R-LRN-04: quarantine deadline not reached";
     }
-    case "recurrence": return record.scope === version.record.scope ? undefined : "R-LRN-03: recurrence scope mismatch";
+    case "recurrence": return undefined;
   }
 }
 
 function inheritedR29(qualification: Qualification): Qualification {
-  // R-LRN-08: retaining conflicting imported text must not erase its pending review.
-  if (qualification.imported && qualification.state === "review_due" && qualification.reason === "import_unverified") return { ...qualification };
+  // R-LRN-08: retaining conflicting imported text must not erase its unverified origin.
+  if (qualification.imported && (qualification.state === "review_due" || qualification.state === "candidate")
+    && qualification.reason === "import_unverified") return { ...qualification };
   return qualification.state === "retired" || qualification.state === "rejected" ? { ...qualification } : { state: "candidate" };
 }
 
@@ -499,6 +544,14 @@ export function applyRecord(state: LearningState, record: LearningRecord): void 
     versionR28(state, record.rule_id, record.hash)!.qualifications.set(record.model, { state: "candidate" });
   } else if (record.kind === "decision") {
     const qualification = versionR28(state, record.rule_id, record.hash)!.qualifications.get(record.model)!;
+    if (record.action === "promote") {
+      qualification.scopeEligible = humanEvaluationR03(state, record, versionR28(state, record.rule_id, record.hash)!)
+        || crossScopeEvidenceR03(state, record);
+    } else if (record.action === "restore" && record.by === "user") {
+      qualification.scopeEligible = true;
+    }
+    delete qualification.reason;
+    delete qualification.scopeMigrationFrom;
     qualification.latestDecision = record;
     if (record.action === "promote" || record.action === "restore") {
       qualification.state = "active";
@@ -512,11 +565,12 @@ export function applyRecord(state: LearningState, record: LearningRecord): void 
     }
   } else if (record.kind === "quarantine") {
     const version = versionR28(state, record.rule_id, record.hash)!;
-    if (version.qualifications.get(record.oldModel)?.state !== "active") {
+    if (record.reason === "no-active-qualification" || version.qualifications.get(record.oldModel)?.state !== "active") {
       state.records.set(record.opId, { ...record, reason: "no-active-qualification" });
       return;
     }
-    version.qualifications.set(record.newModel, { ...version.qualifications.get(record.newModel), state: "quarantined", reviewDueAt: record.reviewDueAt });
+    version.qualifications.set(record.newModel, { ...version.qualifications.get(record.newModel), state: "quarantined", reviewDueAt: record.reviewDueAt,
+      scopeEligible: version.qualifications.get(record.oldModel)?.scopeEligible });
   } else if (record.kind === "reviewDue") {
     versionR28(state, record.rule_id, record.hash)!.qualifications.get(record.model)!.state = "review_due";
   } else if (record.kind === "import") {
@@ -544,6 +598,7 @@ export function applyRecord(state: LearningState, record: LearningRecord): void 
 
 export function applyAdmittedRecords(state: LearningState, records: LearningRecord[]): void {
   for (const record of records) applyRecord(state, structuredClone(record));
+  applyScopeRuleR16(state);
 }
 
 export function restoreState(records: Iterable<LearningRecord>): LearningState;
@@ -555,11 +610,22 @@ export function restoreState(records: Iterable<unknown>): LearningState {
     const record = restoreLearningRecord(raw);
     // R-LRN-01 R-LRN-02: bad rows and duplicate operations must remain visible as skipped records.
     if (!record) { state.skipped.push({ reason: "R-LRN-01 R-LRN-06: malformed record" }); continue; }
-    const reason = seen.has(record.opId) ? "R-LRN-01: duplicate operation" : recordFailureR28(state, record);
+    let reason = seen.has(record.opId) ? "R-LRN-01: duplicate operation" : recordFailureR28(state, record, true);
+    if (reason && !seen.has(record.opId) && (record.kind === "decision" || record.kind === "quarantine")) {
+      // R-LRN-16: validate new decisions against the projection without demoting replay's historical state.
+      const current = structuredClone(state);
+      const version = versionR28(current, record.rule_id, record.hash);
+      for (const model of record.kind === "decision" ? [record.model] : [record.oldModel, record.newModel]) {
+        const qualification = version?.qualifications.get(model);
+        if (qualification) version!.qualifications.set(model, scopeCandidateR16(qualification));
+      }
+      if (!recordFailureR28(current, record)) reason = undefined;
+    }
     if (reason) { state.skipped.push({ opId: record.opId, reason }); continue; }
     applyRecord(state, structuredClone(record));
     seen.add(record.opId);
   }
+  applyScopeRuleR16(state);
   return state;
 }
 
@@ -608,15 +674,15 @@ export function admitTransition(state: LearningState, event: LearningTransition)
   return reason ? { ok: false, reason } : { ok: true, records: [structuredClone(record)] };
 }
 
-export function selectDelivery(state: LearningState, target: { model: string; scope: string }, cap = 15): DeliverySelection {
+export function selectDelivery(state: LearningState, target: { model: string }, cap = 15): DeliverySelection {
   if (!Number.isInteger(cap) || cap < 0 || cap > 15) throw new RangeError("R-LRN-05: cap must be an integer from 0 to 15");
   const eligible: Array<DeliverySelection["rules"][number] & { promotedAt: string }> = [];
   for (const [ruleId, rule] of state.rules) {
     const version = rule.versions.at(-1)!;
     const modelQualification = version.qualifications.get(target.model);
     const qualification = modelQualification?.state === "active" ? modelQualification : version.qualifications.get("*");
-    // R-LRN-05: an older active version must not bypass the current version's qualification or scope.
-    if (qualification?.state !== "active" || version.record.scope !== target.scope) continue;
+    // R-LRN-05: an older active version must not bypass the current version's qualification.
+    if (qualification?.state !== "active") continue;
     eligible.push({ ruleId, hash: version.record.hash, text: version.record.text, domain: version.record.domain, promotedAt: qualification.promotedAt! });
   }
   const compare = (left: string, right: string) => left < right ? -1 : left > right ? 1 : 0;
