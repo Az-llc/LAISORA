@@ -12,8 +12,7 @@ export interface EventWindow {
 
 // bounded event log と webview 同期再生で同じ規則を使う。別実装にすると片方だけ直す事故が起きる。
 // 返す配列は必ず max 件以下で、かつ先頭が turn_started であるか、先頭より前に turn_started が
-// 存在しないかのどちらかになる。この不変条件が崩れると tab.ts の onAssistantTextDelta が
-// turnId 照合に失敗し、delta を全て捨てて本文が消える。
+// 存在しないかのどちらかになる。本文の受理は src/webview/tab.ts#onAssistantTextDelta が決める。
 export function windowEvents(events: NormalizedEvent[], max: number): EventWindow {
   if (max <= 0) return { events: [], droppedCount: events.length, backfilledHead: false };
   if (events.length <= max) return { events, droppedCount: 0, backfilledHead: false };

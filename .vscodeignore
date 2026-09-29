@@ -10,10 +10,11 @@ dist/probe-*
 **/*.map
 
 # 実行時に読む media だけ。README の画像は同梱しない（相対 src と data: は VS Code の拡張詳細ページが剥がす）。
-# icon.png / laisora-icon.svg は package.json、css は extension.ts / settings-panel.ts が読む
+# icon.png / laisora-icon.svg は package.json、css は extension.ts / settings-panel.ts が読み、tokens.css は main.css の @import が読む
 !media/icon.png
 !media/laisora-icon.svg
 !media/main.css
+!media/tokens.css
 !media/settings.css
 !package.json
 !package.nls.json

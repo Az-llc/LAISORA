@@ -1,12 +1,10 @@
 import type { MainTokenTotal, PlanUsage } from "../plan-usage";
 import type { RoleRunView, RoleSummaryView } from "../role-summary";
 import { derivePlanView, planStepKey } from "./plan-view";
-import { renderPlanSection, planDuration, planTokens } from "./plan-panel";
+import { renderPlanSection, planTokens } from "./plan-panel";
 import { createLoader } from "./loader";
 import { EXECUTORS } from "../orchestration-executors";
-// 状況パネル（概要 / グラフ / 分析 / 実行ログ の 4 タブ）と概要タブ・分析タブの描画。
-// 値は Host の payload（WorkModelPayload / SemanticModelPayload.timeBuckets / execLogMarks）の写しだけを描き、
-// ツール名から操作分類を起こしたり、作業を帰属させたり、時間を再計算したりはしない。
+// 分類・帰属・時間区分は Host の payload の値を描くだけで、ここで導出しない（verify-work-overview#O-1, verify-time-buckets#TB-7）。
 import type {
   HostToWebview,
   OrchestrationView,
@@ -30,7 +28,7 @@ type LlmRunStateMessage = Extract<HostToWebview, { type: "llmAnalysisRunState" }
 type LlmRunProgress = NonNullable<LlmRunStateMessage["progress"]>;
 type LlmRunFailure = NonNullable<LlmRunStateMessage["failure"]>;
 
-// tab.ts#handoffElapsedText と同じ表記規則。あちらは module-private で共有できない
+// 表記は src/webview/tab.ts#handoffElapsedText と揃える。あちらは export されていない。
 function llmElapsedText(ms: number): string {
   const total = Math.max(0, Math.round(ms / 1000));
   return total < 60 ? l10n.t("{0}s", total) : l10n.t("{0}m {1}s", Math.floor(total / 60), total % 60);
@@ -40,14 +38,13 @@ function llmElapsedText(ms: number): string {
 export type WorkViewMode = "summary" | "graph" | "analysis" | "log";
 
 const EARLIER_LIMIT = 3;
-// 状態 C（スクリプトで何も拾えなかったとき）の文言。所有者が決めた文言なので言い換えない
+// 所有者が決めた文言。言い換えない（verify-work-overview#O-83f）。
 const NO_FINDINGS_TEXT = l10n.t(
   "Script analysis found no classifiable failures and no operations matching the rule table. This does not mean LLM analysis would find no candidates either; a script can only count events that fit predefined patterns."
 );
 
-// 見出しと注記は exec-log-marks.ts の実装（FAILURE_RULES / CONVENTION_RULES）が支えられる範囲だけを言う。
-// 規則表は手選び 3 件の固定配列で、利用者の CLAUDE.md を読まない。
-// 検出の仕組みを変えたら文も直す（R-DSP-01: 実体より強い主張をしない）
+// 見出しと注記は src/exec-log-marks.ts#FAILURE_RULES と src/exec-log-marks.ts#CONVENTION_RULES が検出できる範囲を超えて主張しない。
+// 検出側を変えたら文言も直す（R-DSP-01）。
 const FINDING_SECTIONS: readonly { family: "failure" | "convention"; code: string; title: string; note: string }[] = [
   {
     family: "failure",
@@ -88,12 +85,11 @@ function sameMarks(a: readonly ExecLogMark[] | undefined, b: readonly ExecLogMar
   return a.every((m, i) => m.toolUseId === b[i].toolUseId && m.findingAnchor === b[i].findingAnchor && m.label === b[i].label);
 }
 
-// 分析の指標の色。CSS の --wa-<tone> と .wa-tone-<tone> に対応する（R-CNV-36: アクセントの濃淡は図の印だけ）
+// CSS の --wa-<tone> と .wa-tone-<tone> に対応する（R-CNV-36: アクセントの濃淡は図の印だけ）
 type ChartTone = "c1" | "c2" | "c3" | "c4" | "tool" | "unobserved";
 const MODEL_TONES: readonly ChartTone[] = ["c1", "c2", "c3"];
 const ROLE_TONES: readonly ChartTone[] = ["c1", "c2", "c3", "c4"];
 
-// 分析タブのサブタブ。既定はスクリプト分析
 type AnalysisSubtab = "script" | "ai";
 const ANALYSIS_SUBTABS: readonly AnalysisSubtab[] = ["script", "ai"];
 
@@ -103,28 +99,26 @@ export class WorkOverview {
   private readonly bodyEl: HTMLElement;
   private orchestrationEl: HTMLElement | undefined;
   private readonly analysisEl: HTMLElement;
-  // 分析の指標（TIME / ROLES / ERR）。スクリプト分析と LLM 分析の両方の上に置く
   private readonly measuredEl: HTMLElement;
-  // 描き直しで開閉を戻さない。キーは役割（other は ""）
+  // 描き直しで開閉を戻さない（verify-work-overview#O-82dm）。
   private readonly expandedRoles = new Set<string>();
   private errExpanded = false;
-  // 根拠リンクを開いた所見の anchor。描き直しで開閉を戻さない
+  // 描き直しで開閉を戻さない（verify-work-overview#O-83k）。
   private readonly expandedFindings = new Set<string>();
-  // スクリプト分析の所見（実行ログの印の飛び先。R-TAB-06）
   private readonly findingsEl: HTMLElement;
   private readonly logHeadEl: HTMLElement;
   private readonly logSumEl: HTMLElement;
-  // 第3タブの主区画（L3）と参考区画（統計分析レポート。裁定A4）を別の入れ物にする。
-  // renderAnalysisView は渡した要素を空にするので、同じ要素へ両方を描くと片方が消える
+  // renderAnalysisView は渡した要素を空にするので、l3El と referenceEl を同じ要素にしない。
   private readonly l3El: HTMLElement;
   private readonly referenceHeadEl: HTMLElement;
   private readonly referenceEl: HTMLElement;
   private readonly graph: WorkGraph;
   private readonly inspector: AgentInspector;
   private mode: WorkViewMode = "summary";
+  private visible = true;
   private payload: WorkModelPayload | undefined;
   private semanticPayload: SemanticModelPayload | undefined;
-  // true=on / false=明示off / undefined=未着（protocol.ts ConversationSnapshot.semanticView と同じ3値）
+  // 値の意味は src/protocol.ts#ConversationSnapshot の semanticView と同じ。
   private semanticView: boolean | undefined;
   private hasReferenceReport = false;
   private llmAnalysisEnabled: boolean | undefined;
@@ -137,16 +131,11 @@ export class WorkOverview {
   private readonly llmEl: HTMLElement;
   private readonly l3LlmEl: HTMLElement;
   private llmRunning = false;
-  // Host が観測した経過と、それを受け取った時点の tick 時刻。表示は前者に tick の進みを足す。
-  // 自前の時計を読まない（G-54）。受け取った時点で tick を 1 度も見ていなければ起点が無いので、
-  // 外挿せず Host の値をそのまま出す
   private llmProgress: (LlmRunProgress & { receivedAt: number | undefined }) | undefined;
   private llmFailure: LlmRunFailure | undefined;
   private llmRunLineEl: HTMLElement | undefined;
-  // Host が実行を開始しなかった理由（llmAnalysisRunState.refusal）。未実行であって失敗ではないので
-  // llmFailure とも LLM 面の attemptFailed とも別に持つ（R-ANL-11）
+  // 未実行は失敗ではないので、llmFailure にも LLM 面の attemptFailed にも混ぜない（R-ANL-11）。
   private llmRefusal: string | undefined;
-  // 要求した分析（スクリプト分析・所見からの操作）を Host が返せなかった理由（analysisFailed.reason）
   private analysisFailure: string | undefined;
   private analysisFailureEl: HTMLElement | undefined;
   private summaryDirty = false;
@@ -164,13 +153,12 @@ export class WorkOverview {
   private execLogMarks: ExecLogMark[] | undefined;
   private execLogFindings: ExecLogFindingView[] | undefined;
   private execLogFindingsEmptyLabel: string | undefined;
-  // 印を貼り終えた行。全行を毎イベント貼り直さない
   private readonly decoratedToolUseIds = new Set<string>();
-  // 要約（R-DSP-25）。undefined = 未生成（1 つ目のプロンプトを出す）。
-  // saveFailed=true = 生成できたが永続化に失敗（「保存済み」と表示してはならない — R-DSP-01）
+  // saveFailed のとき「保存済み」と表示しない（R-DSP-01, verify-work-overview#O-84c）。
   private sessionSummary: { text: string; model: string; saveFailed?: boolean } | undefined;
   private summaryRunning = false;
-  // 直近の要約実行が終えられなかった理由（sessionSummary.failure）。既存の要約は消さない（R-DSP-25）
+  private gistExpanded = false;
+  private gistResizeObserver: ResizeObserver | undefined;
   private summaryFailure: string | undefined;
 
   constructor(
@@ -180,15 +168,12 @@ export class WorkOverview {
       has(toolUseId: string): boolean;
       navigate(toolUseId: string): void;
     },
-    // サブタブ切替の通知。setMode の先頭（隠す前）で呼び、返った関数を applyMode の後（当て直し）に呼ぶ。
-    // スクロール位置の退避・復元は tab.ts の責務（R-TAB-06）
+    // prev の面を隠す前に呼び、返した関数は next の面を出した後に呼ぶ。src/webview/tab.ts#Tab の switchWorkViewScroll がこの順序で位置を退避・復元する。
     private readonly onWorkViewChange?: (prev: WorkViewMode, next: WorkViewMode) => (() => void) | void,
-    // 往復の行から会話面の該当ターンへ飛ぶ導線。飛び先が無い行にはボタンを出さない
     private readonly conversation?: {
       has(turnId: string): boolean;
       navigate(turnId: string): void;
     },
-    // グラフの窓が #logs の可視帯を測り、行の増減で scrollTop を補正する口（tab.ts が用意する）
     private readonly graphScrollPort?: GraphScrollPort,
     private readonly onAnalysisSubChange?: () => void,
     private readonly onModeApplied?: (moveFocus: boolean) => void,
@@ -206,7 +191,7 @@ export class WorkOverview {
     this.rootEl.append(this.coverageEl, this.bodyEl);
 
     this.analysisEl = document.createElement("div");
-    // analysis-view は分析レポート内部（表・findings等）の既存スタイルを効かせるため
+    // `analysis-view` は renderAnalysisView が描く中身の CSS を効かせるために要る。
     this.analysisEl.className = "work-analysis analysis-view";
     this.analysisEl.id = `wa-panel-${this.tabId}`;
     this.analysisEl.setAttribute("role", "tabpanel");
@@ -219,9 +204,8 @@ export class WorkOverview {
     this.referenceHeadEl = span("l3-reference-head", l10n.t("Reference: statistical analysis ("));
     this.referenceHeadEl.append(termSpan("Baseline"), document.createTextNode(l10n.t(" comparison)")));
     this.referenceEl = div("l3-reference");
-    this.referenceEl.appendChild(span("wo-empty", l10n.t("Statistical analysis has not been run yet (use the Analyze button in the history panel 🕘).")));
+    this.referenceEl.appendChild(span("wo-empty", l10n.t("Statistical analysis has not been run yet.")));
     this.syncReferenceVisibility();
-    // 分析の指標の下にサブタブ 2 枚。同時に見えるのは片方だけ
     this.subSwitchEl = document.createElement("div");
     this.subSwitchEl.className = "wa-tabs";
     this.subSwitchEl.setAttribute("role", "tablist");
@@ -240,13 +224,11 @@ export class WorkOverview {
     this.llmEl.setAttribute("aria-labelledby", this.subTabs.ai.id);
     this.subSwitchEl.append(this.subTabs.script, this.subTabs.ai);
     this.scriptEl.append(this.findingsEl, this.l3El);
-    // 分析の入口は「LLM 分析を実行」1 個だけで、LLM 分析側の先頭（af-llm-section の先頭・R-ANL-11）。
-    // 結果は必ずその下に生えるので、押した位置から読み始められる（R-ANL-12）
+    // 実行ボタンを描く l3LlmEl を先頭に置き、結果をボタンの下へ伸ばす（R-ANL-11, R-ANL-12, verify-work-overview#O-71b）。
     this.llmEl.append(this.l3LlmEl, this.referenceHeadEl, this.referenceEl);
     this.analysisEl.append(this.measuredEl, this.subSwitchEl, this.scriptEl, this.llmEl);
     this.applyAnalysisSub();
 
-    // 実行ログの上部にまとめ（指摘 N 件）を置く容器。行は tab.ts が組むので、ここは印の集計だけ
     this.logHeadEl = div("wl-head");
     this.logSumEl = div("wl-sum");
     this.logHeadEl.appendChild(this.logSumEl);
@@ -255,7 +237,7 @@ export class WorkOverview {
     this.inspector = new AgentInspector(this.tabId, () => this.graph.onInspectorClosed());
     this.graph = new WorkGraph(this.tabId, this.inspector, this.graphScrollPort);
 
-    // 検査が DOM 経由で直接呼ぶ外部駆動点。本番の印は updateSemantic が渡す
+    // 本番からは呼ばれない。検査の駆動点で、外すと verify-work-overview#O-63 が落ちる。
     (this.rootEl as HTMLElement & { laisoraSetExecLogMarks?: (marks: ExecLogMark[] | undefined) => void })
       .laisoraSetExecLogMarks = (marks) => this.setExecLogMarks(marks);
   }
@@ -306,8 +288,7 @@ export class WorkOverview {
   }
 
 
-  // 作業ログの先頭へ差し込む。tab.ts は workEl へ append し続けるので、切替は
-  // 「自分の要素以外を hidden にする」形にする
+  // src/webview/tab.ts が workEl へ行を足し続けるので、applyMode は自前の要素以外を隠す形で切り替える。
   mount(): void {
     this.workEl.insertBefore(this.logHeadEl, this.workEl.firstChild);
     this.workEl.insertBefore(this.rootEl, this.logHeadEl.nextSibling);
@@ -316,15 +297,14 @@ export class WorkOverview {
     this.applyMode();
   }
 
-  // 値が同じでも描き直す。webview はボタン押下時に局所的に「分析中…」へ切り替えるため、
-  // Host の running:false（拒否時を含む）を捨てるとボタンが張り付いたままになる
+  // 値が同じでも描き直す。押下時に画面側だけで実行中表示へ切り替えているので、捨てるとボタンが戻らない（verify-webview-wiring#D6-5b）。
   setLlmRunning(running: boolean, progress?: LlmRunProgress, failure?: LlmRunFailure, refusal?: string): void {
     this.llmRunning = running;
     if (running) {
       this.llmFailure = undefined;
       this.llmRefusal = undefined;
       this.analysisFailure = undefined;
-      // receivedAt は進捗行の経過表示専用。TimeBucketView / nowMs() へ渡さない（TB-7 がこの行と読み手の集合を固定）
+      // receivedAt は進捗行の経過表示専用。nowMs と TimeBucketView へ渡さない（verify-time-buckets#TB-7b）。
       if (progress !== undefined) this.llmProgress = { ...progress, receivedAt: Date.now() };
     } else {
       this.llmProgress = undefined;
@@ -335,8 +315,6 @@ export class WorkOverview {
     if (this.mode === "analysis") this.renderAnalysisPanel();
   }
 
-  // 要求した分析を Host が返せなかった理由を、結果が出るはずだった LLM 分析側の区画に出す。
-  // 既存の結果は消さない。次の実行開始（setLlmRunning(true)）か次の結果（setAnalysis）で消える
   showAnalysisFailure(reason: string): void {
     this.analysisFailure = reason;
     this.setAnalysisSub("ai");
@@ -345,12 +323,9 @@ export class WorkOverview {
     this.renderAnalysisPanel();
   }
 
-  // live=true の行だけを読み上げ対象にする。進行の行は 1 秒ごとに書き替わるので、
-  // 読み上げ対象にすると秒が変わるたびに読み上げが走る。
-  // place="tail" は不可用の一般文言（llm-report.ts が組み立て llm-action-view.ts が描く）の
-  // 後ろへ回すため。実行ボタンの隣に置くと、見出しより先に詳細が出る
+  // 進捗の行は tick のたびに書き替わるので live にしない。live にすると書き替えのたびに読み上げが走る。
+  // tail は src/webview/llm-action-view.ts#renderLlmActionView が描く不可用の一般文言の後ろへ置くため。実行ボタンの隣だと見出しより先に詳細が出る。
   private llmRunLineText(): { text: string; live: boolean; place: "run" | "tail" } | null {
-    // 未実行は実行ボタンの隣に理由だけを出す。結果面（attemptFailed / unavailable）は触らない
     if (this.llmRefusal !== undefined) {
       return { live: true, place: "run", text: l10n.t("Not run: {0}", this.llmRefusal) };
     }
@@ -387,6 +362,7 @@ export class WorkOverview {
     }
     const progress = this.llmProgress;
     if (progress === undefined) return null;
+    // lastTickMs が未着なら外挿の起点が無いので、Host の elapsedMs をそのまま出す。自前の時計で補わない（verify-time-buckets#TB-7c）。
     const since =
       progress.receivedAt === undefined || this.lastTickMs === undefined
         ? 0
@@ -401,9 +377,8 @@ export class WorkOverview {
   }
 
   // renderAnalysisFactsView が l3LlmEl を空にするので、受信時に足さず描き直しのたびに足す。
-  // 置き場の探索に querySelector を使わないのは、クラス選択子の字面が
-  // check-protocol-guards S5-T2-D4（概要が LLM 面を名指ししない）の的に誤って当たるため。
-  // D4 はコメントも数えるので、この注記自体もその字面を書けない
+  // 置き場を querySelector で探さない。クラス選択子の字面が check-protocol-guards の S5-T2-D4 に当たる。
+  // S5-T2-D4 はコメントも数えるので、このファイルのコメントにもその字面を書かない。
   private renderLlmRunLine(): void {
     this.llmRunLineEl?.remove();
     this.llmRunLineEl = undefined;
@@ -418,7 +393,7 @@ export class WorkOverview {
     this.llmRunLineEl = el;
   }
 
-  // renderAnalysisFactsView が l3LlmEl を空にするので、描き直しのたびに足す（renderLlmRunLine と同じ理由）
+  // renderLlmRunLine と同じ理由で、描き直しのたびに足す。
   private renderAnalysisFailureLine(): void {
     this.analysisFailureEl?.remove();
     this.analysisFailureEl = undefined;
@@ -435,8 +410,7 @@ export class WorkOverview {
     this.setActive(state !== "idle");
   }
 
-  // 「動いている」はタブのドットと同じ述語（ターン中・バックグラウンド・サブエージェントのみ、を含む）。
-  // turnState だけで決めると、サブエージェントだけが動いている間に「終了」と出る（R-SES-02 / R-DSP-20）
+  // running はタブのドットと同じ src/webview/tab.ts#Tab の isActive で決まる。setTurnState のターン状態だけでは決めない（R-SES-02 / R-DSP-20）。
   setActive(running: boolean): void {
     if (this.turnRunning === running) return;
     this.turnRunning = running;
@@ -467,12 +441,10 @@ export class WorkOverview {
     }
   }
 
-  // 分析レポートの保持キーは sessionId（裁定A2: resume 後も引き継ぐ）。report の貯蔵は
-  // main.ts の sessionId キー Map が持ち、ここは「いま表示している1件」だけを描く
+  // レポートは src/webview/main.ts#analysisReports が sessionId ごとに保持する。ここへ溜めない。
   setAnalysis(sessionId: string, filePath: string, report: AnalysisReport): void {
     this.hasReferenceReport = true;
     this.analysisEl.dataset.sessionId = sessionId;
-    // 新しい結果が届いたので、前回の要求の失敗理由は消す
     this.analysisFailure = undefined;
     this.renderAnalysisFailureLine();
     renderAnalysisView(this.referenceEl, sessionId, filePath, report);
@@ -481,7 +453,6 @@ export class WorkOverview {
 
   showAnalysis(sessionId: string, filePath: string, report: AnalysisReport): void {
     this.setAnalysis(sessionId, filePath, report);
-    // 結果はボタンの下（LLM 分析側）に生える。押した先が見える側へ切り替える（R-ANL-12）
     this.setAnalysisSub("ai");
     this.setMode("analysis");
   }
@@ -502,7 +473,7 @@ export class WorkOverview {
       blockId: block.blockId, text: block.text, start: block.start, end: block.end, running: this.turnRunning,
     } : undefined);
     const view = derivePlanView(this.payload, this.planOrchestration, this.planUsage, this.lastTickMs ?? 0, context);
-    // R-DSP-20: semantic snapshots can predate completion; only legacy payloads need their NOW fallback.
+    // R-DSP-20: semantic の写しは完了より古いことがあるので、planTools を持たない payload のときだけ NOW を補う（verify-work-overview#O-BG-2）。
     for (const agent of time?.agents ?? []) {
       if (this.payload?.planTools !== undefined) continue;
       if (!agent.open || !this.turnRunning) continue;
@@ -520,10 +491,10 @@ export class WorkOverview {
     renderPlanSection(this.planSection, view);
   }
 
-  // 分析面は payload を読まない（ERR の件数は semanticModel.failureSummary）。
-  // ここで分析面を描き直すと 120ms ごとに開いた内訳が閉じる
+  // ここから分析面を描き直さない。分析面は payload を読まず、payload は src/session-semantic.ts#WORK_MODEL_POST_INTERVAL_MS ごとに届くので、開いた内訳が閉じる。
   update(payload: WorkModelPayload | undefined): void {
     this.payload = payload;
+    this.renderExecLogSummary();
     this.summaryDirty = true;
     if (this.mode === "summary") this.render();
     this.graph.update(payload);
@@ -532,10 +503,8 @@ export class WorkOverview {
   updateSemantic(model: SemanticModelPayload | undefined, semanticView?: boolean): void {
     const previous = this.activeSemantic();
     const active = semanticView === false ? undefined : model;
-    // 履歴 backfill 中は coverage だけを差し替えた shallow copy が何度も届く。
-    // 分析面が読む入力の参照がすべて同じなら、結果 DOM を捨てて描き直さない。
-    // Host から新しい semanticModel が届く場合は structured clone により各参照が変わるため、
-    // 同じ revision でも新しい分析入力を取りこぼさない。
+    // 履歴 backfill 中は coverage だけを差し替えた shallow copy が何度も届くので、分析入力の参照が同じなら描き直さない。
+    // Host からの semanticModel は postMessage の structured clone で参照が変わるので取りこぼさない（verify-work-overview#O-86）。
     const shallowAnalysisChanged =
       previous?.timeBuckets !== active?.timeBuckets ||
       previous?.roleSummary !== active?.roleSummary ||
@@ -551,6 +520,7 @@ export class WorkOverview {
     this.execLogFindings = active?.execLogFindings;
     this.execLogFindingsEmptyLabel = active?.execLogFindingsEmptyLabel;
     this.setExecLogMarks(active?.execLogMarks);
+    this.renderExecLogSummary();
     const evidenceChanged = this.analysisEvidenceKey() !== this.renderedAnalysisEvidenceKey;
     if (this.renderedAnalysisValueKey === undefined) {
       this.l3Dirty = true;
@@ -564,7 +534,6 @@ export class WorkOverview {
     this.graph.updateSemantic(model, semanticView);
   }
 
-  // 実行ログの印（R-TAB-06）。印は Host の producer（exec-log-marks.ts）が作る。ここでは行へ貼り、まとめを出すだけ
   setExecLogMarks(marks: ExecLogMark[] | undefined): void {
     if (sameMarks(this.execLogMarks, marks)) return;
     this.execLogMarks = marks;
@@ -575,6 +544,12 @@ export class WorkOverview {
       if (this.mode === "analysis") this.renderAnalysisPanel();
     }
     if (this.mode === "summary") this.render();
+  }
+
+  // src/webview/tab.ts#Tab の setViewMode は setMode を通らずに作業面を離れるので、ここでも graph の可視を更新する（R-DSP-45, verify-work-graph-scale#GS-8）。
+  setVisible(visible: boolean): void {
+    this.visible = visible;
+    this.graph.setVisible(visible && this.mode === "graph");
   }
 
   setMode(mode: WorkViewMode, moveFocus = false): void {
@@ -589,7 +564,7 @@ export class WorkOverview {
     if (typeof after === "function") after();
   }
 
-  // tab.ts が新しい詳細行を append したあとに呼ぶ。呼ばないと概要表示のまま新着だけが見える
+  // src/webview/tab.ts が workEl へ行を足した後に呼ぶ。呼ばないと足した行が実行ログ以外の面にも見える。
   syncVisibility(): void {
     for (const row of Array.from(this.bodyEl.querySelectorAll<HTMLButtonElement>(".earlier-row"))) {
       const turns: string[] = JSON.parse(row.dataset.turnIds ?? "[]");
@@ -603,7 +578,6 @@ export class WorkOverview {
     }
   }
 
-  // #logs の scroll（main.ts）から。グラフ以外を見ている間は渡さない
   onPortScroll(): void {
     if (this.mode !== "graph") return;
     this.graph.onPortScroll();
@@ -614,8 +588,6 @@ export class WorkOverview {
     this.graph.tick(nowMs);
     if (this.mode === "summary") this.renderPlan();
     if (this.mode === "summary" && this.turnRunning) this.refreshLive(nowMs);
-    // 進行中だけ描き直す。終端の便で llmProgress を落としているので、終端の後は
-    // 何度 tick が来ても「分析中…」は復活しない
     if (this.mode === "analysis" && this.llmProgress !== undefined) this.renderLlmRunLine();
   }
 
@@ -639,7 +611,7 @@ export class WorkOverview {
     }
     this.rootEl.hidden = this.mode !== "summary";
     this.graph.rootEl.hidden = this.mode !== "graph";
-    this.graph.setVisible(this.mode === "graph");
+    this.graph.setVisible(this.visible && this.mode === "graph");
     if (this.mode !== "graph" && this.inspector.isOpen()) this.inspector.close();
     this.analysisEl.hidden = this.mode !== "analysis";
     this.logHeadEl.hidden = this.mode !== "log" || this.logSumEl.childElementCount === 0;
@@ -650,7 +622,6 @@ export class WorkOverview {
     }
   }
 
-  // semanticView=false（明示off）は render() と同じ扱いで L3 を出さない
   private activeL3(): SemanticModelPayload["l3"] {
     return (this.semanticView === false ? undefined : this.semanticPayload)?.l3;
   }
@@ -668,8 +639,8 @@ export class WorkOverview {
     this.captureAnalysisKeys();
   }
 
-  // 分析面の描画入力だけを比較する。coverage は概要・グラフの表示入力であり、分析入力ではない。
-  // toolEvidence は同じ payload のまま履歴 backfill で利用可能性が変わるので、参照とは別に含める。
+  // coverage を入れない。履歴 backfill の coverage だけの更新で分析結果を描き直さない（verify-work-overview#O-86）。
+  // toolEvidence の可否は payload が同じまま変わるので analysisEvidenceKey が別に持つ。
   private analysisValueKey(): string {
     const semantic = this.activeSemantic();
     return JSON.stringify([
@@ -717,8 +688,6 @@ export class WorkOverview {
     this.renderedAnalysisEvidenceKey = this.analysisEvidenceKey();
   }
 
-  // 3値: l3 未着（導出前 / 導出失敗 / semantic 明示off）と、値が unavailable と、
-  // 値が observed を区別する。未着では区画を出さず参考区画（統計分析）の表示のままにする（裁定A4）
   private renderL3(): void {
     this.l3Dirty = false;
     const l3 = this.activeL3();
@@ -754,8 +723,7 @@ export class WorkOverview {
     return this.semanticView === false ? undefined : this.semanticPayload;
   }
 
-  // 値・並び・百分率は Host が決めた形のまま描く。null は測れていない値なので何も描かない
-  // （0 や — で埋めると「無かった」を主張する。R-DSP-11）
+  // 値・並び・百分率は Host の値のまま描き、集計・丸め・並べ替えを足さない（verify-work-overview#O-82s）。
   private renderMeasured(): void {
     const head = this.measuredEl;
     head.textContent = "";
@@ -785,11 +753,11 @@ export class WorkOverview {
     return mod;
   }
 
-  // 本体だけ（委任は ROLES）。輪の区切りは Host の百分率を CSS の calc で積むだけで、ここで比を計算しない
+  // 輪の区切りは Host の百分率を CSS の calc で積む。ここで比を計算しない（verify-work-overview#O-82s）。
   private renderTimeModule(view: TimeBucketView | undefined, tokens: MainTokenTotal | null): HTMLElement | null {
     if (view === undefined || view.firstAt === null || view.lastAt === null) return null;
     const mod = this.metricsModule("time", "TIME", l10n.t("Main processing time"));
-    // isTimeBucketsPayload は mainByModel の欠落（旧 payload）を通す
+    // src/protocol.ts#isTimeBucketsPayload は mainByModel の欠落を通す。
     const byModel = view.mainByModel ?? null;
     const totalMs = byModel !== null ? byModel.totalMs : view.bars.mainMs;
     const totalText = totalMs === null ? l10n.t("Not measured") : formatDuration(totalMs);
@@ -840,6 +808,9 @@ export class WorkOverview {
     };
     wait("Waiting for reply", view.main.replyMs);
     wait("Waiting for your answer", view.main.confirmMs);
+    const subOnly = span("wa-fx-i", l10n.t("Subagent only {0}", view.main.subOnlyMs == null ? l10n.t("Not measured") : formatDuration(view.main.subOnlyMs)));
+    subOnly.dataset.fact = "sub-only";
+    facts.appendChild(subOnly);
     legend.appendChild(facts);
     const body = div("wa-tm");
     body.append(ring, legend);
@@ -847,7 +818,7 @@ export class WorkOverview {
     return mod;
   }
 
-  // R-ANL-23: 役割は Host が記録から決めたもの。委任が無ければ区画ごと出さない
+  // R-ANL-23: 役割・省略したサブエージェント・外部実行の記録のどれも無いときだけモジュールを出さない。
   private renderRolesModule(summary: RoleSummaryView | undefined): HTMLElement | null {
     if (summary === undefined || (summary.roles.length === 0 && summary.omittedSubagentCount === 0 && summary.externalRunsCoverage === undefined)) return null;
     const mod = this.metricsModule("roles", "ROLES", l10n.t("By delegated role (press a row for its runs)"));
@@ -895,7 +866,7 @@ export class WorkOverview {
     if (summary.omittedSubagentCount > 0) {
       mod.appendChild(div("wa-note")).textContent = l10n.t("{0} subagents folded into the summary are not listed", summary.omittedSubagentCount);
     }
-    // R-ANL-24 / R-DSP-01: 読めなかった記録があるとき、一覧を外部実行の全件として出さない
+    // R-ANL-24 / R-DSP-01: 読めなかった記録があるとき、一覧を外部実行の全件として見せない（verify-work-overview#O-82um）。
     const external = summary.externalRunsCoverage;
     if (external !== undefined) {
       mod.appendChild(div("wa-note wa-note-external")).textContent = external.readError
@@ -905,8 +876,7 @@ export class WorkOverview {
     return mod;
   }
 
-  // R-DSP-03: 実行中を含む合計はまだ増える。終わった実行に測れていないものを含む合計は測れた分の和
-  // ローダーは行に 1 つ（時間の側）。トークン側にも置くと同じ印が左右に並ぶ
+  // R-DSP-03: ローダーは実行中だけ、withLoader の側だけに出す（verify-work-overview#O-82p, verify-work-overview#O-82pk）。
   private roleTotal(className: string, text: string | null, partial: boolean, running: boolean, withLoader: boolean): HTMLElement {
     const el = span(className, "");
     if (text === null) return el;
@@ -949,7 +919,7 @@ export class WorkOverview {
     return track;
   }
 
-  // 要求値（観測していない値）は「要求」を添えて実測と区別する（R-ANL-23）
+  // R-ANL-23: モデルと effort は modelSource / effortSource が requested のとき要求値の印を付けて出す。
   private renderRoleRun(run: RoleRunView): HTMLElement {
     const row = div("wa-ri");
     const dot = span(`wa-dot wa-tone-${ROLE_TONES[run.shade] ?? "c4"}`, "");
@@ -977,14 +947,14 @@ export class WorkOverview {
     return row;
   }
 
-  // R-DSP-11: 測れていない実行の値は 0 にせず — で示す
+  // R-DSP-11: 測れていない値を 0 で描かない（verify-work-overview#O-82c）。
   private unmeasuredCell(): HTMLElement {
     const el = span("wa-v wa-unmeasured", "—");
     el.title = l10n.t("Not measured");
     return el;
   }
 
-  // R-DSP-40: 上位 3 種と残りの分割・並びは Host が決める
+  // R-DSP-40: top と rest の分割・並びは src/exec-log-marks.ts#deriveFailureSummary が決める。
   private renderErrModule(summary: FailureSummaryView | undefined): HTMLElement | null {
     if (summary === undefined) return null;
     const mod = this.metricsModule("err", "ERR", l10n.t("Failures"));
@@ -1030,7 +1000,8 @@ export class WorkOverview {
     return mod;
   }
 
-  // スクリプト分析の所見（実行ログの印の飛び先。R-TAB-06）。今回の件数だけを出す。累計は数えていないので出さない（R-DSP-11）
+  // スクリプト分析の所見。この行の書き出しは verify-work-overview#O-82s が指標の区間の終端として探す。
+  // 累計は数えていないので出さない（R-DSP-11）。
   private renderFindings(): void {
     const box = this.findingsEl;
     box.textContent = "";
@@ -1060,7 +1031,7 @@ export class WorkOverview {
       head.append(label, headEl);
       section.setAttribute("aria-labelledby", head.id);
       section.appendChild(head);
-      // R-DSP-10: 印が 0 件の family も見出しを残し、Host の「該当なし」を置く
+      // R-DSP-10: 印の無い family も見出しを残す（verify-work-overview#O-83Em）。
       if (rows.length === 0) {
         if (this.execLogFindingsEmptyLabel !== undefined) section.appendChild(div("wa-fsec-empty")).textContent = this.execLogFindingsEmptyLabel;
       } else {
@@ -1072,7 +1043,7 @@ export class WorkOverview {
     }
   }
 
-  // 番号・件数の単位・根拠の開閉の文言・リンクの #n は Host（exec-log-marks.ts）が組んだ値をそのまま置く
+  // 番号・単位・開閉の文言・リンクの序数は Host の値を置き、webview で作らない（verify-work-overview#O-83h, verify-work-overview#O-83i）。
   private renderFindingRows(list: HTMLElement, findings: readonly ExecLogFindingView[]): void {
     for (const f of findings) {
       const row = document.createElement("article");
@@ -1082,7 +1053,7 @@ export class WorkOverview {
       row.tabIndex = -1;
       row.appendChild(div("llm-finding-num llm-finding-digits wa-find-num")).textContent = f.numberDigits;
       const body = div("llm-finding-body");
-      // 行の主語は観測した事象。直す先は候補として添える（R-DSP-01）。置き場所のタグ（category）は出さない
+      // 直す先は候補として添える（R-DSP-01, verify-work-overview#O-83d）。category を出さない（verify-work-overview#O-83n）。
       body.appendChild(div("llm-finding-title wa-find-n")).textContent = f.label;
       if (f.fixCandidate !== undefined) {
         const fix = document.createElement("p");
@@ -1138,7 +1109,6 @@ export class WorkOverview {
     }
   }
 
-  // 実行ログの印から分析タブの所見へ。確認は出さない
   private revealFinding(anchor: string): void {
     this.onViewChange(() => {
       this.setMode("analysis", true);
@@ -1169,9 +1139,7 @@ export class WorkOverview {
     }
     const group = this.orchestrationEl;
     group.replaceChildren();
-    const heading = document.createElement("h3");
-    heading.className = "wo-flow-h";
-    heading.textContent = l10n.t("Agent roster");
+    const heading = this.summaryCode(l10n.t("ROSTER"), l10n.t("Agent roster"));
     group.appendChild(heading);
     if (state.settingsChanged) { // R-ORC-21
       const notice = div("wo-note orchestration-notice");
@@ -1179,8 +1147,8 @@ export class WorkOverview {
       notice.textContent = l10n.t("Orchestration settings changed. They apply from the next session; this conversation keeps its starting roster.");
       group.appendChild(notice);
     }
-    const conductor = div("orchestration-conductor");
-    conductor.appendChild(span("wi-kind", l10n.t("Conductor (main thread)")));
+    const conductor = div("orchestration-conductor orchestration-row");
+    conductor.append(span("orchestration-kind", l10n.t("CONDUCTOR")), span("orchestration-name", l10n.t("Main thread")));
     group.appendChild(conductor);
     const unknown = l10n.t("unknown");
     const list = (title: string, kind: string): HTMLUListElement => {
@@ -1191,49 +1159,57 @@ export class WorkOverview {
       rows.className = "wo-list";
       rows.dataset.orchestrationList = kind;
       rows.setAttribute("aria-label", title);
-      group.append(label, rows);
+      if (kind !== "runs") group.appendChild(label); // R-DSP-51
+      group.appendChild(rows);
       return rows;
     };
-    const row = (rows: HTMLElement, title: string, detail: string, badge: string): HTMLElement => {
+    const row = (rows: HTMLElement, title: string, detail: string, badge: string, numbers = ""): HTMLElement => {
       const entry = document.createElement("li");
-      entry.append(span("wi-kind", badge), document.createTextNode(" "), span("wo-it-t", title), span("wo-note", detail));
+      entry.className = "orchestration-row";
+      const name = span("orchestration-name", "");
+      title.split(/( → | · |-|:)/).forEach((part, index) => {
+        name.appendChild(span("orchestration-name-part", part));
+        if (index % 2 === 1) name.appendChild(document.createElement("wbr"));
+      });
+      entry.append(span("orchestration-kind", badge), name, span("orchestration-model", detail), span("orchestration-numbers", numbers));
       rows.appendChild(entry);
       return entry;
     };
     const usageLabels: Record<string, string> = {
-      input_tokens: l10n.t("Input tokens"), output_tokens: l10n.t("Output tokens"),
-      cached_input_tokens: l10n.t("Cached input tokens"), reasoning_output_tokens: l10n.t("Reasoning output tokens"),
-      cache_read_input_tokens: l10n.t("Cache read input tokens"), cache_creation_input_tokens: l10n.t("Cache creation input tokens"),
-      total_tokens: l10n.t("Total tokens"), thinking_tokens: l10n.t("Thinking tokens"), cache_read_tokens: l10n.t("Cache read tokens"),
+      input_tokens: l10n.t("Input"), output_tokens: l10n.t("Output"),
+      cached_input_tokens: l10n.t("Cached input"), reasoning_output_tokens: l10n.t("Reasoning output"),
+      cache_read_input_tokens: l10n.t("Cache read"), cache_creation_input_tokens: l10n.t("Cache write"),
+      total_tokens: l10n.t("Total"), thinking_tokens: l10n.t("Thinking"), cache_read_tokens: l10n.t("Cache read"),
     };
     const usage = (value: OrchestrationView["agents"][number]["usage"]): string => value === null ? unknown
-      : Object.entries(value).map(([key, count]) => `${usageLabels[key]}: ${count}`).join(" · ");
-    const children = list(l10n.t("Observed agents"), "agents");
+      : Object.entries(value).map(([key, count]) => `${usageLabels[key]} ${planTokens(count)}`).join(" · ");
+    const children = list(l10n.t("Observed executions"), "agents");
     const recentAgents = [...state.agents].sort((a, b) => b.lastActivityAt.localeCompare(a.lastActivityAt)).slice(0, 50); // R-ORC-23
     for (const agent of recentAgents) {
       const appliedModel = agent.model ?? unknown; // R-ORC-22
       const appliedEffort = agent.effort ?? unknown; // R-ORC-22
       const entry = row(children, agent.role ?? agent.agentType ?? unknown,
-        l10n.t("Applied Model: {0} · Applied Effort: {1}", appliedModel, appliedEffort), l10n.t("Child agent"));
-      entry.appendChild(span("wo-note", l10n.t("First seen: {0} · Last activity: {1} · Tokens: {2}",
-        formatDateTime(Date.parse(agent.firstSeenAt)), formatDateTime(Date.parse(agent.lastActivityAt)), usage(agent.usage))));
+        l10n.t("Applied {0} · {1}", appliedModel, appliedEffort), l10n.t("AGENT"));
+      const numbers = entry.querySelector<HTMLElement>(".orchestration-numbers")!;
+      numbers.textContent = `${clock(Date.parse(agent.firstSeenAt))} – ${clock(Date.parse(agent.lastActivityAt))} · ${usage(agent.usage)}`;
     }
     const externalRuns = list(l10n.t("External runs"), "runs");
     const recentRuns = [...state.runs].sort((a, b) => b.startedAt.localeCompare(a.startedAt)).slice(0, 50); // R-ORC-23
     for (const run of recentRuns) {
       const outcome = run.outcome === "ok" ? l10n.t("Succeeded") : run.outcome === "failed" ? l10n.t("Failed")
         : run.outcome === "timeout" ? l10n.t("Timed out") : l10n.t("Refused");
-      row(externalRuns, `${run.role} · ${EXECUTORS[run.executor].displayName}${run.model ? ` · ${run.model}` : ""}${run.effort ? ` · ${run.effort}` : ""}`, l10n.t("{0} · Duration: {1} · Tokens: {2}",
-        outcome, formatDuration(run.durationMs), usage(run.usage)) + (run.cwd ? ` ? ${run.cwd}` : ""), l10n.t("External executor"));
+      const entry = row(externalRuns, `${run.role} · ${EXECUTORS[run.executor].displayName}`,
+        `${run.model ?? unknown} · ${run.effort ?? unknown}`, l10n.t("EXTERNAL"), `${outcome} · ${this.hudDuration(run.durationMs).textContent} · ${usage(run.usage)}` + (run.cwd ? ` · ${run.cwd}` : ""));
+      if (run.outcome === "failed" || run.outcome === "timeout") entry.querySelector(".orchestration-numbers")!.classList.add("l-failure");
     }
     const requested = list(l10n.t("Starting roster (requested settings)"), "roster");
     for (const member of state.roster.agents) {
       row(requested, `${member.role} → ${member.agentKey}`,
-        l10n.t("Requested Model: {0} · Requested Effort: {1}", member.model, member.effort ?? unknown), l10n.t("Child agent"));
+        l10n.t("Requested {0} · {1}", member.model, member.effort ?? unknown), l10n.t("AGENT"));
     }
     for (const member of state.roster.external) {
       row(requested, `${member.role} → ${EXECUTORS[member.executor].displayName}`,
-        l10n.t("Requested Model: {0} · Requested Effort: {1}", member.model ?? unknown, member.effort ?? unknown), l10n.t("External executor"));
+        l10n.t("Requested {0} · {1}", member.model ?? unknown, member.effort ?? unknown), l10n.t("EXTERNAL"));
     }
   }
 
@@ -1241,6 +1217,7 @@ export class WorkOverview {
     this.summaryDirty = false;
     this.rootEl.dataset.renderCount = String(++this.summaryRenderCount);
     this.coverageEl.textContent = "";
+    this.gistResizeObserver?.disconnect();
     this.bodyEl.textContent = "";
     const semantic = this.activeSemantic();
     const payload = this.payload;
@@ -1260,13 +1237,13 @@ export class WorkOverview {
     const tasks = payload?.tasks ?? [];
     const hasFlow = view !== undefined && view.blocks.length > 0;
     if (!hasFlow && tasks.length === 0 && (payload === undefined || this.totalToolCount(payload) === 0)) {
-      // 中身が無い区画は骨組みごと出さない。無いときは 1 行で済ませる（R-DSP-05）
+      // R-DSP-05: 作業が無いときは NO_WORK_SUMMARY_TEXT で済ませ、renderHead / renderHud の空の足場を描かない。
       this.bodyEl.appendChild(span("wo-empty", NO_WORK_SUMMARY_TEXT));
       this.bodyEl.appendChild(this.renderPlanYou(view));
       return;
     }
     this.bodyEl.appendChild(this.renderHead(semantic, view));
-    this.bodyEl.appendChild(this.renderCards(view, payload));
+    this.bodyEl.appendChild(this.renderHud(view, semantic));
     this.bodyEl.appendChild(this.renderPlanYou(view));
   }
 
@@ -1274,8 +1251,10 @@ export class WorkOverview {
     this.coverageEl.dataset.coverageSummary = coverage.summary;
     this.coverageEl.dataset.coverageDetails = coverage.details;
     this.coverageEl.dataset.phaseHistory = coverage.phaseHistory;
-    for (const row of coverageRows(coverage, timeBuckets)) {
-      const el = span("wo-coverage-row", row.text);
+    const rows = coverageRows(coverage, timeBuckets);
+    if (rows.length) this.coverageEl.appendChild(this.summaryCode("COV", l10n.t("Coverage scope")));
+    for (const row of rows) {
+      const el = span("wo-coverage-row", row.factsText ?? row.text);
       el.dataset.coverageScope = row.scope;
       if (row.state !== undefined) el.dataset.state = row.state;
       if (row.detail !== undefined) el.title = row.detail;
@@ -1301,50 +1280,46 @@ export class WorkOverview {
     return undefined;
   }
 
-  // ヘッダ: 開始日時 / 経過 / 1 つ目のプロンプト（R-DSP-19 / R-DSP-02）
   private renderHead(semantic: SemanticModelPayload | undefined, view: TimeBucketView | undefined): HTMLElement {
     const head = div("wo-head");
-    const when = div("wo-when");
-    if (view !== undefined && view.firstAt !== null && view.lastAt !== null) {
-      const start = document.createElement("b");
-      start.textContent = formatDateTime(view.firstAt);
-      when.append(start, document.createTextNode(l10n.t(" started ")));
-      if (this.turnRunning) {
-        const elapsed = document.createElement("b");
-        elapsed.dataset.liveElapsed = "session";
-        elapsed.dataset.start = String(view.firstAt);
-        elapsed.textContent = formatDuration((this.nowMs(view) ?? view.lastAt) - view.firstAt);
-        when.append(document.createTextNode(`${l10n.t("Elapsed")} `), elapsed, document.createTextNode(l10n.t(" (running)")));
-      } else {
-        const elapsed = document.createElement("b");
-        // 起点が継承時刻なら経過を数字にしない（R-DSP-11）
-        elapsed.textContent = view.spanMs === null ? l10n.t("Not measured") : formatDuration(view.spanMs);
-        when.append(document.createTextNode(l10n.t("{0} finished, elapsed ", formatDateTime(view.lastAt))), elapsed);
-      }
-      head.appendChild(when);
-      head.appendChild(this.renderSessionBand(view));
+    const code = this.summaryCode(l10n.t("SUMMARY"), l10n.t("Session summary"));
+    if (!this.turnRunning && view?.firstAt != null && view.lastAt != null) { // R-DSP-19
+      code.appendChild(span("wo-code-right wo-head-range", `${clock(view.firstAt)} – ${clock(view.lastAt)}`));
     }
-    // 値が 1 つ目のプロンプトそのものでないなら「1 つ目のプロンプト」と名乗らせない（R-DSP-02 / R-DSP-01）。
-    // Goal title（1 行目 200 字）を代用しない。要約が保存済みならそれで置き換え、出所（要約: モデル名）を添える（R-DSP-25）
+    head.appendChild(code);
+    // firstPromptText 以外の値に「1 つ目のプロンプト」と名乗らせない（R-DSP-02 / R-DSP-01, verify-work-overview#O-50b）。
+    // 要約があれば置き換え、モデル名を添える（R-DSP-25）。
     const firstPrompt = semantic?.firstPromptText;
     const summary = this.sessionSummary;
     if ((firstPrompt !== undefined && firstPrompt.length > 0) || summary !== undefined) {
       const gist = div("wo-gist");
-      const text = div("wo-gist-t wo-raw");
+      const text = div("wo-gist-t");
+      text.lang = document.documentElement.lang;
       text.textContent = summary?.text ?? firstPrompt ?? "";
-      if (summary !== undefined && firstPrompt !== undefined && firstPrompt.length > 0) {
-        text.title = l10n.t("First prompt: {0}", firstPrompt.length > 300 ? `${firstPrompt.slice(0, 299)}…` : firstPrompt);
-      }
-      gist.appendChild(text);
-      gist.appendChild(this.buildSummaryButton(summary !== undefined));
+      text.id = `wo-gist-${this.tabId}`;
+      const expand = document.createElement("button");
+      expand.type = "button";
+      expand.className = "wo-gist-expand";
+      expand.hidden = true;
+      expand.setAttribute("aria-controls", text.id);
+      const syncExpand = () => {
+        expand.setAttribute("aria-expanded", String(this.gistExpanded));
+        expand.textContent = this.gistExpanded ? l10n.t("Show less") : l10n.t("Show full text");
+        text.classList.toggle("expanded", this.gistExpanded);
+      };
+      syncExpand();
+      this.observeGistOverflow(text, expand, syncExpand);
+      expand.onclick = () => { this.gistExpanded = !this.gistExpanded; syncExpand(); };
+      const line = div("wo-gist-line");
+      const source = div("wo-gist-n");
+      source.textContent = summary !== undefined
+        ? summary.saveFailed === true
+          ? l10n.t("Summary: {0} — could not be saved (retry)", summary.model)
+          : l10n.t("Summary: {0} (saved)", summary.model)
+        : l10n.t("First prompt");
+      line.append(source, this.buildSummaryButton(summary !== undefined));
+      gist.append(line, text, expand);
       head.appendChild(gist);
-      // 保存に失敗した要約を「保存済み」と表示しない（R-DSP-01）。再試行は「作り直す」ボタン
-      head.appendChild(div("wo-gist-n")).textContent =
-        summary !== undefined
-          ? summary.saveFailed === true
-            ? l10n.t("Summary: {0} — could not be saved (retry)", summary.model)
-            : l10n.t("Summary: {0} (saved)", summary.model)
-          : l10n.t("First prompt");
     }
     if (this.summaryFailure !== undefined) {
       const failed = div("wo-gist-err");
@@ -1355,8 +1330,21 @@ export class WorkOverview {
     return head;
   }
 
-  // 要約ボタン（R-DSP-25）。tooltip でトークン消費を明示する（R-ANL-07）。
-  // 押した瞬間に実行中表現へ切り替え、復帰は Host の sessionSummary（running:false）による再描画
+  private observeGistOverflow(text: HTMLElement, expand: HTMLButtonElement, syncExpand: () => void): void {
+    this.gistResizeObserver?.disconnect();
+    this.gistResizeObserver = new ResizeObserver(() => {
+      if (!text.isConnected || text.clientWidth === 0) return;
+      // Measure the collapsed layout even while open, then restore it before paint.
+      text.classList.remove("expanded");
+      const overflows = text.scrollHeight > text.clientHeight;
+      if (!overflows) this.gistExpanded = false;
+      expand.hidden = !overflows;
+      syncExpand();
+    });
+    this.gistResizeObserver.observe(text);
+  }
+
+  // R-DSP-25 / R-ANL-07。押下時の実行中表示は summaryRunning に入れないので、どの再描画でも元へ戻る。
   private buildSummaryButton(hasSummary: boolean): HTMLButtonElement {
     const btn = document.createElement("button");
     btn.type = "button";
@@ -1392,102 +1380,146 @@ export class WorkOverview {
     if (summary !== undefined) {
       this.sessionSummary = saveFailed ? { ...summary, saveFailed: true } : summary;
     }
-    // 失敗理由は終了の便にだけ載る。開始（running）で消し、summary は上のとおり触らない（R-DSP-25）
+    // 失敗の便で既存の要約を消さない（R-DSP-25）。
     this.summaryFailure = running ? undefined : failure;
     this.summaryDirty = true;
     if (this.mode === "summary") this.render();
   }
 
-  // 4 区分と棒 3 本の帯（R-DSP-19。グラフの右パネルから移設）。値は Host の TimeBucketView を
-  // そのまま描き、継承時刻の値（null）は「未測定」（R-DSP-11）
-  private renderSessionBand(view: TimeBucketView): HTMLElement {
-    const band = div("wo-band");
-    const buckets = div("wo-buckets");
-    const item = (term: TermKey | Node, value: number | null, bucket: string) => {
-      const el = span("wo-bk", "");
-      el.dataset.bucket = bucket;
-      el.append(typeof term === "string" ? termSpan(term) : term, document.createTextNode(" "), span("wo-bk-v", value === null ? l10n.t("Not measured") : formatDuration(value)));
-      buckets.appendChild(el);
-    };
-    item("LLM generation", view.main.generateMs, "generate");
-    item("Tool execution", view.main.toolMs, "tool");
-    item("Waiting for your answer", view.main.confirmMs, "confirm");
-    item("Waiting for reply", view.main.replyMs, "reply");
-    if (view.main.subOnlyMs !== null && view.main.subOnlyMs > 0) item(document.createTextNode(l10n.t("Subagent only")), view.main.subOnlyMs, "sub-only");
-    band.append(buckets, this.renderBars(view));
-    return band;
+  private summaryCode(code: string, subtitle: string): HTMLElement {
+    const line = div("wo-code");
+    line.append(span("wo-code-label", code), span("", subtitle));
+    return line;
   }
 
-  // R-DSP-17: 合計 / メイン / サブエージェント の 3 本を同一目盛りに並べる。返信待ちは棒に入れない
-  private renderBars(view: TimeBucketView): HTMLElement {
-    const box = div("wo-bars");
-    // data-bar は言語に依らない識別子（main.css の色分けが引く）。表示名は用語表のキーか翻訳済み文字列
-    const bars: [string, Node, number | null][] = [
-      ["total", document.createTextNode(l10n.t("Total")), view.bars.totalMs],
-      ["main", document.createTextNode(l10n.t("Main")), view.bars.mainMs],
-      ["subagent", termSpan("Subagent"), view.bars.subMs],
-    ];
-    const max = Math.max(1, ...bars.map(([, , v]) => v ?? 0));
-    for (const [id, label, value] of bars) {
-      const rowEl = div("wo-bar-row");
-      rowEl.dataset.bar = id;
-      const name = span("wo-bar-l", "");
-      name.appendChild(label);
-      const track = span("wo-bar-t", "");
-      const fill = span("wo-bar-f", "");
-      // 実測できていない棒を 0 幅で描かない。0 は「無かった」を主張する（R-DSP-01）
-      if (value === null) {
-        fill.classList.add("unmeasured");
-      } else {
-        fill.style.width = `${Math.round(value / max * 1000) / 10}%`;
-        fill.dataset.ms = String(value);
+  private hudGroup(mode: "graph" | "analysis", code: string, subtitle: string, title: string): HTMLButtonElement {
+    const group = document.createElement("button");
+    group.type = "button";
+    group.className = "wo-hud-group";
+    group.dataset.pane = mode;
+    group.title = title;
+    const line = this.summaryCode(code, subtitle);
+    line.appendChild(span("wo-code-right", "›"));
+    group.appendChild(line);
+    group.onclick = () => this.onViewChange(() => this.setMode(mode, true));
+    return group;
+  }
+
+  private hudFigure(id: string, label: string, value: string | HTMLElement, small = false): HTMLElement {
+    const figure = div(`wo-hud-figure${small ? " wo-hud-small" : ""}`);
+    figure.dataset.figure = id;
+    figure.append(span("wo-hud-key", label), typeof value === "string" ? span("wo-hud-value", value) : value);
+    return figure;
+  }
+
+  private hudDuration(ms: number | null | undefined): HTMLElement {
+    const value = span("wo-hud-value wo-hud-duration", "");
+    if (ms === null || ms === undefined) { // R-DSP-11
+      value.textContent = "—";
+      value.title = l10n.t("Not measured");
+      return value;
+    }
+    const seconds = Math.round(Math.max(0, ms) / 1000);
+    const minutes = Math.floor(seconds / 60);
+    const parts: [number, string][] = minutes >= 60
+      ? [[Math.floor(minutes / 60), l10n.t("h")], [minutes % 60, l10n.t("m")]]
+      : [[minutes, l10n.t("m")], [seconds % 60, l10n.t("s")]];
+    for (const [number, unit] of parts) {
+      const small = document.createElement("small");
+      small.textContent = unit;
+      value.append(String(number).padStart(value.childNodes.length ? 2 : 1, "0"), small);
+    }
+    return value;
+  }
+
+  private renderHud(view: TimeBucketView | undefined, semantic: SemanticModelPayload | undefined): HTMLElement {
+    const hud = div("wo-hud");
+    const graph = this.hudGroup("graph", l10n.t("03 GRAPH"), l10n.t("Time"), l10n.t("Open GRAPH (time breakdown and parallelism)"));
+    const figures = div("wo-hud-figures");
+    const elapsed = this.hudDuration(view?.spanMs);
+    if (this.turnRunning && view?.spanMs !== null && view?.firstAt != null) {
+      elapsed.dataset.liveElapsed = "session";
+      elapsed.dataset.start = String(view.firstAt);
+      elapsed.replaceChildren(...Array.from(this.hudDuration((this.nowMs(view) ?? view.lastAt ?? view.firstAt) - view.firstAt).childNodes));
+    }
+    figures.append(this.hudFigure("elapsed", l10n.t("Elapsed"), elapsed),
+      this.hudFigure("processing", l10n.t("Processing"), this.hudDuration(view?.bars.totalMs)),
+      this.hudFigure("parallel", this.turnRunning ? l10n.t("Parallelism") : l10n.t("Maximum parallelism"),
+        view ? String(this.turnRunning ? view.currentParallel : view.maxConcurrency) : "—", true));
+    graph.appendChild(figures);
+    const duration = (ms: number | null) => ms === null ? l10n.t("Not measured") : formatDuration(ms);
+    const swatch = (tone: string) => span(`wo-hud-swatch wo-hud-${tone}`, "");
+    if (view) {
+      const split = div("wo-hud-split");
+      if (view.bars.mainMs !== null && view.bars.subMs !== null) {
+        for (const [tone, ms] of [["main", view.bars.mainMs], ["sub", view.bars.subMs]] as const) {
+          const part = span(`wo-hud-${tone}`, "");
+          part.style.flex = `${ms} 1 0`;
+          split.appendChild(part);
+        }
       }
-      track.appendChild(fill);
-      rowEl.append(name, track, span("wo-bar-v", value === null ? l10n.t("Not measured") : formatDuration(value)));
-      box.appendChild(rowEl);
+      const legend = div("wo-hud-note");
+      legend.append(swatch("main"), l10n.t("Main {0}", duration(view.bars.mainMs)), "　",
+        swatch("sub"), l10n.t("Subagent {0}", duration(view.bars.subMs)));
+      const strip = div("wo-hud-strip");
+      view.blocks.forEach((block) => {
+        const row = div(`wo-hud-request${block.running && this.turnRunning ? " current" : ""}`);
+        row.style.flex = `${block.durationMs ?? 1} 1 0`;
+        const bar = div("wo-hud-request-bar");
+        const processing = block.processingMs ?? null;
+        if (block.strip != null) {
+          for (const [tone, percent] of [["main", block.strip.processingPercent], ["wait", block.strip.replyPercent], ["remainder", block.strip.remainderPercent]] as const) {
+            const part = span(`wo-hud-${tone}`, "");
+            part.style.width = `${percent}%`;
+            bar.appendChild(part);
+          }
+        }
+        const number = block.requestNumber ?? "—";
+        row.title = `${number} ${block.text.split(/\r?\n/, 1)[0]}\n${l10n.t("Processing {0} · Waiting for reply {1}", duration(processing), duration(block.replyMs))}`;
+        row.append(bar, span("wo-hud-request-number", number));
+        strip.appendChild(row);
+      });
+      const waits = div("wo-hud-note");
+      waits.append(swatch("main"), l10n.t("Processing per request"), "　", swatch("wait"), l10n.t("Waiting for reply {0}", duration(view.main.replyMs)));
+      graph.append(split, legend, strip, waits);
     }
-    return box;
+    hud.append(graph, this.renderSummaryAnalysis(semantic?.summaryAnalysis));
+    return hud;
   }
 
-  // 数値タイル。ラベル左・値中央・区切り線。副題は置かない。
-  // 現在値は並列数の 1 枚だけ。他の 4 枚はセッション累計なので、行の見出しで「現在」を名乗らない
-  private renderCards(view: TimeBucketView | undefined, payload: WorkModelPayload | undefined): HTMLElement {
-    const cards = div("wo-cards");
-    // ラベルと値は別の行（div 2 段）。span にすると
-    // 「並列数2」のように 1 行へ潰れる（O-64 が y 座標で固定）
-    const card = (id: string, label: string, value: number, tone?: "hot" | "quiet") => {
-      const c = div(`wo-card${tone !== undefined ? ` wo-${tone}` : ""}`);
-      c.dataset.card = id;
-      const t = div("wo-card-t");
-      t.textContent = label;
-      const v = div("wo-card-v");
-      v.textContent = String(value);
-      c.append(t, v);
-      cards.appendChild(c);
-      return c;
+  private renderSummaryAnalysis(view: SemanticModelPayload["summaryAnalysis"]): HTMLElement {
+    const group = this.hudGroup("analysis", l10n.t("04 ANALYSIS"), l10n.t("Analysis"), l10n.t("Open ANALYSIS (improvement candidates)"));
+    const figures = div("wo-hud-figures");
+    const count = (n: number | null | undefined) => n == null ? "—" : String(n);
+    figures.append(this.hudFigure("improvable", view?.llmState === "current" ? l10n.t("Improvement candidates") : l10n.t("Improvement candidates (script analysis only)"), count(view?.improvableCount)),
+      this.hudFigure("script", l10n.t("Script analysis findings"), count(view?.scriptFindingCount), true));
+    if (view?.llmState === "current") figures.appendChild(this.hudFigure("llm", l10n.t("LLM analysis findings"), count(view.llmFindingCount), true));
+    const breakdown = div("wo-hud-breakdown");
+    const row = (label: string, n: number | null, percent: number | null) => {
+      const item = div("wo-hud-breakdown-row");
+      item.title = label;
+      const track = span("wo-hud-track", "");
+      const fill = span("wo-hud-fill", "");
+      if (percent !== null) fill.style.width = `${percent}%`;
+      track.appendChild(fill);
+      item.append(span("wo-hud-breakdown-label", label), track, span("wo-hud-count", count(n)));
+      breakdown.appendChild(item);
     };
-    if (view !== undefined) {
-      // 並列数は常に現在値（終了セッションは 0）。実行状態で最大値へ切り替えない
-      const parallel = view.currentParallel;
-      const parallelCard = card("parallel", l10n.t("Current parallelism"), parallel, parallel === 0 ? "quiet" : undefined);
-      // ● が点くのは現在値のタイルだけ。実行中でなければ点けない（R-DSP-06）
-      if (this.turnRunning) parallelCard.querySelector(".wo-card-t")?.prepend(span("wo-live-dot", ""));
-      card("agents", l10n.t("Agents"), view.agentCount, view.agentCount === 0 ? "quiet" : undefined);
-    }
-    // 検出器が無い間は「スクリプト分析」タイルを出さない。常に 0 のタイルは
-    // 「分からないもの」を並べ立てることになる（R-DSP-10）
-    if (this.execLogMarks !== undefined) {
-      const anchored = this.execLogMarks.filter((m) => m.findingAnchor !== undefined).length;
-      card("marks", l10n.t("Script analysis"), anchored, anchored > 0 ? "hot" : "quiet");
-    }
-    if (payload !== undefined) {
-      const fails = this.totalFailCount(payload);
-      card("fails", l10n.t("Failed executions"), fails, fails > 0 ? "hot" : "quiet");
-      card("tools", l10n.t("Tool Executions"), this.totalToolCount(payload));
-    }
-    const box = div("wo-kpi");
-    box.appendChild(cards);
-    return box;
+    breakdown.appendChild(span("wo-hud-breakdown-head", l10n.t("Script analysis · Findings with candidates")));
+    row(l10n.t("With candidates (of {0} total)", count(view?.scriptFindingCount)), view?.scriptCandidateCount ?? null, view?.scriptCandidatePercent ?? null);
+    breakdown.appendChild(span("wo-hud-breakdown-head", view?.llmState === "current"
+      ? l10n.t("LLM analysis · {0} · By improvement area · Rejected {1}", view.generatedAtLabel ?? "—", count(view.rejectedCount))
+      : l10n.t("LLM Analysis")));
+    const executionText = view?.llmExecutionState === "running" ? l10n.t("LLM analysis running")
+      : view?.llmExecutionState === "attemptFailed" ? l10n.t("LLM analysis failed")
+      : view?.llmExecutionState === "disabled" ? l10n.t("LLM analysis disabled") : undefined;
+    if (executionText) breakdown.appendChild(span("wo-hud-status", executionText));
+    for (const area of view?.llmAreas ?? []) row(area.label, area.count, area.percent);
+    if (view?.llmState !== "current") breakdown.appendChild(span("wo-hud-none", view === undefined ? l10n.t("Not measured") : view.llmState === "stale"
+      ? l10n.t("Results are out of date · Run again to see counts by improvement area")
+      : executionText ? l10n.t("Counts unavailable") : l10n.t("Not run · Run to see counts by improvement area")));
+    group.append(figures, breakdown);
+    return group;
   }
 
   private renderPlanYou(view: TimeBucketView | undefined): HTMLElement {
@@ -1501,7 +1533,7 @@ export class WorkOverview {
     const blocks = [...(view?.blocks ?? [])].reverse();
     const heading = document.createElement("h3");
     heading.className = "earlier-label";
-    heading.textContent = `EARLIER REQUESTS · ${blocks.length}`;
+    heading.textContent = l10n.t("EARLIER REQUESTS {0} requests", blocks.length);
     earlier.append(heading);
     if (this.payload?.planHistoryTruncated) earlier.append(span("plan-lede earlier-partial", l10n.t("Some earlier request details are unavailable.")));
     if (!blocks.length) earlier.append(span("earlier-empty", l10n.t("No earlier requests available.")));
@@ -1516,22 +1548,27 @@ export class WorkOverview {
       const at = span("earlier-at", block.anchorAt > 0 ? `${monthDay(block.anchorAt)} ${clock(block.anchorAt)}` : "—");
       at.title = formatDateTime(block.anchorAt);
       const history = this.payload?.planHistory?.filter(entry => entry.kind === "todos" && entry.at >= block.start && (entry.at < block.end || block === view?.blocks.at(-1) && entry.at === block.end));
-      // R-DSP-34: 手順数は宣言（kind "todos"）だけ。委任の再開（kind "resume"）は宣言ではないので数えない。同一性は PLAN と同じ planStepKey
+      // R-DSP-34: 手順は宣言の履歴だけから数え、同一性は PLAN と同じ planStepKey で決める（verify-work-overview#O-EARLIER-stepsm）。
       const steps = new Set(history?.flatMap(entry => entry.kind === "todos" ? entry.items.map(item => planStepKey(entry, item)) : []));
       const count = history?.length ? String(steps.size) : "—";
       const usage = this.planUsage?.blocks.find(value => value.blockId === block.blockId);
-      const elapsed = span("earlier-elapsed", planDuration(block.durationMs));
+      const elapsed = span("earlier-elapsed", block.durationMs === null ? "—" : formatDuration(block.durationMs));
       if (block.durationMs !== null && block.running && this.turnRunning) {
         elapsed.dataset.liveElapsed = "block";
         elapsed.dataset.start = String(block.start);
-        elapsed.textContent = planDuration(Math.max(block.durationMs, (this.nowMs(view) ?? block.end) - block.start));
+        elapsed.textContent = formatDuration(Math.max(block.durationMs, (this.nowMs(view) ?? block.end) - block.start));
       }
-      const stats = span("earlier-stats", `${l10n.t("{0} steps", count)} · `);
-      stats.append(elapsed, document.createTextNode(` · ${planTokens(usage?.slices.length ? usage.tokens : null)}`));
+      const stats = span("earlier-stats", "");
+      stats.append(at, ` · ${l10n.t("{0} steps", count)} · ${l10n.t("{0} tokens", planTokens(usage?.slices.length ? usage.tokens : null))}`);
+      const duration = span("earlier-duration", "");
+      if (block.running && this.turnRunning) duration.append(l10n.t("Running"), " ");
+      duration.appendChild(elapsed);
       stats.title = l10n.t("Claude tokens. Cache read: {0}", planTokens(usage?.slices.length ? usage.cacheRead : null));
       const title = span("earlier-title", block.text.split(/\r?\n/, 1)[0]);
       if (/[\u3040-\u30ff\u3400-\u9fff]/.test(title.textContent ?? "")) title.lang = "ja";
-      row.append(at, title, stats);
+      const number = span("earlier-number", block.requestNumber ?? "—");
+      if (block.running && this.turnRunning) number.classList.add("current");
+      row.append(number, title, duration, stats);
       row.onclick = () => {
         const turn = block.turnIds.find(id => this.conversation?.has(id));
         if (turn) this.conversation?.navigate(turn);
@@ -1561,39 +1598,40 @@ export class WorkOverview {
     for (const el of Array.from(this.rootEl.querySelectorAll<HTMLElement>("[data-live-elapsed]"))) {
       const start = Number(el.dataset.start);
       if (Number.isFinite(start) && nowMs > start) {
-        if (el.dataset.liveElapsed === "bg") {
+        if (el.classList.contains("wo-hud-duration")) {
+          el.replaceChildren(...Array.from(this.hudDuration(nowMs - start).childNodes));
+        } else if (el.dataset.liveElapsed === "bg") {
           el.textContent = l10n.t("· Elapsed {0}", formatDuration(nowMs - start));
         } else {
-          el.textContent = el.classList.contains("earlier-elapsed") ? planDuration(nowMs - start) : formatDuration(nowMs - start);
+          el.textContent = formatDuration(nowMs - start);
         }
       }
     }
   }
 
-  // 実行ログの行に印を貼る（R-TAB-06）。行は tab.ts が data-tool-use-id を付けて組む。
-  // full=true は印の集合が変わったとき（貼り直し）、false は行が増えたとき（未処理の行にだけ貼る）
+  // R-TAB-06。行と data-tool-use-id は src/webview/tab.ts が組む。
   private decorateExecLog(full: boolean): void {
     if (full) {
       for (const old of Array.from(this.workEl.querySelectorAll<HTMLElement>(".wl-tag"))) old.remove();
-      for (const row of Array.from(this.workEl.querySelectorAll<HTMLElement>(".tool-row.wl-flag, .tool-row.wl-fail"))) {
+      for (const row of Array.from(this.workEl.querySelectorAll<HTMLElement>(".wl-flag, .wl-fail"))) {
         row.classList.remove("wl-flag", "wl-fail");
       }
       this.decoratedToolUseIds.clear();
     }
     const marks = this.execLogMarks ?? [];
     for (const mark of marks) {
-      // 「失敗（分類なし）」には印を付けない。押しても分析タブに飛び先が無い（R-TAB-06）
+      // findingAnchor の無い印は分析タブに飛び先が無いので貼らない（R-TAB-06, verify-work-overview#O-63b）。
       const anchor = mark.findingAnchor;
       if (anchor === undefined) continue;
       if (this.decoratedToolUseIds.has(`${mark.toolUseId}|${anchor}`)) continue;
-      const row = this.workEl.querySelector<HTMLElement>(`.tool-row[data-tool-use-id="${CSS.escape(mark.toolUseId)}"]`);
+      const row = this.workEl.querySelector<HTMLElement>(`:is(.tool-row, .agent-card)[data-tool-use-id="${CSS.escape(mark.toolUseId)}"]`);
       if (row === null) continue;
       this.decoratedToolUseIds.add(`${mark.toolUseId}|${anchor}`);
       row.classList.add(mark.family === "failure" ? "wl-fail" : "wl-flag");
       const tag = div("wl-tag");
       const button = document.createElement("button");
       button.type = "button";
-      button.textContent = mark.label;
+      button.append(span("wl-tag-code", l10n.t("Flag")), " ", span("wl-tag-label", mark.label), ` ${mark.ordinalLabel ?? ""} `, span("wl-tag-target", l10n.t("→ ANALYSIS")));
       button.dataset.findingAnchor = anchor;
       button.onclick = (event) => {
         event.preventDefault();
@@ -1601,38 +1639,48 @@ export class WorkOverview {
         this.revealFinding(anchor);
       };
       tag.appendChild(button);
-      // 印は summary の中。行の本文へ置くと、行を閉じたままでは見えない（R-TAB-06）
+      // 行の本文へ置くと、行を閉じたままでは見えない（R-TAB-06, verify-work-overview#O-72e）。
       const summary = row.querySelector<HTMLElement>(":scope > summary");
       (summary !== null ? summary : row).appendChild(tag);
     }
     this.renderExecLogSummary();
   }
 
-  // 上部のまとめ（指摘 N 件 ＋ 種類別）。数えるのは Host が載せた印の全件で、
-  // 画面に貼れた行の数ではない。裏読みの途中は行が揃っていないので、行から数えると部分集合になる（R-TAB-07）
+  // R-TAB-07: totalToolCount; totalFailCount; execLogMarks; renderExecLogSummary
   private renderExecLogSummary(): void {
     this.logSumEl.textContent = "";
+    const line = div("wl-code");
+    line.append(span("l-label", l10n.t("LOG")), span("", l10n.t("Execution record")));
+    if (this.payload?.coverage.summary === "complete") {
+      const agents = this.payload.phases.reduce((total, phase) => total + phase.agentCount, 0);
+      line.appendChild(span("wl-totals", l10n.t("Tools {0} calls · Failures {1} · Subagents {2}", this.totalToolCount(this.payload), this.totalFailCount(this.payload), agents)));
+    }
+    this.logSumEl.appendChild(line);
     const anchored = (this.execLogMarks ?? []).filter((m) => m.findingAnchor !== undefined);
-    const total = anchored.length;
-    if (total > 0) {
-      this.logSumEl.appendChild(span("wl-sum-n", l10n.t("{0} flagged", total)));
-      const byAnchor = new Map<string, { label: string; count: number }>();
+    if (anchored.length > 0) {
+      const flags = div("wl-flags");
+      const code = div("wl-code");
+      code.append(span("l-label", l10n.t("FLAGS")), span("wl-sum-n", l10n.t("Flags {0}", anchored.length)));
+      flags.appendChild(code);
+      const byAnchor = new Map<string, { label: string; count: number; failure: boolean }>();
       for (const mark of anchored) {
         const anchor = mark.findingAnchor!;
-        const cur = byAnchor.get(anchor) ?? { label: mark.label, count: 0 };
+        const cur = byAnchor.get(anchor) ?? { label: mark.label, count: 0, failure: mark.family === "failure" };
         cur.count++;
         byAnchor.set(anchor, cur);
       }
-      for (const [anchor, { label, count }] of byAnchor) {
+      for (const [anchor, { label, count, failure }] of byAnchor) {
         const chip = document.createElement("button");
         chip.type = "button";
         chip.className = "wl-chip";
-        chip.textContent = `${label} ${count}`;
+        if (failure) chip.append(span("l-failure", "✗ "));
+        chip.append(span("wl-tag-label", label), span("wl-flag-count", String(count)), " ›");
         chip.dataset.findingAnchor = anchor;
         chip.onclick = () => this.revealFinding(anchor);
-        this.logSumEl.appendChild(chip);
+        flags.appendChild(chip);
       }
+      this.logSumEl.appendChild(flags);
     }
-    this.logHeadEl.hidden = this.mode !== "log" || total === 0;
+    this.logHeadEl.hidden = this.mode !== "log";
   }
 }

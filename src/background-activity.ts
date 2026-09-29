@@ -28,7 +28,7 @@ export interface BackgroundActivityState {
   // 完了か再開を既に観測した task id。遡りの古い完了は、これより新しい観測が無い id にだけ効かせる
   lifecycleSeenIds: Set<string>;
   // key = 委任の toolUseId。ターン境界で消さない: background 委任は turn_completed の後も動き続ける（R-SES-02）。
-  // 回収は turn_interrupted / turn_failed / conversation_closed / conversation_opened だけ
+  // 回収の条件は applyActivityEvent が決める
   delegations: Map<string, DelegationEntry>;
 }
 
@@ -152,7 +152,8 @@ export function applyActivityEvent(state: BackgroundActivityState, ev: Normalize
       }
       break;
     case "tool_call_finished": {
-      // 裁定A2: 起動 ACK は完了ではない。background 委任を閉じるのは task-notification だけ。
+      // 裁定A2: 起動 ACK は完了ではない。background 委任を閉じるのは task-notification と、
+      // work reducer が stale と確定した id（src/work-model.ts#settlePendingStale）。
       // 裁定A1: SendMessage の resumedAgentId は同じ委任が再び動き出した観測
       const d = state.delegations.get(ev.toolUseId);
       if (d !== undefined) {
@@ -193,6 +194,14 @@ export function applyActivityEvent(state: BackgroundActivityState, ev: Normalize
       changed = clearProcessActivity(state);
       break;
   }
+  // R-SES-11: use the reducer's stale judgement, including turn-start recovery.
+  for (const toolUseId of ev.work?.staled ?? []) {
+    const delegation = state.delegations.get(toolUseId);
+    if (delegation?.running) {
+      delegation.running = false;
+      changed = true;
+    }
+  }
   enforceCaps(state);
   return changed;
 }
@@ -228,4 +237,10 @@ export function liveBackgroundTasks(state: BackgroundActivityState): BackgroundT
 export function hasRunningDelegation(state: BackgroundActivityState): boolean {
   for (const d of state.delegations.values()) if (d.running) return true;
   return false;
+}
+
+export function runningDelegationIds(state: BackgroundActivityState): string[] {
+  const ids: string[] = [];
+  for (const [toolUseId, d] of state.delegations) if (d.running) ids.push(toolUseId);
+  return ids;
 }

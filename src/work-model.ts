@@ -1,14 +1,14 @@
+import type { ToolIntentInput } from "./webview/status-line";
 import type { NormalizedEvent } from "./protocol.js";
 import * as l10n from "@vscode/l10n";
 import { isRequestMessageText } from "./time-buckets";
+import { isPureCommandWrapper } from "./human-input-vocabulary";
 import { parseMarkdown } from "./webview/markdown-ast";
 import { findCommitBoundary, recordSeparator } from "./webview/commit-boundary";
 
 export const MAX_PHASES = 256;
 
-// 上限に達したときに捨ててよいのは詳細（segment・agent記録・turn/segment参照・task記録・
-// 未終了ツールの配置）だけで、件数・失敗数・経過時間・tokens・running/stale は必ず
-// phase / rollup の集計（WorkTotals）へ残す。捨てたことは coverage へ出す。
+// WorkTotals; startRequest; reconcileRequestCommands; src/protocol.ts#projectWorkModel
 const MAX_SEGMENTS = 512;
 const MAX_PHASE_REFS = 64;
 const MAX_PHASE_AGENTS = 64;
@@ -125,6 +125,7 @@ export interface WorkTask {
 }
 
 export interface WorkAgent {
+  runStartedAt?: number;
   agentId: string;
   transcriptAgentId?: string;
   parentAgentId: string | null;
@@ -210,6 +211,8 @@ export type TaskIntent =
 // 一切参照しない。agent の running/stale はこの記録が正本で、
 // phase 側の agent 記録が退避されていても集計を戻せる
 export interface WorkTool {
+  requestIndex?: number;
+  intentInput?: ToolIntentInput;
   toolUseId: string;
   parentToolUseId: string | null;
   toolName: string;
@@ -256,6 +259,10 @@ export interface ToolPlacementIndex {
 }
 
 export interface WorkModelState {
+  requests?: WorkRequestTotals[];
+  requestOffset?: number;
+  requestByTurn?: Record<string, number>;
+  requestHeadline?: { turnId: string | null; text: string };
   planDeclaration?: { goal: string; at: number };
   planBoundaryAt?: number;
   planText?: { turnId: string; text: string; declaredThrough: number; recordEnded?: true };
@@ -295,6 +302,94 @@ export interface WorkModelState {
 }
 
 export type WorkModel = WorkModelState;
+export interface WorkRequestTotals {
+  incomplete?: true;
+  turnIds: string[];
+  number: string;
+  command?: string;
+  cliInserted?: boolean;
+  toolCount: number;
+  agentCount: number;
+  failCount: number;
+  revision: number;
+}
+
+function draftRequest(d: Draft, index: number | undefined): WorkRequestTotals | undefined {
+  if (index !== undefined) index -= d.next.requestOffset ?? 0;
+  if (index === undefined || !d.next.requests?.[index]) return undefined;
+  d.next.requests = d.next.requests.slice();
+  const request = { ...d.next.requests[index], revision: d.next.revision };
+  d.next.requests[index] = request;
+  return request;
+}
+
+function startRequest(d: Draft, signal: Extract<WorkSignal, { kind: "turn_started" }>): void {
+  // R-TAB-07: createWorkModelState; startRequest
+  if (d.next.requests === undefined) return;
+  if (d.next.requestByTurn?.[signal.turnId] !== undefined) return;
+  const headline = d.next.requestHeadline;
+  const text = !signal.cliInserted && headline && (headline.turnId === null || headline.turnId === signal.turnId) ? headline.text : undefined;
+  const command = text !== undefined && isPureCommandWrapper(text) ? text : undefined;
+  const requests = d.next.requests ?? [];
+  const previous = requests.at(-1);
+  const repeats = command !== undefined && previous?.command === command;
+  const index = (d.next.requestOffset ?? 0) + (repeats ? requests.length - 1 : requests.length);
+  let dropped: readonly string[] = [];
+  if (repeats) {
+    const request = draftRequest(d, index)!;
+    request.turnIds = [...request.turnIds, signal.turnId];
+    if (request.turnIds.length > MAX_PHASE_REFS) {
+      // R-TAB-07: incomplete requests are excluded by src/protocol.ts#projectWorkModel.
+      request.incomplete = true;
+      dropped = [request.turnIds.shift()!];
+    }
+  } else {
+    d.next.requests = [...requests, { turnIds: [signal.turnId], number: String(index + 1).padStart(2, "0"),
+      command, cliInserted: signal.cliInserted, toolCount: 0, agentCount: 0, failCount: 0, revision: d.next.revision }];
+    if (d.next.requests.length > MAX_TASKS) {
+      dropped = d.next.requests.shift()!.turnIds;
+      d.next.requestOffset = (d.next.requestOffset ?? 0) + 1;
+    }
+  }
+  d.next.requestByTurn = withKey(d.next.requestByTurn, signal.turnId, index, new Set(dropped));
+  if (text !== undefined) d.next.requestHeadline = undefined;
+}
+
+function reconcileRequestCommands(d: Draft, turnId: string, text: string): void {
+  const index = d.next.requestByTurn?.[turnId];
+  const request = draftRequest(d, index);
+  if (!request || request.cliInserted) return;
+  request.command = isPureCommandWrapper(text) ? text : undefined;
+  const offset = d.next.requestOffset ?? 0;
+  const merged: WorkRequestTotals[] = [];
+  const indices = new Map<number, number>();
+  for (const [i, current] of d.next.requests!.entries()) {
+    const previous = merged.at(-1);
+    if (current.command !== undefined && previous?.command === current.command) {
+      previous.turnIds = [...previous.turnIds, ...current.turnIds];
+      previous.toolCount += current.toolCount;
+      previous.agentCount += current.agentCount;
+      previous.failCount += current.failCount;
+      previous.incomplete ||= current.incomplete;
+      previous.revision = d.next.revision;
+      if (previous.turnIds.length > MAX_PHASE_REFS) {
+        // R-TAB-07: src/protocol.ts#projectWorkModel
+        previous.incomplete = true;
+        previous.turnIds = previous.turnIds.slice(-MAX_PHASE_REFS);
+      }
+    } else {
+      merged.push({ ...current, number: String(offset + merged.length + 1).padStart(2, "0") });
+    }
+    indices.set(offset + i, offset + merged.length - 1);
+  }
+  if (merged.length === d.next.requests!.length) return;
+  d.next.requests = merged;
+  d.next.requestByTurn = Object.fromEntries(merged.flatMap((r, i) => r.turnIds.map(id => [id, offset + i])));
+  for (const bucket of d.next.toolPlacements.buckets) for (const placement of Object.values(bucket)) {
+    const nextIndex = indices.get(placement.requestIndex!);
+    if (nextIndex !== undefined && nextIndex !== placement.requestIndex) draftPlacement(d, placement.toolUseId)!.requestIndex = nextIndex;
+  }
+}
 export type PlanHistoryEntry = { at: number; kind: "user" } | {
   at: number; kind: "todos"; source?: "tasks"; created?: boolean; removed?: boolean; items: Extract<TaskIntent, { kind: "todo" }>["items"];
 } | {
@@ -337,6 +432,10 @@ export const CLAUDE_VOCABULARY: ToolVocabulary = {
     "eslint",
   ],
 };
+
+export function isBookkeepingTool(toolName: string): boolean {
+  return CLAUDE_VOCABULARY.task.has(toolName);
+}
 
 function buildVerifyCommandRegex(commands: readonly string[]): RegExp | null {
   if (commands.length === 0) return null;
@@ -385,6 +484,7 @@ export function toolPlacementCount(state: WorkModelState): number {
 
 export function createWorkModelState(): WorkModelState {
   return {
+    requests: [],
     revision: 0,
     phases: [],
     segments: [],
@@ -577,6 +677,17 @@ function withoutKey<T>(source: Record<string, T>, omitted: string): Record<strin
     if (key === omitted) continue;
     target[key] = source[key];
   }
+  return target;
+}
+
+// キーが一意に増え続ける record へスプレッド構文でキーを足すと for-in の再構築より遅く、
+// 大きな記録の復元が verify-webview-wiring#sol-3 の待ち時間を超える。
+function withKey<T>(source: Record<string, T> | undefined, key: string, value: T, omitted: ReadonlySet<string>): Record<string, T> {
+  const target: Record<string, T> = {};
+  for (const existing in source) {
+    if (!omitted.has(existing)) target[existing] = source[existing];
+  }
+  target[key] = value;
   return target;
 }
 
@@ -1430,7 +1541,7 @@ function deletePlacement(d: Draft, toolUseId: string): void {
 }
 
 function handleToolStart(d: Draft, e: ToolStartedSignal): void {
-  if (CLAUDE_VOCABULARY.task.has(e.toolName)) {
+  if (isBookkeepingTool(e.toolName)) {
     const intent = e.taskIntentStructured ?? parseTaskIntent(e);
     if (intent) {
       // 記帳系は作業件数へ混ぜない。状態へ反映するのは成功終了時（失敗した更新は成立していない）
@@ -1519,10 +1630,19 @@ function handleToolStart(d: Draft, e: ToolStartedSignal): void {
   }
   if (phase && owner === undefined) relabelFallbackPhase(d, phase);
 
+  const requestIndex = owner?.requestIndex ?? state.requestByTurn?.[e.turnId];
+  const request = draftRequest(d, requestIndex);
+  if (request) {
+    request.toolCount++;
+    if (agentId !== undefined) request.agentCount++;
+  }
+
   setPlacement(d, {
+    requestIndex,
     toolUseId: e.toolUseId,
     parentToolUseId: e.parentToolUseId,
     toolName: e.toolName,
+    intentInput: e.intentInput,
     description: e.inputSummary ?? e.toolName,
     operation,
     startedAt: e.timestamp,
@@ -1575,6 +1695,10 @@ function finishBackground(
   timestamp: number,
   status: "completed" | "failed" | "stale"
 ): void {
+  if (status === "failed") {
+    const request = draftRequest(d, placement.requestIndex);
+    if (request) request.failCount++;
+  }
   const elapsedMs = Math.max(0, timestamp - (placement.resumedAt ?? placement.startedAt));
   const segment = draftSegment(d, placement.segmentId);
   if (segment && placement.counted) {
@@ -1582,6 +1706,8 @@ function finishBackground(
     else segment.runningCount--;
     segment.elapsedMs += elapsedMs;
     if (status === "failed") segment.failCount++;
+  } else if (segment && placement.ownerAgentId !== undefined && status === "failed") {
+    segment.childFailCount++;
   }
   const target = draftTotals(d, placement.phaseRef);
   if (target) {
@@ -1590,6 +1716,12 @@ function finishBackground(
     if (placement.counted) {
       target.totals.elapsedMs += elapsedMs;
       if (status === "failed") target.totals.failCount++;
+    } else if (placement.ownerAgentId !== undefined && status === "failed") {
+      target.totals.childFailCount++;
+      if (target.phase) {
+        const owner = draftAgent(d, target.phase, placement.ownerAgentId);
+        if (owner) owner.failCount++;
+      }
     }
     if (placement.agentId !== undefined) {
       if (placement.stale) target.totals.staleCount--;
@@ -1681,6 +1813,7 @@ function reopenBackground(d: Draft, taskId: string, timestamp: number): void {
       recordPlanHistory(d, { kind: "resume", at: timestamp, agentId: agent.agentId, description: agent.description,
         status: agent.status, ...(agent.endedAt === undefined ? {} : { endedAt: agent.endedAt }) });
       agent.status = "running";
+      agent.runStartedAt = timestamp;
       agent.endedAt = undefined;
     }
   }
@@ -1784,6 +1917,10 @@ function handleToolFinish(d: Draft, e: ToolFinishedSignal): void {
   }
   removeRunningAgent(d, e.toolUseId);
   removeRunningTool(d, e.toolUseId);
+  if (e.isError) {
+    const request = draftRequest(d, placement.requestIndex);
+    if (request) request.failCount++;
+  }
   const elapsedMs = Math.max(0, e.timestamp - placement.startedAt);
   // 配置は開始時に固定されている。カード切替後に終了しても、集計は開始時の segment へ入る
   // ターン終端で stale へ畳んだ後に遅れて終わる経路があるので、
@@ -1975,6 +2112,7 @@ function applySignal(d: Draft, signal: WorkSignal): void {
       markRunningWorkStale(d, signal.timestamp, true);
       return;
     case "turn_started":
+      startRequest(d, signal);
       d.next.turnActive = true;
       closeSegment(d, signal.timestamp);
       settlePendingStale(d, signal.timestamp);
@@ -1989,6 +2127,11 @@ function applySignal(d: Draft, signal: WorkSignal): void {
       notePendingStale(d, signal.tasks);
       return;
     case "user_message":
+      d.next.requestHeadline = { turnId: signal.turnId, text: signal.text.split("\n").find(line => line.trim().length > 0)?.trim() ?? "" };
+      if (signal.turnId !== null && d.next.requestByTurn?.[signal.turnId] !== undefined) {
+        reconcileRequestCommands(d, signal.turnId, d.next.requestHeadline.text);
+        d.next.requestHeadline = undefined;
+      }
       if (isRequestMessageText(signal.text)) recordPlanHistory(d, { kind: "user", at: signal.timestamp });
       closeSegment(d, signal.timestamp);
       return;

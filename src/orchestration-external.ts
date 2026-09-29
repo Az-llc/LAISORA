@@ -49,7 +49,7 @@ export interface ExternalDependencies {
   killTree?: (pid: number) => Promise<void>;
   timeoutMs?: number;
 }
-export interface ExternalInput { target: string; prompt: string; files?: string[]; diff?: string; cwd?: string }
+export interface ExternalInput { target: string; prompt: string; description?: string; files?: string[]; diff?: string; cwd?: string }
 
 export function observeAgentRun(previous: AgentRunRecord | undefined, input: unknown, now = new Date().toISOString()): AgentRunRecord | undefined {
   if (!input || typeof input !== "object") return undefined; // R-ORC-15
@@ -138,7 +138,7 @@ export function runFailureReason(reason: string, error: unknown): string {
 }
 
 export function externalDescription(rows: readonly ExternalRow[]): string {
-  return [`Run an external target using its exact target key. Optional cwd must be inside the conversation directory or a registered worktree of its repository. ${EXTERNAL_EXECUTORS.map((definition) => definition.displayName).join(" and ")} cost no Claude usage. ${EXTERNAL_CAPABILITIES}`, ...rows.filter((row) => row.enabled)
+  return [`Run an external target using its exact target key. Fill description with a short plain summary of the work being delegated for the status display; prompt remains the execution instructions. Optional cwd must be inside the conversation directory or a registered worktree of its repository. ${EXTERNAL_EXECUTORS.map((definition) => definition.displayName).join(" and ")} cost no Claude usage. ${EXTERNAL_CAPABILITIES}`, ...rows.filter((row) => row.enabled)
     .map(({ target, role, executor, model, effort, description }) => JSON.stringify({ target, role, executor: externalExecutorName(executor), model, effort, description }))].join("\n");
 }
 

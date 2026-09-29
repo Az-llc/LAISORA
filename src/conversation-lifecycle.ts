@@ -1,8 +1,10 @@
+import { applyFallbackModel, fallbackOriginalModel, resolveFallbackByChoice, type EventProvenance, type FallbackRevertOutcome, type NormalizedEventBody } from "./protocol";
 import { join } from "node:path";
 import * as vscode from "vscode";
 import { getLaisoraConfiguration } from "./claude-settings";
-import { flushModelProfileResearch } from "./learning-research";
+import { cancelPendingModelProfileResearch, finishModelProfileResearch, flushModelProfileResearch } from "./learning-research";
 import { postSettingsState } from "./settings-panel";
+import { persistInitialTabTitle } from "./session-list-wiring";
 import { cachedExternalModels, configuredProfileRoster } from "./gateway-host-actions";
 
 import {
@@ -58,7 +60,7 @@ export function postOrchestrationView(s: Session): void {
   publisher.schedule();
 }
 
-// Always posts, even when the effort is unchanged: the message also carries model resolution.
+// publishConfiguredEffort must also publish model resolution when effort is unchanged.
 function publishConfiguredEffort(st: SessionStore | null | undefined, s: Session): void {
   const shown = effortDisplayFromSnapshot(
     s.configuredEffortSnapshot,
@@ -109,11 +111,38 @@ function refreshConfiguredEffort(
     s.configuredEffortSnapshot = snapshot;
     rederiveConfiguredEffort(st, s);
   });
+  const fallbackAtRequest = fallbackReadingMark(s);
   void conv.appliedSettings().then((applied) => {
-    if (applied === undefined || !current()) return;
+    if (applied === undefined || !current() || fallbackReadingStale(s, fallbackAtRequest)) return;
     s.appliedEffort = applied.effort;
     s.appliedModel = applied.model;
-    // 設定の解決（resolveSettings）が失敗・未着でも applied model / effort は届ける
+    s.modelFallback = applyFallbackModel(s.modelFallback, applied.model, Date.now(), s.models);
+    // 設定解決を待たずに適用観測を届ける（publishConfiguredEffort）。
+    publishConfiguredEffort(st, s);
+  });
+}
+
+// R-GW-07: a reading requested before a newer fallback notice or model observation is stale; a restore record alone
+// does not outdate it (verify-gateway-wiring#GW-RFm12).
+function fallbackReadingMark(s: Session): { notice?: object; model?: string } {
+  return { notice: s.modelFallback?.notice, model: s.modelFallback?.appliedModel };
+}
+
+function fallbackReadingStale(s: Session, mark: { notice?: object; model?: string }): boolean {
+  return s.modelFallback?.notice !== mark.notice || s.modelFallback?.appliedModel !== mark.model;
+}
+
+export function refreshFallbackAppliedModel(st: SessionStore, s: Session): void {
+  const conv = s.conversation;
+  const generation = s.generation;
+  if (!s.modelFallback || !conv || conv.isClosed) return;
+  const mark = fallbackReadingMark(s);
+  void conv.appliedSettings().then(applied => {
+    if (!applied || s.closed || s.conversation !== conv || s.generation !== generation || fallbackReadingStale(s, mark)) return;
+    s.modelFallback = applyFallbackModel(s.modelFallback, applied.model, Date.now(), s.models);
+    s.appliedModel = applied.model;
+    s.effectiveModel = applied.model;
+    s.appliedEffort = applied.effort;
     publishConfiguredEffort(st, s);
   });
 }
@@ -136,8 +165,7 @@ function profileTargetState(
   return s.generation === processGeneration && s.conversation === conv ? "current" : "restarted";
 }
 
-// settings.json への保存失敗を会話内の確認文へ載せる理由文。保存の成否は共通関数が返し、
-// 通知は操作したタブの会話に出す（R-DSP-01 / R-CMD-02）
+// 保存失敗の通知先は操作した会話に揃える（applyModelChange / applyEffortChange、R-DSP-01 / R-CMD-02）。
 function settingsWriteFailureText(result: Extract<SettingsWriteResult, { ok: false }>): string {
   return result.reason === "read_failed"
     ? l10n.t("could not read ~/.claude/settings.json (existing settings were not changed)")
@@ -160,15 +188,13 @@ async function applyEffortChange(
   const logicalGeneration = s.logicalGeneration;
   const run = async (): Promise<void> => {
     if (s.closed || s.logicalGeneration !== logicalGeneration) return;
-    // queue 待機中の通常再起動は要求を失効させない。実際に操作を始める時点を基準にする。
+    // 待機中の再起動で要求を失効させないため、世代は profileChangeTail の待機後に捕捉する。
     const processGeneration = s.generation;
-    // model change が applyFlagSettings の待機中に割り込んでも、クリック時点と別modelへ
-    // 永続化しない。実行への適用先と保存先を同じ観測点で固定する。
+    // 適用先と保存先を同じ観測点で固定する（verify-gateway-wiring#MC-3）。
     const canonicalModel = canonicalEffortModel(s);
     const conv = s.conversation;
     if (conv !== null && !conv.isClosed) {
       try {
-        // applyFlagSettings は idle/running の両方で使える。会話入力の /effort は送らない。
         await conv.setEffort(requested);
       } catch (error) {
         const targetState = profileTargetState(s, logicalGeneration, processGeneration, conv);
@@ -184,7 +210,6 @@ async function applyEffortChange(
             ),
             fatal: false,
           });
-          // Webview は楽観更新しないため、失敗時は ack を送らず現在の表示を保つ。
         }
         return;
       }
@@ -238,14 +263,24 @@ async function applyEffortChange(
   await queued;
 }
 
+// R-GW-09: the automatic restore sends the fallback's original model to the CLI but keeps the tab's own selection (verify-gateway-wiring#GW-RFm16).
+interface FallbackRestore {
+  override: string | null | undefined;
+  stillWanted: () => boolean;
+}
+
 async function applyModelChange(
   st: SessionStore,
   s: Session,
-  requested: string | null
-): Promise<void> {
+  requested: string | null,
+  sessionOnly = false,
+  restore?: FallbackRestore
+): Promise<FallbackRevertOutcome | "discarded" | "unwanted"> {
   const logicalGeneration = s.logicalGeneration;
-  const run = async (): Promise<void> => {
-    if (s.closed || s.logicalGeneration !== logicalGeneration) return;
+  const run = async (): Promise<FallbackRevertOutcome | "discarded" | "unwanted"> => {
+    if (s.closed || s.logicalGeneration !== logicalGeneration) return "discarded";
+    // R-GW-09: a choice applied while the restore waited in profileChangeTail wins (verify-gateway-wiring#GW-RFm9).
+    if (restore !== undefined && !restore.stillWanted()) return "unwanted";
     const processGeneration = s.generation;
     const previous = s.modelOverride;
     const conv = s.conversation;
@@ -255,9 +290,12 @@ async function applyModelChange(
       } catch (error) {
         const targetState = profileTargetState(s, logicalGeneration, processGeneration, conv);
         if (targetState === "restarted") {
-          reportProfileRestart(s, "model");
+          // R-GW-09: the restore's recorded "failed" outcome is its only notice (verify-gateway-wiring#GW-RFm23).
+          if (restore === undefined) reportProfileRestart(s, "model");
         } else if (targetState === "current") {
           output.appendLine(`[${s.title}] setModel 失敗: ${String(error)}`);
+          // R-GW-09: nothing was selected on the restore path; its recorded "failed" outcome is the notice (verify-gateway-wiring#GW-RFm22).
+          if (restore !== undefined) return "failed";
           s.pushEvent({
             kind: "error",
             message: l10n.t(
@@ -268,26 +306,28 @@ async function applyModelChange(
           });
           if (previous !== undefined) st.post({ type: "modelChanged", tabId: s.tabId, model: previous });
         }
-        return;
+        return targetState === "discard" ? "discarded" : "failed";
       }
       const targetState = profileTargetState(s, logicalGeneration, processGeneration, conv);
-      if (targetState === "discard") return;
+      if (targetState === "discard") return "discarded";
       if (targetState === "restarted") {
-        reportProfileRestart(s, "model");
-        return;
+        // R-GW-09: the restore's recorded "failed" outcome is its only notice (verify-gateway-wiring#GW-RFm24).
+        if (restore === undefined) reportProfileRestart(s, "model");
+        return "failed";
       }
     }
 
-    s.modelOverride = requested;
+    s.modelOverride = restore === undefined ? requested : restore.override;
     clearObservedEffort(s);
     const knownRow = requested === null || s.models.length === 0 || s.models.some((m) => m.id === requested);
-    const saved: SettingsWriteResult | null = knownRow ? updateClaudeCodeSettings({ model: requested }) : null;
-    // SDK setModel 成功時は新しい auth_status が来ないため、明示指定を分析・要約の選択値にする。
+    const saved: SettingsWriteResult | null = knownRow && !sessionOnly ? updateClaudeCodeSettings({ model: requested }) : null;
+    // src/claudeHost.ts#setModel は認証観測を更新しないため、明示指定を分析・要約へ渡す。
     if (conv !== null && s.conversation === conv) s.effectiveModel = requested;
-    // 確認文は適用と保存が終わったここで組む。webview が選択直後に出す形へ戻すと、SDK 失敗・
-    // 保存失敗のときに「保存しました」と失敗通知が同じ会話に並ぶ（R-DSP-01 / R-CMD-02）
+    // 適用・保存の結果を確認してから通知文を組む（verify-gateway-wiring#NL-MODEL-1、R-DSP-01 / R-CMD-02）。
     const label = requested === null ? null : s.models.find((m) => m.id === requested)?.label ?? requested;
-    const notice = saved === null
+    const notice = sessionOnly
+      ? l10n.t("Changed model to {0} for this conversation.", label ?? "")
+      : saved === null
       ? l10n.t("LAISORA: Changed model to {0} for this session; it was not saved to settings.json because the model is not in the model list.", label ?? "")
       : !saved.ok
         ? label === null
@@ -296,16 +336,27 @@ async function applyModelChange(
         : label === null
           ? l10n.t("LAISORA: Reset the model to the default (removed model from settings.json).")
           : l10n.t("LAISORA: Changed model to {0} (saved to settings.json).", label);
-    st.post({ type: "modelChanged", tabId: s.tabId, model: requested, notice });
+    const openFallback = s.modelFallback?.resolvedAt === undefined ? s.modelFallback : undefined;
+    s.modelFallback = resolveFallbackByChoice(s.modelFallback, requested, Date.now());
+    // R-GW-09: the recorded restore outcome is the notice for the automatic restore (verify-gateway-wiring#GW-RFm17).
+    if (restore === undefined) st.post({ type: "modelChanged", tabId: s.tabId, model: requested, notice, applied: true });
+    // R-CNV-43: the explicit choice is recorded so a replay does not reopen the confirmation (verify-gateway-wiring#GW-RFm15).
+    if (restore === undefined && openFallback !== undefined) {
+      s.pushEvent({ kind: "model_fallback_revert", turnId: openFallback.notice.turnId,
+        originalModel: fallbackOriginalModel(openFallback), outcome: "chosen" });
+    }
     s.configuredEffortSnapshot = undefined;
-    // 切替前の applied 値を残すと、既定へ戻した（modelOverride === null）タブの表示・分析が旧 model を使う
+    // 切替前の適用観測を次の表示・分析へ持ち越さない（verify-gateway-wiring#MC-4）。
     s.appliedModel = undefined;
     s.appliedEffort = undefined;
     s.configuredEffortGeneration += 1;
     publishConfiguredEffort(st, s);
     output.appendLine(`[${s.title}] setModel: ${requested ?? "(既定)"} を適用`);
-    if (conv === null || conv.isClosed) warmup(s);
-    else {
+    if (conv === null || conv.isClosed) {
+      // R-GW-09: the restore never starts a process; the next send launches on launchModel (verify-gateway-wiring#GW-RFm18).
+      if (restore !== undefined) return "deferred";
+      warmup(s);
+    } else {
       const cfg = getLaisoraConfiguration();
       const cwd = s.cwd ?? resolveSessionCwd(s);
       if (cwd !== undefined) {
@@ -318,10 +369,61 @@ async function applyModelChange(
         );
       }
     }
+    return "applied";
   };
   const queued = s.profileChangeTail.then(run, run);
-  s.profileChangeTail = queued.catch(() => {});
-  await queued;
+  s.profileChangeTail = queued.then(() => {}, () => {});
+  return await queued;
+}
+
+export const FALLBACK_REVERT_SETTING = "claude.restoreModelAfterRefusalFallback";
+const FALLBACK_REVERT_TURN_END_KINDS: ReadonlySet<NormalizedEventBody["kind"]> =
+  new Set(["turn_completed", "turn_failed", "turn_interrupted", "conversation_closed"]);
+type LiveEventBody = NormalizedEventBody & { provenance?: EventProvenance };
+
+function noteFallbackRevert(s: Session, conv: ClaudeConversation, ev: LiveEventBody): LiveEventBody {
+  if (ev.kind !== "model_refusal_fallback" || ev.scope !== "session") return ev;
+  if (getLaisoraConfiguration().get<boolean>(FALLBACK_REVERT_SETTING, true) === false) return { ...ev, autoRevert: "off" };
+  const pending = s.fallbackRevert;
+  // R-GW-09: a second fallback in the same turn restores the model the turn started with (verify-gateway-wiring#GW-RFm21).
+  if (pending?.conversation !== conv || pending.turnId !== ev.turnId || s.modelFallback?.resolvedAt !== undefined) {
+    s.fallbackRevert = { conversation: conv, turnId: ev.turnId, originalModel: ev.originalModel, priorOverride: s.modelOverride };
+  }
+  return { ...ev, autoRevert: "pending" };
+}
+
+// R-GW-09: one attempt per pending fallback (verify-gateway-wiring#GW-RFm4).
+function settleFallbackRevert(st: SessionStore | null | undefined, s: Session, conv: ClaudeConversation, ev: LiveEventBody): void {
+  const pending = s.fallbackRevert;
+  if (pending === undefined || pending.conversation !== conv) return;
+  // R-GW-09: a notice that arrives outside a turn is settled at once (verify-gateway-wiring#GW-RFm13).
+  if (!FALLBACK_REVERT_TURN_END_KINDS.has(ev.kind) && !(ev.kind === "model_refusal_fallback" && conv.state === "idle")) return;
+  s.fallbackRevert = undefined;
+  const notice = s.modelFallback?.notice;
+  const stillWanted = (): boolean => s.modelFallback !== undefined && s.modelFallback.notice === notice &&
+    s.modelFallback.resolvedAt === undefined;
+  if (!stillWanted()) return;
+  const record = (outcome: FallbackRevertOutcome): void =>
+    s.pushEvent({ kind: "model_fallback_revert", turnId: pending.turnId, originalModel: pending.originalModel, outcome });
+  if (!st) {
+    record("failed");
+    return;
+  }
+  // R-GW-09: the next root model is observed even when it is the fallback model again (verify-gateway-wiring#GW-RFm14).
+  if (!conv.isClosed) conv.rearmRootModelObservation();
+  const logicalGeneration = s.logicalGeneration;
+  void applyModelChange(st, s, pending.originalModel, true, { override: pending.priorOverride, stillWanted }).then((result) => {
+    if (result !== "discarded" && result !== "unwanted" && !s.closed && s.logicalGeneration === logicalGeneration) record(result);
+  });
+}
+
+// R-GW-09: a resumed CLI keeps the transcript's model unless one is passed,
+// so a fallback restored by LAISORA is pinned for the next launch (verify-gateway-wiring#GW-RFm19).
+function launchModel(s: Session): string | null | undefined {
+  const fallback = s.modelFallback;
+  if (fallback !== undefined && fallback.resolvedAt === undefined) return fallback.appliedModel;
+  if (s.modelOverride !== undefined || fallback === undefined) return s.modelOverride;
+  return fallback.autoRevert === "applied" || fallback.autoRevert === "deferred" ? fallback.appliedModel : undefined;
 }
 
 export async function handleConversationMessage(
@@ -332,8 +434,7 @@ export async function handleConversationMessage(
   switch (msg.type) {
     case "send": {
       target!.conversation?.cancelAutoResume();
-      // Webview は hydration 中だけ clientToken 付きで送る。Host は受理結果を
-      // 同じ token で返し、楽観バブルの確定・撤去を決める
+      // 楽観表示の確定・撤去は送信時のトークンで対応付ける（src/protocol.ts#ResumeHydrationSendDisposition）。
       const clientToken = msg.clientToken;
       const disposition = (
         value: "accepted-human" | "accepted-nonhuman" | "rejected"
@@ -345,7 +446,7 @@ export async function handleConversationMessage(
           sendDisposition: { clientToken, disposition: value },
         });
       };
-      // /clear 処理中は受け付けない（R-SES-08: クリア対象の会話へ投入・再生成しない）
+      // R-SES-08: クリア対象へ投入しない（verify-tab-restore#TR-CLR）。
       if (target!.clearing) {
         target!.pushEvent({
           kind: "error",
@@ -355,8 +456,7 @@ export async function handleConversationMessage(
         disposition("rejected");
         break;
       }
-      // 予約タグ（非人間 allowlist）で始まる人間入力は拒否する（R-HND-05）。
-      // history 側は同じ本文を非人間として落とすため、live で通すと経路が割れる
+      // src/session-transcript.ts#extractHumanUserText と非人間入力の扱いを揃える（R-HND-05）。
       if (HUMAN_INPUT_INJECTED_TAG_RE.test(msg.text.trimStart())) {
         target!.pushEvent({
           kind: "error",
@@ -374,22 +474,17 @@ export async function handleConversationMessage(
         disposition("rejected");
         throw e;
       }
-      // 起動待ちの間にタブが閉じられていたら投入しない
-      // /clear が割り込んだ場合も投入しない（R-SES-08）
+      // 起動待ちの後にも投入先を検証する（R-SES-08、verify-tab-restore#TR-CLR）。
       if (target!.closed || target!.clearing) {
         disposition("rejected");
         break;
       }
-      // 実行中の送信も受理する（steering: ホストが新ターンを作らず現在ターンへ直接投入する）。
-      // user_message はここで一度だけ記録し、ホスト側の投入時は再emitしない
-      // 初回発言でタブを自動命名（先頭行の抜粋。LLM不使用）
       if (!target!.autoTitled) {
         const firstLine = msg.text.trim().split("\n")[0];
         if (firstLine) {
           const hydrating = target!.hydration;
           if (hydrating !== null && hydrating.buffering) {
-            // hydration 中は付け直さず候補だけ持つ。Phase 3 で履歴側 resolver を
-            // 先に適用するので、ここで名付けると同じタブ名が二度変わる（R-SES-05）
+            // 履歴側の命名を先に適用する（src/resume-hydration.ts#runResumeHydration、R-SES-05）。
             hydrating.liveTitleCandidate = firstLine;
           } else {
             target!.title = displayTitleFromSummary(firstLine, target!.tabId);
@@ -398,19 +493,12 @@ export async function handleConversationMessage(
           }
         }
       }
-      // history 側の正規化境界（session-transcript.extractHumanUserText）は
-      // `/rename <引数>` からイベントを作らない。live だけ user_message を作ると
-      // work-model が segment を余分に閉じ、同じセッションでも live/history で採番が割れる。
-      // 投入自体（下の send）は止めないこと — 止めるとコマンドが CLI へ届かない
-      // 添付は「送信メッセージが運んできたもの」ではなく「この tabId のスロットにあるもの」。
-      // webview の手持ちを載せる形へ戻すと、押した瞬間の activeTabId が別タブへ動いていたときに
-      // 添付だけが別の会話へ入る（R-CNV-11）。取り出しは投入が確定するこの位置でだけ行う
-      // ——上の拒否分岐より前で取ると、拒否された送信で添付が黙って消える
+      // 非人間コマンドも送信自体は止めない（src/human-input-vocabulary.ts#isNonHumanCommandInput）。
+      // 拒否した送信の添付を保持するための取得境界（src/pending-attachments.ts#pendingAttachments、R-CNV-11）。
       msg.images = pendingAttachments.take(target!.tabId);
       postAttachments(st, target!.tabId);
       if (!isNonHumanCommandInput(msg.text)) {
-        // hydration 中は token を journal entry へ載せる。失敗確定時に確定
-        // user_message を配送する前に、同じ token の楽観バブルを撤去して二重表示を防ぐ
+        // 確定配送との重複を避けるため、楽観表示と照合できるトークンを渡す（src/protocol.ts#ResumeHydrationSendDisposition）。
         target!.pushEvent(
           { kind: "user_message", turnId: null, text: msg.text, images: msg.images, sentAt: Date.now() },
           undefined,
@@ -421,9 +509,7 @@ export async function handleConversationMessage(
       } else {
         disposition("accepted-nonhuman");
       }
-      // 会話生成時の種は undefined でありうる（read-set の捕捉失敗・hydration 設置前の生成）。
-      // 未観測のまま送ると turn_started が timestamp 契約（event-fold）で破棄され、
-      // webview はそのターンの本文を全て捨てる（RFT-1 / RFT-2）
+      // 復元後の送信にも観測済み時刻を引き継ぐ（sessionObservedTimestampSeed）。
       target!.conversation!.send(msg.text, msg.images, sessionObservedTimestampSeed(target!));
       break;
     }
@@ -438,11 +524,8 @@ export async function handleConversationMessage(
       break;
     case "setMode":
       target!.permissionMode = msg.mode;
-      // 実行中の会話にも即時適用（SDK setPermissionMode。未接続なら次回起動時に反映）
       await target!.conversation?.setPermissionMode(msg.mode);
-      // 選択は LAISORA 内部へ保存する（保存先の根拠は resolveInitialMode 上のコメント）。
-      // bypassPermissions（危険モード）だけは保存しない: 永続化すると次回起動から
-      // 全セッションが確認なしで走る。危険モードはセッション限りに留める
+      // 永続化の根拠は src/claude-settings.ts#resolveInitialMode。
       if (msg.mode !== "bypassPermissions") {
         void extensionContext?.globalState?.update(PERMISSION_MODE_KEY, msg.mode);
       }
@@ -454,37 +537,32 @@ export async function handleConversationMessage(
     }
     case "setModel": {
       const s = target!;
-      await applyModelChange(st, s, msg.model);
+      await applyModelChange(st, s, msg.model, msg.sessionOnly);
       break;
     }
   }
 }
 
-// CLIセッションの事前起動（Claude拡張と同じ体験）。失敗は致命ではないためログのみ。
-// 送信時の ensureConversation と同じ直列化ガードを通るので二重起動しない。
 export function warmup(s: Session): void {
-  // 死んだ会話が残っている場合も事前起動の対象にする。isClosed を見ないと、バックエンドが
-  // 落ちたあと s.conversation が非nullのまま残るため二度と warmup されず、コマンド候補・
-  // モデル一覧・認証実測が送信するまで復旧しない（再生成は ensureConversationInner が行う）。
   if ((s.conversation && !s.conversation.isClosed) || s.closed || s.clearing) return;
   void ensureConversation(s).catch((e: unknown) =>
     output.appendLine(`[${s.title}] ${sinceActivation()} warmup失敗: ${String(e)}`)
   );
 }
 
-// hydration 中は捕捉した read-set の境界時刻（journal の到着 gate が使う値と同一）
-// を渡す。ここがずれると live の timestamp 継承と Host の gate が食い違い、境界を決めない
-// イベントが到着時に落ちる。種の合成規則は observed-timestamp-seed.ts
+// 到着判定と同じ境界時刻を渡す（src/observed-timestamp-seed.ts#observedTimestampSeed）。
 function sessionObservedTimestampSeed(s: Session): number | undefined {
   const hydrating = s.hydration !== null && s.hydration.buffering ? s.hydration : null;
   return observedTimestampSeed(hydrating?.arrivalTimestamp, s.lastRecordedEventTimestamp);
 }
 
 async function ensureConversation(s: Session): Promise<void> {
-  // 並行 send による二重生成防止（後勝ち上書きで孤児CLIプロセスが残留する）
   while (s.starting) await s.starting;
+  const generation = s.logicalGeneration;
   const p = ensureConversationInner(s);
-  s.starting = p.catch(() => {}).then(() => {
+  s.starting = p.catch(() => {
+    cancelPendingModelProfileResearch(s, generation);
+  }).then(() => {
     s.starting = null;
   });
   return p;
@@ -492,25 +570,18 @@ async function ensureConversation(s: Session): Promise<void> {
 
 async function ensureConversationInner(s: Session): Promise<void> {
   const logicalGenerationAtStart = s.logicalGeneration;
-  // クラッシュ復帰の継続 ID（AUDIT-01）。live で始めたタブは resumeSessionId がどの経路でも
-  // 埋まらないので、確定 ID は auth 側にしかない。フィールドへ書き戻さないのは、CLI が resume で
-  // 同じ session ID を保つのか新しい ID へ fork するのかが未確定なため。書くと fork 側の挙動では
-  // 古い ID に固着し、2 回目以降の復帰で新しい ID に積まれた会話を黙って捨てる
+  // 継続先を固定せず、終了した会話の認証観測から取得する（verify-gateway-wiring#GW-CR-02）。
   let crashResumeSessionId: string | undefined;
-  // 死んだ Conversation は捨てて再生成する（abort/クラッシュ後の恒久沈黙防止）
   if (s.conversation?.isClosed) {
     s.guardrailRunner.settleConversationLost();
     void s.conversation.dispose();
     s.conversation = null;
-    s.generation += 1; // generation はプロセス再起動ごとに増える
-    // 旧プロセスの async 委任は新プロセスへ引き継がれない。残すと再ACKなしで running へ戻る
+    s.generation += 1;
     s.clearLiveDelegations();
     s.backgroundActivity = createBackgroundActivityState();
     s.guardrail = clearProcessEphemeral(s.guardrail);
     s.lastContextTotalTokens = null;
-    // 未使用タブ（warmup だけで送信していない）は resume 先の JSONL がまだ無い。
-    // 判定は s.conversation = null の後で行う。前に置くと、閉じた Conversation の state が
-    // idle とは限らないため未使用タブを使用済みと誤判定する
+    // 未使用判定は会話を切り離してから行う（src/session.ts#isUnusedSession、verify-gateway-wiring#GW-CR-01）。
     crashResumeSessionId = isUnusedSession(s) ? undefined : s.auth?.sessionId;
   }
   if (s.conversation) return;
@@ -526,28 +597,21 @@ async function ensureConversationInner(s: Session): Promise<void> {
   }
   s.cwd = cwd;
 
-  // 通常起動の model は settingSources と CLI の環境・project 設定に解決を任せる。
-  // LAISORA で明示選択した値だけを modelOverride として固定する。
-  // 既存の設定キャッシュ更新境界は、model 以外の設定表示・権限初期値のため維持する。
+  // 設定の予測を起動時の明示指定へ昇格させない（verify-gateway-wiring#MC-1）。
   invalidateClaudeCodeSettingsCache();
-  s.effectiveModel = s.modelOverride;
-  // effortOverride は要求値であって適用観測ではない。実効値は init の auth_status だけが確定する。
+  s.effectiveModel = launchModel(s);
+  // 要求値を適用観測として扱わない（clearObservedEffort）。
   s.effectiveEffort = undefined;
 
   const initialObservedTimestamp = sessionObservedTimestampSeed(s);
 
-  // 既定値は CLI 本体の設定解決（settingSources=user）に任せ、独自設定は作らない
-  // （ユーザー方針: Claude Code と常に同期）。ただしユーザーがこのタブで明示的に選んだ
-  // モデル/effort は、会話プロセスを作り直しても引き継ぐ。
-  // モデルと effort の両方を渡す。effort だけだと、/clear・effort 変更による再起動・クラッシュ復帰のたびに
-  // モデルだけ既定へ戻り、チップの表示と実体が食い違う。
   const learningEnabled = cfg.get<boolean>("learning.enabled", false) === true;
   const learningConfiguredSnapshot = learningEnabled ? await resolveConfiguredEffortSnapshot(cwd, settingSources) : undefined;
   const conv = new ClaudeConversation({
     cwd,
     initialObservedTimestamp,
     resumeSessionId: s.resumeSessionId ?? crashResumeSessionId,
-    model: s.modelOverride ?? undefined,
+    model: s.effectiveModel ?? undefined,
     effort: s.effortOverride ?? undefined,
     permissionMode: s.permissionMode,
     settingSources,
@@ -572,8 +636,9 @@ async function ensureConversationInner(s: Session): Promise<void> {
       if (s.conversation === conv) postOrchestrationView(s); // R-ORC-21
     },
     interruptForceKillTimeoutMs: cfg.get("interruptForceKillTimeoutMs", 5000),
-    onEvent: (ev, conversationId, meta) => {
-      // CLI 既定の model は設定からは見えない。init が申告した実値を継承元にする
+    onEvent: (raw, conversationId, meta) => {
+      const own = conversationId === s.expectedConversationId && !s.closed;
+      const ev = own ? noteFallbackRevert(s, conv, raw) : raw;
       if (
         ev.kind === "auth_status" &&
         conversationId === s.expectedConversationId
@@ -585,9 +650,15 @@ async function ensureConversationInner(s: Session): Promise<void> {
         rederiveConfiguredEffort(store, s);
       }
       s.pushEvent(ev, conversationId, meta);
+      if (conversationId === s.expectedConversationId &&
+        ["auth_status", "turn_completed", "turn_failed", "turn_interrupted"].includes(ev.kind)) {
+        persistInitialTabTitle(s);
+      }
       if (["turn_completed", "turn_failed", "turn_interrupted"].includes(ev.kind)) {
+        finishModelProfileResearch(s, conv);
         setTimeout(() => flushModelProfileResearch(s, getLaisoraConfiguration().get<boolean>("learning.enabled", false), cachedExternalModels(), configuredProfileRoster()), 0);
       }
+      if (own) settleFallbackRevert(store, s, conv, ev);
       if (ev.kind === "auth_status" && conversationId === s.expectedConversationId && ev.auth?.billingRealm === "api") {
         store?.post({
           type: "tabNotice",
@@ -604,27 +675,18 @@ async function ensureConversationInner(s: Session): Promise<void> {
       }),
     log: (m) => output.appendLine(`[${s.title}] ${m}`),
   });
-  // start 成功後に公開する（失敗時に壊れた Conversation が残留しないように）
   try {
-    // ここで expected を切り替える（旧世代の遅延イベントは以後 pushEvent で落ちる）
     s.expectedConversationId = conv.conversationId;
     await conv.start();
-    // start 中に論理セッションが入れ替わった場合は掴ませない（FP-1 の並べ替えで
-    // detachConversation は start の完了を待たない）。掴ませると warmup が
-    // 「会話がある」と見て resume 用の CLI を作らず、しかも切り離し済み ID なので
-    // このプロセスのイベントは全て落ち、無言のタブになる。
-    // return ではなく throw なのは、呼び出し側（send / handoff）が「解決したら
-    // s.conversation は非 null」を前提に conversation! を叩くため。失敗として返せば
-    // 既存の起動失敗経路（v4 F-5 の rejected / warmup の catch）へ入る
+    // 失効時も起動失敗として返す。ensureConversation の呼び出し側は成功後に会話の存在を前提とする。
     if (s.logicalGeneration !== logicalGenerationAtStart) {
       void conv.dispose();
       throw new Error(l10n.t("The logical session of this tab changed while the conversation was starting (restore or clear)."));
     }
     s.conversation = conv;
-    setTimeout(() => flushModelProfileResearch(s, getLaisoraConfiguration().get<boolean>("learning.enabled", false), cachedExternalModels(), configuredProfileRoster()), 0);
+    flushModelProfileResearch(s, getLaisoraConfiguration().get<boolean>("learning.enabled", false), cachedExternalModels(), configuredProfileRoster());
     postOrchestrationView(s);
     refreshConfiguredEffort(store, s, cwd, settingSources, conv);
-    // スラッシュコマンド/モデル一覧をサジェスト・ピッカー用にWebviewへ供給（非同期・失敗しても無視）
     void conv.supportedCommands().then((cmds) => {
       if (s.conversation !== conv || cmds.length === 0) return;
       s.applyCommandList(cmds);

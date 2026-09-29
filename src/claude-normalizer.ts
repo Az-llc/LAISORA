@@ -10,6 +10,7 @@ import type {
   TaskNotificationInfo,
   UsageSnapshot,
 } from "./protocol";
+import { captureToolIntentInput } from "./webview/status-line";
 import { assistantUsageFromRaw, summarizeToolInput } from "./protocol";
 import type { HostArtifactAccess } from "./artifact-access";
 import { extractResumeSignals, extractStage0ToolFields, RESUME_SIGNAL_TOOL_NAMES } from "./tool-observation";
@@ -58,6 +59,17 @@ export interface ClaudeLiveNormalizerOptions {
   onTurnEnd?: (turnId: string, kind: "turn_completed" | "turn_interrupted" | "turn_failed") => void;
   isClosed?: () => boolean;
   usageLimitPrefixes?: string[];
+  onDelegateUsageLimitStop?: (agentId: string) => void;
+}
+
+export const DELEGATE_API_ERROR_MARKER = "Agent terminated early due to an API error: ";
+
+// R-CNV-40: DELEGATE_API_ERROR_MARKER separates the description from usageLimitPrefixes.
+export function isDelegateUsageLimitSummary(summary: string, usageLimitPrefixes: readonly string[]): boolean {
+  const at = summary.lastIndexOf(DELEGATE_API_ERROR_MARKER);
+  if (at < 0) return false;
+  const tail = summary.slice(at + DELEGATE_API_ERROR_MARKER.length);
+  return usageLimitPrefixes.some((prefix) => prefix.length > 0 && tail.startsWith(prefix));
 }
 
 interface AssistantTextEvidenceState {
@@ -93,6 +105,7 @@ export interface RefusalNotice {
   explanation: string | null;
   content: string | null;
   retractedMessageUuids: string[];
+  refusedUserMessageUuid: string | null;
 }
 
 // CLI は同じ値を 2 通りに直列化する。SDK ストリームは snake_case、transcript は camelCase で、
@@ -158,10 +171,11 @@ export function parseRefusalNotice(record: Record<string, unknown>): RefusalNoti
     explanation: dualString(record, "api_refusal_explanation", "apiRefusalExplanation"),
     content: typeof record.content === "string" && record.content.length > 0 ? record.content : null,
     retractedMessageUuids: uuidList(retracted),
+    refusedUserMessageUuid: dualString(record, "refused_user_message_uuid", "refusedUserMessageUuid"),
   };
 }
 
-// 拒否フレームの本文は捨てず、エラー通知の本文として運ぶ。カテゴリは未知の値でも必ず出す
+// 拒否フレームの本文は捨てず、通知の本文として運ぶ（フォールバックありは refusalFallbackEvent の message、それ以外は error）。カテゴリは未知の値でも必ず出す
 export function formatRefusalMessage(parts: {
   content: string | null;
   explanation: string | null;
@@ -169,6 +183,29 @@ export function formatRefusalMessage(parts: {
 }): string {
   const head = parts.content ?? parts.explanation ?? "model refusal";
   return parts.category && !head.includes(parts.category) ? `${head} [${parts.category}]` : head;
+}
+
+// A single-segment slash token redacts to itself minus the slash, so keeping it discloses nothing (verify-refusal#RF-REDACT).
+const SINGLE_SEGMENT_SLASH_TOKEN = /(?<=^|[\s("'`])\/[A-Za-z][\w-]*(?![\w/\\-]|\.[\w/\\])/g;
+
+function redactRefusalText(text: string): string {
+  const kept: string[] = [];
+  const masked = text.replace(SINGLE_SEGMENT_SLASH_TOKEN, (token) => `\u0000${kept.push(token) - 1}\u0000`);
+  return redactAbsolutePaths(masked).replace(/\u0000(\d+)\u0000/g, (_, index: string) => kept[Number(index)]);
+}
+
+// R-GW-07: refusalFallbackEvent requires the model identities; malformed notices retain the error path.
+export function refusalFallbackEvent(notice: RefusalNotice, turnId: string | null): Extract<NormalizedEventBody, { kind: "model_refusal_fallback" }> | undefined {
+  if (!notice.hasFallback || !notice.originalModel || !notice.fallbackModel) return undefined;
+  return {
+    kind: "model_refusal_fallback", turnId,
+    originalModel: redactAbsolutePaths(notice.originalModel), fallbackModel: redactAbsolutePaths(notice.fallbackModel),
+    category: notice.category === null ? null : redactAbsolutePaths(notice.category),
+    explanation: notice.explanation === null ? null : redactRefusalText(notice.explanation),
+    scope: notice.scopeIsLocal ? "local" : "session",
+    refusedUserMessageUuid: notice.refusedUserMessageUuid,
+    message: redactRefusalText(formatRefusalMessage(notice)),
+  };
 }
 
 export function formatRefusalReason(category: string | null): string {
@@ -224,6 +261,7 @@ export class ClaudeLiveNormalizer {
   // 観測範囲外の通知が reducer の revision を進め、委任ゼロの既存セッションでも
   // semanticHash が変わる（fold 側ではどの委任にも一致せず no-op なのに）
   private observedAsyncAgentIds = new Set<string>();
+  private usageLimitStopNotificationIds = new Set<string>();
   // 背景 Bash の task id。observedAsyncAgentIds と分けるのは session-transcript と同じ理由（役割が違う）
   private observedBackgroundTaskIds = new Set<string>();
   // 次の emit に相乗りさせる gap 境界時刻（emit を伴わない事象の搬送先）
@@ -454,7 +492,7 @@ export class ClaudeLiveNormalizer {
           if (typeof record.task_id === "string" && record.task_id.length > 0) {
             const usage = record.usage as { total_tokens?: unknown } | null | undefined;
             const tokens = usage?.total_tokens;
-            this.emitTaskNotification(
+            const emitted = this.emitTaskNotification(
               {
                 agentId: record.task_id,
                 ...(typeof record.tool_use_id === "string" && record.tool_use_id
@@ -469,6 +507,21 @@ export class ClaudeLiveNormalizer {
                 ? { timestamp: this.taskEndTimes.get(record.task_id) }
                 : defaultMeta
             );
+            // R-CNV-40: only agents whose launch or resume this process observed; a replayed stop of an
+            // unobserved agent must not reserve an input (verify-usage-limit-resume#DR-narrow)
+            if (
+              emitted &&
+              this.observedAsyncAgentIds.has(record.task_id) &&
+              record.status === "failed" &&
+              typeof record.summary === "string" &&
+              isDelegateUsageLimitSummary(record.summary, this.usageLimitPrefixes)
+            ) {
+              // R-CNV-40: usageLimitStopNotificationIds also rejects old stops replayed after a resume.
+              const notificationId = typeof record.uuid === "string" ? record.uuid : undefined;
+              if (notificationId && this.usageLimitStopNotificationIds.has(notificationId)) break;
+              if (notificationId) this.usageLimitStopNotificationIds.add(notificationId);
+              this.opts.onDelegateUsageLimitStop?.(record.task_id);
+            }
           }
         } else if (record.subtype === "background_tasks_changed") {
           const raw = Array.isArray(record.tasks) ? record.tasks : [];
@@ -821,10 +874,11 @@ export class ClaudeLiveNormalizer {
                     ? redactAbsolutePaths(JSON.stringify(block.input)).slice(0, 20_000)
                     : redactAbsolutePaths(JSON.stringify(block.input)).slice(0, 500),
                 inputSummary: redactOptional(summarizeToolInput(blockName, block.input) ?? undefined),
+                intentInput: captureToolIntentInput(blockName, block.input),
                 isBackground: isBackground || undefined,
-                subagentType,
-                subagentModel,
-                subagentEffort,
+                subagentType: redactOptional(subagentType),
+                subagentModel: redactOptional(subagentModel),
+                subagentEffort: redactOptional(subagentEffort),
                 delegation: stage0.delegation,
                 taskIntentStructured: stage0.taskIntentStructured,
                 artifacts: stage0.artifacts,
@@ -1007,6 +1061,10 @@ export class ClaudeLiveNormalizer {
     }
   }
 
+  rearmRootModelObservation(): void {
+    this.lastRootModel = null;
+  }
+
   private emitRetraction(uuids: string[], meta?: NormalizedOutMeta): void {
     if (uuids.length === 0) return;
     this.emit({ kind: "assistant_retracted", turnId: this.currentTurnId, uuids }, meta);
@@ -1018,13 +1076,18 @@ export class ClaudeLiveNormalizer {
     meta?: NormalizedOutMeta
   ): void {
     // 通知は完全な監査記録で、置き換える側のフレームの supersedes と冪等（sdk.d.ts）。
-    // 拒否の通知（error）より先に出す＝画面から退去させてから通知ブロックを積む
+    // 拒否の通知（model_refusal_fallback または error）より先に出す＝画面から退去させてから通知ブロックを積む
     this.emitRetraction(notice.retractedMessageUuids, meta);
     const message = formatRefusalMessage(notice);
     if (notice.hasFallback) {
+      const fallback = refusalFallbackEvent(notice, this.currentTurnId);
+      if (fallback) this.emit(fallback, meta);
       // scope=local は subagent / 側質問だけの切替でセッションのモデルは変わらない
-      if (!notice.scopeIsLocal) this.refusalWithoutFallback = null;
-      this.emit({ kind: "error", message, fatal: false }, meta);
+      if (!notice.scopeIsLocal) {
+        this.refusalWithoutFallback = null;
+        this.lastRootModel = notice.fallbackModel;
+      }
+      if (!fallback) this.emit({ kind: "error", message, fatal: false }, meta);
       // 切替後のターンで再び拒否されたら、それは別の refusal として通知する
       this.refusalNoticeEmitted = false;
       return;
@@ -1115,7 +1178,7 @@ export class ClaudeLiveNormalizer {
   // task-notification は tool_result block を持たないため、合成 toolUseId
   // （既存カード・placement に一致しない）で tool_call_finished に載せる。
   // 序数は agentId 単位: 同一 task-id の複数回通知を live/history で同じ ID 列にする
-  private emitTaskNotification(notification: TaskNotificationInfo, meta?: NormalizedOutMeta): void {
+  private emitTaskNotification(notification: TaskNotificationInfo, meta?: NormalizedOutMeta): boolean {
     if (!this.observedAsyncAgentIds.has(notification.agentId) && !this.observedBackgroundTaskIds.has(notification.agentId)) {
       this.droppedTaskNotificationCount++;
       // 破棄してもイベントの無い「委任完了の到着」という事実は残る。history 側の
@@ -1123,7 +1186,7 @@ export class ClaudeLiveNormalizer {
       // system メッセージは自前の timestamp を持たず、時刻源は task_updated の
       // end_time だけなので、それが無い通知は境界を置けない（既知の残余）
       if (meta?.timestamp !== undefined) this.pendingGapBoundaries.push(meta.timestamp);
-      return;
+      return false;
     }
     const ordinal = (this.notificationOrdinals.get(notification.agentId) ?? 0) + 1;
     this.notificationOrdinals.set(notification.agentId, ordinal);
@@ -1139,6 +1202,7 @@ export class ClaudeLiveNormalizer {
       },
       meta
     );
+    return true;
   }
 
   private emit(

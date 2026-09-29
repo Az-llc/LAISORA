@@ -1,10 +1,14 @@
+import { fallbackOriginalModel, sameModel } from "../protocol";
+import type { ModelFallbackState, ModelInfo } from "../protocol";
 import type { NormalizedEvent } from "../protocol";
 import type { AskBlock } from "./ask-parser";
 
 export interface YouItem {
   readonly id: string;
-  readonly kind: "approve" | "decide" | "check";
+  readonly kind: "approve" | "decide" | "check" | "confirm";
   readonly title: string;
+  readonly explanation?: string;
+  readonly originalModel?: string;
   readonly options?: readonly { readonly label: string; readonly description: string }[];
   readonly steps?: readonly { readonly do: string; readonly look: string }[];
   readonly createdAt: number;
@@ -165,6 +169,30 @@ export function createYouItems(tabId: string, saved: SavedAskDismissals = {}, lo
   return {
     reader,
     reply,
+    fallback(state: ModelFallbackState, title: string): void {
+      const ev = state.notice;
+      const id = `fallback:${ev.generation}:${ev.seq}`;
+      const previous = items.get(id)?.resolvedAt;
+      // R-GW-09: a re-opened state outranks an earlier resolution of the same item (verify-refusal#RF-MREOPEN2).
+      const resolvedAt = state.resolvedAt ?? (state.reopenedAt === undefined ? previous : undefined);
+      items.set(id, {
+        id, kind: "confirm", title, explanation: ev.explanation ?? undefined,
+        originalModel: fallbackOriginalModel(state), createdAt: ev.timestamp,
+        anchor: { id: youAnchor(tabId, id) },
+        ...(resolvedAt !== undefined ? { resolvedAt, resolution: "resolved" as const } : {}),
+      });
+      notify();
+    },
+    appliedModel(model: string, at: number, models: readonly ModelInfo[]): void {
+      let changed = false;
+      for (const [id, item] of items) {
+        if (item.kind === "confirm" && item.resolvedAt === undefined && sameModel(model, item.originalModel, models)) {
+          items.set(id, { ...item, resolvedAt: at, resolution: "resolved" });
+          changed = true;
+        }
+      }
+      if (changed) notify();
+    },
     retain(replyId: string, from: number, to: number, ids: ReadonlySet<string>): void {
       let changed = false;
       for (const [id, position] of positions) {

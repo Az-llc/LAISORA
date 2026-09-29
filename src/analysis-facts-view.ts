@@ -1,7 +1,51 @@
 import type { DivergenceReport } from "./l3-divergence";
 import type { SessionFacts } from "./session-facts";
 import type { LearningFacts } from "./learning";
+import type { ExecLogFindingView } from "./exec-log-marks";
+import type { LlmFindingReportView } from "./protocol";
 import * as l10n from "@vscode/l10n";
+
+export interface SummaryAnalysisView {
+  improvableCount: number | null;
+  scriptFindingCount: number | null;
+  scriptCandidateCount: number | null;
+  scriptCandidatePercent: number | null;
+  llmState: "current" | "not-run" | "stale";
+  llmExecutionState: "idle" | "running" | "attemptFailed" | "disabled" | "attached";
+  llmFindingCount: number | null;
+  rejectedCount: number | null;
+  generatedAtLabel?: string;
+  llmAreas: { label: string; count: number; percent: number }[];
+}
+
+// R-DSP-50: projectSummaryAnalysis; src/session-semantic.ts#semanticModelPayload
+export function projectSummaryAnalysis(
+  findings: readonly ExecLogFindingView[] | undefined,
+  report: LlmFindingReportView | undefined,
+): SummaryAnalysisView {
+  const attached = report && "attached" in report ? report.attached : undefined;
+  const current = attached?.freshness === "current" ? attached : undefined;
+  const scriptFindingCount = findings?.length ?? null;
+  const scriptCandidateCount = findings?.filter(f => !!f.fixCandidate).length ?? null;
+  const llmFindingCount = current?.findings.length ?? null;
+  const counts = new Map<string, number>();
+  for (const finding of current?.findings ?? []) {
+    counts.set(finding.destinationLabel, (counts.get(finding.destinationLabel) ?? 0) + 1);
+  }
+  const max = Math.max(1, scriptCandidateCount ?? 0, ...counts.values());
+  return {
+    improvableCount: scriptCandidateCount === null ? null : scriptCandidateCount + (llmFindingCount ?? 0),
+    scriptFindingCount,
+    scriptCandidateCount,
+    scriptCandidatePercent: scriptCandidateCount === null ? null : scriptCandidateCount / max * 100,
+    llmExecutionState: report?.state ?? "idle",
+    llmState: current ? "current" : attached ? "stale" : "not-run",
+    llmFindingCount,
+    rejectedCount: current?.rejectedCount ?? null,
+    ...(current ? { generatedAtLabel: current.generatedAtLabel } : {}),
+    llmAreas: [...counts].map(([label, count]) => ({ label, count, percent: count / max * 100 })),
+  };
+}
 
 // Host 射影。整形はすべてここで確定し、webview は文字列を置くだけ
 // （閾値・並べ替え・集約を持ち込まない）

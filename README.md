@@ -6,11 +6,11 @@ An AI agent runs command after command and rewrites code. Watching the log does 
 
 I wanted the everyday view to focus on the conversation: what I want to achieve and how to move forward. When I need the details, I can ask the agent to explain or open the execution log. LAISORA is a VS Code extension built around that way of working.
 
-Commands and file operations appear in LOG, making your instructions and the agent's replies easier to follow in CHAT. The two screenshots below are the same turn: first CHAT with PLAN and YOU beside the conversation, then LOG with the commands it ran, the files it read and edited, the tests, and the subagent.
+Commands and file operations appear in LOG, making your instructions and the agent's replies easier to follow in CHAT. The two screenshots below are the same conversation: first CHAT with PLAN and YOU beside the conversation, then LOG, where each of your requests is a numbered group of the tool calls it led to.
 
 <img src="media/screenshots/conversation.png" alt="CHAT with a decision the agent is asking for, YOU with the waiting decision and resolved items folded into one line, and PLAN with its goal and completed steps folded into one line" width="734">
 
-<img src="media/screenshots/execution-log.png" alt="LOG for the same turn, with commands, file operations, tests, and an expanded subagent report" width="734">
+<img src="media/screenshots/execution-log.png" alt="LOG for the same conversation, with each request as a numbered group: the latest is open, and earlier ones are folded to their last tool call" width="734">
 
 ## Turn work logs into improvements for the next task
 
@@ -42,18 +42,18 @@ CHAT shows what the model says to you, along with approval requests, failures, a
 
 The other views let you look more closely:
 
-- **SUMMARY** — PLAN on the left and YOU on the right, and earlier requests with their step count, time, and tokens. With the agent roster enabled, it also lists the observed agents with their applied model and effort. In a narrow window, YOU comes first in a single column.
-- **GRAPH** — a timeline of the main agent, its subagents, and background tasks, with a zoomable time window. Open a subagent to read the full instruction it was given.
-- **ANALYSIS** — at the top, TIME (the main agent's time by model and in tools), ROLES (time and tokens by delegated role; open a row for its runs) and ERR (failures out of all tool calls, by kind). Below, script analysis lists failure classifications and convention violations linked to LOG, and optional LLM analysis shows findings as numbered articles that link back to their evidence. Analyzing a past session from the history list also compares it with your own past sessions.
-- **LOG** — tool calls with the available input and output previews, duration, and marks for failures and convention violations.
+- **SUMMARY** — at the top, the key figures from GRAPH (elapsed and processing time, parallelism, time per request) and ANALYSIS (improvement candidates by area). Below, PLAN on the left and YOU on the right, and earlier requests with their step count, time, and tokens. With the agent roster enabled, it also lists the observed agents with their applied model and effort. In a narrow window, YOU comes first in a single column.
+- **GRAPH** — a timeline of the main agent, its subagents, and background tasks on an elapsed-time axis, with each request as a block and a zoomable time window. Long waits can be hidden from the axis. Open a subagent to read the full instruction it was given.
+- **ANALYSIS** — at the top, TIME (the main agent's time by model and in tools), ROLES (time and tokens by delegated role; open a row for its runs) and ERR (failures out of all tool calls, by kind). Below, script analysis lists failure classifications and convention violations linked to LOG, and optional LLM analysis shows findings as numbered articles that link back to their evidence. Analyzing a past session opened from the history list also compares it with your own past sessions.
+- **LOG** — tool calls grouped by request, with the available input and output previews, duration, and marks for failures and convention violations. Only the latest request is open; a folded request still shows its last tool call.
 
 Some information may be unavailable when session records are incomplete; the views say so instead of showing partial numbers as complete.
 
 The screenshots below show SUMMARY, GRAPH, and the instruction given to a subagent opened from GRAPH.
 
-<img src="media/screenshots/summary.png" alt="SUMMARY with PLAN and YOU side by side, completed steps and resolved items folded into counted lines, and earlier requests with step counts, time and tokens" width="734">
+<img src="media/screenshots/summary.png" alt="SUMMARY with the GRAPH figures (elapsed and processing time, parallelism, time per request) and the ANALYSIS figures (improvement candidates by area) at the top, and PLAN and YOU below" width="734">
 
-<img src="media/screenshots/graph.png" alt="GRAPH showing a timeline of the main agent and its subagent" width="734">
+<img src="media/screenshots/graph.png" alt="GRAPH with each request as a block on an elapsed-time axis and its subagents below it" width="734">
 
 <img src="media/screenshots/subagent-instruction.png" alt="A subagent opened from GRAPH, with its Instruction tab showing the full instruction the main agent gave it" width="734">
 
@@ -98,8 +98,6 @@ Windows is the tested platform. macOS and Linux have not been verified. WSL, Rem
 
 Install the supplied `.vsix` file using **Extensions: Install from VSIX…** in the VS Code command palette, then reload the window. Open LAISORA from the activity bar or run **LAISORA: Open** from the command palette.
 
-Before starting a conversation, open a project folder or set the default working directory.
-
 The main interface supports English and Japanese; some diagnostic messages remain in Japanese. The README language links above let you choose the documentation language.
 
 ## LAISORA settings
@@ -130,8 +128,6 @@ Permission mode changes in LAISORA do not rewrite Claude Code's shared default p
 Start a manual handoff when the conversation is idle. LAISORA preserves the original session and opens a continuation using a summary and user messages captured since the previous handoff. Older context is carried through existing summaries and handoff records. Handoff uses model capacity. A summary can omit or misinterpret details, so check important requirements when continuing.
 
 You can send an additional instruction while a turn is running. Delivery depends on the Claude Code execution boundary; it does not guarantee an immediate change in behavior.
-
-Live Guardrail detects patterns such as repeated failures and records them in Output. Automatic intervention defaults to warnings; settings can allow reports to be sent to the running agent. It does not automatically interrupt execution, detect stagnation while a tool is running, or monitor all background processes.
 
 #### History, data transmission, and model use
 

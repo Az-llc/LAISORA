@@ -94,6 +94,12 @@ export const FILE_LINK_INSTRUCTION = (cwd = ""): string => {
   return `When you mention a local file or folder, write it as a Markdown link. The link target is the absolute path or the path relative to the ${cwd ? "conversation folder" : "working directory"}, with forward slashes, optionally followed by #L<line> or #L<line>C<column>. ${base} Use the path and line as the link text, for example [src/app.ts:42](src/app.ts#L42) or [app.ts](C:/work/src/app.ts). Folders end with a slash: [artifacts/](artifacts/). Files such as spreadsheets, documents and PDFs are linked the same way and open in their default app. If the path contains spaces, wrap the target in angle brackets: [notes.md](<docs/my notes.md>). Write web URLs with the https:// scheme.`;
 };
 
+export const ASK_DECIDE_FORMAT = () => [
+  l10n.t("Use a fenced code block whose language is exactly laisora-ask. Use the user's language for values. This is a strict YAML-like subset: one nonempty scalar key: value per line; no comments, multiline scalars, nesting, aliases or flow collections. Plain text and JSON double-quoted strings are supported; a plain value must not start with |, >, &, * or ! (use a JSON double-quoted string instead). Keys are unique. List entries use exactly two spaces before '- ' and four spaces before subsequent keys."),
+  l10n.t("A decision requires kind, title, why, options and default. Every option requires label, effect, pros and cons; mark your recommended option with recommended: true and explain why in its effect. Other options omit recommended."),
+  l10n.t("```laisora-ask\nkind: decide\ntitle: What should we choose?\nwhy: Why this decision matters now.\noptions:\n  - label: First choice\n    effect: What happens next and why I recommend it.\n    pros: Its benefit in plain words.\n    cons: Its drawback in plain words.\n    recommended: true\n  - label: Second choice\n    effect: What happens next.\n    pros: Its benefit.\n    cons: Its drawback.\ndefault: Without an answer, I will continue with A.\n```"),
+].join("\n");
+
 // SDK 0.3.270: an omitted systemPrompt is an empty custom prompt (not the claude_code preset), so OFF passes "" to keep that prompt.
 // snapshot:false is required on every launch: the default snapshot replays the prompt recorded when the session was
 // first rendered on each resume (until /compact), so a changed setting would never reach a resumed conversation.
@@ -106,9 +112,7 @@ export const PLAN_INSTRUCTION = [
   "Use AskUserQuestion only when you cannot continue without the answer; otherwise use a laisora-ask block and continue with the stated default.",
   "<format>",
   "A laisora-plan fence contains only goal: followed by one nonempty line in the user's language, using the same scalar rules below: ```laisora-plan\ngoal: Make progress visible throughout the work\n```.",
-  "Use a fenced code block whose language is exactly laisora-ask. Use the user's language for values. This is a strict YAML-like subset: one nonempty scalar key: value per line; no comments, multiline scalars, nesting, aliases or flow collections. Plain text and JSON double-quoted strings are supported. Keys are unique. List entries use exactly two spaces before '- ' and four spaces before subsequent keys.",
-  "A decision requires kind, title, why, options and default. Every option requires label, effect, pros and cons; mark your recommended option with recommended: true and explain why in its effect. Other options omit recommended.",
-  "```laisora-ask\nkind: decide\ntitle: What should we choose?\nwhy: Why this decision matters now.\noptions:\n  - label: First choice\n    effect: What happens next and why I recommend it.\n    pros: Its benefit in plain words.\n    cons: Its drawback in plain words.\n    recommended: true\n  - label: Second choice\n    effect: What happens next.\n    pros: Its benefit.\n    cons: Its drawback.\ndefault: Without an answer, I will continue with A.\n```",
+  ASK_DECIDE_FORMAT(),
   "A real-machine check requires kind, title, why, steps and default. Every step requires do (the action) and look (what to observe). Do not mix options and steps.",
   "```laisora-ask\nkind: check\ntitle: Check the result on your machine\nwhy: What I cannot verify here.\nsteps:\n  - do: Open the changed screen.\n    look: Confirm the labels fit without clipping.\n  - do: Resize the window.\n    look: Confirm every action remains reachable.\ndefault: While awaiting the result, I will continue with the independent work.\n```",
   "</format>",
@@ -607,6 +611,8 @@ export class ClaudeConversation {
       setTimer: (callback, delay) => setTimeout(callback, delay),
       clearTimer: (timer) => clearTimeout(timer as ReturnType<typeof setTimeout>),
       enabled: () => readClaudeCodeSettings(true).autoContinueAtUsageLimit !== false,
+      // R-CNV-41: UsageLimitResume distinguishes connection loss from a busy main turn.
+      connected: () => this.q !== null && !this.closed,
       live: () => this.q !== null && !this.closed && this.state === "idle" && this.inputQueue.length === 0,
       send: (text) => this.send(text, undefined, undefined, true),
       notify: (event) => this.emit(event),
@@ -641,6 +647,7 @@ export class ClaudeConversation {
         void this.requestContextUsage();
       },
       isClosed: () => this.closed,
+      onDelegateUsageLimitStop: (agentId) => this.usageLimitResume.delegateStopped(agentId),
     });
   }
 
@@ -858,7 +865,7 @@ ${ctxJson}`
       options.mcpServers = { ...(options.mcpServers ?? {}), laisora_external: sdk.createSdkMcpServer({
         name: "laisora_external", timeout: this.externalTimeoutMinutes * 60_000 + 10_000,
         tools: [sdk.tool("run", externalDescription(this.externalRows), {
-          target: z.string(), prompt: z.string(), files: z.array(z.string()).optional(), diff: z.string().optional(), cwd: z.string().optional(),
+          target: z.string(), prompt: z.string(), description: z.string().optional(), files: z.array(z.string()).optional(), diff: z.string().optional(), cwd: z.string().optional(),
         }, async (input) => {
           const row = this.externalRows.find((entry) => entry.target === input.target);
           if (!row) return { isError: true, content: [{ type: "text" as const, text: "R-ORC-10: target is not in the conversation snapshot." }] };
@@ -1224,6 +1231,10 @@ ${ctxJson}`
       ]);
     }
     await this.recordLearningDeliveryR31(true);
+  }
+
+  rearmRootModelObservation(): void {
+    this.normalizer.rearmRootModelObservation();
   }
 
   // 実行中のモデル切替（SDK公式API・ストリーミング入力モード限定）

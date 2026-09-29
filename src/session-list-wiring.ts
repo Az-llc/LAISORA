@@ -179,7 +179,7 @@ async function historicalOrigin(file: string): Promise<"claude" | "unknown"> {
 // （ファイル本体は読まない）。組み立ては session-list.ts の純関数。
 // SDK は dist へ束ねてあるが、esbuild は ESM 依存の評価を最初の require まで遅延させる
 // （dist/extension.js の init_sdk）。この評価は同期で、初回だけ二桁〜三桁 ms かかる。
-// この費用は webview の ready ハンドラが払い終えている: warmup → ClaudeHost.start() の
+// この費用は webview の ready ハンドラが払い終えている: warmup → ClaudeConversation.start() の
 // 第一文が同じ require を同期で通す（claudeHost.ts の start）。listSessions を出すのは
 // webview の openHistPanel だけで、その postMessage は同じ経路の ready より後にしか
 // 起きないため、履歴一覧の解決がこの評価を背負うことはない。
@@ -197,8 +197,9 @@ function sessionInfoSdk(): Pick<typeof ClaudeCodeSdk, "getSessionInfo"> {
 // 一覧とタブ名が食い違わない。自前で custom-title を読みに行くと解決器の写しになり腐る。
 // 先頭行の取り出し・空判定・切り詰めをここでやらないこと。displayTitleFromSummary と
 // 二重の正規化になり、先頭行が空の summary で一覧（無題）とタブ（据え置き）が割れる（R-SES-05）
-// 公式の単体解決器を叩く唯一の場所。タブ名（sessionSummaryOf 経由）と履歴一覧が同じ
-// 呼び出しを通るので、両者が食い違わない（R-SES-05）。
+// 公式の単体解決器を叩く唯一の場所。通常のタブ名（sessionSummaryOf 経由）と履歴一覧が
+// 同じ呼び出しを通る（R-SES-05）。
+// R-LRN-18: research titles use a persisted custom title before history resolution on reload.
 // dir は渡さない。SDK の dir は「実 cwd」で、これを SDK 側が Jf() で符号化して
 // ~/.claude/projects/<符号化名> を組み立てる（sdk.mjs er / Ci）。こちらが readdir で
 // 知っているのは符号化後のディレクトリ名で、Jf は非可逆（[^a-zA-Z0-9]→'-'・200 字超は
@@ -225,8 +226,24 @@ export async function sessionSummaryOf(sessionId: string): Promise<string | unde
   return typeof info?.summary === "string" ? info.summary : undefined;
 }
 
-// タブ名を履歴一覧と同じ値へ付け直す。autoTitled は読まない（読むと初回発言の名前で
-// 固定され、履歴一覧の summary が動いた分だけ食い違う — R-SES-05）
+const initialTabTitles = new WeakMap<Session, { generation: number; title: string }>();
+
+export function setInitialTabTitle(session: Session, title: string): void {
+  session.title = title;
+  session.autoTitled = true;
+  initialTabTitles.set(session, { generation: session.logicalGeneration, title });
+}
+
+export function persistInitialTabTitle(session: Session): void {
+  const initial = initialTabTitles.get(session);
+  if (initial?.generation !== session.logicalGeneration || session.closed || session.clearing || session.titleRefreshing) return;
+  // R-LRN-18: persist as soon as init supplies a transcript ID; terminal events retry missing files or failed IO.
+  session.titleRefreshing = true;
+  void refreshTabTitle(session);
+}
+
+// 初期固定名は custom-title として保存し、それ以外は履歴一覧と同じ値へ付け直す。
+// autoTitled は読まない（初回発言で固定すると summary の変化と食い違う — R-SES-05）。
 export async function refreshTabTitle(session: Session): Promise<void> {
   // SDK が system/init の session_id として報告した「今書いているセッション」の id だけを使う。
   // expectedConversationId は claudeHost が自前で振る randomUUID で SDK へ渡らないため、
@@ -236,6 +253,21 @@ export async function refreshTabTitle(session: Session): Promise<void> {
   try {
     if (!sessionId) return;
     rememberSession(session);
+    const initial = initialTabTitles.get(session);
+    if (initial?.generation === generation) {
+      const ref = sessionTranscriptRef(session);
+      if (!ref) return; // R-SES-05: persist the initial title through formatCustomTitleRecord.
+      try {
+        await appendSessionRecord(ref.file, formatCustomTitleRecord(ref.sessionId, initial.title));
+      } catch (error) {
+        output.appendLine(`R-LRN-18: Could not save the research tab title: ${String(error)}`);
+        return;
+      }
+      if (session.logicalGeneration !== generation || session.closed) return; // R-LRN-18
+      initialTabTitles.delete(session);
+      session.titleRefreshed = true;
+      return;
+    }
     const summary = await sessionSummaryOf(sessionId);
     // 解決できないときは既存のタブ名を保ち、印も立てない。次のターンで再試行する（R-SES-05）
     if (summary === undefined) return;
@@ -282,7 +314,7 @@ async function listPastSessions(
 
   // 読めなかったものを種類別に数える。ここを数えないと、走査が失敗しても complete=true・
   // 0 件で返り、画面が「セッションが見つかりません」と断言する（R-DSP-01。Google Drive 同期下で
-  // 現実に起こる）。emit へ渡すこと自体を消すと検査 W-F0-DEG が落ちる
+  // 現実に起こる）。emit へ渡すこと自体を消すと verify-session-list#SL-34b が落ちる
   const degradation: SessionScanDegradation = {
     rootFailed: false,
     unreadableProjects: 0,
@@ -451,6 +483,7 @@ export async function handleSessionFileMessage(
       // 書き込み待ちの間に /clear や resume で別セッションになったタブへ名前を入れない
       if (s.closed || s.logicalGeneration !== generation) break;
       s.title = displayTitleFromSummary(title, ref.sessionId);
+      initialTabTitles.delete(s);
       s.autoTitled = true;
       st.post({ type: "tabRenamed", tabId: s.tabId, title: s.title });
       break;

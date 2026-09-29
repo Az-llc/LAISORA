@@ -104,7 +104,7 @@ export interface EffectGapRecord {
 }
 
 // 上限に当たっても捨ててはいけない要約（P1-F / 要求18）。
-// raw の TodoTransition 配列を単純に cap すると reworkCount・Attempt 境界・Q4 が壊れる
+// raw の TodoTransition 配列を単純に cap すると reopenCount・Attempt 境界・Q4 が壊れる
 export interface TaskTransitionSummary {
   taskKey: string;
   reopenCount: number;
@@ -315,7 +315,7 @@ function applyIntentAtFinish(
   if (intent.kind === "todo") {
     const currentKeys = new Set(intent.items.map((i) => i.taskKey));
     // TodoWrite はレベル信号: 配列から消えた todo を失効させないと in_progress が
-    // 滞留し、activeAmbiguous が立ちっぱなしになる（reducer applyTodoIntent と同じ規律）
+    // 滞留し、activeAmbiguousAtStart が立ちっぱなしになる（reducer applyTodoIntent と同じ規律）
     for (const s of summaryMap.values()) {
       if (
         s.taskKey.startsWith("todo:") &&

@@ -1,6 +1,9 @@
+import { foldModelFallback } from "./protocol";
+import type { ModelFallbackState, ModelInfo } from "./protocol";
 import type { ClaudeConversation } from "./claudeHost";
 import type { HostArtifactAccess } from "./artifact-access";
 import { applyActivityEvent, type BackgroundActivityState } from "./background-activity";
+import { attachTimeBucketRequestNumbers } from "./time-buckets";
 import { foldEvidence, type SemanticEvidenceIndex } from "./evidence-index";
 import { windowEvents } from "./event-window";
 import { foldGuardrail, touchedSignalIds, type GuardrailState } from "./guardrail";
@@ -78,6 +81,10 @@ export interface EventFoldDraft {
   guardrailLiveSince?: number;
   commands: SlashCommandInfo[];
   auth: AuthStatus | null;
+  modelFallback?: ModelFallbackState;
+  models?: ModelInfo[];
+  appliedModel?: string;
+  effectiveModel?: string | null;
   lastContextTotalTokens: number | null;
   liveDelegationAgentIds: Set<string>;
   liveDelegationRev: number;
@@ -235,6 +242,12 @@ export function foldEventState(
     seq: draft.seq,
     timestamp: meta?.timestamp ?? draft.lastEventTimestamp ?? 0,
   } as NormalizedEvent;
+  const previousFallback = draft.modelFallback;
+  draft.modelFallback = foldModelFallback(previousFallback, ev, draft.models);
+  if (draft.modelFallback && draft.modelFallback !== previousFallback && draft.modelFallback.resolvedAt === undefined) {
+    draft.appliedModel = draft.modelFallback.appliedModel;
+    draft.effectiveModel = draft.modelFallback.appliedModel;
+  }
   if (ev.kind === "auth_status") {
     draft.auth = ev.auth;
     if (ev.auth?.sessionId) {
@@ -281,6 +294,10 @@ export function foldEventState(
       meta?.hostArtifacts,
       boundaries.length > 0 ? boundaries : undefined
     );
+    if (ev.kind === "turn_started" || ev.kind === "user_message") {
+      const timeBuckets = attachTimeBucketRequestNumbers(draft.evidenceIndex.timeBuckets, draft.workModel.requests ?? []);
+      if (timeBuckets !== draft.evidenceIndex.timeBuckets) draft.evidenceIndex = { ...draft.evidenceIndex, timeBuckets };
+    }
   } catch (error) {
     // 落としたイベントの根拠は後から復元できない。数えずに進めると L3・LLM 入力・Inspector が
     // 欠けた索引の上で「全量」として走る（R-DSP-01。G-COV-8）
@@ -329,7 +346,8 @@ export function foldEventState(
   // complete のままになり、概要が「詳細: すべて表示」と嘘をつく
   draft.workModel = markEventLogTrimmed(draft.workModel, draft.events.length + 1 - trimmed.length);
   draft.events = trimmed;
-  // 初回ターンが完了した時点で、履歴一覧と同じ解決器由来の名前へ付け直す（R-SES-05）。
+  // 初回ターン完了時、通常のタブ名を履歴一覧と同じ解決器由来の名前へ付け直す（R-SES-05）。
+  // R-LRN-18: research titles use a persisted custom title; refresh retries it if init could not save it.
   // live に限るのは resume の履歴再生でも turn_completed が流れるため（history 経路は
   // 常に provenance {path:"history"} を持つ）。resuming / closed 中は付け直さない
   if (

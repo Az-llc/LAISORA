@@ -1,10 +1,12 @@
 import { DEFAULT_ACCENT_SETTINGS, isAccentColor, isAccentSettingValue, type AccentSetting, type AccentSettings } from "./accent";
-import { join } from "node:path";
+import { isAbsolute, join, relative, sep } from "node:path";
+import { containsAbsolutePath } from "./path-redaction";
 import { latestModelProfile } from "./learning";
 import { sharedLearningService } from "./learning-service";
-import { listedProfileTargets, selectedProfileRows, profileTargetKey, resolveClaudeProfileModel, renderModelProfileSection, profileAutoApply } from "./orchestration-profiles";
+import { listedProfileTargets, selectedProfileRows, profileTargetKey, resolveClaudeProfileModel, renderModelProfileSection, profileAutoApply, rosterEffortInstruction, type EffortSettingsLocation } from "./orchestration-profiles";
 import { conductorInstruction, estimateTokens, resolveOrchestrationRoster, orchestrationExternalTargets } from "./orchestration-roster";
-import { queueModelProfileResearch, flushModelProfileResearch } from "./learning-research";
+import { queueModelProfileResearch, flushModelProfileResearch, hasModelProfileResearch } from "./learning-research";
+import { openNewConversationTab, tabLimit } from "./store-surfaces";
 import { homedir } from "node:os";
 import { listClaudeModels, detectClaudeExecutor } from "./orchestration-claude";
 import { EXECUTORS, claudeModelIdLabel, executorMap, type ExecutorId } from "./orchestration-executors";
@@ -28,7 +30,7 @@ import * as l10n from "@vscode/l10n";
 import { configuredClaudeExecutablePath, getLaisoraConfiguration, readClaudeCodeSettings } from "./claude-settings";
 import { extensionContext, output, store } from "./host-context";
 import { ADDITIONAL_MODELS_KEY, CLAUDE_VERSION_ID, additionalClaudeModelIds, recomputeModelRows, modelsMessage } from "./gateway-models";
-import { restoreTabsOnStartupEnabled } from "./session-list-wiring";
+import { restoreTabsOnStartupEnabled, setInitialTabTitle } from "./session-list-wiring";
 
 export function accentSettings(): AccentSettings {
   const cfg = getLaisoraConfiguration();
@@ -203,43 +205,100 @@ export function projectConductorPreview(policy?: string): { text: string; tokens
 
 export function researchUnavailableReason(): string {
   if (!getLaisoraConfiguration().get<boolean>("learning.enabled", false)) return l10n.t("Enable learning to research model characteristics.");
-  if (!currentResearchSession()) return l10n.t("Open a conversation to research model characteristics.");
+  if (store && store.sessions.size >= tabLimit()) return l10n.t("LAISORA: The tab limit ({0}) has been reached.", tabLimit());
   return "";
 }
 
-function currentResearchSession() {
-  const activeId = store?.activeWebview ? store.activeTabIdOf(store.activeWebview) : undefined;
-  const session = activeId ? store?.sessions.get(activeId) : store?.sessions.size === 1 ? [...store.sessions.values()][0] : undefined;
-  return session && !session.closed && !session.clearing && (session.conversation || session.auth?.sessionId || session.resumeSessionId) ? session : undefined;
+function remoteEffortUnavailableReason(): string {
+  // R-LRN-19: remote workspace hosts cannot resolve the local settings destination.
+  return vscode.env.remoteName && extensionContext?.extension?.extensionKind === vscode.ExtensionKind.Workspace
+    ? l10n.t("Effort proposals are unavailable because LAISORA is running in a remote extension host.") : "";
 }
 
-export function requestModelProfileResearch(ids: readonly string[]): void {
-  const reason = researchUnavailableReason();
-  if (reason) { void vscode.window.showInformationMessage(reason); return; }
-  const session = currentResearchSession()!;
-  if (Object.values(externalModels).some(list => list.state === "checking")) return; // R-LRN-13: wait for the complete settings model lists.
+export function resolveRosterSettingsLocation(): EffortSettingsLocation | undefined {
+  if (remoteEffortUnavailableReason()) return undefined; // R-LRN-19
+  const cfg = getLaisoraConfiguration();
+  const inspected = cfg.inspect("orchestration.agents");
+  const folder = vscode.workspace.workspaceFolders?.[0]?.uri;
+  const workspaceFile = vscode.workspace.workspaceFile;
+  // R-LRN-19: use the same working folder as a newly opened conversation.
+  const cwd = cfg.get<string>("defaultCwd") || folder?.fsPath || homedir();
+  const locationFor = (file: string, scope: EffortSettingsLocation["scope"], isDefault: boolean, inWorkspaceFile: boolean): EffortSettingsLocation | undefined => {
+    for (const [base, pathBase] of [[cwd, "workingFolder"], [homedir(), "home"]] as const) {
+      const local = relative(base, file);
+      if (!local || isAbsolute(local) || local === ".." || local.startsWith(`..${sep}`)) continue;
+      const path = (pathBase === "home" ? "~/" : "") + local.split(sep).join("/");
+      if (!containsAbsolutePath(path)) return { path, pathBase, scope, isDefault, inWorkspaceFile };
+    }
+    return undefined;
+  };
+  if (inspected?.workspaceFolderValue !== undefined && folder) {
+    return locationFor(vscode.Uri.joinPath(folder, ".vscode", "settings.json").fsPath, "workspaceFolder", false, false);
+  }
+  if (inspected?.workspaceValue !== undefined && (workspaceFile || folder)) {
+    return locationFor(workspaceFile?.fsPath ?? vscode.Uri.joinPath(folder!, ".vscode", "settings.json").fsPath,
+      "workspace", false, !!workspaceFile);
+  }
+  // R-LRN-19 / R-ORC-05: application settings use the Host's user-data directory.
+  const storage = extensionContext?.globalStorageUri;
+  return storage ? locationFor(vscode.Uri.joinPath(storage, "..", "..", "settings.json").fsPath,
+    "user", inspected?.globalValue === undefined, false) : undefined;
+}
+
+function effortUnavailableReason(): string {
+  return remoteEffortUnavailableReason() || (resolveRosterSettingsLocation() ? ""
+    : l10n.t("Effort proposals are unavailable because the settings file cannot be named without an absolute path."));
+}
+
+export function requestModelProfileResearch(ids: readonly string[], purpose?: "effort"): void {
+  if (!getLaisoraConfiguration().get<boolean>("learning.enabled", false)) {
+    void vscode.window.showInformationMessage(researchUnavailableReason()); // R-LRN-18
+    return;
+  }
+  if (!store) return;
   const known = listedProfileTargets(externalModels, configuredProfileRoster());
   const targets = known.filter(target => ids.includes(profileTargetKey(target)));
   if (!ids.length || ids.some(id => !targets.some(target => profileTargetKey(target) === id))) {
-    output.appendLine("R-LRN-13: rejected unknown model research targets");
+    output.appendLine("R-LRN-18: rejected unknown model research targets");
     return;
   }
-  queueModelProfileResearch(session, targets, normalizeProfileSources(getLaisoraConfiguration().get("learning.profileSources")));
-  flushModelProfileResearch(session, true, externalModels, configuredProfileRoster());
-  void vscode.window.showInformationMessage(l10n.t("Research is queued for this conversation. If learning was just enabled, it waits for the next normal connection start."));
+  if ([...store.sessions.values()].some(session => hasModelProfileResearch(session, targets, purpose === "effort"))) {
+    void vscode.window.showInformationMessage(purpose === "effort" ? l10n.t("An effort proposal for these models is already running.") : l10n.t("Research for these models is already running.")); // R-LRN-18 / R-LRN-19
+    return;
+  }
+  const reason = researchUnavailableReason() || (purpose === "effort" ? effortUnavailableReason() : "");
+  if (reason) { void vscode.window.showInformationMessage(reason); return; } // R-LRN-18
+  const location = purpose === "effort" ? resolveRosterSettingsLocation() : undefined;
+  openNewConversationTab(store, session => {
+    setInitialTabTitle(session, purpose === "effort" ? l10n.t("Roster effort proposal") : l10n.t("Model characteristics research"));
+    queueModelProfileResearch(session, targets, normalizeProfileSources(getLaisoraConfiguration().get("learning.profileSources")),
+      purpose === "effort" ? (models, roster, confirmed) => {
+        const instruction = rosterEffortInstruction(location!, roster, models, confirmed);
+        if (containsAbsolutePath(instruction)) {
+          void vscode.window.showInformationMessage(l10n.t("Effort proposals are unavailable because the instruction contains an absolute path."));
+          return undefined;
+        }
+        return instruction;
+      } : undefined);
+  });
 }
 
 function projectSettingsProfiles() {
   const state = settingsLearningState();
   const selected = listedProfileTargets(externalModels, configuredProfileRoster());
-  const missing = selected.filter(target => !state || !latestModelProfile(state, target));
   const unresolved = [...new Set(selectedProfileRows(configuredProfileRoster(), externalModels)
     .filter(row => row.executor === "claude" && !resolveClaudeProfileModel(row.model, externalModels)).map(row => row.model))];
-  const names = [...missing.map(target => target.executor === "claude" ? claudeModelIdLabel(target.model) : target.model),
+  const names = [...selected.map(target => {
+    const name = target.executor === "claude" ? claudeModelIdLabel(target.model) : target.model;
+    const profile = state && latestModelProfile(state, target);
+    const checked = profile && new Date(Math.max(...profile.sources.map(source => Date.parse(source.checkedAt))));
+    const date = checked && [checked.getFullYear(), String(checked.getMonth() + 1).padStart(2, "0"), String(checked.getDate()).padStart(2, "0")].join("-");
+    return l10n.t("{0} ({1})", name, date ? l10n.t("Last retrieved {0}", date) : l10n.t("Not registered"));
+  }),
     ...unresolved.map(alias => l10n.t("{0} (cannot research because the version could not be retrieved)", alias))];
-  return { missingProfiles: missing.map(profileTargetKey),
-    researchText: names.length ? l10n.t("Model characteristics not registered: {0}", names.join(l10n.t(", "))) : "",
-    researchUnavailable: researchUnavailableReason(), conductorPreview: projectConductorPreview() };
+  return { researchTargets: selected.map(profileTargetKey),
+    researchText: names.length ? l10n.t("Model characteristics: {0}", names.join(l10n.t(", "))) : "",
+    researchUnavailable: researchUnavailableReason(), effortUnavailable: effortUnavailableReason(), conductorPreview: projectConductorPreview() };
 }
 
 export function settingsStateMessage(): Extract<HostToSettingsPage, { type: "settingsState" }> {

@@ -1,4 +1,5 @@
 import * as l10n from "@vscode/l10n";
+import { toolIntentLabel } from "./status-line";
 import type { OrchestrationView, PlanContext, WorkAgentNode, WorkModelPayload } from "../protocol";
 import type { PlanUsage, PlanTokenTotal } from "../plan-usage";
 import type { TaskStatus, WorkStatus } from "../work-model";
@@ -183,7 +184,7 @@ export function derivePlanView(model: WorkModelPayload | undefined, orchestratio
   const visit = (agent: WorkAgentNode): void => {
     const observed = orchestration?.agents.find(value => value.agentId === (agent.transcriptAgentId ?? agent.agentId));
     const lane: PlanLane = { id: `agent:${agent.transcriptAgentId ?? agent.agentId}`, agent: observed?.role ?? agent.agentType ?? agent.modelMeasured ?? agent.modelDeclared ?? "Claude",
-      title: agent.description, start: agent.startedAt ?? null,
+      title: agent.status === "running" && agent.intentInput ? toolIntentLabel("Agent", agent.intentInput) : agent.description, start: agent.startedAt ?? null,
       elapsed: agent.status === "running" && agent.startedAt !== undefined && context.running
         ? Math.max(agent.elapsedMs, nowMs - agent.startedAt)
         : agent.origin === "restored" && (agent.startedAt === undefined || agent.endedAt === undefined) ? null : agent.elapsedMs,
@@ -221,7 +222,7 @@ export function derivePlanView(model: WorkModelPayload | undefined, orchestratio
       start: Date.parse(run.startedAt), elapsed: run.durationMs, status: run.outcome === "ok" ? "completed" : "failed",
       tokens: tokens?.tokens ?? null, cacheRead: tokens?.cacheRead ?? 0, external: true });
   }
-  for (const tool of model?.planTools ?? []) attach({ id: `tool:${tool.id}`, agent: "Claude", title: tool.description || tool.name,
+  for (const tool of model?.planTools ?? []) attach({ id: `tool:${tool.id}`, agent: "Claude", title: toolIntentLabel(tool.name, tool.intentInput),
     start: tool.startedAt, elapsed: Math.max(0, (context.running ? Math.max(nowMs, context.end) : context.end) - tool.startedAt),
     status: "running", tokens: null, cacheRead: 0, external: false });
   const external = [...view.now, ...view.steps.flatMap(step => step.lanes)].filter(lane => lane.external);
@@ -233,5 +234,5 @@ export function derivePlanView(model: WorkModelPayload | undefined, orchestratio
 // PLAN の手順の同一性。TaskCreate / TaskUpdate は task id（改名しても同じ手順）、TodoWrite は正規化した文面。
 // "\n" は normalizePlanContent を通らないので、task id と TodoWrite の文面は衝突しない
 export function planStepKey(entry: { source?: "tasks" }, item: { taskKey: string; description: string }): string {
-  return entry.source === "tasks" ? `task\n${item.taskKey}` : normalizePlanContent(item.description);
+  return (entry.source === "tasks" || item.taskKey.startsWith("task:")) ? `task\n${item.taskKey}` : normalizePlanContent(item.description);
 }

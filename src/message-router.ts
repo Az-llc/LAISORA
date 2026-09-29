@@ -25,7 +25,6 @@ export async function handleWebviewMessage(
     return;
   }
   const msg = raw;
-  // tabId を持つメッセージは対象 Session を解決（閉鎖済みタブ宛は黙って捨てず記録）
   const target = "tabId" in msg ? st.sessions.get(msg.tabId) : undefined;
   if ("tabId" in msg && !target) {
     output.appendLine(`[drop] message for unknown tab: ${msg.type} ${msg.tabId}`);
@@ -40,7 +39,6 @@ export async function handleWebviewMessage(
       case "closeTab":
       case "clearTab":
         await handleSurfaceMessage(st, msg, sender, target);
-        // 設定値は snapshot に載せず、面が立つたびにここで届ける
         if (msg.type === "ready") void st.postTo(sender, userSettingsMessage());
         break;
       case "send":
@@ -87,7 +85,6 @@ export async function handleWebviewMessage(
         await runHostActionMessage(msg);
         break;
       case "analyzeCurrent":
-      case "analyzeSession":
       case "llmAnalysisRequest":
       case "suggestSessionName":
       case "summarizeSession":
@@ -112,8 +109,6 @@ export async function handleWebviewMessage(
         fatal: false,
       });
     }
-    // 分析中の例外でもペンディング表示を解除する。待ちが無ければ webview 側は何もしない。
-    // 理由は上の error イベントが会話へ運ぶので載せない。要求元の面だけへ返す（別面の待ちを解除しない）
     void st.postTo(sender, { type: "analysisFailed", kind: "script", ...("tabId" in msg ? { tabId: msg.tabId } : {}) });
   }
 }

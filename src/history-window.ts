@@ -222,8 +222,8 @@ function touchScope(scopeKey: string): Registration {
 
 // windowEvents は「先頭が turn_started であるか、先頭より前に turn_started が存在しない」窓しか
 // 返さない（event-window.ts:8-11）。prefix へ max=1 で当てると、その不変条件を満たす頭が1件だけ
-// 返り、それが prepend 方向のスナップ位置になる。minIndex をそのまま使う形へ単純化すると窓の
-// 先頭が turn_started でなくなり、tab.ts の turnId 照合が落ちて delta が全消滅する（C2-4）。
+// 返り、それが prepend 方向のスナップ位置になる。本文の結合は
+// src/webview/tab.ts#prependPastConvEvents が担い、開始イベントを前提にしない。
 // turn 境界の規則をここへ書き写して第2実装にしないこと。
 function snapChunkStart(reg: Registration, minIndex: number): number {
   if (minIndex <= 0) return 0;

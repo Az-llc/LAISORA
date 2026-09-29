@@ -17,6 +17,7 @@
   "config.laisora.restoreTabsOnStartup.description": "ウィンドウを最後に閉じた・再読み込みしたときに開いていた会話タブを、起動時に開き直します。一度も送信していないタブは復元しません。",
   "config.laisora.claude.planInstruction.description": "Claudeに計画を更新させ、判断と実機確認を専用のブロックで表示させます。新しく始めた会話と、再開した会話から有効です。実行中の会話には反映しません。",
   "config.laisora.claude.fileLinkInstruction.description": "Claudeに、ローカルファイルをエディタで開けるMarkdownリンクの形式で書かせます（短いシステムプロンプトとして渡します）。新しく始めた会話と、再開した会話から有効です。実行中の会話には反映しません（会話の途中でシステムプロンプトを変えるとプロンプトキャッシュが使えなくなり、次の返答で会話全体を送り直すことになるため）。",
+  "config.laisora.claude.restoreModelAfterRefusalFallback.description": "拒否によって会話がフォールバック先のモデルへ切り替わったとき、そのターンの終了時に選んでいたモデルへ戻します。変更はその会話だけに適用し、settings.json には保存しません。オフのときは YOU の「元のモデルに戻す」を使います。",
   "config.laisora.fileLinks.revealInExplorer.description": "LAISORAのエディタータブでファイルリンクを押したとき、エクスプローラーでもそのファイルを選択します。サイドバーのLAISORAで押したリンクでは選択しません（サイドバーではエクスプローラーが会話と入れ替わるため）。ワークスペース外のファイルはエクスプローラーで選択しません。",
   "config.laisora.fileLinks.allowOutsideWorkspace.description": "会話中のMarkdownファイルリンクが、ワークスペースと会話フォルダーの外を指していても開きます。ネットワーク共有（UNCパス）とデバイスパスは常に拒否し、リンクにもしません。ユーザー設定でのみ指定できます。",
   "config.laisora.fileLinks.confirmOutsideWorkspace.description": "ワークスペース外のファイルを開く前に確認します。laisora.fileLinks.allowOutsideWorkspaceがオンのときだけ使います。ユーザー設定でのみ指定できます。",

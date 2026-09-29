@@ -1,8 +1,8 @@
-// 履歴から再開: 🕘 の履歴パネル（一覧・検索・分析導線）。
+// 履歴から再開: 🕘 の履歴パネル（一覧・検索）。
 import * as l10n from "@vscode/l10n";
 import type { SessionListItem, SessionScanDegradation } from "../protocol";
 import { sessionScanNote } from "../session-list";
-import { histBtn, histListEl, histPanelEl, histSearchEl, isAnalysisPending, requestAnalysis, vscode } from "./dom";
+import { histBtn, histListEl, histPanelEl, histSearchEl, vscode } from "./dom";
 import { activeTabId } from "./main";
 
 let historySource: "laisora" | "claude" = "laisora";
@@ -132,24 +132,12 @@ export function renderHistList(sessions: SessionListItem[]): void {
     const meta = document.createElement("div");
     meta.className = "hist-meta";
     meta.textContent = `${relativeTime(s.mtime)} · ${cwdTail(s.cwd)}`;
-    const analyzeBtn = document.createElement("button");
-    analyzeBtn.className = "hist-analyze";
-    analyzeBtn.textContent = "📊";
-    analyzeBtn.title = l10n.t("Analyze this session");
-    analyzeBtn.setAttribute("aria-label", l10n.t("Analyze this session"));
-    analyzeBtn.dataset.analysisTrigger = "true";
-    analyzeBtn.disabled = isAnalysisPending();
-    analyzeBtn.onclick = (e) => {
-      e.stopPropagation();
-      requestAnalysis(analyzeBtn, { type: "analyzeSession", sessionId: s.sessionId, filePath: s.filePath });
-      closeHistPanel();
-    };
     if (s.originUnverified) {
       const origin = document.createElement("div");
       origin.className = "hist-meta";
       origin.textContent = l10n.t("Earlier history (app not recorded)");
-      row.append(title, meta, origin, analyzeBtn);
-    } else row.append(title, meta, analyzeBtn);
+      row.append(title, meta, origin);
+    } else row.append(title, meta);
 
     row.onclick = () => {
       // 表示中のタブが未使用なら、そこへ復元してタブを増やさない（判定はホスト側）

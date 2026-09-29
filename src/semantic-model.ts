@@ -1503,7 +1503,7 @@ function deriveReviewsEdges(
 
   // reviews 辺は candidate / inferred のみ。L2 グラフ表示と L3 の件数（attemptPairReviewsRelated）にだけ使い、判定入力にしない。
   // 1. 親（コンダクター自筆）Attempt はレビュー主体から除外する
-  // 2. exec ゲートは EXEC_TOOLS 呼び出し数ではなく effectGaps 件数で近似する（mcp__/未知ツール・path 欠落も含む広い述語）
+  // 2. exec ゲートは effectGaps 件数で近似する（mcp__/未知ツール・path 欠落も含む広い述語）
   // 3. 交差判定は norm 済みイベントに限定せず全 artifactAccesses を使う
   // 4. depth>=2 の subagent reviewer は Attempt を持たないので発火しない
   {
@@ -1605,7 +1605,7 @@ function deriveReviewsEdges(
   return Array.from(edgeMap.values());
 }
 
-// R6a-2: 間接シグナルは candidate 別格保持・task_reopened へ昇格させない
+// R6a-2: 間接シグナルは candidate 別格保持・taskReopened へ昇格させない
 function deriveReworkCandidates(
   taskNodes: TaskDefinitionNode[],
   attemptNodes: ExecutionAttemptNode[],
@@ -1968,7 +1968,7 @@ export function deriveSemanticModel(
     liveDelegationAgentIds?: ReadonlySet<string>;
     // scope 照合の基準ディレクトリ（Host-only）
     baseDir?: string;
-    // サブエージェントの端点（子 transcript の最初 / 最後）。渡さないと起動 ACK や子ツール終端で近似する（R-DSP-17）
+    // R-DSP-49: childSpans; src/time-buckets.ts#deriveTimeBuckets
     childSpans?: readonly ChildTranscriptSpan[];
   }
 ): SemanticModel {

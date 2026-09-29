@@ -202,6 +202,15 @@ function buildEventItems(
       continue;
     }
 
+    if (event.kind === "model_refusal_fallback") {
+      const alias = `N${items.length + 1}`;
+      const detail = JSON.stringify({ scope: event.scope, originalModel: event.originalModel,
+        fallbackModel: event.fallbackModel, category: event.category, turnId: event.turnId });
+      items.push({ canonicalId: `model-fallback:${event.timestamp}:${items.length}`, alias,
+        timestamp: event.timestamp, line: `${alias} | ${offset} | model_refusal_fallback | ${detail}`, isError: false });
+      continue;
+    }
+
     if (event.kind === "tool_call_started") {
       eventSeq++;
       const alias = aliases.aliasOf.get(event.toolUseId) ?? `E${eventSeq}`;

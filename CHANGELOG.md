@@ -1,5 +1,39 @@
 # Changelog
 
+## 1.3.0
+
+- **GRAPH redesigned.** The axis is elapsed time. Hidden waits are cut from both the axis and the
+  total, and reply waits start hidden. A 15-minute grid replaces the break marks and fold bands,
+  and a coverage line appears only where records are really missing.
+- **LOG redesigned.** Each request is a numbered, foldable group with its duration. Only the
+  latest request is open, and a folded request still shows its last tool row. Failures are marked
+  by a glyph, and findings appear as a line under the row they concern.
+- **SUMMARY HUD.** The top of SUMMARY is now a compact HUD with two groups. GRAPH covers elapsed
+  and processing time, parallelism, a per-request strip and reply wait. ANALYSIS covers
+  improvement candidates and their state. The old start line, time buckets, bars and cards are
+  gone.
+- **Status line shows what is really happening:** generating, delegates running, or a decision
+  waiting for you. It and NOW also say what a tool call is doing, taken from the call's own input.
+- Loading indicators in the status line, history slot and PLAN bar sit at the right end, so the
+  text is truncated first. The PLAN bar loader lines up with the running text beside it.
+- **Refusal fallback.** When a refusal switches the conversation to a fallback model, the
+  conversation says so and the model chip warns while it is in effect. When that turn ends, the
+  model you chose is restored for that conversation only; settings.json is not changed. To
+  confirm in YOU with a restore button instead, turn off
+  `laisora.claude.restoreModelAfterRefusalFallback`.
+- **Delegated runs resume after usage limits.** If a delegate stops on the usage limit while the
+  main conversation is idle, a resume is scheduled.
+- **Settings: Suggest efforts.** A new button next to Research opens a conversation that proposes
+  an effort for each roster row. Only the rows you approve are changed, and the diff is shown.
+- **Model characteristics.** Research opens in its own conversation tab and can be run again at
+  any time. The research block lists each roster model with the date it was last retrieved. The
+  characteristics now cover only effort behaviour and caveats.
+- The per-row analysis button in the history list is removed.
+- Fixes: a decision block value that starts with `#` or another literal character is now read
+  correctly; a reply that was still arriving when the next turn started keeps its late text;
+  `media/tokens.css` was missing from the 1.1.1 and 1.2.0 packages and is now included.
+- Agent SDK 0.3.284 (bundled Claude Code CLI 2.1.284).
+
 ## 1.2.0
 
 - **ANALYSIS redesigned.** A compact grid opens the page: TIME (the main agent's time per model

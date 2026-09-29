@@ -2,10 +2,9 @@
 // createElement / addEventListener 等は各モジュールに残る。この入口が守るのは取得の評価順だけ。
 // テンプレート書き込みは init 関数に包まない: 値 import された時点で必ず走ることが、
 // 「要素取得はテンプレートより後」を規律ではなくモジュールグラフで保証する仕組みそのもの。
-// この保証は本モジュールの値 import が、import もトップレベルの DOM 参照も持たない葉（@vscode/l10n・./loader）
+// この保証は本モジュールの値 import が、import もトップレベルの DOM 参照も持たない葉（@vscode/l10n）
 // だけであることに依存する（それ以外の import を足すな）。
 import * as l10n from "@vscode/l10n";
-import { createLoader } from "./loader";
 import type { WebviewToHost } from "../protocol";
 
 type VsCodeWebviewApi = {
@@ -124,54 +123,5 @@ export const findPrevBtn = document.getElementById("findprev") as HTMLButtonElem
 export const findNextBtn = document.getElementById("findnext") as HTMLButtonElement;
 export const findCloseBtn = document.getElementById("findclose") as HTMLButtonElement;
 findInputEl.placeholder = FIND_PLACEHOLDER;
-
-// テンプレートに置かず生成するのは、dom.ts が値 import を持たない葉であることで保証している
-// 「要素取得はテンプレートより後」の規律に、新しい getElementById を足さないため
-const analysisBusyEl = document.createElement("div");
-analysisBusyEl.id = "analysis-busy";
-analysisBusyEl.setAttribute("role", "status");
-const analysisBusySpinner = document.createElement("span");
-analysisBusySpinner.className = "analysis-busy-spinner";
-analysisBusySpinner.append(createLoader());
-const analysisBusyLabel = document.createElement("span");
-analysisBusyLabel.textContent = l10n.t("Analyzing…");
-analysisBusyEl.append(analysisBusySpinner, analysisBusyLabel);
-app.appendChild(analysisBusyEl);
-
-type AnalysisRequest = Extract<WebviewToHost, { type: "analyzeSession" | "analyzeCurrent" }>;
-
-// analysisFailed が届かない経路が残っても永久に無効化されないための保険
-const ANALYSIS_PENDING_TIMEOUT_MS = 30_000;
-let analysisPendingTimer: ReturnType<typeof setTimeout> | undefined;
-let analysisPendingButton: HTMLButtonElement | null = null;
-
-function setAnalysisPending(pending: boolean, button: HTMLButtonElement | null): void {
-  if (analysisPendingTimer !== undefined) { clearTimeout(analysisPendingTimer); analysisPendingTimer = undefined; }
-  analysisPendingButton?.classList.remove("is-analysis-pending");
-  analysisPendingButton?.querySelector(".loader")?.remove();
-  analysisPendingButton?.removeAttribute("aria-busy");
-  analysisPendingButton = button;
-  analysisBusyEl.classList.toggle("on", pending);
-  document.querySelectorAll<HTMLButtonElement>("[data-analysis-trigger]").forEach((el) => { el.disabled = pending; });
-  if (!pending) return;
-  button?.classList.add("is-analysis-pending");
-  button?.append(createLoader(12));
-  button?.setAttribute("aria-busy", "true");
-  analysisPendingTimer = setTimeout(() => setAnalysisPending(false, null), ANALYSIS_PENDING_TIMEOUT_MS);
-}
-
-export function requestAnalysis(button: HTMLButtonElement, message: AnalysisRequest): void {
-  if (analysisPendingButton !== null) return;
-  setAnalysisPending(true, button);
-  vscode.postMessage(message);
-}
-
-export function isAnalysisPending(): boolean {
-  return analysisPendingButton !== null;
-}
-
-export function finishAnalysisRequest(): void {
-  setAnalysisPending(false, null);
-}
 
 export const sessionActionsEl = document.getElementById("session-actions-slot") as HTMLElement;

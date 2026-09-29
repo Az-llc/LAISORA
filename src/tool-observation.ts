@@ -1,6 +1,6 @@
 import { extractArtifactAccesses, projectArtifactAccess, PROGRESS_WIRE_TOOL_NAME } from "./artifact-access";
 import type { EffectCoverage, HostArtifactAccess, ProjectedArtifactAccess } from "./artifact-access";
-import { redactAbsolutePaths } from "./path-redaction";
+import { redactAbsolutePaths, redactOptional } from "./path-redaction";
 import type { DelegationInfo, ProgressEmission, ProgressState, TaskNotificationInfo } from "./protocol";
 import { parseTaskIntentFromRawInput } from "./work-model";
 import type { TaskIntent } from "./work-model";
@@ -60,6 +60,23 @@ export function extractProgressEmission(
   };
 }
 
+function redactTaskIntent(intent: TaskIntent | undefined): TaskIntent | undefined {
+  if (!intent) return undefined;
+  if (intent.kind === "todo") {
+    return { ...intent, items: intent.items.map(item => ({
+      ...item,
+      taskKey: `todo:${redactAbsolutePaths(item.taskKey.slice("todo:".length))}`,
+      description: redactAbsolutePaths(item.description),
+      activeForm: redactOptional(item.activeForm),
+    })) };
+  }
+  if (intent.kind === "create") {
+    return { ...intent, subject: redactAbsolutePaths(intent.subject), activeForm: redactOptional(intent.activeForm) };
+  }
+  return { ...intent, taskKey: `task:${redactAbsolutePaths(intent.taskKey.slice("task:".length))}`, subject: redactOptional(intent.subject),
+    activeForm: redactOptional(intent.activeForm) };
+}
+
 export function extractStage0ToolFields(
   toolName: string,
   input: Record<string, unknown> | undefined,
@@ -70,9 +87,9 @@ export function extractStage0ToolFields(
 
   let delegation: DelegationInfo | undefined;
   if (isAgentTool && input) {
-    const subagentType = typeof input.subagent_type === "string" ? input.subagent_type : undefined;
+    const subagentType = typeof input.subagent_type === "string" ? redactAbsolutePaths(input.subagent_type) : undefined;
     const subagentModel =
-      typeof input.model === "string" && input.model && input.model !== "inherit" ? input.model : undefined;
+      typeof input.model === "string" && input.model && input.model !== "inherit" ? redactAbsolutePaths(input.model) : undefined;
     const isBackground = input.run_in_background === true ? true : undefined;
     let description: string | undefined;
     if (typeof input.description === "string") {
@@ -89,7 +106,7 @@ export function extractStage0ToolFields(
     }
   }
 
-  const taskIntentStructured = parseTaskIntentFromRawInput(toolName, input, toolUseId);
+  const taskIntentStructured = redactTaskIntent(parseTaskIntentFromRawInput(toolName, input, toolUseId));
   const extraction = extractArtifactAccesses(toolName, input, baseDir);
   const progressEmission = extractProgressEmission(toolName, input);
 

@@ -9,7 +9,7 @@ import { output } from "./host-context";
 import { buildFindingSessionPrompt } from "./llm-report";
 import { personalBaseline } from "./personal-baseline";
 import type { AttachedFindingView, WebviewToHost } from "./protocol";
-import { findSessionFile, isInSessionStore, lookupSessionFile } from "./session-files";
+import { findSessionFile, lookupSessionFile } from "./session-files";
 import { llmAnalysisEnabled } from "./session-semantic";
 import type { Session } from "./extension";
 import { tabLimit, warnTabLimit, type SessionStore } from "./store-surfaces";
@@ -20,17 +20,16 @@ function hostDisplayLocale(): string {
 
 export async function handleAnalysisMessage(
   st: SessionStore,
-  msg: Extract<WebviewToHost, { type: "analyzeCurrent" | "analyzeSession" | "llmAnalysisRequest" | "summarizeSession" | "suggestSessionName" | "setLlmAnalysisEnabled" | "startFindingSession" | "prepareHistoricalDraft" | "selectAnalysisArtifact" }>,
+  msg: Extract<WebviewToHost, { type: "analyzeCurrent" | "llmAnalysisRequest" | "summarizeSession" | "suggestSessionName" | "setLlmAnalysisEnabled" | "startFindingSession" | "prepareHistoricalDraft" | "selectAnalysisArtifact" }>,
   sender: vscode.Webview,
   target: Session | undefined
 ): Promise<void> {
   switch (msg.type) {
     case "analyzeCurrent": {
-      // 現在のタブのセッションを分析する。ファイルパスは webview に持たせず、
-      // sessionId からホスト側で解決する（webview から任意パスを渡させない）。
+      // src/session-files.ts#lookupSessionFile で対象を解決し、表示側に任意のパスを選ばせない。
       const sid = target!.resumeSessionId ?? target!.auth?.sessionId;
       if (!sid) {
-        // R-SES-09。理由は要求元の面の、操作したタブの分析画面へ返す（toast にすると操作対象から離れた場所に出る。R-ANL-11）
+        // 理由を src/webview/main.ts#showAnalysisFailure へ渡し、操作した分析画面へ返す（R-SES-09 / R-ANL-11）。
         void st.postTo(sender, {
           type: "analysisFailed",
           kind: "script",
@@ -44,8 +43,7 @@ export async function handleAnalysisMessage(
         output.appendLine(
           `[analysis] ${found.reason} session=${sid}` + (found.reason === "scan_failed" ? ` — ${found.detail}` : "")
         );
-        // 走査に失敗しただけのときに「まだ書き出されていません」と言わない。
-        // 待っても直らないので、利用者を存在しない待ちへ誘導することになる（R-DSP-01）
+        // src/session-files.ts#lookupSessionFile の走査失敗を、記録の不在と混同しない（R-DSP-01）。
         void st.postTo(sender, {
           type: "analysisFailed",
           kind: "script",
@@ -67,39 +65,6 @@ export async function handleAnalysisMessage(
         sessionId: sid,
         filePath: path,
         report: analyzeSessionFile(path, baseline, scan, hostDisplayLocale()),
-      });
-      break;
-    }
-    case "analyzeSession": {
-      // セッションストア外のパスは拒否（readSessionTranscriptと同じガード）
-      if (!isInSessionStore(msg.filePath)) {
-        // 理由なしで返すと webview は何も描かない（無言の失敗）。記録の有無は唯一の解決器で引き、
-        // 走査の失敗を「無い」と言わない（R-ANL-11）
-        const found = lookupSessionFile(msg.sessionId);
-        output.appendLine(
-          `[analysis] outside_store session=${msg.sessionId} lookup=${found.reason ?? "found"}` +
-            (found.reason === "scan_failed" ? ` — ${found.detail}` : "")
-        );
-        void st.postTo(sender, {
-          type: "analysisFailed",
-          kind: "script",
-          sessionId: msg.sessionId,
-          reason:
-            found.reason === "scan_failed"
-              ? l10n.t(
-                  "LAISORA: Could not determine whether the session log exists (check sync and permissions): {0}",
-                  found.detail
-                )
-              : found.path !== null
-                ? l10n.t("LAISORA: The requested log path is outside the session store. Open the session from the history list again.")
-                : l10n.t("LAISORA: The session log was not found in the session store."),
-        });
-        break;
-      }
-      const { baseline, scan } = await personalBaseline(msg.filePath);
-      const report = analyzeSessionFile(msg.filePath, baseline, scan, hostDisplayLocale());
-      void st.postTo(sender, {
-        type: "analysis", sessionId: msg.sessionId, filePath: msg.filePath, report,
       });
       break;
     }
@@ -140,13 +105,12 @@ export async function handleAnalysisMessage(
       const isoTime = art ? new Date(art.generatedAt).toISOString() : new Date().toISOString();
       const currentBase = s.semantic.semanticBasePayload();
 
-      // R-ANL-02: 表示側の current/stale 判定と同じ参照同一性を Host 境界でも確認する。
-      // 保存 artifact と古い webview message の hash 同士が一致しても、現在値が進んでいれば拒否する。
+      // currentBase との参照同一性も確認し、古い要求と保存結果のハッシュの一致だけで実行しない（R-ANL-02）。
       if (!finding || !base || base !== currentBase || base.semanticHash !== msg.semanticHash) {
         output.appendLine(
           `[${s.title}] startFindingSession 拒否: 分析結果が更新されています (runId=${msg.analysisRunId})`
         );
-        // 拒否は押した所見のある分析画面へ返す（R-ANL-02 / R-ANL-11）
+        // 拒否理由を src/webview/main.ts#showAnalysisFailure で所見のある分析画面へ返す（R-ANL-02 / R-ANL-11）。
         void st.postTo(sender, {
           type: "analysisFailed",
           kind: "action",

@@ -91,9 +91,9 @@ const RECORD_INPUT = z.looseObject({
   expectHash: field("candidate: current text hash when changing an existing rule"),
   executor: field('modelProfile: "claude", "codex" or "agy"'),
   sources: field("modelProfile: 1-3 {url, checkedAt} entries for public model-information sources; no private project URLs or identifiers"),
-  strengths: field("modelProfile: reusable model strengths, one line, at most 120 Unicode code points; no project facts or private examples"),
-  effort: field("modelProfile: reusable model effort behavior, one line, at most 120 Unicode code points; no project-specific configuration"),
-  caveats: field("modelProfile: reusable model limitations with relevant conditions, one line, at most 120 Unicode code points; no project facts or private examples"),
+  strengths: field("modelProfile: not delivered to the conductor; leave unset"),
+  effort: field("modelProfile: effort behavior that changes delegation (default, supported values, quality, latency or token change across efforts), one line, at most 120 Unicode code points; no project-specific configuration"),
+  caveats: field("modelProfile: model limitations or behaviors that change prompting, timeouts or verification, with relevant conditions, one line, at most 120 Unicode code points; no project facts or private examples"),
 });
 
 export function createLearningMcpServer(sdk: Pick<typeof Sdk, "createSdkMcpServer" | "tool">, gate: LearningRootGate,

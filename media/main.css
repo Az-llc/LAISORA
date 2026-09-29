@@ -145,24 +145,6 @@ html, body {
   border-bottom: 1px solid var(--vscode-inputValidation-warningBorder, var(--vscode-panel-border));
 }
 .convlog-history-note { margin: 8px 0 6px; }
-.hist-row {
-  position: relative;
-  padding-right: 30px;
-}
-.hist-analyze {
-  position: absolute;
-  right: 4px;
-  top: 50%;
-  transform: translateY(-50%);
-  background: transparent;
-  border: none;
-  color: var(--vscode-foreground);
-  padding: 2px 6px;
-  font-size: 12px;
-  cursor: pointer;
-  border-radius: 4px;
-}
-.hist-analyze:hover { background: var(--vscode-toolbar-hoverBackground, rgba(128,128,128,0.2)); }
 #tabbar {
   display: flex;
   flex: 1 1 auto;
@@ -348,6 +330,7 @@ button#auth.chip:hover { filter: brightness(1.15); }
   pointer-events: none;
 }
 .chip.ok { background: var(--vscode-testing-iconPassed, #2d7d46); color: #fff; }
+.chip.model-fallback-warning, .chip.warn.model-fallback-warning { color: var(--vscode-editorWarning-foreground); background: var(--vscode-editor-background); border-color: var(--vscode-editorWarning-foreground); }
 .chip.warn { background: var(--vscode-editorWarning-foreground, #b8860b); color: #fff; }
 
 /* ---------- ログ ---------- */
@@ -398,6 +381,7 @@ button#auth.chip:hover { filter: brightness(1.15); }
 .you-dismiss:hover { color: var(--vscode-foreground); }
 .you-dismiss:focus-visible { outline: 1px solid var(--vscode-focusBorder); outline-offset: 2px; }
 .you-summary { margin: 4px 0 0; overflow-wrap: anywhere; }
+.fallback-status { font-size: 11.5px; line-height: 1.5; color: var(--vscode-descriptionForeground); margin: 4px 0 0; overflow-wrap: anywhere; }
 .you-resolved .you-square { background: none; border: 1px solid var(--vscode-descriptionForeground); }
 .you-resolved .you-title-text { color: var(--vscode-descriptionForeground); text-decoration: line-through; }
 .laisora-ask.flash, .block.approval.flash { outline: 2px solid var(--laisora-accent); outline-offset: 4px; }
@@ -418,13 +402,17 @@ button#auth.chip:hover { filter: brightness(1.15); }
 .wo-plan-you .plan-section-body, .wo-plan-you .you-section-body { align-self: start; border-bottom: 1px solid var(--vscode-panel-border); }
 .wo-plan-column > .earlier-requests { grid-row: 5; }
 .earlier-requests { margin-top: 24px; }
-.earlier-label { margin: 0 0 8px; text-wrap: balance; }
-.earlier-row { display: grid; grid-template-columns: 80px minmax(0, 1fr) auto; gap: 8px; align-items: baseline; width: 100%; border: 0; border-top: 1px solid var(--vscode-panel-border); padding: 8px 0; background: none; font: inherit; text-align: left; color: var(--vscode-descriptionForeground); cursor: pointer; }
+.earlier-label { margin: 0 0 4px; text-wrap: balance; }
+.earlier-row { display: grid; grid-template-columns: 32px minmax(0, 1fr) max-content; column-gap: 0; align-items: baseline; width: 100%; border: 0; border-top: 1px solid var(--vscode-panel-border); padding: 8px 0; background: none; font: inherit; text-align: left; color: var(--vscode-descriptionForeground); cursor: pointer; }
 .earlier-row:disabled { cursor: default; opacity: 1; }
 .earlier-row:not(:disabled):hover .earlier-title { text-decoration: underline; }
-.earlier-at, .earlier-stats, .earlier-empty { font-size: 11.5px; line-height: 1.5; }
-.earlier-title { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-weight: 700; color: var(--vscode-foreground); }
-.earlier-stats { text-align: right; }
+.earlier-empty { font-size: var(--l-note); line-height: 1.5; }
+.earlier-at, .earlier-stats { font-size: var(--l-label); line-height: 16px; letter-spacing: .04em; }
+.earlier-number { font-size: 10px; font-weight: 600; letter-spacing: .08em; line-height: 20px; }
+.earlier-duration { padding-left: 12px; font-size: var(--l-note); line-height: 20px; white-space: nowrap; }
+.earlier-duration::after { content: "›"; margin-left: 8px; }
+.earlier-title { font-size: var(--l-body); line-height: 20px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-weight: 700; color: var(--vscode-foreground); }
+.earlier-stats { grid-column: 2 / span 2; text-align: left; }
 .earlier-expand { font-size: 11.5px; line-height: 1.5; margin-top: 8px; }
 @container summary (width < 900px) {
   .wo-plan-you { grid-template-columns: minmax(0, 1fr); grid-template-rows: auto auto; gap: 24px; }
@@ -434,8 +422,7 @@ button#auth.chip:hover { filter: brightness(1.15); }
   .wo-you { order: -1; }
 }
 @container summary (width < 500px) {
-  .earlier-row { grid-template-columns: 80px minmax(0, 1fr); }
-  .earlier-stats { grid-column: 2; }
+  .earlier-row { grid-template-columns: 24px minmax(0, 1fr) max-content; }
 }
 .plan-section { border-bottom: 1px solid var(--vscode-panel-border); }
 .plan-top { display: flex; align-items: baseline; gap: 8px; }
@@ -470,8 +457,11 @@ button#auth.chip:hover { filter: brightness(1.15); }
 .plan-bar-number { font-size: 18px; font-weight: 300; line-height: 1; font-variant-numeric: tabular-nums; color: var(--laisora-accent); }
 .plan-bar-current { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 13px; font-weight: 600; }
 .plan-bar-stats { white-space: nowrap; font-size: 11.5px; }
-.plan-bar-loader { display: inline-flex; align-self: center; flex: none; color: var(--vscode-descriptionForeground); }
+.plan-bar-loader { display: inline-flex; align-items: center; font-size: 11.5px; flex: none; margin-left: auto; color: var(--vscode-descriptionForeground); }
+.plan-bar-waiting:not(:empty) ~ .plan-bar-loader { margin-left: 0; }
 .plan-bar-loader[hidden] { display: none; }
+/* 行の baseline をこの箱へ与え、アイコンを隣の文字の行箱の中央に置く。消すと verify-markdown#LOADER-1 が落ちる */
+.plan-bar-loader::before { content: "\200b"; }
 .plan-bar-waiting { margin-left: auto; white-space: nowrap; }
 .plan-bar-waiting:empty { display: none; }
 .plan-bar-chevron { color: var(--vscode-descriptionForeground); }
@@ -577,7 +567,8 @@ button#auth.chip:hover { filter: brightness(1.15); }
   color: var(--vscode-descriptionForeground);
 }
 .conv-load.hidden { display: none; }
-.conv-load-icon { display: inline-block; flex: none; }
+/* 状態行（.status-strip-spinner）と同じ右端の列に置く */
+.conv-load-icon { display: inline-flex; justify-content: center; flex: 0 0 16px; width: 16px; order: 1; margin-inline-start: 2px; }
 /* 幅が足りないときは文言から削る。数字を含む末尾ではなく先頭から詰めると残件が消える */
 .conv-load-text {
   overflow: hidden;
@@ -786,28 +777,6 @@ button#auth.chip:hover { filter: brightness(1.15); }
 .worklog-history-more { display: flex; justify-content: center; }
 .worklog-history-more:empty { display: none; }
 
-/* 履歴パネル経由の分析はボタンごとパネルが閉じるので、固定表示の #analysis-busy が要る */
-#analysis-busy {
-  display: none;
-  position: fixed;
-  right: 14px;
-  bottom: 14px;
-  z-index: 20;
-  align-items: center;
-  gap: 6px;
-  padding: 5px 9px;
-  border: 1px solid var(--vscode-panel-border);
-  border-radius: 4px;
-  background: var(--vscode-editorWidget-background);
-  color: var(--vscode-foreground);
-  font-size: 11px;
-  pointer-events: none;
-}
-#analysis-busy.on { display: flex; }
-.analysis-busy-spinner { display: inline-flex; }
-button[data-analysis-trigger].is-analysis-pending { cursor: progress; }
-button[data-analysis-trigger].is-analysis-pending .loader { margin-left: 8px; vertical-align: middle; }
-button[data-analysis-trigger]:disabled.is-analysis-pending { opacity: 1; }
 /* 承認要求の参照行（操作は会話側。ここは監査用の記録だけ） */
 .block.worklog-approval-ref {
   font-size: 12px;
@@ -910,15 +879,25 @@ button[data-analysis-trigger]:disabled.is-analysis-pending { opacity: 1; }
 /* sticky は親の .log-head が担うため、ここでは位置指定しない（二重stickyを避ける） */
 .status-strip-wrap { min-width: 0; }
 .status-strip-wrap.hidden { display: none; }
-.status-strip { display: flex; align-items: center; gap: 8px; font-size: 11.5px; line-height: 1.5; color: var(--vscode-descriptionForeground); font-variant-numeric: tabular-nums; }
-.status-strip-spinner { display: inline-flex; flex: none; }
+.status-strip { display: flex; justify-content: flex-end; align-items: center; gap: var(--l-space-2); font-size: var(--l-note); line-height: 1.5; color: var(--vscode-descriptionForeground); font-variant-numeric: tabular-nums; }
+.status-strip-spinner { display: inline-flex; flex: 0 0 16px; width: 16px; }
+.status-strip-spinner[hidden] { display: none; }
 .status-strip-text {
-  flex: 1 1 auto;
+  flex: 0 1 auto;
+  min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
-.status-strip-time { flex: 0 0 auto; }
+.status-strip-note {
+  flex: 1 1000 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.status-strip-note:not(:empty)::before { content: "· "; }
+.status-strip-time { flex: 0 0 auto; white-space: nowrap; font-variant-numeric: tabular-nums; }
 .status-strip-time:not(:empty)::before { content: "· "; }
 
 /* ---------- 分析タブ（会話タブとは別系統） ---------- */
@@ -2151,10 +2130,14 @@ button:disabled { opacity: 0.4; cursor: default; }
   display: flex;
   flex-direction: column;
   gap: 2px;
-  font-size: 12px;
-  color: var(--vscode-descriptionForeground);
-  margin-bottom: 10px;
+  font-size: var(--l-note);
+  color: var(--vscode-editorWarning-foreground);
+  margin-left: var(--conv-gutter);
+  padding: 12px 0;
+  border-bottom: 1px solid var(--vscode-panel-border);
 }
+.wo-coverage:empty { display: none; }
+.wo-coverage .wo-code { margin-bottom: 4px; }
 .wo-coverage-row[data-state="prefix-truncated"] { color: var(--vscode-editorWarning-foreground, #b8860b); }
 
 .wo-empty, .wo-note { color: var(--vscode-descriptionForeground); font-size: 12px; }
@@ -2208,7 +2191,8 @@ button:disabled { opacity: 0.4; cursor: default; }
 
 /* ---------- Agent実行グラフ（work-graph.ts） ---------- */
 
-.work-graph { font-size: 12px; }
+.work-graph { font-size: var(--l-note); }
+.work-graph [hidden] { display: none; }
 .wg-empty { color: var(--vscode-descriptionForeground); font-size: 12px; }
 .wg-coverage {
   color: var(--vscode-descriptionForeground);
@@ -2583,43 +2567,78 @@ button.llm-evidence-chip:focus-visible { outline: 1px solid var(--vscode-focusBo
 .term-note { border-bottom: 1px dashed var(--vscode-descriptionForeground); cursor: help; }
 
 /* 概要（work-overview.ts） */
-.wo-head { padding: 4px 0 10px; }
-.wo-when { font-size: 12px; color: var(--vscode-descriptionForeground); font-variant-numeric: tabular-nums; margin-bottom: 9px; }
-.wo-when b { color: var(--vscode-foreground); }
-/* セッション全体の 4 区分と棒 3 本（R-DSP-19） */
-.wo-band { margin: -4px 0 12px; }
-.wo-buckets { display: flex; flex-wrap: wrap; gap: 3px 14px; font-size: 11.5px; color: var(--vscode-descriptionForeground); margin-bottom: 7px; }
-.wo-bk-v { color: var(--vscode-foreground); font-variant-numeric: tabular-nums; }
-.wo-bars { display: grid; gap: 4px; max-width: 560px; }
-.wo-bar-row { display: grid; grid-template-columns: 96px minmax(0, 1fr) 64px; gap: 8px; align-items: center; font-size: 11px; }
-.wo-bar-l { color: var(--vscode-descriptionForeground); }
-.wo-bar-t { display: block; height: 9px; background: rgba(128, 128, 128, 0.15); border-radius: 2px; overflow: hidden; }
-.wo-bar-f { display: block; height: 100%; background: #4a6a8a; }
-.wo-bar-row[data-bar="subagent"] .wo-bar-f { background: #a8783a; }
-.wo-bar-f.unmeasured { width: 0; }
-.wo-bar-v { text-align: right; font-variant-numeric: tabular-nums; }
-.wo-gist { display: flex; align-items: flex-start; gap: 10px; }
-.wo-gist-t { flex: 1; font-size: 13px; line-height: 1.6; white-space: pre-wrap; overflow-wrap: anywhere; max-height: 9.6em; overflow: auto; }
-.wo-gist-t.wo-raw { font-family: var(--vscode-editor-font-family); font-size: 12.5px; color: var(--vscode-descriptionForeground); }
-.wo-gist-n { font-size: 11px; color: var(--vscode-descriptionForeground); margin-top: 4px; }
-.wo-gist-err { font-size: 11px; color: var(--vscode-errorForeground); margin-top: 4px; white-space: pre-wrap; overflow-wrap: anywhere; }
-.wo-gist-b { flex: none; font-size: 11px; padding: 1px 8px; border-radius: 3px; border: 1px solid var(--vscode-button-border, rgba(128, 128, 128, 0.45)); background: transparent; color: var(--vscode-foreground); cursor: pointer; }
-.wo-gist-b:disabled { opacity: 0.6; cursor: default; }
-.wo-live-dot { width: 7px; height: 7px; border-radius: 50%; background: #a8783a; display: inline-block; animation: wo-pulse 1.6s ease-in-out infinite; }
-.wo-card-t .wo-live-dot { margin-right: 5px; vertical-align: middle; }
-@keyframes wo-pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.3; } }
-.wo-cards { display: grid; grid-template-columns: repeat(5, 1fr); gap: 1px; padding: 0 0 14px; }
-@media (max-width: 380px) {
-  .wo-card { padding: 2px 4px 2px 6px; }
-  .wo-card-t { font-size: 10.5px; white-space: normal; }
-  .wo-card-v { font-size: 19px; }
+.wo-head { padding: 12px 0 12px var(--conv-gutter); }
+.wo-code { display: flex; align-items: baseline; gap: 8px; font-size: 10px; line-height: 16px; min-width: 0; color: var(--vscode-descriptionForeground); }
+.wo-code-label { font-weight: 600; letter-spacing: .16em; color: var(--vscode-foreground); white-space: nowrap; }
+.wo-code-right { margin-left: auto; font-size: var(--l-note); }
+.wo-gist { margin-top: 8px; }
+.wo-gist-line { display: flex; align-items: baseline; gap: 8px; }
+.wo-gist-n { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 10px; line-height: 16px; letter-spacing: .04em; color: var(--vscode-descriptionForeground); }
+.wo-gist-expand { border: 0; background: none; color: var(--vscode-descriptionForeground); font: inherit; font-size: 10px; cursor: pointer; padding: 4px 0; }
+.wo-gist-expand:hover { text-decoration: underline; }
+.wo-gist-expand:focus-visible { outline: 1px solid var(--vscode-focusBorder); }
+.wo-gist-t.expanded { display: block; overflow: visible; }
+.wo-gist-t { margin-top: 4px; max-width: 46em; font-size: var(--l-body); line-height: 1.7; text-wrap: pretty; word-break: auto-phrase; overflow-wrap: anywhere; display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical; overflow: hidden; }
+.wo-gist-err { font-size: var(--l-note); line-height: 1.5; color: var(--vscode-errorForeground); margin-top: 4px; white-space: pre-wrap; overflow-wrap: anywhere; }
+.wo-gist-b { margin-left: auto; flex: none; font: inherit; font-size: 10px; letter-spacing: .08em; line-height: 16px; padding: 0 8px; border-radius: 0; border: 1px solid var(--vscode-foreground); background: none; color: var(--vscode-foreground); cursor: pointer; }
+.wo-gist-b:disabled { opacity: .6; cursor: default; }
+.wo-gist-b:focus-visible { outline: 1px solid var(--vscode-focusBorder); outline-offset: 1px; }
+.wo-hud { margin-left: var(--conv-gutter); display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 1px; background: var(--vscode-panel-border); border-block: 1px solid var(--vscode-panel-border); }
+.wo-hud-group { display: flex; flex-direction: column; gap: 8px; min-width: 0; padding: 12px 20px 16px; background: var(--vscode-editor-background); border: 0; border-radius: 0; font: inherit; color: var(--vscode-foreground); text-align: left; cursor: pointer; }
+.wo-hud-group:first-child { padding-left: 0; }
+.wo-hud-group:last-child { padding-right: 0; }
+.wo-hud-group:hover .wo-code-label { text-decoration: underline; text-underline-offset: 3px; }
+.wo-hud-group:focus-visible { outline: 1px solid var(--vscode-focusBorder); outline-offset: -1px; }
+.wo-hud-figures { display: flex; flex-wrap: wrap; align-items: flex-end; gap: 4px 24px; }
+.wo-hud-figure { display: grid; min-width: 0; }
+.wo-hud-key { font-size: 10px; font-weight: 600; letter-spacing: .08em; line-height: 16px; color: var(--vscode-descriptionForeground); }
+.wo-hud-value { font-size: var(--l-step-number); font-weight: 200; line-height: 32px; font-variant-numeric: tabular-nums; white-space: nowrap; }
+.wo-hud-value small { margin: 0 3px 0 1px; font-size: var(--l-note); font-weight: 400; color: var(--vscode-descriptionForeground); }
+.wo-hud-small .wo-hud-value { font-size: var(--l-title); font-weight: 300; }
+.wo-hud-note { font-size: var(--l-note); line-height: 1.5; color: var(--vscode-descriptionForeground); font-variant-numeric: tabular-nums; }
+.wo-hud-swatch { display: inline-block; width: 8px; height: 8px; margin-right: 4px; vertical-align: -.5px; }
+.wo-hud-main { background: var(--vscode-descriptionForeground); }
+.wo-hud-sub { background: color-mix(in srgb, var(--vscode-descriptionForeground) 45%, var(--vscode-editor-background)); }
+.wo-hud-remainder { background: var(--vscode-editor-background); }
+.wo-hud-wait { background: color-mix(in srgb, var(--vscode-descriptionForeground) 14%, var(--vscode-editor-background)); }
+.wo-hud-split { display: flex; gap: 1px; height: 4px; }
+.wo-hud-strip { display: flex; gap: 2px; }
+.wo-hud-request { display: grid; grid-template-rows: 8px 16px; min-width: 0; }
+.wo-hud-request-bar { display: flex; }
+/* 収まらない番号は高さ外の 2 行目へ折り返して丸ごと隠す。切れた番号・接した番号を出さない（verify-work-overview#O-HUD-labelsMutation・verify-work-overview#O-HUD-labelsGapMutation）。 */
+.wo-hud-request-number { display: flex; flex-wrap: wrap; align-content: flex-start; height: 16px; padding-inline-end: 4px; font-size: 10px; font-weight: 600; letter-spacing: .08em; line-height: 16px; color: var(--vscode-descriptionForeground); font-variant-numeric: tabular-nums; white-space: nowrap; overflow: hidden; }
+.wo-hud-request-number::before { content: ""; flex: 0 0 0; height: 16px; }
+.wo-hud-request.current .wo-hud-request-number, .earlier-number.current { color: var(--laisora-accent); }
+.wo-hud-breakdown { display: grid; }
+.wo-hud-breakdown-head { margin-top: 4px; font-size: 10px; font-weight: 600; letter-spacing: .08em; line-height: 16px; color: var(--vscode-descriptionForeground); }
+.wo-hud-breakdown-row { display: grid; grid-template-columns: minmax(0, 1fr) 72px 24px; column-gap: 8px; align-items: center; font-size: var(--l-note); line-height: 20px; }
+.wo-hud-breakdown-label { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.wo-hud-track { height: 4px; background: color-mix(in srgb, var(--vscode-descriptionForeground) 14%, var(--vscode-editor-background)); }
+.wo-hud-fill { display: block; height: 100%; width: 0; background: var(--vscode-descriptionForeground); }
+.wo-hud-count { text-align: right; font-variant-numeric: tabular-nums; }
+.wo-hud-none, .wo-hud-status { font-size: var(--l-note); line-height: 20px; color: var(--vscode-descriptionForeground); }
+@container summary (width < 700px) {
+  .wo-hud { grid-template-columns: minmax(0, 1fr); }
+  .wo-hud-group { padding: 12px 0; }
+  .wo-hud-figures { gap: 4px 16px; }
 }
-.wo-card { padding: 2px 12px 2px 13px; border-left: 1px solid var(--vscode-editorWidget-border, var(--vscode-panel-border)); }
-.wo-card:first-child { border-left: none; padding-left: 0; }
-.wo-card-t { font-size: 11.5px; color: var(--vscode-descriptionForeground); margin-bottom: 1px; white-space: nowrap; text-align: left; }
-.wo-card-v { font-size: 24px; font-weight: 600; line-height: 1.25; text-align: center; }
-.wo-card.wo-hot .wo-card-v { color: #a8622a; }
-.wo-card.wo-quiet .wo-card-v { color: var(--vscode-descriptionForeground); font-weight: 400; }
+@keyframes wo-pulse { 0%, 100% { opacity: 1; } 50% { opacity: .3; } }
+.orchestration-roster { margin-left: var(--conv-gutter); padding-top: 12px; border-top: 1px solid var(--vscode-panel-border); }
+.orchestration-roster .wo-code { margin-bottom: 4px; }
+.orchestration-roster .wo-flow-h { margin: 8px 0 0; font-size: 10px; font-weight: 400; line-height: 16px; letter-spacing: .04em; }
+.orchestration-row { display: grid; grid-template-columns: 72px minmax(0, 1.1fr) minmax(0, .9fr) minmax(0, 1.5fr); column-gap: 12px; align-items: baseline; padding: 4px 0; border-top: 1px solid var(--vscode-panel-border); font-size: var(--l-note); line-height: 20px; font-variant-numeric: tabular-nums; }
+.orchestration-kind { font-size: 10px; font-weight: 600; letter-spacing: .08em; color: var(--vscode-descriptionForeground); white-space: nowrap; }
+.orchestration-name { min-width: 0; overflow-wrap: normal; }
+.orchestration-name-part { white-space: nowrap; }
+.orchestration-model { min-width: 0; overflow-wrap: anywhere; }
+.orchestration-model, .orchestration-numbers { color: var(--vscode-descriptionForeground); }
+.orchestration-numbers { text-align: right; overflow-wrap: anywhere; }
+.orchestration-numbers.l-failure { color: var(--vscode-errorForeground); }
+.orchestration-roster .wo-note { font-size: var(--l-note); }
+@container summary (width < 700px) {
+  .orchestration-row { grid-template-columns: 64px minmax(0, 1fr); }
+  .orchestration-model, .orchestration-numbers { grid-column: 2; text-align: left; }
+}
 .wo-flow { padding: 12px 0 4px; border-top: 1px solid var(--vscode-editorWidget-border, var(--vscode-panel-border)); }
 .wo-flow-h { font-size: 11.5px; color: var(--vscode-descriptionForeground); margin-bottom: 9px; display: flex; align-items: baseline; gap: 9px; }
 .wo-flow-h .wo-c { margin-left: auto; font-variant-numeric: tabular-nums; }
@@ -2665,58 +2684,71 @@ button.llm-evidence-chip:focus-visible { outline: 1px solid var(--vscode-focusBo
   .wo-it-t::before { transition: none; }
 }
 
-/* グラフ（work-graph.ts・SVG 時間軸） */
+/* R-DSP-44 / R-DSP-46 / R-CNV-36 */
 .wg-stage { position: relative; }
-/* .log-head（top: 0）の直下に貼り付く。--log-head-h は tab.ts の syncLogHeadHeight() が実測して書く
-   （契機は syncHeadLayout と .log-head の ResizeObserver）。z-index は .log-head（6）より下 */
-/* 軸 SVG は下限幅（MIN_CHART_W=520）で描かれる。狭いと .wg-head からはみ出して #logs に
-   横スクロールが出る（実測: pane 433px で軸 520px・scrollWidth 534 > clientWidth 461。G-99）。
-   clip は overflow-y: visible を保てる唯一の値で、sticky もスクロール枠も壊さない */
-.wg-head { position: sticky; top: var(--log-head-h, 0px); z-index: 5; background: var(--vscode-editor-background); padding: 4px 0 8px; overflow-x: clip; }
-.wg-axis { display: block; }
-.wg-zoom-bar { display: flex; align-items: center; justify-content: space-between; font-size: 11.5px; color: var(--vscode-descriptionForeground); padding: 0 0 6px; }
-.wg-zoom-range { font-variant-numeric: tabular-nums; }
-.wg-zoom-all { font-size: 11px; padding: 2px 9px; cursor: pointer; border-radius: 4px; color: var(--vscode-foreground); background: var(--vscode-button-secondaryBackground); border: 1px solid var(--vscode-button-border, var(--vscode-editorWidget-border)); }
-.wg-zoom-all[aria-pressed="true"] { border-color: #b08b57; box-shadow: inset 0 -2px 0 #b08b57; }
-.wg-zoom-all:focus-visible { outline: 2px solid var(--vscode-focusBorder); outline-offset: 1px; }
+.wg-head { position: sticky; top: var(--log-head-h, 0px); z-index: 5; background: var(--vscode-editor-background); padding: 4px 0 0; }
+.wg-axis { display: block; max-width: 100%; }
+.wg-code { font-size: var(--l-label); letter-spacing: .16em; color: var(--vscode-foreground); white-space: nowrap; }
+.wg-caption { margin-left: 8px; font-size: var(--l-label); color: var(--vscode-descriptionForeground); }
+.wg-zoom-bar { display: flex; align-items: center; gap: 12px; font-size: var(--l-label); color: var(--vscode-descriptionForeground); padding-bottom: 6px; }
+.wg-zoom-range { margin-left: auto; font-variant-numeric: tabular-nums; }
+.wg-zoom-all { font: inherit; padding: 0 8px; cursor: pointer; color: var(--vscode-foreground); background: none; border: 1px solid var(--vscode-foreground); }
+.wg-zoom-all[aria-pressed="true"] { background: var(--vscode-foreground); color: var(--vscode-editor-background); font-weight: 700; }
+.wg-zoom-all:focus-visible { outline: 1px solid var(--vscode-focusBorder); outline-offset: 1px; }
 .wg-zoom-live { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; border-width: 0; }
-.wg-mini { display: block; width: 100%; height: 34px; touch-action: none; cursor: pointer; }
+.wg-mini { display: block; width: 100%; height: 30px; touch-action: none; cursor: pointer; }
 .wg-mini.can-drag { cursor: grab; }
 .wg-mini.dragging { cursor: grabbing; }
-.wg-mini-win { fill: rgba(176, 139, 87, 0.12); stroke: #b08b57; stroke-width: 1.8; vector-effect: non-scaling-stroke; }
-.wg-mini-hint { font-size: 10px; fill: var(--vscode-foreground); pointer-events: none; }
-.wg-legend { display: flex; flex-wrap: wrap; gap: 4px 14px; font-size: 11px; color: var(--vscode-descriptionForeground); padding: 6px 0 2px; }
-.wg-legend-item { display: inline-flex; align-items: center; gap: 5px; }
-.wg-sw { width: 10px; height: 10px; border-radius: 2px; display: inline-block; }
-.wg-sw-g, .wg-seg-g { fill: #4a6a8a; background: #4a6a8a; }
-.wg-sw-t, .wg-seg-t { fill: #6f8b57; background: #6f8b57; }
-.wg-sw-a, .wg-seg-a { fill: #7a5a8a; background: #7a5a8a; }
-.wg-sw-wait, .wg-seg-wait { fill: #d8cdba; background: #d8cdba; stroke: #b9a887; stroke-width: 0.8; }
-.wg-sw-sub, .wg-seg-sub { fill: #a8783a; background: #a8783a; }
-.wg-seg-sub.open, .wg-seg-g.open, .wg-seg-t.open, .wg-seg-a.open { fill-opacity: 0.6; }
-.wg-note { font-size: 11.5px; color: var(--vscode-descriptionForeground); padding: 4px 0; }
+.wg-mini-win { fill: color-mix(in srgb, var(--vscode-foreground) 6%, transparent); stroke: var(--vscode-foreground); stroke-width: 1; vector-effect: non-scaling-stroke; }
+.wg-mini-hint { font-size: var(--l-label); fill: var(--vscode-foreground); pointer-events: none; }
+.wg-legend { display: flex; flex-wrap: wrap; align-items: center; gap: 2px 4px; color: var(--vscode-descriptionForeground); padding: 12px 0; margin-top: 12px; border-top: 1px solid var(--vscode-panel-border); }
+.wg-legend > .wg-caption { margin: 0 8px 0 4px; }
+.wg-legend-item { display: inline-flex; align-items: center; gap: 6px; padding: 1px 6px; border: 0; background: none; color: inherit; font: inherit; font-size: var(--l-note); line-height: 18px; cursor: pointer; white-space: nowrap; }
+.wg-legend-item[aria-pressed="false"] .term-note { opacity: .5; text-decoration: line-through; }
+.wg-legend-item[aria-pressed="false"] .wg-sw { background: none; border: 1px solid var(--vscode-descriptionForeground); }
+.wg-legend-item:focus-visible, .wg-hidden-status button:focus-visible { outline: 1px solid var(--vscode-focusBorder); }
+.wg-value { color: var(--vscode-foreground); font-variant-numeric: tabular-nums; }
+.wg-hidden-status { display: flex; align-items: baseline; gap: 8px; margin-left: auto; font-size: var(--l-label); }
+.wg-hidden-status button { border: 0; padding: 0; background: none; color: var(--vscode-textLink-foreground); font: inherit; cursor: pointer; }
+.wg-sw { width: 8px; height: 8px; box-sizing: border-box; display: inline-block; }
+.wg-sw-g, .wg-seg-g { fill: var(--l-chart-c1); background: var(--l-chart-c1); }
+.wg-sw-t, .wg-seg-t { fill: var(--l-chart-tool); background: var(--l-chart-tool); }
+.wg-sw-a, .wg-seg-a { fill: var(--l-chart-c4); background: var(--l-chart-c4); stroke: var(--l-chart-c1); stroke-width: 1; }
+.wg-sw-a { border: 1px solid var(--l-chart-c1); }
+.wg-sw-wait, .wg-seg-wait { fill: color-mix(in srgb, var(--vscode-descriptionForeground) 16%, var(--vscode-editor-background)); background: color-mix(in srgb, var(--vscode-descriptionForeground) 16%, var(--vscode-editor-background)); }
+.wg-sw-sub, .wg-seg-sub { fill: var(--l-chart-c2); background: var(--l-chart-c2); }
+.wg-seg-sub.open, .wg-seg-g.open, .wg-seg-t.open, .wg-seg-a.open { fill-opacity: .6; }
+.wg-note { font-size: var(--l-label); color: var(--vscode-descriptionForeground); padding: 4px 0; }
 .wg-note-line { display: block; }
+.wg-timeline-head { display: grid; align-items: end; margin-top: 12px; border-bottom: 1px solid var(--vscode-panel-border); }
+.wg-timeline-head > div { padding-bottom: 4px; }
+.wg-total { display: block; font-size: var(--l-label); font-variant-numeric: tabular-nums; }
 .wg-body { display: grid; grid-template-columns: minmax(0, 1fr); align-items: start; }
-.wg-chart-pane { min-width: 0; overflow-x: auto; }
+.wg-chart-pane { min-width: 0; }
 .wg-chart { display: block; }
 .wg-chart [data-clipped] { stroke: var(--vscode-foreground); stroke-opacity: .55; stroke-dasharray: 2 2; }
-.wg-tick { font-size: 10px; fill: var(--vscode-descriptionForeground); }
-.wg-tick-line { stroke: var(--vscode-editorWidget-border, rgba(128, 128, 128, 0.35)); stroke-width: 1; }
-.wg-fold { fill: rgba(128, 128, 128, 0.12); }
-.wg-fold-bg { fill: rgba(168, 120, 58, 0.18); }
-.wg-fold[data-fold-kind="unobserved"] { fill: rgba(128, 128, 128, 0.08); }
-.wg-fold[data-fold-kind="confirm"] { fill: rgba(122, 90, 138, 0.2); }
-.wg-fold-label { fill: #b08b57; }
+.wg-tick { font-size: var(--l-label); fill: var(--vscode-descriptionForeground); font-variant-numeric: tabular-nums; }
+.wg-axis-tick { stroke: var(--vscode-descriptionForeground); stroke-width: 1; }
+.wg-tick-line { stroke: var(--vscode-panel-border); stroke-opacity: .6; stroke-width: 1; shape-rendering: crispEdges; }
+.wg-group-line { stroke: var(--vscode-panel-border); stroke-width: 1; }
 .wg-row { cursor: pointer; outline: none; }
 .wg-row-bg { fill: transparent; }
-.wg-row:hover .wg-row-bg { fill: rgba(176, 139, 87, 0.1); }
-.wg-row.on .wg-row-bg, .wg-row.open .wg-row-bg { fill: rgba(176, 139, 87, 0.18); }
-.wg-row:focus-visible .wg-row-bg { stroke: var(--vscode-focusBorder); stroke-width: 1.5; }
-.wg-lbl { font-size: 12px; fill: var(--vscode-foreground); }
-.wg-lbl-dim { font-size: 10px; fill: var(--vscode-descriptionForeground); }
-.wg-open { font-size: 16px; fill: var(--vscode-descriptionForeground); cursor: pointer; }
+.wg-row:hover .wg-row-bg { fill: var(--vscode-list-hoverBackground); }
+.wg-row.on .wg-row-bg, .wg-row.open .wg-row-bg { fill: var(--vscode-list-inactiveSelectionBackground); }
+.wg-row:focus-visible .wg-row-bg { stroke: var(--vscode-focusBorder); stroke-width: 1; }
+.wg-lbl, .wg-row-value { font-size: var(--l-note); fill: var(--vscode-foreground); }
+.wg-row[data-kind="block"] .wg-lbl { font-weight: 600; }
+.wg-row-value { font-variant-numeric: tabular-nums; }
+.wg-row[data-kind="agent"] .wg-row-value, .wg-row[data-kind="bg"] .wg-row-value { fill: var(--vscode-descriptionForeground); }
+.wg-lbl-dim, .wg-block-number { font-size: var(--l-label); fill: var(--vscode-descriptionForeground); }
+.wg-block-number { letter-spacing: .08em; }
+.wg-open { font-size: 14px; fill: var(--vscode-descriptionForeground); cursor: pointer; }
 .wg-row:hover .wg-open, .wg-row:focus-visible .wg-open { fill: var(--vscode-foreground); }
-.wg-sub-link { fill: none; stroke: #a8783a; stroke-width: 1.2; opacity: 0.65; }
+.wg-sub-link { fill: none; stroke: var(--vscode-descriptionForeground); stroke-width: 1; opacity: .5; }
+.wg-narrow .wg-legend-item { font-size: var(--l-label); padding: 0 4px; gap: 4px; }
+.wg-narrow .wg-hidden-status { margin-left: 0; flex-basis: 100%; }
+.wg-narrow .wg-mini { height: 24px; }
+.wg-narrow .wg-map-caption { display: none; }
 @keyframes wg-row-pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.55; } }
 .wg-row.running .wg-seg { animation: wg-row-pulse 1.8s ease-in-out infinite; }
 @media (prefers-reduced-motion: reduce) { .wg-row.running .wg-seg { animation: none; } }
@@ -2742,25 +2774,6 @@ button.llm-evidence-chip:focus-visible { outline: 1px solid var(--vscode-focusBo
 .wi-cnt { font-size: 10px; color: var(--vscode-descriptionForeground); margin-left: 5px; }
 .wi-body { flex: 1; min-height: 0; overflow: auto; padding: 4px 10px 10px; }
 .wi-sections { padding: 0 10px; }
-
-/* 実行ログの印（R-TAB-06）。行は tab.ts が組む。ここは印・まとめ・時刻列の見た目だけ */
-.wl-head { padding: 4px 0 6px; }
-.wl-sum { position: sticky; top: 0; display: flex; flex-wrap: wrap; gap: 6px; align-items: center; font-size: 11.5px; padding: 6px 0; background: var(--vscode-editor-background); }
-.wl-sum-n { font-weight: 600; }
-.wl-chip { font-size: 10.5px; padding: 1px 7px; border-radius: 3px; background: rgba(176, 139, 87, 0.18); color: var(--vscode-foreground); }
-.tool-row.wl-flag { box-shadow: inset 3px 0 0 #b08b57; }
-.tool-row.wl-fail { box-shadow: inset 3px 0 0 var(--vscode-errorForeground); }
-/* 印は summary の中で改行して 1 段下に並ぶ（行を閉じたままで見える） */
-.tool-row.wl-flag > summary, .tool-row.wl-fail > summary { flex-wrap: wrap; }
-.wl-tag { flex: 0 0 100%; padding: 0 0 2px 4px; }
-.wl-tag > button { font-size: 10.5px; padding: 1px 7px; border-radius: 3px; cursor: pointer; background: rgba(176, 139, 87, 0.18); color: var(--vscode-foreground); border: 1px solid rgba(176, 139, 87, 0.5); }
-.wl-tag > button:focus-visible { outline: 1px solid var(--vscode-focusBorder); outline-offset: 1px; }
-.tool-at { flex: 0 0 auto; white-space: nowrap; min-width: 7.5ch; font-size: 10.5px; color: var(--vscode-descriptionForeground); font-variant-numeric: tabular-nums; margin-right: 6px; }
-@keyframes wlflash { 0% { background: rgba(176, 139, 87, 0.35); } 100% { background: transparent; } }
-.tool-row.wl-back > summary { animation: wlflash 1.4s ease-out; }
-@media (prefers-reduced-motion: reduce) { .tool-row.wl-back > summary { animation: none; outline: 1px solid #b08b57; } }
-.wl-chip { cursor: pointer; border: 1px solid rgba(176, 139, 87, 0.5); }
-.wl-chip:focus-visible { outline: 1px solid var(--vscode-focusBorder); outline-offset: 1px; }
 
 /* 分析タブ: サブタブ（スクリプト分析 / LLM 分析）・分析の指標・スクリプト分析の所見（R-TAB-06） */
 .wa-tabs { display: flex; gap: 2px; margin: 0 0 12px; border-bottom: 1px solid var(--vscode-editorWidget-border, var(--vscode-panel-border)); }
@@ -2889,7 +2902,7 @@ button.llm-evidence-chip:focus-visible { outline: 1px solid var(--vscode-focusBo
 .af-learning-note, .af-learning-line, .wa-fsec-empty { font-size: 11.5px; line-height: 1.6; color: var(--vscode-descriptionForeground); }
 .af-llm-section { margin-top: 10px; padding-top: 10px; border-top: 1px solid var(--vscode-editorWidget-border, var(--vscode-panel-border)); }
 @media (forced-colors: active) {
-  .wi-pop, .wi-max, .wi-close, .wl-tag > button, .wo-card { border: 1px solid CanvasText; forced-color-adjust: none; background: Canvas; color: CanvasText; }
+  .wi-pop, .wi-max, .wi-close, .wl-tag > button, .wo-hud-group { border: 1px solid CanvasText; forced-color-adjust: none; background: Canvas; color: CanvasText; }
   .wg-row:focus-visible .wg-row-bg { stroke: Highlight; }
   .term-note { border-bottom-color: CanvasText; }
 }
@@ -3066,3 +3079,96 @@ mark.find-match-current {
   cursor: pointer;
 }
 .auto-resume button:hover { background: var(--vscode-button-secondaryHoverBackground); }
+
+/* R-TAB-06; R-TAB-11 */
+.panel-work { container-type: inline-size; --log-time: 60px; --log-status: 16px; --log-name: 56px; --log-gap: 8px; --log-preview: calc(var(--log-time) + var(--log-status) + var(--log-name) + 3 * var(--log-gap)); }
+.panel-work .worklog-turn {
+  display: grid; grid-template-columns: 32px minmax(0, 1fr) max-content;
+  gap: 0; margin: 0; padding: var(--l-space-3) 0 var(--l-space-2);
+  border: 0; background: none; cursor: pointer;
+  color: var(--vscode-foreground); font-size: var(--l-label); line-height: 20px;
+}
+.panel-work .worklog-turn ~ .worklog-turn { margin-top: var(--l-space-2); border-top: 1px solid var(--vscode-panel-border); }
+.panel-work .worklog-turn > b { grid-column: 2; font-size: var(--l-body); font-weight: 700; line-height: 20px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.panel-work .wl-request-number { grid-column: 1; grid-row: 1 / 3; color: var(--vscode-descriptionForeground); font-size: var(--l-label); letter-spacing: .08em; }
+.panel-work .wl-request-meta { grid-column: 2 / 4; font-size: var(--l-label); line-height: 16px; color: var(--vscode-descriptionForeground); }
+.panel-work .wl-request-duration { grid-column: 3; grid-row: 1; font-size: var(--l-note); color: var(--vscode-descriptionForeground); white-space: nowrap; }
+.panel-work .wl-request-duration::after { content: "›"; display: inline-block; margin-left: var(--l-space-2); transform: rotate(90deg); color: var(--vscode-descriptionForeground); }
+.panel-work .wl-request-closed .wl-request-duration::after { transform: none; }
+.panel-work .wl-request-running .wl-request-number, .panel-work .wl-request-running .wl-request-duration { color: var(--vscode-descriptionForeground); }
+.panel-work .worklog-turn .wl-rep { grid-column: 2 / 4; font-size: var(--l-label); color: var(--vscode-descriptionForeground); }
+.panel-work .wl-request-hidden { display: none !important; }
+.panel-work .wl-request-last { opacity: .8; }
+.panel-work .wl-request-last > :not(summary) { display: none; }
+.panel-work .block.toolgroup { border: 0; border-radius: 0; background: none; margin: 0 0 0 var(--l-space-8); padding: 0; overflow: visible; }
+.panel-work .block.toolgroup > summary { display: none; }
+.panel-work .tool-row, .panel-work .agent-card { position: relative; border: 0; border-radius: 0; padding: 0; margin: 0; background: none; box-shadow: none; font-size: var(--l-note); }
+.panel-work :is(.tool-row, .agent-card).wl-request-last { margin-left: var(--l-space-8); }
+.panel-work .tool-row > summary, .panel-work .agent-card > summary {
+  display: grid; grid-template-columns: var(--log-time) var(--log-status) var(--log-name) minmax(0, 1fr) max-content;
+  position: relative; column-gap: var(--log-gap); row-gap: 0; align-items: baseline; min-height: 24px; padding: 0; line-height: 24px;
+  font-size: var(--l-note); cursor: pointer; list-style: none;
+}
+.panel-work .tool-row > summary:hover, .panel-work .agent-card > summary:hover { background: var(--vscode-list-hoverBackground); }
+.panel-work .tool-row > summary::before, .panel-work .agent-card > summary::before { content: "›"; position: absolute; left: -16px; width: 12px; margin: 0; text-align: center; opacity: 0; color: var(--vscode-descriptionForeground); }
+.panel-work :is(.tool-row, .agent-card)[open] > summary::before, .panel-work :is(.tool-row, .agent-card) > summary:hover::before { opacity: 1; }
+.panel-work :is(.tool-row, .agent-card).running > summary::after { content: ""; position: absolute; left: -8px; top: 4px; bottom: 4px; border-left: 2px solid var(--laisora-accent); pointer-events: none; }
+.panel-work :is(.tool-row, .agent-card).running > summary > :is(.tool-at, .tool-elapsed, .agent-meta) { color: var(--vscode-descriptionForeground); }
+.panel-work .tool-at { grid-column: 1; min-width: 0; overflow: hidden; white-space: nowrap; margin: 0; font-size: var(--l-note); color: var(--vscode-descriptionForeground); font-variant-numeric: tabular-nums; }
+.panel-work :is(.tool-row, .agent-card) > summary > .tool-status { grid-column: 2; width: 12px; height: auto; background: none; border: 0; border-radius: 0; line-height: 1; font-size: var(--l-note); text-align: center; color: var(--vscode-descriptionForeground); }
+.panel-work :is(.tool-row, .agent-card) > summary > .tool-status.failed { color: var(--vscode-errorForeground); }
+.panel-work :is(.tool-row, .agent-card) > summary > .tool-status.done { color: var(--vscode-descriptionForeground); }
+.panel-work .tool-name { grid-column: 3; font-size: var(--l-label); font-weight: 600; letter-spacing: .08em; text-transform: uppercase; color: var(--vscode-descriptionForeground); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.panel-work .tool-preview, .panel-work .agent-name { grid-column: 4; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; font-family: var(--vscode-editor-font-family); font-size: var(--l-note); font-weight: 400; }
+.panel-work .tool-preview-ui, .panel-work .agent-name { font-family: var(--vscode-font-family); }
+.panel-work .failed > summary > :is(.tool-preview, .agent-name) { color: var(--vscode-errorForeground); }
+.panel-work .tool-elapsed, .panel-work .agent-meta { grid-column: 5; grid-row: 1; padding: 0; margin: 0; font-size: var(--l-note); color: var(--vscode-descriptionForeground); font-variant-numeric: tabular-nums; text-align: right; white-space: nowrap; }
+.panel-work .tool-meta { grid-column: 4 / 6; margin: 0; padding: 0; font-size: var(--l-label); color: var(--vscode-descriptionForeground); line-height: 16px; }
+.panel-work .tool-row > pre { margin: var(--l-space-1) 0 var(--l-space-2) var(--log-preview); padding: 0 0 0 var(--l-space-3); border: 0; border-left: 1px solid var(--vscode-panel-border); border-radius: 0; background: none; font-family: var(--vscode-editor-font-family); font-size: var(--l-note); line-height: 1.5; white-space: pre-wrap; overflow-wrap: anywhere; }
+.panel-work .tool-row > pre::before, .panel-work .agent-result::before { content: attr(data-label); display: block; font-family: var(--vscode-font-family); font-size: var(--l-label); font-weight: 600; letter-spacing: .08em; line-height: 16px; color: var(--vscode-descriptionForeground); }
+.panel-work .agent-chips { display: inline; margin-left: var(--l-space-2); color: var(--vscode-descriptionForeground); }
+.panel-work .agent-chip { padding: 0; border: 0; border-radius: 0; background: none; font-size: var(--l-note); }
+.panel-work .agent-chip + .agent-chip::before { content: " · "; }
+.panel-work .agent-chip-effort { display: none; }
+.panel-work .agent-children, .panel-work .agent-result { margin: 0 0 var(--l-space-2) var(--log-preview); padding: 0 0 0 var(--l-space-3); border-left: 1px solid var(--vscode-panel-border); background: none; font-size: var(--l-note); line-height: 1.5; }
+.panel-work .agent-children > :is(.tool-row, .agent-card) { --log-time: 52px; --log-name: 48px; }
+.panel-work .agent-children .tool-row > pre { margin-left: 0; }
+.panel-work .block.todocard { margin: var(--l-space-1) 0 var(--l-space-2) calc(var(--l-space-8) + var(--log-preview)); padding: 0; background: none; border: 0; border-radius: 0; font-size: var(--l-note); }
+.panel-work .block.todocard > summary { padding: 0; font-size: var(--l-label); line-height: 16px; }
+.panel-work .block.todocard > summary::before { display: none; }
+.panel-work .todocard-list { padding: 0; border: 0; }
+.panel-work .todo-item { border: 0; }
+.panel-work .todo-item > summary { padding: 0; gap: var(--l-space-2); font-size: var(--l-note); line-height: 20px; }
+.panel-work .todocard-icon { box-sizing: border-box; width: 7px; height: 7px; border: 1px solid var(--vscode-descriptionForeground); }
+.panel-work .todocard-completed .todocard-icon { background: var(--vscode-descriptionForeground); }
+.panel-work .wl-head { position: sticky; top: var(--log-head-h, 0px); z-index: 2; padding: var(--l-space-3) 0 var(--l-space-2); background: var(--vscode-editor-background); border-bottom: 1px solid var(--vscode-panel-border); }
+.panel-work .wl-code { display: flex; flex-wrap: wrap; align-items: baseline; gap: var(--l-space-2); font-size: var(--l-label); line-height: 16px; color: var(--vscode-descriptionForeground); }
+.panel-work .wl-code > .l-label { color: var(--vscode-foreground); letter-spacing: .16em; }
+.panel-work .wl-totals { margin-left: auto; font-size: var(--l-note); font-variant-numeric: tabular-nums; }
+.panel-work .wl-flags { display: flex; flex-wrap: wrap; gap: var(--l-space-1) var(--l-space-4); align-items: baseline; margin-top: var(--l-space-2); font-size: var(--l-note); line-height: 20px; }
+.panel-work .wl-chip, .panel-work .wl-tag > button { border: 0; border-radius: 0; padding: 0; background: none; font: inherit; cursor: pointer; color: var(--vscode-descriptionForeground); }
+.panel-work .wl-tag-label { color: var(--vscode-foreground); }
+.panel-work .wl-chip:hover .wl-tag-label, .panel-work .wl-tag > button:hover .wl-tag-label { text-decoration: underline; text-underline-offset: 4px; }
+.panel-work .wl-flag-count { margin-left: var(--l-space-2); font-variant-numeric: tabular-nums; }
+.panel-work .wl-tag { grid-column: 4 / 6; align-self: start; padding-bottom: var(--l-space-1); font-size: var(--l-label); line-height: 16px; }
+.panel-work .wl-tag-code, .panel-work .wl-tag-target { letter-spacing: .08em; }
+.panel-work .wl-back > summary { outline: 1px solid var(--vscode-focusBorder); }
+@container (max-width: 520px) {
+  .panel-work .worklog-turn { grid-template-columns: 24px minmax(0, 1fr) max-content; gap: 0; }
+  .panel-work .block.toolgroup, .panel-work :is(.tool-row, .agent-card).wl-request-last { margin-left: 24px; }
+  .panel-work :is(.tool-row, .agent-card, .todocard) { --log-time: 0px; --log-status: 12px; --log-name: 44px; --log-gap: 4px; --log-preview: 64px; }
+  .panel-work :is(.tool-row, .agent-card) > summary { grid-template-columns: var(--log-status) var(--log-name) minmax(0, 1fr) max-content; }
+  .panel-work .tool-at { display: none; }
+  .panel-work :is(.tool-row, .agent-card) > summary > .tool-status { grid-column: 1; }
+  .panel-work .tool-name { grid-column: 2; }
+  .panel-work .tool-preview, .panel-work .agent-name { grid-column: 3; }
+  .panel-work .tool-elapsed, .panel-work .agent-meta { grid-column: 4; }
+  .panel-work .wl-tag, .panel-work .tool-meta { grid-column: 3 / 5; }
+  .panel-work .block.todocard { margin-left: calc(24px + var(--log-preview)); }
+}
+.panel-work .wl-request-duration { margin-left: var(--l-space-3); }
+.panel-work .todo-work { margin: var(--l-space-1) 0; padding: 0; border: 0; }
+.panel-work .tool-row > pre.tool-result-error { color: var(--vscode-errorForeground); }
+.panel-work .worklog-turn:focus-visible, .panel-work .wl-tag > button:focus-visible, .panel-work .wl-chip:focus-visible { outline: 1px solid var(--vscode-focusBorder); outline-offset: 4px; }
+
+.panel-work .todo-work-badge { display: none; }

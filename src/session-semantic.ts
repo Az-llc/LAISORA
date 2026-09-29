@@ -13,7 +13,7 @@ import {
   type RosterEvidence,
 } from "./roster-evidence";
 
-import { projectAnalysisFactsView } from "./analysis-facts-view";
+import { projectAnalysisFactsView, projectSummaryAnalysis } from "./analysis-facts-view";
 import type { SemanticEvidenceIndex } from "./evidence-index";
 import { output } from "./host-context";
 import { deriveL3 } from "./l3-analysis";
@@ -50,7 +50,7 @@ const WORK_MODEL_POST_INTERVAL_MS = 120;
 // ターン境界の直後は JSONL の末尾レコードがまだ書かれていないことがある。境界イベントから少し置いて読む
 const TRANSCRIPT_TIME_BUCKETS_DELAY_MS = 1500;
 
-// 設定の生死は send 時に毎回読む（tabState の semanticView 明示と、off 時に payload を
+// 設定の生死は send 時に毎回読む（ConversationSnapshot.semanticView の明示と、off 時に payload を
 // 送らない裁定の両方をここで満たす）。try は検証ハーネスの偽 vscode が
 // getConfiguration を持たないため（欠けていたら既定 on）
 export function semanticViewEnabled(): boolean {
@@ -162,7 +162,7 @@ export class SessionSemantic {
     streamOpen: boolean;
     liveDelegationRev: number;
     // 導出は sessionFacts と baseline も読む（deriveSessionFacts）。鍵に入れないと
-    // assistant_usage のような GUARDRAIL_ONLY イベントで sessionFacts だけが進んだとき
+    // GUARDRAIL_ONLY_EVENT_KINDS のイベントで sessionFacts だけが進んだとき
     // memo が hit し続け、古い L3 を返す。foldSessionFacts は毎回新しいオブジェクトを
     // 返すので参照比較で足りる
     sessionFacts: SessionFactsAccumulator;
@@ -433,6 +433,7 @@ export class SessionSemantic {
         rosterEvidence: this.rosterEvidence(),
       }),
       failureSummary: deriveFailureSummary(payload.execLogFindings ?? [], work.phases),
+      summaryAnalysis: projectSummaryAnalysis(payload.execLogFindings, payload.l3?.llm),
       mainTokens: summarizeMainTokens(this.host.sessionFacts.planUsage),
     };
   }
@@ -527,8 +528,12 @@ export class SessionSemantic {
     if (!this.semanticDerivationFailedLast || last === undefined || last.logicalGeneration !== this.host.logicalGeneration) {
       return undefined;
     }
+    const llm = this.attachLlm(last.payload, last.payload)?.l3?.llm;
+    const attached = llm && "attached" in llm ? llm.attached : undefined;
+    const staleLlm = attached && llm ? { ...llm, attached: { ...attached, freshness: "stale" as const } } : llm;
     return {
       ...last.payload,
+      summaryAnalysis: projectSummaryAnalysis(undefined, staleLlm),
       coverage: { ...last.payload.coverage, base: { ...last.payload.coverage.base, semanticDerivationFailed: "stale" } },
     };
   }

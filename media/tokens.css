@@ -1,5 +1,10 @@
 :root {
   --laisora-accent: var(--vscode-focusBorder, var(--vscode-textLink-foreground));
+  --l-chart-c1: var(--laisora-accent);
+  --l-chart-c2: color-mix(in srgb, var(--laisora-accent) 70%, var(--vscode-editor-background));
+  --l-chart-c3: color-mix(in srgb, var(--laisora-accent) 45%, var(--vscode-editor-background));
+  --l-chart-c4: color-mix(in srgb, var(--laisora-accent) 25%, var(--vscode-editor-background));
+  --l-chart-tool: color-mix(in srgb, var(--vscode-descriptionForeground) 45%, var(--vscode-editor-background));
   --l-title: 18px;
   --l-heading: 14px;
   --l-body: 13px;

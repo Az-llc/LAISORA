@@ -4,6 +4,7 @@
 import type { NormalizedEvent } from "./protocol";
 import { redactAbsolutePaths } from "./path-redaction";
 import { isPureCommandWrapper } from "./human-input-vocabulary";
+import { isBookkeepingTool } from "./work-model";
 import * as l10n from "@vscode/l10n";
 
 export type TimeBucket = "generate" | "tool" | "confirm" | "reply";
@@ -112,6 +113,7 @@ export type RequestBlockKind = "say" | "command" | "interrupt";
 
 export interface RequestBlockRecord {
   blockId: string;
+  requestNumber?: string;
   kind: RequestBlockKind;
   text: string;
   start: number;
@@ -135,6 +137,19 @@ export interface TimeBucketState {
   blocks: RequestBlockRecord[];
   droppedIntervalCount: number;
   droppedBlockCount: number;
+}
+
+// R-DSP-34: preserve canonical LOG numbers before its request retention evicts them.
+export function attachTimeBucketRequestNumbers(state: TimeBucketState, requests: readonly { turnIds: readonly string[]; number: string }[]): TimeBucketState {
+  const numbers = new Map(requests.flatMap(request => request.turnIds.map(id => [id, request.number] as const)));
+  let changed = false;
+  const blocks = state.blocks.map(block => {
+    const number = block.turnId === null ? undefined : numbers.get(block.turnId);
+    if (number === undefined || number === block.requestNumber) return block;
+    changed = true;
+    return { ...block, requestNumber: number };
+  });
+  return changed ? { ...state, blocks } : state;
 }
 
 export function createTimeBucketState(): TimeBucketState {
@@ -231,6 +246,8 @@ export function foldTimeBuckets(state: TimeBucketState, event: NormalizedEvent):
       if (state.openTurn !== undefined) {
         n.turnSpans = [...state.turnSpans, { turnId: state.openTurn.turnId, start: state.openTurn.startedAt, end: Math.max(state.openTurn.startedAt, ts) }];
       }
+      const pending = n.blocks.at(-1);
+      if (pending?.turnId === null) n.blocks = [...n.blocks.slice(0, -1), { ...pending, turnId: event.turnId }];
       n.openTurn = { turnId: event.turnId, startedAt: ts };
       return n;
     }
@@ -481,7 +498,7 @@ export interface TimeBucketTotals {
   confirmMs: number;
   replyMs: number | null;
   // サブエージェントだけが稼働していた時間（メインのターン・ツール外で、返信待ちではない）。
-  // generate + tool + confirm + reply + subOnly = span
+  // generateMs + toolMs + confirmMs + replyMs + subOnlyMs = spanMs
   subOnlyMs: number | null;
   // null = 最初の境界が継承時刻で、経過の起点が測れていない（R-DSP-11）
   spanMs: number | null;
@@ -521,6 +538,9 @@ export interface AgentSpanView {
 
 export interface RequestBlockView {
   blockId: string;
+  requestNumber: string | null;
+  processingMs: number | null;
+  strip: { processingPercent: number; replyPercent: number; remainderPercent: number } | null;
   kind: RequestBlockKind;
   text: string;
   start: number;
@@ -530,6 +550,7 @@ export interface RequestBlockView {
   // null = start が継承値（fidelity=inherited）。数字にすると継承した時刻からの差を経過として出す（R-DSP-11）
   durationMs: number | null;
   turnIds: string[];
+  // isBookkeepingTool を除く。failCount も同じ母集団
   toolCount: number;
   failCount: number;
   agentCount: number;
@@ -552,7 +573,7 @@ export interface MainModelTimeEntry {
   percent: number | null;
 }
 
-// 本体の処理時間 = LLM 生成 + 委任でないツール（R-DSP-17 のメイン棒と同じ母数）
+// R-DSP-49: deriveMainByModel; TimeBucketView
 export interface MainTimeByModelView {
   totalMs: number;
   generateMs: number;
@@ -571,7 +592,7 @@ export interface TimeBucketView {
   spanMs: number | null;
   main: TimeBucketTotals;
   sub: { generateMs: number; toolMs: number; spanMs: number };
-  // R-DSP-17 の 3 本。返信待ちと確認待ちは入れない
+  // R-DSP-49: deriveTimeBuckets の mainBarMs と subSpan。
   bars: { totalMs: number | null; mainMs: number | null; subMs: number };
   // null = model の地点を渡されていない（live の fold）か、継承時刻で生成時間を測っていない（R-DSP-11）
   mainByModel: MainTimeByModelView | null;
@@ -752,8 +773,7 @@ export function deriveTimeBuckets(
   const confirmUnion = unionSpans(confirmSpans);
   // 確認待ちを返信待ちへ畳まない。畳むと「LLM からの確認を減らす」が改善方向として見えなくなる（R-DSP-16）
   const toolUnion = subtractSpans(unionSpans(allMainToolSpans), confirmUnion);
-  // メイン棒のツール分は「委任でないツールの和集合」。toolUnion から Agent 区間を引く形だと、
-  // Agent と重なって走った Read 等の時間まで消えて過小になる（R-DSP-17）
+  // R-DSP-49: nonDelegationToolSpans; DELEGATION_TOOL_NAMES; nonDelegationToolUnion
   const nonDelegationToolSpans = state.mainTools
     .filter((t) => !DELEGATION_TOOL_NAMES.has(t.toolName))
     .map((t) => [t.start, t.end] as Span);
@@ -916,14 +936,28 @@ export function deriveTimeBuckets(
     const bspan: Span[] = [[b.start, bEnd]];
     const turnIds = turnSpansAll.filter((t) => t.start >= b.start && t.start < bEnd).map((t) => t.turnId);
     if (b.turnId !== null && !turnIds.includes(b.turnId)) turnIds.unshift(b.turnId);
-    const tools = state.mainTools.filter((t) => t.start >= b.start && t.start < bEnd);
+    const blockTools = state.mainTools.filter((t) => t.start >= b.start && t.start < bEnd);
+    const tools = blockTools.filter((t) => !isBookkeepingTool(t.toolName));
     const blockAgents = agents.filter((a) => a.start >= b.start && a.start < bEnd);
     for (const a of blockAgents) a.blockId = b.blockId;
     for (const t of backgroundTasks) if (t.start >= b.start && t.start < bEnd) t.blockId = b.blockId;
-    const firstReal = tools.length > 0 ? Math.min(...tools.map((t) => t.start)) : undefined;
+    const firstReal = blockTools.length > 0 ? Math.min(...blockTools.map((t) => t.start)) : undefined;
     const running = state.openTurn !== undefined && i === state.blocks.length - 1;
+    const generate = measureSpans(intersectSpans(generateSpans, bspan));
+    const tool = measureSpans(intersectSpans(toolUnion, bspan));
+    const confirm = measureSpans(intersectSpans(confirmUnion, bspan));
+    const reply = measureSpans(intersectSpans(replySpans, bspan));
+    const processing = generate + tool + confirm;
+    const elapsed = bEnd - b.start;
     blocks.push({
       blockId: b.blockId,
+      requestNumber: b.requestNumber ?? null,
+      processingMs: inherited ? null : processing,
+      strip: inherited || elapsed === 0 ? null : {
+        processingPercent: processing / elapsed * 100,
+        replyPercent: reply / elapsed * 100,
+        remainderPercent: Math.max(0, elapsed - processing - reply) / elapsed * 100,
+      },
       kind: b.kind,
       text: b.text,
       start: b.start,
@@ -980,7 +1014,7 @@ export function deriveTimeBuckets(
       spanMs: inherited ? null : spanMs,
     },
     sub: { generateMs: subGenerate, toolMs: subTool, spanMs: subSpan },
-    // 返信待ちは棒に入れない。改善できない時間で、入れると処理側が読めなくなる（R-DSP-17）
+    // R-DSP-49: mainBarMs; subSpan
     bars: {
       mainMs: inherited ? null : mainBarMs,
       subMs: subSpan,
@@ -1052,7 +1086,7 @@ export function overlayLiveTimeBucketState(measured: TimeBucketView, live: TimeB
       blocks[at] = { ...blocks[at], running: true, end: Math.max(blocks[at].end, liveLast.end) };
     } else {
       // live の最後の往復が読み直しにまだ無い。数値は継承時刻由来なので出さない（R-DSP-11）
-      blocks.push({ ...liveLast, durationMs: null, generateMs: null, replyMs: null, running: true });
+      blocks.push({ ...liveLast, durationMs: null, generateMs: null, replyMs: null, processingMs: null, strip: null, running: true });
     }
   }
   return {

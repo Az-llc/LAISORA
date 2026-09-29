@@ -1,3 +1,4 @@
+import { isToolIntentInput, type ToolIntentInput } from "./webview/status-line";
 import { isAccentSettings, isAccentSettingValue, type AccentSettings, type AccentSetting } from "./accent";
 import { normalizeSystemAppExtension } from "./file-link-open-mode";
 import { isPlanUsage, type MainTokenTotal } from "./plan-usage";
@@ -8,10 +9,7 @@ import { isExternalTimeout, isExternalDetection, isExternalModels, type External
 import { isOrchestrationSettingRoster, type OrchestrationSettingRow } from "./orchestration-roster";
 import { isOrchestrationView, type OrchestrationView } from "./orchestration-view";
 export type { OrchestrationView } from "./orchestration-view";
-// 拡張⇔Webview メッセージプロトコル
-// マルチタブ（tabId ごとに Conversation 1本）。
-// generation+seq / cursor / backendId は差分再送のための語彙として先に固定してあるが、
-// 増分resume自体は未配線（ready は常に cursor:null を送り、host は毎回フルスナップショットを返す）。
+// ready の cursor を Host は読まない（src/store-surfaces.ts#SessionStore.initForReady）。差分再送は配線されていない。
 
 // work-model.ts が protocol.ts から取るのは NormalizedEvent の型だけなので、
 // こちらから値を取っても実行時の循環にはならない。逆向き（work-model.ts が protocol.ts の
@@ -36,11 +34,9 @@ import type {
   WorkTotals,
 } from "./work-model";
 import type { EffectCoverage, ProjectedArtifactAccess } from "./artifact-access";
-import type { AnalysisFactsView } from "./analysis-facts-view";
-// type-only に保つこと: semantic-model.ts は node:crypto を実行時 import しており、
+import type { AnalysisFactsView, SummaryAnalysisView } from "./analysis-facts-view";
+// type-only に保つこと: semantic-model.ts と l3-divergence.ts は node:crypto を実行時 import しており、
 // 値を取ると browser バンドル（dist/webview.js）が壊れる。
-// l3-analysis.ts は semantic-model.ts から値を取り、l3-divergence.ts は node:crypto を
-// 直接 import する（divergenceId）ので、どちらにも同じ制約が伝播する
 import type { Coverage, ExecutionAttemptNode, SemanticModel, SemanticNode } from "./semantic-model";
 import type { L3Report, SerializationClassification } from "./l3-analysis";
 import type {
@@ -49,14 +45,11 @@ import type {
   DivergenceRecord,
   DivergenceReport,
 } from "./l3-divergence";
-// type-only に保つこと: llm-finding-verify.ts は protocol.ts を import しており、値を取ると循環する
 import type { LlmAnalysisProvenance, RejectedFinding } from "./llm-finding-verify";
-// type-only に保つこと: handoff-envelope.ts は handoff-accept.ts 経由で @vscode/l10n を取り込むため、
-// 値を取ると browser バンドル（dist/webview.js）へ Host 専用の依存が入る
 import type { HandoffDecisionEntry, HandoffDecisions } from "./handoff-envelope";
 
-// Host と webview は同じ VSIX で出るが、webview の再読込前などに版がずれる。wire の形を変えたら版を上げる。
-// webview は init で版を突き合わせ、食い違いを利用者へ出す（黙って行が消える状態にしない）。
+// 再読込前の webview は Host と版がずれうる。src/webview/main.ts が init の protocolVersion と突き合わせて利用者へ出す。
+// バリアントの追加では上げない（verify-history-wiring#W-0b）。
 export const PROTOCOL_VERSION = 5;
 
 export type BackendId = "claude" | "codex";
@@ -76,25 +69,22 @@ export interface DelegationInfo {
   isBackground?: boolean;
 }
 
-// task-notification の構造化（agentId = <task-id>。toolUseId = <tool-use-id> で、
-// 初回完了は dispatch の id・resume 後は SendMessage の id を指す）
+// CLI の task-notification を写す（src/tool-observation.ts#parseTaskNotification）。toolUseId は初回完了では dispatch の id、
+// resume 後は SendMessage の id を指す。
 export interface TaskNotificationInfo {
   agentId: string;
   toolUseId?: string;
   status?: string;
-  // history は本文の <usage><subagent_tokens>、live は system/task_notification の usage.total_tokens。
-  // 同じ task-id の再通知（SendMessage 後）は新しい値で置き換える量で、足し合わせない
+  // 同じ agentId の再通知は置き換える量で、足し合わせない（src/work-model.ts#recordNotifiedTokens）。
   tokens?: number;
 }
 
-// Progress Protocol pp1。
-// queued は emitter から到達不能のため emission enum に含めない
+// 待機状態（queued）は emitter から到達不能なので加えない。受理する集合は src/tool-observation.ts#PROGRESS_STATES。
 export type ProgressState = "active" | "blocked" | "review" | "done";
 
 export interface ProgressEmission {
   pp: "pp1";
-  // subagent は SubagentStart hook 経由で pp1 を受け取り task id を知らないため optional。
-  // キーごとの欠落だけが正常系で、空文字・空白のみは emission ごと破棄する
+  // subagent は task id を知らずに pp1 を出すので省略できる。空の値は src/tool-observation.ts#extractProgressEmission が emission ごと捨てる（verify-progress#PX-22）。
   taskId?: string;
   state: ProgressState;
   activity?: string;
@@ -109,26 +99,115 @@ export interface EventEnvelope {
   generation: number;
   seq: number;
   timestamp: number;
-  // reducer が確定した配置と集計。詳細ログの描画はここだけを見る（R1-F2）。
-  // EventLog へ保存する値でもある: snapshot 再生と live で同じものを webview へ渡すため、
-  // メッセージ側にだけ載せると再生時に配置が失われる
+  // 詳細ログのカード配置は work だけで決める（verify-detail-cards#C-1b）。保存される event に載せるので、再生も live と同じ配置になる。
   work?: WorkEventInfo;
   provenance?: EventProvenance;
 }
 
 export type NormalizedEvent = EventEnvelope & NormalizedEventBody;
 
-// semantic 境界（segment / phase / agent の開始・終了）を決めるイベント種別。
-// これらに timestamp が無い状態で semantic derivation へ入れてはならない。
-// 実時計（Date.now()）で補完すると replay 決定性が壊れ、live と history で
-// segment の endedAt が食い違う。
-// 供給の正規経路は ClaudeLiveNormalizer の「直近観測時刻の継承」で、
-// それでも欠けている場合は契約違反として落とす。実時計では救済しない。
-//
-// 必須になるのは「一度でも時刻を観測した後」。ストリーム先頭の turn_started は
-// 継承元が無く、かつ閉じるべき segment も running work もまだ存在しないため
-// （work-model.ts:1606 の closeSegment / markRunningWorkStale は空に対する no-op）、
-// 時刻を持たないことが正当。観測開始後に欠けたら境界が壊れるので落とす
+export interface ModelRefusalFallback {
+  originalModel: string;
+  fallbackModel: string;
+  category: string | null;
+  explanation: string | null;
+  scope: "session" | "local";
+  turnId: string | null;
+  refusedUserMessageUuid: string | null;
+  message: string;
+  // R-GW-09: set only by the Host on live session-scope fallbacks (src/conversation-lifecycle.ts#noteFallbackRevert).
+  autoRevert?: FallbackAutoRevertStart;
+}
+
+export const FALLBACK_AUTO_REVERT_STARTS = ["pending", "off"] as const;
+export type FallbackAutoRevertStart = (typeof FALLBACK_AUTO_REVERT_STARTS)[number];
+export const FALLBACK_REVERT_OUTCOMES = ["applied", "deferred", "failed", "chosen"] as const;
+export type FallbackRevertOutcome = (typeof FALLBACK_REVERT_OUTCOMES)[number];
+
+export function sameModel(a: string | null | undefined, b: string | null | undefined, models: readonly ModelInfo[] = []): boolean {
+  if (!a || !b) return false;
+  const resolved = (id: string): string => models.find(row => row.id === id)?.resolvedModel ?? id;
+  return resolved(a) === resolved(b);
+}
+
+// Returns the same object when nothing changes: src/webview/tab.ts#Tab.handleEvent refreshes the chrome only on a new state (verify-refusal#RF-MSAME).
+export function applyFallbackModel(state: ModelFallbackState | undefined, model: string | null | undefined,
+  at: number, models: readonly ModelInfo[] = []): ModelFallbackState | undefined {
+  if (!state || !model) return state;
+  if (state.resolvedAt === undefined && sameModel(model, fallbackOriginalModel(state), models)) {
+    return { ...state, appliedModel: model, resolvedAt: at };
+  }
+  // R-GW-09: a resolved fallback re-opens when the session is observed on the fallback model again (verify-refusal#RF-MREOPEN1).
+  if (state.resolvedAt !== undefined && sameModel(model, state.notice.fallbackModel, models) &&
+    !sameModel(model, state.appliedModel, models)) {
+    const { resolvedAt: _resolvedAt, autoRevert: _autoRevert, ...open } = state;
+    return { ...open, appliedModel: model, reopenedAt: at };
+  }
+  return model === state.appliedModel ? state : { ...state, appliedModel: model };
+}
+
+export function resolveFallbackByChoice(state: ModelFallbackState | undefined, model: string | null | undefined,
+  at: number): ModelFallbackState | undefined {
+  if (!state) return state;
+  return { ...state, appliedModel: model || state.appliedModel, resolvedAt: state.resolvedAt ?? at };
+}
+
+// R-GW-09: the model the turn started with; a later fallback in the same turn starts from the previous fallback model.
+export function fallbackOriginalModel(state: ModelFallbackState): string {
+  return state.turnOriginalModel ?? state.notice.originalModel;
+}
+
+// The model a notice's status line names: the restore target while the notice is the current state (verify-refusal#RF-MCOALESCE3).
+export function fallbackNoticeOriginal(state: ModelFallbackState | undefined,
+  notice: Extract<NormalizedEvent, { kind: "model_refusal_fallback" }>): string {
+  return state !== undefined && state.notice === notice ? fallbackOriginalModel(state) : notice.originalModel;
+}
+
+export function foldModelFallback(state: ModelFallbackState | undefined, event: NormalizedEvent,
+  models: readonly ModelInfo[] = []): ModelFallbackState | undefined {
+  if (event.kind === "model_refusal_fallback" && event.scope === "session") {
+    // R-GW-09: same coalescing rule as src/conversation-lifecycle.ts#noteFallbackRevert (verify-refusal#RF-MCOALESCE).
+    const coalesced = state !== undefined && state.resolvedAt === undefined && state.notice.turnId === event.turnId;
+    return { notice: event, appliedModel: event.fallbackModel, ...(event.autoRevert ? { autoRevert: event.autoRevert } : {}),
+      ...(coalesced ? { turnOriginalModel: fallbackOriginalModel(state) } : {}) };
+  }
+  if (event.kind === "model_fallback_revert") {
+    if (!state || state.notice.turnId !== event.turnId) return state;
+    if (event.outcome === "failed") return { ...state, autoRevert: event.outcome };
+    const resolved = resolveFallbackByChoice(state, event.outcome === "chosen" ? undefined : event.originalModel, event.timestamp)!;
+    return { ...resolved, autoRevert: event.outcome };
+  }
+  if (event.kind === "model_observed") return applyFallbackModel(state, event.model, event.timestamp, models);
+  if (event.kind === "auth_status") return applyFallbackModel(state, event.auth.model, event.timestamp, models);
+  return state;
+}
+
+// R-CNV-43 (verify-refusal#RF-MREVERT1)
+export function fallbackNeedsConfirmation(state: ModelFallbackState): boolean {
+  return state.autoRevert !== "pending" && state.autoRevert !== "applied" && state.autoRevert !== "deferred";
+}
+
+// R-GW-07 (verify-refusal#RF-MREVERT2)
+export function fallbackChipWarning(state: ModelFallbackState | undefined, modelOverride: string | null | undefined,
+  models: readonly ModelInfo[]): boolean {
+  if (state === undefined || state.resolvedAt !== undefined) return false;
+  const requested = modelOverride === null
+    ? models.find(row => row.id === "default")?.resolvedModel
+    : modelOverride ?? fallbackOriginalModel(state);
+  return !sameModel(state.appliedModel, requested, models);
+}
+
+export interface ModelFallbackState {
+  notice: Extract<NormalizedEvent, { kind: "model_refusal_fallback" }>;
+  appliedModel: string;
+  resolvedAt?: number;
+  reopenedAt?: number;
+  turnOriginalModel?: string;
+  autoRevert?: FallbackAutoRevertStart | FallbackRevertOutcome;
+}
+
+// 欠けた時刻を実時計で補わない: replay が決定的でなくなり、live と history で segment の区切りが食い違う（verify-stage1-public#S1-A4mut）。
+// 欠けた event は src/event-fold.ts#foldEventState が破棄する。時刻を一度も観測していない間は閉じる区切りが無いので gate しない。
 export const TIMESTAMP_REQUIRED_KINDS: readonly string[] = [
   "turn_started",
   "turn_completed",
@@ -146,8 +225,7 @@ export type NormalizedEventBody =
   (
     | { kind: "conversation_opened"; cwd: string; model?: string }
     | { kind: "conversation_closed"; reason: string }
-    // cliInserted: このターンを開いたのは CLI が書いた user レコード（`isMeta`）で、利用者は何も打っていない。
-    // 本文は user_message にしない（発言として集計・タイトル・逐語へ入る）ので、表示はこの印だけを見る
+    // cliInserted: CLI が書いた isMeta の user レコードで開いたターン。本文を user_message にすると利用者の発言として集計・タイトルへ入る。
     | { kind: "turn_started"; turnId: string; cliInserted?: true }
     | { kind: "auto_resume"; state: "pending"; at: number }
     | { kind: "auto_resume"; state: "cancelled" | "fired" | "exhausted" }
@@ -157,14 +235,11 @@ export type NormalizedEventBody =
         kind: "turn_failed";
         turnId: string;
         reason: string;
-        // limit到達等の分類。SDKのresult文字列から判別
         errorKind?: "usage_limit";
-        // usage_limit時のリセット時刻（epoch ms）。取れなければnull
+        // epoch ms
         resetsAt?: number | null;
-        // どのlimitか（モデル別/週間枠/credits）を含むSDK原文（表示用）
         detail?: string;
       }
-    // SDK内部リトライの可視化（無処理だとUIがフリーズしたように見える）
     | {
         kind: "api_retry";
         turnId: string | null;
@@ -172,38 +247,31 @@ export type NormalizedEventBody =
         maxRetries: number;
         retryDelayMs: number;
         errorStatus?: number;
-        // SDKAssistantMessageError（HTTP応答なしのリトライでも原因種別を出す）
+        // SDK の SDKAssistantMessageError。HTTP 応答の無いリトライでも入る。
         errorType?: string;
       }
     | { kind: "assistant_text_delta"; turnId: string; text: string }
-    // 直前に流した未ラベルの assistant 本文が、この wire uuid のフレームのものであるという印。
-    // SDK の assistant フレームは本文が完結した後に届くので、ストリーム中の assistant_text_delta
-    // へ uuid を載せることはできない（uuid を知る前に本文を出している）。
-    // live 専用: 撤回対象は CLI が自分の転記録から削除するので history からは復元されない
+    // 直前に流した assistant 本文の wire uuid。SDK の assistant フレームは本文の完結後に届くので、assistant_text_delta には載せられない。
+    // live だけが出す: 撤回された本文は CLI が転記録から消すので history には無い。
     | { kind: "assistant_message_uuid"; turnId: string; uuid: string }
-    // プロバイダからの撤回指示（R-DSP-26）。到着した uuid のメッセージを画面から退去させる。
-    // 撤回は冪等で、未知・撤回済みの uuid は no-op（sdk.d.ts）。2 経路（置き換える側のフレームの
-    // supersedes / ターン末 model_refusal_fallback の retracted_message_uuids）が同じ uuid を
-    // 名乗りうるため、消費側は 2 回来ても壊れてはならない
+    // R-DSP-26: 置き換え側フレームの supersedes とターン末の retracted_message_uuids が同じ uuid を名乗りうる（sdk.d.ts）。
+    // 消費側は同じ uuid の再到着と未知の uuid を何もせずに受ける。
     | { kind: "assistant_retracted"; turnId: string | null; uuids: string[] }
+    | ({ kind: "model_refusal_fallback" } & ModelRefusalFallback)
+    // R-GW-09: recorded by src/conversation-lifecycle.ts#settleFallbackRevert and src/conversation-lifecycle.ts#applyModelChange; the CLI transcript never contains it.
+    | { kind: "model_fallback_revert"; turnId: string | null; originalModel: string; outcome: FallbackRevertOutcome }
     | {
         kind: "user_message";
         turnId: string | null;
         text: string;
         images?: ImageAttachment[];
         imageRefs?: ImageRefInfo[];
-        // sentAt は Host が送信を観測した実時刻（R-CNV-16 のフッター表示専用）。
-        // envelope の timestamp は順序用の観測時刻の継承で、復元タブの初回送信では
-        // 記録末尾の時刻になる。名前を `timestamp` にすると envelope の spread に潰される
+        // R-CNV-16: Host が送信を観測した時刻。envelope の timestamp は継承された順序用の時刻なので代用しない。
+        // timestamp と名付けると EventEnvelope の spread で上書きされる。
         sentAt?: number;
       }
-    // resume 時の過去ログ再生（表示専用。復元境界は会話へ挿入する区切り行で示す）
-    // uuid は会話の過去 chunk との重複判定にだけ使う表示専用の項目。
-    // replayed_message は work-model / evidence-index / semantic-model / l3-analysis の
-    // どこにも現れない（grep 0 件）ので、足しても導出には入り得ない
-    // recordedAt はそのレコード自身の時刻（R-CNV-15 / R-CNV-16 のフッター表示専用）。
-    // 名前を `timestamp` にすると envelope の spread に潰される。meta.timestamp で運ぶと
-    // timestamp gate の判定基準（lastEventTimestamp）が過去へ巻き戻る
+    // recordedAt（R-CNV-15 / R-CNV-16）: timestamp と名付けると EventEnvelope の spread で上書きされる。
+    // meta.timestamp で運ぶと lastEventTimestamp が過去へ巻き戻る。
     | {
         kind: "replayed_message";
         role: "user" | "assistant";
@@ -212,7 +280,6 @@ export type NormalizedEventBody =
         imageRefs?: ImageRefInfo[];
         model?: string;
         recordedAt?: number;
-        // Original send time, used for display when recordedAt is absent.
         sentAt?: number;
       }
     | {
@@ -222,61 +289,49 @@ export type NormalizedEventBody =
         parentToolUseId: string | null;
         toolName: string;
         inputPreview: string;
-        // 切り詰め前の完全な入力から算出した人間可読の1行（summarizeToolInput）。
-        // inputPreview は500字切り詰めでJSONとして壊れるため、要約はホスト側で作る
+        // inputSummary は Host が切り詰め前の入力から summarizeToolInput で作る。無いときだけ src/webview/format.ts#toolSummary が
+        // 切り詰め済みの inputPreview を JSON.parse して作り直し、読めなければ生 JSON の断片を出す。
         inputSummary?: string;
-        // Task/Agent の run_in_background:true（H-1: inputPreviewは500字切り詰めのため
-        // 欠落しうる。切り詰め前の生inputを見られるホスト側で判定して構造化フィールドにする）
+        intentInput?: ToolIntentInput;
         isBackground?: boolean;
-        // Task/Agent 起動時のサブエージェント情報（inputPreview切り詰めと同じ理由でホスト側で構造化）。
-        // subagentModel/subagentEffort は起動時点の宣言値: input.model（明示指定）＞ agent定義
-        // frontmatter（model は "inherit" を除く）。実際に使われたモデルは後続の subagent_info が正
+        // 起動時の宣言値。実際のモデルは後続の subagent_info が持つ。
         subagentType?: string;
         subagentModel?: string;
         subagentEffort?: string;
         delegation?: DelegationInfo;
         taskIntentStructured?: TaskIntent;
         artifacts?: ProjectedArtifactAccess[];
-        // 省略時は complete と解釈しない（unknown 扱い）
         effectCoverage?: EffectCoverage;
-        // pp1 progress emission（既存 kind への optional フィールド）。
-        // 抽出は Step 2 の共有ヘルパのみが書く（preview からは絶対に作らない）
+        // src/tool-observation.ts#extractProgressEmission だけが書く。inputPreview から作らない。
         progressEmission?: ProgressEmission;
       }
-    // サブエージェントの実測情報。最初の sidechain assistant メッセージ（parent_tool_use_id あり）の
-    // message.model を1回だけ流す。起動時の宣言値は inherit 等で実モデルが分からないため、
-    // 実測値でカード表示を上書きする。effort フィールドを持たない理由: SDKAssistantMessage 型に
-    // effort は無く、セッションJSONLでは永続化エンベロープにのみ現れる。SDK hooks 入力には
-    // 載るが表示のためだけの hooks 配線は不採用（claudeHost.ts 参照）。宣言値は tool_call_started 側で運ぶ
+    // 最初の sidechain assistant の message.model。起動時の宣言値ではモデルが分からないので、観測値でカード表示を上書きする。
+    // SDKAssistantMessage に effort は無いので effort は運ばない。hooks 入力の effort は src/claudeHost.ts#ClaudeConversation.observeAgentSettings が
+    // オーケストレーション有効時だけ観測し、この event へは載せない。
     | { kind: "subagent_info"; turnId: string | null; toolUseId: string; model?: string; agentId?: string }
-    // root message.model の変化ごとに1回 emit（表示専用。work-model / evidence-index / semantic-model / l3-analysis / time-buckets は読まない。
-    // 本体時間の model 別内訳は transcript-time-buckets が読み直しの側で拾う）
+    // root message.model の観測。直前に出した model と同じなら出さない。session scope のフォールバックは
+    // src/claude-normalizer.ts#ClaudeLiveNormalizer.handleRefusalNotice が出さずに直前の model を進め、
+    // src/claude-normalizer.ts#ClaudeLiveNormalizer.rearmRootModelObservation の後は同じ model でも出す
+    // （verify-refusal#RF-RETURN・verify-gateway-wiring#GW-RF14）。表示と foldModelFallback が読み、
+    // その状態は src/conversation-lifecycle.ts#launchModel が使う。
     | { kind: "model_observed"; turnId: string | null; model: string }
-    // CLI のコンテキスト圧縮地点（表示専用。model_observed と同じ扱い。turn 境界ではない）
-    // priorGeneration: 世代境界より前の圧縮（`src/session-transcript.ts#readSessionHistory` だけが立てる）。
-    // 作業ログ・集計は全世代を保つので、落とすのは会話面（conv-renderable.ts）だけ
+    // turn 境界として扱わない。priorGeneration は src/session-transcript.ts#readSessionHistory だけが立て、
+    // 会話面から外すのは src/conv-renderable.ts#isConvRenderableEvent だけ（R-HND-13）。
     | { kind: "compact_boundary"; trigger: "auto" | "manual"; preTokens?: number; priorGeneration?: true }
     | {
         kind: "tool_call_finished";
         turnId: string;
         toolUseId: string;
         isError: boolean;
-        // is_error tool_result の本文。canUseTool 非発火環境での拒否理由可視化に使う
-        // （暫定の拒否理由表示）
         resultPreview: string;
-        // resume 観測（裁定A1: 新 kind でなく既存 kind への optional フィールド）。
-        // 3値とも切り詰め前の生 tool_result / 生 user record から共有ヘルパで抽出する
-        // （resultPreview は 2000 字切り詰め済みで抽出元にできない）
-        // async 起動ACKの実 agentId（transcript 名）。dispatch toolUseId との対応表の素材
+        // 以下は切り詰め前の結果から src/tool-observation.ts#extractResumeSignals と src/tool-observation.ts#parseTaskNotification が作る。
+        // resultPreview は切り詰め済みなので抽出元にしない。
         asyncLaunchedAgentId?: string;
-        // SendMessage 成功結果の resumedAgentId。resume 確定はここでのみ観測する
-        // （tool_use 開始時に観測すると失敗した SendMessage でも reopen してしまう）
+        // resume はここでだけ確定する。tool_use の開始で確定すると、失敗した SendMessage でも再開扱いになる。
         resumedAgentId?: string;
-        // 背景 Bash の起動 ACK が運ぶ task id（run_in_background）。asyncLaunchedAgentId と同じく
-        // task-notification の agentId と結合する素材。ACK は完了ではない（裁定A2 を Bash にも適用）
+        // 起動 ACK の id。ACK は完了ではなく、完了は taskNotification で受ける。
         backgroundTaskId?: string;
-        // task-notification（background 委任の真の完了信号。裁定A2: 起動ACKでは完了にしない）。
-        // 対応する tool_result block が無いため toolUseId は合成 ID になる
+        // 対応する tool_result が無いので、この event の toolUseId は合成 ID（src/claude-normalizer.ts#ClaudeLiveNormalizer.emitTaskNotification）。
         taskNotification?: TaskNotificationInfo;
       }
     | {
@@ -284,14 +339,12 @@ export type NormalizedEventBody =
         turnId: string | null;
         requestId: string;
         toolName: string;
-        // 原データ全文（要約だけで許可させない）。承認カードの「詳細を表示」で出す
+        // 要約だけで許可させないため、SDK の文脈まで含む全文を運ぶ。
         rawInputJson: string;
-        // 承認カードの可読表示用。inputJson は context を含まない純粋な入力JSON
-        // （rawInputJson は末尾に "--- context ---" が連結されるためパースできない）
+        // rawInputJson は文脈を連結した表示文で JSON として読めない。入力の構造を読むのは inputJson。
         inputJson?: string;
         inputSummary?: string;
         expiresAt: number | null;
-        // AskUserQuestion の質問構造（機能B）。パース失敗時は undefined のまま rawInputJson へフォールバック
         questions?: AskUserQuestionSpec;
       }
     | {
@@ -299,21 +352,18 @@ export type NormalizedEventBody =
         requestId: string;
         behavior: "allow" | "deny";
         resolvedBy: string;
-        // AskUserQuestion の回答（機能B/M-7）。監査性のため replay でも再現できるよう保持する
+        // replay で回答を再現できるよう event に残す。
         answers?: Record<string, string>;
       }
     | { kind: "permission_denied"; turnId: string | null; toolName: string; reason: string }
     | { kind: "usage_update"; scope: "turn" | "conversation"; turnId: string | null; usage: UsageSnapshot }
-    // root message（message.id）につき 1 回。live は stream_event:message_delta の usage
-    // （assistant record の usage.output_tokens は message_start の placeholder）、history は JSONL の
-    // 同 messageId の最終 record の後。subagent は live に stream_event が無く history にしか無い
-    // 最終 message もあるため両経路とも発行しない（parentToolUseId は null 固定）。
-    // この kind はどの consumer でも seq / WorkModel / Evidence / EventLog / webview / semanticHash に混入せず、
-    // 全 consumer が isGuardrailOnlyEventKind で gate する（GUARDRAIL_ONLY_EVENT_KINDS）。
+    // root message ごとに 1 回。assistant record の usage.output_tokens は message_start の仮値なので、live は message_delta の usage を使う。
+    // subagent の message は live で取れないものがあるので、両経路とも出さない。消費側は isGuardrailOnlyEventKind で gate する（verify-guardrail-recordings#GR-34）。
     | {
         kind: "assistant_usage";
         turnId: string;
         messageId: string;
+        // null 固定の型が subagent の usage を出さない不変条件を表す。string へ広げると live と history で件数がずれる。
         parentToolUseId: null;
         usage: AssistantUsage;
       }
@@ -327,12 +377,10 @@ export type NormalizedEventBody =
       }
     | { kind: "auth_status"; auth: AuthStatus }
     | { kind: "commands_changed"; commands: SlashCommandInfo[] }
-    // SDK の background_tasks_changed（レベル信号）。生きているバックグラウンドタスクの
-    // 全量が毎回届くので、受信側は集合ごと置き換える。開始/終了のエッジを対にして数えると
-    // 取りこぼしで実行中表示が固着する（sdk.d.ts の SDKBackgroundTasksChangedMessage 参照）
+    // SDKBackgroundTasksChangedMessage は生きている集合の全量（sdk.d.ts）。受信側は集合ごと置き換え、開始と終了を対にして数えない。
     | {
         kind: "background_tasks";
-        // ambient は CLI が利用者作業として出さない housekeeping（sdk.d.ts）。activity indicator から除外する
+        // ambient は CLI の housekeeping（sdk.d.ts）。実行中の表示に数えない。
         tasks: Array<{ id: string; type: string; description: string; ambient?: true }>;
       }
     | {
@@ -340,7 +388,6 @@ export type NormalizedEventBody =
         message: string;
         fatal: boolean;
       }
-    // CLIが随時送ってくるレート制限状況（Account & Usage 相当の元データ）
     | {
         kind: "rate_limit";
         status: string;
@@ -383,7 +430,7 @@ export interface AssistantUsage {
   outputTokens?: number;
 }
 
-// live / history の両経路が必ずこれを通す（同値は構成で保証する）。無い値は省略（0 埋めしない）
+// live と history の両経路がこれを通す（verify-guardrail-recordings#GR-35）。欠けた値を 0 で埋めない。
 export function assistantUsageFromRaw(raw: unknown, includeOutput: boolean): AssistantUsage {
   const r = typeof raw === "object" && raw !== null ? (raw as Record<string, unknown>) : {};
   const pick = (key: string): number | undefined =>
@@ -400,7 +447,7 @@ export function assistantUsageFromRaw(raw: unknown, includeOutput: boolean): Ass
   return out;
 }
 
-// provider 生値をそのまま保持。取れない値は undefined = unknown（0にしない）
+// 取れない値を 0 にしない（不明と区別する）。
 export interface UsageSnapshot {
   inputTokens?: number;
   outputTokens?: number;
@@ -430,7 +477,7 @@ export interface AuthStatus {
   runtime?: RuntimeCapability;
 }
 
-// 画像添付（クリップボード貼り付け）。data は base64（dataURLプレフィックスなし）
+// data は data URL の接頭辞を含まない base64。
 export interface ImageAttachment {
   mediaType: "image/png" | "image/jpeg" | "image/gif" | "image/webp";
   data: string;
@@ -445,25 +492,23 @@ export interface ImageRefInfo {
   mediaType: ImageAttachment["mediaType"];
 }
 
-// 未送信の添付。実体は Host が tabId ごとに持ち、webview はこの形で受け取って描くだけ（R-CNV-11）
+// R-CNV-11: 未送信の添付の実体は Host が持ち、webview は描くだけ。
 export interface PendingAttachmentInfo {
   id: string;
   mediaType: ImageAttachment["mediaType"];
   data: string;
 }
-// Host が採番する添付 ID の字面。webview から戻る attachmentId をこれで絞る
+// src/pending-attachments.ts#PendingAttachmentStore の採番と同じ字面に保つ。
 export const ATTACHMENT_ID_RE = /^att-[0-9]+$/;
 export const IMAGE_MAX_COUNT = 4;
 // /rename の名前の上限。SDK の解決器は JSONL の末尾 64KB しか読まないので、それに収まらない名前は
 // 履歴一覧で解決されずタブ名と食い違う（R-SES-05）
 export const RENAME_TITLE_MAX = 2000;
-export const IMAGE_MAX_BASE64_LEN = 8_000_000; // ≒6MB実体/枚
+export const IMAGE_MAX_BASE64_LEN = 8_000_000;
 export const SEND_TEXT_MAX_LEN = 1_000_000;
-// JSONL のファイル名に載る文字だけ。保存先の走査（extension.ts#lookupSessionFile）が
-// この id をファイル名へ連結するので、正本はここ 1 本にする（複製すると片方だけ緩む）
+// src/session-files.ts#lookupSessionFile がこの id をファイル名へ連結する。字面の判定をほかへ複製しない（複製すると片方だけ緩む）。
 export const SESSION_ID_RE = /^[A-Za-z0-9._-]+$/;
-// ファイル選択ダイアログから 1 回で入力欄へ入れるパスの上限。
-// 多重選択で入力欄が読めなくなる量を差し込ませない
+// 多重選択で入力欄が読めなくなる量を差し込ませない上限（R-CNV-05）。
 export const PICKED_FILE_MAX_COUNT = 20;
 
 // SDK実測: PermissionMode は auto / dontAsk を含む6値（sdk.d.ts:2092）
@@ -533,11 +578,8 @@ export function isInternalSlashCommand(cmd: SlashCommandInfo): boolean {
   return INTERNAL_COMMAND_DESC_HINTS.some((re) => re.test(cmd.description));
 }
 
-// ツール入力から人が読める1行を作る（拡張・Webview共有）。
-// ホスト側で「切り詰め前の完全な入力オブジェクト」に対して呼ぶのが正。Webview に届く
-// inputPreview は500字で切り詰められており JSON として壊れているため、そちらでパースすると
-// 必ず失敗して生JSONの断片が表示される（Agent や長文プロンプトのツールで顕著）。
-// 要約に足る情報が無ければ null を返し、呼び出し側でフォールバックさせる。
+// 切り詰め前の入力に対して Host で呼ぶ。inputPreview は切り詰め済みで JSON として読めないことがあり、
+// src/webview/format.ts#toolSummary の作り直しは失敗すると生 JSON の断片を出す。要約できなければ null を返し、呼び出し側が代替を選ぶ。
 export function summarizeToolInput(toolName: string, input: unknown): string | null {
   if (typeof input !== "object" || input === null) return null;
   const obj = input as Record<string, unknown>;
@@ -586,7 +628,7 @@ export function summarizeToolInput(toolName: string, input: unknown): string | n
   }
 }
 
-// Webview から VS Code コマンドを直接指名させない。command ID と引数は Host 側の対応表が持つ
+// webview に VS Code の command ID を指名させない。対応は src/gateway-host-actions.ts#runHostActionMessage が持つ。
 export const HOST_ACTIONS = ["openSettings", "addClaudeModel"] as const;
 export type HostAction = (typeof HOST_ACTIONS)[number];
 
@@ -620,12 +662,11 @@ export function isProfileSources(value: unknown): value is ProfileSource[] {
     && new Set(value).size === value.length && value.every(source => PROFILE_SOURCES.includes(source));
 }
 
-// 設定エディタ（src/settings-panel.ts が開く WebviewPanel）との境界。会話面の WebviewToHost / HostToWebview とは受信口が別
-// requestId は画面が書込み要求ごとに採番し、Host は書込み後の返送に replyTo として写す
+// 会話面の WebviewToHost とは受信口が別。requestId は画面が採番し、Host は書込み後の settingsState の replyTo へ写す。
 export type SettingsPageToHost =
   | { type: "settingsPageReady" }
   | { type: "recheckExternalExecutors" }
-  | { type: "researchModelProfiles"; targets: string[] }
+  | { type: "researchModelProfiles"; targets: string[]; purpose?: "effort" }
   | { type: "previewConductorInstruction"; requestId: number; policy: string }
   | { type: "setAccentSetting"; requestId: number; setting: AccentSetting; value: string }
   | { type: "setComposerSendKey"; requestId: number; sendKey: ComposerSendKey }
@@ -641,15 +682,15 @@ export type SettingsPageToHost =
 
 export interface SettingsProfileProjection {
   profileSources?: ProfileSource[];
-  missingProfiles?: string[];
+  researchTargets?: string[];
   researchUnavailable?: string;
+  effortUnavailable?: string;
   researchText?: string;
   conductorPreview?: { text: string; tokens: number };
 }
 export type HostToSettingsPage =
   | { type: "conductorPreview"; requestId: number; text: string; tokens: number }
-  // 構成から読み直した実効値。書込みの後も要求値ではなくこれを返す（R-DSP-01）。
-  // replyTo は書込み要求への返送だけが持つ。構成変更・ready への送信は持たない
+  // R-DSP-01: 書込みの後も要求値ではなく、構成から読み直した実効値を返す。replyTo は書込み要求への返送だけが持つ。
   | ({ type: "settingsState"; appearance?: AccentSettings; composerSendKey: ComposerSendKey; apiKeyPolicy: ApiKeyPolicy; restoreTabsOnStartup: boolean; autoContinueAtUsageLimit: boolean; learningEnabled: boolean; replyTo?: number }
     & SettingsProfileProjection & Record<FileLinkBooleanSetting, boolean> & { openWithSystemApp: string[] } & { orchestrationEnabled: boolean; orchestrationAgents: OrchestrationSettingRow[]; orchestrationDefaults: OrchestrationSettingRow[]; conductorPolicy: string; conductorPolicyDefault: string; externalTimeoutMinutes: number; externalDetection: Record<ExecutorId, ExternalDetection>; externalModels: ExternalModels });
 
@@ -662,7 +703,8 @@ export function isSettingsPageToHost(v: unknown): v is SettingsPageToHost {
   const m = v as Record<string, unknown>;
   const t = m.type as SettingsPageToHost["type"];
   if (t === "settingsPageReady" || t === "recheckExternalExecutors" || t === "openVsCodeSettings") return hasOnlyKeys(m, ["type"]);
-  if (t === "researchModelProfiles") return hasOnlyKeys(m, ["type", "targets"]) && isProfileTargetIds(m.targets) && m.targets.length > 0;
+  if (t === "researchModelProfiles") return hasOnlyKeys(m, ["type", "targets", "purpose"]) && isProfileTargetIds(m.targets) && m.targets.length > 0
+    && (m.purpose === undefined || m.purpose === "effort");
   if (t === "setProfileSources") return hasOnlyKeys(m, ["type", "requestId", "sources"]) && isSettingsRequestId(m.requestId) && isProfileSources(m.sources);
   if (t === "previewConductorInstruction") return hasOnlyKeys(m, ["type", "requestId", "policy"]) && isSettingsRequestId(m.requestId) && typeof m.policy === "string";
   if (t === "setAccentSetting") {
@@ -702,8 +744,9 @@ function isProfileTargetIds(value: unknown): value is string[] {
 function isProfileObject(value: unknown): value is Record<string, unknown> { return !!value && typeof value === "object" && !Array.isArray(value); }
 function isSettingsProfiles(m: Record<string, unknown>): boolean {
   const preview = m.conductorPreview as Record<string, unknown> | undefined;
-  return (m.missingProfiles === undefined || isProfileTargetIds(m.missingProfiles))
+  return (m.researchTargets === undefined || isProfileTargetIds(m.researchTargets))
     && (m.researchUnavailable === undefined || typeof m.researchUnavailable === "string")
+    && (m.effortUnavailable === undefined || typeof m.effortUnavailable === "string")
     && (m.researchText === undefined || typeof m.researchText === "string")
     && (m.profileSources === undefined || isProfileSources(m.profileSources))
     && (preview === undefined || isProfileObject(preview) && hasOnlyKeys(preview, ["text", "tokens"]) && typeof preview.text === "string" && typeof preview.tokens === "number" && Number.isFinite(preview.tokens));
@@ -728,24 +771,23 @@ export function isHostToSettingsPage(v: unknown): v is HostToSettingsPage {
       && FILE_LINK_BOOLEAN_SETTINGS.every((key) => typeof m[key] === "boolean")
       && Array.isArray(m.openWithSystemApp) && m.openWithSystemApp.every((item) => typeof item === "string")
       && (m.replyTo === undefined || isSettingsRequestId(m.replyTo))
-      && hasOnlyKeys(m, ["type", "appearance", "composerSendKey", "apiKeyPolicy", "restoreTabsOnStartup", "autoContinueAtUsageLimit", "learningEnabled", ...FILE_LINK_SETTINGS, "orchestrationEnabled", "orchestrationAgents", "orchestrationDefaults", "conductorPolicy", "conductorPolicyDefault", "externalTimeoutMinutes", "externalDetection", "externalModels", "replyTo", "profileSources", "missingProfiles", "researchUnavailable", "researchText", "conductorPreview"]);
+      && hasOnlyKeys(m, ["type", "appearance", "composerSendKey", "apiKeyPolicy", "restoreTabsOnStartup", "autoContinueAtUsageLimit", "learningEnabled", ...FILE_LINK_SETTINGS, "orchestrationEnabled", "orchestrationAgents", "orchestrationDefaults", "conductorPolicy", "conductorPolicyDefault", "externalTimeoutMinutes", "externalDetection", "externalModels", "replyTo", "profileSources", "researchTargets", "researchUnavailable", "effortUnavailable", "researchText", "conductorPreview"]);
   }
   t satisfies never;
   return false;
 }
 
-// Webview → 拡張（フェーズ2: マルチタブ。tabId は host が採番し init/tabCreated で通知する）
+// tabId は Host が採番して init と tabCreated で渡す。
 export type WebviewToHost =
   | { type: "ready"; cursor: { generation: number; seq: number } | null }
-  // images は Host が自分の添付スロットから詰める欄で、wire では受けない
-  // （isWebviewToHost の send は images キーを持つメッセージを丸ごと捨てる。R-CNV-11）
+  // R-CNV-11: images は Host が添付スロットから詰める欄で、isWebviewToHost は images を持つ send を捨てる。
   | { type: "send"; tabId: string; text: string; clientToken?: string; images?: ImageAttachment[] }
-  // 添付の預け入れ・取り消し。実体は Host が tabId ごとに保持し、応答は必ず attachments で返す
+  // 受理しなくても Host は attachments で返す（src/composer-io.ts#handleComposerMessage）。
   | { type: "attachImage"; tabId: string; mediaType: ImageAttachment["mediaType"]; data: string }
   | { type: "removeAttachment"; tabId: string; attachmentId: string }
   | { type: "startHandoff"; tabId: string }
   | { type: "cancelHandoff"; tabId: string; runId: string }
-  // 状態カードを展開したときだけ本文を取りに行く。part は 0 起算で順に要求する
+  // part は 0 起算で、順に要求する。
   | { type: "getHandoffDetail"; tabId: string; runId: string; part: number }
   | { type: "openHandoffSource"; tabId: string; sourceSessionId: string }
   | { type: "interrupt"; tabId: string }
@@ -755,37 +797,31 @@ export type WebviewToHost =
       tabId: string;
       requestId: string;
       behavior: "allow" | "deny";
-      // AskUserQuestion の回答（機能B）。question文字列→選択labelまたは自由入力。
-      // multiSelect はカンマ区切り。allow 以外では無視する
+      // 形式は SDK の AskUserQuestionInput.answers。deny では読まない。
       answers?: Record<string, string>;
     }
   | { type: "newTab" }
   | { type: "closeTab"; tabId: string }
-  // /clear: 会話履歴とCLIセッションを破棄して同タブで新規セッションを開始する
   | { type: "clearTab"; tabId: string }
   | { type: "setMode"; tabId: string; mode: PermissionModeId }
-  | { type: "setModel"; tabId: string; model: string | null }
+  | { type: "setModel"; tabId: string; model: string | null; sessionOnly?: boolean }
   | { type: "setEffort"; tabId: string; effort: string | null }
   | { type: "queryFiles"; reqId: number; query: string }
-  // ファイル選択ダイアログを開く。imageSlots は「あと何枚を画像として添付できるか」で、
-  // 超えた分と画像でないものは Host がパスとして返す
+  // imageSlots は画像として添付できる残り枚数。超えた分と画像でないものは Host がパスとして返す（src/composer-io.ts#pickComposerFiles）。
   | { type: "pickFiles"; reqId: number; imageSlots: number }
   | { type: "openFile"; tabId: string; target: string }
   | { type: "exportTab"; tabId: string }
-  // /rename: Host がセッション JSONL へ custom-title を書き、タブ名と履歴一覧を同じ解決器で揃える（R-SES-05）
+  // R-SES-05: Host が記録へ custom-title を書き、タブ名と履歴一覧を同じ解決器で揃える。
   | { type: "renameTab"; tabId: string; title: string }
   | { type: "listSessions"; source?: "laisora" | "claude"; cursor?: string }
-  | { type: "analyzeSession"; sessionId: string; filePath: string }
-  // 現在のタブのセッションを分析する（ファイルパスはホストが sessionId から解決する）
+  // ファイルパスは webview から受け取らず、Host が解決する（src/session-files.ts#lookupSessionFile）。
   | { type: "analyzeCurrent"; tabId: string }
-  // セッション概要の要約（R-DSP-25）。そのタブの model・effort で生成し、Host が保存する
+  // R-DSP-25: 要約のモデルは Host が決める。webview はモデルを送らない。
   | { type: "summarizeSession"; tabId: string }
   | { type: "suggestSessionName"; tabId: string }
-  // VS Code 標準の配色テーマ選択を開く（/color の受け皿）
   | { type: "openThemePicker" }
   | { type: "runHostAction"; action: "openSettings" }
   | { type: "runHostAction"; action: "addClaudeModel"; tabId: string }
-  // 起動直後でも利用率を出すため、CLIがローカルへ残したキャッシュを要求する
   | { type: "requestCachedUsage" }
   | {
       type: "agentInspectorRequest";
@@ -793,13 +829,11 @@ export type WebviewToHost =
       agentId: string;
       section: AgentInspectorSection;
       requestId: string;
-      // Host が発行した不透明tokenだけを往復する。file path/byte offset/limitは受け取らない。
+      // Host が発行した不透明な token だけを往復する。パス・読み位置・件数は webview から受け取らない。
       cursor?: string;
     }
-  // 作業ログの過去イベントを1 chunk ぶん古い側へ取り寄せる（会話履歴 Lazy Loading フェーズ1）。
-  // cursor は Host が発行した不透明token。anchor は Host が pushEvent で採番して同じ webview へ
-  // 既に渡した識別子で、初回要求のときだけ使う（ready の cursor と同じ語彙）。
-  // どちらか一方だけを載せる。file path/byte offset/chunk件数は受け取らない（上の :445 と同じ規則）
+  // cursor は Host 発行の不透明な token、anchor は Host が既に渡した generation と seq で初回だけ使う。
+  // パス・読み位置・件数は受け取らない（agentInspectorRequest と同じ規則）。
   | {
       type: "historyChunkRequest";
       tabId: string;
@@ -807,8 +841,7 @@ export type WebviewToHost =
       cursor?: string;
       anchor?: { generation: number; seq: number };
     }
-  // 作業ログの過去イベントを transcript から読み直して取り寄せる（R-TAB-07）。
-  // cursor は Host 発行 token、初回は anchor。file path / offset は受け取らない
+  // R-TAB-07。cursor と anchor は historyChunkRequest と同じ語彙で、どちらも無い要求も受ける。
   | {
       type: "worklogTranscriptRequest";
       tabId: string;
@@ -816,14 +849,8 @@ export type WebviewToHost =
       cursor?: string;
       anchor?: { generation: number; seq: number };
     }
-  // 会話ログの過去メッセージを1 chunk ぶん古い側へ取り寄せる（Lazy Loading フェーズ2）。
-  // 表示専用の経路で、Host 側は transcript を読むだけ。pushEvent / EventLog / semantic
-  // ingestion のどれにも入れない（ユーザー裁定）。
-  // cursor は Host が発行した不透明token。初回は cursor 無しで「画面に出ている最古より前」を
-  // 要求する。file path / byte offset / 件数は受け取らない（historyChunkRequest と同じ規則）
-  // anchorUuid は Host が搬送した識別子の往復で、cursor と同じ扱い（webview が任意の
-  // 位置を作れるわけではない）。cursor が Host 側の LRU 退避や世代更新で無効になったとき、
-  // これが無いと Host は最初の起点から返し直すしかなく、遡りの位置が黙って巻き戻る
+  // 表示専用: Host は transcript を読むだけで、読んだものを pushEvent へ入れない。初回は cursor 無しで送る。
+  // anchorUuid は Host が既に渡した識別子で、cursor が Host 側で無効になったときの起点。無いと遡りの位置が黙って巻き戻る。
   | {
       type: "conversationHistoryRequest";
       tabId: string;
@@ -849,9 +876,7 @@ export type WebviewToHost =
       content: string;
       artifactId?: string;
     }
-  // 作業ログの LLM 意味分析をユーザーの明示操作で1回だけ起動する。
-  // tabId 以外を受け取らない: modelId / prompt / timeout を webview から渡せる形にすると、
-  // 課金される呼び出しのパラメータが UI 側の真実源になる（起動可否も含め Host が決める）
+  // tabId 以外を受け取らない: 課金される呼び出しのパラメータと起動可否は Host が決める。
   | { type: "llmAnalysisRequest"; tabId: string }
   | { type: "setLlmAnalysisEnabled"; enabled: boolean }
   | {
@@ -872,22 +897,18 @@ export type WebviewToHost =
       tabId: string;
       artifactId: string;
     }
-  // first-paint: init を受け取ってから活性タブが画面に載るまでの実測。時刻は document age
-  // （performance.now）で、現在時刻は載せない（TB-7）
-  // orphan-turn-adopted: turn_started 不着のまま本文デルタで開いたターン（OA-1〜OA-7）。
-  // message は tabId と turnId だけで、本文を載せない
+  // first-paint の時刻は document age（performance.now）で、現在時刻を載せない。
+  // orphan-turn-adopted の message は tabId と turnId だけで、本文を載せない（verify-detail-cards#OA-1）。
   | {
       type: "webviewDiagnostic";
       kind: "error" | "ready-retry" | "first-paint" | "orphan-turn-adopted";
       message: string;
     }
-  // intoTabId: 未使用の会話タブがあればそこへ開く（新タブを増やさない）。ホスト側で
-  // 「本当に未使用か」を判定し、使用中なら従来どおり新タブを作る
+  // intoTabId は候補に過ぎず、使えるかは Host が src/session.ts#isUnusedSession で判定し直す。
   | { type: "resumeSession"; sessionId: string; filePath: string; intoTabId?: string }
-  // Resume fast path v4 F-4: live Session をresetせず表示 hydration だけを再試行する。
+  // live の Session を作り直さず、表示の hydration だけを再試行する。
   | { type: "resumeHydrationRetry"; tabId: string }
-  // 復帰の init は可視化の時点で飛ぶ（ready を待たない）ので、見ているタブを先に
-  // 積むには Host が面ごとの最後の選択を覚えている必要がある
+  // 復帰の init は ready を待たずに送るので、見ているタブを先に積むため Host が面ごとに覚える（src/store-surfaces.ts#SessionStore.restoreVisible）。
   | { type: "activeTab"; tabId: string };
 
 export interface SessionListItem {
@@ -899,19 +920,15 @@ export interface SessionListItem {
   mtime: number;
 }
 
-// 履歴一覧の走査で落ちたものを種類別に数える。1 個の真偽値へ畳まないこと。畳むと
-// 利用者も次に触る者も「どの扉から欠けたか」を画面から判別できず、再発時に特定できない。
-// resolveFailed は getSessionInfo が例外で落ちた件数だけを数える。要約を持たない候補は
-// 欠落ではなく正常な読み飛ばしなので含めない
+// 1 つの真偽値へ畳まない: どの段で欠けたかを画面から判別できなくなる。
+// resolveFailed は getSessionInfo が例外を投げた件数だけで、要約を持たない候補は数えない。
 export interface SessionScanDegradation {
   rootFailed: boolean;
   unreadableProjects: number;
   statFailed: number;
   resolveFailed: number;
-  // 候補は見つかったのに 1 行も出せなかったときの候補数。SDK の getSessionInfo は
-  // 壊れた記録に対して例外を投げず undefined を返すことがあり、そのとき resolveFailed は
-  // 0 のままになる。これを数えないと「候補 40 件・表示 0 件」が「セッションが見つかりません」
-  // として断言される（走査は成功しているので rootFailed も立たない）
+  // getSessionInfo は壊れた記録に例外を投げず undefined を返すことがあり、resolveFailed は増えない。
+  // これが無いと、出せなかった一覧を「見つからない」と断言する。
   unresolvedCandidates: number;
 }
 
@@ -925,17 +942,11 @@ export interface ModelInfo {
   supportedEffortLevels?: string[];
 }
 
-// ---------- WorkModel の公開面 ----------
-
-// WorkModelState をそのまま流さない理由: toolPlacements は 8192 件規模の内部索引、
-// segments は詳細カードが自分で持つ。version は WorkModelPayload の形の版であり
-// PROTOCOL_VERSION とは別に動く（概要の項目追加でプロトコル全体を上げたくない）
-// tasks / taskTotals を運ぶ。詳細ログのTODO行は、snapshot 再生の窓（1500件）から Task 更新イベントが
-// 落ちても復元できる必要があり、イベント側の情報だけでは足りない
+// WorkModelPayload は WorkModelState をそのまま流さない: toolPlacements は大きな内部索引で、segments は詳細カードが持つ。
+// WORK_MODEL_VERSION は payload の形の版で、PROTOCOL_VERSION とは別に上げる。
 export const WORK_MODEL_VERSION = 3;
 
-// 木の深さの上限。projection も同じ上限で辺を落とすので、自分で作った payload は必ず
-// ガードを通る。ガード側だけに置くと、深い階層を復元した payload が丸ごと捨てられる
+// projectWorkModel と isWorkAgentNode が同じ上限を使う。ガード側だけに置くと、深い木を復元した payload が丸ごと捨てられる。
 const AGENT_TREE_MAX_DEPTH = 16;
 
 export const OPERATION_KIND_LIST: OperationKind[] = [
@@ -950,15 +961,14 @@ export const OPERATION_KIND_LIST: OperationKind[] = [
 export type WorkAgentOrigin = "live" | "restored";
 
 export interface WorkAgentNode {
+  runStartedAt?: number;
+  intentInput?: ToolIntentInput;
   agentId: string;
-  // resume 時に transcript の実 agentId（meta.json 由来）が判明した場合の別名。
-  // agentId 自体は経路不変の合成 ID を保つ（凍結期待値: 同値射影の除外は
-  // 固定 allowlist のみ。値の置換は availability 欠落ではないため許されない）
+  // transcript 上の id が分かっても agentId を置き換えない。agentId は経路によらない合成 ID で、live と history の同値比較の鍵になる。
   transcriptAgentId?: string;
   parentAgentId: string | null;
   toolUseId: string;
-  // agent から親の tool-row を選ぶための識別子。
-  // 落とすと後段が EventLog か DOM から推定し直すことになる
+  // 外すと親の tool 行を DOM から推定し直すことになる。
   parentToolUseId: string | null;
   spawnDepth: number;
   agentType?: string;
@@ -978,8 +988,6 @@ export interface WorkAgentNode {
   origin: WorkAgentOrigin;
   children: WorkAgentNode[];
 }
-
-// ---------- Agent Inspector ----------
 
 export type AgentInspectorSection = "overview" | "tools" | "messages" | "report";
 
@@ -1043,10 +1051,9 @@ export type AgentInspectorPage =
   | (AgentInspectorPageBase & { section: "report"; text: string });
 
 export type AgentInspectorErrorReason =
-  // 「記録が無い（まだ書き出されていない）」。待てば出る
+  // 記録がまだ書き出されていない。待てば出る。
   | "session-unavailable"
-  // 「記録があるかどうかを確かめられなかった」（保存先の走査が失敗）。待っても直らない。
-  // session-unavailable や read-failed へ畳むと、待つ／読み直すという別の対処へ誘導する（R-DSP-01）
+  // R-DSP-01: 保存先の走査が失敗し、記録の有無を確かめられなかった。待っても直らないので、session-unavailable や read-failed へ畳まない。
   | "session-scan-failed"
   | "agent-unavailable"
   | "transcript-unavailable"
@@ -1056,11 +1063,8 @@ export type AgentInspectorErrorReason =
   | "response-too-large"
   | "meta-limit";
 
-// history-window.ts の同名型と構造だけを合わせる（import しない）。history-window.ts は
-// node:crypto を実行時 import するので、値・型のどちらでもここから参照すると webview バンドルが
-// 壊れる経路を作る。両者の一致は extension.ts の代入1箇所で tsc が検査するが、検出できるのは
-// history-window.ts 側の削除・型変更だけ。非リテラル代入には余剰プロパティ検査が掛からないので、
-// 向こうにフィールドを足しても tsc は落ちず、ここへ来ないまま webview へ届かない
+// src/history-window.ts#HistoryChunkCoverage と構造を合わせる。一致は src/history-serving.ts の代入で tsc が見るが、
+// 非リテラル代入に余剰プロパティ検査は掛からないので、あちらへ足したフィールドはここへ来ないまま webview へ届かない。
 export interface HistoryChunkCoveragePayload {
   returnedCount: number;
   remainingOlderCount: number;
@@ -1075,12 +1079,10 @@ export interface HistoryChunkPagePayload {
   coverage: HistoryChunkCoveragePayload;
 }
 
-// 前半5つは HistoryWindowErrorReason と同じ綴り。向こうへ足すと extension.ts の代入が落ちるが、
-// 向こうから減らしても部分集合なので落ちない（ここと isHostToWebview の whitelist に死んだ
-// reason が残る）。減らすときは両方を手で消すこと
-// response-too-large は持たない。単一イベントが搬送予算を超えても本文を切って必ず送るので、
-// この面はサイズを理由に失敗しない（R-CNV-01。extension.ts の fitEventForTransport 経路）。
-// 復活させると「過去の読み込みが止まりました」の再開不能な行き止まりが戻る
+// src/history-window.ts#HistoryWindowErrorReason を含む。あちらへ足すと src/history-serving.ts の代入が落ちるが、減らしても落ちないので、
+// 減らすときはここと isHostToWebview の許可を手で消す。
+// R-CNV-01: response-too-large を加えない。大きなイベントは src/history-chunk-fit.ts#fitEventForTransport が切り詰めて送るので、
+// この経路はサイズで失敗しない。加えると再開できない行き止まりが戻る。
 export type HistoryChunkErrorReason =
   | "invalid-cursor"
   | "unknown-anchor"
@@ -1090,9 +1092,7 @@ export type HistoryChunkErrorReason =
   | "stale-request"
   | "host-error";
 
-// 会話の過去 chunk。conversation-history.ts の同名型と構造だけを合わせる（import しない。
-// 向こうは node:crypto を使うので webview バンドルが壊れる経路を作る）。
-// uuid はレコード固有の識別子で、重複挿入の判定に使う。持たないレコードは運ばない
+// src/conversation-history.ts#ConversationMessage と構造を合わせる。uuid は重複挿入の判定に使い、持たないレコードは運ばない。
 export interface ConversationHistoryMessagePayload {
   uuid: string;
   role: "user" | "assistant";
@@ -1110,8 +1110,7 @@ export interface ConversationHistoryPagePayload {
     returnedCount: number;
     remainingOlderCount: number;
     oldestReached: boolean;
-    // 登録した transcript 全体の値（page ごとではない）。読めなかった行と、uuid が無く
-    // 運べなかった発言。数えるだけで運ばないと、会話が欠けたまま「読み終わった」になる（R-DSP-03）
+    // R-DSP-03: page ごとではなく transcript 全体の値。運ばないと、会話が欠けたまま読み終わった表示になる。
     malformedLineCount?: number;
     droppedWithoutUuidCount?: number;
   };
@@ -1122,20 +1121,16 @@ export type ConversationHistoryErrorReason =
   | "unknown-anchor"
   | "history-unavailable"
   | "invalid-request"
-  // 「そのセッションの記録が無い」。遡る対象が無いので終端でよい
+  // 記録が無い。遡る対象が無いので終端として扱う。
   | "session-unavailable"
-  // 「記録があるかどうかを確かめられなかった」。同期ロック・権限・競合で走査自体が失敗した。
-  // session-unavailable と同じ扱いにすると、読めなかっただけの状態が「読み終わった」として
-  // 進行表示から消える（R-CNV-02）。これは終端ではなく一過性の失敗として扱う
+  // R-CNV-02: 走査が失敗し、記録の有無を確かめられなかった。終端ではなく一過性の失敗として扱い、session-unavailable と同一視しない。
   | "session-scan-failed"
   | "read-failed"
   | "stale-request"
   | "response-too-large"
   | "host-error";
 
-// resume で <sessionId>/subagents/agent-*.meta.json から復元したサブエージェント。
-// meta には effort と時刻が無いため、それらは同名 transcript の先頭/末尾から採る
-// （meta だけで確定するのは階層）
+// CLI の subagent meta.json には effort と時刻が無いので、それらは同名 transcript の先頭と末尾から採る。
 export interface RestoredAgent {
   agentId: string;
   parentAgentId: string | null;
@@ -1157,8 +1152,7 @@ export interface WorkPhaseView extends WorkTotals {
   occurrence?: number;
   operation: PhaseOperation;
   title: string;
-  // phase から詳細カード（segment）とターンへ辿るための識別子。
-  // reducer 側で各64件に制限済みなので、そのまま運んでも上限は保たれる
+  // 件数の上限は reducer 側の src/work-model.ts#MAX_PHASE_REFS が保つ。
   segmentIds: string[];
   segmentCount: number;
   turnIds: string[];
@@ -1167,27 +1161,18 @@ export interface WorkPhaseView extends WorkTotals {
   startedAt: number;
   endedAt?: number;
   isCurrent: boolean;
-  // 実行状態の判定は work-model.ts の phaseStateOf だけが行う。renderer はこの値を描く
+  // 判定は src/work-model.ts#phaseStateOf だけが行い、renderer は描くだけ。
   state: WorkPhaseState;
   compactedPhaseCount?: number;
   agents: WorkAgentNode[];
 }
 
-// ---------- イベントに載せる配置と集計 ----------
-
-// 概要（WorkModelPayload）と違い、こちらは1イベントごとに同期で届く。詳細カードは
-// イベント処理のその場で置き先を決める必要があり、間引いた payload では間に合わない。
-// また EventLog の保持範囲を超えて古い segment は payload から落ちるため、
-// 再生されたイベントが作るカードの数値は payload からは復元できない。
-// 値はすべて reducer 状態の写しで、ここで計算し直さない
-
 export interface WorkPlacementView {
-  // rollup へ併合済みの配置は "rollup"
+  // rollup へ併合済みの配置は固定の phaseId を持つ（projectWorkEvent が src/work-model.ts#PhaseRef から写す）。
   phaseId: string;
   segmentId?: string;
-  // 明示タスク配下ならそのキー。詳細ログはこれでTODO行の中へ入れる
   taskKey?: string;
-  // agent の子ツールは false（agent 1件として数え、二重計上しない）
+  // agent の子ツールは false。agent を 1 件として数え、二重に数えない。
   counted: boolean;
   ownerToolUseId?: string;
 }
@@ -1206,6 +1191,7 @@ export interface WorkSegmentView {
 }
 
 export interface WorkAgentStateView {
+  runStartedAt?: number;
   toolUseId: string;
   status: WorkStatus;
   childCount: number;
@@ -1234,21 +1220,18 @@ export interface WorkTaskItemView {
 
 export interface WorkEventInfo {
   revision: number;
-  // 現在の segment（閉じたときは null）。変わったときだけ載る。これが無いと、ツールを
-  // 使わないターンで webview 側が前ターンのカードを「現在の作業」として出し続ける
+  // 変わったときだけ載り、閉じたら null。null を送らないと、ツールを使わないターンで前のカードを現在の作業として出し続ける。
   currentSegmentId?: string | null;
-  // tool_call_started のみ。記帳系（TodoWrite/TaskCreate/TaskUpdate）として解釈できたものには付かない
+  // tool_call_started だけに付く。付かないものは reducer が記帳系として扱った（projectWorkEvent）。
   placement?: WorkPlacementView;
-  // このイベントで値が変わった分だけ。届いた分を上書きする（差分計算を webview へ持たせない）
+  // 変わった分だけ載る。webview は届いた分を上書きし、差分を計算しない。
   segments?: WorkSegmentView[];
   agents?: WorkAgentStateView[];
   taskTotals?: WorkTaskTotalsView[];
-  // task の集合・状態が変わったときの全量（レベル信号）。TODOカードの正本
+  // 変わったときに全量を載せる。webview は集合ごと置き換える。
   tasks?: WorkTaskItemView[];
-  // ターン境界で running から stale へ移った toolUseId
   staled?: string[];
   pendingApprovalCount?: number;
-  // turn_completed のみ。そのターンの counted ツール件数。今は webview に消費点が無い（返信フッターは件数を出さない）
   turnToolCount?: number;
 }
 
@@ -1257,35 +1240,30 @@ export interface PlanContext {
 }
 
 export interface WorkModelPayload {
+  requests?: import("./work-model").WorkRequestTotals[];
   planDeclaration?: { goal: string; at: number };
   planBoundaryAt?: number;
   planHistory?: import("./work-model").PlanHistoryEntry[];
   planHistoryTruncated?: boolean;
   planHistoryLostThrough?: number;
   planContext?: PlanContext;
-  planTools?: Array<{ id: string; name: string; description: string; startedAt: number }>;
+  planTools?: Array<{ id: string; name: string; description: string; startedAt: number; intentInput?: ToolIntentInput }>;
+  // R-SES-11: open foreground calls, including Agent/Task starts outside the replay window.
+  runningMainTools?: Array<{ id: string; name: string; startedAt: number; intentInput?: ToolIntentInput }>;
   version: number;
   revision: number;
   coverage: WorkCoverage;
   currentPhaseId?: string;
   ambiguity?: "multiple-active-tasks";
   phases: WorkPhaseView[];
-  // 親を特定できなかったサブエージェント。任意の親へ付けずここへ分離する
+  // 親を特定できない、または AGENT_TREE_MAX_DEPTH を超えたサブエージェント。推測した親へ付けない。
   unlinkedAgents: WorkAgentNode[];
-  // Task の現在状態と集計。イベント側の tasks は「変わったとき」にしか載らないので、
-  // 再生窓から Task更新イベントが落ちた snapshot では、これが唯一の復元元になる。
-  // 無いと窓内にあるTask配下のツール行まで未接続DOMへ入って画面から消える
+  // WorkEventInfo の tasks は変わったときにしか載らないので、再生窓から Task 更新が落ちた snapshot ではこれが唯一の復元元（verify-detail-cards#C-13）。
   tasks: WorkTaskItemView[];
   taskTotals: WorkTaskTotalsView[];
 }
 
-// ---------- SemanticModel の公開面 ----------
-
-// deriveSemanticModel の出力を運ぶが、attempt の artifacts は ProjectedArtifactAccess へ
-// 射影済みでなければならない。canonicalPath は Host-only で、どのフィールドからも
-// Webview へ流さない。
-// canonicalPath?: never は、未射影の HostArtifactAccess[] が構造的部分型として
-// 素通りするのを型検査で塞ぐためのもの
+// canonical path を webview へ出さない。canonicalPath?: never は、未射影の HostArtifactAccess が構造的部分型として素通りするのを tsc で塞ぐ。
 export type SemanticArtifactView = ProjectedArtifactAccess & { canonicalPath?: never };
 
 export type SemanticAttemptNodeView = Omit<ExecutionAttemptNode, "artifacts"> & {
@@ -1294,12 +1272,8 @@ export type SemanticAttemptNodeView = Omit<ExecutionAttemptNode, "artifacts"> & 
 
 export type SemanticNodeView = Exclude<SemanticNode, ExecutionAttemptNode> | SemanticAttemptNodeView;
 
-// ---------- L3 の公開面（裁定A1） ----------
-
-// `DivergenceRecord.coverage` は「その乖離を検出するための入力がどれだけ観測できたか」
-// であって、record の存在の確からしさではない（裁定Q8）。record が在ること自体が観測事実なので
-// **これを理由に record を隠してはならない**。表示側が Coverage を見て畳む実装を書けないよう、
-// 公開面では名前を変えて運ぶ（record を出すか否かの判断は kind 側の state が持つ）
+// DivergenceRecord の coverage は検出入力の観測度で、record の確からしさではない。これを理由に record を隠さない。
+// 表示側が coverage を見て畳まないよう名前を変えて運ぶ。record を出すかは kind 側の state が決める。
 export type DivergenceRecordView = Omit<DivergenceRecord, "coverage"> & {
   detectionInputCoverage: Coverage;
 };
@@ -1312,22 +1286,18 @@ export type DivergenceReportView = Omit<DivergenceReport, "kinds"> & {
   kinds: Record<DivergenceKind, DivergenceKindReportView>;
 };
 
-// 裁定A1: L3 は SemanticModelPayload に内包して1経路で運ぶ（webview 側で再集計しない）。
-// L3Report は canonicalPath 基底の値を持たない（basis は nodeId/edgeId/EvidenceRef、
-// footprint 由来の値は件数のみ）ため、nodes と違い射影を要しない
+// L3Report は canonical path 由来の値を持たないので、nodes と違って射影しない。webview は再集計しない。
 export interface L3ReportPayload {
   facts?: AnalysisFactsView;
   analysis: L3Report;
   divergences: DivergenceReportView;
-  // 省略可能（LLM は既定オフ）。undefined = 未着 / disabled = 既定オフ /
-  // unavailable = 実行できなかった / completed かつ accepted 0 件 = 実行したが検証を
-  // 通ったものが無い。4つは別物として描く（D-9/D-11: 棄却件数は要約行 rejectedCount に表示、棄却所見詳細は診断面に閉じる）
+  // undefined（未着）と LlmFindingReportView の各 state と、所見 0 件の attached を、それぞれ別の表示にする。
+  // 棄却の件数は rejectedCount だけで運び、棄却した所見の中身は LlmFindingDiagnosticsPayload に閉じる。
   llm?: LlmFindingReportView;
 }
 
-// 通常 UI 面の unavailable 理由。client 側の LlmAnalysisUnavailableReason は粒度が細かく、
-// どれを本語彙のどれへ写すかは llm-report.ts が網羅的に決める（string を受けると
-// tsc が写像漏れを検出できず、表示文言の無い理由コードがそのまま画面に出る）
+// src/llm-report.ts#unavailableCode が src/llm-analysis-client.ts#LlmAnalysisUnavailableReason から網羅的に写す。
+// string に広げない: 写像漏れを tsc が検出できず、文言の無い理由コードが画面に出る。
 export type LlmUnavailableReason =
   | "not_configured"
   | "model_unresolved"
@@ -1353,7 +1323,7 @@ export type FindingAction =
 export interface AttachedFindingView {
   findingId: string;
   numberLabel: string;
-  // 番号列に出す数字だけの番号（Host が 0 埋めする）。webview は採番しない（VND-S6）
+  // Host が 0 埋めして渡す。webview は採番しない（verify-analysis-b5-data#B5-N1）。
   numberDigits?: string;
   title: string;
   observed: string;
@@ -1390,7 +1360,6 @@ export interface AttachedAnalysisView {
   persistence: PersistenceState;
   persistenceLabel: string;
   summaryLabel: string;
-  // summaryLabel を組む値そのもの
   findingsCount?: number;
   rejectedCount?: number;
   modelsLabel?: string;
@@ -1398,7 +1367,7 @@ export interface AttachedAnalysisView {
   tokensLabel?: string | null;
   slicesCount?: number;
   emptyStateLabel?: string;
-  // 分析入力の被覆行（Host が組む）。再起動前の artifact には無い
+  // Host のメモリにだけ持つ値（src/session.ts#Session.inputCoverageLabelByArtifactId）で、再起動前の artifact には無い。
   inputCoverageLabel?: string;
   historyOptions: HistoryOption[];
   selectedArtifactId: string;
@@ -1415,8 +1384,7 @@ export type LlmFindingReportView =
 export type AnalysisPanelView = LlmFindingReportView;
 
 
-// オプトイン時のみ Host が送る診断面。SemanticModelPayload からは辿れない。
-// 検証器の観測可能性（候補数・棄却理由内訳・キャッシュ）はここに閉じる
+// 検証器の内訳はオプトインの診断面に閉じる。SemanticModelPayload から辿れる場所へ移さない。
 export type LlmFindingDiagnosticsPayload =
   | { state: "unavailable"; reason: string }
   | {
@@ -1425,9 +1393,7 @@ export type LlmFindingDiagnosticsPayload =
       provenance: LlmAnalysisProvenance;
       cacheState: "hit" | "miss";
       rejected: RejectedFinding[];
-      // 件数は2段の漏斗。candidate は LLM が出した数であって検証器へ渡った数ではない
-      // （candidate = schemaRejected + verified / verified = accepted + rejected）。
-      // candidate に verified を当てるとスキーマ段の棄却が観測できなくなる
+      // candidate は LLM が出した数で、検証器へ渡った数ではない。candidate に verified を当てるとスキーマ段の棄却が見えなくなる。
       counts: {
         candidate: number;
         schemaRejected: number;
@@ -1439,22 +1405,19 @@ export type LlmFindingDiagnosticsPayload =
       };
     };
 
-// version は SemanticModel 自身の SEMANTIC_MODEL_SPEC_VERSION が載る
-// （WORK_MODEL_VERSION と同様、PROTOCOL_VERSION とは独立に動く）
-// progress は Host-only（baseDir / canonicalPath を含む）。
-// projection が runtime で落とすのに加え、型でも公開面から外す
+// version は src/semantic-model.ts#SEMANTIC_MODEL_SPEC_VERSION で、PROTOCOL_VERSION とは別に上げる。
+// progress は canonical path を含む Host 専用の値で、投影で落とし、型でも外す。
 export interface SemanticModelPayload extends Omit<SemanticModel, "nodes" | "progress"> {
   nodes: SemanticNodeView[];
-  // 省略可能。undefined は「L3 未着」（導出前 / 導出失敗）。
-  // **「L3 未着」と「指標が unavailable」と「observed 0」は別物**
+  // undefined は未着（導出前か失敗）で、指標の unavailable や観測 0 と同一視しない。
   l3?: L3ReportPayload;
-  // timeBuckets の読み直し（src/transcript-time-buckets.ts）で読めなかったもの。省略 = 欠落なし。
-  // 読めなかった subagents/ を 0 本として timeBuckets に畳むと、並列していたセッションが
-  // 「直列 100%」で描かれる（R-DSP-01）。任意フィールドは全て webview に描き手を持つ（G-COV-4）
+  // src/transcript-time-buckets.ts が読めなかったもの。省略は欠落なし。読めなかった記録を 0 本として畳むと、並列していたセッションが直列で描かれる（R-DSP-01）。
+  // 任意フィールドにはすべて webview の描き手がある（verify-work-graph#G-COV-4mut）。
   timeBucketsCoverage?: TimeBucketsCoverage;
-  // 分析の ROLES / ERR / 本体トークン。並び・合計・百分率は Host が決める（webview は集計しない。VND-S6 / VND-S6b）
+  // 並びと集計は Host が決め、webview は集計しない（verify-no-declared#VND-S6, verify-no-declared#VND-S6b）。
   roleSummary?: RoleSummaryView;
   failureSummary?: FailureSummaryView;
+  summaryAnalysis?: SummaryAnalysisView;
   // null = メインの使用量を 1 件も観測していない（R-DSP-11）
   mainTokens?: MainTokenTotal | null;
 }
@@ -1479,7 +1442,6 @@ export function isTimeBucketsCoverage(v: unknown): v is TimeBucketsCoverage {
   );
 }
 
-// Task 表示に要る値の写し。reducer の値をそのまま並べるだけで、ここで数え直さない
 function taskItemViews(state: WorkModelState): WorkTaskItemView[] {
   return state.tasks.map((task) => ({
     taskKey: task.taskKey,
@@ -1516,7 +1478,7 @@ function restoredToNode(agent: RestoredAgent): WorkAgentNode {
     agentId: agent.agentId,
     parentAgentId: agent.parentAgentId,
     toolUseId: agent.toolUseId,
-    // meta.json は親の tool_use を持たない。推定で埋めると相関先を捏造することになる
+    // CLI の meta.json は親の tool_use を持たない。推定で埋めると相関先を捏造する。
     parentToolUseId: null,
     spawnDepth: agent.spawnDepth,
     agentType: agent.agentType,
@@ -1536,8 +1498,7 @@ function restoredToNode(agent: RestoredAgent): WorkAgentNode {
   };
 }
 
-// meta の parentAgentId は親を高々1つしか持たない。辿って再訪したら循環で、
-// どちらの辺も採れない（ファイル名順で片側だけ採ると宣言順で階層が変わる）
+// 循環の辺はどちらも採らない。片側だけ採ると、読んだ順で階層が変わる。
 function findCyclicRestoredIds(restoredAgents: readonly RestoredAgent[]): Set<string> {
   const byId = new Map<string, RestoredAgent>();
   for (const agent of restoredAgents) {
@@ -1567,8 +1528,7 @@ function findCyclicRestoredIds(restoredAgents: readonly RestoredAgent[]): Set<st
   return cyclic;
 }
 
-// Host の materialized WorkModel を webview へ出す形へ落とす。分類も帰属もここでは行わない
-// （reducer が決めた値と、meta 由来の識別情報の突き合わせだけ）。
+// 分類と帰属をここで足さない。reducer が決めた値と restoredAgents の突き合わせだけを行う。
 export function projectWorkModel(
   state: WorkModelState,
   restoredAgents: readonly RestoredAgent[] = []
@@ -1580,8 +1540,7 @@ export function projectWorkModel(
       restoredByToolUseId.set(agent.toolUseId, agent);
     }
   }
-  // live 側の agentId（reducer の合成ID）と meta 側の実 agentId の両方で引けるようにする。
-  // 深い階層の meta が指す parentAgentId は実IDなので、合成IDだけでは親に到達できない
+  // meta の parentAgentId は実 ID なので、合成 ID だけで引くと深い階層の親に届かない。
   const nodeByKey = new Map<string, WorkAgentNode>();
   const levelByNode = new Map<WorkAgentNode, number>();
   const matchedRestoredIds = new Set<string>();
@@ -1589,8 +1548,7 @@ export function projectWorkModel(
   const unlinkedAgents: WorkAgentNode[] = [];
   let depthLimitedCount = 0;
 
-  // 親が見つかっても深さ上限を超えるなら、その辺だけを捨てて根へ回す。
-  // 木ごと拒否すると壊れた一部のために payload 全体を失う
+  // AGENT_TREE_MAX_DEPTH を超える辺だけを捨てて根へ回す。木ごと拒否すると、壊れた一部のために payload 全体を失う。
   const attach = (node: WorkAgentNode, parent: WorkAgentNode | undefined, roots: WorkAgentNode[]): void => {
     if (parent === undefined || parent === node) {
       levelByNode.set(node, 0);
@@ -1634,6 +1592,7 @@ export function projectWorkModel(
       if (restored) matchedRestoredIds.add(restored.agentId);
       const node: WorkAgentNode = {
         agentId: agent.agentId,
+        intentInput: findToolPlacement(state, agent.toolUseId)?.intentInput,
         transcriptAgentId: agent.transcriptAgentId ?? restored?.agentId,
         parentAgentId: agent.parentAgentId,
         toolUseId: agent.toolUseId,
@@ -1646,6 +1605,7 @@ export function projectWorkModel(
         effortDeclared: agent.effortDeclared,
         effortMeasured: restored?.effortMeasured,
         status: agent.status,
+        runStartedAt: agent.runStartedAt ?? agent.startedAt,
         startedAt: agent.startedAt,
         endedAt: agent.endedAt,
         elapsedMs: agent.elapsedMs,
@@ -1677,8 +1637,7 @@ export function projectWorkModel(
   }
 
   const cyclicRestoredIds = findCyclicRestoredIds(restoredAgents);
-  // 浅い順に並べてから解決する。深い側を先に処理すると親がまだ登録されておらず
-  // 「階層未確認」へ落ちる（実データは depth 3 まで）
+  // 深い側を先に解決すると親がまだ登録されておらず、階層未確認へ落ちる。
   const pending = restoredAgents
     .filter((agent) => !matchedRestoredIds.has(agent.agentId))
     .slice()
@@ -1695,6 +1654,9 @@ export function projectWorkModel(
 
   return {
     version: WORK_MODEL_VERSION,
+    // R-TAB-07: projectWorkModel
+    requests: state.coverage.summary === "complete" && !state.coverage.hydrationUnconfirmed
+      ? state.requests?.filter(request => !request.incomplete).map(({ command: _command, cliInserted: _cliInserted, incomplete: _incomplete, ...request }) => request) : undefined,
     planDeclaration: state.planDeclaration,
     planBoundaryAt: state.planBoundaryAt,
     planHistory: state.planHistory,
@@ -1703,8 +1665,13 @@ export function projectWorkModel(
     planTools: state.runningToolUseIds.flatMap(id => {
       const tool = findToolPlacement(state, id);
       return tool && !tool.stale && tool.parentToolUseId === null
-        ? [{ id, name: tool.toolName, description: tool.description, startedAt: tool.startedAt }] : [];
+        ? [{ id, name: tool.toolName, description: tool.description, startedAt: tool.startedAt, intentInput: tool.intentInput }] : [];
     }),
+    runningMainTools: [...state.runningToolUseIds, ...state.runningAgentToolUseIds].flatMap(id => {
+      const tool = findToolPlacement(state, id);
+      return tool && !tool.stale && tool.parentToolUseId === null && tool.background === undefined
+        ? [{ id, name: tool.toolName, startedAt: tool.startedAt, intentInput: tool.intentInput }] : [];
+    }).sort((a, b) => a.startedAt - b.startedAt),
     revision: state.revision,
     coverage:
       depthLimitedCount > 0
@@ -1725,19 +1692,14 @@ export function projectWorkModel(
   };
 }
 
-// 1イベント分の配置と、そのイベントで変わった集計を取り出す。「何が変わったか」は
-// revision の一致で決める（reducer が書き換えた枝にだけ現在の revision が入る）。
-// 規則を再実装しないため、ここでは加減算も分類もしない。
-// previousState は staled の判定にだけ使う（このイベントで初めて stale になったものだけを出す）
+// 変わった集計は revision の一致で選ぶ（reducer が書き換えた枝にだけ現在の revision が入る）。分類の規則をここで再実装しない。
 export function projectWorkEvent(
   previousState: WorkModelState,
   nextState: WorkModelState,
   event: NormalizedEvent
 ): WorkEventInfo | undefined {
-  // 本文デルタはストリーミング中の最頻イベント。毎回集計を載せると EventLog と postMessage の
-  // 量がデルタ数に比例して増えるので、配置先が変わった最初の1件だけ載せる。
-  // 丸ごと除外すると、ツールを使わないターンで webview の「現在の作業カード」が
-  // 前ターンのまま残る（reducer はデルタで新しい segment を開いている）
+  // 本文デルタには segment が変わったときだけ載せる。毎回載せると保存と送信の量がデルタ数に比例し、
+  // 丸ごと外すとツールを使わないターンで前のカードが現在の作業のまま残る。
   if (event.kind === "assistant_text_delta" && nextState.currentSegmentId === previousState.currentSegmentId) {
     return undefined;
   }
@@ -1751,9 +1713,7 @@ export function projectWorkEvent(
   }
 
   if (event.kind === "tool_call_started") {
-    // placement が付かない tool_call_started は「reducer が記帳系として扱った」ことを意味する。
-    // その区別を webview へ渡すため、配置が無くても情報自体は必ず付ける
-    // （付けないと webview 側で配置情報の欠落と区別できず、ツール名の表を持つことになる）
+    // 配置が無くても info は必ず付ける。付けないと webview が記帳系と配置の欠落を区別できず、ツール名の表を持つことになる。
     touched = true;
     const placement = findToolPlacement(nextState, event.toolUseId);
     if (placement !== undefined && placement.phaseRef !== undefined) {
@@ -1814,6 +1774,7 @@ export function projectWorkEvent(
     for (const agent of phase.agents) {
       if (agent.revision !== revision) continue;
       agents.push({
+        runStartedAt: agent.runStartedAt ?? agent.startedAt,
         toolUseId: agent.toolUseId,
         status: agent.status,
         childCount: agent.childCount,
@@ -1847,7 +1808,6 @@ export function projectWorkEvent(
     touched = true;
   }
 
-  // 走査するのは直前まで実行中だったものだけ。全 placement を見ると完了済みまで触る
   const staled: string[] = [];
   for (const toolUseId of [...previousState.runningAgentToolUseIds, ...previousState.runningToolUseIds]) {
     if (findToolPlacement(previousState, toolUseId)?.stale === true) continue;
@@ -1869,9 +1829,8 @@ export function projectWorkEvent(
   return touched ? info : undefined;
 }
 
-// webview 側の同期再生上限で落とした詳細イベントを Host 由来の coverage へ合流させる。
-// renderer 側で「Host は complete だがこの画面では欠けている」を分岐すると、
-// 概要と詳細で別々の欠落判定を持つ状態へ戻る
+// src/webview/main.ts#REPLAY_MAX で落とした分を Host の coverage へ合流させる（verify-history-prepend#HPmut-13）。
+// renderer 側で分岐すると、概要と詳細が別々の欠落判定を持つ。
 export function withLocalEventDrop(
   payload: WorkModelPayload | undefined,
   droppedCount: number
@@ -1948,6 +1907,7 @@ function isWorkAgentNode(v: unknown, depth = 0): v is WorkAgentNode {
   if (typeof v !== "object" || v === null) return false;
   const a = v as Record<string, unknown>;
   return (
+    (a.intentInput === undefined || isToolIntentInput(a.intentInput)) &&
     typeof a.agentId === "string" &&
     (a.parentAgentId === null || typeof a.parentAgentId === "string") &&
     typeof a.toolUseId === "string" &&
@@ -1960,6 +1920,7 @@ function isWorkAgentNode(v: unknown, depth = 0): v is WorkAgentNode {
     isOptionalString(a.effortDeclared) &&
     isOptionalString(a.effortMeasured) &&
     WORK_STATUSES.includes(a.status as string) &&
+    (a.runStartedAt === undefined || isNumber(a.runStartedAt)) &&
     (a.startedAt === undefined || isNumber(a.startedAt)) &&
     (a.endedAt === undefined || isNumber(a.endedAt)) &&
     isNumber(a.elapsedMs) &&
@@ -2016,6 +1977,12 @@ export function isWorkModelPayload(v: unknown): v is WorkModelPayload {
   if (typeof v !== "object" || v === null) return false;
   const m = v as Record<string, unknown>;
   return (
+    (m.requests === undefined || isArrayOf(m.requests, value => {
+      if (!value || typeof value !== "object") return false;
+      const request = value as Record<string, unknown>;
+      return isStringArray(request.turnIds) && typeof request.number === "string" &&
+        isNumber(request.toolCount) && isNumber(request.agentCount) && isNumber(request.failCount) && isNumber(request.revision);
+    })) &&
     (m.planHistory === undefined || isArrayOf(m.planHistory, entry => {
       if (!entry || typeof entry !== "object") return false;
       const row = entry as Record<string, unknown>;
@@ -2029,10 +1996,15 @@ export function isWorkModelPayload(v: unknown): v is WorkModelPayload {
     (m.planHistoryTruncated === undefined || typeof m.planHistoryTruncated === "boolean") &&
     (m.planHistoryLostThrough === undefined || isNumber(m.planHistoryLostThrough)) &&
     (m.planContext === undefined || isPlanContext(m.planContext)) &&
+    (m.runningMainTools === undefined || isArrayOf(m.runningMainTools, tool => {
+      if (!tool || typeof tool !== "object") return false;
+      const row = tool as Record<string, unknown>;
+      return (row.intentInput === undefined || isToolIntentInput(row.intentInput)) && typeof row.id === "string" && typeof row.name === "string" && isNumber(row.startedAt);
+    })) &&
     (m.planTools === undefined || isArrayOf(m.planTools, tool => {
       if (!tool || typeof tool !== "object") return false;
       const row = tool as Record<string, unknown>;
-      return typeof row.id === "string" && typeof row.name === "string" && typeof row.description === "string" && isNumber(row.startedAt);
+      return (row.intentInput === undefined || isToolIntentInput(row.intentInput)) && typeof row.id === "string" && typeof row.name === "string" && typeof row.description === "string" && isNumber(row.startedAt);
     })) &&
     isNumber(m.version) &&
     isNumber(m.revision) &&
@@ -2138,7 +2110,7 @@ function isSemanticArtifactView(v: unknown): boolean {
     typeof a.artifactId === "string" &&
     isOptionalString(a.displayName) &&
     SEMANTIC_ARTIFACT_MODES.includes(a.mode as string) &&
-    // 型と対の実行時検査。射影漏れの canonicalPath をここで止める
+    // SemanticArtifactView の canonicalPath?: never と対の実行時検査。
     !("canonicalPath" in a)
   );
 }
@@ -2315,9 +2287,6 @@ function isSemanticReworkCandidate(v: unknown): boolean {
   );
 }
 
-// ---- L3 payload のガード（裁定A1） ----
-
-// counts / excludedPairCounts の共通形
 function isNumberRecord(v: unknown): boolean {
   if (typeof v !== "object" || v === null || Array.isArray(v)) return false;
   return Object.values(v as Record<string, unknown>).every(isNumber);
@@ -2333,8 +2302,7 @@ function isL3Basis(v: unknown): boolean {
   );
 }
 
-// reason 文字列は enum をここへ複製せず string 検査に留める（語彙を2箇所に置くと
-// 追加時に静かに食い違う）。表示側は未知の reason を落とさず「未観測」として描くこと
+// reason の語彙をここへ複製しない。複製すると追加時に静かに食い違う。表示側は未知の reason を落とさず未観測として描く。
 function isL3Metric(v: unknown): boolean {
   if (typeof v !== "object" || v === null) return false;
   const m = v as Record<string, unknown>;
@@ -2346,7 +2314,7 @@ function isL3Metric(v: unknown): boolean {
   return false;
 }
 
-// L3Report.metrics のキー集合を型で固定する（指標追加時にここがコンパイルエラーになる）
+// 指標を足すと tsc がここで落ちるよう、配列でなく Record で持つ。
 const L3_METRIC_KEYS: Record<keyof L3Report["metrics"], true> = {
   longGapMs: true,
   longGapCount: true,
@@ -2449,7 +2417,7 @@ function isL3Report(v: unknown): boolean {
   );
 }
 
-// kind の集合を型で固定する（kind 追加時にここがコンパイルエラーになる）
+// kind を足すと tsc がここで落ちるよう、配列でなく Record で持つ。
 const DIVERGENCE_KIND_KEYS: Record<DivergenceKind, true> = {
   serialization: true,
   unsupported_completion: true,
@@ -2457,11 +2425,8 @@ const DIVERGENCE_KIND_KEYS: Record<DivergenceKind, true> = {
   declared_state_conflict: true,
 };
 
-// declared / observed は拡張点（unknown 型）なので値の形を検査しない。
-// `divergenceId` は必須で緩めない: ID 無しの record を通すと「LLM finding は
-// DivergenceRecord の ID の引用でしか乖離へ言及できない」が成立しない payload が
-// LLM 分析へ届く（llm-finding-verify.ts はそれを unidentified として全件棄却する）。
-// ID を持たない l3 は payload ごと落ち、l3 未着の表示へ縮退する
+// declared / observed は unknown 型の拡張点なので形を検査しない。divergenceId は緩めない（verify-work-overview#O-58b）:
+// 所見は ID の引用でしか乖離へ言及できない。ID を持たない l3 は payload ごと落ち、未着の表示になる。
 function isDivergenceRecordView(v: unknown): boolean {
   if (typeof v !== "object" || v === null) return false;
   const r = v as Record<string, unknown>;
@@ -2504,8 +2469,7 @@ function isDivergenceReportView(v: unknown): boolean {
     Object.keys(DIVERGENCE_KIND_KEYS).every((k) => isDivergenceKindReportView(kinds[k])) &&
     isNumber(d.recordCount) &&
     isNumber(d.droppedRecordCount) &&
-    // 診断値の欠落で l3 全体を落とさない（欠けると観測された乖離が UI から消える）。
-    // 検出結果の正しさに関与しないので、必須にする側の利得が無い（裁定 P-2）
+    // 診断値が欠けても l3 全体を落とさない。落とすと観測された乖離が画面から消える。
     (d.segmentAnchoredIdCount === undefined || isNumber(d.segmentAnchoredIdCount))
   );
 }
@@ -2663,8 +2627,7 @@ function isActionFinding(v: unknown): boolean {
   );
 }
 
-// 棄却側を運ぶ名前は通常 UI 面から落とす（本文も内訳も出さない）。
-// rejectedCount は要約行に出すため許可する（D-9/D-11）
+// 棄却の中身を通常の画面へ運ぶ名前を拒否する。rejectedCount は要約行に出すので含めない。
 const LLM_REPORT_BANNED_KEYS = [
   "rejected",
   "byReason",
@@ -2672,8 +2635,7 @@ const LLM_REPORT_BANNED_KEYS = [
   "candidateCount",
 ];
 
-// 自由文（例外メッセージ）には LLM 本文が混ざりうる。コード語彙そのものを複製せず
-// 「コード化されている」ことだけを検査する（新しいコードの追加で payload を落とさない）
+// 自由文には LLM 本文が混ざりうるので、コードの字面であることだけを検査する。語彙は複製しない（コードを足しても payload を落とさない）。
 const LLM_REASON_CODE_RE = /^[a-z][a-z0-9_]{0,63}$/;
 
 export function isAnalysisPanelView(v: unknown): v is AnalysisPanelView {
@@ -2703,8 +2665,7 @@ export function isLlmFindingReportView(v: unknown): v is LlmFindingReportView {
   return isAnalysisPanelView(v);
 }
 
-// check / reason は llm-finding-verify.ts の enum を複製せず string 検査に留める
-// （l3 の reason と同じ方針。語彙が増えるたびに二重管理へ戻さない）
+// check と reason の語彙を src/llm-finding-verify.ts から複製しない（isL3Metric と同じ理由）。
 function isFindingRejectionView(v: unknown): boolean {
   if (typeof v !== "object" || v === null) return false;
   const r = v as Record<string, unknown>;
@@ -2819,6 +2780,7 @@ export function isSemanticModelPayload(v: unknown): v is SemanticModelPayload {
     (m.timeBuckets === undefined || isTimeBucketsPayload(m.timeBuckets)) &&
     (m.roleSummary === undefined || isRoleSummaryView(m.roleSummary)) &&
     (m.failureSummary === undefined || isFailureSummaryView(m.failureSummary)) &&
+    (m.summaryAnalysis === undefined || isSummaryAnalysisView(m.summaryAnalysis)) &&
     (m.mainTokens === undefined || m.mainTokens === null || isMainTokenTotal(m.mainTokens))
   );
 }
@@ -2826,11 +2788,41 @@ export function isSemanticModelPayload(v: unknown): v is SemanticModelPayload {
 const isNullableNumber = (v: unknown): boolean => v === null || isNumber(v);
 const isNullableString = (v: unknown): boolean => v === null || typeof v === "string";
 
-// timeBuckets の他の項目は既存の webview 検査の合成 payload が部分形で送るため、ここでは形を問わない
+function isSummaryAnalysisView(v: unknown): boolean {
+  if (typeof v !== "object" || v === null || Array.isArray(v)) return false;
+  const s = v as Record<string, unknown>;
+  const count = (n: unknown) => n === null || (Number.isSafeInteger(n) && (n as number) >= 0);
+  const percent = (n: unknown) => isNumber(n) && (n as number) >= 0 && (n as number) <= 100;
+  return count(s.improvableCount) && count(s.scriptFindingCount) && count(s.scriptCandidateCount) &&
+    (s.scriptCandidatePercent === null || percent(s.scriptCandidatePercent)) &&
+    (s.llmExecutionState === "idle" || s.llmExecutionState === "running" || s.llmExecutionState === "attemptFailed" || s.llmExecutionState === "disabled" || s.llmExecutionState === "attached") &&
+    (s.llmState === "current" || s.llmState === "not-run" || s.llmState === "stale") &&
+    count(s.llmFindingCount) && count(s.rejectedCount) && isOptionalString(s.generatedAtLabel) &&
+    isArrayOf(s.llmAreas, value => {
+      if (typeof value !== "object" || value === null) return false;
+      const area = value as Record<string, unknown>;
+      return typeof area.label === "string" && area.count !== null && count(area.count) && percent(area.percent);
+    });
+}
+
+// 他の項目は webview 検査の合成 payload が部分形で送るので、形を問わない。
 function isTimeBucketsPayload(v: unknown): boolean {
   if (typeof v !== "object" || v === null || Array.isArray(v)) return false;
-  const byModel = (v as Record<string, unknown>).mainByModel;
-  return byModel === undefined || byModel === null || isMainTimeByModelView(byModel);
+  const { mainByModel: byModel, blocks } = v as Record<string, unknown>;
+  const percent = (value: unknown) => isNumber(value) && (value as number) >= 0 && (value as number) <= 100;
+  return (byModel === undefined || byModel === null || isMainTimeByModelView(byModel)) &&
+    (blocks === undefined || isArrayOf(blocks, value => {
+      if (typeof value !== "object" || value === null) return false;
+      const block = value as Record<string, unknown>;
+      if (block.requestNumber !== undefined && block.requestNumber !== null &&
+        !(typeof block.requestNumber === "string" && /^\d+$/.test(block.requestNumber))) return false;
+      if (block.processingMs !== undefined && block.processingMs !== null &&
+        !(isNumber(block.processingMs) && (block.processingMs as number) >= 0)) return false;
+      if (block.strip === undefined || block.strip === null) return true;
+      if (typeof block.strip !== "object" || Array.isArray(block.strip)) return false;
+      const strip = block.strip as Record<string, unknown>;
+      return percent(strip.processingPercent) && percent(strip.replyPercent) && percent(strip.remainderPercent);
+    }));
 }
 
 function isMainModelTimeEntry(v: unknown): boolean {
@@ -2928,13 +2920,11 @@ export type ResumeHydrationPhase = "loading" | "complete" | "failed";
 
 export const RESUME_PREVIEW_MESSAGE_MAX = 80;
 
-// 「転記済みと同じ内容が書き直されている可能性」を出す比（R-HND-11）。機械側は重複を消さない
-// （近似一致は決定の取り違えになる）ので、防御は指示文側に置き、ここは観測だけを持つ
+// R-HND-11: 書き直しの可能性を知らせるだけに使う。近似一致で重複を消さない（決定を取り違える）。
 export const DECISIONS_REWRITE_RATIO = 0.8;
 
-// 記録から復元した引き継ぎカードの展開部を指す実行 ID（R-HND-10）。Host と webview が
-// 同じ関数で作る。**固定値にしないこと**: intoTabId によるタブ再利用で同じ tabId に別セッションが
-// 載ったとき、古い展開部の cache が一致して別会話の本文を返す
+// R-HND-10: Host と webview が同じ関数で作る。固定値にしない: intoTabId で同じ tabId に別セッションが載ると、
+// 古い展開部の cache が一致して別会話の本文を返す。
 export function restoredHandoffRunId(forkSessionId: string): string {
   return `restored:${forkSessionId}`;
 }
@@ -2985,15 +2975,12 @@ export type HostToWebview =
   // treats a missing value as Windows (stricter) and never infers it from its own navigator.
   | { type: "init"; protocolVersion: number; tabs: TabSnapshot[]; hostWindows?: boolean; systemAppExtensions?: string[] }
   | { type: "events"; tabId: string; events: NormalizedEvent[] }
-  // Resume fast path v4 F-2/F-5/F-8: hydration 中の表示差分だけを in-place で運ぶ。
-  // 判別ユニオンは runtime guard（isResumeHydrationStateShape）と同じ制約を型に持たせるため:
-  // phase 遷移か carrier のどちらか一方を必ず運び、reason は failed のときだけ許す。
+  // 判別ユニオンで isResumeHydrationStateMessage と同じ制約を型に持たせる。
   | {
       type: "resumeHydrationState";
       tabId: string;
       phase: Exclude<ResumeHydrationPhase, "failed">;
-      // FP-1: 最初の描画は read-set 捕捉だけを待つ。tail の読取が終わったあと
-      // 表示専用 preview をこれで追送する（tabCreated/tabCleared を二度撃たない）
+      // 最初の描画の後に表示専用の preview を追送する欄。tabCreated と tabCleared を二度送らない。
       previewMessages?: ResumePreviewMessage[];
     }
   | {
@@ -3018,27 +3005,24 @@ export type HostToWebview =
       displayEvent?: undefined;
       sendDisposition: ResumeHydrationSendDisposition;
     }
-  // activate=false は引き継ぎ先タブを裏で開く経路（R-HND-08: 完了時にフォーカスを奪わない）。
-  // 他の経路は利用者の操作に対する応答なので true を送る
+  // R-HND-08: activate が false になるのは、src/handoff-runner.ts#shouldActivateForkTab が偽を返した引き継ぎタブと、
+  // src/extension.ts#restorePersistedTabs が起動時に復元する先頭以外のタブだけ。他の生産者は true を送る。
   | { type: "tabCreated"; tab: TabSnapshot; activate: boolean }
   | { type: "tabClosed"; tabId: string }
   | { type: "activateTab"; tabId: string }
-  // /clear 完了通知。tab はクリア後の新スナップショット（webview側はタブを同位置で置換する）
+  // webview はタブを同じ位置で置き換える。
   | { type: "tabCleared"; tab: TabSnapshot }
-  // 復帰の init で deferred として積んだタブの中身。受け側は tabCleared と同じ手順で
-  // その場に作り直す（並びとアクティブ選択を保つ）
+  // init で deferred として送ったタブの中身。受け側は tabCleared と同じ手順で、並びとアクティブ選択を保ったまま作り直す。
   | { type: "tabRestored"; tab: TabSnapshot }
   | { type: "tabRenamed"; tabId: string; title: string }
-  // 引き継ぎの状態通知。要約・逐語の本文はここへ載せない
-  // （webview が展開したときだけ getHandoffDetail で取りに行く）
+  // 要約と逐語の本文は載せない。webview が展開したときだけ getHandoffDetail で取りに行く。
   | {
       type: "handoffStatus";
       tabId: string;
       runId: string;
       state: "running" | "failed" | "done";
       phase?: string;
-      // compact 進行中の心拍ごとに載る（running・phase "compacting" のときだけ）。
-      // since は elapsedMs の起点で、result 未着なら "compact_start"
+      // compact 中の心拍ごとに載る。since は elapsedMs の起点。
       progress?: { heartbeats: number; elapsedMs: number; since: "compact_start" | "result" };
       reason?: string;
       detail?: string;
@@ -3047,9 +3031,9 @@ export type HostToWebview =
       fork?: { sessionId: string; tabId: string; title: string };
       compact?: { preTokens: number; postTokens: number };
       utteranceCount?: number;
-      // F のうち JSON として読めず捨てた行数（done のときだけ。0 は載せない）
+      // JSON として読めず捨てた行数。0 は載せない。
       unreadableLineCount?: number;
-      // 決定行の転記の件数だけ（R-HND-11 / R-HND-12）。本文は handoffDetail の part 0 が運ぶ
+      // R-HND-11 / R-HND-12: 件数だけ。本文は handoffDetail の part 0 が運ぶ。
       decisions?: {
         total: number;
         carried: number;
@@ -3059,9 +3043,8 @@ export type HostToWebview =
         warn?: { entries: number; bytes: number };
       };
     }
-  // 状態カードの展開部。getHandoffDetail への応答で、1 通あたり
-  // HANDOFF_DETAIL_MAX_BYTES 以下に分割する。summary は part 0 だけが運ぶ。
-  // total===0 は「F を読めなかった」で、webview はその旨を出す
+  // 1 通を src/handoff-runner.ts#HANDOFF_DETAIL_MAX_BYTES 以下に分ける。summary は part 0 だけが運ぶ。
+  // total が 0 なのは記録を読めなかった印で、webview はその旨を出す。
   | {
       type: "handoffDetail";
       tabId: string;
@@ -3070,7 +3053,7 @@ export type HostToWebview =
       total: number;
       summary?: string;
       utterances: { n: number; at: string; kind: "typed" | "answer"; text: string; questions?: string[] }[];
-      // 転記した決定行。summary と同じく part 0 だけが運ぶ
+      // summary と同じく part 0 だけが運ぶ。
       decisions?: HandoffDecisions;
     }
   | { type: "modeChanged"; tabId: string; mode: PermissionModeId }
@@ -3080,48 +3063,35 @@ export type HostToWebview =
       tabId: string;
       models: ModelInfo[];
     }
-  // notice は Host が適用・保存を終えた後の結果文（適用済み / 保存失敗）。webview は選択直後に
-  // 自前で「保存しました」を出さない（R-DSP-01: 保存前に保存済みを名乗らない）
-  | { type: "modelChanged"; tabId: string; model: string | null; notice?: string }
+  // R-DSP-01: notice は Host が適用と保存を終えた後の結果文。webview は選択直後に自前で保存済みを出さない。
+  | { type: "modelChanged"; tabId: string; model: string | null; notice?: string; applied?: boolean }
   | { type: "effortChanged"; tabId: string; effort: string | null; notice?: string }
   | { type: "configuredEffortChanged"; tabId: string; effort: string | null; model?: string | null; defaultEffort?: string | null; appliedModel?: string | null; appliedEffort?: string | null }
   | { type: "files"; reqId: number; paths: string[] }
-  // pickFiles の応答。キャンセルは paths / images とも空で返す（無応答にしない）
+  // キャンセルでも paths と images を空にして返す（無応答にしない）。
   | { type: "pickedFiles"; reqId: number; paths: string[]; images: ImageAttachment[] }
-  // そのタブの未送信添付の全量。差分ではなく毎回全量を送り、webview は置き換えるだけにする
+  // 差分ではなく毎回全量を送り、webview は置き換えるだけにする。
   | { type: "attachments"; tabId: string; items: PendingAttachmentInfo[] }
-  // 履歴一覧は確定した行から逐次届く。requestId は listSessions 要求ごとに単調増加し、
-  // パネル再オープンで走り出した新しい実行より小さい requestId の行は捨てる。
-  // complete=false の到着は「まだ確認中」であって「これで全部」ではない（部分応答を
-  // 0 件の根拠にしない）。complete=true が来て初めて件数が確定する
-  // degraded は「走査中に読めなかったものがある」ことだけを運ぶ。complete=false へ逃がさない
-  // こと（受信側は complete でないと「読み込んでいます…」を出し続け、断言が永久スピナーへ
-  // 変わるだけになる）。complete は「走査が終わった」、degraded は「件数が本物ではない」
+  // requestId は listSessions 要求ごとに増え、受け側は新しい実行より小さい requestId の行を捨てる。
+  // complete が偽の到着は確認中で、全件ではない（部分応答を 0 件の根拠にしない）。
+  // degraded は件数が本物でないことだけを運ぶ。complete を偽にして逃がさない（受け側が読み込み中を出し続ける）。
   | { type: "sessions"; source?: "laisora" | "claude"; nextCursor?: string; append?: boolean; requestId: number; sessions: SessionListItem[]; complete: boolean; degraded?: SessionScanDegradation }
   | { type: "analysis"; sessionId: string; filePath: string; report: unknown }
-  // 成功時の analysis と対。これが無いと webview はペンディング表示をタイムアウトまで解除できない。
-  // 要求元の面だけへ postTo で返す（全面へ配ると別タブの分析画面に理由が出る）。
-  // kind "script" は analyzeCurrent / analyzeSession の失敗（ペンディング解除 + 理由）、
-  // kind "action" は所見からの操作（startFindingSession / prepareHistoricalDraft）の拒否。
-  // reason は Host が組んだ表示文。tabId が無い script 失敗は sessionId から表示先タブを引く（R-ANL-11）
-  | { type: "analysisFailed"; kind: "script" | "action"; tabId?: string; sessionId?: string; reason?: string }
+  // R-ANL-11: src/webview/main.ts#showAnalysisFailure が操作元の画面へ理由を描く。要求元の面だけへ返す（全面へ配ると別タブの分析画面に理由が出る）。
+  // kind は失敗した要求で分かれ、script は analyzeCurrent、action は所見からの操作。
+  | { type: "analysisFailed"; kind: "script" | "action"; tabId?: string; reason?: string }
   | { type: "composerPrefill"; tabId: string; text: string }
   | { type: "editorContext"; path: string; startLine: number; endLine: number }
-  // 概要表示用の materialized WorkModel。snapshot（init/tabCreated/tabCleared/tabRestored）が運ぶものと
-  // 同じ projectWorkModel の出力で、live 更新のときだけこの経路で送る
+  // snapshot が運ぶものと同じ projectWorkModel の出力。live の更新だけをこの経路で送る。
   | { type: "workModel"; tabId: string; model: WorkModelPayload }
-  // L2b semantic model の live 更新。snapshot が運ぶ semanticModel と同じ導出結果。
   | { type: "semanticModel"; tabId: string; model: SemanticModelPayload }
   | { type: "llmAnalysisSetting"; enabled: boolean }
-  // 利用者設定の現在値。ready 応答と設定変更後に送る（snapshot には載せない）
+  // snapshot には載せない。ready の応答と設定変更の後に送る。
   | { type: "userSettings"; appearance?: AccentSettings; composerSendKey: ComposerSendKey }
-  // 会話面へ出す 1 行の system 表示。イベントログには残らない（modelChanged.notice と同じ性質）
+  // 保存される event にしない。
   | { type: "tabNotice"; tabId: string; text: string }
-  // LLM 分析の飛行中フラグ。開始/終了で post。snapshot の llmAnalysisRunning と同じ真偽値
-  // running 中の進行は LLM 呼び出しの開始・完了ごとに載る（running:true のときだけ）。
-  // failure は不可用で終えたときだけ載る。limit はどちらの上限で落ちたか（タイムアウト以外では欠ける）
-  // refusal は実行を開始しなかった理由（Host 拒否・入力不足）。running:false にだけ載り、failure とは
-  // 同居しない。未実行を分析結果（attemptFailed / unavailable）として描かせないための別スロット（R-ANL-11）
+  // running は snapshot の llmAnalysisRunning と同じ値。failure の limit はタイムアウト以外では欠ける。
+  // R-ANL-11: refusal は実行を始めなかった理由で、failure と同居しない。未実行を分析結果として描かせないための別の欄。
   | {
       type: "llmAnalysisRunState";
       tabId: string;
@@ -3137,16 +3107,10 @@ export type HostToWebview =
       };
       refusal?: string;
     }
-  // セッション概要の要約の状態（R-DSP-25）。summary は生成完了時に載る。saveFailed=true は
-  // 生成できたが永続化に失敗した（表示はできるが再起動で消える。Webview は「保存済み」と
-  // 表示してはならない — R-DSP-01）。
-  // failure は実行しなかった / 生成できなかった理由（running:false にだけ載る）。summary は既存の要約を
-  // そのまま運ぶので、失敗の通知が保存済みの要約を消さない（R-DSP-25）
+  // R-DSP-25: failure の通知も既存の summary を運ぶので、保存済みの要約を消さない。saveFailed のときは保存済みと表示しない（R-DSP-01）。
   | { type: "sessionSummary"; tabId: string; running: boolean; summary?: { text: string; model: string }; saveFailed?: boolean; failure?: string }
   | { type: "sessionNameSuggestion"; tabId: string; title: string }
   | { type: "sessionNameSuggestion"; tabId: string; reason: string }
-  // 棄却された LLM finding の診断面。Host はオプトイン時のみ送る。
-  // 通常 UI が読む SemanticModelPayload / L3ReportPayload からは到達できない別経路にする。
   | { type: "llmFindingDiagnostics"; tabId: string; payload: LlmFindingDiagnosticsPayload }
   | {
       type: "agentInspectorResult";
@@ -3165,10 +3129,8 @@ export type HostToWebview =
       generation: number;
       reason: AgentInspectorErrorReason;
     }
-  // 作業ログの過去 chunk。EventLog へは入れず（入れると EVENT_LOG_MAX を跨いで coverage が
-  // 反転する）、この経路だけで webview の窓へ prepend する。
-  // generation は応答時点の世代であって照合用ではない。CLI 再起動で世代だけが進んでも登録は
-  // 生きているので、webview がこれを破棄条件に使うと正当な応答を捨てる。破棄は requestId で行う
+  // 保存される event へ入れない: 入れると src/event-fold.ts#EVENT_LOG_MAX を跨いで coverage が反転する。
+  // generation は照合に使わない（CLI の再起動で世代だけ進んでも登録は生きている）。破棄は requestId で判定する。
   | {
       type: "historyChunkResult";
       tabId: string;
@@ -3183,7 +3145,7 @@ export type HostToWebview =
       generation: number;
       reason: HistoryChunkErrorReason;
     }
-  // 作業ログの過去 chunk（transcript 読み直し由来。R-TAB-07）。破棄は requestId で行う
+  // R-TAB-07。破棄は historyChunkResult と同じく requestId で判定する。
   | {
       type: "worklogTranscriptResult";
       tabId: string;
@@ -3198,9 +3160,7 @@ export type HostToWebview =
       generation: number;
       reason: HistoryChunkErrorReason;
     }
-  // 会話の過去 chunk。historyChunkResult と同じ扱い: EventLog へは入れず、この経路だけで
-  // webview の会話面へ prepend する。
-  // generation は応答時点の世代であって照合用ではない。破棄は requestId で行う
+  // historyChunkResult と同じく、保存される event へ入れず、破棄は requestId で判定する。
   | {
       type: "conversationHistoryResult";
       tabId: string;
@@ -3228,7 +3188,7 @@ export type HostToWebview =
       requestId: string;
       reason: "not-found" | "read-failed" | "invalid-request";
     }
-  // ~/.claude.json の cachedUsageUtilization 由来。ターン未実行でも利用率を出すために使う
+  // CLI が ~/.claude.json に残す cachedUsageUtilization から読む（src/session-files.ts#readCachedUsage）。
   | {
       type: "cachedUsage";
       fetchedAtMs: number;
@@ -3245,9 +3205,7 @@ export type HostToWebview =
 export interface TabSnapshot {
   tabId: string;
   title: string;
-  // 復帰の init が運ぶ「まだ中身を積んでいないタブ」。events は空・workModel は無い。
-  // 空の events は「0 件」の主張ではなく、受け側は読み込み中の表示を出す
-  // （R-TAB-08 / R-CNV-02）。中身は tabRestored で後から届く
+  // R-TAB-08 / R-CNV-02: 空の events は 0 件の主張ではなく、受け側は読み込み中を出す（verify-webview-wiring#sol-13d）。中身は tabRestored で後から届く。
   deferred?: true;
   state: ConversationSnapshot;
 }
@@ -3257,23 +3215,23 @@ export interface ConversationSnapshot {
   cwd: string;
   turnState: "idle" | "running" | "interrupting";
   auth: AuthStatus | null;
-  // 接続前表示用の設定値（実測の auth が来たらそちらを優先表示）
+  // 接続前の表示用。auth が届いたらそちらを優先する。
   configModel?: string;
   configEffort?: string;
   // 設定に effort が無いとき、実行中 CLI が既定として使う effort（get_settings の applied.effort）
   defaultEffort?: string;
   // 実行中 CLI が次のリクエストで使う model（get_settings の applied.model）。resume では記録の model で、configModel より優先する
   appliedModel?: string;
+  modelFallback?: ModelFallbackState;
   // get_settings の applied.effort。null = CLI が effort を送らない。configEffort / defaultEffort はこれと一致するときだけ立つ
   appliedEffort?: string | null;
   recordedModel?: string;
   permissionMode: PermissionModeId;
   commands?: SlashCommandInfo[];
   models?: ModelInfo[];
-  // setModel による実行中上書き（null = 既定モデル）
+  // null は既定モデルへの上書き。
   modelOverride?: string | null;
   effortOverride?: string | null;
-  // resume で開いたタブのとき、元セッションの識別子。作業ログから分析タブを開く導線に使う
   resumeSessionId?: string;
   resumeFilePath?: string;
   handoffSource?: {
@@ -3282,50 +3240,40 @@ export interface ConversationSnapshot {
     compact?: { preTokens: number; postTokens: number };
     utteranceCount?: number;
     detailRunId?: string;
-    // 封筒が運ぶ決定行の本数（消した行を含む）。これが無いと復元したカードは決定行の展開部を
-    // 作れず、他の展開を開いて part 0 が届くまで決定行へ到達する導線が無い（R-HND-11）
+    // R-HND-11: 消した行を含む決定行の本数。無いと、復元したカードが決定行の展開部を作れない。
     decisionCount?: number;
   };
   resumeHydration?: ResumeHydrationSnapshotState;
-  // Host が保持する materialized WorkModel。イベント再 fold で作らせない
+  // webview にイベントの再 fold で作らせない。
   workModel?: WorkModelPayload;
   planUsage?: import("./plan-usage").PlanUsage;
-  // semanticView の明示状態。「未着」と「明示off」を同一視しない。
-  // true = on（semanticModel が無ければ未着/導出失敗）、false = 設定で明示off
+  // undefined（未着）と false（設定で明示 off）を同一視しない。true で semanticModel が無ければ未着か導出失敗。
   semanticView?: boolean;
   semanticModel?: SemanticModelPayload;
   llmAnalysisEnabled?: boolean;
   llmAnalysisRunning?: boolean;
-  // Webview を作り直した時点の最後の観測。飛行中でも最初の call 通知前は存在しない。
-  // elapsedMs は snapshot 時点まで Host の壁時計で進めてから渡す。
+  // 実行中でも最初の呼び出し通知の前は無い。elapsedMs は snapshot の時点まで Host の時計で進めて渡す。
   llmAnalysisProgress?: LlmAnalysisRunProgress;
-  // 保存済みのセッション概要の要約（R-DSP-25）。無ければ 1 つ目のプロンプトを表示する
+  // R-DSP-25: 無ければ webview は最初のプロンプトを表示する。
   sessionSummary?: { text: string; model: string };
   sessionSummaryRunning?: boolean;
-  // 診断表示の**実効**状態（semanticView と同じ3値）。診断設定単体ではなく分析設定との積であることに
-  // 注意。true = 両方 on、false = どちらかが off（Webview は診断パネルを DOM ごと撤去する）
+  // 診断設定と分析設定の両方が on のときだけ true。false なら webview は診断パネルを DOM ごと外す。undefined は semanticView と同じく未着。
   llmDiagnostics?: boolean;
-  // 復帰の init は見ているタブの events を末尾側だけ運ぶ。落とした先頭側は Host の履歴窓に
-  // 残っており、受け側は窓落ちとして数えて遡り（historyChunkRequest）で埋める。
-  // 省略していない snapshot には載せない（0 件を運ぶと「省略なし」の表現が 2 通りになる）。
-  // count は windowEvents の droppedCount と同じ正味の件数。backfilledHead=true のときは
-  // events[0] が先頭へ戻した turn_started で、events[0] と events[1] は連続していない
+  // 省略した snapshot にだけ載せる（0 件を載せると省略なしの表現が二通りになる）。受け側は窓落ちとして数えて遡る（verify-webview-wiring#sol-15c）。
+  // count は src/event-window.ts#windowEvents の droppedCount と同じ正味の件数。backfilledHead なら events の先頭は戻した turn_started で、次の要素と連続しない。
   headOmitted?: { count: number; hasConvEvent: boolean; backfilledHead: boolean };
-  // Host が全イベントを畳んだ点灯・帯の背景側の現在値。webview は再生の後にこれで置き換える（R-SES-02）。
-  // 空 = 活動なしの確定値（ストリームが閉じた Host も空を運ぶ）
+  // R-SES-02: Host が全イベントを畳んだ背景側の現在値。webview は再生の後にこれで置き換える。空は活動なしの確定値。
   backgroundActivity?: BackgroundActivitySnapshot;
   events: NormalizedEvent[];
 }
 
 export function isWebviewToHost(v: unknown): v is WebviewToHost {
   if (typeof v !== "object" || v === null) return false;
-  // 網羅性ガードのため既知のリテラル和集合として扱う（実値の検証は各 if 内で行う。
-  // ここでの as は「t の静的型を絞る」ためだけで、実行時の妥当性は保証しない）
+  // as は網羅の検査のために静的型を絞るだけで、実行時の値は各分岐が検査する。
   const t = (v as { type?: unknown }).type as WebviewToHost["type"];
   const tabId = (v as { tabId?: unknown }).tabId;
 
   if (t === "ready") {
-    // cursor は未指定・undefined・null または数値の {generation, seq}（型検証の抜けを塞ぐ）
     const c = (v as { cursor?: unknown }).cursor;
     if (c === null || c === undefined) return true;
     return (
@@ -3350,7 +3298,9 @@ export function isWebviewToHost(v: unknown): v is WebviewToHost {
   }
   if (t === "setModel") {
     const model = (v as { model?: unknown }).model;
+    const sessionOnly = (v as { sessionOnly?: unknown }).sessionOnly;
     return (
+      (sessionOnly === undefined || typeof sessionOnly === "boolean") &&
       typeof tabId === "string" &&
       (model === null || (typeof model === "string" && model.length <= 100))
     );
@@ -3359,12 +3309,6 @@ export function isWebviewToHost(v: unknown): v is WebviewToHost {
     const q = v as { source?: unknown; cursor?: unknown };
     return (q.source === undefined || q.source === "laisora" || q.source === "claude") &&
       (q.cursor === undefined || (typeof q.cursor === "string" && /^\d+:\d+$/.test(q.cursor)));
-  }
-  if (t === "analyzeSession") {
-    return (
-      typeof (v as { sessionId?: unknown }).sessionId === "string" &&
-      typeof (v as { filePath?: unknown }).filePath === "string"
-    );
   }
   if (t === "openFile") {
     const message = v as Record<string, unknown>;
@@ -3608,12 +3552,8 @@ export function isWebviewToHost(v: unknown): v is WebviewToHost {
     );
   }
   if (t === "pickFiles") {
-    // 上限（slots <= IMAGE_MAX_COUNT）は R-CNV-05 を守る: 超過を通すと Host が
-    // IMAGE_MAX_COUNT を超える images を返しうる。その応答は isHostToWebview の
-    // pickedFiles ガードで落ち、main.ts が丸ごと捨てるので、選んだパスが 1 件も
-    // 入力欄へ入らない（R-CNV-05）。
-    // 型・非負の検査はこの経路とは無関係で（負の slots は全件がパスへ回るだけ）、
-    // 守る要件は特定できていない
+    // R-CNV-05: IMAGE_MAX_COUNT の上限を外すと Host が超過した images を返し、isHostToWebview が pickedFiles ごと落として、
+    // 選んだパスが入力欄へ入らない。整数・非負の検査が守る要件は特定できていない。
     const slots = (v as { imageSlots?: unknown }).imageSlots;
     return (
       typeof (v as { reqId?: unknown }).reqId === "number" &&
@@ -3651,9 +3591,8 @@ export function isWebviewToHost(v: unknown): v is WebviewToHost {
   }
   if (t === "send") {
     const message = v as Record<string, unknown>;
-    // images を許可キーに戻さないこと。戻すと「押した瞬間の activeTabId」宛てに webview の
-    // 手持ちが載る経路が復活し、添付が別の会話へ入る（R-CNV-11）。添付は Host が tabId の
-    // スロットから取り出す
+    // R-CNV-11: images を許可キーに戻さない（verify-attachment#AT-08）。戻すと押した瞬間の activeTabId 宛てに webview の手持ちが載り、
+    // 添付が別の会話へ入る。
     const allowed = new Set(["type", "tabId", "text", "clientToken"]);
     return (
       Object.keys(message).every((key) => allowed.has(key)) &&
@@ -3698,8 +3637,7 @@ export function isWebviewToHost(v: unknown): v is WebviewToHost {
     }
     if (m.answers === undefined) return true;
     if (typeof m.answers !== "object" || m.answers === null) return false;
-    // L-3: 質問数上限(4)を大きく超える混入やDoS的なキー水増しを防ぐ（キー数≤8）。
-    // キー長は質問文の妥当な範囲（≤2000）、空文字キーは拒否
+    // キー数の上限は SDK の AskUserQuestionInput が許す質問数より大きく取り、キーの水増しを拒む。
     const entries = Object.entries(m.answers as Record<string, unknown>);
     if (entries.length > 8) return false;
     return entries.every(
@@ -3741,26 +3679,11 @@ export function isWebviewToHost(v: unknown): v is WebviewToHost {
       typeof message.artifactId === "string" && message.artifactId.length > 0 && message.artifactId.length <= 200
     );
   }
-  // 網羅性ガード: WebviewToHost に新バリアントを追加してここに分岐を足し忘れると、
-  // t がここで never に絞り込まれず tsc が落ちる（実行時の分岐漏れではなく型検査で捕まえる。
-  // isHostToWebview と対称にする＝B4-4）
+  // バリアントを足して分岐を忘れると tsc がここで落ちる。
   t satisfies never;
   return false;
 }
 
-// 拡張(host) → Webview のランタイム型ガード（R2-4 B-4a）。
-// isWebviewToHost（webview→拡張）とは非対称に検証範囲を絞る:
-// - トップレベルの type 判別と必須フィールドの型は isWebviewToHost と同じ厳密さで検証する
-//   （壊れたメッセージを受信側の as キャストへ素通りさせないため。isWebviewToHost はここが本体）。
-//   ただし値域・長さ制限（length 上限や effort の集合メンバシップ）は host 方向では課さない。
-// - NormalizedEvent の kind ごとの追加必須フィールド（turnId 等）・AuthStatus の内部・
-//   AnalysisReport（report は protocol.ts 上も unknown 型）は検証しない。ここまで踏み込むと
-//   型定義の二重管理になり、protocol.ts を変更するたびにバリデータ側も直す羽目になる
-//   （isWebviewToHost が images/answers を検証する深さ＝配列要素の必須フィールドの型止まり、に揃えた）。
-// - host は同一拡張内の信頼できる送信元なので、ここでの目的は悪意ある入力の遮断ではなく
-//   protocol変更時の型崩れを早期に検出すること。検出できる時点は変更の種類で異なる:
-//   バリアント追加漏れはコンパイル時（末尾の never チェック）、フィールド名変更は
-//   ランタイム受信時のみ（インラインの typeof 検査は改名に静的追従しない）。
 function isArrayOf(value: unknown, check: (item: unknown) => boolean): boolean {
   return Array.isArray(value) && (value as unknown[]).every(check);
 }
@@ -3878,8 +3801,7 @@ export function isImageRefInfoArray(v: unknown): v is ImageRefInfo[] {
   return Array.isArray(v) && v.every(isImageRefInfo);
 }
 
-// 上限は搬送量の歯止め。text は表示本文なので長くなりうるが、無制限だと1 chunk で
-// postMessage を詰まらせる。Host 側も同じ上限で切ってから送る
+// Host が切って送る src/history-serving.ts#CONVERSATION_TEXT_MAX 以上に保つ。下回ると正当な応答を捨て、外すと 1 chunk で postMessage を詰まらせる。
 const CONVERSATION_TEXT_MAX = 20000;
 const CONVERSATION_ITEMS_MAX = 500;
 
@@ -3940,13 +3862,12 @@ function isWorkTaskTotalsView(item: unknown): boolean {
   );
 }
 
-// 詳細ログはこの値だけを見て描くので、形が違うイベントは events ごと落とす。
-// 緩めると「配置不明のまま描画へ進む」経路ができ、DOM 側の推測が復活する
+// 詳細ログはこの値だけで描くので、形が違う event は events ごと落とす。緩めると配置不明のまま描画へ進み、DOM 側の推測が復活する。
 export function isWorkEventInfo(v: unknown): v is WorkEventInfo {
   if (typeof v !== "object" || v === null) return false;
   const info = v as Record<string, unknown>;
   if (!isNumber(info.revision)) return false;
-  // segment が閉じたことは null で伝える。isOptionalString は null を弾くので個別に見る
+  // null は segment が閉じた印。isOptionalString は null を弾くので使わない。
   if (info.currentSegmentId !== undefined && info.currentSegmentId !== null) {
     if (typeof info.currentSegmentId !== "string") return false;
   }
@@ -3979,6 +3900,7 @@ export function isWorkEventInfo(v: unknown): v is WorkEventInfo {
       const agent = item as Record<string, unknown>;
       return (
         typeof agent.toolUseId === "string" &&
+        (agent.runStartedAt === undefined || isNumber(agent.runStartedAt)) &&
         (WORK_STATUSES as string[]).includes(agent.status as string) &&
         isNumber(agent.childCount) &&
         isNumber(agent.failCount) &&
@@ -4011,6 +3933,19 @@ function isPlausibleNormalizedEvent(x: unknown): x is NormalizedEvent {
     (e.work !== undefined && !isWorkEventInfo(e.work))
   ) {
     return false;
+  }
+  if (e.kind === "model_refusal_fallback") {
+    if (typeof e.originalModel !== "string" || typeof e.fallbackModel !== "string" ||
+      (e.scope !== "session" && e.scope !== "local") ||
+      (e.turnId !== null && typeof e.turnId !== "string") ||
+      (e.category !== null && typeof e.category !== "string") ||
+      (e.explanation !== null && typeof e.explanation !== "string") ||
+      (e.refusedUserMessageUuid !== null && typeof e.refusedUserMessageUuid !== "string") || typeof e.message !== "string" ||
+      (e.autoRevert !== undefined && !(FALLBACK_AUTO_REVERT_STARTS as readonly unknown[]).includes(e.autoRevert))) return false;
+  }
+  if (e.kind === "model_fallback_revert") {
+    if ((e.turnId !== null && typeof e.turnId !== "string") || typeof e.originalModel !== "string" ||
+      !(FALLBACK_REVERT_OUTCOMES as readonly unknown[]).includes(e.outcome)) return false;
   }
   if (e.kind === "user_message") {
     if (e.imageRefs !== undefined && !isImageRefInfoArray(e.imageRefs)) {
@@ -4150,9 +4085,7 @@ function isResumeHydrationStateMessage(value: Record<string, unknown>): boolean 
   return true;
 }
 
-// TabSnapshot は init.tabs / tabCreated.tab / tabCleared.tab / tabRestored.tab の4箇所で使うため共有する
-// count は 1 以上の整数だけを受理する。0 や負値を通すと「省略していない」が
-// undefined と count:0 の 2 通りで表現され、受け側の分岐が二重になる
+// count に 0 を通すと、省略なしの表現が undefined と二通りになり受け側の分岐が二重になる。
 function isHeadOmitted(v: unknown): boolean {
   if (typeof v !== "object" || v === null) return false;
   const h = v as { count?: unknown; hasConvEvent?: unknown; backfilledHead?: unknown };
@@ -4165,8 +4098,7 @@ function isHeadOmitted(v: unknown): boolean {
   );
 }
 
-// R-SES-02。id の空文字は拒まない: claude-normalizer は task_id の無い集合要素を id "" で出し、
-// 拒むと init ごと捨てられて全タブが空になる
+// R-SES-02: 空の id を拒まない。src/claude-normalizer.ts は task_id の無い要素を空の id で出すので、拒むと init ごと捨てられて全タブが空になる。
 function isBackgroundActivitySnapshot(v: unknown): boolean {
   if (typeof v !== "object" || v === null || Array.isArray(v)) return false;
   const a = v as Record<string, unknown>;
@@ -4202,8 +4134,7 @@ function isTabSnapshotShape(x: unknown): x is TabSnapshot {
   if (typeof x !== "object" || x === null) return false;
   const t = x as { tabId?: unknown; title?: unknown; state?: unknown; deferred?: unknown };
   if (typeof t.tabId !== "string" || typeof t.title !== "string") return false;
-  // 省略可能だが値は true 以外を認めない。false を運べると「deferred でない」の
-  // 表現が 2 通りになり、受け側の分岐が二重になる
+  // false を通すと、deferred でない表現が二通りになり受け側の分岐が二重になる。
   if (t.deferred !== undefined && t.deferred !== true) return false;
   if (typeof t.state !== "object" || t.state === null) return false;
   const s = t.state as Record<string, unknown>;
@@ -4213,7 +4144,6 @@ function isTabSnapshotShape(x: unknown): x is TabSnapshot {
     (s.turnState === "idle" || s.turnState === "running" || s.turnState === "interrupting") &&
     (s.auth === null || typeof s.auth === "object") &&
     (PERMISSION_MODES as string[]).includes(s.permissionMode as string) &&
-    // 省略可能にするのは commands?/models? と同じ扱い。存在するなら中身は緩めない
     (s.workModel === undefined || isWorkModelPayload(s.workModel)) &&
     (s.planUsage === undefined || isPlanUsage(s.planUsage)) &&
     (s.semanticView === undefined || typeof s.semanticView === "boolean") &&
@@ -4221,6 +4151,14 @@ function isTabSnapshotShape(x: unknown): x is TabSnapshot {
     (s.effortOverride === undefined || s.effortOverride === null || typeof s.effortOverride === "string") &&
     (s.defaultEffort === undefined || typeof s.defaultEffort === "string") &&
     (s.appliedModel === undefined || typeof s.appliedModel === "string") &&
+    (s.modelFallback === undefined || (isProfileObject(s.modelFallback) &&
+      isPlausibleNormalizedEvent(s.modelFallback.notice) && s.modelFallback.notice.kind === "model_refusal_fallback" &&
+      s.modelFallback.notice.scope === "session" && typeof s.modelFallback.appliedModel === "string" &&
+      (s.modelFallback.resolvedAt === undefined || isNumber(s.modelFallback.resolvedAt)) &&
+      (s.modelFallback.reopenedAt === undefined || isNumber(s.modelFallback.reopenedAt)) &&
+      (s.modelFallback.turnOriginalModel === undefined || typeof s.modelFallback.turnOriginalModel === "string") &&
+      (s.modelFallback.autoRevert === undefined ||
+        ([...FALLBACK_AUTO_REVERT_STARTS, ...FALLBACK_REVERT_OUTCOMES] as readonly unknown[]).includes(s.modelFallback.autoRevert)))) &&
     (s.appliedEffort === undefined || s.appliedEffort === null ||
       (typeof s.appliedEffort === "string" && ["low", "medium", "high", "xhigh", "max"].includes(s.appliedEffort))) &&
     (s.recordedModel === undefined || typeof s.recordedModel === "string") &&
@@ -4348,10 +4286,10 @@ function isSessionScanDegradation(v: unknown): boolean {
   );
 }
 
+// 送信元は同じ拡張なので、目的は悪意の遮断ではなく protocol 変更時の型崩れの検出。フィールドの改名は受信時にしか検出できない。
 export function isHostToWebview(v: unknown): v is HostToWebview {
   if (typeof v !== "object" || v === null) return false;
-  // 網羅性ガードのため既知のリテラル和集合として扱う（実値の検証は各 if 内で行う。
-  // ここでの as は「t の静的型を絞る」ためだけで、実行時の妥当性は保証しない）
+  // as は網羅の検査のために静的型を絞るだけで、実行時の値は各分岐が検査する。
   const t = (v as { type?: unknown }).type as HostToWebview["type"];
   const tabId = (v as { tabId?: unknown }).tabId;
 
@@ -4392,8 +4330,7 @@ export function isHostToWebview(v: unknown): v is HostToWebview {
     return isResumeHydrationStateMessage(v as Record<string, unknown>);
   }
   if (t === "tabCreated") {
-    // R-HND-08: activate の欠落・非 boolean を通すと、引き継ぎ先タブが裏で開く経路が
-    // 「常に前面へ出す」へ退化して完了時にフォーカスを奪う
+    // R-HND-08: activate の欠落を通すと、裏で開く経路が前面へ出す扱いに退化してフォーカスを奪う。
     return (
       isTabSnapshotShape((v as { tab?: unknown }).tab) &&
       typeof (v as { activate?: unknown }).activate === "boolean"
@@ -4513,6 +4450,8 @@ export function isHostToWebview(v: unknown): v is HostToWebview {
     );
   }
   if (t === "modelChanged") {
+    const applied = (v as { applied?: unknown }).applied;
+    if (applied !== undefined && typeof applied !== "boolean") return false;
     const model = (v as { model?: unknown }).model;
     const notice = (v as { notice?: unknown }).notice;
     return typeof tabId === "string" && (model === null || typeof model === "string") &&
@@ -4550,9 +4489,7 @@ export function isHostToWebview(v: unknown): v is HostToWebview {
   if (t === "pickedFiles") {
     const paths = (v as { paths?: unknown }).paths;
     const images = (v as { images?: unknown }).images;
-    // 入力欄と添付欄へ差し込む前に形を確かめる（R-CNV-05）。
-    // ただし paths.length の上限は Host 側の切り捨て（PICKED_FILE_MAX_COUNT）との整合検査で、
-    // R-CNV-05 を守るものではない（むしろ制限する側。守る要件は未確定）
+    // R-CNV-05: 入力欄と添付欄へ差し込む前に形を確かめる。PICKED_FILE_MAX_COUNT の上限は Host 側の切り捨てとの整合で、守る要件は特定できていない。
     return (
       typeof (v as { reqId?: unknown }).reqId === "number" &&
       Array.isArray(paths) &&
@@ -4623,8 +4560,7 @@ export function isHostToWebview(v: unknown): v is HostToWebview {
     return typeof tabId === "string" && typeof (v as { text?: unknown }).text === "string" && (v as { text: string }).text.length <= 20_000;
   }
   if (t === "analysis") {
-    // report: unknown は中身を見ない契約（analysis.ts の AnalysisReport 変更のたびに
-    // ここを直す二重管理を避けるため）。存在有無すら問わない — unknown は undefined も含む
+    // report は中身も有無も見ない（src/analysis.ts#AnalysisReport と二重に持たない）。
     return (
       typeof (v as { sessionId?: unknown }).sessionId === "string" &&
       typeof (v as { filePath?: unknown }).filePath === "string"
@@ -4632,11 +4568,10 @@ export function isHostToWebview(v: unknown): v is HostToWebview {
   }
   if (t === "analysisFailed") {
     const m = v as Record<string, unknown>;
-    const allowed = new Set(["type", "kind", "tabId", "sessionId", "reason"]);
+    const allowed = new Set(["type", "kind", "tabId", "reason"]);
     if (!Object.keys(m).every((key) => allowed.has(key))) return false;
     if (m.kind !== "script" && m.kind !== "action") return false;
     if (tabId !== undefined && (typeof tabId !== "string" || tabId.length === 0 || tabId.length > 200)) return false;
-    if (m.sessionId !== undefined && typeof m.sessionId !== "string") return false;
     if (m.reason !== undefined && (typeof m.reason !== "string" || m.reason.length === 0)) return false;
     // 所見からの操作の拒否は必ず要求元タブと理由を持つ（無いと別タブへ出るか、無言で消える。R-ANL-11）
     return m.kind === "script" || (typeof tabId === "string" && typeof m.reason === "string");
@@ -4695,7 +4630,7 @@ export function isHostToWebview(v: unknown): v is HostToWebview {
           typeof failure.attemptedCalls === "number" &&
           typeof failure.completedCalls === "number" &&
           typeof failure.plannedCalls === "number")) &&
-      // 未実行の理由は実行中・失敗と同居しない（3 状態の区別を wire で崩さない。R-ANL-11）
+      // R-ANL-11: 未実行の理由を実行中・失敗と同居させない。
       (refusal === undefined ||
         (typeof refusal === "string" && refusal.length > 0 && m.running === false && failure === undefined))
     );
@@ -4834,8 +4769,7 @@ export function isHostToWebview(v: unknown): v is HostToWebview {
     );
   }
 
-  // 網羅性ガード: HostToWebview に新バリアントを追加してここに分岐を足し忘れると、
-  // t がここで never に絞り込まれず tsc が落ちる（実行時の分岐漏れではなく型検査で捕まえる）
+  // バリアントを足して分岐を忘れると tsc がここで落ちる。
   t satisfies never;
   return false;
 }

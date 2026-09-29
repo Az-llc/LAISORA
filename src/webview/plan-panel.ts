@@ -1,4 +1,5 @@
 import * as l10n from "@vscode/l10n";
+import { truncateToolIntent } from "./status-line";
 import type { OrchestrationView, WorkModelPayload } from "../protocol";
 import type { PlanUsage } from "../plan-usage";
 import { derivePlanView, type PlanLane, type PlanView } from "./plan-view";
@@ -78,7 +79,7 @@ export class PlanPanel {
     this.bar.setAttribute("aria-controls", this.aside.id);
     this.bar.setAttribute("aria-expanded", "false");
     this.bar.setAttribute("aria-haspopup", "dialog");
-    this.bar.append(node("span", "plan-label", "PLAN"), this.barCount, this.barNumber, this.barTitle, this.barLoader, this.barStats, this.barRunning, this.waiting, node("span", "plan-bar-chevron", "▸"));
+    this.bar.append(node("span", "plan-label", "PLAN"), this.barCount, this.barNumber, this.barTitle, this.barStats, this.barRunning, this.waiting, this.barLoader, node("span", "plan-bar-chevron", "▸"));
     this.bar.onclick = () => {
       this.returnFocus = document.activeElement instanceof HTMLElement ? document.activeElement : this.bar;
       this.dialog.append(this.aside);
@@ -136,7 +137,9 @@ function renderLane(lane: PlanLane): HTMLElement {
   const metric = node("span", "plan-metric", `${status(lane.status)} ${planDuration(lane.elapsed)} · ${planTokens(lane.tokens)}`);
   metric.title = l10n.t("Cache read: {0} tokens", planTokens(lane.cacheRead));
   row.classList.toggle("plan-failed", lane.status === "failed");
-  row.append(name, node("span", "plan-lane-title", lane.title), metric);
+  const title = node("span", "plan-lane-title", truncateToolIntent(lane.title));
+  title.title = lane.title;
+  row.append(name, title, metric);
   return row;
 }
 

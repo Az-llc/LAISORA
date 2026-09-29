@@ -4,6 +4,7 @@
 import type { NormalizedEvent, TimeBucketsCoverage } from "./protocol";
 import { readSessionHistory, readSubagentAgents, type HistoryEvent } from "./session-transcript";
 import {
+  attachTimeBucketRequestNumbers,
   createTimeBucketState,
   deriveTimeBuckets,
   foldTimeBuckets,
@@ -13,12 +14,14 @@ import {
   type TimeBucketView,
 } from "./time-buckets";
 
+import { createWorkModelState, reduceWorkModel } from "./work-model";
+
 export interface TranscriptIds {
   conversationId: string;
   generation: number;
 }
 
-// サブエージェント棒の端点は子 transcript の最初 / 最後のレコード時刻。起動 ACK や子ツール終端から作らない（R-DSP-17）
+// R-DSP-49: childSpansOf; src/time-buckets.ts#deriveTimeBuckets
 export function childSpansOf(
   agents: ReadonlyArray<{ toolUseId: string; startedAt?: number; endedAt?: number }>
 ): ChildTranscriptSpan[] {
@@ -35,6 +38,7 @@ export function timeBucketsFromHistory(
   ids: TranscriptIds
 ): TimeBucketView {
   let state = createTimeBucketState();
+  let requests = createWorkModelState();
   let modelMarks: ModelMark[] = [];
   let currentModel: string | undefined;
   let markedInTurn = false;
@@ -71,6 +75,10 @@ export function timeBucketsFromHistory(
       generation: ids.generation,
     } as NormalizedEvent;
     state = foldTimeBuckets(state, ev);
+    if (ev.kind === "turn_started" || ev.kind === "user_message") {
+      requests = reduceWorkModel(requests, ev);
+      state = attachTimeBucketRequestNumbers(state, requests.requests ?? []);
+    }
   }
   return deriveTimeBuckets(state, { childSpans, modelMarks });
 }

@@ -381,12 +381,18 @@ researchText.id = "setting-research-text";
 const researchMissing = element("button", "settings-segment", l10n.t("Research"));
 researchMissing.id = "setting-research-missing";
 researchMissing.type = "button";
-researchMissing.addEventListener("click", () => requestResearch(current?.missingProfiles ?? []));
+researchMissing.addEventListener("click", () => requestResearch(current?.researchTargets ?? []));
+const effortProposal = element("button", "settings-segment", l10n.t("Suggest efforts"));
+effortProposal.id = "setting-suggest-efforts";
+effortProposal.type = "button";
+effortProposal.addEventListener("click", () => requestResearch(current?.researchTargets ?? [], "effort"));
 const researchActions = element("div", "settings-detection-header");
-researchActions.append(researchText, researchMissing);
+researchActions.append(researchText, researchMissing, effortProposal);
 const researchReason = element("p", "settings-muted");
 researchReason.id = "setting-research-reason";
-const researchUsage = element("p", "settings-muted", l10n.t("Research uses the model usage of the current conversation."));
+const effortReason = element("p", "settings-muted");
+effortReason.id = "setting-effort-reason";
+const researchUsage = element("p", "settings-muted", l10n.t("Research opens a new conversation tab and uses model usage there."));
 researchUsage.id = "setting-research-usage";
 const researchSources = element("div", "settings-research-sources");
 researchSources.setAttribute("role", "group");
@@ -405,7 +411,7 @@ const sourceChips = PROFILE_SOURCES.map(source => {
   chip.addEventListener("click", () => {
     if (!current || pendingSources !== null) return;
     const sources = normalizeProfileSources(current.profileSources);
-    if (sources.length === 1 && sources.includes(source)) return; // R-LRN-13: retain one source without an alert.
+    if (sources.length === 1 && sources.includes(source)) return; // R-LRN-18: 最後の 1 つは警告を出さずに残す（verify-settings-page#SP-LRN-sources）。
     const next = sources.includes(source) ? sources.filter(item => item !== source) : [...sources, source];
     pendingSources = nextRequestId();
     vscode.postMessage({ type: "setProfileSources", requestId: pendingSources, sources: next });
@@ -437,8 +443,8 @@ externalRecheck.type = "button";
 externalRecheck.disabled = true;
 externalRecheck.addEventListener("click", () => vscode.postMessage({ type: "recheckExternalExecutors" }));
 detectionHeader.append(externalHeading, externalRecheck);
-function requestResearch(targets: string[]): void {
-  if (targets.length) vscode.postMessage({ type: "researchModelProfiles", targets });
+function requestResearch(targets: string[], purpose?: "effort"): void {
+  if (targets.length) vscode.postMessage({ type: "researchModelProfiles", targets, ...(purpose ? { purpose } : {}) });
 }
 function renderProfileResearch(state: SettingsState): void {
   if (pendingSources === state.replyTo) pendingSources = null;
@@ -458,14 +464,20 @@ function renderProfileResearch(state: SettingsState): void {
   });
   researchBlock.setAttribute("aria-labelledby", state.researchText ? researchText.id : researchSourcesLabel.id);
   researchText.textContent = state.researchText ?? "";
-  researchMissing.disabled = !!state.researchUnavailable || !(state.missingProfiles?.length) || Object.values(state.externalModels).some(list => list.state === "checking");
+  researchMissing.disabled = !!state.researchUnavailable || !(state.researchTargets?.length);
   if (state.researchUnavailable) researchMissing.title = state.researchUnavailable;
   else researchMissing.removeAttribute("title");
   researchMissing.setAttribute("aria-describedby", [researchText.id,
     state.researchUnavailable ? researchReason.id : !researchMissing.disabled ? researchUsage.id : ""].filter(Boolean).join(" "));
+  const effortUnavailable = state.researchUnavailable || state.effortUnavailable;
+  effortProposal.disabled = researchMissing.disabled || !!effortUnavailable;
+  if (effortUnavailable) effortProposal.title = effortUnavailable;
+  else effortProposal.removeAttribute("title");
+  effortProposal.setAttribute("aria-describedby", [researchMissing.getAttribute("aria-describedby"), state.effortUnavailable ? effortReason.id : ""].filter(Boolean).join(" "));
+  effortReason.textContent = state.effortUnavailable ?? "";
   researchReason.textContent = state.researchUnavailable ?? "";
   researchBlock.replaceChildren(...(state.researchText
-    ? [researchActions, ...(state.researchUnavailable ? [researchReason] : !researchMissing.disabled ? [researchUsage] : [])] : []),
+    ? [researchActions, ...(state.effortUnavailable ? [effortReason] : []), ...(state.researchUnavailable ? [researchReason] : !researchMissing.disabled ? [researchUsage] : [])] : []),
     researchSources, ...(sources.length === 1 ? [researchSourcesNote] : []));
   policyCard.appendChild(researchBlock);
 }
@@ -663,7 +675,7 @@ function renderOrchestration(state: SettingsState): void {
         if (detected?.state === "notInstalled" && list?.state !== "ok") continue; // R-ORC-20
         const group = element("optgroup", "");
         group.label = candidate.displayName;
-        group.disabled = detected?.state === "notInstalled"; // R-ORC-39: keep remembered choices visible even when the CLI is missing.
+        group.disabled = detected?.state === "notInstalled"; // R-ORC-39: CLI が無くても覚えている選択を見せる（verify-settings-page#SP-ORC-39missing）。
         const selection = modelSelectionState(candidate.id, list, state.externalDetection[candidate.id]);
         const choices = selection.choices;
         const option = (model: string, label: string) => {
@@ -672,7 +684,7 @@ function renderOrchestration(state: SettingsState): void {
           item.disabled = entry.rows.some((value, i) => i !== rowIndex && value.executor === candidate.id && value.model === model); // R-ORC-20
           group.appendChild(item);
         };
-        if (selection.checking) { // R-ORC-39: a remembered list remains selectable during refresh.
+        if (selection.checking) { // R-ORC-39: 覚えている一覧は更新中も選べる。src/orchestration-executors.ts#modelSelectionState の checking は一覧が無いときだけ立つ（verify-settings-page#SP-ORC-39states）。
           group.disabled = true;
           option("", l10n.t("checking…"));
           group.firstElementChild?.setAttribute("disabled", "");
@@ -824,9 +836,8 @@ generalCategory.appendChild(footer);
 let current: SettingsState | null = null;
 let requestSerial = 0;
 const nextRequestId = (): number => ++requestSerial;
-// 自分の要求への返送（replyTo が一致。失敗時の返送を含む）が届くまで、同じ操作の再押下を捨てる。current は返送でしか
-// 変わらないため、捨てないと 2 回目も 1 回目と同じ値を送り、戻したい意図が失われる。構成変更の通知や別の要求への返送では
-// 解かない（それらは自分の書込みの完了を意味しない）（R-DSP-01）
+// replyTo が自分の requestId と一致する返送（失敗を含む）まで、同じ操作の再押下を捨てる。current は返送でしか変わらないので、
+// 捨てないと 2 回目も 1 回目と同じ値を送る。構成変更の通知や別の要求への返送では解かない（R-DSP-01）。
 const pending: { autoContinue: number | null; restore: number | null; apiKey: number | null; learning: number | null } = { autoContinue: null, restore: null, apiKey: null, learning: null };
 const pendingFileLink: Record<FileLinkBooleanSetting, number | null> = {
   fileLinkInstruction: null,
@@ -942,7 +953,7 @@ moreLink.addEventListener("click", () => vscode.postMessage({ type: "openVsCodeS
 window.addEventListener("message", (event: MessageEvent<unknown>) => {
   if (!isHostToSettingsPage(event.data)) return;
   if (event.data.type === "conductorPreview") {
-    if (event.data.requestId !== previewRequest) return; // R-ORC-37: an older preview must not replace the current draft.
+    if (event.data.requestId !== previewRequest) return; // R-ORC-37: 古いプレビューで今の下書きを置き換えない（verify-settings-page#SP-LRN-preview）。
     instructionPreview.textContent = event.data.text;
     instructionTokens.textContent = l10n.t("≈ {0} tokens", event.data.tokens);
   } else render(event.data);

@@ -8,8 +8,6 @@ import type { SessionStore } from "./extension";
 // （output.appendLine( など）が一斉に外れる。書き込みは import binding へ代入できないので setter を通す。
 export let output: vscode.OutputChannel;
 export let extensionContext: vscode.ExtensionContext | null = null;
-// 起動直後の遅さを調べるための共通原点。どの処理がどの処理と重なっていたかは、
-// 個々の所要時間ではなく activate からの経過でしか読めない
 export let activationT0 = Date.now();
 export function sinceActivation(): string {
   return `t+${Date.now() - activationT0}ms`;
@@ -17,7 +15,7 @@ export function sinceActivation(): string {
 export let artifactServer: ArtifactServer | null = null;
 export let store: SessionStore | null = null;
 
-// onDidDispose を登録済みの WebviewView（再 resolve での二重登録防止）
+// disposeHooked は再表示をまたいで保持し、src/extension.ts#activate で破棄通知の重複登録を防ぐ。
 export const disposeHooked = new WeakSet<vscode.WebviewView>();
 
 export function setActivationT0(at: number): void {

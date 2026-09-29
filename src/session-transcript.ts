@@ -1,3 +1,4 @@
+import { captureToolIntentInput } from "./webview/status-line";
 import { subagentResultForDisplay } from "./subagent-result";
 import type { HostArtifactAccess } from "./artifact-access";
 import type { AssistantUsage, EventProvenance, ImageRefInfo, NormalizedEventBody, RestoredAgent, ResumePreviewMessage } from "./protocol";
@@ -10,6 +11,7 @@ import {
   isApiErrorFrame,
   isRefusalErrorProse,
   parseRefusalNotice,
+  refusalFallbackEvent,
   parseRefusalStop,
 } from "./claude-normalizer";
 import { parseHandoffEnvelope, type HandoffEnvelopeV2 } from "./handoff-envelope";
@@ -867,6 +869,7 @@ export async function readSessionHistory(
                 toolName: toolUse.name,
                 inputPreview,
                 inputSummary,
+                intentInput: captureToolIntentInput(toolUse.name, toolUse.input),
                 isBackground: stage0.delegation?.isBackground,
                 subagentType: stage0.delegation?.subagentType,
                 subagentModel: stage0.delegation?.subagentModel,
@@ -907,7 +910,13 @@ export async function readSessionHistory(
       } else if (obj.type === "system") {
         const notice = parseRefusalNotice(obj);
         if (notice) {
-          rawEvents.push({
+          const fallback = refusalFallbackEvent(notice, currentTurnId);
+          if (fallback?.scope === "session") lastRootModel = fallback.fallbackModel;
+          if (fallback) rawEvents.push({
+            body: { ...fallback, provenance: { path: "history" } },
+            timestamp: recordTime, sourcePriority: 0, fileOrder: parentOrderCounter++,
+          });
+          if (!fallback) rawEvents.push({
             body: {
               kind: "error",
               message: formatRefusalMessage(notice),
@@ -1174,6 +1183,7 @@ export async function readSessionHistory(
                     toolName: toolUse.name,
                     inputPreview,
                     inputSummary,
+                    intentInput: captureToolIntentInput(toolUse.name, toolUse.input),
                     isBackground: stage0.delegation?.isBackground,
                     subagentType: stage0.delegation?.subagentType,
                     subagentModel: stage0.delegation?.subagentModel,

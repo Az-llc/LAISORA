@@ -30,19 +30,12 @@ import { displayTitleFromSummary } from "./session-list";
 import { sessionSummaryOf } from "./session-list-wiring";
 import type { SessionStore } from "./store-surfaces";
 
-// 状態カードの本文。done の時点で 1 回だけ取った内容を保持し、part 要求はここから切る
-// （要求のたびに F を読むと、以後の発言や再 compact で要約と part 境界が変わる）
+// 取得後の追記で分割境界を変えないよう、sendHandoffDetailPart は handoffDetailSources の内容を使う。
 export const handoffDetailSources = new Map<string, { runId: string; detail: HandoffDetail }>();
 
-// 引き継ぎ実行中の Runner。開始元タブごとに 1 本だけ持つ（2 本目を許すと同じ S から
-// fork が 2 つでき、片方が孤児のまま残る）
 const handoffRuns = new Map<string, { runId: string; runner: HandoffRunner | null }>();
 
-// 「CLI から何も来ない時間」の上限。全体の所要時間ではない（handoff-runner の armTimeout が
-// stream のメッセージごとに引き直す）。**絶対時間の締め切りとして使い直さないこと**:
-// compact の所要時間は文脈量にほぼ比例するので、絶対時間の締め切りは大きい文脈で compact 完了前に発火し、
-// 完成した fork を捨てる。値を伸ばす対処は文脈量が増えるたびに同じ失敗を繰り返す。
-// 値の根拠は COMPACT_HEARTBEAT_GRACE_MS の定義に置いてある（別名を作らず直接使う）
+// src/handoff-runner.ts#COMPACT_HEARTBEAT_GRACE_MS を全体の締め切りへ流用しない。
 
 export function handoffPersist(): { get(k: string): unknown; update(k: string, v: unknown): Promise<void> } {
   return {
@@ -66,8 +59,6 @@ async function writeHandoffDiagnostic(name: string, text: string): Promise<strin
   return p;
 }
 
-// HandoffRunner が受け取る記録列。並べ替えず、UUID 重複だけ落とす（時刻の fallback は
-// extractVerbatimUserUtterances 側が持つ）
 export async function readHandoffRecords(filePath: string): Promise<HandoffRecordsRead> {
   return parseHandoffRecords(await readFile(filePath, "utf8"));
 }
@@ -92,7 +83,7 @@ async function runHandoff(st: SessionStore, sender: vscode.Webview, target: Sess
   };
   const busy = (): boolean => (target.conversation?.state ?? "idle") !== "idle";
 
-  // R-HND-07: 元タブが実行中なら開始しない。webview 側のボタン状態には依存しない
+  // R-HND-07: 画面側の操作可否だけに頼らず、runHandoff でも開始可否を確認する。
   if (busy()) {
     fail("source_busy");
     return;
@@ -101,8 +92,7 @@ async function runHandoff(st: SessionStore, sender: vscode.Webview, target: Sess
     fail("already_running");
     return;
   }
-  // 予約は has 判定と同じ tick で置く。await を挟むと同時押下が両方ガードを通り、
-  // 同じ S から fork が 2 つできる
+  // 並行要求が予約前に通過しないよう、handoffRuns への予約まで非同期処理を挟まない。
   const reservation: { runId: string; runner: HandoffRunner | null } = { runId, runner: null };
   handoffRuns.set(target.tabId, reservation);
   try {
@@ -165,7 +155,7 @@ async function runHandoff(st: SessionStore, sender: vscode.Webview, target: Sess
       },
     });
     reservation.runner = runner;
-    // タブ名は resume の hydration 完了まで既定値「会話 N」のままなので、履歴一覧と同じ解決器で JSONL から引く
+    // 復元中はタブ名が未解決の場合があるため、src/session-list-wiring.ts#sessionSummaryOf で名前を取得する。
     let sourceTitle = target.title;
     try {
       const summary = await sessionSummaryOf(source.sessionId);
@@ -183,7 +173,7 @@ async function runHandoff(st: SessionStore, sender: vscode.Webview, target: Sess
       fail(outcome.reason, outcome.detail);
       return;
     }
-    // R-HND-08: 完了時にフォーカスを奪わない。判定は開始時ではなく完了時のアクティブタブで行う
+    // R-HND-08: 開始時の選択をキャッシュせず、src/handoff-runner.ts#shouldActivateForkTab に完了時の選択を渡す。
     const opened = await openResumedSession(st, {
       sessionId: outcome.forkSessionId,
       filePath: outcome.forkFilePath,
@@ -192,7 +182,7 @@ async function runHandoff(st: SessionStore, sender: vscode.Webview, target: Sess
       knownCwd: cwd,
     });
     if (!opened.tabPosted || opened.session === undefined) {
-      // F は完成品なので消さない。履歴から開ける
+      // 表示の失敗で完成した複製を消さない。再取得先は outcome.forkSessionId。
       fail("tab_failed");
       return;
     }
@@ -205,13 +195,13 @@ async function runHandoff(st: SessionStore, sender: vscode.Webview, target: Sess
       ...(outcome.detail?.decisions !== undefined
         ? { decisionCount: handoffDecisionLineCount(outcome.detail.decisions) }
         : {}),
-      // 再読込後の snapshot もこの ID でカードを描き、展開部は記録から取り直す（R-HND-10）
+      // R-HND-10: 再読込後の展開要求と同じ識別子を使う（src/protocol.ts#restoredHandoffRunId）。
       detailRunId: restoredHandoffRunId(outcome.forkSessionId),
     };
     if (outcome.unreadableLineCount > 0) {
       output.appendLine(`[handoff] ${runId} F の ${outcome.unreadableLineCount} 行を JSON として読めなかった（逐語が欠けている可能性）`);
     }
-    // 本文は載せない（既存条項）。件数だけを状態通知に載せ、行は handoffDetail の part 0 が運ぶ
+    // 本文で状態通知を膨らませない。展開内容は sendHandoffDetailPart で返す。
     const decisions = outcome.detail?.decisions;
     const done = {
       type: "handoffStatus",
@@ -242,8 +232,6 @@ async function runHandoff(st: SessionStore, sender: vscode.Webview, target: Sess
       utteranceCount: outcome.utteranceCount,
       ...(outcome.unreadableLineCount > 0 ? { unreadableLineCount: outcome.unreadableLineCount } : {}),
     } as const;
-    // 開始元タブは進行表示を消すため、引き継ぎ先タブは状態カードを出すために受け取る
-    // 本文は積まない。webview が展開したときだけ getHandoffDetail で取りに来る
     if (outcome.detail !== undefined) {
       handoffDetailSources.set(forkSession.tabId, { runId, detail: outcome.detail });
     }
@@ -256,12 +244,7 @@ async function runHandoff(st: SessionStore, sender: vscode.Webview, target: Sess
   }
 }
 
-// 再読込・復元で開いたカードの展開部（R-HND-10）。handoffDetailSources はプロセス内の Map なので
-// 再読込で消える。復元の runId（セッション ID 由来）を名乗る要求のときだけ記録から取り直し、
-// **1 回だけ** cache へ入れる（part 要求のたびに読み直すと、以後の発言や再 compact で
-// 要約と part 境界が変わる）
-// 飛行中の読み直し。要約と発言の展開を同時に開くと 2 本の要求が同じ tick で届くので、
-// 合流させないと数 MB の記録を 2 回読んで 2 回 parse する
+// R-HND-10: 同時に届く展開要求の読み取りを handoffDetailRestores で共有する。
 const handoffDetailRestores = new Map<string, Promise<{ runId: string; detail: HandoffDetail } | undefined>>();
 
 async function restoreHandoffDetailSource(
@@ -288,7 +271,6 @@ async function restoreHandoffDetailSource(
     if (detail === undefined) return undefined;
     const entry = { runId, detail };
     handoffDetailSources.set(tabId, entry);
-    // 1 回の復元につき 1 行。同時要求が合流できていなければ行が増える
     output.appendLine(`[handoff] detail restored from record: ${forkSessionId}`);
     return entry;
   })().finally(() => {
@@ -298,8 +280,7 @@ async function restoreHandoffDetailSource(
   return started;
 }
 
-// 状態カードの展開部を 1 part 返す。応答は要求元の面だけへ送る（st.post で全可視面へ
-// 配ると、各面が次の part を要求して要求数が part ごとに倍化する）
+// 他の面の追加要求を誘発しないよう、sendHandoffDetailPart は要求元へだけ応答する（verify-webview-wiring#W-HND-8）。
 async function sendHandoffDetailPart(
   st: SessionStore,
   sender: vscode.Webview,
@@ -349,8 +330,7 @@ function jsonByteLength(value: unknown): number {
   return Buffer.byteLength(JSON.stringify(value), "utf8");
 }
 
-// 検索の失敗はリンクを押した会話（origin。引き継ぎ先タブ）へ返す。対象の元会話はまだタブとして
-// 存在しないので、表示先は常に origin（R-HND-08。toast にすると操作した場所から離れて出る）
+// R-HND-08: 元会話の検索失敗も操作した origin に表示し、操作場所から離れた通知にしない。
 async function openHandoffSourceSession(
   st: SessionStore,
   sender: vscode.Webview,
@@ -406,12 +386,10 @@ export async function handleHandoffMessage(
       await sendHandoffDetailPart(st, sender, target!.tabId, msg.runId, msg.part);
       break;
     case "cancelHandoff": {
-      // runId 単位で冪等。古い runId の中止要求で次の実行を止めない
       const active = handoffRuns.get(target!.tabId);
-      // R-HND-08: 完成済み fork の表示準備中は、受理されなかった取消を通知しない。
+      // R-HND-08: 取消の受理は src/handoff-runner.ts#HandoffRunner.cancel に委ね、完成後の表示準備を取消と誤通知しない。
       if (active?.runId === msg.runId && active.runner?.cancel()) {
-        // run() の解決は drain 完了後で、CLI が止まるまで数秒〜数分かかりうる。押した瞬間に
-        // 失敗表示へ切り替える（同じ runId の後続 failed は webview が捨てる。R-HND-08）
+        // R-HND-08: 取消の表示は src/handoff-runner.ts#HandoffRunner.run の終了を待たない。子プロセスの終了待ちで操作への反応を遅らせない。
         st.post({
           type: "handoffStatus",
           tabId: target!.tabId,

@@ -72,9 +72,9 @@ export function joinTextBlocks(content: unknown): string {
     .trim();
 }
 
-// longGap を切る3分岐のうち hasToolResult 以外の2つ。
+// longGap を切る3分岐のうち `tool_result` を持つレコード以外の2つ。
 // 該当レコードはモデルが動いていた区間ではないので longGap の境界になる
-// （承認待ち等は除外し、「待ち時間」と呼ばない）。hasToolResult 分岐は
+// （承認待ち等は除外し、「待ち時間」と呼ばない）。`tool_result` の分岐は
 // L1.5 の tool_call_finished がそのまま境界になるためここには無い
 // NON_HUMAN_COMMAND_NAMES を境界からも抜くのは、境界が semanticHash の入力
 // （semantic-model の longGaps 射影）だから。境界にすると /rename レコードの有無で

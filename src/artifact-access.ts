@@ -117,7 +117,7 @@ export function projectArtifactAccess(host: HostArtifactAccess): ProjectedArtifa
 
 // pp1 progress の wire 名。no-op ツールのため無効果として扱う。
 // mcp__ 分岐より先に判定しないと unavailable に落ち、当該 Attempt が unknownEffects=true になって
-// observed_data_dep 走査から丸ごと外れる（KNOWN_NO_EFFECT の例外集合への追加であり、input キー由来の分類規則は変えない）
+// observed_data_dep 走査から丸ごと外れる（KNOWN_NO_EFFECT_TOOLS の例外集合への追加であり、input キー由来の分類規則は変えない）
 export const PROGRESS_WIRE_TOOL_NAME = "mcp__laisora_progress__progress";
 
 const KNOWN_NO_EFFECT_TOOLS = new Set([

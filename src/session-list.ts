@@ -120,7 +120,7 @@ export async function streamSessionRows(
   return { sent, scanned };
 }
 
-// SDKSessionInfo は filePath を持たない。resumeSession / analyzeSession は filePath を要求するので、
+// SDKSessionInfo は filePath を持たない。resumeSession は filePath を要求するので、
 // 対応するファイルが見つからない sessionId は一覧へ出さない（推測でパスを組み立てない。
 // エンコード済みディレクトリ名からの逆変換は一意でなく、別プロジェクトのセッションを掴む）。
 export function toSessionListItems(

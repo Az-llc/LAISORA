@@ -2,6 +2,8 @@ import { createLoader } from "./loader";
 import { mergeAskChoice } from "./ask-choice";
 import { createSessionHeader } from "./session-header";
 import { PlanPanel } from "./plan-panel";
+import { applyFallbackModel, fallbackNeedsConfirmation, fallbackNoticeOriginal, foldModelFallback, resolveFallbackByChoice } from "../protocol";
+import type { ModelFallbackState } from "../protocol";
 import { YouList } from "./you-list";
 import type { YouItem } from "./you-items";
 import { shortModelDisplayName } from "../model-display-name";
@@ -30,12 +32,11 @@ import { DECISIONS_REWRITE_RATIO } from "../protocol";
 import * as l10n from "@vscode/l10n";
 import { inputEl, logsEl, tabbarEl, usagePanelEl, sessionActionsEl, vscode } from "./dom";
 import { buildApprovalBody } from "./approval";
-import { clock, formatDuration, formatTokenCount, monthDayClock, toolSummary, uiLocale } from "./format";
+import { clock, formatDuration, monthDayClock, toolSummary, uiLocale } from "./format";
 import { createCopyButton, renderMarkdownInto } from "./markdown";
 import { askHeading, askOptionContent, updateAskCounters } from "./ask-view";
 import { createYouItems, encodeAskDismissal, youAnchor, type AskIdentity, type YouItemsReader } from "./you-items";
 import { appendRecordPart, findCommitBoundary, joinRecordTexts, prependRecordParts, recordSeparator, type RecordTextPart } from "./commit-boundary";
-import { isPureCommandWrapper } from "../human-input-vocabulary";
 import { isConvRenderableEvent } from "../conv-renderable";
 import {
   applyActivityEvent,
@@ -44,6 +45,7 @@ import {
   hasRunningDelegation,
   liveBackgroundTasks,
   notePastLifecycle,
+  runningDelegationIds,
   type BackgroundActivitySnapshot,
   type BackgroundActivityState,
 } from "../background-activity";
@@ -51,6 +53,7 @@ import type { HandoffFailReason } from "../handoff-runner";
 import type { WorkViewMode } from "./work-overview";
 import type { GraphScrollPort } from "./work-graph";
 import { refreshFind, refreshFindCount } from "./find-bar";
+import { deriveStatusLine, statusLineText, truncateToolIntent, type ToolIntentInput } from "./status-line";
 import {
   SCROLL_BOTTOM_GAP_PX,
   activeTabId,
@@ -65,11 +68,26 @@ import {
   refreshComposer,
 } from "./main";
 
+export function requestIsOpen(id: string, latest: string | undefined, overrides: ReadonlyMap<string, boolean>): boolean {
+  return overrides.get(id) ?? id === latest;
+}
+
+export function agentElapsed(state: WorkAgentStateView, now: number): number {
+  return state.elapsedMs + (state.status === "running" && (state.runStartedAt ?? 0) > 0
+    ? Math.max(0, now - state.runStartedAt!) : 0);
+}
+
+type LogRequest = {
+  anchor?: HTMLElement;
+  members: Set<HTMLElement>;
+  turns: Set<string>;
+  last?: { row: HTMLElement; order: number[] };
+  preview?: { row: HTMLElement; home: Comment };
+};
+
 type HandoffStatusMessage = Extract<HostToWebview, { type: "handoffStatus" }>;
 type HandoffDetailMessage = Extract<HostToWebview, { type: "handoffDetail" }>;
 
-// 折り畳みは既定で閉じ、本文は空で作る（開くまで取りに行かない）。
-// 本文は textContent で入れる（Markdown 解釈も HTML 挿入もしない）
 function buildHandoffDetail(label: string): HTMLElement {
   const wrap = document.createElement("details");
   wrap.className = "handoff-detail";
@@ -87,8 +105,7 @@ function detailBodyOf(card: HTMLElement, index: number): HTMLElement {
 
 type HandoffDecisionCounts = NonNullable<HandoffStatusMessage["decisions"]>;
 
-// 転記した決定行の件数・警報（R-HND-11 / R-HND-12）。live は handoffStatus が、復元は
-// handoffDetail の part 0 が同じ数を運ぶので、描き手は 1 つにして経路で文面が割れないようにする
+// R-HND-11 / R-HND-12: handoffStatus と handoffDetail の件数を同じ文面で出すため、描き手は renderDecisionCounts だけにする。
 function renderDecisionCounts(card: HTMLElement, counts: HandoffDecisionCounts): void {
   const slot = card.querySelector<HTMLElement>(".handoff-decisions-lines");
   if (slot === null) return;
@@ -295,10 +312,8 @@ export function handleSessionImageResult(
   img.alt = l10n.t("Attached image");
   img.dataset.imageRef = JSON.stringify(ref);
   attachLightboxHandlers(img, tabId, { ref });
-  // DOM へ入れる前に復号を終わらせる。未復号のまま差し替えると差し替え時と復号完了時で
-  // レイアウトが 2 回動き、2 回目は補正の外に出る。width / height 属性で寸法を与える手は使えない
-  // （.block.user .user-image は max-width / max-height しか持たないので、両軸が独立に
-  //   切り詰められて縦横比が壊れる）
+  // 復号前に差し替えると swapPreservingConvView の測定が実寸を含まない（verify-history-prepend#HPmut-25）。
+  // 寸法属性で代用しない。`.user-image` の CSS は最大寸法だけを持つので、属性を与えると縦横比が崩れる。
   const place = (): void => {
     if (slot.isConnected) swapPreservingConvView(tabId, slot, img);
     drainImageLoadQueue();
@@ -323,13 +338,11 @@ export function clearPendingImageLoads(tab: Tab): void {
   }
 }
 
-// 失敗表示は次の操作まで残す（数分の compact の後に出た失敗は見逃されやすい。M-16 の「読み終わったら消す」は
-// 進行表示の規則で、失敗理由は読む前に消えてはいけない）
+// 長い compact の後に出た失敗理由を読む前に消さないよう、失敗表示は次の引き継ぎが始まるまで最長 HANDOFF_FAILURE_VISIBLE_MS 残す。
 const HANDOFF_FAILURE_VISIBLE_MS = 120_000;
 const HANDOFF_RUN_MEMORY = 1_000;
 const HANDOFF_DETAIL_UNAVAILABLE = l10n.t("Could not read the details");
 
-// 失敗文面。理由コードをそのまま画面へ出さない
 const HANDOFF_FAILURE_MESSAGES = {
   compact_rejected_analysis: l10n.t("The AI model refused to generate the summary, or the summary was incomplete"),
   compact_rejected_structure: l10n.t("The AI model refused to generate the summary, or the summary was incomplete"),
@@ -339,10 +352,8 @@ const HANDOFF_FAILURE_MESSAGES = {
   source_busy: l10n.t("Cannot hand off while a turn is running (wait for it to finish or interrupt it)"),
   already_running: l10n.t("A handoff is already running"),
   tab_failed: l10n.t("The handoff was created. You can open it from history"),
-  // 文面は理由コードごとに 1 つで、原因を断定しない。compact_failed / hook_not_fired は
-  // 生産者が複数あり（CLI の拒否・通信断・result 先行）、断定すると誤った操作へ誘導する。
-  // 具体的な理由は detail 行が運ぶ。
-  // 「元の会話は変更されていません」は setHandoffStatus が後置するのでここに書かない。
+  // compact_failed と hook_not_fired は src/handoff-runner.ts#HandoffFailReason の中でも複数の経路から出るので、文面で原因を断定しない。具体的な理由は detail が運ぶ。
+  // 元の会話が変わっていない旨は showHandoffStatus が後置するので、ここへ重ねない。
   compact_failed: l10n.t("Could not summarize the conversation. Please try again"),
   hook_not_fired: l10n.t("The summary did not run. Please try again"),
   fork_failed: l10n.t("Could not create the handoff conversation. Wait a moment and try again"),
@@ -361,8 +372,7 @@ function handoffFailureMessage(reason: string | undefined): string {
   return known ?? l10n.t("Handoff aborted ({0})", reason ?? "unknown");
 }
 
-// 段階ごとの進行文言。compacting は心拍が届くまで「要約しています」と言わない（R-DSP-01。
-// CLI は /compact の応答を要約開始前に返すことがあり、心拍だけが進行の観測点）
+// R-DSP-01: CLI の応答は要約開始の観測点にならないので、compacting は心拍が届くまで要約中と表示しない（verify-webview-wiring#W-HND-9rmut）。
 const HANDOFF_PHASE_TEXTS: Record<string, string> = {
   forking: l10n.t("(creating a copy)"),
   extracting: l10n.t("(extracting messages)"),
@@ -391,9 +401,7 @@ function handoffRunningText(msg: HandoffStatusMessage): string {
   return l10n.t("Handing off…{0}", HANDOFF_PHASE_TEXTS[msg.phase ?? ""] ?? "");
 }
 
-// 装飾の行。事実の行と分け、compacting の心拍が届いている間だけ出す。
-// 進行が HANDOFF_QUIET_MS 途絶えたら真顔の 1 本へ替える。Host の 120 秒アイドル猶予とは
-// 別物で、protocol には載せない（webview のローカルタイマーだけで閉じる）
+// HANDOFF_QUIET_MS は src/handoff-runner.ts#COMPACT_HEARTBEAT_GRACE_MS とは独立した webview 側の表示タイマーで、protocol に載せない。
 const HANDOFF_QUIET_MS = 90_000;
 
 function handoffPlayfulLines(): string[] {
@@ -417,7 +425,6 @@ function formatHandoffTokens(compact: { preTokens: number; postTokens: number } 
 }
 
 function handoffSummaryHeading(summary: string | undefined): string {
-  // Compact summaries use Markdown headings or numbered section headings.
   let fence: string | undefined;
   for (const line of (summary ?? "").split(/\r?\n/)) {
     const mark = /^(?:`{3,}|~{3,})/.exec(line.trim())?.[0][0];
@@ -436,15 +443,11 @@ function handoffSummaryHeading(summary: string | undefined): string {
   return l10n.t("Summary");
 }
 
-// 詳細カード1枚分。集計は持たない。数値は WorkModel（イベントに載る WorkEventInfo）から来る。
-// カードの同定は reducer が開始時に固定した segmentId で行う。「その時点のカレント」で同定すると、
-// カードが切り替わったあとに前カードのツールが終了したとき集計が次のカードへ混入し、
-// 実行中のツールが残っているのにスピナーが止まる。
+// カードは segmentId で同定する。現在のカードで同定すると、切替後に終わった前カードのツールの集計が次のカードへ混入する（verify-detail-cards#C-1）。
 interface SegmentCard {
   segmentId: string;
   el: HTMLDetailsElement;
   summaryEl: HTMLElement;
-  // 直近に置いたツールの表示名。集計ではなく最後の1件の見出し
   lastLabel: string;
 }
 
@@ -452,14 +455,11 @@ interface AgentCardEntry {
   card: HTMLDetailsElement;
   statusEl: HTMLElement;
   metaEl: HTMLElement;
-  // モデル・effort等のチップ置き場。モデルは起動時は宣言値（frontmatter/入力）しか無く、
-  // 実測値が subagent_info で後着するため、チップは kind 単位で差し替えられる形にしている
   chipsEl: HTMLElement;
   childrenEl: HTMLElement;
 }
 
-// 行1件の中身。行の材料をイベント由来の値として保持する。
-// 集計（件数・失敗数・時間・状態語）はここに入れない。それらは WorkModel 側の値を使う
+// 集計値を WorkRowData で数えない。集計は WorkModelPayload と WorkEventInfo の値を使う。
 interface WorkRowData {
   toolUseId: string;
   kind: "tool" | "agent";
@@ -467,18 +467,17 @@ interface WorkRowData {
   summaryText: string;
   inputPreview: string;
   status: "running" | "done" | "failed" | "stale";
-  // 開始時刻（provider 時刻）。0 = 未観測で、そのときは時刻列を空にする
+  // provider 時刻。0 は未観測で、時刻列を空にする。
   startedAt: number;
   resultPreview?: string;
   elapsedLabel?: string;
   statusGlyph?: string;
   metaText?: string;
   chips?: { kind: string; text: string }[];
-  // agent 配下に置いた行（順序を保つ）
   childIds?: string[];
 }
 
-// agent の状態語。値は WorkModel の status をそのまま写す（DOMのクラスから逆算しない）
+// 状態語は WorkAgentStateView の status から引き、DOM のクラスから逆算しない。
 const AGENT_STATUS_WORD: Record<WorkAgentStateView["status"], string> = {
   running: l10n.t("Running"),
   completed: l10n.t("Completed"),
@@ -497,9 +496,7 @@ function compactBoundaryText(ev: { trigger: "auto" | "manual"; preTokens?: numbe
 }
 const APPROVAL_REF_SUFFIX = l10n.t(" (respond in the Conversation tab)");
 
-// サブエージェントカードのチップ。同 kind があれば置き換える（subagent_info の実測モデルが
-// 宣言値チップを上書きする経路）。表示順は AGENT_CHIP_ORDER で固定する
-// （model は後着するため、到着順に並べると起動ごとに並びが変わる）。
+// model チップは subagent_info で後着して宣言値を置き換えるので、並びは到着順でなく AGENT_CHIP_ORDER で決める。
 const AGENT_CHIP_ORDER = ["type", "model", "effort"];
 function chipRank(kind: string): number {
   const index = AGENT_CHIP_ORDER.indexOf(kind);
@@ -525,18 +522,15 @@ function fillChips(chipsEl: HTMLElement, data: WorkRowData): void {
   }
 }
 
-// モデルIDのチップ表示。"claude-" 接頭辞は全モデル共通で情報量が無いため落とす
 function shortModelLabel(model: string): string {
   return model.replace(/^claude-/, "");
 }
 
-// 進行中は activeForm（「〜を実行中」）で出す。両方 WorkModel が持つ値で、選ぶだけ
 function taskLabel(item: WorkTaskItemView): string {
   return item.status === "in_progress" && item.activeForm ? item.activeForm : item.description;
 }
 
-// 表示に影響する全項目を見る。taskKey だけの比較にすると、状態やラベルだけが変わった更新で
-// TODOカードが描き直されず、完了・進行中の表示が古いまま残る
+// taskKey だけで比べると、状態やラベルだけが変わった更新で TODO カードが描き直されない。
 function sameTaskItems(a: readonly WorkTaskItemView[], b: readonly WorkTaskItemView[]): boolean {
   if (a.length !== b.length) return false;
   return a.every((item, index) => {
@@ -550,13 +544,8 @@ function sameTaskItems(a: readonly WorkTaskItemView[], b: readonly WorkTaskItemV
   });
 }
 
-// 過去 chunk 再生中の挿入位置を持ち回す。anchor は容器ごとに「その容器へ最初に入れた時点の
-// firstChild」で、固定した anchor の直前へ入れ続けることで chunk 内の順序を保ったまま
-// live の内容より上に積む（毎回 firstChild を取り直すと chunk 内が逆順になる — 契約 C1）。
-// createdNow はこの再生で作った容器で、空から作るので append でよい。
-// live 再生で既に作られていた segment カードへ入れる場合は anchor 機構のほうを通る
-// （anchor が summary になりうるが、Chromium は最初の summary 子をスロットへ割り当てるので
-// 表示順は逆転しない）
+// anchors は容器ごとに、その再生で最初に入れた時点の firstChild を固定する。毎回取り直すと chunk 内が逆順になる（verify-history-prepend#HPmut-7）。
+// createdNow の容器は空から作るので append する。anchor が summary でも、Chromium は最初の summary 子を表示用に割り当てるので表示順は崩れない。
 interface PastRenderContext {
   frag: DocumentFragment;
   anchors: Map<Node, Node | null>;
@@ -568,18 +557,12 @@ interface PastRenderContext {
   failures: string[];
 }
 
-// prepend 1回ぶんの突合材料（契約 C4b）。2本の等式を呼び出し側が検査する:
-//   rendered + skipped + duplicates + failed == total   … 取りこぼしたイベントが無い
-//   connected == expectedConnected             … 作った行が接続済み DOM に居る
-// 後者が要るのは、未接続コンテナへ appendChild しても例外が出ないため。
-// created（新しく行要素を作った件数）と rendered（何らかの効果があった件数）は別物で、
-// subagent_info / approval_resolved は既存要素を書き換えるだけなので created に入らない
+// 突合は src/webview/main.ts#onHistoryChunkResult が行う。connected を突き合わせるのは、未接続コンテナへの appendChild が例外を出さないため（verify-history-prepend#HPmut-5）。
 export interface PastPrependResult {
   total: number;
   rendered: number;
   skipped: number;
   duplicates: number;
-  // 描画中に例外が出た件数。識別子を登録しないので取り直せば再挑戦できる
   failed: number;
   connected: number;
   expectedConnected: number;
@@ -588,7 +571,6 @@ export interface PastPrependResult {
 
 type PastRenderOutcome = "created" | "applied" | "skipped";
 
-// 会話の過去 chunk 1回ぶんの突合材料（契約 P7）
 export interface ConvPrependResult {
   total: number;
   rendered: number;
@@ -599,24 +581,18 @@ export interface ConvPrependResult {
   expectedConnected: number;
 }
 
-// EventLog 由来（原因A）の chunk だけが持つ内訳。transcript 由来（原因B）には
-// 白リストも turn 継続も無いので基底のままにする。
-// duplicates へ畳むと「185件が重複だった」と誤読される（post-close audit 原因A M-5）
+// events 由来の chunk だけが skipped と continued を持つ。duplicates へ畳むと重複と誤読される（verify-conversation-history#CH-C22mut-a）。
 export interface ConvEventPrependResult extends ConvPrependResult {
-  // 会話面の白リスト外（isConvRenderableEvent が false）
+  // isConvRenderableEvent が false の件数。
   skipped: number;
-  // 既存の assistant ブロックへ本文を足しただけで、新しい行は作っていない件。
-  // rendered へ入れてはならない（connected は data-conv-past の実数と突合する）
+  // 既存の assistant ブロックへ本文を足しただけの件数。connected は data-conv-past の実数なので rendered へ入れない（verify-conversation-history#CH-C22mut-b）。
   continued: number;
 }
 
-// ---------- タブ ----------
-
-// セッション内の表示モード。conv=会話（本文と判断）/ work=作業ログ（内部進行と監査）
 export type ViewMode = "conv" | "work";
 
-// 作り直しをまたぐ位置は行の同一性と表示位置で持つ。画素位置は、末尾送りから全件への作り直しで
-// 上に中身が増えると別の行を指す。offset は #logs 上端から（ヘッダは帯の有無で高さが変わる）
+// 作り直しをまたぐ位置を画素位置で持たない。上に中身が増えると別の行を指す。
+// offset の基準は logsEl の上端（ヘッダの高さは帯の有無で変わる）。
 export interface RowAnchor {
   attr: "msgUuid" | "turnId" | "toolUseId";
   id: string;
@@ -671,12 +647,10 @@ export function isScrollCarry(v: unknown): v is ScrollCarry {
   );
 }
 
-// 開始行を持たない tool_call_finished の退避上限。窓境界を跨ぐツールは高々1ターンぶんなので
-// これを超えるのは想定外の並び。溢れたぶんは退避しない（running 表示が残るが、無制限に
-// 溜めて解放されないほうが害が大きい）
+// 窓境界を跨ぐツールは 1 ターン分に収まるので、ORPHAN_FINISH_MAX を超える退避は想定外の並びとして捨てる。
+// 解放されない蓄積を避けるためで、捨てた分は running 表示が残る。
 const ORPHAN_FINISH_MAX = 512;
 
-// 裏読みの進行表示の状態。会話面・状況面で同じ形を使う
 export type LoadProgressState =
   | { phase: "preparing" }
   | { phase: "loading"; remaining: number; ratio: number }
@@ -687,11 +661,11 @@ function clockLabel(timestamp: number): string {
     hour: "2-digit",
     minute: "2-digit",
     second: "2-digit",
+    hour12: false,
   });
 }
 
-// assistant セグメントの中身を「確定領域 / 未確定の末尾」の 2 枠に作り直す（増分描画）。
-// 新規作成と撤回後の描き直しで同じ形にする（片方だけ形が変わると増分描画の前提が崩れる）
+// 新規作成と撤回後の描き直しはどちらも buildSegParts で組む。片方だけ形を変えると増分描画の前提が崩れる。
 function buildSegParts(seg: HTMLElement): { committed: HTMLElement; tail: HTMLElement } {
   seg.textContent = "";
   const committed = document.createElement("div");
@@ -702,20 +676,21 @@ function buildSegParts(seg: HTMLElement): { committed: HTMLElement; tail: HTMLEl
   return { committed, tail };
 }
 
-// 実行ログの状態列は色だけでなく文字を持つ（R-TAB-06）。stale は ⏸
-const TOOL_STATUS_GLYPH: Record<WorkRowData["status"], string> = { running: "", done: "✓", failed: "✕", stale: "⏸" };
-// 状況の 4 タブの張り付きの初期値。初回は先頭から。張り付きを初期値にすると、結果が縦に長い分析タブは初回に
-// 末尾へ飛びボタンが画面から消える（R-ANL-11 / R-ANL-12）。実行ログだけは追記に追従するので張り付き
+// R-TAB-06: 実行ログの状態を色だけで区別しない。
+const TOOL_STATUS_GLYPH: Record<WorkRowData["status"], string> = { running: "", done: "✓", failed: "✗", stale: "⏸" };
+// 同じ文字列でも代入すると子のテキストノードが作り直され、視界の上端がそこにあるとブラウザの scroll anchoring の基準が失われる（verify-history-prepend#HPmut-10）。
+function setTextIfChanged(el: HTMLElement, text: string): void {
+  if (el.textContent !== text) el.textContent = text;
+}
+// R-ANL-11 / R-ANL-12: 分析タブを張り付きで始めると初回に末尾へ飛び、ボタンが画面から消える。追記に追従するのは実行ログだけ。
 const WORK_VIEW_AT_BOTTOM_INITIAL: Record<WorkViewMode, boolean> = { summary: false, graph: false, analysis: false, log: true };
 
-// タブのドットと同じ述語（isTabActive）の変化。概要の「実行中」はこちらを見る（R-SES-02 / R-DSP-20）
+// R-SES-02 / R-DSP-20: 概要の実行中はタブのドットと同じ isTabActive の変化を onTabActivity で受ける。
 export let onTabActivity: ((tabId: string, active: boolean) => void) | undefined;
 export function setOnTabActivity(fn: typeof onTabActivity): void {
   onTabActivity = fn;
 }
 
-// 会話面が表示になったことの通知口。main.ts が過去ログの裏読みを継ぐために使う。
-// tab.ts から main.ts を import すると循環するので、setter で注入する
 export let onConvViewShown: ((tabId: string) => void) | undefined;
 export function setOnConvViewShown(fn: typeof onConvViewShown): void {
   onConvViewShown = fn;
@@ -735,7 +710,6 @@ export class Tab {
     }
     return this.youStoreValue;
   }
-  // Record uuids used as the reply ID of history-rendered assistant messages.
   private readonly recordReplyIds = new Set<string>();
 
   private locateAsk(replyId: string, offset: number): { message: string; start: number } | undefined {
@@ -830,13 +804,10 @@ export class Tab {
   readonly planPanel: PlanPanel;
   readonly summaryYou: YouList;
   private readonly chatYou: YouList;
-  // logEl はタブの表示領域全体（#logs の子）。中身は [headEl, convEl, workEl]。
   readonly logEl: HTMLElement;
-  // 会話パネル: ユーザー/LLM本文・承認カード・判断に必要な通知だけを置く
+  // 会話面へ描く種別は src/conv-renderable.ts#isConvRenderableEvent が決める。
   readonly convEl: HTMLElement;
-  // 作業ログパネル: ツール・TODO・サブエージェント・リトライ・診断を置く
   readonly workEl: HTMLElement;
-  // Sticky session heading, progress row and running-status strip in the content column.
   private headEl!: HTMLElement;
   private viewTabs = {} as Record<"chat" | WorkViewMode, HTMLButtonElement>;
   private viewNav!: HTMLElement;
@@ -845,8 +816,9 @@ export class Tab {
   private turnRailMutationObserver?: MutationObserver;
   private changingView = false;
   setWorkViewMode?: (mode: WorkViewMode) => void;
-  // 過去ログの裏読みの進行表示（タイトル・日付の右側）。要素は会話面と状況面で 1 つを共有し、
-  // 見ている面の状態だけを描く（クラス名は conv-load だが状況面もこの要素に描く）
+  syncWorkVisibility?: () => void;
+  setWorkViewVisible?: (visible: boolean) => void;
+  // クラス名は `conv-load` だが、状況面の進行もこの要素に描く（renderLoadSlot）。
   private convLoadEl!: HTMLElement;
   private convLoadIconEl!: HTMLElement;
   private convLoadTextEl!: HTMLElement;
@@ -861,82 +833,61 @@ export class Tab {
   private handoffStatusTextEl!: HTMLElement;
   private handoffCancelEl!: HTMLButtonElement;
   private handoffPlayfulEl: HTMLElement | null = null;
-  // 山から順に消費する。心拍ごとに独立抽選へ変えると同じ 1 本が続けて出る（W-HND-11 は
-  // 2 回続けてしか見ないので、抽選へ退化しても大半の回は緑になる）
+  // 心拍ごとの独立抽選へ変えない。同じ行が続けて出る。verify-webview-wiring#W-HND-11 はこの退化を確実には落とさない。
   private handoffPlayfulDeck: string[] = [];
   private handoffPlayfulLast: string | null = null;
   private handoffQuietTimer: ReturnType<typeof setTimeout> | null = null;
-  // いま右端スロットに出している引き継ぎの runId。null = 所有者なし（終端を出した後も外す）
   private handoffRunId: string | null = null;
   private readonly handoffEndedRunIds = new Set<string>();
   private readonly handoffCardRunIds = new Set<string>();
   private restoredHandoffCard: HTMLElement | undefined;
   handoffSource?: NonNullable<ConversationSnapshot["handoffSource"]>;
   private readonly handoffCardEls = new Map<string, HTMLElement>();
-  // 次に受け取るべき part。重複・逆順の応答を捨て、次の要求を二重に出さない
+  // 重複・逆順の part を捨て、次の要求を二重に出さないために持つ。
   private readonly handoffExpectedPart = new Map<string, number>();
-  // part 0 を要求済みの実行 ID。取得に失敗した（total===0）ら外し、開き直しで再要求させる
   private readonly handoffDetailRequested = new Set<string>();
   private handoffClearTimer: ReturnType<typeof setTimeout> | null = null;
-  // 会話面の遡り位置。null = 最新（張り付き）
   private convCursorEl: HTMLElement | null = null;
-  // 表示モードはセッション（タブ）ごとに保持する
   viewMode: ViewMode = "conv";
-  // パネルごとのスクロール位置。切替・タブ切替で不必要に失わないため退避する
   private scrollPos: Record<ViewMode, number> = { conv: 0, work: 0 };
-  // 状況の 4 タブごとのスクロール位置と張り付き。実行ログ→分析→実行ログの往復で位置を失わない（R-TAB-06）
+  // R-TAB-06: サブタブを往復しても位置を失わないよう、サブタブごとに持つ。
   private workViewScrollPos: Record<WorkViewMode, number> = { summary: 0, graph: 0, analysis: 0, log: 0 };
   private workViewAtBottom: Record<WorkViewMode, boolean> = { ...WORK_VIEW_AT_BOTTOM_INITIAL };
-  // いま選ばれている状況のサブタブ。WorkOverview の既定（summary）と同じ値から始め、切替のたびに追随する
+  // 初期値は src/webview/work-overview.ts#WorkOverview の mode の初期値と揃える。
   private workView: WorkViewMode = "summary";
   get workViewMode(): WorkViewMode { return this.workView; }
-  // 実行ログを離れたとき最上部に見えていた行。戻ったとき 1.4 秒光らせる
   private workViewReturnRow: HTMLElement | null = null;
-  // 直前の人の発言（1 行目）。次のターン区切りの見出しに使う。live は user_message → turn_started の順で届く
+  // live では発言がターン開始より先に届くので、noteHumanHeadline が lastHumanHeadline へ持ち越す。
   private lastHumanHeadline: string | null = null;
-  // 見出しが未確定のターン区切り。history は turn_started → user_message の順なので後から埋める。
-  // live の区切りだけを指す。裏読みで積む過去の区切りは別に持つ（下）。共有すると、後から届く live の
-  // user_message（turnId 無し）が過去の区切りへ入り、以後の見出しが 1 つずつずれ続ける（R-TAB-09）
+  // history では turn_started が user_message より先に届くので、見出しを後から埋める。live の区切りだけを指し、
+  // pastPendingAnchor と共有しない。共有すると後から届く live の発言が過去の区切りへ入り、以後の見出しがずれる（R-TAB-09、verify-history-prepend#HP-C26）。
   private pendingHeadlineAnchor: HTMLElement | null = null;
-  // 過去 chunk 側の見出しの受け渡し。chunk は新しい順に届き、chunk 内は時系列順なので、
-  // 区切りと発言の並びは [turn_started | user_message]（history）と [user_message | turn_started]（live 由来）の
-  // どちらも chunk 境界で割れうる。区切りは chunk をまたいで待ち（pastPendingAnchor）、turnId を持つ発言は
-  // chunk をまたいで待つ（pastHeadline.chunk = null）。turnId の無い発言は直後に始まったターンにだけ付く:
-  // 同じ chunk の次の区切りが引き取り、chunk 末尾に残ったものは直前に積んだ（新しい側の）chunk の先頭の区切りが
-  // 見出し待ちなら引き取る（takePastChunkTail）。見出し待ちの区切りへ即座に入れると、発言なしで始まったターン
-  // （自動投入による非人間発話）の区切りが次の発言を引き取り、以後の見出しが 1 つずつずれる（R-TAB-09）
+  // chunk は新しい順に届き chunk 内は時系列順なので、区切りと発言の組は chunk 境界で割れうる。turnId の無い発言は
+  // 直後に始まったターンにだけ付け、chunk 末尾に残った分は takePastChunkTail が渡す。見出し待ちの区切りへ即座に入れると、
+  // 発言なしで始まったターンが次の発言を引き取り、以後の見出しがずれる（R-TAB-09、verify-history-prepend#HPmut-21）。
   private pastPendingAnchor: HTMLElement | null = null;
   private pastPendingChunk = 0;
   private pastPendingFirst = false;
   private pastChunkTurnSeen = false;
   private pastHeadline: { text: string; turnId: string | null; chunk: number | null } | null = null;
   private pastChunkSerial = 0;
-  // 同じコマンドの連続を 1 つの区切りに畳む
-  private lastCommandRun: { text: string; anchor: HTMLElement; count: number } | null = null;
-  // パネルごとの「最下部に張り付いているか」。初期は張り付き（＝新着に追従する）
   private atBottom: Record<ViewMode, boolean> = { conv: true, work: true };
-  // グラフが窓（画面に収まる行数分）を開いている間、作業ログ追記の末尾追従と張り付き記録を止める。
-  // 書き手は WorkGraph（GraphScrollPort.setHold）だけ
+  // 書き手は src/webview/work-graph.ts#GraphScrollPort の setHold だけ。
   private graphHold = false;
-  // 作り直しで受け取った位置。restoreScroll が当てるまでは退避の答えもこれ（新しい DOM の scrollTop はまだ当てていない値）
+  // restoreScroll が当てるまでは退避の答えも unappliedCarry を使う。新しい DOM の scrollTop はまだ当てていない値。
   private unappliedCarry: ScrollCarry | undefined;
-  // 活性化してから restoreScroll が位置を当てたか。当てる前の #logs.scrollTop は前のタブの値
+  // restoreScroll が当てる前の logsEl.scrollTop は前のタブの値。
   private scrollRestored = false;
-  // 面ごとに、最初に表示したとき一度だけ当てる行
   private carryAnchor: Partial<Record<ViewMode, RowAnchor>> = {};
   private carryAwaitsConvBackfill = false;
-  // 最後に測った（または当てた）面ごとの行。測るのはスクロールの遅延保存・面やタブを離れるとき・作り直しの退避と、
-  // 位置が動いた後の最初の persistState だけ（入力欄の打鍵ごとに呼ばれるので、動いていなければ elementsFromPoint を回さない）
+  // persistState は打鍵ごとに呼ばれるので、位置が動いていなければ elementsFromPoint で測り直さない。
   private knownAnchor: Partial<Record<ViewMode, RowAnchor>> = {};
-  // 表示中の面の行を最後に測ったときの #logs.scrollTop。今の scrollTop と違えば knownAnchor は古い位置の行で、
-  // 新しい scrollPos と組にして書くと復元が別の行へ合う。scroll イベントや scrollPos では判定しない
-  // （移動系は scroll イベントより先に scrollPos を書き、イベントは次のフレームまで届かない）
+  // 今の logsEl.scrollTop と違えば knownAnchor は古い位置の行で、新しい scrollPos と組にすると復元が別の行へ合う。
+  // scroll イベントや scrollPos では判定しない（移動系は scroll イベントより先に scrollPos を書き、イベントは次のフレームまで届かない）。
   private anchorMeasuredTop: number | undefined;
-  // 末尾送りで窓に無い行を、会話の遡りが積むたびに探し直す。諦めるのは利用者の操作（main.ts abandonAwaitedScrollAnchor）・
-  // pager の終端・タブ切替。scrollTop の変化では判定しない（画像差し替えなどの補正も scroll を起こす）
+  // 諦めの判定に scrollTop の変化を使わない。画像差し替えなどの補正も scroll を起こす。利用者の操作は src/webview/main.ts#abandonAwaitedScrollAnchor が伝える。
   private awaitedConvAnchor: RowAnchor | undefined;
-  // 同一ターンのassistant本文をまとめるコンテナ。ツールを挟んでも別回答に見せない
-  // （断片は連結せず、セグメント要素として連続配置する）
+  // ツールを挟んでも同じターンの本文を別の回答に見せないためのコンテナ。
   private currentAssistantTurn: HTMLElement | null = null;
   readonly tabBtn: HTMLElement;
   labelEl!: HTMLElement;
@@ -978,19 +929,16 @@ export class Tab {
     this.sessionHeader.updateTitle(title);
   }
 
-  // 引き継ぎの進行・失敗を右端スロットへ出す。done はスロットからは消すだけで、
-  // 引き継ぎ先タブの状態カードが結果を担う。表示文面はこのファイルの表が正本で、
-  // Host が送る message は読まない
+  // 文面は HANDOFF_FAILURE_MESSAGES と handoffRunningText が決め、Host の message は読まない。
   showHandoffStatus(msg: HandoffStatusMessage): void {
-    // カードは引き継ぎ先タブで runId ごとに 1 回だけ。done の再送で複製しない
     if (msg.state === "done" && msg.fork?.tabId === this.tabId && !this.handoffCardRunIds.has(msg.runId)) {
       this.handoffCardRunIds.add(msg.runId);
       this.restoredHandoffCard?.remove();
       this.restoredHandoffCard = undefined;
       this.handoffCardEls.set(msg.runId, this.renderHandoffCard({ ...msg, runId: msg.runId }));
     }
-    // R-HND-08: 終端を出し終えた実行と、いま表示している実行以外の通知は表示を触らない。
-    // failed / done を出したら所有権を手放す（次の実行の running を捨てないため）
+    // R-HND-08: 終端を出した実行と、表示中でない実行の通知は表示を触らない（verify-webview-wiring#W-HND-1mut）。
+    // 終端で所有権を手放すのは、次の実行の running を捨てないため。
     if (this.handoffEndedRunIds.has(msg.runId)) return;
     if (this.handoffRunId !== null && this.handoffRunId !== msg.runId) return;
     if (msg.state === "done") {
@@ -1089,8 +1037,7 @@ export class Tab {
     return line;
   }
 
-  // 展開部の 1 便。届いた分だけ描き、続きがあれば次の part を要求する。
-  // 全文を 1 つの文字列へ組み立てない（967k セッションでは逐語が MB 級になる）
+  // 逐語は大きくなりうるので、全文を 1 つの文字列へ組み立てず、届いた part ごとに描く。
   showHandoffDetail(msg: HandoffDetailMessage): void {
     const card = this.handoffCardEls.get(msg.runId);
     if (card === undefined) return;
@@ -1140,8 +1087,7 @@ export class Tab {
     }
   }
 
-  // 追い出しはしない。カード DOM を残したまま重複排除情報だけ消すと、
-  // 追い出された done の再送でカードが複製される
+  // HANDOFF_RUN_MEMORY に達しても古い runId を追い出さない。カードを残したまま重複排除だけ消すと、done の再送でカードが複製される。
   private noteHandoffEnded(runId: string): void {
     if (this.handoffEndedRunIds.size < HANDOFF_RUN_MEMORY) this.handoffEndedRunIds.add(runId);
   }
@@ -1174,7 +1120,6 @@ export class Tab {
     if (source.detailRunId !== undefined) this.handoffCardEls.set(source.detailRunId, card);
   }
 
-  // 引き継ぎ先タブの会話面の先頭に置く状態カード。本文は handoffDetail が後から足す
   private renderHandoffCard(msg: {
     source: { sessionId: string; title?: string };
     compact?: { preTokens: number; postTokens: number };
@@ -1267,21 +1212,86 @@ export class Tab {
         decisionsEl.addEventListener("toggle", request);
       }
     }
-    // 会話面の先頭に置く（R-HND-09）。前世代を描かないので、この世代はカードから始まる。
-    // live と復元で同じ位置にする。履歴 head が既にあっても、その前へ置く。
+    // R-HND-09: live と復元のどちらでも、履歴 head より前の会話面の先頭に置く。
     this.convEl.insertBefore(card, this.convEl.firstChild);
     this.convEl.scrollTop = this.convEl.scrollHeight;
     return card;
   }
 
   auth: AuthStatus | null = null;
-  // resume 元のセッションID（snapshot 由来）。analysis メッセージの行き先解決に使う
   resumeSessionId: string | undefined;
   configModel: string | undefined;
   configEffort: string | undefined;
   defaultEffort: string | undefined;
   appliedEffort: string | null | undefined;
   appliedModel: string | undefined;
+  modelFallback?: ModelFallbackState;
+
+  private modelLabel(model: string): string {
+    return this.models.find(row => row.id === model || (row.id !== "default" && row.resolvedModel === model))?.label ?? model;
+  }
+
+  private fallbackText(ev: Extract<NormalizedEvent, { kind: "model_refusal_fallback" }>): string {
+    const label = (model: string): string => this.modelLabel(model);
+    return ev.scope === "local"
+      ? l10n.t("Local model fallback: {0} → {1} (category: {2})", label(ev.originalModel), label(ev.fallbackModel), ev.category ?? l10n.t("Unknown"))
+      : l10n.t("Model switched: {0} → {1} (category: {2})", label(ev.originalModel), label(ev.fallbackModel), ev.category ?? l10n.t("Unknown"));
+  }
+
+  private fallbackStatusText(ev: Extract<NormalizedEvent, { kind: "model_refusal_fallback" }>): string | undefined {
+    const original = this.modelLabel(fallbackNoticeOriginal(this.modelFallback, ev));
+    return ev.autoRevert === "pending" ? l10n.t("{0} will be restored automatically when this turn ends.", original)
+      : ev.autoRevert === "off" ? l10n.t("Automatic restore is off; restore {0} from YOU.", original)
+        : undefined;
+  }
+
+  private fallbackRevertText(ev: Extract<NormalizedEvent, { kind: "model_fallback_revert" }>): string {
+    const original = this.modelLabel(ev.originalModel);
+    return ev.outcome === "applied" ? l10n.t("Restored the original model {0} automatically.", original)
+      : ev.outcome === "deferred" ? l10n.t("The conversation will start on the original model {0} next time.", original)
+        : ev.outcome === "failed" ? l10n.t("Could not restore the original model {0} automatically; restore it from YOU.", original)
+          : l10n.t("Your model selection replaced the fallback model.");
+  }
+
+  private fallbackLogText(ev: Extract<NormalizedEvent, { kind: "model_refusal_fallback" }>): string {
+    const status = this.fallbackStatusText(ev);
+    return status === undefined ? this.fallbackText(ev) : `${this.fallbackText(ev)} ${status}`;
+  }
+
+  private decorateFallbackBlock(block: HTMLElement, ev: Extract<NormalizedEvent, { kind: "model_refusal_fallback" }>): void {
+    block.id = youAnchor(this.tabId, `fallback:${ev.generation}:${ev.seq}`);
+    for (const [className, text] of [["you-summary", ev.explanation], ["fallback-status", this.fallbackStatusText(ev)]] as const) {
+      if (!text) continue;
+      const secondary = document.createElement("p");
+      secondary.className = className;
+      secondary.textContent = text;
+      block.append(secondary);
+    }
+  }
+
+  setModelFallback(state: ModelFallbackState | undefined): void {
+    this.modelFallback = state;
+    if (state && fallbackNeedsConfirmation(state)) {
+      this.youStore.fallback(state, this.fallbackText(state.notice));
+      this.youStore.appliedModel(state.appliedModel, state.resolvedAt ?? state.notice.timestamp, this.models);
+    }
+  }
+
+  observeAppliedModel(model: string | null | undefined): void {
+    const next = applyFallbackModel(this.modelFallback, model, Date.now(), this.models);
+    if (next !== this.modelFallback) this.setModelFallback(next);
+    if (model) this.youStore.appliedModel(model, Date.now(), this.models);
+  }
+
+  chooseModel(model: string | null | undefined): void {
+    this.setModelFallback(resolveFallbackByChoice(this.modelFallback, model, Date.now()));
+    if (model) this.youStore.appliedModel(model, Date.now(), this.models);
+  }
+
+  private restoreFallbackModel(model: string): void {
+    vscode.postMessage({ type: "setModel", tabId: this.tabId, model, sessionOnly: true });
+  }
+
   recordedModel: string | undefined;
   permissionMode: PermissionModeId = "default";
   commands: SlashCommandInfo[] = [];
@@ -1292,164 +1302,140 @@ export class Tab {
   usage: UsageSnapshot | null = null;
   contextUsage: Extract<NormalizedEvent, { kind: "context_usage" }> | null = null;
   currentTurnId: string | null = null;
-  // このタブが turn_started・終端（完了/中断/失敗）・撤回のどれかで観測した turnId と、
-  // turn_started が届かないまま本文デルタで開いた turnId。孤児デルタの採用は
-  // onAssistantTextDelta の門（provenance が history でない・turnId が currentTurnId と違う）を
-  // 通った先で、この 2 つを見て決める。既知の turnId を採用すると、次のターンが始まった後に
-  // 届く遅延 final が終わったターンを開き直す
+  // 孤児デルタの採用可否は adoptOrphanTurn が knownTurnIds で決める。既知の turnId を採用すると、次のターン開始後に届く遅延 final が
+  // 終わったターンを開き直す（verify-detail-cards#OAmut-2）。adoptedTurnIds は採用したターンを turn_started で開き直さないために持つ。
   private readonly knownTurnIds = new Set<string>();
   private readonly adoptedTurnIds = new Set<string>();
-  // snapshot 再生が終わったか。main.ts は再生ループの直後に installHistoryHead() を呼び、
-  // 再生しない経路（hydration loading）でも必ず呼ぶので、これが再生中かどうかの唯一の目印になる。
-  // 再生窓が turn_started を切り落としただけの採用を live の異常として診断に出さない（OA-8）
+  // src/webview/main.ts は再生しない経路でも installHistoryHead を呼ぶので、replayDone が再生中かどうかの唯一の目印になる。
+  // 再生窓が turn_started を落としただけの採用を live の異常として診断しない（verify-detail-cards#OA-8）。
   private replayDone = false;
-  // 楽観的 running 中（turn_started 未着）フラグ。APIキー除去警告以外の error 到着で idle へ戻す
   pendingSend = false;
   private currentAssistantBlock: HTMLElement | null = null;
   private assistantBuffer = "";
-  // live の本文記録が uuid・root のツール開始・ターン境界のどれかで閉じるまで true
   private liveRecordOpen = false;
-  // 開いた記録の後ろへ会話ブロックを置いたときのコンテナ。その記録が閉じたらこれを閉じる
+  private replyFinished = false;
   private convBlockAfterRecordIn: HTMLElement | null = null;
-  // 現在ターンで最後に作った assistant コンテナ。返信フッターはこの直後に置く（R-CNV-15）
+  // R-CNV-15: 返信フッターは replyFooterAnchor の直後に置く。
   private replyFooterAnchor: HTMLElement | null = null;
-  // api_retry の更新先ブロック（ターン毎にリセット）
+  private readonly suspendedReplies = new Map<string, ReturnType<Tab["captureReply"]>>();
   private retryBlock: HTMLElement | null = null;
 
-  // R-DSP-01: ターン終端でリトライ表示をDOMごと撤去する（回復後・replay後に
-  // 「再試行中」の警告が恒久残留する）
+  // R-DSP-01: 撤去しないと、回復後や再生後も再試行中の警告が残る。
   private clearRetryBlock(): void {
     this.retryBlock?.remove();
     this.retryBlock = null;
   }
-  // delta batch（rAF でまとめて描画）
   private pendingDeltaText = "";
   private rafScheduled = false;
-  // 保留中デルタの turnId。currentTurnId は次の turn_started で先に進むので、
-  // セグメントの帰属はデルタ受理時の値で決める
+  // currentTurnId は次の turn_started で先に進むので、セグメントの帰属はデルタ受理時の値で決める。
   private pendingDeltaTurnId: string | null = null;
   private currentSegTurnId: string | null = null;
-  // 会話面の最上部にある確定済みセグメントの turnId と原文。裏読みが同じ turnId のデルタを
-  // 積むとき、原文を連結して描き直すために 1 つだけ持つ（R-CNV-09）。上に別の発言が
-  // 乗った時点でそのセグメントは伸びないので、保持はこの 1 件で足りる
+  // R-CNV-09: prependPastConvEvents が裏読みの本文を結合する先。keepRecordOpen で末尾が書き込み可能なままの候補も含む。
   private topConvSeg: { turnId: string; el: HTMLElement; text: string; records: RecordTextPart[] } | null = null;
   private toolCards = new Map<string, HTMLElement>();
-  // 作業カード(toolgroup)。key = reducer の segmentId。過去カードのツールが遅れて終了しても、
-  // イベントに載った配置がそのカードを指すので混入しない。
   private segmentCards = new Map<string, SegmentCard>();
-  // 最初の replayed_message の前に一度だけ復元マーカーを出すためのフラグ
   private replayMarkerShown = false;
   private lastObservedModel: string | null = null;
-  // 復元マーカーの実体。会話の過去 chunk はこれより上へ入れる
-  // （マーカーは「ここから下が復元分」の意味なので、より古い復元分を下へ入れると意味が逆になる）
+  // 会話の過去 chunk は replayMarkerEl より上へ入れる。マーカーより下は復元分を意味するので、より古い分を下へ入れると意味が逆になる。
   private replayMarkerEl: HTMLElement | null = null;
   private convHistoryEl: HTMLElement | null = null;
   private convHistoryBodyEl: HTMLElement | null = null;
-  // 会話メッセージの同一性（transcript の uuid）。live の復元ブロックも登録するので、
-  // 取り寄せた過去 chunk と重複しない
+  // live の復元ブロックも登録する。登録しないと取り寄せた過去 chunk と重複する（verify-conversation-history#CH-C4）。
   private convMessageUuids = new Set<string>();
   private convPrependedTotal = 0;
-  // 会話面へ描いたイベントの識別子。作業ログ側の renderedEventKeys とは**別に持つ**。
-  // 共有すると、同じイベントを作業ログ側が先に描いた時点で会話側が「描画済み」と判断して
-  // 二度と描かれない（同じ chunk が両面へ別々に流れる設計のため）
+  // renderedEventKeys と共有しない。同じ chunk が両面へ別々に流れるので、共有すると作業ログ側が先に描いた時点で会話側が描かれなくなる。
   private renderedConvEventKeys = new Set<string>();
-  // 遡りで作った過去ターンの本文。chunk を跨いだ同一 turnId を1ブロックへ統合するために持つ。
-  // Tab インスタンスと寿命を共にするので clearTab / 再 resume では作り直される
   private pastConvTurns = new Map<string, { el: HTMLElement; text: string }>();
   private pastConvRecords = new Map<string, RecordTextPart[]>();
   private assistantLeadingRecord: { turnId: string; uuid: string } | null = null;
-  // 遡りで作った過去ターンの返信フッターと、その日時の出所。EventLog 位相の chunk では
-  // 本文（assistant_text_delta）と完了時刻（turn_completed）が別の chunk に割れうるので、
-  // 両方を turnId で持ち越して後から突き合わせる
+  // events 由来の chunk では本文と完了時刻が別の chunk に割れうるので、pastConvFooters と pastTurnCompletedAt を turnId で持ち越して突き合わせる。
   private pastConvFooters = new Map<string, HTMLElement>();
   private pastTurnCompletedAt = new Map<string, number>();
   private lastPastModel: string | null = null;
-  // 作業ログ側の復元マーカー（会話側とは独立に1回だけ出す）
   private workReplayMarkerShown = false;
-  // TodoWrite 専用カード（Tabごとに1枚。更新のたびにログ末尾へ移動）
   private todoCardEl: HTMLDetailsElement | null = null;
   private todoSummaryEl: HTMLElement | null = null;
   private todoListEl: HTMLElement | null = null;
-  // task（TODO行）ごとの作業コンテナ。key = reducer の taskKey。
   private todoWork = new Map<string, HTMLElement>();
-  // todo行の展開状態。展開はユーザー操作のみで変わる（再描画・status変化で自動開閉しない）
+  // 展開状態は利用者の操作でだけ変える。再描画や状態の変化で開閉しない。
   private todoRowOpen = new Map<string, boolean>();
-  // 記帳系（reducer が配置を作らなかった tool_call_started）の toolUseId。
-  // finished 側でツール行として扱わないためのガード。
+  // reducer が配置を作らなかった開始の toolUseId。終了側でツール行として扱わないために持つ。
   private nonWorkToolUseIds = new Set<string>();
-  // 実行時間計測: tool_call_started 時の envelope timestamp を保持し、finished で差分を取る。
-  // これはツール行1件の表示で、カードの集計ではない（カードの経過時間は WorkModel 側の値）。
   private toolStartTimes = new Map<string, number>();
-  // サブエージェント（Agent/Task ツール起動）のカード。toolUseId をキーに DOM 参照だけを持つ。
   private agentCards = new Map<string, AgentCardEntry>();
-  // 行の中身。agent 配下の並びは WorkRowData.childIds が持つ
   private rowData = new Map<string, WorkRowData>();
   private bgTaskIdToToolUseId = new Map<string, string>();
-  // ---------- WorkModel から受け取った値（このタブが描く数値の正本） ----------
-  // 直近に受け取った WorkModel の revision（DOM検証の同定に使う）
   private workRevision = 0;
   private segmentTotals = new Map<string, WorkSegmentView>();
-  // 過去 chunk 由来の集計と agent 状態。過去カードの描画にだけ使い、segmentTotals / agentStates
-  // へ混ぜない（R-TAB-09）。chunk は新しい側から届くので、revision が新しいものだけを残す
+  // R-TAB-09: 過去カードの描画にだけ使い、segmentTotals と agentStates へ混ぜない。chunk は新しい側から届くので、revision が新しい値だけを残す。
   private pastSegmentTotals = new Map<string, WorkSegmentView>();
   private pastAgentStates = new Map<string, WorkAgentStateView>();
   private taskTotals = new Map<string, WorkTaskTotalsView>();
   private agentStates = new Map<string, WorkAgentStateView>();
   private taskItems: WorkTaskItemView[] = [];
-  // 未解決の承認要求数。DOM を数え直さない（承認カードは会話パネル・作業ログ・ミラーに現れうる）
+  // 件数は WorkEventInfo の pendingApprovalCount から受ける。承認カードは会話面・作業ログ・ミラーに現れうるので DOM を数えない。
   private pendingApprovalCount = 0;
   private approvalCards = new Map<string, HTMLElement>();
   private approvalRefs = new Map<string, HTMLElement>();
-  // 配置情報の無いイベントを受けたことを1度だけ報告する（毎イベント送ると診断が溢れる）
+  // イベントごとに報告すると診断が溢れるので、一度だけ報告する。
   private missingWorkInfoReported = false;
-  // 過去 chunk 再生中だけ非 null
   private pastRender: PastRenderContext | null = null;
-  // 作業ログの履歴挿入点。chrome（overview の 4 要素）の下・ログ本体の上に居る
   private historyHeadEl: HTMLElement | null = null;
   private historyMoreEl: HTMLElement | null = null;
   private historyBodyEl: HTMLElement | null = null;
-  // 描画済みイベントの識別子（generation:seq）。cursor は消費されない設計なので同じ chunk が
-  // 何度でも返る。要求単位ではなくイベント単位で弾く必要がある（契約 C4）
+  // cursor は消費されないので同じ chunk が何度でも返る。要求単位でなくイベント単位で弾く（verify-history-prepend#HPmut-2）。
   private renderedEventKeys = new Set<string>();
-  // 反映先がまだ無い更新イベントの保留。窓境界や chunk 境界を跨ぐと、更新のほうが先に
-  // 処理され対象の行が後から作られる並びが実際に起きる。保留しないと
-  // 「永久 running」「モデルチップが宣言値のまま」「解決済み承認が未解決に見える」になる（契約 C5）。
-  // 対象が作られた時点で当て直し、当てたら消す
+  // 窓境界や chunk 境界を跨ぐと、更新が対象の行より先に処理される。保留しないとツールが running のまま残り、
+  // モデルチップが宣言値のまま、解決済み承認が未解決に見える。対象を作った時点で当て直して消す（verify-history-prepend#HPmut-3）。
   private orphanFinishes = new Map<string, Extract<NormalizedEvent, { kind: "tool_call_finished" }>>();
   private orphanSubagentInfo = new Map<string, Extract<NormalizedEvent, { kind: "subagent_info" }>>();
   private orphanApprovalResolved = new Map<
     string,
     Extract<NormalizedEvent, { kind: "approval_resolved" }>
   >();
-  // reducer が stale へ移したが行がまだ無かった toolUseId（orphanFinishes とは別に数える）
+  // reducer が stale へ移したが行がまだ無かった toolUseId（verify-history-prepend#HPmut-14）。
   private orphanStaled = new Set<string>();
-  // 突合用の累計。workEl 配下の .hll-past の実数と一致していなければ、作った行が
-  // 未接続コンテナへ落ちている（契約 C1b / C4b）。
-  // これらの履歴状態に明示的な破棄経路は無い。tabCleared / init / tabClosed は
-  // いずれも Tab インスタンスごと作り直すので、寿命はインスタンスと同一（契約 C9）
+  // workEl 配下の `.hll-past` の実数と一致しなければ、作った行が未接続コンテナへ落ちている（verify-history-prepend#HPmut-5）。
+  // 履歴状態は tabCleared でも Tab ごと作り直されるので、個別の破棄経路を持たない。
   private pastRenderedTotal = 0;
 
-  // ---------- タイトル右の状態行 ----------
-  // サブエージェント配下で実行中の子ツール（key=子のtoolUseId）。親の委任を観測できない間もタブを点灯させる（isTabActive）。
-  // 所有権（H-3）: turn_started・終端イベント（turn_completed/turn_interrupted/turn_failed/conversation_closed）でクリア。
+  // 親の委任を観測できない間も isTabActive でタブを点灯させるために持つ。
   private runningChildTools = new Map<string, { name: string; parentId: string }>();
-  // 点灯・帯の背景側（委任の生存・背景タスク集合）。規則は background-activity.ts だけが持ち、Host も同じ fold を回す。
-  // snapshot が運ぶ Host の現在値で置き換える（replaceBackgroundActivity）。再生したイベントだけから作ると、
-  // 窓から起動と集合信号が落ちた背景だけのタブが消灯する（R-SES-02）
+  // 規則は src/background-activity.ts だけが持つ。snapshot の Host 現在値で置き換える（replaceBackgroundActivity）。
+  // 再生したイベントだけから作ると、窓から起動が落ちた背景だけのタブが消灯する（R-SES-02）。
   private activity: BackgroundActivityState = createBackgroundActivityState();
-  // 新規セッションの 1 ターン目は provider 時刻が未観測で turn_started.timestamp が 0（Host は実時計で埋めない）。
-  // 0 を起点にすると経過表示が 1970 年起点（約 56 年）になるため、表示用の起点は webview の壁時計で補う
+  // 新規セッションの最初のターンは provider 時刻が未観測で turn_started の timestamp が 0 になり、Host は実時計で埋めない。
+  // 0 を起点にすると経過表示がエポック起点になるので、表示用の起点は webview の壁時計で補う。
   private stripStartedAt: number | null = null;
+  private stripSince: number | null = null;
+  private runningMainTools = new Map<string, { name: string; intentInput?: ToolIntentInput }>();
+  private logRefreshPending = false;
+  private readonly logFoldOverrides = new Map<string, boolean>();
+  private readonly logTurnAliases = new Map<string, string>();
+  private readonly logTurnEnds = new Map<string, number>();
+  private readonly logRequests = new Map<string, LogRequest>();
+  private readonly logAnchors = new Map<string, HTMLElement>();
+  private readonly logTaskRequests = new Set<string>();
+  private readonly logDirty = new Set<string>();
+  private readonly logToolRequests = new Map<string, string>();
+  private readonly logFinishOrder = new Map<string, number[]>();
+  private readonly logRunningLabels = new Map<string, (now: number) => void>();
+  private readonly logRequestMeta = new Map<string, NonNullable<WorkModelPayload["requests"]>[number]>();
+  private logLatestRequest: string | undefined;
+  private logEventTurn: string | undefined;
+  private workModel: WorkModelPayload | undefined;
+  private openYouCount = 0;
   private stripWrapEl!: HTMLElement;
   private stripEl!: HTMLElement;
+  private stripSpinnerEl!: HTMLElement;
   private stripTextEl!: HTMLElement;
   private stripTimeEl!: HTMLElement;
+  private stripNoteEl!: HTMLElement;
 
   constructor(readonly tabId: string, public title: string) {
     this.logEl = document.createElement("div");
     this.logEl.className = "log";
-    // パネルより前に置くことで #logs に対する position:sticky が効き、
-    // どちらのパネルを見ていても常に見える
+    // パネルより前に置かないと logsEl に対する sticky が効かない。
     this.headEl = document.createElement("div");
     this.headEl.className = "log-head";
     this.headEl.dataset.view = "conv";
@@ -1469,14 +1455,13 @@ export class Tab {
     progress.append(this.buildConvLoad(), this.buildHandoffStatus());
     heading.append(titleBlock, progress);
     this.buildStrip(progress);
-    // 裏読みの帯・状態行・PLAN の帯は syncHeadLayout を通らない契機でも高さが変わる。高さの変化を全て拾って .wg-head の貼り付き位置へ渡す
+    // headEl の高さは syncHeadLayout を通らない契機でも変わるので、ResizeObserver でも syncLogHeadHeight を呼ぶ。
     if (typeof ResizeObserver !== "undefined") new ResizeObserver(() => this.syncLogHeadHeight()).observe(this.headEl);
 
     this.convEl = document.createElement("div");
     this.convEl.className = "panel panel-conv active";
     this.convEl.id = `panel-conv-${this.tabId}`;
     this.convEl.setAttribute("role", "tabpanel");
-    // タブと相互参照させ、パネル自体もキーボードで到達できるようにする（AR5-L6）
     this.convEl.setAttribute("aria-labelledby", `viewtab-conv-${this.tabId}`);
     this.convEl.tabIndex = 0;
     this.workEl = document.createElement("div");
@@ -1487,8 +1472,13 @@ export class Tab {
     chat.append(this.convEl);
     content.append(chat, this.workEl);
     this.planPanel = new PlanPanel(chat, this.headEl, this.tabId);
-    this.chatYou = new YouList(this.youItems, item => this.navigateToYou(item), (count, total) => this.planPanel.setWaiting(count, total), item => this.dismissYou(item));
-    this.summaryYou = new YouList(this.youItems, item => this.navigateToYou(item), undefined, item => this.dismissYou(item));
+    this.chatYou = new YouList(this.youItems, item => this.navigateToYou(item), (count, total) => {
+      this.planPanel.setWaiting(count, total);
+      this.openYouCount = count;
+      // R-SES-11: the constructor's initial notification precedes tabBtn; updateStrip uses syncTabDot.
+      if (this.tabBtn !== undefined) this.updateStrip();
+    }, item => this.dismissYou(item), model => this.restoreFallbackModel(model));
+    this.summaryYou = new YouList(this.youItems, item => this.navigateToYou(item), undefined, item => this.dismissYou(item), model => this.restoreFallbackModel(model));
     this.planPanel.you.append(this.chatYou.element);
     this.logEl.appendChild(content);
     logsEl.appendChild(this.logEl);
@@ -1508,13 +1498,11 @@ export class Tab {
     const label = document.createElement("span");
     label.className = "tab-label";
     label.textContent = title;
-    // タブの表示幅は CSS で切れるので、ツールチップが唯一の識別手段になる。
-    // rename() だけでなく生成時にも設定する（無いと履歴から開いたタブで似た名前のセッションを取り違える）
+    // タブ名は CSS で切れるので、似た名前のセッションを見分けるために rename だけでなく生成時にも title を設定する。
     label.title = title;
     this.labelEl = label;
     const dot = document.createElement("span");
     dot.className = "tab-dot";
-    // 閉じるはキーボード到達可能な button にする
     const close = document.createElement("button");
     close.className = "tab-close";
     close.textContent = "×";
@@ -1586,14 +1574,13 @@ export class Tab {
     this.syncLogHeadHeight();
   }
 
-  // グラフの .wg-head（zoom bar・ミニマップ・時間軸）は .log-head の直下に貼り付く（main.css .wg-head の top）
+  // `--log-head-h` は media/main.css の `.wg-head` の top が読む。
   private syncLogHeadHeight(): number {
     const headH = this.headEl.getBoundingClientRect().height;
     if (headH > 0) this.logEl.style.setProperty("--log-head-h", `${headH}px`);
     return headH;
   }
 
-  // The per-session navigation is separate from the top-level session tabbar.
   private buildViewSwitch(): void {
     const list = document.createElement("nav");
     list.className = "view-switch";
@@ -1701,7 +1688,6 @@ export class Tab {
     this.syncViewTabs(moveFocus);
   }
 
-  // 引き継ぎの進行はタイトル・日付の右側へ置き、会話本文の領域を食わない。
   private buildHandoffStatus(): HTMLElement {
     const wrap = document.createElement("div");
     wrap.className = "handoff-status hidden";
@@ -1724,7 +1710,6 @@ export class Tab {
     return wrap;
   }
 
-  // 過去ログの裏読みもヘッダー右列へ置き、独立した進行行で高さを増やさない。
   private buildConvLoad(): HTMLElement {
     const wrap = document.createElement("div");
     wrap.className = "conv-load hidden";
@@ -1749,33 +1734,28 @@ export class Tab {
     return wrap;
   }
 
-  // 会話の裏読み進行の唯一の表示口。数字は Host が申告した残件をそのまま出す。
-  // 単位語を付けない: events phase は NormalizedEvent 件数、transcript phase はメッセージ件数で、
-  // 同じ数字の実体が phase で変わる
+  // remaining に単位語を付けない。取得元によって数える単位が変わる。
   setConvLoadProgress(state: LoadProgressState | { phase: "done" }): void {
-    // 読み終わったら消す。完了状態は出さない（R-CNV-02）
+    // R-CNV-02: 完了状態を表示しない。
     this.convLoadState = state.phase === "done" ? null : state;
     this.renderLoadSlot();
     // 検索の件数注記は読み込み状態に連動する。ここで描き直さないと終端後も「読み込み中」が残る（R-DSP-03）
     if (this.tabId === activeTabId) refreshFindCount();
   }
 
-  // 検索バーの件数注記が読む。loading = 遡りが進行中で件数は途中、failed = 途中で止まった
   convHistoryLoadState(): "loading" | "failed" | null {
     const state = this.convLoadState;
     if (state === null) return null;
     return state.phase === "failed" ? "failed" : "loading";
   }
 
-  // 状況面（作業ログ）の裏読み進行の唯一の表示口。残件は Host が申告した NormalizedEvent 件数
   setWorkLoadProgress(state: LoadProgressState | { phase: "done" }): void {
-    // 読み終わったら消す。完了状態は出さない（R-TAB-08）
+    // R-TAB-08: 完了状態を表示しない。
     this.workLoadState = state.phase === "done" ? null : state;
     this.renderLoadSlot();
   }
 
-  // 会話面と状況面の進行を混同させない。見ている面の進行だけを出し、
-  // もう一方の面の進行は裏で続いていても描かない（R-CNV-02 / R-TAB-08）
+  // R-CNV-02 / R-TAB-08: 見ている面の進行だけを描き、裏で続くもう一方の面の進行は描かない。
   private renderLoadSlot(): void {
     const state = this.viewMode === "conv" ? this.convLoadState : this.workLoadState;
     if (state === null) {
@@ -1813,15 +1793,10 @@ export class Tab {
     this.convLoadEl.classList.remove("hidden");
   }
 
-  // 表示モードを切り替える。スクロール位置はモードごとに退避・復元する。
-  // moveFocus=true はキーボード操作時（ロービングtabindexの移動先へフォーカスを送る）。
-  // persist=false は復元中に使う。復元ループの途中で persistState() を走らせると、
-  // まだ tabs へ登録されていないタブの views が欠落し、未入力の inputEl で下書きを
-  // 空に上書きしてしまう。
+  // 復元中は persist を false にする。復元の途中で persistState を呼ぶと、未登録タブの状態が欠落し、下書きを空で上書きする。
   setViewMode(mode: ViewMode, moveFocus = false, persist = true): void {
     if (mode !== this.viewMode && activeTabId === this.tabId) noteSurfaceChange();
     if (mode !== this.viewMode) {
-      // 現在のパネルのスクロール位置を退避してから切り替える
       if (activeTabId === this.tabId) {
         this.scrollPos[this.viewMode] = logsEl.scrollTop;
         this.knownAnchor[this.viewMode] = this.atBottom[this.viewMode] ? undefined : this.measureAnchor(this.viewMode);
@@ -1841,6 +1816,8 @@ export class Tab {
       this.placeSurface(mode);
       if (moveFocus) this.syncViewTabs(true);
     }
+    // placeSurface より後に呼ぶ。先に見せると溜めた行の補正を当てた位置を placeSurface の復元が上書きする（verify-work-graph#G-100）。
+    this.setWorkViewVisible?.(mode === "work");
     refreshComposer();
     this.renderLoadSlot();
     if (mode === "conv") onConvViewShown?.(this.tabId);
@@ -1855,12 +1832,15 @@ export class Tab {
     const target = this.toolCards.get(toolUseId) ?? this.agentCards.get(toolUseId)?.card;
     if (target === undefined) return;
     this.selectPane("log");
+    this.refreshLogRequests();
+    this.openLogRequest(target);
     let details = target.closest("details");
     while (details instanceof HTMLDetailsElement) {
+      this.openLogRequest(details);
       details.open = true;
       details = details.parentElement?.closest("details") ?? null;
     }
-    const stickyHeight = this.headEl.getBoundingClientRect().height;
+    const stickyHeight = this.headEl.getBoundingClientRect().height + (this.workEl.querySelector(".wl-head")?.getBoundingClientRect().height ?? 0);
     target.style.scrollMarginTop = `${Math.ceil(stickyHeight) + 8}px`;
     target.scrollIntoView({ block: "start" });
     target.classList.add("flash");
@@ -1895,12 +1875,10 @@ export class Tab {
     this.scrollPos.conv = logsEl.scrollTop;
   }
 
-  // 会話面に該当ターンの塊があるか。概要の「会話」ボタンは飛び先が無ければ出さない（AR5-L3 と同じ規律）
   hasConversationTurn(turnId: string): boolean {
     return this.convEl.querySelector(`[data-turn-id="${CSS.escape(turnId)}"]`) !== null;
   }
 
-  // 概要の往復の行から会話面の該当ターンへ飛ぶ（R-CNV-03 の data-turn-id）
   navigateToConversationTurn(turnId: string): void {
     const target = this.convEl.querySelector<HTMLElement>(`[data-turn-id="${CSS.escape(turnId)}"]`);
     if (target === null) return;
@@ -1914,9 +1892,8 @@ export class Tab {
     this.scrollPos.conv = logsEl.scrollTop;
   }
 
-  // 状況のサブタブ切替。WorkOverview.setMode の先頭で呼ばれ、離れる側の位置を退避する。
-  // 返す関数は applyMode（hidden の付け替え）の後に呼ばれ、入る側の位置を当て直す。
-  // 隠れたパネルの scrollTop は内容高が縮んで clamp されるので、退避は隠す前でなければならない
+  // src/webview/work-overview.ts#WorkOverview の setMode が面を隠す前に呼び、返した関数を面の付け替え後に呼ぶ。
+  // 隠れた面の scrollTop は内容高が縮んで clamp されるので、退避は隠す前に行う。
   switchWorkViewScroll(prev: WorkViewMode, next: WorkViewMode): () => void {
     const visible = activeTabId === this.tabId && this.viewMode === "work";
     // holdsWorkScroll は現在の workView を見る。書き換える前後で離れる側・入る側の hold を取る
@@ -1937,7 +1914,6 @@ export class Tab {
       // hold 中は記録した値に関わらず末尾へ復元しない（記録側と二重に見る）
       const toBottom = this.workViewAtBottom[next] && !heldNext;
       if (!visible) {
-        // 次に状況を開いたとき（setViewMode）が、入る側のサブタブの位置へ当たるようにしておく
         this.atBottom.work = toBottom;
         this.scrollPos.work = this.workViewScrollPos[next];
         return;
@@ -1953,8 +1929,7 @@ export class Tab {
     };
   }
 
-  // グラフの窓が可視帯を測る口。top は topVisibleToolRow と同じ量（.log-head の下端）。
-  // 状況面が表示中でなければ矩形が 0 になるので測らせない
+  // top は topVisibleToolRow と同じ基準にする。状況面が非表示だと矩形が 0 になるので、rect は undefined を返す。
   graphScrollPort(): GraphScrollPort {
     return {
       rect: () => {
@@ -1999,12 +1974,9 @@ export class Tab {
     return null;
   }
 
-  // 1 つ前の自分の発言へ移動する。押すたびに 1 つずつ古い方へ進む（R-CNV-03）。
-  // 走査対象は会話面の `.block.user` を document 順に並べたもので、ライブ・復元・
-  // 取り寄せた過去を区別しない（利用者から見ればどれも「自分の発言」）。
-  // 飛び先が無いときは何もしない（戻り値は持たない: 呼び出し側に分岐は無い）
+  // R-CNV-03: 会話面の `.block.user` を document 順に走査し、live・復元・取り寄せた過去を区別しない。
   scrollToPreviousUserBlock(): void {
-    // 起点の計算は会話面の実測寸法に依存し、非表示パネル（display:none）では矩形が
+    // 起点の計算は会話面の描画後の寸法に依存し、非表示パネル（display:none）では矩形が
     // すべて 0 になる。測る前に会話面へ出す。既に会話面なら通さない —
     // setViewMode は同じ mode でも退避済みスクロール位置を当て直すため、
     // 通すと測る前に視点が動く
@@ -2040,7 +2012,6 @@ export class Tab {
     this.scrollPos.conv = logsEl.scrollTop;
   }
 
-  // いま見ている面の最新位置へ戻る。
   scrollToLatest(): void {
     this.convCursorEl = null;
     // 明示操作なので遡り中の張り付き抑止を解除する。順序を入れ替えると ↓ が効かない（R-CNV-04）
@@ -2048,8 +2019,7 @@ export class Tab {
     this.scrollToBottom(this.viewMode, true);
   }
 
-  // 会話側に「応答が要る／致命的な問題が出た」ことを、作業ログ表示中でも見落とさせない。
-  // 自動で画面は切り替えない（要件8）ため、切替タブ側で注意を促すに留める。
+  // 画面は自動で切り替えず、切替タブ側で注意を促すに留める。
   private flagConvAttention(): void {
     if (this.viewMode === "conv") return;
     this.viewTabs.chat?.classList.add("needs-attention");
@@ -2059,14 +2029,11 @@ export class Tab {
     this.viewTabs.chat?.classList.remove("needs-attention");
   }
 
-  // 復元後に注意表示を貼り直す。再生中は viewMode がまだ "conv" なので flagConvAttention は何もせず、
-  // 作業ログ表示で復元したタブに未応答の承認が残っていても赤字が出ない
-  // 過去の失敗は復元しない（応答待ちではないため）。
+  // 再生中は viewMode がまだ会話面なので flagConvAttention が何もしない。復元後にここで貼り直す。過去の失敗は応答待ちではないので貼り直さない。
   syncConvAttention(): void {
     if (this.hasPendingApproval()) this.flagConvAttention();
   }
 
-  // 未解決の承認があるか。件数は WorkModel が持つ。DOM を走査して数えない（ヘッダのミラーまで拾って誤検知する）。
   private hasPendingApproval(): boolean {
     return this.pendingApprovalCount > 0;
   }
@@ -2087,30 +2054,41 @@ export class Tab {
     this.stripTextEl.className = "status-strip-text";
     this.stripTimeEl = document.createElement("span");
     this.stripTimeEl.className = "status-strip-time";
-    this.stripEl.append(spinner, this.stripTextEl, this.stripTimeEl);
+    this.stripSpinnerEl = spinner;
+    this.stripNoteEl = document.createElement("span");
+    this.stripNoteEl.className = "status-strip-note";
+    this.stripEl.append(this.stripTextEl, this.stripNoteEl, this.stripTimeEl, spinner);
 
     wrap.append(this.stripEl);
     progress.appendChild(wrap);
   }
 
-  // タイトル右の状態行。turnState/taskItems が変わる箇所（setTurnState・applyWork・renderTaskCard 等）から呼ぶ。
-  // 背景作業・エージェントの一覧はここへ出さない（PLAN の NOW と狭幅の引き出しが持つ）
+  // R-SES-11: src/webview/status-line.ts#deriveStatusLine selects the observed status.
   updateStrip(): void {
     this.syncTabDot();
-    const visible = this.turnState !== "idle";
-    this.stripWrapEl.classList.toggle("hidden", !visible);
-    if (visible) {
-      const inProgress = this.taskItems.find(item => item.status === "in_progress");
-      this.stripTextEl.textContent = inProgress?.activeForm ?? l10n.t("Generating response…");
-      this.updateStripElapsed();
-    }
+    const runningTool = [...this.runningMainTools.values()].at(-1);
+    const line = deriveStatusLine({
+      turnState: this.turnState,
+      turnStartedAt: this.stripStartedAt,
+      runningTool: runningTool?.name ?? null,
+      intentInput: runningTool?.intentInput,
+      runningDelegations: runningDelegationIds(this.activity),
+      workModel: this.workModel,
+      openYouCount: this.openYouCount,
+      declared: this.taskItems.find(item => item.status === "in_progress")?.activeForm ?? null,
+    });
+    this.stripWrapEl.classList.toggle("hidden", line.kind === "none");
+    this.stripSpinnerEl.hidden = line.kind === "waiting";
+    const label = statusLineText(line);
+    this.stripTextEl.textContent = truncateToolIntent(label);
+    this.stripTextEl.title = label;
+    this.stripNoteEl.textContent = line.kind === "conductor" || line.kind === "delegated" ? line.declared ?? "" : "";
+    this.stripSince = line.kind === "conductor" || line.kind === "delegated" ? line.since : null;
+    this.updateStripElapsed();
     this.syncHeadLayout();
   }
 
-  // このタブが「動いている」かの唯一の述語。サブエージェント・バックグラウンドだけが
-  // 動いている間も点ける。turnState 単独で判定しない（R-SES-02）。
-  // 委任の項が「サブエージェントだけが動いている」場合の本体で、この項を外すと
-  // その場合に turn_completed の時点で必ず偽になる（背景タスクが別に立っていない限り）
+  // R-SES-02: turnState 単独で判定しない。委任の項を外すと、サブエージェントだけが動いているタブが turn_completed で消灯する（verify-conversation-history#CH-S1mut）。
   private isTabActive(): boolean {
     return (
       this.turnState !== "idle" ||
@@ -2143,27 +2121,32 @@ export class Tab {
     return this.isTabActive();
   }
 
-  // 経過時間表示のみの軽量更新（1秒毎のグローバルタイマーから呼ぶ）。
   private updateStripElapsed(): void {
-    if (this.stripStartedAt === null) {
+    if (this.stripSince === null) {
       this.stripTimeEl.textContent = "";
       return;
     }
-    const sec = Math.max(0, Math.floor((Date.now() - this.stripStartedAt) / 1000));
+    const sec = Math.max(0, Math.floor((Date.now() - this.stripSince) / 1000));
     const mm = String(Math.floor(sec / 60)).padStart(2, "0");
     const ss = String(sec % 60).padStart(2, "0");
     this.stripTimeEl.textContent = `${mm}:${ss}`;
   }
 
-  // グローバル1秒タイマーからの呼び出し口（アクティブタブのみ・かつ実行中の間だけ意味がある）。
-  // タブ毎の setInterval は持たない＝タブ閉鎖時のタイマーリークが構造的に起きない（要件4）。
-  tickStrip(): void {
-    if (this.turnState !== "idle") this.updateStripElapsed();
+  // タブごとの setInterval を持たない。閉じたタブのタイマーを残さないよう、src/webview/main.ts#initTicker の共通タイマーから呼ぶ。
+  tickStrip(now = Date.now()): void {
+    if ((this.viewMode === "work" && this.workView === "log") || this.logRunningLabels.size > 0) {
+      for (const update of this.logRunningLabels.values()) update(now);
+    }
+    if (this.stripSince !== null) this.updateStripElapsed();
   }
 
   private notifiedActive: boolean | undefined;
 
   setTurnState(state: "idle" | "running" | "interrupting"): void {
+    if (this.turnState !== state && this.currentTurnId !== null) {
+      this.logDirty.add(this.logTurnAliases.get(this.currentTurnId) ?? this.currentTurnId);
+      this.scheduleLogRefresh();
+    }
     this.turnState = state;
     this.updateStrip();
     if (activeTabId === this.tabId) refreshChrome();
@@ -2179,14 +2162,9 @@ export class Tab {
     block.prepend(label);
   }
 
-  // target で表示先パネルを選ぶ。既定は会話（ユーザーの判断・読解に関わるもの）。
-  // 内部進行ログ（リトライ・診断など）は "work" を明示する。
   addBlock(cls: string, text: string, markdown = false, target: ViewMode = "conv", model: string | null = null): HTMLElement {
-    // 会話へブロックを差し込むときは、進行中のassistantコンテナを閉じる。
-    // 閉じないと、このブロックの後に再開した本文が「このブロックより上のコンテナ」へ
-    // 追加され、時系列が逆転する。クラス名の前方一致で除外しない（"assistant replayed" も startsWith("assistant") に一致する）。
-    // ライブ本文は appendAssistantSegment 経由で addBlock を通らないため影響しない。
-    // 例外は記録の途中（endAssistantTurnBeforeConvBlock）。
+    // 進行中の assistant コンテナを閉じないと、このブロックの後に再開した本文がこのブロックより上のコンテナへ入り、時系列が逆転する。
+    // クラス名の前方一致で除外しない（再生した assistant ブロックのクラスも一致する）。記録の途中の扱いは endAssistantTurnBeforeConvBlock が持つ。
     if (target === "conv") this.endAssistantTurnBeforeConvBlock();
     const div = document.createElement("div");
     div.className = `block ${cls}`;
@@ -2196,6 +2174,7 @@ export class Tab {
       if (div.classList.contains("user")) this.prependTurnLabel(div, "user");
       else if (div.classList.contains("assistant")) this.prependTurnLabel(div, "assistant", model);
     }
+    if (target === "work") this.registerLogMember(div);
     (target === "work" ? this.workEl : this.convEl).appendChild(div);
     // 新しい発言が末尾へ増えたら「↑」の起点を最新へ戻す。上へ prepend されたときは
     // 起点が指す要素は変わらないので落とさない
@@ -2205,10 +2184,8 @@ export class Tab {
     return div;
   }
 
-  // 表示中のパネルへ追記したときだけ追従する。裏のパネルへの追記でスクロールを動かさない。
-  // 裏のパネルは「最下部に張り付いていたか」を保持し、張り付いていたときだけ末尾へ更新する
-  // （途中まで読んで別パネルへ移ったユーザーの位置を奪わない）。
-  // explicit は利用者の「最新へ」。グラフの窓（graphHold）は、見ている区間を Host 起因の追記で動かさない
+  // 裏の面は張り付いていたときだけ末尾へ更新し、途中まで読んだ位置を奪わない。
+  // graphHold 中は、利用者の明示操作（explicit）以外の追記で見ている区間を動かさない。
   private scrollToBottom(target: ViewMode = this.viewMode, explicit = false): void {
     if (!explicit && target === "work" && this.holdsWorkScroll()) return;
     if (activeTabId !== this.tabId) {
@@ -2219,13 +2196,11 @@ export class Tab {
       if (this.atBottom[target]) this.scrollPos[target] = Number.MAX_SAFE_INTEGER;
       return;
     }
-    if (!this.atBottom[target]) return; // 上へ遡って読んでいる最中は引き戻さない
+    if (!this.atBottom[target]) return;
     logsEl.scrollTop = logsEl.scrollHeight;
   }
 
-  // 追記の末尾追従（scrollToBottom）・張り付き記録（noteScroll）・サブタブ往復の退避と復元
-  // （switchWorkViewScroll）の 3 つがこれ 1 つを見る。1 つでも外すと、復元経路が末尾へ飛ぶ材料
-  // （atBottom.work / workViewAtBottom.graph）が残る
+  // scrollToBottom・noteScroll・switchWorkViewScroll はどれもこの述語を見る。どれか一つでも外すと、復元経路が末尾へ飛ぶ材料が残る。
   private holdsWorkScroll(): boolean {
     return this.workView === "graph" && this.graphHold;
   }
@@ -2235,7 +2210,6 @@ export class Tab {
     return this.atBottom[mode];
   }
 
-  // #logs のスクロールに追従して「最下部に張り付いているか」を記録する（表示中パネル分）。
   noteScroll(): void {
     const gap = logsEl.scrollHeight - logsEl.scrollTop - logsEl.clientHeight;
     // hold 中は張り付きを記録しない。復元経路（setViewMode / restoreScroll / switchWorkViewScroll）が末尾へ飛ぶ材料になる
@@ -2243,7 +2217,6 @@ export class Tab {
     this.scrollPos[this.viewMode] = logsEl.scrollTop;
   }
 
-  // このタブがアクティブになったときのスクロール復元。
   restoreScroll(): void {
     this.syncHeadLayout();
     this.placeSurface(this.viewMode);
@@ -2251,7 +2224,6 @@ export class Tab {
     this.scrollRestored = true;
   }
 
-  // 張り付きなら末尾、持ち越した行があれば一度だけその行、どちらでもなければ退避した位置
   private placeSurface(mode: ViewMode): void {
     const anchor = this.carryAnchor[mode];
     delete this.carryAnchor[mode];
@@ -2273,8 +2245,7 @@ export class Tab {
     if (this.carryAwaitsConvBackfill) this.awaitedConvAnchor = anchor;
   }
 
-  // 行が窓に無い実行ログは末尾へ置く。末尾でないと裏読み（mayRequestBackfill は実行ログの張り付きを見る）が止まり、
-  // 状況の数字が読み終わらない（R-TAB-07）
+  // R-TAB-07: src/webview/main.ts#mayRequestBackfill は実行ログの張り付きを見るので、末尾に置かないと裏読みが止まり、状況の数字が読み終わらない。
   private placeWorkAtBottomForBackfill(): void {
     delete this.knownAnchor.work;
     this.stickWorkToBottom();
@@ -2317,7 +2288,6 @@ export class Tab {
     return row === root ? null : row;
   }
 
-  // 可視帯の先頭の行。表示中の面でだけ測れる
   private measureAnchor(mode: ViewMode): RowAnchor | undefined {
     if (activeTabId !== this.tabId || this.viewMode !== mode) return undefined;
     if (mode === "work" && this.workView !== "log") return undefined;
@@ -2354,8 +2324,6 @@ export class Tab {
     return undefined;
   }
 
-  // 作り直しの前に今の位置を行で退避する。当てる前（unappliedCarry）は受け取った値をそのまま返す。
-  // measure=false は #logs.scrollTop が最後に測ったときと同じなら行を測らず、記録済みの張り付き・位置と最後に測った行から組む（persistState 用）
   captureScrollCarry(measure = true): ScrollCarry {
     if (this.unappliedCarry !== undefined) return this.unappliedCarry;
     const live = activeTabId === this.tabId && this.scrollRestored && (measure || logsEl.scrollTop !== this.anchorMeasuredTop);
@@ -2384,8 +2352,7 @@ export class Tab {
     };
   }
 
-  // addTab の最後（状況のサブタブを戻した後）に呼ぶ。サブタブの復元（switchWorkViewScroll）は面の値を
-  // 書き換えるので、先に入れると上書きされる。位置を当てるのは restoreScroll / setViewMode
+  // src/webview/main.ts#addTab で状況のサブタブを戻した後に呼ぶ。switchWorkViewScroll が面の値を書き換えるので、先に入れると上書きされる。
   applyScrollCarry(carry: ScrollCarry, convBackfill: boolean): void {
     const held = this.holdsWorkScroll();
     const sameWorkView = carry.workView === this.workView;
@@ -2411,12 +2378,11 @@ export class Tab {
     this.unappliedCarry = carry;
   }
 
-  // スクロールが落ち着いたとき（main.ts の遅延保存）に、表示中の面の行を測り直す
   noteScrollAnchor(): void {
     if (this.unappliedCarry === undefined && activeTabId === this.tabId && this.scrollRestored) this.captureScrollCarry();
   }
 
-  // タブを離れるとき。表示していない間は矩形が測れないので、ここで行を控える。遡り待ちはここで諦める
+  // タブを離れた後は矩形が測れないので、ここで行を控える。
   noteLeavingScroll(): void {
     this.awaitedConvAnchor = undefined;
     this.knownAnchor[this.viewMode] = this.atBottom[this.viewMode] ? undefined : this.measureAnchor(this.viewMode);
@@ -2424,7 +2390,6 @@ export class Tab {
     this.scrollRestored = false;
   }
 
-  // 会話の遡りが先頭へ積んだ後。待っている行が届いていれば合わせる
   realignScrollAnchor(): void {
     const anchor = this.awaitedConvAnchor;
     if (anchor === undefined || activeTabId !== this.tabId || this.viewMode !== "conv") return;
@@ -2435,12 +2400,12 @@ export class Tab {
     this.awaitedConvAnchor = undefined;
   }
 
-  // snapshot再生の直後に呼ぶ。旧 DOM への参照は、位置を持ち越す作り直しでも消す
+  // 旧 DOM への参照は、位置を持ち越す作り直しでも消す。
   resetReplayArtifacts(): void {
     this.convCursorEl = null;
   }
 
-  // 持ち越す位置が無いときだけ呼ぶ。会話面を「最新に追従」、状況の 4 タブを初期状態（実行ログだけ追従・他は先頭）へ戻す
+  // 持ち越す位置が無いときだけ呼ぶ。
   resetScrollPosition(): void {
     this.workViewScrollPos = { summary: 0, graph: 0, analysis: 0, log: 0 };
     this.workViewAtBottom = { ...WORK_VIEW_AT_BOTTOM_INITIAL };
@@ -2449,14 +2414,12 @@ export class Tab {
     if (activeTabId === this.tabId) logsEl.scrollTop = this.atBottom[this.viewMode] ? logsEl.scrollHeight : 0;
   }
 
-  // 実行ログが最下部に張り付いているか。裏読みを止める／再開する判断（main.ts mayRequestBackfill）はこれを見る。
-  // 他のサブタブを見ている間は、実行ログ側に退避してある張り付きが答え（概要のままでも裏読みは進む — R-TAB-07）
+  // R-TAB-07: src/webview/main.ts#mayRequestBackfill が読む。他のサブタブを見ている間も、実行ログ側に退避した張り付きで答える。
   isWorklogAtBottom(): boolean {
     return this.workView === "log" ? this.atBottom.work : this.workViewAtBottom.log;
   }
 
-  // 実行ログを最下部へ張り付け直す。裏読みの「再開」が、上へ遡って止めた状態からでも
-  // 進めるようにするための明示操作の入口（R-TAB-08）。他のサブタブを見ている間はその位置を動かさない
+  // R-TAB-08: 上へ遡って止めた状態からでも裏読みの再開を進める入口。他のサブタブを見ている間はその位置を動かさない。
   stickWorkToBottom(): void {
     this.workViewAtBottom.log = true;
     if (this.workView !== "log") return;
@@ -2469,20 +2432,17 @@ export class Tab {
     }
   }
 
-  // 再生終了時に、開いたままの assistant セグメント/コンテナを確定する。
-  // 実行中のターンを復元した場合は閉じない（続きのdeltaが別回答として分かれてしまうため）。
+  // 実行中のターンを復元した場合は閉じない。閉じると続きのデルタが別の回答に分かれる。
   finalizeReplay(stillRunning: boolean): void {
     if (!stillRunning) this.endAssistantTurn();
   }
 
-  // WorkModel が running から stale へ移したツール・エージェントの表示を止める。
-  // 判断は reducer 側（ターン終端・ターン開始・会話終了）で、ここは指名された toolUseId の
-  // 表示だけを変える。DOM を走査して「実行中に見えるもの」を探さない（完了済みまで巻き込む）。
+  // stale への移行は reducer が決め、指名された toolUseId の表示だけを変える。DOM を走査して実行中に見えるものを探さない（完了済みまで巻き込む）。
   private applyStaled(toolUseIds: readonly string[]): void {
     for (const toolUseId of toolUseIds) {
+      this.logRunningLabels.delete(toolUseId);
       const data = this.rowData.get(toolUseId);
-      // 行がまだ無い＝開始が窓の外。裏読みが行を作った時点で当て直さないと、
-      // 中断済みの過去のツールが「実行中」として壁時計で育つ（R-TAB-09）
+      // 行がまだ無いのは開始が窓の外にあるとき。裏読みが行を作った時点で当て直さないと、中断済みのツールが実行中として育つ（R-TAB-09、verify-history-prepend#HPmut-14）。
       if (data === undefined) {
         if (this.orphanStaled.size < ORPHAN_FINISH_MAX) this.orphanStaled.add(toolUseId);
         continue;
@@ -2502,6 +2462,8 @@ export class Tab {
         }
         const rowSummary = row.querySelector("summary");
         if (rowSummary) {
+          // refreshLogRow の実行中の経過は描いた時点の時計を読む。止まった行に残すと、描き直した時刻で値が変わる（verify-detail-cards#C-7）。
+          if (data.elapsedLabel === undefined) rowSummary.querySelector(".tool-elapsed")?.remove();
           let metaEl = rowSummary.querySelector<HTMLElement>(".tool-meta");
           if (!metaEl) {
             metaEl = document.createElement("span");
@@ -2521,7 +2483,7 @@ export class Tab {
     }
   }
 
-  // 失敗の出し方は概要側と同じ規則にそろえる（直下の失敗と agent 子ツールの失敗を足す）
+  // 失敗数は src/webview/work-overview.ts#WorkOverview と同じ規則で数える。
   private fillSegmentSummary(summaryEl: HTMLElement, totals: WorkSegmentView, lastLabel: string): void {
     const failed = totals.failCount + totals.childFailCount;
     summaryEl.textContent = "";
@@ -2569,15 +2531,13 @@ export class Tab {
     this.fillSegmentSummary(card.summaryEl, totals, card.lastLabel);
   }
 
-  // reducer が開始時に固定した配置へ el を置く。ここでは「今どこか」を一切見ない
-  // （見た瞬間に、カード切替後の遅延完了が次のカードへ入る経路が戻る = R1-F2）。
+  // placement だけで置き先を決め、現在のカードを見ない。見るとカード切替後の遅延完了が次のカードへ入る（verify-detail-cards#C-1）。
   private placeWork(el: HTMLElement, placement: WorkPlacementView, lastLabel: string): void {
     const toolUseId = el.dataset.toolUseId ?? "";
     if (placement.ownerToolUseId !== undefined) {
       const owner = this.agentCards.get(placement.ownerToolUseId);
       const ownerData = this.rowData.get(placement.ownerToolUseId);
-      // 親カードが無いのは、その開始イベントが再生範囲の外にある場合。行を捨てるより
-      // 通常の配置先へ出す（件数は WorkModel 側の値なので、ここで増減はしない）
+      // 親カードが無いのは、その開始イベントが再生範囲の外にある場合。行を捨てずに通常の配置先へ出す。
       if (owner && ownerData) {
         this.insertWork(owner.childrenEl, el);
         (ownerData.childIds ?? (ownerData.childIds = [])).push(toolUseId);
@@ -2585,10 +2545,12 @@ export class Tab {
       }
     }
     if (placement.taskKey !== undefined) {
+      if (this.todoCardEl) {
+        this.registerLogMember(this.todoCardEl, el.dataset.logRequestId);
+      }
       const container = this.ensureTodoWorkContainer(placement.taskKey);
-      // 未接続コンテナは live なら次のタスク一覧再構築で接続されるが、過去 chunk の taskKey は
-      // 現在の WorkModel から既に消えていることがあり、その場合は永久に未接続のまま
-      // ＝行が例外も出さずに画面から消える。過去再生では履歴ブロック直下へ落とす（契約 C1b）
+      // 過去 chunk の taskKey は現在の WorkModel から消えていることがあり、その容器は接続されないまま行が画面から消える。
+      // 過去再生では履歴ブロック直下へ落とす（verify-history-prepend#HPmut-5）。
       if (this.pastRender === null || container.isConnected) {
         this.insertWork(container, el);
         return;
@@ -2598,7 +2560,7 @@ export class Tab {
     }
     const card = this.ensureSegmentCard(placement);
     if (!card) {
-      // live は segmentId 無しの行を捨てる（従来どおり）。過去再生で捨てると突合が合わない
+      // 過去再生で segmentId 無しの行を捨てると突合が合わない。
       if (this.pastRender !== null) this.insertWork(this.pastRender.frag, el);
       return;
     }
@@ -2607,12 +2569,10 @@ export class Tab {
     this.renderSegmentCard(card);
   }
 
-  // live は末尾へ足すだけ。過去再生は「その容器へ最初に入れた時点の firstChild」を容器ごとに
-  // 固定し、その直前へ入れ続ける。固定するから chunk 内の順序が保たれる（契約 C1）。
-  // 履歴ブロック（frag）だけは常に append: frag は空から始まり chunk 順に積むだけなので
-  // anchor 機構が要らず、かつ ensureSegmentCard が先に append していると
-  // anchor がそのカードに固定されて以後の平文行がカードの上へ潜り込む
+  // frag は空から chunk 順に積むので常に append する。anchor を使うと、ensureSegmentCard が先に append したカードへ anchor が固定され、
+  // 以後の平文行がカードの上へ潜り込む。
   private insertWork(container: Node, el: Node): void {
+    if (el instanceof HTMLElement && !el.dataset.logRequestId) this.registerLogMember(el);
     const ctx = this.pastRender;
     if (ctx === null || ctx.createdNow.has(container) || container === ctx.frag) {
       container.appendChild(el);
@@ -2626,7 +2586,6 @@ export class Tab {
     container.insertBefore(el, anchor);
   }
 
-  // Agent/Task（サブエージェント起動）の行データを作る。DOM は buildAgentCardDom が組む
   private createAgentCard(ev: Extract<NormalizedEvent, { kind: "tool_call_started" }>): HTMLDetailsElement {
     const data: WorkRowData = {
       toolUseId: ev.toolUseId,
@@ -2639,12 +2598,12 @@ export class Tab {
       childIds: [],
     };
     if (ev.subagentType) setRowChip(data, "type", ev.subagentType);
-    // 起動時点は宣言値（明示input.model / frontmatter）。実測モデルは subagent_info で差し替わる
     if (ev.subagentModel) setRowChip(data, "model", shortModelLabel(ev.subagentModel));
     if (ev.subagentEffort) setRowChip(data, "effort", `effort: ${ev.subagentEffort}`);
     this.rowData.set(ev.toolUseId, data);
     const entry = this.buildAgentCardDom(data);
     this.agentCards.set(ev.toolUseId, entry);
+    this.registerLogRow(entry.card, ev);
     return entry.card;
   }
 
@@ -2658,12 +2617,19 @@ export class Tab {
     status.append(createLoader(12));
     const nameEl = document.createElement("span");
     nameEl.className = "agent-name";
-    nameEl.textContent = `🤖 ${data.summaryText}`;
+    nameEl.textContent = data.summaryText;
     const chipsEl = document.createElement("span");
     chipsEl.className = "agent-chips";
     const meta = document.createElement("span");
     meta.className = "agent-meta";
-    summary.append(status, nameEl, chipsEl, meta);
+    const at = document.createElement("span");
+    at.className = "tool-at";
+    at.textContent = data.startedAt > 0 ? clockLabel(data.startedAt) : "";
+    const name = document.createElement("span");
+    name.className = "tool-name";
+    name.textContent = l10n.t("AGENT");
+    nameEl.appendChild(chipsEl);
+    summary.append(at, status, name, nameEl, meta);
     card.appendChild(summary);
     const childrenEl = document.createElement("div");
     childrenEl.className = "agent-children";
@@ -2684,9 +2650,6 @@ export class Tab {
     return entry;
   }
 
-  // エージェントカードのメタ表示を「⚙N [✗M] · 経過時間 · tok · 状態」の順で統一する。
-  // 値はすべて WorkModel のもの。DOM の子要素数で数えると入れ子のエージェント（別カード）が入らずモデルと食い違う。
-  // 経過時間・tok は未確定（実行中）の間は出さない
   private paintAgent(entry: AgentCardEntry, data: WorkRowData): void {
     const state = this.agentStates.get(data.toolUseId) ?? this.pastAgentStates.get(data.toolUseId);
     if (!state) return;
@@ -2695,13 +2658,12 @@ export class Tab {
       state.status === "completed" ? "done" : state.status === "unknown" ? "stale" : state.status
     }`;
     entry.statusEl.replaceChildren(...(state.status === "running" ? [createLoader(12)] : []));
-    let text = `⚙${state.childCount}`;
-    if (state.failCount > 0) text += ` ✗${state.failCount}`;
-    if (state.elapsedMs > 0) text += ` · ${formatDuration(state.elapsedMs)}`;
-    if (state.tokens !== undefined) text += ` · ${formatTokenCount(state.tokens)}`;
-    text += ` · ${AGENT_STATUS_WORD[state.status]}`;
-    entry.metaEl.textContent = text;
-    entry.metaEl.classList.toggle("has-fail", state.failCount > 0);
+    entry.card.classList.toggle("running", state.status === "running");
+    entry.card.classList.toggle("failed", state.status === "failed");
+    if (state.status !== "running") entry.statusEl.textContent = state.status === "failed" ? "✗" : state.status === "completed" ? "✓" : TOOL_STATUS_GLYPH.stale;
+    const elapsed = agentElapsed(state, Date.now());
+    entry.metaEl.textContent = l10n.t("{0} calls · {1}", state.childCount, formatDuration(elapsed));
+    entry.metaEl.title = AGENT_STATUS_WORD[state.status];
     if (state.modelMeasured) {
       setRowChip(data, "model", shortModelLabel(state.modelMeasured));
       fillChips(entry.chipsEl, data);
@@ -2712,10 +2674,9 @@ export class Tab {
     const entry = this.agentCards.get(toolUseId);
     const data = this.rowData.get(toolUseId);
     if (entry && data) this.paintAgent(entry, data);
+    this.refreshLogRow(toolUseId);
   }
 
-  // 通常のツール行（agent-card の子ツールも含め共通）。tool_call_finished 側で
-  // toolCards から引き当てて状態ドット・結果・経過時間を反映する。
   private buildToolRow(ev: Extract<NormalizedEvent, { kind: "tool_call_started" }>, summaryText: string): HTMLDetailsElement {
     const data: WorkRowData = {
       toolUseId: ev.toolUseId,
@@ -2729,6 +2690,7 @@ export class Tab {
     this.rowData.set(ev.toolUseId, data);
     const row = this.buildToolRowDom(data);
     this.toolCards.set(ev.toolUseId, row);
+    this.registerLogRow(row, ev);
     return row;
   }
 
@@ -2737,18 +2699,18 @@ export class Tab {
     row.className = data.status === "stale" ? "tool-row" : `tool-row ${data.status}`;
     row.dataset.toolUseId = data.toolUseId;
     const rowSummary = document.createElement("summary");
-    // 5 列: 時刻 / 状態（文字）/ ツール名 / プレビュー / 所要時間（R-TAB-06）
+    // R-TAB-06
     const at = document.createElement("span");
     at.className = "tool-at";
     at.textContent = data.startedAt > 0 ? clockLabel(data.startedAt) : "";
     const status = document.createElement("span");
     status.className = `tool-status ${data.status}${data.statusGlyph === "🔄" ? " bg-running" : ""}`;
-    status.replaceChildren(data.status === "running" && data.statusGlyph === undefined ? createLoader(12) : document.createTextNode(data.statusGlyph ?? TOOL_STATUS_GLYPH[data.status]));
+    status.replaceChildren(data.status === "running" ? createLoader(12) : document.createTextNode(data.statusGlyph ?? TOOL_STATUS_GLYPH[data.status]));
     const name = document.createElement("span");
     name.className = "tool-name";
-    name.textContent = data.toolName;
+    name.textContent = data.toolName.startsWith("Task") ? l10n.t("TASK") : data.toolName;
     const preview = document.createElement("span");
-    preview.className = "tool-preview";
+    preview.className = data.toolName.startsWith("Task") ? "tool-preview tool-preview-ui" : "tool-preview";
     preview.textContent = data.summaryText;
     rowSummary.append(at, status, name, preview);
     if (data.metaText !== undefined) {
@@ -2778,33 +2740,27 @@ export class Tab {
     return row;
   }
 
-  // 行データから組み直す。本体のDOMは読まない（読むと順序制約が戻る = AR-M1）
+  // 表示中の DOM を読まずに rowData から組む。読むと構築の順序制約が戻る。
   private buildRowDom(toolUseId: string): HTMLElement | null {
     const data = this.rowData.get(toolUseId);
     if (!data) return null;
     return data.kind === "agent" ? this.buildAgentCardDom(data).card : this.buildToolRowDom(data);
   }
 
-  // segmentId ごとに1枚。カードはツールが最初に置かれた位置に留め、ログ末尾へは移動しない
-  // 移動案は
-  // (1) DOMの再挿入になるためカード内のテキスト選択とフォーカスが毎ツール破壊される
-  //     （全再構築と同じく、テキスト選択が消える）
-  // (2) TODOカードも末尾へ移動するため両者が末尾を奪い合い、TODO完了後に
-  //     古いカードが新しいTODO内容の下へ潜り込む＝防ぎたかった逆転が別経路で起きる
-  // ため採らない。TODO期間の前後で同じカードが使い回されないことは segmentId が保証する
-  // （タスクの出入りで reducer が segment を切るため、前後で別IDになる）。
+  // カードをログ末尾へ移動しない。再挿入でカード内の選択とフォーカスが壊れ、末尾へ移る TODO カードと順序を奪い合う。
   private ensureSegmentCard(placement: WorkPlacementView): SegmentCard | undefined {
     const segmentId = placement.segmentId;
     if (segmentId === undefined) return undefined;
     const existing = this.segmentCards.get(segmentId);
-    // 既存カードがあればそこへ入れる。単一巨大ターン分岐では live 窓がターンの途中から
-    // 始まるため、同一 segmentId が過去 chunk と live の双方に出る（契約 C2）
+    // 単一巨大ターンでは live 窓がターンの途中から始まるので、同じ segmentId が過去 chunk と live の双方に出る。
     if (existing) return existing;
     const details = document.createElement("details");
     details.className = "block toolgroup";
+    details.open = true;
     details.dataset.segmentId = segmentId;
     details.dataset.phaseId = placement.phaseId;
     const summary = document.createElement("summary");
+    summary.hidden = true;
     details.appendChild(summary);
     if (this.pastRender !== null) {
       this.pastRender.createdNow.add(details);
@@ -2817,21 +2773,14 @@ export class Tab {
     return card;
   }
 
-  // ストリーミング整形の増分描画用。
-  // segCommittedEl: 確定した段落を描き終えた領域。以後この中のDOMには触れない（選択が壊れない）。
-  // segTailEl: 未確定の末尾。デルタ到着のたびにここだけ描き直す。1回の描き直し量は「最後の確定境界から
-  //   末尾まで」。確定境界はフェンス外の空行でしか進まないので、それが現れない間は末尾が伸び続け、
-  //   その伸びた範囲を毎デルタ丸ごと描き直す。コードフェンスが開いている間はその一例で、空行を挟まない長い
-  //   箇条書き・表・一段落の長文でも同じことが起きる（R1-F4。振る舞いは未修正）。
-  // committedLen: assistantBuffer のうち確定済みの文字数。
+  // segCommittedEl の中は確定後に触れない（選択が壊れない）。segTailEl は最後の確定境界から末尾までをデルタごとに描き直す。
+  // 確定境界は findCommitBoundary が決め、境界が現れない長い末尾は毎デルタ丸ごと描き直される（未修正の既知の問題）。
   private segCommittedEl: HTMLElement | null = null;
   private segTailEl: HTMLElement | null = null;
   private committedLen = 0;
 
-  // R-DSP-26。撤回は wire uuid で来るが、本文はストリームで uuid より先に届くので、
-  // 出した本文を run として持ち、assistant_message_uuid で後から名前を付ける。
-  // 捨てるのは turn_started だけ。endAssistantTurn で捨てると、拒否の通知ブロックが
-  // セグメントを閉じた直後に届く撤回指示が対象を見つけられなくなる
+  // R-DSP-26: 撤回は wire uuid で来るが、本文は uuid より先に届くので、出した本文を run として持ち assistant_message_uuid で後から名前を付ける。
+  // beginTurn が run をリセットする。遅延した撤回のための保持は captureReply と suspendedReplies が担い、onConversationClosed が解放する。
   private assistantRuns: { uuid: string | null; text: string; seg: HTMLElement }[] = [];
 
   // 直近に組んだ返信フッターのコピー元（R-CNV-15）。closure がこの入れ物を読むので、
@@ -2842,10 +2791,9 @@ export class Tab {
   // refreshLatestReplyFooter だけが行う（他所で data-latest を書くと両者がずれる）
   private latestReplyFooter: HTMLElement | null = null;
 
-  // 楽観バブルのフッター（R-CNV-16）。吹き出しを取り消すときに実体で消す
+  // R-CNV-16: 楽観バブルを取り消すときにフッターも実体で消す。
   private readonly optimisticFoots = new Map<string, HTMLElement>();
 
-  // 現在ターンのassistantコンテナへ新しいセグメントを足して返す。コンテナが無ければ作る。
   private appendAssistantSegment(): HTMLElement {
     if (!this.currentAssistantTurn || !this.currentAssistantTurn.isConnected) {
       const turn = document.createElement("div");
@@ -2885,9 +2833,6 @@ export class Tab {
     return joinRecordTexts(this.assistantRuns.map((run) => run.text));
   }
 
-  // 完了済みターンのフッターが持つコピー元を、そのターンへ後から届いた本文・撤回で更新する。
-  // 対象は直近の 1 ターンだけ（本文 gate も撤回の探索も currentTurnId を見るので、
-  // 次の turn_started 以降は古いターンへ届かない）
   private refreshLiveReplyText(): void {
     const holder = this.liveReplyText;
     if (holder === null || holder.turnId !== this.currentTurnId) return;
@@ -2898,6 +2843,14 @@ export class Tab {
     // R-DSP-26: history の本文は run を作らない（onAssistantTextDelta）。history のラベルを通すと、
     // 未ラベルの live run が記録側の uuid で名付けられ、live の撤回がそれを見つけられなくなる
     if (ev.provenance?.path === "history") return;
+    if (this.withSuspendedReply(ev.turnId, () => this.onAssistantMessageUuid(ev))) return;
+    // R-CNV-42: retain a replay-leading boundary before any text adopts the turn.
+    if (!this.replayDone && this.currentTurnId === null && this.assistantRuns.length === 0) {
+      this.assistantLeadingRecord = { turnId: ev.turnId, uuid: ev.uuid };
+      return;
+    }
+    // R-CNV-42: onAssistantMessageUuid must not label another turn's assistantRuns.
+    if (ev.turnId !== this.currentTurnId) return;
     this.flushDelta();
     // The replay window may start at the UUID, with its text in the preceding page.
     if (this.assistantRuns.length === 0) this.assistantLeadingRecord = { turnId: ev.turnId, uuid: ev.uuid };
@@ -2908,11 +2861,17 @@ export class Tab {
     // Before turn_started clears the runs, so asks keep their record identity (R-CNV-39).
     this.persistAskDismissals(this.youStore.relabel());
     this.closeLiveRecord();
+    if (this.replyFinished) this.endAssistantTurn();
   }
 
   // 撤回は冪等（未知・撤回済みの uuid は no-op）。turnId では絞らない——通知は
   // currentTurnId が無い状態でも届き、対象は uuid だけで決まる
-  private onAssistantRetracted(ev: Extract<NormalizedEvent, { kind: "assistant_retracted" }>): void {
+  private onAssistantRetracted(ev: Extract<NormalizedEvent, { kind: "assistant_retracted" }>, suspended = false): void {
+    if (!suspended) {
+      for (const turnId of this.suspendedReplies.keys()) {
+        this.withSuspendedReply(turnId, () => this.onAssistantRetracted(ev, true));
+      }
+    }
     // 撤回したターンは孤児デルタとして採用し直さない（R-DSP-26 の撤回が無効になる）
     if (ev.turnId !== null) this.knownTurnIds.add(ev.turnId);
     this.flushDelta();
@@ -2927,13 +2886,14 @@ export class Tab {
       kept.push(run);
     }
     if (touched.length === 0) return;
+    // R-CNV-42: retracting a labelled record must not close a surviving unlabelled run.
+    if (suspended && !kept.some(run => run.uuid === null)) this.liveRecordOpen = false;
     this.assistantRuns = kept;
     this.refreshLiveReplyText();
     for (const seg of touched) this.rebuildAssistantSegment(seg);
     if (this.tabId === activeTabId) refreshFind();
   }
 
-  // 撤回後の残りで 1 セグメントを描き直す。残りが無ければセグメントごと取り除く
   private rebuildAssistantSegment(seg: HTMLElement): void {
     const text = joinRecordTexts(this.assistantRuns.filter((run) => run.seg === seg).map((run) => run.text));
     const askSource = seg.dataset.askSource ?? seg.closest<HTMLElement>("[data-turn-id]")?.dataset.turnId;
@@ -2979,11 +2939,8 @@ export class Tab {
     this.rafScheduled = false;
     if (!this.pendingDeltaText) return;
     if (!this.currentAssistantBlock) {
-      // ここでカードを区切らない。テキストを挟むたびに作業カードが分割されると、
-      // 一言書くごとに1〜2件だけのカードが並ぶ（ユーザー要望: ターン内は1枚）。
-      // 区切りは reducer が user_message とターン境界で segment を閉じることだけが担う。
-      //
-      // ツールを挟む本文も同じセグメントへ連結し、Markdown構造を保つ。
+      // ここで作業カードを区切らない。区切りは reducer の segment だけが決める。
+      // ツールを挟む本文も同じセグメントへ連結し、Markdown 構造を保つ。
       this.currentAssistantBlock = this.appendAssistantSegment();
       this.currentSegTurnId = this.pendingDeltaTurnId;
       this.assistantBuffer = "";
@@ -2996,12 +2953,6 @@ export class Tab {
     this.assistantBuffer += appended;
     this.pendingDeltaText = "";
     this.noteAssistantRun(appended);
-    // 増分描画: 確定した段落は seg-committed へ一度だけ描いて以後触らず、未確定の末尾だけを
-    // seg-tail に描き直す。
-    // 減るのはDOM再構築量だけで、直下の findCommitBoundary はバッファ全長を毎回走査するため
-    // 境界探索は常に Θ(n)。さらに確定境界はフェンス外の空行でしか進まないので、それが現れない間
-    // （開いたコードフェンス、空行なしの長い箇条書きなど）はDOM再構築量も減らず O(n²) のまま
-    // （R1-F4。振る舞いは未修正）。
     const boundary = findCommitBoundary(this.assistantBuffer, this.committedLen);
     if (boundary > this.committedLen && this.segCommittedEl) {
       const chunk = this.assistantBuffer.slice(this.committedLen, boundary);
@@ -3018,9 +2969,7 @@ export class Tab {
     this.scrollToBottom("conv");
   }
 
-  // タスク一覧の描画。項目・状態・件数はすべて WorkModel の値（イベントに載る tasks / taskTotals）で、
-  // ここで inputPreview を解釈しない。記帳系ツールの結果が失敗なら reducer は状態を更新しないので、
-  // 失敗した更新が「成立した」ようには見えない。
+  // inputPreview を解釈せず、WorkModel が運ぶタスクと taskTotals だけを描く。
   private renderTaskCard(items: WorkTaskItemView[]): void {
     this.taskItems = items;
     if (!this.todoCardEl) {
@@ -3039,53 +2988,21 @@ export class Tab {
     this.todoCardEl.dataset.workRevision = String(this.workRevision);
     this.fillTaskSummary(this.todoSummaryEl!);
     this.fillTaskList(this.todoListEl!);
-    // 末尾へ移動（既にログ内にあれば付け直すことで最下部になる）
+    this.registerLogMember(this.todoCardEl);
     this.workEl.appendChild(this.todoCardEl);
+    this.scheduleLogRefresh();
     this.scrollToBottom("work");
-    // タイトル右の状態行を最新タスクで更新する
     this.updateStrip();
   }
 
-  // タスクカードのsummary行（☰ タスク (N/M) · 合計時間 · ✗合計失敗 · 🤖 合計tok）。
-  // 合計は WorkModel が task ごとに出した値の足し合わせで、DOM からは数え直さない
   private fillTaskSummary(summaryEl: HTMLElement): void {
     const items = this.taskItems;
     const done = items.filter((it) => it.status === "completed").length;
-    let totalElapsedMs = 0;
-    let totalFails = 0;
-    let totalAgentTokens = 0;
-    for (const item of items) {
-      const totals = this.taskTotals.get(item.taskKey);
-      if (!totals) continue;
-      totalElapsedMs += totals.elapsedMs;
-      totalFails += totals.failCount + totals.childFailCount;
-      totalAgentTokens += totals.agentTokens;
-    }
-
     summaryEl.textContent = "";
     const label = document.createElement("span");
-    label.className = "todocard-summary-label";
-    label.textContent = l10n.t("☰ Tasks ({0}/{1})", done, items.length);
+    label.className = "todocard-summary-label l-label";
+    label.textContent = l10n.t("TASKS {0}/{1}", done, items.length);
     summaryEl.appendChild(label);
-    if (totalElapsedMs > 0) {
-      const dur = document.createElement("span");
-      dur.className = "todocard-summary-stats";
-      dur.textContent = ` · ${formatDuration(totalElapsedMs)}`;
-      summaryEl.appendChild(dur);
-    }
-    if (totalFails > 0) {
-      const fail = document.createElement("span");
-      fail.className = "todocard-summary-stats has-fail";
-      fail.textContent = ` · ✗${totalFails}`;
-      summaryEl.appendChild(fail);
-    }
-    if (totalAgentTokens > 0) {
-      const tok = document.createElement("span");
-      tok.className = "todocard-summary-stats";
-      tok.title = l10n.t("Total consumed by subagents (see the turn usage chip below for the main tokens)");
-      tok.textContent = ` · 🤖 ${formatTokenCount(totalAgentTokens)}`;
-      summaryEl.appendChild(tok);
-    }
   }
 
   private fillTaskList(listEl: HTMLElement): void {
@@ -3103,7 +3020,7 @@ export class Tab {
       const rowSummary = document.createElement("summary");
       const icon = document.createElement("span");
       icon.className = "todocard-icon";
-      icon.textContent = item.status === "completed" ? "✓" : item.status === "in_progress" ? "◐" : "○";
+      icon.setAttribute("aria-label", item.status === "completed" ? l10n.t("Completed") : item.status === "in_progress" ? l10n.t("Running") : l10n.t("Pending"));
       const label = document.createElement("span");
       label.className = "todocard-label";
       label.textContent = taskLabel(item);
@@ -3117,7 +3034,6 @@ export class Tab {
     }
   }
 
-  // todo行summary内の「⚙N ✗M · 経過」バッジ。件数は WorkModel の toolCount
   private buildTaskBadge(taskKey: string): HTMLElement | null {
     const totals = this.taskTotals.get(taskKey);
     if (!totals || totals.toolCount === 0) return null;
@@ -3148,9 +3064,7 @@ export class Tab {
     if (this.todoCardEl) this.todoCardEl.dataset.workRevision = String(this.workRevision);
   }
 
-  // taskKey に対応する作業コンテナを取得（無ければ作成）し、現在DOM上に描画されている
-  // todo行（data-todo-key一致）の中に配置する。todo行がまだ無い場合はコンテナを未接続のまま
-  // 返し、次にタスク一覧が届いたときの再構築で接続される。
+  // todo 行がまだ無ければ容器を未接続のまま返し、次のタスク一覧の再構築で接続される。
   private ensureTodoWorkContainer(key: string): HTMLElement {
     let container = this.todoWork.get(key);
     if (!container) {
@@ -3166,24 +3080,21 @@ export class Tab {
     return container;
   }
 
-  // 現在のassistantセグメントを確定する（markdown整形）。ターンのコンテナは閉じない
-  // ＝ツール実行後に本文が再開したら同じコンテナへ次のセグメントが足され、連続して読める。
-  // 呼び出し元は endAssistantTurn の 1 箇所だけ。確定はターン境界・会話ブロックの差し込みと、
-  // 開いた記録の後ろへ会話ブロックを置いた後の記録境界（closeLiveRecord）でだけ起きる。
-  // それ以外のツール開始でここを呼ぶ経路を足すと、表・箇条書き・単語がツール呼び出しをまたいで
-  // 途中で切れる（R-DSP-24）。
-  // 短い・単一段落のテキストを進行メモと推測して作業ログへ移さない。進行メモか回答かは後に何が来るかで決まり、
-  // テキストからは判別できないので、回答本文を誤って隠す。
-  private endAssistantBlock(): void {
+  // 確定はターン境界・会話ブロックの差し込み・closeLiveRecord の記録境界でだけ起こす。ツール開始から呼ぶ経路を足すと、
+  // 表・箇条書き・単語がツール呼び出しをまたいで途中で切れる（R-DSP-24、verify-markdown#M-31）。
+  // 短いテキストを進行メモと推測して作業ログへ移さない。進行メモか回答かは後続で決まるので、回答本文を誤って隠す。
+  private endAssistantBlock(keepRecordOpen = false): void {
     this.flushDelta();
     if (this.currentAssistantBlock) {
       const text = this.assistantBuffer.trim();
       if (!text) {
-        // 中身が空のセグメントは残さない（ツール連打で空セグメントが増えるのを防ぐ）
         this.currentAssistantBlock.remove();
       } else {
         this.currentAssistantBlock.classList.remove("streaming");
-        if (this.topConvSeg === null && this.currentSegTurnId !== null) {
+        // R-CNV-42: suspended replies can finalize out of order; select by DOM order.
+        const first = this.topConvSeg === null || Array.from(this.convEl.querySelectorAll(".assistant-seg"))
+          .find(el => el === this.currentAssistantBlock || el === this.topConvSeg?.el) === this.currentAssistantBlock;
+        if (first && this.currentSegTurnId !== null) {
           this.topConvSeg = {
             turnId: this.currentSegTurnId,
             el: this.currentAssistantBlock,
@@ -3195,7 +3106,9 @@ export class Tab {
             ],
           };
         }
-        // 未確定の末尾だけを確定させる。確定済みDOMは触らない（選択を壊さない）
+        // A completed suspended reply is history-joinable, but its final delta may still arrive.
+        // Keep the rendered tail and its incremental state until the UUID closes the record.
+        if (keepRecordOpen) return;
         if (this.segTailEl && this.segCommittedEl) {
           const rest = this.assistantBuffer.slice(this.committedLen);
           if (rest.trim()) {
@@ -3205,7 +3118,6 @@ export class Tab {
           }
           this.segTailEl.remove();
         } else {
-          // 増分描画の状態が無い経路（想定外）では従来どおり全体を整形する
           this.renderReplyMarkdown(this.currentAssistantBlock, this.assistantBuffer);
         }
       }
@@ -3230,7 +3142,6 @@ export class Tab {
     this.convBlockAfterRecordIn = this.currentAssistantTurn;
   }
 
-  // 閉じるのはブロックを後ろへ置いた時点のコンテナだけ。別のコンテナが進行中なら触らない
   private closeLiveRecord(): void {
     this.liveRecordOpen = false;
     const placedIn = this.convBlockAfterRecordIn;
@@ -3238,7 +3149,6 @@ export class Tab {
     if (placedIn !== null && placedIn === this.currentAssistantTurn) this.endAssistantTurn();
   }
 
-  // ターン境界: assistantコンテナを閉じ、次の本文は新しい回答として始める。
   private endAssistantTurn(): void {
     this.liveRecordOpen = false;
     this.convBlockAfterRecordIn = null;
@@ -3250,39 +3160,19 @@ export class Tab {
     if (this.tabId === activeTabId) refreshFind();
   }
 
-  // 作業ログ側にターンの区切りを打つ。
-  // 見出しは直前の人の発言 1 行目。同じコマンドの連続は新しい区切りを作らず件数だけ進める
+  // R-TAB-11: reconcileLogRequests uses Host request membership for command runs.
   private appendTurnAnchor(
     turnId: string,
     timestamp: number,
     headline: string | null,
     cliInserted = false
   ): HTMLElement {
-    const prev = this.lastCommandRun;
-    if (
-      headline !== null &&
-      prev !== null &&
-      prev.text === headline &&
-      isPureCommandWrapper(headline) &&
-      prev.anchor.isConnected
-    ) {
-      prev.count += 1;
-      let rep = prev.anchor.querySelector<HTMLElement>(".wl-rep");
-      if (rep === null) {
-        rep = document.createElement("span");
-        rep.className = "wl-rep";
-        prev.anchor.appendChild(rep);
-      }
-      rep.textContent = l10n.t("Same command {0} times", prev.count);
-      return prev.anchor;
-    }
     const anchor = this.buildTurnAnchor(turnId, timestamp, headline, false, cliInserted);
     this.workEl.appendChild(anchor);
     // 見出しの引き取り先は live の区切りだけ（過去の区切りは pastPendingAnchor が持つ）。
     // CLI が開いた区切りは引き取り先にならず、先行する引き取り待ちも潰さない——null で上書きすると、
     // まだ発言が届いていない直前のターンが永久に見出しを埋められなくなる
     if (!cliInserted) this.pendingHeadlineAnchor = headline === null ? anchor : null;
-    this.lastCommandRun = headline !== null && isPureCommandWrapper(headline) ? { text: headline, anchor, count: 1 } : null;
     return anchor;
   }
 
@@ -3296,6 +3186,19 @@ export class Tab {
     const anchor = document.createElement("div");
     anchor.className = past ? "worklog-turn hll-past" : "worklog-turn";
     anchor.dataset.turnId = turnId;
+    anchor.dataset.startedAt = String(timestamp > 0 ? timestamp : past ? 0 : Date.now());
+    anchor.setAttribute("role", "button");
+    anchor.tabIndex = 0;
+    const toggle = () => {
+      const id = this.logTurnAliases.get(turnId) ?? turnId;
+      this.logFoldOverrides.set(id, anchor.getAttribute("aria-expanded") !== "true");
+      this.logDirty.add(id);
+      this.refreshLogRequests();
+    };
+    anchor.onclick = toggle;
+    anchor.onkeydown = (event) => {
+      if (event.key === "Enter" || event.key === " ") { event.preventDefault(); toggle(); }
+    };
     const b = document.createElement("b");
     // CLI が開いたターンは見出しを持たない（本文を発言として出さない）。空の区切りと同じ
     // 「ターン開始」で出すと、利用者が打っていない行がある事実まで消える
@@ -3304,12 +3207,262 @@ export class Tab {
       : l10n.t("Turn started");
     if (headline !== null) b.textContent = headline;
     const time = document.createElement("span");
-    // timestamp 0 は provider 時刻未観測。live（新規セッション 1 ターン目）は stripStartedAt と同じく壁時計で補い、
-    // 再生では壁時計で補えない（過去の時刻）ので未観測と明示する。
-    // 0 のまま整形すると 1970-01-01 の現地時刻（JST なら 09:00:00）が出る
+    // timestamp が 0 なら provider 時刻は未観測。live は stripStartedAt と同じく壁時計で補い、再生では補えないので未観測と出す。
+    // 0 のまま整形するとエポックの現地時刻が出る。
     time.textContent = timestamp > 0 ? clockLabel(timestamp) : past ? l10n.t("Time not observed") : clockLabel(Date.now());
-    anchor.append(b, time);
+    time.className = "wl-request-meta";
+    const number = document.createElement("span");
+    number.className = "wl-request-number";
+    const duration = document.createElement("span");
+    duration.className = "wl-request-duration";
+    anchor.append(number, b, duration, time);
+    const request = this.logRequests.get(turnId) ?? { members: new Set<HTMLElement>(), turns: new Set([turnId]) };
+    this.logRequests.set(turnId, request);
+    request.turns.add(turnId);
+    request.anchor ??= anchor;
+    this.logAnchors.set(turnId, anchor);
+    const latest = this.logLatestRequest;
+    if (!past || latest === undefined || timestamp > Number(this.logRequests.get(latest)?.anchor?.dataset.startedAt ?? 0)) {
+      if (latest !== undefined) this.logDirty.add(latest);
+      this.logLatestRequest = turnId;
+    }
+    this.logDirty.add(turnId);
     return anchor;
+  }
+
+  private logRequest(turnId: string): LogRequest {
+    const id = this.logTurnAliases.get(turnId) ?? turnId;
+    let request = this.logRequests.get(id);
+    if (!request) {
+      request = { members: new Set(), turns: new Set([turnId]) };
+      this.logRequests.set(id, request);
+    }
+    return request;
+  }
+
+  private registerLogMember(node: HTMLElement, turnId = this.logEventTurn ?? this.currentTurnId ?? undefined): void {
+    if (turnId === undefined || node.matches(".worklog-turn, .toolgroup")) return;
+    const id = this.logTurnAliases.get(turnId) ?? turnId;
+    if (node === this.todoCardEl) {
+      this.logTaskRequests.add(id);
+      this.logDirty.add(id);
+      return;
+    }
+    const previous = node.dataset.logRequestId;
+    if (previous !== undefined && previous !== id) {
+      this.logRequests.get(previous)?.members.delete(node);
+      this.logDirty.add(previous);
+    }
+    node.dataset.logRequestId = id;
+    this.logRequest(id).members.add(node);
+    this.logDirty.add(id);
+  }
+
+  private registerLogRow(row: HTMLElement, ev: Extract<NormalizedEvent, { kind: "tool_call_started" }>): void {
+    this.registerLogMember(row, this.logToolRequests.get(ev.parentToolUseId ?? "") ?? ev.turnId);
+    const id = row.dataset.logRequestId!;
+    this.logToolRequests.set(ev.toolUseId, id);
+    const request = this.logRequest(id);
+    const order = [ev.generation, ev.seq, ev.timestamp];
+    const last = request.last;
+    const newer = !last || order.some((value, index) => value > last.order[index] && order.slice(0, index).every((v, i) => v === last.order[i]));
+    if (newer && (ev.parentToolUseId === null || !this.agentCards.has(ev.parentToolUseId))) request.last = { row, order };
+    this.refreshLogRow(ev.toolUseId);
+  }
+
+  private observeLogEvent(ev: NormalizedEvent): void {
+    this.logEventTurn = "turnId" in ev ? ev.turnId ?? undefined : undefined;
+    if (ev.kind === "turn_completed" || ev.kind === "turn_interrupted" || ev.kind === "turn_failed") {
+      this.logTurnEnds.set(ev.turnId, Math.max(this.logTurnEnds.get(ev.turnId) ?? 0, ev.timestamp));
+      this.logDirty.add(this.logTurnAliases.get(ev.turnId) ?? ev.turnId);
+    }
+  }
+
+  private refreshLogRow(id: string): void {
+    const requestId = this.logToolRequests.get(id);
+    if (requestId !== undefined) this.logDirty.add(requestId);
+    const data = this.rowData.get(id);
+    const row = this.toolCards.get(id);
+    const agent = this.agentCards.get(id);
+    const state = this.agentStates.get(id) ?? this.pastAgentStates.get(id);
+    this.logRunningLabels.delete(id);
+    if (agent && state?.status === "running") {
+      const update = (now: number) => { agent.metaEl.textContent = l10n.t("{0} calls · {1}", state.childCount, formatDuration(agentElapsed(state, now))); };
+      this.logRunningLabels.set(id, update);
+      update(Date.now());
+    } else if (row && data?.status === "running" && data.startedAt > 0) {
+      const summary = row.querySelector("summary")!;
+      let elapsed = summary.querySelector<HTMLElement>(".tool-elapsed");
+      if (!elapsed) { elapsed = document.createElement("span"); elapsed.className = "tool-elapsed"; summary.appendChild(elapsed); }
+      const update = (now: number) => { elapsed!.textContent = formatDuration(Math.max(0, now - data.startedAt)); };
+      this.logRunningLabels.set(id, update);
+      update(Date.now());
+    }
+    if (row) for (const pre of Array.from(row.querySelectorAll<HTMLElement>(":scope > pre"))) {
+      pre.dataset.label = pre.classList.contains("tool-input") ? l10n.t("INPUT") : pre.classList.contains("tool-result-error") ? l10n.t("ERROR") : l10n.t("RESULT");
+    }
+    if (agent) for (const result of Array.from(agent.card.querySelectorAll<HTMLElement>(":scope > .agent-result"))) result.dataset.label = l10n.t("REPORT");
+  }
+
+  private openLogRequest(target: HTMLElement): void {
+    const id = target.dataset.logRequestId ?? target.closest<HTMLElement>("[data-log-request-id]")?.dataset.logRequestId;
+    if (id === undefined || requestIsOpen(id, this.logLatestRequest, this.logFoldOverrides)) return;
+    this.logFoldOverrides.set(id, true);
+    this.logDirty.add(id);
+    this.refreshLogRequests();
+  }
+
+  private scheduleLogRefresh(): void {
+    if (this.logRefreshPending || this.logDirty.size === 0) return;
+    this.logRefreshPending = true;
+    queueMicrotask(() => {
+      this.logRefreshPending = false;
+      this.refreshLogRequests();
+    });
+  }
+
+  private restoreLogPreview(request: LogRequest): void {
+    if (!request.preview) return;
+    const { row, home } = request.preview;
+    home.replaceWith(row);
+    row.hidden = false;
+    row.onclick = null;
+    row.classList.remove("wl-request-last");
+    request.preview = undefined;
+  }
+
+  private reconcileLogRequests(): void {
+    for (const meta of new Set(this.logRequestMeta.values())) {
+      const id = meta.turnIds[0];
+      if (id === undefined) continue;
+      const entries = [...this.logRequests].filter(([key, request]) => key === id || meta.turnIds.some(turn => request.turns.has(turn)));
+      for (const turn of meta.turnIds) this.logTurnAliases.set(turn, id);
+      if (entries.length === 0) continue;
+      const request = this.logRequests.get(id) ?? { members: new Set<HTMLElement>(), turns: new Set<string>() };
+      const anchors = meta.turnIds.map(turn => this.logAnchors.get(turn)).filter((anchor): anchor is HTMLElement => !!anchor);
+      const anchor = anchors[0] ?? request.anchor;
+      const changed = entries.some(([key]) => key !== id) || request.anchor !== anchor || anchors.length > 1;
+      if (!changed) continue;
+      for (const [key, member] of entries) {
+        this.restoreLogPreview(member);
+        for (const node of member.members) {
+          node.dataset.logRequestId = id;
+          request.members.add(node);
+        }
+        for (const turn of member.turns) request.turns.add(turn);
+        const last = member.last;
+        if (last && (!request.last || last.order.some((value, i) => value > request.last!.order[i] && last.order.slice(0, i).every((v, j) => v === request.last!.order[j])))) request.last = last;
+        if (!this.logFoldOverrides.has(id) && this.logFoldOverrides.has(key)) this.logFoldOverrides.set(id, this.logFoldOverrides.get(key)!);
+        if (this.logLatestRequest === key) this.logLatestRequest = id;
+        if (key !== id) {
+          this.logRequests.delete(key);
+          this.logFoldOverrides.delete(key);
+          this.logDirty.delete(key);
+          this.logRunningLabels.delete(`request:${key}`);
+        }
+      }
+      for (const redundant of anchors.slice(1)) {
+        if (this.pendingHeadlineAnchor === redundant) this.pendingHeadlineAnchor = anchor ?? null;
+        if (this.pastPendingAnchor === redundant) this.pastPendingAnchor = anchor ?? null;
+        this.logAnchors.delete(redundant.dataset.turnId!);
+        redundant.remove();
+      }
+      request.anchor = anchor;
+      this.logRequests.set(id, request);
+      this.logDirty.add(id);
+      for (const [tool, owner] of this.logToolRequests) if (this.logTurnAliases.get(owner) === id) this.logToolRequests.set(tool, id);
+    }
+  }
+
+  private refreshLogRequests(): void {
+    this.reconcileLogRequests();
+    for (const id of this.logDirty) {
+      const request = this.logRequests.get(id);
+      const anchor = request?.anchor;
+      if (!request || !anchor) continue;
+      const open = requestIsOpen(id, this.logLatestRequest, this.logFoldOverrides);
+      anchor.setAttribute("aria-expanded", String(open));
+      anchor.classList.toggle("wl-request-closed", !open);
+      const totals = this.logRequestMeta.get(id);
+      setTextIfChanged(anchor.querySelector<HTMLElement>(".wl-request-number")!, totals?.number ?? "");
+      let repeated = anchor.querySelector<HTMLElement>(".wl-rep");
+      if (!repeated && totals && totals.turnIds.length > 1) {
+        repeated = document.createElement("span");
+        repeated.className = "wl-rep";
+        anchor.appendChild(repeated);
+      }
+      if (repeated) setTextIfChanged(repeated, totals && totals.turnIds.length > 1 ? l10n.t("Same command {0} times", totals.turnIds.length) : "");
+      const startedAt = Number(anchor.dataset.startedAt);
+      const current = this.currentTurnId;
+      const running = current !== null && request.turns.has(current) && !this.logTurnEnds.has(current) && this.turnState !== "idle";
+      let end = running ? undefined : this.logTurnEnds.get(id);
+      if (!running) {
+        for (const turn of request.turns) {
+          const endedAt = this.logTurnEnds.get(turn);
+          if (endedAt !== undefined) end = Math.max(end ?? 0, endedAt);
+        }
+      }
+      anchor.classList.toggle("wl-request-running", running);
+      const duration = anchor.querySelector<HTMLElement>(".wl-request-duration")!;
+      const update = (now: number) => {
+        setTextIfChanged(duration, startedAt > 0 && (end !== undefined || running)
+          ? running ? l10n.t({ message: "Running {0}", args: [formatDuration(Math.max(0, now - startedAt))], comment: ["LOG request elapsed time"] }) : formatDuration(end! - startedAt) : "");
+        if (running || !duration.textContent) {
+          duration.removeAttribute("title");
+          duration.removeAttribute("aria-label");
+          return;
+        }
+        const note = l10n.t("Until the last reply");
+        duration.title = note;
+        duration.setAttribute("aria-label", `${duration.textContent} (${note})`);
+      };
+      this.logRunningLabels.delete(`request:${id}`);
+      if (running) this.logRunningLabels.set(`request:${id}`, update);
+      update(Date.now());
+      const meta = anchor.querySelector<HTMLElement>(".wl-request-meta")!;
+      const nextMeta = document.createElement("span");
+      nextMeta.textContent = startedAt > 0 ? new Date(startedAt).toLocaleTimeString(uiLocale(), { hour: "2-digit", minute: "2-digit", hour12: false }) : l10n.t("Time not observed");
+      // R-TAB-07: logRequestMeta contains only complete Host aggregates.
+      if (totals) {
+        nextMeta.append(" · " + l10n.t("Tools {0} calls (incl. subagents)", totals.toolCount));
+        if (totals.agentCount > 0) nextMeta.append(" · " + l10n.t("Subagents {0}", totals.agentCount));
+        if (totals.failCount > 0) {
+          const failure = document.createElement("span");
+          failure.className = "l-failure";
+          failure.textContent = l10n.t("Failures {0}", totals.failCount);
+          nextMeta.append(" · ", failure);
+        }
+      }
+      // setTextIfChanged と同じ理由で、同じ内容なら子を差し替えない。
+      if (meta.textContent !== nextMeta.textContent) meta.replaceChildren(...Array.from(nextMeta.childNodes));
+      const last = request.last?.row;
+      if (request.preview && (open || request.preview.row !== last)) {
+        this.restoreLogPreview(request);
+      }
+      for (const node of request.members) {
+        node.classList.toggle("wl-request-hidden", !open && node !== last);
+        node.classList.toggle("wl-request-last", !open && node === last);
+        if (node.matches(".tool-row, .agent-card")) node.onclick = null;
+      }
+      if (!open && last) {
+        if (!request.preview && last.parentNode) {
+          const home = document.createComment("LOG preview home");
+          last.before(home);
+          request.preview = { row: last, home };
+        }
+        anchor.after(last);
+        last.onclick = () => this.openLogRequest(last);
+      }
+    }
+    // R-TAB-11: shared TASKS stays visible for every open owner in logTaskRequests.
+    if (this.todoCardEl) this.todoCardEl.classList.toggle("wl-request-hidden", this.logTaskRequests.size > 0 &&
+      [...this.logTaskRequests].every(turn => {
+        const id = this.logTurnAliases.get(turn) ?? turn;
+        return !!this.logRequests.get(id)?.anchor && !requestIsOpen(id, this.logLatestRequest, this.logFoldOverrides);
+      }));
+    this.logDirty.clear();
+    // R-TAB-11: syncWorkVisibility; verify-exec-log#EL-19m; verify-exec-log#EL-20m
+    this.syncWorkVisibility?.();
   }
 
   private static headlineOf(text: string): string {
@@ -3321,10 +3474,8 @@ export class Tab {
     if (b !== null && b.textContent === "") b.textContent = headline;
   }
 
-  // 人の発言 1 行目をターン区切りの見出しへ。turnId を持つ発言（history の順）は同じ turnId の見出し待ちの区切りへ
-  // 埋める。turnId の無い発言（live の順）は直後に始まるターンにだけ付く（次の turn_started が引き取る）。
-  // 見出し待ちの区切りへ入れてはいけない: 発言なしで始まったターン（自動投入による非人間発話）の区切りが後から届く発言を
-  // 引き取り、以後の見出しが 1 つずつずれる（R-TAB-09）。対象は live の区切りだけ
+  // turnId の無い発言は見出し待ちの区切りへ入れず、次の turn_started へ持ち越す。入れると発言なしで始まったターンが
+  // 後から届く発言を引き取り、以後の見出しがずれる（R-TAB-09）。
   private noteHumanHeadline(text: string, turnId: string | null): void {
     const headline = Tab.headlineOf(text);
     if (headline.length === 0) return;
@@ -3338,9 +3489,6 @@ export class Tab {
     if (turnId === null) this.lastHumanHeadline = headline;
   }
 
-  // 過去 chunk の人の発言。turnId を持つ発言は同じ turnId の見出し待ちの区切りへ埋め、無ければ chunk をまたいで
-  // 持ち越す。turnId の無い発言は持ち越すだけで、同じ chunk の次の区切りか chunk 末尾の処理（takePastChunkTail）が
-  // 引き取る（fields の注記を見る。R-TAB-09）
   private notePastHumanHeadline(text: string, turnId: string | null): boolean {
     const headline = Tab.headlineOf(text);
     if (headline.length === 0) return false;
@@ -3354,8 +3502,7 @@ export class Tab {
     return false;
   }
 
-  // chunk の末尾に残った turnId 無しの発言。[user_message | turn_started] が chunk 境界で割れた形で、相手は直前に
-  // 積んだ（新しい側の）chunk の先頭の区切りに限る。それ以外の見出し待ちの区切りへは渡さず、発言は捨てる
+  // chunk 末尾に残った turnId の無い発言は、直前に積んだ chunk の先頭の区切りにだけ渡し、それ以外なら捨てる（R-TAB-09）。
   private takePastChunkTail(): void {
     const stash = this.pastHeadline;
     if (stash === null || stash.turnId !== null || stash.chunk !== this.pastChunkSerial) return;
@@ -3366,8 +3513,7 @@ export class Tab {
     this.pastPendingAnchor = null;
   }
 
-  // フッターの日時（R-CNV-15 / R-CNV-16）。時刻を観測していないレコードでは時刻を出さない。
-  // 0 のまま整形すると 1970-01-01 の現地時刻が出る（buildTurnAnchor と同じ理由）
+  // R-CNV-15 / R-CNV-16: 時刻が未観測なら出さない。0 のまま整形するとエポックの現地時刻が出る。
   private static footerTime(at: number | undefined): HTMLElement | null {
     if (at === undefined || at <= 0) return null;
     const time = document.createElement("span");
@@ -3380,7 +3526,7 @@ export class Tab {
   private buildReplyFooter(at: number | undefined, source: () => string): HTMLElement {
     const footer = document.createElement("div");
     footer.className = "reply-footer";
-    // 並び（日時 → ボタン）と右寄せは発言フッターと同じ。日時が後から分かる経路は applyFooterTime が先頭へ入れる
+    // 並びは buildUserFoot と揃える。後から分かる日時は applyFooterTime が先頭へ入れる。
     const { button, status } = createCopyButton("msg-copy-button", l10n.t("Copy reply"), source);
     const time = Tab.footerTime(at);
     if (time !== null) {
@@ -3392,7 +3538,6 @@ export class Tab {
     return footer;
   }
 
-  // 日時が本文より後の chunk で分かる経路（EventLog 位相）用。既に入っていれば触らない
   private static applyFooterTime(footer: HTMLElement, at: number | undefined): void {
     if (footer.querySelector(".reply-footer-time") !== null) return;
     const time = Tab.footerTime(at);
@@ -3401,10 +3546,8 @@ export class Tab {
     footer.prepend(time);
   }
 
-  // live / 復元で足すフッターは常に最も新しい返信のものなので、「最新の返信」の印（R-CNV-15）は
-  // 控えた要素から付け替える。追記のたびに全走査すると、会話が伸びるほど 1 ターンの後始末が重くなる
-  // anchor は返信のコンテナ。記録の後ろへ実行中送信の発言が入ったターンでは末尾が発言なので、
-  // 末尾へ足すとフッターが返信から離れ、撤回時の後始末（直後の兄弟だけを見る）からも漏れる
+  // R-CNV-15: 最新の印は latestReplyFooter から付け替える。古い返信にもフッターを足す finishSuspendedReply は、後で refreshLatestReplyFooter が DOM 順に直す。
+  // anchor は返信のコンテナ。記録の後ろへ発言が入ったターンで末尾へ足すと、フッターが返信から離れ、撤回時の後始末（直後の兄弟だけを見る）からも漏れる。
   private appendReplyFooter(at: number | undefined, source: () => string, anchor: HTMLElement | null = null): void {
     const footer = this.buildReplyFooter(at, source);
     if (anchor !== null && anchor.isConnected) anchor.after(footer);
@@ -3414,7 +3557,6 @@ export class Tab {
     this.latestReplyFooter = footer;
   }
 
-  // 印の持ち主が追記以外で変わる経路（前へ積む・ターンごと取り除く）用。DOM 順の最後で決め直す
   private refreshLatestReplyFooter(): void {
     const footers = this.convEl.querySelectorAll<HTMLElement>(".reply-footer");
     const latest = footers.length > 0 ? footers[footers.length - 1] : null;
@@ -3425,16 +3567,12 @@ export class Tab {
     this.latestReplyFooter = latest;
   }
 
-  // 発言フッター（R-CNV-16）。`.block.user` の中ではなく直後の兄弟として常に置き、
-  // hover / focus-within で opacity と pointer-events だけを切り替える。中へ入れると
-  // 吹き出しの枠がフッターのぶん広がる。要素の出し入れで行の高さを変えない。
-  // コピー元は DOM ではなく渡された原文（`.block.user` の textContent は画像スロットの
-  // 読み込み文言を含む）。
-  // 本文の無い発言（画像だけ）にはコピーボタンを出さない——押しても空文字を配るだけになる
+  // R-CNV-16: フッターは `.block.user` の中へ入れず直後の兄弟に置く。中へ入れると吹き出しの枠が広がる（verify-history-prepend#FTmut-17）。
+  // コピー元は DOM でなく渡された原文にする。`.block.user` の textContent は画像スロットの読み込み文言を含む。
   private buildUserFoot(at: number | undefined, text: string): HTMLElement {
     const foot = document.createElement("div");
     foot.className = "msg-foot";
-    // 並び（日時 → ボタン）と右寄せは返信フッターと同じにする。発言と返信でボタンの位置を変えない
+    // 並びは buildReplyFooter と揃える。
     const time = Tab.footerTime(at);
     if (time !== null) {
       time.className = "msg-foot-time";
@@ -3457,9 +3595,14 @@ export class Tab {
   }
 
   handleEvent(ev: NormalizedEvent): void {
+    this.observeLogEvent(ev);
     this.observeYouEvent(ev);
-    // 描画より前に畳む。完了の記録が applyWork・帯の再描画より後になると、以後の再描画契機が無いまま
-    // 帯の鏡に終わったタスクが残る（CH-S1b）
+    const fallback = foldModelFallback(this.modelFallback, ev, this.models);
+    if (fallback !== this.modelFallback) {
+      this.setModelFallback(fallback);
+      if (activeTabId === this.tabId) refreshChrome();
+    }
+    // 描画より前に畳む。完了の記録が applyWork や帯の再描画より後になると、終わったタスクが帯に残る（verify-conversation-history#CH-S1bmut-a）。
     const activityChanged = applyActivityEvent(this.activity, ev);
     switch (ev.kind) {
       case "conversation_opened":
@@ -3468,6 +3611,16 @@ export class Tab {
         break;
       case "conversation_closed":
         this.onConversationClosed(ev);
+        break;
+      case "model_refusal_fallback": {
+        this.addBlock("system", this.fallbackLogText(ev), false, "work");
+        this.decorateFallbackBlock(this.addBlock("system", this.fallbackText(ev)), ev);
+        if (activeTabId === this.tabId) refreshChrome();
+        break;
+      }
+      case "model_fallback_revert":
+        this.addBlock("system", this.fallbackRevertText(ev), false, "work");
+        this.addBlock("system", this.fallbackRevertText(ev));
         break;
       case "auth_status":
         this.onAuthStatus(ev);
@@ -3545,23 +3698,31 @@ export class Tab {
         this.onError(ev);
         break;
     }
+    if (ev.kind === "tool_call_started" || ev.kind === "tool_call_finished" || ev.kind === "subagent_info") {
+      const id = ev.kind === "tool_call_finished" ? ev.taskNotification?.toolUseId ?? this.bgTaskIdToToolUseId.get(ev.taskNotification?.agentId ?? "") ?? ev.toolUseId : ev.toolUseId;
+      this.refreshLogRow(id);
+    }
+    this.logEventTurn = undefined;
+    if (ev.kind !== "assistant_text_delta") this.scheduleLogRefresh();
   }
 
   private onConversationOpened(_ev: Extract<NormalizedEvent, { kind: "conversation_opened" }>): void {
     this.contextUsage = null;
     if (activeTabId === this.tabId) refreshChrome();
-    // 会話開始自体は本文へ表示しない（cwd は必要ならチップ/ツールチップで足す）。
   }
 
   private onConversationClosed(ev: Extract<NormalizedEvent, { kind: "conversation_closed" }>): void {
+    for (const turnId of this.suspendedReplies.keys()) {
+      this.withSuspendedReply(turnId, () => this.endAssistantTurn());
+    }
+    this.suspendedReplies.clear();
     this.autoResumeBlock?.remove();
     this.autoResumeBlock = null;
     // turn_failed を経ない突然死でも streaming ブロックを終端する
     this.endAssistantTurn();
-    // 実行中表示の終端は WorkModel の遷移に従う（どの toolUseId を畳むかは reducer が決める）。
-    // H-3: runningChildTools のライフサイクルは終端イベントに一元化
     this.applyWork(ev.work);
     this.runningChildTools.clear();
+    this.runningMainTools.clear();
     this.stripStartedAt = null;
     this.addBlock("system", l10n.t("Conversation ended: {0}", ev.reason));
     this.setTurnState("idle");
@@ -3573,9 +3734,65 @@ export class Tab {
     if (activeTabId === this.tabId) refreshChrome();
   }
 
-  // ターン開始の状態リセット。turn_started と孤児ターンの採用（adoptOrphanTurn）の両方がここを通る。
-  // assistantRuns のクリアはここだけに置く。他所へ移すと、採用したターンが 2 回続いたとき
-  // 2 枚目のフッターが前ターンの本文をコピーする（OA-3）
+  private captureReply() {
+    return {
+      currentTurnId: this.currentTurnId,
+      currentAssistantTurn: this.currentAssistantTurn,
+      currentAssistantBlock: this.currentAssistantBlock,
+      currentSegTurnId: this.currentSegTurnId,
+      pendingDeltaTurnId: this.pendingDeltaTurnId,
+      assistantBuffer: this.assistantBuffer,
+      assistantRuns: this.assistantRuns,
+      assistantLeadingRecord: this.assistantLeadingRecord,
+      segCommittedEl: this.segCommittedEl,
+      segTailEl: this.segTailEl,
+      committedLen: this.committedLen,
+      liveRecordOpen: this.liveRecordOpen,
+      replyFinished: this.replyFinished,
+      convBlockAfterRecordIn: this.convBlockAfterRecordIn,
+      replyFooterAnchor: this.replyFooterAnchor,
+      liveReplyText: this.liveReplyText,
+    };
+  }
+
+  private withSuspendedReply(turnId: string | null, apply: () => void): boolean {
+    if (turnId === null || turnId === this.currentTurnId) return false;
+    const reply = this.suspendedReplies.get(turnId);
+    if (reply === undefined) return false;
+    this.flushDelta();
+    const current = this.captureReply();
+    Object.assign(this, reply);
+    try {
+      apply();
+      this.flushDelta();
+      this.suspendedReplies.set(turnId, this.captureReply());
+    } finally {
+      Object.assign(this, current);
+    }
+    return true;
+  }
+
+  private finishSuspendedReply(ev: Extract<NormalizedEvent, { kind: "turn_completed" | "turn_interrupted" | "turn_failed" }>): boolean {
+    const finished = this.withSuspendedReply(ev.turnId, () => {
+      if (this.replyFinished) return;
+      this.replyFinished = true;
+      // Completion can precede the final delta/UUID. Keep that record's segment writable.
+      if (this.liveRecordOpen && ev.kind === "turn_completed") this.endAssistantBlock(true);
+      else this.endAssistantTurn();
+      if (ev.kind === "turn_completed") {
+        this.appendLiveReplyFooter(ev);
+        this.refreshLatestReplyFooter();
+      }
+    });
+    if (finished) {
+      // Retain runs for late UUIDs and retractions until onConversationClosed clears them.
+      this.applyWork(ev.work);
+    }
+    return finished;
+  }
+
+  // turn_started と adoptOrphanTurn の両方がここを通る。assistantRuns のクリアはここだけに置く。他所へ移すと、
+  // 採用したターンが続いたとき次のフッターが前ターンの本文をコピーする（verify-detail-cards#OA-3）。
   private beginTurn(
     turnId: string,
     timestamp: number,
@@ -3583,40 +3800,45 @@ export class Tab {
     work: WorkEventInfo | undefined
   ): void {
     this.pendingSend = false;
+    // R-CNV-42: preserve captureReply before switching currentTurnId (verify-record-join#LR-1・verify-record-join#LR-2).
+    this.flushDelta();
+    if (this.liveRecordOpen && this.currentTurnId !== null) {
+      this.suspendedReplies.set(this.currentTurnId, this.captureReply());
+      this.currentAssistantTurn = null;
+      this.currentAssistantBlock = null;
+      this.segCommittedEl = null;
+      this.segTailEl = null;
+      this.assistantBuffer = "";
+      this.committedLen = 0;
+      this.liveRecordOpen = false;
+      this.convBlockAfterRecordIn = null;
+    } else {
+      this.endAssistantTurn();
+    }
     this.currentTurnId = turnId;
     this.knownTurnIds.add(turnId);
-    // 前ターンのassistantコンテナを閉じる（次の本文は別回答として始める）
-    this.endAssistantTurn();
     this.assistantRuns = [];
+    this.replyFinished = false;
+    this.liveReplyText = null;
     this.replyFooterAnchor = null;
     if (this.assistantLeadingRecord?.turnId !== turnId) this.assistantLeadingRecord = null;
-    // 作業ログ側にターンの区切りを打つ
     // CLI が開いたターンは見出しを取らない。持ち越しの消費もしない——消すと、その発言を待っている
     // 次の人間のターンが見出しを失う（復元タブは hydration 済み履歴をこの経路へ流すので実際に起こる）
     const headline = cliInserted ? null : this.lastHumanHeadline;
     if (!cliInserted) this.lastHumanHeadline = null;
     this.appendTurnAnchor(turnId, timestamp, headline, cliInserted);
-    // 前ターンのカードへ追記させないのは segmentId の切替が担う（reducer が turn_started で
-    // segment を閉じるので、次のツールは別カードになる）。終端イベントを取りこぼしたときに
-    // 「実行中」が残り続けるのを回収するのも reducer 側で、ここは指名された分の表示を止める
-    // だけにする（完了済みまで走査しない）。
     this.applyWork(work);
     this.clearRetryBlock();
-    // H-3: 新ターン開始時に前ターンの残留を確実にクリアする。
-    // 委任（activity）は含めない。前ターンで起動した background 委任は今も動いており、
-    // ここで消すと次の turn_completed で消灯する（R-SES-02）
+    // activity はここで消さない。前ターンで起動した背景の委任は今も動いており、消すと次の turn_completed で消灯する（R-SES-02）。
     this.runningChildTools.clear();
-    // ストリップ: 経過時間の起点をリセットし、前ターンからの背景タスクカウンタを
-    // クリアする（機能仕様: 次の turn_started が来たら0にリセットする簡易方式）。
-    // M-1: Date.now()ではなくev.timestamp（envelopeの実時刻）を使う。replay再生時も
-    // 実際の開始時刻からの経過が出る（Date.now()だと再生時刻起点になり巻き戻って見える）。
+    this.runningMainTools.clear();
+    // 起点は timestamp を優先する。壁時計にすると再生時に再生時刻起点になる。
     this.stripStartedAt = timestamp > 0 ? timestamp : Date.now();
     this.setTurnState("running");
   }
 
   private onTurnStarted(ev: Extract<NormalizedEvent, { kind: "turn_started" }>): void {
-    // 本文デルタで既に開いたターンの turn_started。開き直すと本文ブロックが閉じて
-    // 同じターンが 2 つの回答として描かれる（OA-5）
+    // 本文デルタで既に開いたターンを開き直すと、同じターンが別々の回答として描かれる（verify-detail-cards#OA-5）。
     if (this.adoptedTurnIds.has(ev.turnId)) {
       this.applyWork(ev.work);
       return;
@@ -3625,15 +3847,25 @@ export class Tab {
   }
 
   private onTurnCompleted(ev: Extract<NormalizedEvent, { kind: "turn_completed" }>): void {
+    if (this.finishSuspendedReply(ev)) return;
     this.knownTurnIds.add(ev.turnId);
     this.endAssistantTurn();
     this.applyWork(ev.work);
     this.runningChildTools.clear();
+    this.runningMainTools.clear();
     // 委任（activity）はここでは触らない。background 委任はメインのターンが終わった後も
     // 動き続けるので、消すと「サブエージェントだけが動いている間」に消灯する（R-SES-02）
     this.clearRetryBlock();
     this.stripStartedAt = null;
     this.setTurnState("idle");
+    this.appendLiveReplyFooter(ev);
+    if (ev.usage) {
+      this.usage = ev.usage;
+      if (activeTabId === this.tabId) refreshChrome();
+    }
+  }
+
+  private appendLiveReplyFooter(ev: Extract<NormalizedEvent, { kind: "turn_completed" }>): void {
     // 返信フッター（R-CNV-15）。コピー元は文字列ではなく入れ物で持つ: turn_completed の時点で
     // 確定させると、完了後に届く遅延 final（本文 gate は currentTurnId のままなので描画はされる）と
     // 完了後の撤回がコピーに入らない／残る。更新は noteAssistantRun と onAssistantRetracted。
@@ -3642,25 +3874,23 @@ export class Tab {
       const holder = { turnId: ev.turnId, text: this.assistantRunsText() };
       if (holder.text.trim().length > 0) {
         this.liveReplyText = holder;
-        const top = this.topConvSeg?.turnId === ev.turnId ? this.topConvSeg : undefined;
         this.appendReplyFooter(ev.timestamp > 0 ? ev.timestamp : undefined, () => {
+          const top = this.topConvSeg?.turnId === holder.turnId ? this.topConvSeg : undefined;
           const past = this.pastConvTurns.get(holder.turnId);
           return past !== undefined && top !== undefined ? past.text + holder.text.slice(top.text.length) : holder.text;
         }, this.replyFooterAnchor);
         this.scrollToBottom("conv");
       }
     }
-    if (ev.usage) {
-      this.usage = ev.usage;
-      if (activeTabId === this.tabId) refreshChrome();
-    }
   }
 
   private onTurnInterrupted(ev: Extract<NormalizedEvent, { kind: "turn_interrupted" }>): void {
+    if (this.finishSuspendedReply(ev)) return;
     this.knownTurnIds.add(ev.turnId);
     this.endAssistantTurn();
     this.applyWork(ev.work);
     this.runningChildTools.clear();
+    this.runningMainTools.clear();
     this.clearRetryBlock();
     this.stripStartedAt = null;
     this.addBlock("system warn", l10n.t("Turn interrupted"));
@@ -3688,11 +3918,13 @@ export class Tab {
   }
 
   private onTurnFailed(ev: Extract<NormalizedEvent, { kind: "turn_failed" }>): void {
+    if (this.finishSuspendedReply(ev)) return;
     this.knownTurnIds.add(ev.turnId);
     this.flagConvAttention();
     this.endAssistantTurn();
     this.applyWork(ev.work);
     this.runningChildTools.clear();
+    this.runningMainTools.clear();
     this.clearRetryBlock();
     this.stripStartedAt = null;
     if (ev.errorKind === "usage_limit") {
@@ -3715,7 +3947,6 @@ export class Tab {
   }
 
   private onApiRetry(ev: Extract<NormalizedEvent, { kind: "api_retry" }>): void {
-    // 同一ターン内は1ブロックを更新（リトライは最大10回程度連続しうる）
     const cause = ev.errorStatus
       ? `HTTP ${ev.errorStatus}`
       : ev.errorType
@@ -3735,6 +3966,10 @@ export class Tab {
 
   private onAssistantTextDelta(ev: Extract<NormalizedEvent, { kind: "assistant_text_delta" }>): void {
     if (ev.provenance?.path === "history") return;
+    // R-CNV-42: withSuspendedReply continues the existing record without adoptOrphanTurn.
+    if (this.withSuspendedReply(ev.turnId, () => {
+      if (this.liveRecordOpen) this.onAssistantTextDelta(ev);
+    })) return;
     if (ev.turnId !== this.currentTurnId && !this.adoptOrphanTurn(ev)) return;
     if (ev.text.length > 0) this.liveRecordOpen = true;
     this.pendingDeltaText += ev.text;
@@ -3745,16 +3980,14 @@ export class Tab {
     }
   }
 
-  // Host の gate が turn_started を落としたターンの本文を無言で捨てない（OA-1〜OA-7）。
-  // 採用してよいのは「このタブが開始も終端も撤回も観測していない turnId」だけで、
-  // 既知の turnId のデルタは従来どおり捨てる（遅延 final が終わったターンを開き直す）。
-  // 本文を持つのは webview 側だけなので Host へ取り寄せに行かない
+  // Host の gate が turn_started を落としたターンの本文を捨てない（verify-detail-cards#OAmut-1）。保持した返信への遅延本文は、
+  // この判定より前に onAssistantTextDelta が withSuspendedReply へ渡す。本文は webview 側にしか無いので Host へ取り寄せに行かない。
   private adoptOrphanTurn(ev: Extract<NormalizedEvent, { kind: "assistant_text_delta" }>): boolean {
     if (this.knownTurnIds.has(ev.turnId)) return false;
     this.adoptedTurnIds.add(ev.turnId);
     this.beginTurn(ev.turnId, ev.timestamp, false, ev.work);
-    // 再生中の採用は上流の欠落ではなく再生窓が turn_started を切り落としただけなので診断に出さない。
-    // 本文は載せない（Output は利用者の目に触れる恒久ログ）
+    // 再生中の採用は再生窓が turn_started を落としただけなので診断しない（verify-detail-cards#OA-8）。
+    // Output は利用者の目に触れる恒久ログなので、診断に本文を載せない（verify-detail-cards#OAmut-6）。
     if (this.replayDone) {
       vscode.postMessage({
         type: "webviewDiagnostic",
@@ -3768,7 +4001,6 @@ export class Tab {
   private onUserMessage(ev: Extract<NormalizedEvent, { kind: "user_message" }>): void {
     // history の発言はここで描かないので、開いた live 記録の後ろへ置いた扱いにしない
     if (ev.provenance?.path !== "history" || !this.liveRecordOpen) this.endAssistantTurnBeforeConvBlock();
-    // プロンプト追加でカードを分けるのは reducer 側（user_message で segment を閉じる）
     this.applyWork(ev.work);
     this.noteHumanHeadline(ev.text, ev.turnId);
     if (ev.provenance?.path === "history") return;
@@ -3790,8 +4022,7 @@ export class Tab {
     }
     this.observeSessionTime(ev.sentAt);
     this.appendUserFoot(block, ev.sentAt ?? (ev.timestamp > 0 ? ev.timestamp : undefined), ev.text);
-    // フッターは addBlock の末尾追従より後に行を伸ばす。ここで追い直さないと、発言のたびに
-    // フッター 1 行ぶんの隙間が下に残り、張り付き判定（gap <= 24）も折れる
+    // フッターは addBlock の末尾追従より後に行を伸ばす。追い直さないと下に隙間が残り、SCROLL_BOTTOM_GAP_PX による張り付き判定も折れる。
     this.scrollToBottom("conv");
   }
 
@@ -3815,10 +4046,9 @@ export class Tab {
       if (ev.uuid) this.recordReplyIds.add(ev.uuid);
       this.renderReplyMarkdown(block, ev.text, ev.uuid ?? `replay:${ev.generation}:${ev.seq}`, 0, ev.recordedAt ?? 0, ev.seq, ev.generation);
       this.prependTurnLabel(block, "assistant", ev.model ?? null);
-      // addBlock が素の本文で検索した後に本文を描き直すので、ここで検索し直さないと印が外れたまま件数だけ残る（CH-U32b）
+      // addBlock が素の本文で検索した後に本文を描き直すので、ここで検索し直さないと印が外れたまま件数だけ残る（verify-conversation-history#CH-U32b）
       if (this.tabId === activeTabId) refreshFind();
     }
-    // uuid は会話の遡りとの重複判定にだけ使う（表示専用）
     if (ev.uuid !== undefined && ev.uuid.length > 0) {
       block.dataset.msgUuid = ev.uuid;
       this.convMessageUuids.add(ev.uuid);
@@ -3837,7 +4067,6 @@ export class Tab {
     this.scrollToBottom("conv");
   }
 
-  // 詳細ログの数値の唯一の入口。DOM を数えない
   private applyWork(work: WorkEventInfo | undefined): void {
     if (!work) return;
     this.workRevision = work.revision;
@@ -3864,20 +4093,51 @@ export class Tab {
       this.pendingApprovalCount = work.pendingApprovalCount;
       if (this.pendingApprovalCount === 0) {
         this.tabBtn.classList.remove("needs-approval");
-        // 会話タブ側の注意表示も同条件で解除する（解除しないと応答不要になっても赤字＋●が残る。AR5-L2）
+        // 会話タブ側の注意表示も同じ条件で解除する。解除しないと応答不要になっても残る。
         this.clearConvAttention();
       }
     }
     this.updateStrip();
   }
 
-  // snapshot（と間引かれた live 更新）が運ぶ WorkModel から Task の現在状態を取り込む。
-  // 再生窓から Task更新イベントが落ちていると、これが無ければTODO行が作られず、
-  // 窓内にあるTask配下のツール行まで未接続DOMへ入って画面から消える。
-  // 集計だけの更新で行を作り直さないのは、作り直すと配下のツール行が再挿入され、
-  // 読んでいる最中のテキスト選択とフォーカスが飛ぶため
+  private applyLogModel(model: WorkModelPayload | undefined): void {
+    const previousMeta = new Map(this.logRequestMeta);
+    this.logRequestMeta.clear();
+    if (model?.coverage.summary === "complete" && !model.coverage.hydrationUnconfirmed) {
+      for (const request of model.requests ?? []) for (const turnId of request.turnIds) this.logRequestMeta.set(turnId, request);
+    }
+    for (const id of this.logRequests.keys()) {
+      const before = previousMeta.get(id);
+      const after = this.logRequestMeta.get(id);
+      if (before?.revision !== after?.revision || before?.number !== after?.number || (!!before !== !!after)) this.logDirty.add(id);
+    }
+    if (!model) {
+      this.scheduleLogRefresh();
+      return;
+    }
+    const visitAgent = (agent: WorkModelPayload["unlinkedAgents"][number]): void => {
+      const before = this.agentStates.get(agent.toolUseId);
+      if (!before || before.revision < agent.revision || before.runStartedAt !== agent.runStartedAt) {
+        this.agentStates.set(agent.toolUseId, agent);
+        this.renderAgentMeta(agent.toolUseId);
+      }
+      for (const child of agent.children) visitAgent(child);
+    };
+    for (const phase of model.phases) for (const agent of phase.agents) visitAgent(agent);
+    for (const agent of model.unlinkedAgents) visitAgent(agent);
+    this.scheduleLogRefresh();
+  }
+
+  // 再生窓からタスク更新のイベントが落ちていると、ここで取り込まない限り TODO 行が作られず、窓内の配下のツール行まで未接続 DOM へ入って消える。
+  // 集計だけの更新では refreshTaskTotals と同じ理由で行を作り直さない。
   applyWorkModel(model: WorkModelPayload | undefined): void {
     this.planPanel.setModel(model);
+    this.workModel = model;
+    this.applyLogModel(model);
+    if (model?.runningMainTools !== undefined) {
+      this.runningMainTools = new Map(model.runningMainTools.map(tool => [tool.id, tool]));
+    }
+    this.updateStrip();
     if (!model) return;
     if (model.revision > this.workRevision) this.workRevision = model.revision;
     for (const totals of model.taskTotals) this.taskTotals.set(totals.taskKey, totals);
@@ -3889,9 +4149,7 @@ export class Tab {
     this.renderTaskCard(model.tasks);
   }
 
-  // 配置情報の無いイベント。Host と webview の版が食い違ったときにしか起きない。
-  // ここで「その時点のカレントカード」へ落とすと、詳細ログが WorkModel と別の帰属規則を持つ（二重正本）。
-  // 落として報告する。
+  // Host と webview の版が食い違ったときにしか起きない。現在のカードへ落とすと詳細ログが WorkModel と別の帰属規則を持つので、捨てて報告する。
   private dropUnplacedEvent(kind: string): void {
     if (this.missingWorkInfoReported) return;
     this.missingWorkInfoReported = true;
@@ -3915,13 +4173,18 @@ export class Tab {
     const isHistory = ev.provenance?.path === "history";
     // uuid が届かない記録（wire uuid 欠落）でもツール開始で閉じる。サブエージェントのツールは
     // root の本文と並行して走るので境界にしない
-    if (!isHistory && ev.parentToolUseId === null) this.closeLiveRecord();
+    if (!isHistory && ev.parentToolUseId === null) {
+      if (!this.withSuspendedReply(ev.turnId, () => this.closeLiveRecord()) && ev.turnId === this.currentTurnId) this.closeLiveRecord();
+    }
     if (isHistory && !this.workReplayMarkerShown) {
       this.workReplayMarkerShown = true;
       this.addBlock("system", l10n.t("── Restored previous session ──"), false, "work");
     }
-    if (!isHistory) {
-      this.toolStartTimes.set(ev.toolUseId, ev.timestamp);
+    // 履歴の開始も記録する。無いと完了が所要時間を書かず、refreshLogRow の実行中の経過が残る（verify-exec-log#EL-23m）。
+    this.toolStartTimes.set(ev.toolUseId, ev.timestamp);
+    if (!isHistory && ev.parentToolUseId === null) {
+      this.runningMainTools.set(ev.toolUseId, { name: ev.toolName, intentInput: ev.intentInput });
+      this.updateStrip();
     }
     this.applyWork(ev.work);
     if (!ev.work) {
@@ -3930,9 +4193,7 @@ export class Tab {
       return;
     }
     const placement = ev.work.placement;
-    // 配置が無い＝reducer が記帳系（TodoWrite/TaskCreate/TaskUpdate）として扱った。
-    // 「実行中の作業」ではないので帯にも件数にも出さない（L-1）。どのツール名がそれに当たるかは
-    // reducer だけが決める（ここに名前の表を置くと分類が2箇所になる）
+    // ev.work supplies placement; runningMainTools also observes calls without placement.
     if (!placement) {
       this.nonWorkToolUseIds.add(ev.toolUseId);
       return;
@@ -3948,15 +4209,13 @@ export class Tab {
       }
     }
 
-    // サブエージェント起動: 通常のツール行ではなくエージェントカードを作る。
-    // どれがサブエージェント起動かは reducer の判定（agents に載るか）に従う
+    // サブエージェント起動かどうかは reducer の判定（work の agents に載るか）に従う。
     if (ev.work.agents?.some((agent) => agent.toolUseId === ev.toolUseId)) {
       this.flushDelta();
       const card = this.createAgentCard(ev);
       if (isHistory) card.classList.add("replayed");
       this.placeWork(card, placement, `🤖 ${toolSummary(ev)}`);
       this.renderAgentMeta(ev.toolUseId);
-      // 帯とパネルは配置が決まってから描く（現在のカードを映すため）
       if (!isHistory) this.updateStrip();
       this.scrollToBottom("work");
       return;
@@ -3973,11 +4232,10 @@ export class Tab {
 
   private onToolCallFinished(ev: Extract<NormalizedEvent, { kind: "tool_call_finished" }>, activityChanged: boolean): void {
     this.runningChildTools.delete(ev.toolUseId);
+    const mainToolFinished = this.runningMainTools.delete(ev.toolUseId);
     // tool_call_finished は work を伴わないことがあり、その経路では applyWork 経由の
     // 再描画が起きない。委任が閉じた（開いた）ならここで引き直す（R-SES-02）
-    if (activityChanged) this.updateStrip();
-    // 集計・タスク状態はここで取り込む。記帳系の更新が成立するのは成功終了のときだけで、
-    // 失敗していれば reducer が tasks を送ってこない＝表示も変わらない
+    if (activityChanged || mainToolFinished) this.updateStrip();
     this.applyWork(ev.work);
     if (this.nonWorkToolUseIds.has(ev.toolUseId)) {
       this.nonWorkToolUseIds.delete(ev.toolUseId);
@@ -3985,18 +4243,26 @@ export class Tab {
       return;
     }
 
-    // 終端の DOM 反映は live / 過去 chunk の共通経路。行が無かった（＝開始が窓の外）ときは
-    // 退避して、後から過去 chunk が同じ行を作ったときに当て直す（契約 C5）
+    // 行が無い（開始が窓の外）ときは退避し、後から過去 chunk が同じ行を作ったときに当て直す（verify-history-prepend#HPmut-3）。
     if (!this.applyToolFinishDom(ev)) this.rememberOrphanFinish(ev);
   }
 
-  // 既存の行 / agent カードへ終端状態を反映する。反映先が無ければ false。
+  // 反映先の行が無ければ false を返し、呼び出し側が退避する。
   private applyToolFinishDom(ev: Extract<NormalizedEvent, { kind: "tool_call_finished" }>): boolean {
     if (ev.backgroundTaskId !== undefined && !ev.isError) {
       this.bgTaskIdToToolUseId.set(ev.backgroundTaskId, ev.toolUseId);
     }
     if (ev.asyncLaunchedAgentId !== undefined && !ev.isError) {
       this.bgTaskIdToToolUseId.set(ev.asyncLaunchedAgentId, ev.toolUseId);
+    }
+
+    const finishedId = ev.taskNotification?.toolUseId ?? this.bgTaskIdToToolUseId.get(ev.taskNotification?.agentId ?? "") ?? ev.toolUseId;
+    if (this.rowData.has(finishedId)) {
+      const order = [ev.generation, ev.seq, ev.timestamp];
+      const previous = this.logFinishOrder.get(finishedId);
+      // R-TAB-09: logFinishOrder; verify-exec-log#EL-17
+      if (previous && order.some((value, index) => value < previous[index] && order.slice(0, index).every((v, i) => v === previous[i]))) return true;
+      this.logFinishOrder.set(finishedId, order);
     }
 
     if (ev.taskNotification !== undefined) {
@@ -4033,7 +4299,7 @@ export class Tab {
           agentEntry.card.appendChild(result);
         }
         agentEntry.statusEl.className = `tool-status ${finalStatus}`;
-        agentEntry.statusEl.textContent = "";
+        agentEntry.statusEl.textContent = finalGlyph;
         return true;
       }
 
@@ -4091,7 +4357,7 @@ export class Tab {
     if (isAsyncAck) {
       const data = this.rowData.get(ev.toolUseId);
       // 過去 chunk・退避の当て直しでは完了が起動 ACK より先に当たることがある。終端済みの行を running へ戻さない。
-      // ここで false を返すと ACK が退避されるので、退避済みの完了を上書きしない側は rememberOrphanFinish が持つ
+      // ここで false を返すと ACK が退避されるので、退避済みの完了を上書きしない側は rememberOrphanFinish が持つ（verify-history-prepend#HP-C31）。
       if (data && data.status !== "running") return true;
       if (data) {
         data.status = "running";
@@ -4106,7 +4372,7 @@ export class Tab {
         const status = row.querySelector<HTMLElement>(".tool-status");
         if (status) {
           status.className = "tool-status running bg-running";
-          status.textContent = "🔄";
+          status.replaceChildren(createLoader(12));
         }
         const rowSummary = row.querySelector("summary");
         if (rowSummary) {
@@ -4134,7 +4400,7 @@ export class Tab {
       const agentEntry = this.agentCards.get(ev.toolUseId);
       if (agentEntry) {
         agentEntry.statusEl.className = "tool-status running bg-running";
-        agentEntry.statusEl.textContent = "🔄";
+        agentEntry.statusEl.replaceChildren(createLoader(12));
         return true;
       }
       return false;
@@ -4142,10 +4408,8 @@ export class Tab {
 
     const startedAt = this.toolStartTimes.get(ev.toolUseId);
     this.toolStartTimes.delete(ev.toolUseId);
-    // ツール行1件の所要時間。カードやTODO行の合計は WorkModel 側の値を使う
     const elapsedMs = startedAt !== undefined ? ev.timestamp - startedAt : 0;
 
-    // 行データも更新する
     const data = this.rowData.get(ev.toolUseId);
     if (data) {
       data.status = ev.isError ? "failed" : "done";
@@ -4155,8 +4419,7 @@ export class Tab {
       if (data.kind === "tool" && startedAt !== undefined) data.elapsedLabel = formatDuration(elapsedMs);
     }
 
-    // エージェントカード自身の確定: 報告ブロックだけを足す（状態・経過時間・tok・子件数は
-    // applyWork / 過去 chunk は notePastWork が WorkModel の値で描く）
+    // 状態と集計は applyWork と notePastWork が WorkModel の値で描くので、ここでは報告だけを足す。
     const agentEntry = this.agentCards.get(ev.toolUseId);
     if (agentEntry) {
       const result = document.createElement("div");
@@ -4181,14 +4444,16 @@ export class Tab {
       row.appendChild(resultPre);
       const rowSummary = row.querySelector("summary");
       if (rowSummary && startedAt !== undefined) {
-        const elapsedEl = document.createElement("span");
-        elapsedEl.className = "tool-elapsed";
+        let elapsedEl = rowSummary.querySelector<HTMLElement>(".tool-elapsed");
+        if (!elapsedEl) {
+          elapsedEl = document.createElement("span");
+          elapsedEl.className = "tool-elapsed";
+          rowSummary.appendChild(elapsedEl);
+        }
         elapsedEl.textContent = formatDuration(elapsedMs);
-        rowSummary.appendChild(elapsedEl);
       }
     }
-    // ツール失敗の独立赤ブロックは出さない（ツール行自体が赤くなり結果も行内に出るため冗長。
-    // モデルの試行錯誤による失敗はClaude Code本体同様に控えめ表示とする）
+    // ツール失敗で別のエラーブロックを出さない。行自体が失敗表示になり、結果も行内に出る。
     return row !== undefined;
   }
 
@@ -4202,7 +4467,6 @@ export class Tab {
     this.orphanFinishes.set(key, ev);
   }
 
-  // 行が出来た直後に、保留していた更新を当て直す
   private drainOrphanUpdates(toolUseId: string): void {
     const finish = this.orphanFinishes.get(toolUseId);
     if (finish !== undefined) {
@@ -4219,11 +4483,9 @@ export class Tab {
     if (this.orphanStaled.delete(toolUseId)) this.applyStaled([toolUseId]);
   }
 
-  // サブエージェントの実測モデル（最初の sidechain assistant メッセージ由来）。
-  // 宣言値チップ（frontmatter/入力）があっても実測値で置き換える（inherit や既定変更を正しく映す）
+  // subagent_info のモデルは最初の sidechain assistant メッセージの観測値で、inherit や既定の変更を映すので宣言値のチップより優先する。
   private onSubagentInfo(ev: Extract<NormalizedEvent, { kind: "subagent_info" }>): void {
-    // 実測モデルは reducer が agent へ持たせるので applyWork がチップを差し替える。
-    // agent 記録が上限で退避されているとモデル側に無いため、その場合だけイベントから直接出す
+    // 観測モデルは reducer が agent へ持たせ、applyWork がチップを差し替える。agent 記録が上限で退避されて WorkModel に無いときだけ、イベントから直接出す。
     this.applyWork(ev.work);
     if (ev.model === undefined) return;
     if (this.agentStates.get(ev.toolUseId)?.modelMeasured !== undefined) return;
@@ -4290,23 +4552,18 @@ export class Tab {
   private onApprovalRequest(ev: Extract<NormalizedEvent, { kind: "approval_request" }>): void {
     this.applyWork(ev.work);
     this.renderApproval(ev);
-    // バックグラウンドタブでも承認待ちが判別できるようタブ上に明示
     this.tabBtn.classList.add("needs-approval");
-    // 作業ログを見ている最中でも気づけるように、会話タブ側にも注意表示を出す
     this.flagConvAttention();
   }
 
   private onApprovalResolved(ev: Extract<NormalizedEvent, { kind: "approval_resolved" }>): void {
-    // 未解決件数は WorkModel から来る（末尾の hasPendingApproval）。
-    // カード本体は作った時に控えた参照で引く（DOM 検索は範囲を誤るとヘッダのミラーを掴む）。
+    // カードは控えた参照で引く。DOM 検索は範囲を誤るとヘッダのミラーを掴む。
     this.applyWork(ev.work);
     const el = this.approvalCards.get(ev.requestId);
     if (el) {
       el.querySelectorAll("button").forEach((b) => ((b as HTMLButtonElement).disabled = true));
-      // L-2: 自由入力欄（.askq-other）も操作不能にする
       el.querySelectorAll("input").forEach((i) => ((i as HTMLInputElement).disabled = true));
       el.classList.add(ev.behavior === "allow" ? "approved" : "denied");
-      // 決着したカードは畳む。タイトル行に結果を出し、詳細は開けば読める状態で残す。
       const det = el.querySelector<HTMLDetailsElement>("details.approval-det");
       const titleEl = det?.querySelector<HTMLElement>("summary.approval-title");
       if (titleEl && !titleEl.querySelector(".approval-verdict")) {
@@ -4316,7 +4573,6 @@ export class Tab {
         titleEl.appendChild(verdict);
       }
       if (det) det.open = false;
-      // 作業ログ側の参照行にも結果を反映する（監査で会話へ戻らずに済む）
       const refRow = this.approvalRefs.get(ev.requestId);
       if (refRow && !refRow.classList.contains("resolved")) {
         refRow.classList.add("resolved", ev.behavior);
@@ -4324,9 +4580,7 @@ export class Tab {
           (refRow.textContent?.replace(APPROVAL_REF_SUFFIX, "") ?? "") +
           (ev.behavior === "allow" ? l10n.t(" (Allowed)") : l10n.t(" (Denied)"));
       }
-      // M-7: 回答の監査性。カード内に「回答: 質問→値」を textContent で追記する（replay でも再現）。
-      // details の外に置くので、畳んだ状態でも何を答えたかが見える。
-      // 判定チップ側と同条件の二重付与ガード（再生で2回処理されうる）
+      // details の外に置き、畳んだ後も回答が見えるようにする。再生で二度処理されうるので重ねて足さない。
       if (ev.answers && Object.keys(ev.answers).length > 0 && !el.querySelector(".askq-answers-summary")) {
         const summary = document.createElement("div");
         summary.className = "askq-answers-summary";
@@ -4340,7 +4594,7 @@ export class Tab {
     }
     if (!this.hasPendingApproval()) {
       this.tabBtn.classList.remove("needs-approval");
-      // 会話タブ側の注意表示も同条件で解除する（解除しないと応答不要になっても赤字＋●が残る。AR5-L2）
+      // 会話タブ側の注意表示も同じ条件で解除する。解除しないと応答不要になっても残る。
       this.clearConvAttention();
     }
   }
@@ -4369,9 +4623,7 @@ export class Tab {
     this.addBlock("error", ev.message);
     this.flagConvAttention();
     if (activeTabId === this.tabId) refreshChrome();
-    // 送信の楽観的 running 中にエラーが返ったら idle へ復帰させる。
-    // ensureConversation 失敗・連投ガード時に UI が running のまま固まるため。
-    // ただし起動時の APIキー除去警告は送信失敗ではないので復帰させない
+    // idle へ戻さないと、会話の開始失敗や連投ガードで running のまま固まる。起動時の API キー除去の警告は送信失敗ではないので戻さない。
     if (this.pendingSend && !ev.message.includes("ANTHROPIC_API_KEY")) {
       this.pendingSend = false;
       this.setTurnState("idle");
@@ -4387,8 +4639,6 @@ export class Tab {
     div.dataset.approval = requestId;
     div.id = youAnchor(this.tabId, `approval:${requestId}`);
     this.approvalCards.set(requestId, div);
-    // カード全体を details にし、未解決の間は開いておく。解決したら閉じてタイトル行と
-    // 回答要約だけを残す（回答済みカードがログを占有し続けないように）。
     const det = document.createElement("details");
     det.className = "approval-det";
     det.open = true;
@@ -4398,14 +4648,11 @@ export class Tab {
 
     const denyBtn = document.createElement("button");
     denyBtn.className = "danger";
-    // L-7: 質問カード時のみ「回答しない」。通常の承認カードは従来通り「拒否」
     denyBtn.textContent = questions ? l10n.t("Don't answer") : l10n.t("Deny");
     denyBtn.onclick = () =>
       vscode.postMessage({ type: "approvalDecision", tabId: this.tabId, requestId, behavior: "deny" });
 
     if (questions && questions.questions.length > 0) {
-      // AskUserQuestion（機能B）: 質問カードを描画する。生JSONは出さず質問文・選択肢のみ表示。
-      // question文字列 -> 回答（選択labelまたは自由入力。multiSelectはカンマ区切り）
       const answers = new Map<string, string[]>();
       const allowBtn = document.createElement("button");
       allowBtn.className = "primary";
@@ -4426,7 +4673,7 @@ export class Tab {
         const optsEl = document.createElement("div");
         optsEl.className = "askq-options ask-options";
         const selected = new Set<string>();
-        // 解除は3箇所あるので、classList と aria-pressed の乖離を防ぐため必ずこの2関数を通す
+        // classList と aria-pressed がずれないよう、選択の変更は setSelected と clearSelected だけで行う。
         const setSelected = (el: Element, on: boolean) => {
           el.classList.toggle("selected", on);
           el.setAttribute("aria-pressed", on ? "true" : "false");
@@ -4437,12 +4684,10 @@ export class Tab {
         otherInput.type = "text";
         otherInput.className = "askq-other";
         otherInput.placeholder = l10n.t("Other (free text)");
-        // N-4: ホスト側検証（isWebviewToHost）の値上限(10000文字)と整合させる
+        // src/protocol.ts#isWebviewToHost の値の上限と揃える。
         otherInput.maxLength = 10_000;
 
         const commit = () => {
-          // M-5: 単一選択（multiSelect=false）は選択肢と自由入力を排他にする。
-          // answersには片方のみ入れる（両立させたい場合のannotations対応は今回スコープ外）。
           const other = otherInput.value.trim();
           const vals = q.multiSelect ? [...selected, ...(other ? [other] : [])] : other ? [other] : [...selected];
           if (vals.length > 0) answers.set(q.question, vals);
@@ -4466,7 +4711,6 @@ export class Tab {
               selected.add(opt.label);
               clearSelected();
               setSelected(btn, true);
-              // M-5: 選択肢を選んだら自由入力を排他的にクリアする
               if (otherInput.value) otherInput.value = "";
             }
             commit();
@@ -4475,7 +4719,6 @@ export class Tab {
         }
         card.appendChild(optsEl);
         otherInput.oninput = () => {
-          // M-5: 単一選択で自由入力に文字があれば選択肢の選択を解除する（排他）
           if (!q.multiSelect && otherInput.value.trim()) {
             selected.clear();
             clearSelected();
@@ -4487,8 +4730,7 @@ export class Tab {
       });
 
       allowBtn.onclick = () => {
-        // N-4: ホスト側検証（isWebviewToHost: キー数≤8・キー長≤2000・値長≤10000・空文字キー拒否）
-        // と整合する事前整形を行い、不一致による approvalDecision の無言破棄を防ぐ。
+        // src/protocol.ts#isWebviewToHost の検証と揃える。揃わないと approvalDecision が無言で捨てられる。
         const out: Record<string, string> = {};
         for (const [question, vals] of answers) {
           const key = question.slice(0, 2000);
@@ -4511,10 +4753,8 @@ export class Tab {
       det.append(title, ...cards, actions);
       div.append(det);
     } else {
-      // 何を求められているかを人が読める形で先に示す（生JSONだけでは判断できない）。
       const body = buildApprovalBody(toolName, ev.inputJson, ev.inputSummary);
-      // 原データ全文は残す（要約だけで許可させない）。textContent なので XSS 安全。
-      // 既定は閉じておき、必要な時だけ開く（タイトル/説明/ボタンは常時見える）。
+      // 要約だけで許可させないよう、原データの全文を残す。
       const detail = document.createElement("details");
       const detailSummary = document.createElement("summary");
       detailSummary.textContent = l10n.t("Show raw data (JSON)");
@@ -4532,10 +4772,11 @@ export class Tab {
       det.append(title, ...body, detail, actions);
       div.append(det);
     }
-    // 会話側に操作可能な本体を置く（見落とさないため）。作業ログ側には監査用の参照行だけを
-    // 置き、ボタンは複製しない（同じ承認が2箇所から解決できると二重送信になるため）。
+    // 作業ログ側には参照行だけを置き、ボタンを複製しない。同じ承認を二箇所から解決できると二重送信になる。
     this.convEl.appendChild(div);
-    this.workEl.appendChild(this.buildApprovalRefRow(ev));
+    const ref = this.buildApprovalRefRow(ev);
+    this.registerLogMember(ref, ev.turnId ?? undefined);
+    this.workEl.appendChild(ref);
     this.scrollToBottom("conv");
   }
 
@@ -4555,10 +4796,7 @@ export class Tab {
     return ref;
   }
 
-  // ---------- 会話の過去 chunk（History Lazy Loading Phase 2） ----------
-
-  // 会話面の履歴挿入点。引き継ぎカードの後、復元マーカーと会話本文の前。
-  // 取り寄せた chunk は body の先頭へ積む
+  // R-HND-09: 挿入点は引き継ぎカードの後、復元マーカーと会話本文の前に置く（verify-history-prepend#HP-HNDtop）。
   installConvHistoryHead(): HTMLElement {
     if (this.convHistoryEl !== null && this.convHistoryEl.isConnected) return this.convHistoryEl;
     const head = document.createElement("div");
@@ -4579,7 +4817,6 @@ export class Tab {
     return head;
   }
 
-  // 会話に出せなかった件数の注記。body（取り寄せた chunk）より上に 1 つだけ置き、届くたびに文言を差し替える
   setConvHistoryNote(text: string): void {
     const head = this.installConvHistoryHead();
     let note = head.querySelector<HTMLElement>(".convlog-history-note");
@@ -4597,23 +4834,15 @@ export class Tab {
     return this.oldestConversationUuid() !== undefined;
   }
 
-  // いま会話面に出ている最古のメッセージの uuid。遡りの起点はこれで決める。
-  // Host が resume 時点で控えた uuid を使うと、再接続で窓が切られて古い復元ブロックが
-  // 落ちた分（原因A）が起点より新しくなり、**通知も出ずに欠落する**
+  // Host が resume 時点で控えた uuid を起点にすると、再接続で窓から落ちた復元ブロックが起点より新しくなり、通知も出ずに欠落する（verify-conversation-history#CH-C8）。
   oldestConversationUuid(): string | undefined {
     const el = this.convEl.querySelector<HTMLElement>("[data-msg-uuid]");
     return el?.dataset.msgUuid;
   }
 
-  // 作業ログの窓（REPLAY_MAX）で落ちた会話イベントを会話面へ prepend する（原因A）。
-  // 供給元は Phase 1 と同じ Host の EventLog chunk で、**描く面だけが違う**。
-  // transcript 由来の過去メッセージ（原因B）とは uuid 空間を共有するので重複しない。
-  //
-  // 復元マーカーより上へ入れてよい理由: 1スコープ＝1論理セッションで、その中の並びは
-  // [history events][replayed_message×N][live events]。窓は先頭から落ちるので、
-  // マーカーが DOM に在る＝窓に replayed_message が残っている＝落ちた前半に
-  // ライブ会話は含まれない。よって復元分だけが上へ積まれる（すべて過去セッションの内容）。
-  // addBlock を通さないのは Phase 2 と同じ理由（endAssistantTurn が走る）
+  // src/webview/main.ts#REPLAY_MAX の窓で落ちた会話イベントを会話面へ積む。transcript 由来の過去メッセージとは uuid 空間を共有するので重複しない。
+  // 窓は先頭から落ちるので、復元マーカーが DOM にある限り落ちた前半に live の会話は含まれず、マーカーより上へ入れてよい。
+  // addBlock は endAssistantTurn を走らせるので通さない。
   prependPastConvEvents(events: readonly NormalizedEvent[]): ConvEventPrependResult {
     const frag = document.createDocumentFragment();
     let rendered = 0;
@@ -4622,10 +4851,7 @@ export class Tab {
     let continued = 0;
     let failed = 0;
     const failures: string[] = [];
-    // 本文デルタは turnId ごとに連結して1ブロックにする。chunk 境界を跨いだターンも
-    // pastConvTurns で引き継いで1枚に統合する。統合しないと、物理 chunk 境界が行の途中に
-    // 落ちたとき markdown の意味境界として現れる（見出しが「## 併せて見」と
-    // 「つかった検査の盲点」へ割れる）
+    // chunk 境界を跨いだターンも pastConvTurns で引き継いで一つのブロックに統合する。統合しないと chunk 境界が markdown の意味境界として現れる（verify-conversation-history#CH-C14mut）。
     const turns = new Map<string, { el: HTMLElement }>();
     const records = new Map<string, RecordTextPart[]>();
     for (const ev of events) {
@@ -4694,8 +4920,6 @@ export class Tab {
     };
   }
 
-  // 会話面に出る kind だけを描く。作業ログ側の白リスト（契約 C3）と鏡像の関係で、
-  // どちらにも属さない kind はどちらの面にも出ない
   private renderPastConvEvent(
     ev: NormalizedEvent,
     frag: DocumentFragment,
@@ -4703,6 +4927,19 @@ export class Tab {
   ): "created" | "duplicate" | "continued" | "skipped" {
     this.observeYouEvent(ev);
     if (!isConvRenderableEvent(ev)) return "skipped";
+    if (ev.kind === "model_refusal_fallback" || ev.kind === "model_fallback_revert") {
+      const div = document.createElement("div");
+      div.className = "block system";
+      div.dataset.convPast = "1";
+      if (ev.kind === "model_refusal_fallback") {
+        div.textContent = this.fallbackText(ev);
+        this.decorateFallbackBlock(div, ev);
+      } else {
+        div.textContent = this.fallbackRevertText(ev);
+      }
+      frag.append(div);
+      return "created";
+    }
     if (ev.kind === "replayed_message") {
       const uuid = ev.uuid;
       if (uuid !== undefined && this.convMessageUuids.has(uuid)) return "duplicate";
@@ -4760,20 +4997,14 @@ export class Tab {
     if (ev.kind === "assistant_text_delta") {
       const existing = turns.get(ev.turnId);
       if (existing !== undefined) {
-        // 2件目以降は同じブロックへ足すだけなので新しい行は作っていない
         return "continued";
       }
-      // 前の chunk で作ったブロックが生きていれば、そこへ統合する（新しい行は作らない）。
-      // el が外れているのは clearTab 後などで、その場合は作り直す
       const carried = this.pastConvTurns.get(ev.turnId);
       if (carried !== undefined && carried.el.isConnected) {
         turns.set(ev.turnId, { el: carried.el });
         return "continued";
       }
-      // 再生窓の切れ目で割れたターン。窓の先頭で描いた最上部のセグメントが同じ turnId なら、
-      // 別ブロックを作らずそこへ統合する（R-CNV-09）。
-      // 候補は確定済みのセグメントだけ（topConvSeg は endAssistantBlock でしか設定しない）。
-      // 進行中のセグメントを候補にすると、増分描画の途中で描き直して進行中の応答が壊れる（R-CNV-08）
+      // R-CNV-09: 再生窓の切れ目で割れたターンは、別ブロックを作らず topConvSeg へ統合する。
       const top = this.topConvSeg;
       if (top !== null && top.turnId === ev.turnId && top.el.isConnected) {
         turns.set(ev.turnId, { el: top.el });
@@ -4824,9 +5055,7 @@ export class Tab {
     return "skipped";
   }
 
-  // 会話の過去 chunk を prepend する。**addBlock を通さない**: addBlock は target が conv の
-  // とき末尾へ足し、進行中の assistant コンテナを閉じる（記録の途中なら記録の終わりで閉じる）ので、
-  // 進行中の assistant ストリーミングが確定される（契約 P4・ユーザー裁定）。streaming state・EventLog・semantic ingestion には触れない
+  // addBlock を通さない。addBlock は進行中の assistant コンテナを閉じるので、ストリーミング中の本文が確定される（verify-conversation-history#CH-C5）。
   prependPastMessages(
     items: ReadonlyArray<{
       uuid: string;
@@ -4911,17 +5140,11 @@ export class Tab {
     };
   }
 
-  // ---------- 過去 chunk の再生（History Lazy Loading Phase 1） ----------
-
-  // 履歴挿入点を置く。main.ts が再生ループの直後・overview.mount() より前に呼ぶことで、
-  // 以後 workEl 先頭へ差し込まれる overview 4要素は必ずこれより上に入る（契約 C7）
+  // src/webview/main.ts は再生の直後、概要の要素を workEl 先頭へ入れる前に呼ぶ。この順で概要の要素が挿入点より上に入る。
   installHistoryHead(): HTMLElement {
-    // 再生ループより後に呼ばれる契約（上のコメント）を、孤児採用の診断の live 判定にも使う
     this.replayDone = true;
     if (this.historyHeadEl !== null && this.historyHeadEl.isConnected) return this.historyHeadEl;
-    // [head[more][body]] ...ログ本体... の順。取り寄せた chunk は body の先頭へ入れる。
-    // 後から来る chunk ほど古いので、毎回 body の先頭へ入れれば時系列順に積み上がる。
-    // more は遡りの失敗通知（addHistoryNotice）の置き場で、body より上に固定する
+    // 後から届く chunk ほど古いので、毎回 body の先頭へ入れれば時系列順に積み上がる。
     const head = document.createElement("div");
     head.className = "worklog-history";
     const more = document.createElement("div");
@@ -4936,14 +5159,11 @@ export class Tab {
     return head;
   }
 
-  // 履歴ブロックが実際に見えているか。作業ビューは既定が「概要」で、WorkOverview.applyMode が
-  // workEl 直下の子を hidden にするため、詳細サブタブでないとボタンごと見えない。
-  // 見えていないところへ prepend すると scrollHeight が動かず視界維持が成立しない
+  // src/webview/work-overview.ts#WorkOverview の applyMode は workEl 直下の子を隠す。見えていない所へ積むと scrollHeight が動かず、視界を保てない。
   historyPaneUsable(): boolean {
     return this.historyHeadEl !== null && this.historyHeadEl.isConnected && !this.historyHeadEl.hidden;
   }
 
-  // 遡りの失敗理由を1行だけ出す
   addHistoryNotice(text: string): HTMLElement {
     this.installHistoryHead();
     const div = document.createElement("div");
@@ -4953,15 +5173,11 @@ export class Tab {
     return div;
   }
 
-  // 再生済みイベントの識別子を登録する。addTab の窓ぶんもここを通す（契約 C4）
+  // src/webview/main.ts#addTab で再生した窓の分もここで登録する。
   noteRenderedEvents(events: readonly NormalizedEvent[]): void {
     for (const ev of events) this.renderedEventKeys.add(`${ev.generation}:${ev.seq}`);
   }
 
-  // 過去 chunk を作業ログへ prepend する。会話面へは何も出さない（会話の過去は別経路）。
-  // 戻り値は突合材料。破れていたら行がどこかで消えている（契約 C4b）:
-  //   rendered + skipped + duplicates + failed == total
-  //   connected == expectedConnected（= 累計 created。rendered ではない）
   prependPastEvents(events: readonly NormalizedEvent[]): PastPrependResult {
     const ctx: PastRenderContext = {
       frag: document.createDocumentFragment(),
@@ -4992,7 +5208,9 @@ export class Tab {
         // 失敗した件は識別子を登録しないので、もう一度取れば再挑戦できる
         let outcome: PastRenderOutcome;
         try {
+          this.observeLogEvent(ev);
           outcome = this.renderPastEvent(ev);
+          if (ev.kind === "tool_call_started" || ev.kind === "tool_call_finished" || ev.kind === "subagent_info") this.refreshLogRow(ev.toolUseId);
         } catch (error) {
           ctx.failed++;
           if (ctx.failures.length < 5) ctx.failures.push(`${ev.kind}: ${String(error)}`);
@@ -5006,10 +5224,12 @@ export class Tab {
       this.takePastChunkTail();
     } finally {
       this.pastRender = null;
+      this.logEventTurn = undefined;
     }
     this.installHistoryHead();
     const body = this.historyBodyEl!;
     body.insertBefore(ctx.frag, body.firstChild);
+    this.refreshLogRequests();
     this.pastRenderedTotal += ctx.created;
     if (bgFinishedChanged) this.updateStrip();
     return {
@@ -5025,8 +5245,7 @@ export class Tab {
     };
   }
 
-  // 白リスト（契約 C3）。created = 新しい行要素を作った / applied = 既存要素へ反映した /
-  // skipped = 何もしなかった。created だけが接続済み DOM との突合対象になる
+  // created だけが pastRenderedTotal に数えられ、接続済み DOM と突き合わされる。
   private renderPastEvent(ev: NormalizedEvent): PastRenderOutcome {
     this.youStore.observe(ev);
     this.notePastWork(ev.work);
@@ -5034,13 +5253,12 @@ export class Tab {
       case "turn_started":
         return this.renderPastTurnStart(ev);
       case "user_message":
-        // 会話面へは描かない（会話の過去は別経路）。作業ログ側では区切りの見出しにだけ使う
         return this.notePastHumanHeadline(ev.text, ev.turnId) ? "applied" : "skipped";
       case "tool_call_started":
         return this.renderPastToolStarted(ev);
       case "tool_call_finished": {
         if (this.applyToolFinishDom(ev)) return "applied";
-        // 開始行がまだ無い（この chunk より古い側にある）。退避して当て直せるようにする
+        // 開始行は古い側の chunk にあるので、退避して当て直す（verify-history-prepend#HPmut-8）。
         this.rememberOrphanFinish(ev);
         return "skipped";
       }
@@ -5070,6 +5288,10 @@ export class Tab {
           permissionDeniedText(ev),
           "error"
         );
+      case "model_refusal_fallback":
+        return this.renderPastPlainRow(this.fallbackLogText(ev), "system");
+      case "model_fallback_revert":
+        return this.renderPastPlainRow(this.fallbackRevertText(ev), "system");
       case "error":
         return this.renderPastPlainRow(ev.message, "error");
       case "api_retry":
@@ -5121,7 +5343,7 @@ export class Tab {
     }
     const anchor = this.buildTurnAnchor(ev.turnId, ev.timestamp, headline, true, cliInserted);
     // CLI の区切りは引き取り待ちにならず、先行する引き取り待ちも潰さない。
-    // anchor と chunk / first は 1 組なので、更新するときは 3 つとも同時に動かす
+    // pastPendingAnchor・pastPendingChunk・pastPendingFirst は組なので、更新するときは同時に動かす。
     if (!cliInserted) {
       this.pastPendingAnchor = headline === null ? anchor : null;
       this.pastPendingChunk = this.pastChunkSerial;
@@ -5132,8 +5354,6 @@ export class Tab {
     return "created";
   }
 
-  // 配置情報を持たないイベント（契約 C6）。live が作業ログ末尾へ出すのと同じ見た目の行を
-  // 履歴ブロック側へ置く。スクロール追従は動かさない
   private renderPastPlainRow(text: string, cls: string): PastRenderOutcome {
     const div = document.createElement("div");
     div.className = `block ${cls} hll-past`;
@@ -5145,10 +5365,9 @@ export class Tab {
   private renderPastToolStarted(
     ev: Extract<NormalizedEvent, { kind: "tool_call_started" }>
   ): PastRenderOutcome {
-    // live 側に既にある行は作り直さない（契約 C4）
     if (this.rowData.has(ev.toolUseId)) return "skipped";
     const placement = ev.work?.placement;
-    // 配置が無い＝reducer が記帳系として扱った。live も行を作らないので過去でも作らない
+    // live も配置の無い開始には行を作らないので、過去でも作らない。
     if (!placement) return "skipped";
     this.toolStartTimes.set(ev.toolUseId, ev.timestamp);
     const isAgent = ev.work?.agents?.some((agent) => agent.toolUseId === ev.toolUseId) === true;
@@ -5160,8 +5379,7 @@ export class Tab {
       isAgent ? `🤖 ${toolSummary(ev)}` : `${ev.toolName}: ${toolSummary(ev)}`
     );
     if (isAgent) this.renderAgentMeta(ev.toolUseId);
-    // 窓の外で開始し窓の中で終わったツールは、live が finish を空振り消費している。
-    // 行ができた今その終端を当て直さないと永久 running で固着する（契約 C5）
+    // 窓の外で開始し窓の中で終わったツールは、行ができた今その終端を当て直さないと running のまま固着する（verify-history-prepend#HPmut-3）。
     this.drainOrphanUpdates(ev.toolUseId);
     return "created";
   }
@@ -5224,7 +5442,6 @@ export class Tab {
     scheduleImageLoads(this);
   }
 
-  // Token-based optimistic user bubble during hydration
   renderOptimisticUserBubble(text: string, clientToken: string, images?: ImageAttachment[]): HTMLElement {
     this.endAssistantTurn();
     const block = this.addBlock("user", text);
@@ -5243,7 +5460,6 @@ export class Tab {
     return block;
   }
 
-  // rejected / accepted-nonhuman による楽観バブルの撤去
   removeOptimisticBubble(clientToken: string): void {
     const el = this.convEl.querySelector<HTMLElement>(
       `.block.user[data-hydration-optimistic="true"][data-client-token="${CSS.escape(clientToken)}"]`
@@ -5258,7 +5474,6 @@ export class Tab {
     if (el) el.remove();
   }
 
-  // accepted-human による楽観バブルの確定標識
   markOptimisticBubbleAccepted(clientToken: string): void {
     const el = this.convEl.querySelector<HTMLElement>(
       `.block.user[data-hydration-optimistic="true"][data-client-token="${CSS.escape(clientToken)}"]`

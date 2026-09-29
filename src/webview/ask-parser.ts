@@ -25,7 +25,7 @@ function scalar(raw: string): string | null {
       return typeof parsed === "string" && parsed.trim() && !/[\u0000-\u001f]/.test(parsed) ? parsed : null;
     } catch { return null; }
   }
-  if (/^[\[\]{}&*!|>'%@`#]/.test(value) || /\s#/.test(value)) return null;
+  if (/^[|>&*!]/.test(value)) return null;
   return value;
 }
 

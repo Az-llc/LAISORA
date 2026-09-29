@@ -16,7 +16,7 @@ export class YouList {
   private readonly unsubscribe: () => void;
 
   constructor(reader: YouItemsReader, navigate: (item: YouItem) => void, onCount?: (count: number, total: number) => void,
-    dismiss?: (item: YouItem) => void) {
+    dismiss?: (item: YouItem) => void, restoreModel?: (model: string) => void) {
     this.element.lang = document.documentElement.lang;
     this.element.setAttribute("aria-label", "YOU");
     let signature = "";
@@ -43,7 +43,7 @@ export class YouList {
         const square = node("span", "you-square");
         square.setAttribute("aria-hidden", "true");
         const body = node("div", "you-body");
-        const kind = item.kind === "approve" ? l10n.t("Approval") : item.kind === "decide" ? l10n.t("Decision") : l10n.t("Machine check");
+        const kind = item.kind === "approve" ? l10n.t("Approval") : item.kind === "decide" ? l10n.t("Decision") : item.kind === "confirm" ? l10n.t("Confirmation") : l10n.t("Machine check");
         body.append(node("div", "you-kind", item.resolvedAt === undefined ? kind : l10n.t("{0} · Resolved", kind)));
         const title = node("div", "you-title");
         const link = node("button", "you-link", item.anchor.approvalRef ? l10n.t("↗ Card") : l10n.t("↗ Message"));
@@ -51,8 +51,8 @@ export class YouList {
         link.setAttribute("aria-label", l10n.t("Go to: {0}", item.title));
         link.onclick = () => navigate(item);
         title.append(node("strong", "you-title-text", item.title), link);
-        // R-CNV-39: only rendered asks can be dismissed; approvals are resolved by the Host.
-        if (dismiss && !item.anchor.approvalRef && item.resolvedAt === undefined) {
+        // R-CNV-39 / R-CNV-43: dismiss applies to asks; confirmation follows the applied model.
+        if (dismiss && item.kind !== "confirm" && !item.anchor.approvalRef && item.resolvedAt === undefined) {
           const remove = node("button", "you-dismiss", "×");
           remove.type = "button";
           remove.title = l10n.t("Remove from the list");
@@ -67,6 +67,13 @@ export class YouList {
           title.append(remove);
         }
         body.append(title);
+        if (item.explanation) body.append(node("p", "you-summary", item.explanation));
+        if (item.originalModel && item.resolvedAt === undefined && restoreModel) {
+          const restore = node("button", "you-restore-model", l10n.t("Restore original model"));
+          restore.type = "button";
+          restore.onclick = () => restoreModel(item.originalModel!);
+          body.append(restore);
+        }
         const summary = item.options?.map(option => option.label).join(" / ")
           ?? item.steps?.map(step => `${step.do} — ${step.look}`).join(" / ");
         if (summary) body.append(node("p", "you-summary", summary));

@@ -3,20 +3,23 @@
 // パスの同一性は artifacts[].artifactId が運ぶため、表示は basename で足りる（P0-H）。
 // 入力は JSON.stringify 済み文字列と生文字列の両方。JSON 形では実バックスラッシュ 1 本が `\\` 2 文字、
 // UNC（実 2 本）は 4 文字で現れる。
-// URL（https://… の s:）の除外は、直前の文字ではなく URL 側のシグネチャである `//` で行う。
-// 直前の文字で判定すると、JSON エスケープが直前を英数字に変えるため
-// （"paths:\nC:/Users/…" の n）本物の絶対パスを丸ごと取り逃す。
+// `//` もドライブ区切りとして許すが、https://… の s: は URL スキームの一部なので除く。
+// JSON エスケープ直後（"paths:\nC://Users/…" の n）はドライブとして扱う。
 // トークン本体は `\"`（JSON エスケープ済み引用符）と `<` で止める。止めないと閉じ引用符のエスケープを
 // 食って JSON を壊し（`cd \"C:/x\" && ls` → `cd \"x" && ls`）、`C:\…\project</tool_use_error>` の
 // basename が `tool_use_error>` になる。
 
-const WIN_ABS = /[A-Za-z]:(?:\\+|\/(?!\/))(?:[^\s"'`|;)\]}>\\<]|\\(?!"))*/g;
+const WIN_ABS = /[A-Za-z]:(?:\\+|\/(?!\/)|(?<![A-Za-z0-9+.-][A-Za-z]:)\/+|(?<=\\[nrt][A-Za-z]:)\/+)(?:[^\s"'`|;)\]}>\\<]|\\(?!"))*/g;
 // JSON 形の相対パス `scripts\\build.py` は `\\` の直前が名前文字。UNC はトークン先頭（直前が境界文字）か
 // JSON 形の 4 本以上だけ。境界に非 ASCII を入れると `資料（d）\\a.txt` 型の相対パスが潰れる。
 const UNC = /(?:(?<=^|[\s"'`=(\[{,:;<>|])\\{2,}|\\{4,})(?:[^\s"'`|;)\]}>\\<]|\\(?!"))+/g;
+const FILE_URI = /file:\/\/(?:[^\s"'`|;)\]}>\\<]|\\(?!"))+/gi;
 // /dev /proc /sys は擬似 FS で利用者のパスを含まない。`/dev/null` を `null` に潰すとシェル系の失敗を
 // LLM が帰属できない。
-const POSIX_ABS = /(?<=^|[\s"'=(\[])\/(?!(?:dev|proc|sys)\/)(?:[^\s"'/\\<>]+\/)+[^\s"'/\\<>]+/g;
+// 名前文字・相対パスの接頭辞以外を境界にする。-I/path のフラグ部分も境界として扱う。
+// `<` も境界だが、`.` を含まない閉じタグ `</name>` は除く。`</key.pem>` はパスとして落とす
+// （verify-analysis-persistence#P-22）。
+const POSIX_ABS = /(?<=^|[^\p{L}\p{N}\p{M}_./\\~%+-]|\\[nrt]|(?:^|[^\p{L}\p{N}\p{M}_./\\~%+-])-[A-Za-z])(?!(?<=<)\/[A-Za-z][\w:-]*>)(?!(?<=(?<!\\)[A-Za-z0-9+.-]:)\/\/)\/+(?!(?:dev|proc|sys)\/)[^\s"'`|;)\]}>\\<]+/gu;
 
 function basenameOf(token: string): string {
   const parts = token.split(/[\\/]+/).filter((p) => p.length > 0);
@@ -33,6 +36,7 @@ export function containsAbsolutePath(text: string): boolean {
 
 export function redactAbsolutePaths(text: string): string {
   return text
+    .replace(FILE_URI, (m) => basenameOf(m))
     .replace(WIN_ABS, (m) => basenameOf(m))
     .replace(UNC, (m) => basenameOf(m))
     .replace(POSIX_ABS, (m) => basenameOf(m));

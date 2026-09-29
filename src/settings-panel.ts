@@ -70,7 +70,7 @@ export async function handleSettingsPageMessage(webview: vscode.Webview, raw: un
       void webview.postMessage({ type: "conductorPreview", requestId: raw.requestId, ...projectConductorPreview(raw.policy) });
       return;
     case "researchModelProfiles":
-      requestModelProfileResearch(raw.targets);
+      requestModelProfileResearch(raw.targets, raw.purpose);
       break;
     case "openVsCodeSettings":
       await vscode.commands.executeCommand("workbench.action.openSettings", "laisora");
