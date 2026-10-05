@@ -128,7 +128,6 @@ export type MdNode =
   | MdSoftbreakNode
   | MdHardbreakNode;
 
-// R-CNV-12: Windows (stricter) until the Host's init says otherwise.
 const hostPlatform: FileLinkPlatform = { windows: true };
 let fileLinkSystemAppExtensions = new Set(DEFAULT_SYSTEM_APP_EXTENSIONS);
 export function setFileLinkSystemAppExtensions(extensions?: readonly string[]): void {
@@ -152,8 +151,6 @@ const md = new MarkdownIt({ html: false, linkify: true, typographer: false });
 const defaultValidateLink = md.validateLink.bind(md);
 md.validateLink = (url) => defaultValidateLink(url) || parseHostFileLinkTarget(url)?.kind === "file-uri";
 md.linkify.set({ fuzzyLink: true, fuzzyEmail: true });
-// スキーム無しの一致は www. で始まるものだけ残す。.md / .sh / .py などは実在の国別 TLD なので、
-// MEMORY.md や run.sh のようなファイル名が外部ドメインへのリンクになる。core の linkify は null を受けないので配列で返す
 const linkifyMatch = md.linkify.match.bind(md.linkify);
 md.linkify.match = (text) => (linkifyMatch(text) ?? []).filter((m) => m.schema !== "" || /^www\./i.test(m.raw));
 

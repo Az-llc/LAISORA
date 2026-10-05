@@ -1,18 +1,18 @@
 import { installAccent } from "./accent";
+import { setDisplayName } from "./user-label";
 import { prependPreservingView } from "./history-scroll";
 import * as l10n from "@vscode/l10n";
 
 const applyAccent = installAccent();
 
-// モデル・利用者由来のテキストは textContent で DOM 化し、innerHTML へ流さない（verify-markdown#T4-S1）。
-
 import type {
+  AccountUsageRow,
+  AccountUsageSnapshot,
   ConversationHistoryErrorReason,
   HistoryChunkPagePayload,
   HostToWebview,
   ImageAttachment,
   ImageRefInfo,
-  ModelInfo,
   NormalizedEvent,
   PendingAttachmentInfo,
   PermissionModeId,
@@ -22,8 +22,9 @@ import type {
   UsageSnapshot,
   WorkModelPayload,
 } from "../protocol";
-import { fallbackChipWarning, IMAGE_MAX_COUNT, PROTOCOL_VERSION, RENAME_TITLE_MAX, isHostToWebview, withLocalEventDrop } from "../protocol";
+import { ACCOUNT_USAGE_REPLY_WAIT_MS, fallbackChipWarning, IMAGE_MAX_COUNT, isCurrentAccountUsageRow, PROTOCOL_VERSION, RENAME_TITLE_MAX, isHostToWebview, withLocalEventDrop } from "../protocol";
 import { windowEvents } from "../event-window";
+import { findModelRow, resolveModelDisplayName } from "../model-display-name";
 import type { AnalysisReport } from "../analysis";
 import {
   actionBtn,
@@ -47,7 +48,7 @@ import {
   vscode,
   CONTEXT_CHIP_EMPTY,
 } from "./dom";
-import { applySessionChunk, initHistory, openHistPanel } from "./history";
+import { applySessionChunk, applySessionHiddenChanged, applySessionListActionFailed, applySessionRenamed, initHistory, openHistPanel } from "./history";
 import {
   applyUserSettings,
   closeAuthPicker,
@@ -76,7 +77,7 @@ import { WorkOverview, type WorkViewMode } from "./work-overview";
 import type { CoverageBackfillHint } from "./work-graph";
 import { renderLlmDiagnosticsView } from "./llm-diagnostics-view";
 import { closeFindBar, findNext, initFindBar, isFindBarOpen, openFindBar, refreshFind } from "./find-bar";
-import { uiLocale } from "./format";
+import { uiLocale } from "./l10n";
 
 export const MODE_LABELS: Record<PermissionModeId, string> = {
   default: l10n.t("Ask before actions"),
@@ -100,16 +101,11 @@ const tabs = new Map<string, Tab>();
 const overviews = new Map<string, WorkOverview>();
 setOnTabActivity((tabId, active) => overviews.get(tabId)?.setActive(active));
 setOnConvViewShown((tabId) => resumeConversationChase(tabId));
-// Host の coverage は REPLAY_MAX による画面側の窓落ちを含まない。displayWorkModel が受信のたびに合流させる（verify-history-prepend#HPmut-13）。
 const localEventDrops = new Map<string, number>();
 const hostDroppedAtInstall = new Map<string, number>();
 export let activeTabId: string | null = vscode.getState()?.activeTabId ?? null;
-// init 済みのタブを tabCreated が作り直すときは、activeTabId が init の選んだ activeTabAfterInit のまま（利用者が別タブへ移っていない）
-// ときだけ activate に従う。移った後に従うと、利用者の選択を後から届いた復元が奪う。
 let activeTabAfterInit: string | null = null;
-// 下書きはタブごとに持つ。共有の inputEl だけに置くと別のタブへ送る。
 const drafts = new Map<string, string>(Object.entries(vscode.getState()?.drafts ?? {}));
-// persistState は保存済みの値へ上書きマージするので、閉じたタブは forgottenTabIds で明示的に消す。
 const forgottenTabIds = new Set<string>();
 
 export type ResumeHostState = ResumeHydrationPhase;
@@ -149,7 +145,6 @@ function savedScrollAnchors(): Record<string, unknown> {
   return typeof saved === "object" && saved !== null ? saved : {};
 }
 
-// savedScrollCarry の値は前の document のもの。同じ document で作り直すときは init が destroy より先に取った持ち越しの方が新しい。
 const tabsAddedInDocument = new Set<string>();
 
 function savedScrollCarry(tabId: string): ScrollCarry | undefined {
@@ -160,13 +155,13 @@ function savedScrollCarry(tabId: string): ScrollCarry | undefined {
 
 export function persistState(): void {
   if (activeTabId) drafts.set(activeTabId, inputEl.value);
-  // 保存済みの値へ上書きマージする。全置換にすると tabs が揃う前の呼び出しで未登録タブの設定が消える。
   const views: Record<string, ViewMode> = { ...(vscode.getState()?.views ?? {}) };
   const workViews: Record<string, WorkViewMode> = { ...(vscode.getState()?.workViews ?? {}) };
   const analysisViews: Record<string, "script" | "ai"> = { ...(vscode.getState()?.analysisViews ?? {}) };
   const scrollAnchors = { ...savedScrollAnchors() };
   const askChecks = { ...(vscode.getState()?.askChecks ?? {}) };
   const askDismissed = { ...(vscode.getState()?.askDismissed ?? {}) };
+  const askResolved = { ...(vscode.getState()?.askResolved ?? {}) };
   const out = Object.fromEntries(drafts);
   for (const id of forgottenTabIds) {
     delete views[id];
@@ -174,6 +169,7 @@ export function persistState(): void {
     delete analysisViews[id];
     delete askChecks[id];
     delete askDismissed[id];
+    delete askResolved[id];
     delete scrollAnchors[id];
     delete out[id];
   }
@@ -181,20 +177,17 @@ export function persistState(): void {
   for (const [id, t] of tabs) workViews[id] = t.workViewMode;
   for (const [id, overview] of overviews) analysisViews[id] = overview.analysisSubtab;
   for (const [id, t] of tabs) scrollAnchors[id] = t.captureScrollCarry(false);
-  const { askDismissedMessages, askCheckedMessages } = vscode.getState() ?? {};
-  const next: PersistedState = { activeTabId, drafts: out, views, workViews, analysisViews, scrollAnchors, askChecks, askDismissed, askDismissedMessages, askCheckedMessages };
+  const { askDismissedMessages, askResolvedMessages, askCheckedMessages } = vscode.getState() ?? {};
+  const next: PersistedState = { activeTabId, drafts: out, views, workViews, analysisViews, scrollAnchors, askChecks, askDismissed, askDismissedMessages, askResolved, askResolvedMessages, askCheckedMessages };
   vscode.setState(next);
 }
 
-// 非表示で document ごと破棄される（src/extension.ts は retainContextWhenHidden を偽で渡す）。破棄直前のイベントに頼らず、
-// 位置はスクロールのたびに SCROLL_PERSIST_DELAY_MS 遅れで保存する。
 const SCROLL_PERSIST_DELAY_MS = 250;
 let scrollPersistTimer: ReturnType<typeof setTimeout> | undefined;
 
 function initLogsScroll(): void {
   logsEl.addEventListener("scroll", () => {
     if (!activeTabId) return;
-    // onPortScroll を noteScroll より先に呼ぶ。逆順だとグラフの補正前の scrollTop が張り付き状態として記録される。
     overviews.get(activeTabId)?.onPortScroll();
     tabs.get(activeTabId)?.noteScroll();
     syncWorklogBackfillScroll(activeTabId);
@@ -208,14 +201,12 @@ function initLogsScroll(): void {
   for (const type of ["wheel", "touchstart"]) {
     logsEl.addEventListener(type, abandonAwaitedScrollAnchor, { passive: true });
   }
-  // スクロールバーの操作は #logs 自身が target になる。中身への pointerdown では abandonAwaitedScrollAnchor を呼ばない。
   logsEl.addEventListener("pointerdown", (e) => {
     if (e.target === logsEl) abandonAwaitedScrollAnchor();
   }, { passive: true });
   logsEl.addEventListener("keydown", (e) => {
     if (SCROLL_KEYS.has(e.key)) abandonAwaitedScrollAnchor();
   }, { passive: true });
-  // 検索は #logs に触れずにスクロールするので、findBarEl の操作でも遡り待ちを諦める。
   findBarEl.addEventListener("input", abandonAwaitedScrollAnchor);
   findBarEl.addEventListener("click", abandonAwaitedScrollAnchor);
   findBarEl.addEventListener("keydown", (e) => {
@@ -229,15 +220,12 @@ function abandonAwaitedScrollAnchor(): void {
   if (activeTabId) tabs.get(activeTabId)?.stopAwaitingScrollAnchor();
 }
 
-// init で消さない。再 init 後に同じ sessionId を開いたタブへ引き継ぐ（verify-webview-wiring#T4-3）。
 const analysisReports = new Map<string, { filePath: string; report: AnalysisReport }>();
 export function refreshComposer(): void {
   inputEl.placeholder = composerPlaceholder();
   refreshChrome();
 }
 
-// tabActivationDepth が正の間、reflowComposer は #logs の位置を張り付きとして記録しない。位置はまだ離れるタブのもので、
-// 記録すると restoreScroll が新しいタブを末尾へ飛ばす。surfaceGeneration は切替より前に積まれた遅延の張り付け直しを無効にする。
 let tabActivationDepth = 0;
 let surfaceGeneration = 0;
 
@@ -263,10 +251,8 @@ export function setActiveTab(tabId: string): void {
   tabActivationDepth += 1;
   noteSurfaceChange();
   try {
-    // R-CNV-11: renderAttachments を外すと前のタブの添付が画面に残る。
     renderAttachments();
     persistState();
-    // 切替のたびに送る。可視化時の init（src/store-surfaces.ts#restoreVisible）は document の作り直しより先に出る。
     vscode.postMessage({ type: "activeTab", tabId });
     for (const [id, t] of tabs) {
       t.tabBtn.classList.toggle("active", id === tabId);
@@ -274,10 +260,10 @@ export function setActiveTab(tabId: string): void {
       t.logEl.classList.toggle("active", id === tabId);
       t.setSessionMenuActive(id === tabId);
     }
+    tabs.get(tabId)!.updateStrip();
     refreshComposer();
     resumeConversationChase(tabId);
     resumeWorklogBackfill(tabId);
-    // autosizeComposer を restoreScroll より先に呼ぶ。restoreScroll は #logs の高さから scrollTop を決める。
     autosizeComposer();
     tabs.get(tabId)!.restoreScroll();
   } finally {
@@ -312,7 +298,6 @@ function showAnalysis(sessionId: string, filePath: string, report: AnalysisRepor
   });
 }
 
-// R-ANL-11: 失敗は要求元のタブへ出す。script 以外は操作元の画面から切り替えない。
 function showAnalysisFailure(msg: Extract<HostToWebview, { type: "analysisFailed" }>): void {
   if (msg.reason === undefined) return;
   const tabId = msg.tabId ?? activeTabId;
@@ -331,8 +316,6 @@ export function activeTab(): Tab | null {
   return activeTabId ? tabs.get(activeTabId) ?? null : null;
 }
 
-// src/webview/tab.ts#syncHeadLayout は #logs の実高から測る。ポート高だけが変わる経路は Tab 側のイベントに現れないので、
-// resize とコンポーザの伸縮からここで測り直す。
 let headLayoutPending = false;
 function syncActiveHeadLayout(): void {
   if (headLayoutPending) return;
@@ -344,8 +327,6 @@ function syncActiveHeadLayout(): void {
 }
 window.addEventListener("resize", syncActiveHeadLayout);
 
-// height を auto に戻してから測る。戻さないと scrollHeight が伸びた側に張り付いて縮まない。
-// inputEl はタブ間で共有なので、value を差し替える経路はすべてここを通す。
 function autosizeComposer(): void {
   const previous = inputEl.style.height;
   inputEl.style.height = "auto";
@@ -360,7 +341,6 @@ function autosizeComposer(): void {
   });
 }
 
-// 高さは autosizeComposer で戻す。style.height を直接書くと reflowComposer の張り付け直しと syncActiveHeadLayout を飛ばす。
 function clearComposerInput(): void {
   inputEl.value = "";
   autosizeComposer();
@@ -382,7 +362,6 @@ export function refreshChrome(): void {
     actionBtn.setAttribute("aria-label", l10n.t("Stop"));
     actionBtn.disabled = state === "interrupting";
   }
-  // 表示面で無効化しない。src/webview/tab.ts#scrollToPreviousUserBlock は会話面へ切り替えてから遡る。
   convPrevBtn.disabled = t === null;
   convNextBtn.disabled = t === null;
   renderAuth(t);
@@ -396,36 +375,15 @@ function renderMode(t: Tab | null): void {
   modeBtn.className = mode === "bypassPermissions" ? "mode-chip mode-danger" : "mode-chip";
 }
 
-// R-CMD-02: 表示名は CLI が返した行のラベルだけから取る。適用済みのモデルは解決後の id で届き、行の id は選択用の綴りなので
-// resolvedModel でも引く。default の行は指し先であってモデル名ではないので resolvedModel の照合から外す（verify-webview-menu#MODEL-ALIAS）。
-function findModelRow(t: Tab | null, value: string): ModelInfo | undefined {
-  const rows = t?.models ?? [];
-  return (
-    rows.find((m) => m.id === value) ??
-    rows.find((m) => m.id !== "default" && m.resolvedModel === value)
-  );
-}
-
-// R-GW-07: an unresolved fallback outranks the requested selection (verify-webview-menu#RF-UI).
-// src/conversation-lifecycle.ts#applyModelChange answers with modelChanged and does not resend auth_status,
-// so an explicit selection outranks auth.model (verify-webview-menu#MODEL-ALIAS).
 export function displayModelName(t: Tab | null): string | undefined {
-  if (t?.modelFallback && t.modelFallback.resolvedAt === undefined) {
-    const model = t.modelFallback.appliedModel;
-    return findModelRow(t, model)?.label ?? model;
-  }
+  const rows = t?.models ?? [];
+  if (t?.modelFallback && t.modelFallback.resolvedAt === undefined) return resolveModelDisplayName(rows, t.modelFallback.appliedModel);
   const override = t?.modelOverride;
-  if (override) {
-    const label = findModelRow(t, override)?.label;
-    return label && label !== override ? label : t?.modelDisplayName(override) ?? override;
-  }
-  // 空白だけの設定値は trim で未設定へ落とす。落とさないとチップが空のまま出る。照合も raw で行う。
+  if (override) return resolveModelDisplayName(rows, override);
   const raw = override === null ? "default" : (t?.auth?.model ?? t?.appliedModel ?? t?.recordedModel ?? t?.configModel)?.trim();
   if (!raw) return undefined;
-  const info = findModelRow(t, raw);
-  // default は指し先なので、findModelRow の行が無ければ文字列のまま出さない。
-  if (raw === "default") return info?.label;
-  return info?.label && info.label !== raw ? info.label : t?.modelDisplayName(raw) ?? raw;
+  if (raw === "default" && !findModelRow(rows, raw)) return undefined;
+  return resolveModelDisplayName(rows, raw);
 }
 
 export function renderAuth(t: Tab | null): void {
@@ -454,7 +412,7 @@ export function renderAuth(t: Tab | null): void {
   authEl.className = (auth.billingRealm === "subscription" ? "chip" : "chip warn") + (fallback ? " model-fallback-warning" : "");
   authEl.title = `${auth.credentialSource} / ${auth.billingRealm} · apiKeySource=${
     auth.apiKeySource ?? "?"
-  } session=${auth.sessionId ?? "?"}`;
+  }`;
 }
 
 function contextUsageLine(c: NonNullable<Tab["contextUsage"]>): string {
@@ -483,7 +441,6 @@ function costText(totalCostUsd: number | undefined): string {
 
 function renderUsage(u: UsageSnapshot | null, contextUsage: Tab["contextUsage"] | null): void {
   const contextTitle = contextUsage ? contextUsageLine(contextUsage) : null;
-  // R-CNV-06: チップ本文はコンテキスト利用率だけ。他の消費情報は title へ回す。
   const chipText = contextUsage ? `ctx ${contextUsage.percentage}%` : CONTEXT_CHIP_EMPTY;
   if (!u) {
     usageEl.textContent = chipText;
@@ -508,17 +465,50 @@ function renderUsage(u: UsageSnapshot | null, contextUsage: Tab["contextUsage"] 
   usageEl.title = `${contextTitle ? `${contextTitle}\n` : ""}${l10n.t("This turn's usage: {0}", usageText)}`;
 }
 
-let cachedUsageFetchedAt = 0;
-// utilization はパーセント値で持つ（SDK の SDKControlGetUsageResponse の rate_limits と同じ単位）。生産者は
-// src/webview/tab.ts#onRateLimit と cachedUsage の受信で、どちらも換算しない。片方だけ換算すると同じ Map に尺度が混ざる。
-export const rateLimits = new Map<string, { utilization: number; resetsAt: number | null; isUsingOverage: boolean }>();
-const RATE_LABELS: Record<string, string> = {
-  five_hour: l10n.t("5-hour window"),
-  weekly: l10n.t("Weekly window"),
-  seven_day: l10n.t("Weekly window"),
-  seven_day_opus: l10n.t("Weekly window (Opus)"),
-  seven_day_sonnet: l10n.t("Weekly window (Sonnet)"),
-};
+let accountUsage: AccountUsageSnapshot | null = null;
+let accountUsagePending = false;
+let accountUsageRequestId: string | null = null;
+let accountUsageRequestSeq = 0;
+let accountUsageReplyTimer: ReturnType<typeof setTimeout> | undefined;
+let accountUsageResetTimer: ReturnType<typeof setTimeout> | undefined;
+const TIMER_DELAY_MAX_MS = 2_147_483_647;
+
+function settleAccountUsageRequest(): void {
+  accountUsagePending = false;
+  if (accountUsageReplyTimer !== undefined) clearTimeout(accountUsageReplyTimer);
+  accountUsageReplyTimer = undefined;
+}
+
+function scheduleAccountUsageReset(rows: AccountUsageRow[], now: number): void {
+  if (accountUsageResetTimer !== undefined) clearTimeout(accountUsageResetTimer);
+  accountUsageResetTimer = undefined;
+  const next = Math.min(...rows.map((row) => (row.resetsAt === null ? Infinity : row.resetsAt)));
+  if (!Number.isFinite(next)) return;
+  accountUsageResetTimer = setTimeout(() => {
+    accountUsageResetTimer = undefined;
+    if (!usagePanelEl.classList.contains("hidden")) renderUsagePanel();
+  }, Math.min(TIMER_DELAY_MAX_MS, Math.max(0, next - now)));
+}
+
+function accountUsageRowLabel(row: AccountUsageRow): string {
+  switch (row.kind) {
+    case "session":
+      return l10n.t("5-hour window");
+    case "weekly_all":
+      return l10n.t("Weekly window");
+    case "weekly_scoped":
+      return row.scope ? l10n.t("Weekly window ({0})", row.scope) : l10n.t("Weekly window");
+    default:
+      return row.scope ? `${row.kind} (${row.scope})` : row.kind;
+  }
+}
+
+function accountUsageLine(text: string): HTMLDivElement {
+  const line = document.createElement("div");
+  line.className = "usage-line";
+  line.textContent = text;
+  return line;
+}
 
 export function renderUsagePanel(): void {
   usagePanelEl.textContent = "";
@@ -547,37 +537,32 @@ export function renderUsagePanel(): void {
   const context = curTab?.contextUsage;
   contextLine.textContent = context ? contextUsageLine(context) : l10n.t("Context: not fetched yet");
   usagePanelEl.appendChild(contextLine);
-  if (rateLimits.size === 0) {
-    const none = document.createElement("div");
-    none.className = "usage-line";
-    // 実測: CLI は利用率を実APIコールを伴うターンでしか送ってこない。/usage を打っても
-    // 送られない（ローカル処理のターンでは rate_limit が来ない）ため、待てば出る類ではない
-    none.textContent = l10n.t("Usage: not fetched (arrives from the CLI after one exchange)");
-    usagePanelEl.appendChild(none);
+  if (accountUsagePending || accountUsage === null) {
+    usagePanelEl.appendChild(accountUsageLine(l10n.t("Usage: fetching…")));
+    return;
   }
-  if (cachedUsageFetchedAt > 0 && rateLimits.size > 0) {
-    const at = document.createElement("div");
-    at.className = "usage-line";
-    const fetchedAt = new Date(cachedUsageFetchedAt).toLocaleString(uiLocale(), { hour12: false });
-    at.textContent = l10n.t("Usage fetched at: {0}", fetchedAt);
-    usagePanelEl.appendChild(at);
+  if (accountUsage.state !== "ok") {
+    usagePanelEl.appendChild(accountUsageLine(l10n.t("Usage: unavailable")));
+    return;
   }
-  for (const [type, rl] of rateLimits) {
+  const fetchedAt = new Date(accountUsage.fetchedAtMs).toLocaleString(uiLocale(), { hour12: false });
+  usagePanelEl.appendChild(accountUsageLine(l10n.t("Usage fetched at: {0}", fetchedAt)));
+  const now = Date.now();
+  const rows = accountUsage.rows.filter((row) => isCurrentAccountUsageRow(row, now));
+  scheduleAccountUsageReset(rows, now);
+  if (rows.length === 0) usagePanelEl.appendChild(accountUsageLine(l10n.t("Usage: no current windows")));
+  for (const rl of rows) {
     const row = document.createElement("div");
     row.className = "usage-rl";
-    const label = document.createElement("div");
-    label.className = "usage-line";
-    const pct = Math.round(rl.utilization);
-    const reset = rl.resetsAt ? new Date(rl.resetsAt).toLocaleString(uiLocale(), { hour12: false }) : "?";
-    const rateLabel = RATE_LABELS[type] ?? type;
-    label.textContent = rl.isUsingOverage
-      ? l10n.t("{0}: {1}% (using overage) · resets {2}", rateLabel, pct, reset)
-      : l10n.t("{0}: {1}% · resets {2}", rateLabel, pct, reset);
+    const pct = Math.round(rl.percent);
+    const reset = rl.resetsAt !== null ? new Date(rl.resetsAt).toLocaleString(uiLocale(), { hour12: false }) : "?";
+    const label = accountUsageLine(l10n.t("{0}: {1}% · resets {2}", accountUsageRowLabel(rl), pct, reset));
     const barWrap = document.createElement("div");
     barWrap.className = "usage-bar-wrap";
     const bar = document.createElement("div");
-    bar.className = `usage-bar${pct >= 90 ? " warn" : ""}`;
-    bar.style.width = `${Math.min(100, pct)}%`;
+    const warn = rl.severity !== undefined ? rl.severity !== "normal" : pct >= 90;
+    bar.className = `usage-bar${warn ? " warn" : ""}`;
+    bar.style.width = `${Math.min(100, Math.max(0, pct))}%`;
     barWrap.appendChild(bar);
     row.append(label, barWrap);
     usagePanelEl.appendChild(row);
@@ -585,8 +570,18 @@ export function renderUsagePanel(): void {
 }
 
 function openUsagePanel(): void {
-  vscode.postMessage({ type: "requestCachedUsage" });
-  // 外側クリックで閉じる判定は stopPropagation する経路で走らないので、開く側で closeAuthPicker と closeModeMenu を呼ぶ。
+  if (!accountUsagePending) {
+    accountUsagePending = true;
+    accountUsageReplyTimer = setTimeout(() => {
+      accountUsageReplyTimer = undefined;
+      if (!accountUsagePending) return;
+      accountUsagePending = false;
+      accountUsage = { seq: accountUsage?.seq ?? 0, fetchedAtMs: Date.now(), state: "failed", rows: [] };
+      if (!usagePanelEl.classList.contains("hidden")) renderUsagePanel();
+    }, ACCOUNT_USAGE_REPLY_WAIT_MS);
+    accountUsageRequestId = `usage-${++accountUsageRequestSeq}`;
+    vscode.postMessage({ type: "requestAccountUsage", requestId: accountUsageRequestId, ...(activeTabId ? { tabId: activeTabId } : {}) });
+  }
   closeAuthPicker();
   closeModeMenu();
   renderUsagePanel();
@@ -595,6 +590,13 @@ function openUsagePanel(): void {
 }
 
 export function closeUsagePanel(): void {
+  if (accountUsageRequestId !== null && !usagePanelEl.classList.contains("hidden")) {
+    accountUsageRequestId = null;
+    settleAccountUsageRequest();
+    vscode.postMessage({ type: "accountUsagePanelClosed" });
+  }
+  if (accountUsageResetTimer !== undefined) clearTimeout(accountUsageResetTimer);
+  accountUsageResetTimer = undefined;
   usagePanelEl.classList.add("hidden");
   usageEl.setAttribute("aria-expanded", "false");
 }
@@ -616,7 +618,6 @@ function initUsagePanel(): void {
 }
 
 let llmDiagnosticsEl: HTMLElement | undefined;
-// undefined は未着で、撤去も抑止もしない（verify-webview-wiring#D5-2）。
 let llmDiagnosticsAllowed: boolean | undefined;
 
 function llmDiagnosticsPanel(): HTMLElement {
@@ -630,8 +631,6 @@ function llmDiagnosticsPanel(): HTMLElement {
   return llmDiagnosticsEl;
 }
 
-// 明示 off では hidden でなく DOM から外す（verify-webview-wiring#D5-4）。on だけではパネルを作らない。作ると空枠が
-// 未実行を 0 件と描く（verify-webview-wiring#D5-1）。
 function applyLlmDiagnosticsMode(mode: boolean | undefined): void {
   llmDiagnosticsAllowed = mode;
   if (mode !== false) return;
@@ -642,26 +641,20 @@ function applyLlmDiagnosticsMode(mode: boolean | undefined): void {
 }
 
 const REPLAY_MAX = 1500;
-// 応答が失われると status が inflight のまま固着するので、HISTORY_REQUEST_TIMEOUT_MS で error へ降ろして再開を出す。
 const HISTORY_REQUEST_TIMEOUT_MS = 30_000;
-// cursor 無しの transcript 要求は Host がセッションの記録を全読みするので、HISTORY_REQUEST_TIMEOUT_MS より長く待つ
-// （verify-conversation-history#CH-T1mut）。
 const CONV_FIRST_TRANSCRIPT_TIMEOUT_MS = 120_000;
 const CONV_FIRST_CHUNK_RETRY_MAX = 3;
 const CONV_FIRST_CHUNK_RETRY_DELAY_MS = 2_000;
 
 interface HistoryPager {
   anchorUuid?: string;
-  // events を尽くしてから transcript へ移る。events の方が新しいので、上へ積むだけで時系列順になる。
   phase?: "events" | "transcript";
   eventAnchor?: { generation: number; seq: number };
   status: "idle" | "inflight" | "exhausted" | "error";
-  // anchor と cursor を同じ要求に載せない。src/protocol.ts#isWebviewToHost が拒否する。
   anchor?: { generation: number; seq: number };
   cursor?: string;
   requestId?: string;
   retried: boolean;
-  // undefined は追走していない印。stopConvChase は undefined に戻して追走を止め、convChaseContinues はそれを見て続けない。
   autoSteps?: number;
   chaseBudget?: number;
   chasePaused?: boolean;
@@ -671,8 +664,6 @@ interface HistoryPager {
   firstChunkRetries?: number;
   backfillBudget?: number;
   backfillTotal?: number;
-  // 読了の判定は transcriptRemaining で行う。transcript 位相に入った事実で判定すると、渡されなかった分が読了扱いになる。
-  // hostDroppedAtInstall との差で代用しない。記録の fold と live の fold は件数が一致しない。
   transcriptRemaining?: number;
   wasAtBottom?: boolean;
   timer?: ReturnType<typeof setTimeout>;
@@ -681,8 +672,6 @@ interface HistoryPager {
   renderFailNoteEl?: HTMLElement;
 }
 
-// prepend の間だけ scroll anchoring を止める。自前の補正と重なると二重に補正される（verify-history-prepend#HPmut-10）。
-// #logs で恒久的に止めると、画面外の上の行が伸びたときに表示が跳ねる（verify-history-prepend#HP-C17）。
 function withoutScrollAnchoring<T>(fn: () => T): T {
   const previous = logsEl.style.overflowAnchor;
   logsEl.style.overflowAnchor = "none";
@@ -693,8 +682,6 @@ function withoutScrollAnchoring<T>(fn: () => T): T {
   }
 }
 
-// R-TAB-07: 見えていない面では scrollHeight が動かないので補正しない。補正は視界の上端より上の差し替えに限る。
-// prepend と違い、画像スロットは視界より下でも差し替わる（verify-history-prepend#HPmut-24）。
 export function swapPreservingConvView(tabId: string, target: Element, replacement: Node): void {
   if (!convPaneVisible(tabId)) {
     target.replaceWith(replacement);
@@ -703,7 +690,6 @@ export function swapPreservingConvView(tabId: string, target: Element, replaceme
   withoutScrollAnchoring(() => {
     const portTop = logsEl.getBoundingClientRect().top;
     const nodeTop = target.getBoundingClientRect().top;
-    // Tab の atBottom は scroll イベントでしか更新されず直前の追記を含まないので、SCROLL_BOTTOM_GAP_PX で測り直す。
     const atBottom = logsEl.scrollHeight - logsEl.scrollTop - logsEl.clientHeight <= SCROLL_BOTTOM_GAP_PX;
     const heightBeforeSwap = logsEl.scrollHeight;
     target.replaceWith(replacement);
@@ -738,8 +724,6 @@ function reflowComposer(mutate: (settle: () => void) => void): void {
   const generation = surfaceGeneration;
   let placedTop = logsEl.scrollTop;
   let placedHeight = logsEl.scrollHeight;
-  // 上の見出しが縮むと scroll anchoring が同じだけ scrollTop を下げる。縮んだ分で説明できない下げ幅が
-  // SCROLL_BOTTOM_GAP_PX を超えたときだけ、利用者が遡ったとみなして張り付け直さない。
   const settleLater = (): void => {
     if (generation !== surfaceGeneration) return;
     const shrank = Math.max(placedHeight - logsEl.scrollHeight, 0);
@@ -753,22 +737,17 @@ function reflowComposer(mutate: (settle: () => void) => void): void {
   restickConv(stuck);
   placedTop = logsEl.scrollTop;
   placedHeight = logsEl.scrollHeight;
-  // syncActiveHeadLayout のタイマーより後に積むので、その測り直しで動いた scrollHeight に対して張り付け直せる。
   setTimeout(settleLater, 0);
 }
 
 const historyPagers = new Map<string, HistoryPager>();
-// localEventDrops を当てる前の値。refreshLocalDropViews が件数の変化を当て直す。
 const lastWorkModels = new Map<string, Parameters<typeof withLocalEventDrop>[0]>();
-// 概要とグラフは semantic の coverage.base を読むので、こちらも素の値を持って displaySemanticModel で当て直す。
 const lastSemanticModels = new Map<string, { model: SemanticModelPayload | undefined; view: boolean | undefined }>();
 let historyRequestSeq = 0;
 
 const convPagers = new Map<string, HistoryPager>();
 let convRequestSeq = 0;
 
-// R-CNV-01: 追走は描画の結果では止めない（verify-conversation-history#CH-C25mut、verify-conversation-history#CH-C28mut）。
-// 一過性のエラーでも止めない（verify-conversation-history#CH-E1mut）。前進の検査は convChaseContinues が持つ。
 function stopConvChase(pager: HistoryPager): void {
   pager.autoSteps = undefined;
   pager.lastRemainingOlder = undefined;
@@ -784,7 +763,6 @@ function convChaseContinues(
 ): boolean {
   if (pager.autoSteps === undefined) return false;
   if (!page.hasMore || page.nextCursor === undefined) return false;
-  // cursor が進まない応答で無限追走にしない（R-CNV-01）
   if (page.nextCursor === usedCursor) {
     stopConvChase(pager);
     reportWebviewDiagnostic(
@@ -793,7 +771,6 @@ function convChaseContinues(
     );
     return false;
   }
-  // 0 件で hasMore を信じ続けると終端へ着かない（R-CNV-01）
   if (returnedCount === 0) {
     stopConvChase(pager);
     reportWebviewDiagnostic(
@@ -803,7 +780,6 @@ function convChaseContinues(
     return false;
   }
   const remaining = page.coverage.remainingOlderCount;
-  // 残件が減らない応答は前進していない（R-CNV-01）
   if (pager.lastRemainingOlder !== undefined && remaining >= pager.lastRemainingOlder) {
     stopConvChase(pager);
     reportWebviewDiagnostic(
@@ -813,7 +789,6 @@ function convChaseContinues(
     return false;
   }
   pager.lastRemainingOlder = remaining;
-  // R-CNV-01: 上限は直前の応答の残件から引き直す。固定値にすると長い会話が終端の前に止まる（verify-conversation-history#CH-C32mut）。
   if (pager.chaseBudget !== undefined && pager.autoSteps >= pager.chaseBudget) {
     stopConvChase(pager);
     reportWebviewDiagnostic(
@@ -822,7 +797,6 @@ function convChaseContinues(
     );
     return false;
   }
-  // 余裕を足さない。残件は直前の検査で必ず減るので、足すと chaseBudget に到達しなくなる。
   pager.chaseBudget = pager.autoSteps + remaining;
   pager.autoSteps++;
   return true;
@@ -834,13 +808,11 @@ function dropConvPager(tabId: string): void {
   convPagers.delete(tabId);
 }
 
-// logsEl はタブ横断の単一容器で、非表示パネルでは scrollHeight が動かず視界維持の補正が成立しない。
 function convPaneVisible(tabId: string): boolean {
   const t = tabs.get(tabId);
   return t !== undefined && activeTabId === tabId && t.viewMode === "conv";
 }
 
-// R-CNV-02: 分母の phaseInitialRemaining は phase ごとに取り直す。phase で数える単位が違う。
 function showConvChaseProgress(tabId: string, pager: HistoryPager, remaining: number): void {
   const coord = resumeCoordinators.get(tabId);
   if (coord) coord.convPager = "running";
@@ -852,7 +824,6 @@ function showConvChaseProgress(tabId: string, pager: HistoryPager, remaining: nu
   t.setConvLoadProgress({ phase: "loading", remaining, ratio });
 }
 
-// R-DSP-03: 欠落の種類ごとに件数を分けて出す。
 export function conversationHistoryGapNote(coverage: {
   malformedLineCount?: number;
   droppedWithoutUuidCount?: number;
@@ -871,7 +842,6 @@ export function conversationHistoryGapNote(coverage: {
   );
 }
 
-// 描画失敗を診断だけに出すと、進行表示が消えたとき全件出たと読まれる（verify-conversation-history#CHmut-C41）。
 export function conversationRenderFailureNote(failedTotal: number): string | undefined {
   if (failedTotal <= 0) return undefined;
   return l10n.t(
@@ -884,7 +854,6 @@ export function worklogRenderFailureNote(failedTotal: number): string {
   return l10n.t("⚠ {0} past events failed to render and could not be shown in the execution log", failedTotal);
 }
 
-// prepend の後に数え直さないと過去の一致が検索の件数に入らない（verify-conversation-history#CHmut-U32c-a）。
 function refreshFindAfterPrepend(tabId: string): void {
   if (tabId === activeTabId) refreshFind("end");
 }
@@ -894,7 +863,6 @@ function finishConvChaseProgress(tabId: string): void {
   const coord = resumeCoordinators.get(tabId);
   if (coord) {
     coord.convPager = "exhausted";
-    // R-CNV-02: 進行表示は Host の complete と pager の exhausted が揃ったときだけ消す。
     if (coord.host === "complete") {
       tabs.get(tabId)?.setConvLoadProgress({ phase: "done" });
     }
@@ -925,7 +893,6 @@ function installConvPager(
   t: Tab,
   tabId: string,
   windowed: { events: NormalizedEvent[]; droppedCount: number; backfilledHead: boolean },
-  // droppedCount で判定しない。落ちた区間が会話に描けないイベントだけでも追走を起こす（verify-conversation-history#CH-C20mut-a）。
   hasDroppedConvEvent: boolean
 ): void {
   dropConvPager(tabId);
@@ -936,7 +903,6 @@ function installConvPager(
     if (coord) coord.convPager = "exhausted";
     return;
   }
-  // 起点は画面に出ている最古。Host の resume 時点の起点に任せると、窓から落ちた復元ブロックが黙って欠ける（verify-conversation-history#CHmut-4）。
   const pager: HistoryPager = {
     status: "idle",
     retried: false,
@@ -946,7 +912,6 @@ function installConvPager(
   };
   convPagers.set(tabId, pager);
   if (coord) coord.convPager = "running";
-  // R-CNV-01: 開いた時点で追走を始める（verify-conversation-history#CH-C31amut）。
   startConversationChase(tabId);
 }
 
@@ -972,12 +937,10 @@ function resumeConversationChase(tabId: string): void {
 function requestConversationChunk(tabId: string): void {
   const pager = convPagers.get(tabId);
   if (pager === undefined) return;
-  // 並列 fetch にしない。同時要求は cursor 空間を壊す（R-CNV-01）
   if (pager.status === "inflight" || pager.status === "exhausted") {
     stopConvChase(pager);
     return;
   }
-  // R-CNV-01: 非表示の面へは要求を出さずに退避し、convPaneVisible になったら resumeConversationChase で継ぐ。
   if (!convPaneVisible(tabId)) {
     pager.chasePaused = true;
     return;
@@ -1030,7 +993,6 @@ function onConvEventChunkResult(
     dropConvPager(tabId);
     return;
   }
-  // R-CNV-01: 見えていない面へは描かず、cursor を進めずに退避する。戻ったら同じ chunk から読み直す。
   if (!convPaneVisible(tabId)) {
     pager.retried = false;
     pager.status = "idle";
@@ -1055,7 +1017,6 @@ function onConvEventChunkResult(
       `conv event prepend partial failure: ${result.failed}件 ${result.failures.join(" | ")} (tab=${tabId})`
     );
   }
-  // skipped と continued を duplicates へ畳まない。畳むと重複だったと読まれる。
   if (
     result.rendered + result.continued + result.skipped + result.duplicates + result.failed !==
     result.total
@@ -1074,7 +1035,6 @@ function onConvEventChunkResult(
         `expected=${result.expectedConnected} (tab=${tabId})`
     );
   }
-  // 描画失敗の件数は進行表示が消える前に会話面へ出す（verify-conversation-history#CHmut-C41c）。
   if (result.failed > 0) {
     pager.renderFailedTotal = (pager.renderFailedTotal ?? 0) + result.failed;
     const renderNote = conversationRenderFailureNote(pager.renderFailedTotal);
@@ -1089,7 +1049,6 @@ function onConvEventChunkResult(
     pager.cursor = page.nextCursor;
     pager.status = "idle";
     showConvChaseProgress(tabId, pager, page.coverage.remainingOlderCount);
-    // 続けられないのに残件があるときは停止として扱い、読了として消さない。
     if (chase) requestConversationChunk(tabId);
     else failConvChaseProgress(tabId, "stalled");
     return;
@@ -1100,15 +1059,12 @@ function onConvEventChunkResult(
   if (t.hasReplayedConversation() && pager.anchorUuid !== undefined) {
     pager.phase = "transcript";
     pager.status = "idle";
-    // events が描画なしで尽きても止めずに transcript へ入る。
     if (pager.autoSteps !== undefined) {
-      // phase で数える単位が変わるので、残件の比較・分母・上限を取り直す（verify-conversation-history#CH-C31bmut2）。
       pager.lastRemainingOlder = undefined;
       pager.phaseInitialRemaining = undefined;
       pager.chaseBudget = pager.autoSteps + 1;
       requestConversationChunk(tabId);
     } else {
-      // R-CNV-02: 到達しない想定の保険。追走が止まったまま phase だけ移ると、進行表示が読み込み中のまま残り再開手段も出ない。
       failConvChaseProgress(tabId, "stalled");
     }
     return;
@@ -1122,7 +1078,7 @@ function onConversationHistoryResult(
   tabId: string,
   requestId: string,
   page: {
-    items: Array<{ uuid: string; role: "user" | "assistant"; text: string; imageRefs?: ImageRefInfo[] }>;
+    items: Array<{ uuid: string; role: "user" | "assistant" | "system"; text: string; imageRefs?: ImageRefInfo[] }>;
     nextCursor?: string;
     hasMore: boolean;
     coverage: { remainingOlderCount: number; malformedLineCount?: number; droppedWithoutUuidCount?: number };
@@ -1138,7 +1094,6 @@ function onConversationHistoryResult(
     dropConvPager(tabId);
     return;
   }
-  // R-CNV-01: 見えていない面へは描かず、cursor を進めずに退避する（verify-conversation-history#CH-C33mut）。
   if (!convPaneVisible(tabId)) {
     pager.retried = false;
     pager.status = "idle";
@@ -1179,16 +1134,13 @@ function onConversationHistoryResult(
         `expected=${result.expectedConnected} (tab=${tabId})`
     );
   }
-  // R-DSP-03: 欠落の注記は進行表示が消える前に出す（verify-conversation-history#CHmut-C40）。
   const gapNote = conversationHistoryGapNote(page.coverage);
-  // 描画失敗も同じ注記に並べる。events 位相の分も renderFailedTotal に累計済み（verify-conversation-history#CHmut-C41）。
   if (result.failed > 0) pager.renderFailedTotal = (pager.renderFailedTotal ?? 0) + result.failed;
   const renderNote = conversationRenderFailureNote(pager.renderFailedTotal ?? 0);
   const historyNote = [gapNote, renderNote].filter((n): n is string => n !== undefined).join(" ");
   if (historyNote.length > 0) t.setConvHistoryNote(historyNote);
   refreshFindAfterPrepend(tabId);
   t.realignScrollAnchor();
-  // cursor が無効になったときの取り直しは anchorUuid から始まるので、描画済みの最古を控える。
   const oldest = page.items[0];
   if (oldest !== undefined) pager.anchorUuid = oldest.uuid;
   if (page.hasMore && page.nextCursor !== undefined) {
@@ -1208,8 +1160,6 @@ function onConversationHistoryResult(
 function onConvEventChunkError(tabId: string, reason: string): void {
   const pager = convPagers.get(tabId)!;
   const t = tabs.get(tabId);
-  // R-CNV-01: 一過性のエラーでも追走の状態を落とさない（verify-conversation-history#CH-E2mut）。無限に続かないのは、
-  // retried が再 anchor を応答の成功まで 1 回に限り、前進の検査を convChaseContinues が持つため。
   const transient =
     reason === "invalid-cursor" || reason === "unknown-anchor" || reason === "stale-request";
   if (transient && !pager.retried && pager.eventAnchor !== undefined) {
@@ -1235,7 +1185,6 @@ function onConvEventChunkError(tabId: string, reason: string): void {
   failConvChaseProgress(tabId, reason);
 }
 
-// 進行表示の本文に理由コードを生で出さない（R-DSP-12）
 const CONV_HISTORY_ERROR_LABELS: Record<ConversationHistoryErrorReason, string> = {
   "invalid-cursor": l10n.t("the load position became invalid"),
   "unknown-anchor": l10n.t("the position to go back to could not be determined"),
@@ -1255,18 +1204,12 @@ function onConversationHistoryError(tabId: string, requestId: string, reason: st
   if (pager.timer !== undefined) clearTimeout(pager.timer);
   pager.timer = undefined;
   pager.requestId = undefined;
-  // 一過性の失敗は cursor を捨て、anchorUuid（画面の最古）から取り直す。Host の起点に任せると遡った位置が黙って巻き戻る。
-  // R-CNV-01: 追走の状態は落とさない（verify-conversation-history#CH-E1mut）。session-scan-failed は解けうるので一過性に含め、
-  // 終端にしない（verify-conversation-history#CH-C7b-mut）。
   const transient =
     reason === "invalid-cursor" ||
     reason === "history-unavailable" ||
     reason === "stale-request" ||
     reason === "session-scan-failed";
   if (transient && pager.receivedTranscriptChunk !== true) {
-    // chunk を受け取る前の一過性失敗は CONV_FIRST_CHUNK_RETRY_DELAY_MS 置いて取り直す。再読込直後は Host 側の登録し直しと
-    // 重なって続く（verify-conversation-history#CH-T2mut）。使い切っても即時の取り直しへ落とさない。失う cursor が無く、
-    // ロックもまだ解けていない（verify-conversation-history#CH-T3mut-a）。
     if ((pager.firstChunkRetries ?? 0) < CONV_FIRST_CHUNK_RETRY_MAX) {
       pager.firstChunkRetries = (pager.firstChunkRetries ?? 0) + 1;
       pager.cursor = undefined;
@@ -1285,15 +1228,12 @@ function onConversationHistoryError(tabId: string, requestId: string, reason: st
     return;
   }
   stopConvChase(pager);
-  // 終端にするのは遡る対象が無いと確定した理由だけ。取り直しても結果が変わらず、そのたびに Host が記録を全読みする。
-  // 一過性の理由を使い切った場合は error として出す。
   if (reason === "session-unavailable" || reason === "unknown-anchor") {
     pager.status = "exhausted";
     finishConvChaseProgress(tabId);
     return;
   }
   pager.status = "error";
-  // 取り直しを使い切ったことを本文に出す（verify-conversation-history#CH-T3）。
   const attempts = pager.receivedTranscriptChunk !== true ? (pager.firstChunkRetries ?? 0) : 1;
   const label = CONV_HISTORY_ERROR_LABELS[reason as ConversationHistoryErrorReason] ?? l10n.t("a failure whose reason could not be determined");
   failConvChaseProgress(
@@ -1303,14 +1243,12 @@ function onConversationHistoryError(tabId: string, requestId: string, reason: st
   );
 }
 
-// lastWorkModels をここで消さない。addTab が installHistoryPager より前に控えた値を refreshLocalDropViews が使う。
 function dropHistoryPager(tabId: string): void {
   const pager = historyPagers.get(tabId);
   if (pager?.timer !== undefined) clearTimeout(pager.timer);
   historyPagers.delete(tabId);
 }
 
-// 視界補正の可否にだけ使う。発行条件にすると見えていないタブが読み進まない（verify-history-prepend#HPmut-11）。
 function historyPaneVisible(tabId: string): boolean {
   const t = tabs.get(tabId);
   return (
@@ -1323,9 +1261,6 @@ function mayRequestBackfill(tabId: string): boolean {
   const pager = historyPagers.get(tabId);
   if (t === undefined || pager === undefined) return false;
   if (pager.status === "exhausted") return false;
-  // 実行ログを遡っている間は止め、syncWorklogBackfillScroll と retryWorklogBackfill で再開する
-  // （verify-history-prepend#HPmut-15、verify-history-prepend#HPmut-19）。R-TAB-07: 見るのは実行ログの張り付きで、
-  // 表示中のサブタブの位置ではない。
   if (!t.isWorklogAtBottom()) return false;
   return true;
 }
@@ -1356,7 +1291,6 @@ function failWorklogBackfill(tabId: string, reason: string): void {
   refreshLocalDropViews(tabId);
 }
 
-// R-TAB-08: 最下部へ戻してから始める。戻さないと mayRequestBackfill が偽のまま要求が出ない（verify-history-prepend#HPmut-19）。
 function retryWorklogBackfill(tabId: string): void {
   const pager = historyPagers.get(tabId);
   const t = tabs.get(tabId);
@@ -1367,12 +1301,10 @@ function retryWorklogBackfill(tabId: string): void {
   startWorklogBackfill(tabId);
 }
 
-// R-TAB-08: 進行表示は pager が exhausted になったときだけ消す。残件数からは消さない（verify-history-prepend#HPmut-17）。
 function finishWorklogBackfill(tabId: string): void {
   const coord = resumeCoordinators.get(tabId);
   if (coord) {
     coord.workPager = "exhausted";
-    // R-TAB-08: Host の complete と pager の exhausted が揃ったときだけ消す。
     if (coord.host === "complete") {
       tabs.get(tabId)?.setWorkLoadProgress({ phase: "done" });
     }
@@ -1390,7 +1322,6 @@ function startWorklogBackfill(tabId: string): void {
   refreshLocalDropViews(tabId);
 }
 
-// error で止まった裏読みはアクティブ化で再開しない。再開は retryWorklogBackfill だけ。
 function resumeWorklogBackfill(tabId: string): void {
   const pager = historyPagers.get(tabId);
   if (pager === undefined) return;
@@ -1398,7 +1329,6 @@ function resumeWorklogBackfill(tabId: string): void {
   startWorklogBackfill(tabId);
 }
 
-// 最下部へ戻った遷移で再開する（verify-history-prepend#HPmut-15）。毎スクロールでは要求しない。
 function syncWorklogBackfillScroll(tabId: string): void {
   const pager = historyPagers.get(tabId);
   const t = tabs.get(tabId);
@@ -1417,12 +1347,10 @@ function worklogBackfillContinues(
   returnedCount: number
 ): boolean {
   if (!page.hasMore || page.nextCursor === undefined) return false;
-  // cursor が進まない応答で無限追走にしない（R-TAB-07）
   if (page.nextCursor === usedCursor) {
     reportWebviewDiagnostic("error", `worklog backfill stopped: cursor が進んでいない (tab=${tabId})`);
     return false;
   }
-  // 0 件で hasMore を信じ続けると終端へ着かない（R-TAB-07）
   if (returnedCount === 0) {
     reportWebviewDiagnostic(
       "error",
@@ -1431,7 +1359,6 @@ function worklogBackfillContinues(
     return false;
   }
   const remaining = page.coverage.remainingOlderCount;
-  // 残件が減らない応答は前進していない（R-TAB-07）
   if (pager.lastRemainingOlder !== undefined && remaining >= pager.lastRemainingOlder) {
     reportWebviewDiagnostic(
       "error",
@@ -1440,8 +1367,6 @@ function worklogBackfillContinues(
     return false;
   }
   pager.lastRemainingOlder = remaining;
-  // R-TAB-07: 予算は初回応答の coverage から導く。chunk は最低 1 件を返す（src/history-serving.ts#HISTORY_CHUNK_MIN_ITEMS_LADDER）
-  // ので、予算を超える往復は cursor か索引が壊れている。固定値にすると 1 件ずつ返る長い履歴で足りない。
   if (pager.backfillBudget === undefined) {
     pager.backfillBudget = remaining + page.coverage.returnedCount + 1;
     return true;
@@ -1453,8 +1378,6 @@ function worklogBackfillContinues(
   return true;
 }
 
-// R-TAB-07 / R-TAB-08: 手動の読み込みボタンを置かず、窓落ちを裏読みで埋める。ここでは要求を出さない。init は全タブを
-// 作るので、出すとタブの数だけ連鎖が同時に走る（verify-history-prepend#HP-C25）。
 function installHistoryPager(
   tabId: string,
   windowed: { events: NormalizedEvent[]; droppedCount: number; backfilledHead: boolean },
@@ -1467,7 +1390,6 @@ function installHistoryPager(
     return;
   }
   const anchor = initialHistoryAnchor(windowed);
-  // 誤った anchor を送ると Host が欠落区間を黙って落とすので、initialHistoryAnchor が取れなければ遡らない。
   if (anchor === undefined) {
     if (coord) coord.workPager = "exhausted";
     return;
@@ -1476,12 +1398,10 @@ function installHistoryPager(
   if (coord) coord.workPager = "running";
 }
 
-// localEventDrops を合流する前の値。窓落ちを足した表示用の値と混ぜない。
 function hostCoverage(tabId: string): WorkModelPayload["coverage"] | undefined {
   return lastWorkModels.get(tabId)?.coverage ?? lastSemanticModels.get(tabId)?.model?.coverage.base;
 }
 
-// R-DSP-01: 現在の droppedEventCount を使わない。再生より後に落ちた分は live で描き終えている。
 function coverageUnreachableBase(tabId: string): number {
   return hostDroppedAtInstall.get(tabId) ?? 0;
 }
@@ -1490,12 +1410,9 @@ function coverageBackfillHint(tabId: string): CoverageBackfillHint {
   const pending = localEventDrops.get(tabId) ?? 0;
   const pager = historyPagers.get(tabId);
   const base = coverageUnreachableBase(tabId);
-  // pager が無いのは遡る先が無いときか hydration が終わっていないときで、resumeCoordinators で見分ける。前者を読了にしないと
-  // live の切り詰めで直近のみの表示が残り続ける。
   const coord = resumeCoordinators.get(tabId);
   const settled =
     pager === undefined ? coord === undefined || coord.workPager === "exhausted" : pager.status === "exhausted";
-  // 止まった遡りも件数は確定している。出さないと欠けが黙って消える（R-DSP-03）
   const stopped = pager?.status === "error";
   const unreachable =
     !settled && !stopped
@@ -1503,7 +1420,6 @@ function coverageBackfillHint(tabId: string): CoverageBackfillHint {
       : pager?.phase === "transcript"
         ? pager.transcriptRemaining ?? base
         : base;
-  // R-DSP-03: pager の無いタブでは復元時に外した件数が残っているので、restoreCapped なら complete を名乗らない。
   const host = hostCoverage(tabId);
   const restoreCapped =
     host !== undefined &&
@@ -1540,7 +1456,6 @@ function displayWorkModel(tabId: string, model: WorkModelPayload | undefined): W
   return { ...merged, coverage };
 }
 
-// src/protocol.ts#withLocalEventDrop と同じ規則を coverage.base へ当てる。変えるときは両方を変える。
 function displaySemanticModel(tabId: string, model: SemanticModelPayload | undefined): SemanticModelPayload | undefined {
   const dropped = localEventDrops.get(tabId) ?? 0;
   const hint = coverageBackfillHint(tabId);
@@ -1553,7 +1468,6 @@ function displaySemanticModel(tabId: string, model: SemanticModelPayload | undef
     return { ...model, coverage: { ...model.coverage, base } };
   }
   if (model === undefined) return model;
-  // R-DSP-03: 窓落ちが無くても付記は載せる。載せないと記録から読めなかった欠落が semantic の画面にだけ出ない。
   if (dropped <= 0) {
     if (hint.backfillUnreachableCount === undefined) return model;
     const onlyHint: WorkModelPayload["coverage"] & CoverageBackfillHint = { ...model.coverage.base, ...hint };
@@ -1568,7 +1482,6 @@ function displaySemanticModel(tabId: string, model: SemanticModelPayload | undef
   return { ...model, coverage: { ...model.coverage, base } };
 }
 
-// 受信を待たずに描き直す。受信時にしか withLocalEventDrop を当て直さないと、idle 中に遡り終えても前方切り詰めの表示が残る。
 function refreshLocalDropViews(tabId: string): void {
   const overview = overviews.get(tabId);
   if (overview === undefined) return;
@@ -1595,7 +1508,6 @@ function reduceLocalEventDrops(tabId: string, by: number): void {
   }
 }
 
-// requestId だけで照合し、generation を破棄条件に使わない。CLI の再起動で世代だけ進んでも Host の登録は生きている。
 function acceptHistoryResponse(tabId: string, requestId: string): HistoryPager | undefined {
   const pager = historyPagers.get(tabId);
   if (pager === undefined || pager.requestId !== requestId) return undefined;
@@ -1619,11 +1531,9 @@ function onHistoryChunkResult(
   }
   pager.retried = false;
   const usedCursor = pager.cursor;
-  // R-TAB-07: 見えていない面へも描き、補正だけ落とす。
   const correct = mayCorrectScroll(tabId);
   let result;
   try {
-    // 測定から補正までを同じ同期ブロックで行う。間にフレーム待ちを挟むと跳ねが見える。
     result = correct
       ? withoutScrollAnchoring(() => {
         const before = logsEl.scrollHeight;
@@ -1634,7 +1544,6 @@ function onHistoryChunkResult(
       })
       : t.prependPastEvents(page.items);
   } catch (error) {
-    // acceptHistoryResponse がタイマーを消しているので、ここで error にしないと inflight のまま固着する。
     pager.status = "error";
     failWorklogBackfill(tabId, "prepend-failed");
     reportWebviewDiagnostic("error", `history prepend failed: ${String(error)} (tab=${tabId})`);
@@ -1645,7 +1554,6 @@ function onHistoryChunkResult(
       "error",
       `history prepend partial failure: ${result.failed}件 ${result.failures.join(" | ")} (tab=${tabId})`
     );
-    // 描画失敗の件数は実行ログの先頭に残す（verify-conversation-history#CHmut-C41d）。
     pager.renderFailedTotal = (pager.renderFailedTotal ?? 0) + result.failed;
     const text = worklogRenderFailureNote(pager.renderFailedTotal);
     if (pager.renderFailNoteEl === undefined || !pager.renderFailNoteEl.isConnected) {
@@ -1655,7 +1563,6 @@ function onHistoryChunkResult(
     }
   }
   reduceLocalEventDrops(tabId, result.rendered + result.skipped);
-  // 未接続のコンテナへの appendChild は例外を出さないので、件数に加えて connected も突き合わせる。
   if (result.rendered + result.skipped + result.duplicates + result.failed !== result.total) {
     reportWebviewDiagnostic(
       "error",
@@ -1676,21 +1583,16 @@ function onHistoryChunkResult(
     pager.cursor = page.nextCursor;
     pager.status = "idle";
     showWorklogBackfillProgress(tabId, pager, page.coverage.remainingOlderCount);
-    // R-TAB-08: 続けられないのに残件があるときは停止として扱い、読了として消さない。
     if (chase) {
       requestHistoryChunk(tabId);
       return;
     }
-    // idle に置くと resumeWorklogBackfill と syncWorklogBackfillScroll が再開してしまう。
     pager.status = "error";
     failWorklogBackfill(tabId, "stalled");
     return;
   }
   const host = hostCoverage(tabId);
-  // R-TAB-08: 現在値でなく coverageUnreachableBase を使う。現在値だと live で描き終えた分まで読みに行き、終端が矛盾して止まる。
   const hostDropped = coverageUnreachableBase(tabId);
-  // live で作ったタブは記録の fold とイベントの番号が対応せず Host も history-unavailable で拒むので、resumeSessionId の
-  // あるタブだけ transcript 位相へ入る。入れない分は記録から読めなかった件数として残す（verify-history-prepend#HP-R48-3）。
   if (hostDropped > 0 && host?.source === "provider-transcript" && t.resumeSessionId !== undefined) {
     pager.phase = "transcript";
     pager.cursor = undefined;
@@ -1715,7 +1617,6 @@ function onHistoryChunkError(tabId: string, requestId: string, reason: string): 
   const pager = acceptHistoryResponse(tabId, requestId);
   if (pager === undefined) return;
   const t = tabs.get(tabId);
-  // stale-request は CLI の再起動による世代更新で出るので一過性に含める。
   const transient = reason === "invalid-cursor" || reason === "unknown-anchor" || reason === "stale-request";
   if (transient && !pager.retried && pager.anchor !== undefined) {
     pager.retried = true;
@@ -1725,7 +1626,6 @@ function onHistoryChunkError(tabId: string, requestId: string, reason: string): 
     return;
   }
   pager.status = "error";
-  // 取り直さない経路は失敗表示に「再開」を残す。黙って止めない（R-TAB-08）
   failWorklogBackfill(tabId, reason);
   t?.addHistoryNotice(l10n.t("Could not load earlier history ({0})", reason));
 }
@@ -1744,7 +1644,6 @@ function onWorklogTranscriptResult(
   }
   pager.retried = false;
   const usedCursor = pager.cursor;
-  // 切り詰め分（backfillTotal）を読みに来て初回が空の終端なのは矛盾。終端扱いにすると何も積まずに全件表示になる。
   if (
     pager.receivedTranscriptChunk !== true &&
     page.items.length === 0 &&
@@ -1811,7 +1710,6 @@ function onWorklogTranscriptResult(
     failWorklogBackfill(tabId, "stalled");
     return;
   }
-  // 残件（transcriptRemaining）を終端で 0 へ上書きしない。渡されなかった分が読了として隠れる
   localEventDrops.set(tabId, 0);
   pager.status = "exhausted";
   finishWorklogBackfill(tabId);
@@ -1838,11 +1736,8 @@ function onWorklogTranscriptError(tabId: string, requestId: string, reason: stri
 function requestHistoryChunk(tabId: string): void {
   const pager = historyPagers.get(tabId);
   if (pager === undefined) return;
-  // 並列 fetch にしない。同時要求は cursor 空間を壊す。この早期 return が
-  // スクロール再開路（syncWorklogBackfillScroll）の二重発行防止も兼ねる（R-TAB-07）
   if (pager.status === "inflight" || pager.status === "exhausted") return;
   if (pager.cursor === undefined && pager.anchor === undefined) return;
-  // 同時に走る連鎖をアクティブタブの 1 本に抑える。他のタブは idle のまま resumeWorklogBackfill で継ぐ（verify-history-prepend#HPmut-16）。
   if (activeTabId !== tabId) return;
   if (!mayRequestBackfill(tabId)) return;
   const requestId = `hist-${++historyRequestSeq}`;
@@ -1875,7 +1770,6 @@ function requestHistoryChunk(tabId: string): void {
   );
 }
 
-// backfilledHead の窓では先頭が戻した飛び地なので、その次を anchor にする。先頭にすると窓外の区間が黙って落ちる（verify-history-prepend#HPmut-6）。
 function initialHistoryAnchor(
   windowed: { events: NormalizedEvent[]; backfilledHead: boolean }
 ): { generation: number; seq: number } | undefined {
@@ -1885,7 +1779,6 @@ function initialHistoryAnchor(
   return { generation: ev.generation, seq: ev.seq };
 }
 
-// R-TAB-07: 飛び地で anchor を上書きしない。上書きすると再 anchor や transcript の要求で窓外の区間が黙って落ちる。
 function resolveContiguousHistoryAnchor(
   currentAnchor: { generation: number; seq: number } | undefined,
   items: readonly NormalizedEvent[]
@@ -1929,7 +1822,6 @@ function sendReady(): void {
   initRetryTimer = setTimeout(() => {
     if (initReceived || readyRetries >= INIT_RETRY_MAX) return;
     readyRetries++;
-    // Date.now を使わない（verify-time-buckets#TB-7）。performance.now は document の経過時間なので、再送と別 document の起動を見分けられる。
     reportWebviewDiagnostic(
       "ready-retry",
       `init not received; retry ${readyRetries}; docAge=${Math.round(performance.now())}ms; sinceReady=${Math.round(performance.now() - readySentAt)}ms`
@@ -1938,7 +1830,6 @@ function sendReady(): void {
   }, INIT_RETRY_DELAY_MS);
 }
 
-// headOmitted を droppedCount へ合流する。しないと installHistoryPager が遡る先が無いと判定し、復帰のたびに古い区間が黙って消える。
 function withHeadOmitted(
   windowed: ReturnType<typeof windowEvents>,
   headOmitted: TabSnapshot["state"]["headOmitted"]
@@ -1952,9 +1843,7 @@ function withHeadOmitted(
 }
 
 function addTab(snap: TabSnapshot, scrollCarry?: ScrollCarry): Tab {
-  // 明示 off を運ぶのは snapshot だけなので、再生で投げる前に当てる。
   applyLlmDiagnosticsMode(snap.state.llmDiagnostics);
-  // R-DSP-01: 作り直しのたびに取り直す。持ち越すと前の中身の数字で被覆を判定する。
   hostDroppedAtInstall.set(snap.tabId, snap.state.workModel?.coverage.droppedEventCount ?? 0);
   if (snap.state.workModel === undefined) lastWorkModels.delete(snap.tabId);
   lastSemanticModels.delete(snap.tabId);
@@ -1980,7 +1869,6 @@ function addTab(snap: TabSnapshot, scrollCarry?: ScrollCarry): Tab {
   const hydration = snap.state.resumeHydration;
   let model: WorkModelPayload | undefined;
 
-  // replaySnapshot を経路ごとに複製しない。複製すると変異注入の的が一意に決まらず、片方の欠落を検査が見逃す。
   const replaySnapshot = (): {
     windowed: ReturnType<typeof windowEvents>;
     droppedNoticeEl: HTMLElement | undefined;
@@ -1993,14 +1881,11 @@ function addTab(snap: TabSnapshot, scrollCarry?: ScrollCarry): Tab {
     }
     if (snap.state.workModel !== undefined) lastWorkModels.set(snap.tabId, snap.state.workModel);
     model = withLocalEventDrop(snap.state.workModel, windowed.droppedCount);
-    // applyWorkModel を再生より先に当てる。窓から Task の更新が落ちていると TODO 行が無く、配下のツール行が未接続の DOM へ入って消える。
     t.applyWorkModel(model);
     const events = windowed.events;
     for (const ev of events) t.handleEvent(ev);
-    // R-SES-11: replayed turn boundaries may clear calls that the current model still observes.
     t.applyWorkModel(model);
     t.replaceBackgroundActivity(snap.state.backgroundActivity);
-    // 再生した init イベントは後のモデル・effort の変更より古いので、auth は TabSnapshot の値で上書きする。
     t.auth = snap.state.auth;
     t.setModelFallback(snap.state.modelFallback);
     t.finalizeReplay(snap.state.turnState !== "idle");
@@ -2009,13 +1894,9 @@ function addTab(snap: TabSnapshot, scrollCarry?: ScrollCarry): Tab {
     return { windowed, droppedNoticeEl };
   };
 
-  // Host の履歴窓（src/history-window.ts#registerHistoryWindow）の scope は snapshot の events と同じ列なので、窓に残らなかった分が
-  // そのまま遡る先になる。
   const installPagers = (windowed: ReturnType<typeof windowEvents>, droppedNoticeEl: HTMLElement | undefined): void => {
-    // R-TAB-07 / R-TAB-08: 窓落ちはタブの種別で分けずに裏読みで埋める。
     installHistoryPager(snap.tabId, windowed, droppedNoticeEl);
     const keptKeys = new Set(windowed.events.map((e) => `${e.generation}:${e.seq}`));
-    // Host が落とした先頭側は events に無いので、Host が src/conv-renderable.ts#isConvRenderableEvent で数えた hasConvEvent を合流する。
     const hasDroppedConvEvent =
       snap.state.headOmitted?.hasConvEvent === true ||
       snap.state.events.some(
@@ -2033,12 +1914,9 @@ function addTab(snap: TabSnapshot, scrollCarry?: ScrollCarry): Tab {
     coord.workPager = "not-installed";
     coord.convPager = "not-installed";
     coord.convTouched = false;
-    // loading 中は pager を置かない。Host が登録していない scope へ要求が飛ぶ（verify-conversation-history#CHmut-C1c）。
     dropHistoryPager(snap.tabId);
     dropConvPager(snap.tabId);
-    // preview は遡りの起点にしない（verify-conversation-history#CHmut-C1b）。
     t.renderResumePreview(hydration.previewMessages ?? []);
-    // R-TAB-08 / R-CNV-02: loading 中も進行表示を出す（verify-history-prepend#HPmut-29）。
     t.setConvLoadProgress({ phase: "preparing" });
     t.setWorkLoadProgress({ phase: "preparing" });
     localEventDrops.set(snap.tabId, 0);
@@ -2053,7 +1931,6 @@ function addTab(snap: TabSnapshot, scrollCarry?: ScrollCarry): Tab {
     dropHistoryPager(snap.tabId);
     dropConvPager(snap.tabId);
     t.renderResumePreview(hydration.previewMessages ?? []);
-    // failed でも確定済みの events は replaySnapshot で再生する。再読み込みで送信済みの発言を失わない。
     replaySnapshot();
     const reason = hydration.failureReason ?? "hydration-failed";
     t.setConvLoadProgress({
@@ -2070,7 +1947,6 @@ function addTab(snap: TabSnapshot, scrollCarry?: ScrollCarry): Tab {
     const coord = getOrCreateCoordinator(snap.tabId, "complete");
     const { windowed, droppedNoticeEl } = replaySnapshot();
     installPagers(windowed, droppedNoticeEl);
-    // R-TAB-08 / R-CNV-02: 作り直しで進行表示は消えているので、遡る対象が残る面は応答を待たずに出し直す。待つと点滅する。
     if (convPagers.has(snap.tabId)) t.setConvLoadProgress({ phase: "preparing" });
     if (historyPagers.has(snap.tabId)) t.setWorkLoadProgress({ phase: "preparing" });
     if (coord.convPager === "exhausted" || !convPagers.has(snap.tabId)) {
@@ -2083,17 +1959,13 @@ function addTab(snap: TabSnapshot, scrollCarry?: ScrollCarry): Tab {
     }
   }
   if (snap.state.resumeSessionId) t.resumeSessionId = snap.state.resumeSessionId;
-  // 再生が turnState を上書きするので最後に当て直す。interrupting が running へ戻ると二度目の中断が効かない。
+  t.replaceAutoResumeReservation(snap.state.autoResumeAt ?? null);
   t.setTurnState(snap.state.turnState);
-  // 復元途中に保存しない（setViewMode の persist を偽にする）。tabs が揃う前の保存は他タブの設定を壊す。
   const savedView = vscode.getState()?.views?.[snap.tabId];
   if (savedView === "work") t.setViewMode("work", false, false);
-  // 再生中は viewMode が会話面のままで注意表示が付かないので、復元後に syncConvAttention で貼り直す。
   t.syncConvAttention();
-  // 持ち越す位置があるときは resetScrollPosition を呼ばない。applyScrollCarry が入れ、活性化の restoreScroll が最後に当てる。
   t.resetReplayArtifacts();
   if (scrollCarry === undefined) t.resetScrollPosition();
-  // 概要は installHistoryHead の後に作る。先に作ると取り寄せた過去の chunk が概要の上に積まれる。
   let restoringWorkView = true;
   const savedWorkView = vscode.getState()?.workViews?.[snap.tabId];
   const savedAnalysisView = vscode.getState()?.analysisViews?.[snap.tabId];
@@ -2120,7 +1992,6 @@ function addTab(snap: TabSnapshot, scrollCarry?: ScrollCarry): Tab {
   overview.setPlanUsage(snap.state.planUsage);
   overview.mount();
   overview.update(displayWorkModel(snap.tabId, snap.state.workModel));
-  // 明示 off と未着を区別して渡す（verify-webview-wiring#T4-4）。
   lastSemanticModels.set(snap.tabId, { model: snap.state.semanticModel, view: snap.state.semanticView });
   overview.updateSemantic(displaySemanticModel(snap.tabId, snap.state.semanticModel), snap.state.semanticView);
   overview.setLlmAnalysisEnabled(snap.state.llmAnalysisEnabled);
@@ -2143,9 +2014,7 @@ function addTab(snap: TabSnapshot, scrollCarry?: ScrollCarry): Tab {
   }
   restoringWorkView = false;
   if (scrollCarry !== undefined) t.applyScrollCarry(scrollCarry, convPagers.has(snap.tabId));
-  // R-CNV-02 / R-TAB-08: deferred のタブは空を何も無いと見せない。tabRestored の作り直しで消える。
   if (snap.deferred) {
-    // loading 分岐と同じ綴りにしない。変異注入の的が一意でなくなる（verify-history-prepend#HPmut-29、verify-conversation-history#CHmut-C1c）。
     const preparing = { phase: "preparing" } as const;
     t.setConvLoadProgress(preparing);
     t.setWorkLoadProgress(preparing);
@@ -2153,7 +2022,6 @@ function addTab(snap: TabSnapshot, scrollCarry?: ScrollCarry): Tab {
   return t;
 }
 
-// preserveScroll は中身が同じ会話の作り直し（tabRestored）でだけ真にする。
 function rebuildTabInPlace(snap: TabSnapshot, preserveScroll: boolean): void {
   const old = tabs.get(snap.tabId);
   if (!old) return;
@@ -2167,7 +2035,6 @@ function rebuildTabInPlace(snap: TabSnapshot, preserveScroll: boolean): void {
   tabbarEl.insertBefore(t.tabBtn, btnNext);
   logsEl.insertBefore(t.logEl, logNext);
   if (activeTabId === snap.tabId) setActiveTab(snap.tabId);
-  // 保存済みの位置は前の中身の行を指すので、document が作り直される前に persistState で書き換える。
   else if (!preserveScroll) persistState();
 }
 
@@ -2189,7 +2056,6 @@ function discardTab(tabId: string): void {
   }
 }
 
-// setActiveTab が投げても空白画面で終わらせず、次の候補を試す（verify-webview-wiring#sol-2）。
 function activateFirstUsableTab(preferred: string): void {
   const candidates = [preferred, ...[...tabs.keys()].filter((id) => id !== preferred)];
   for (const tabId of candidates) {
@@ -2208,7 +2074,6 @@ function initMessageBus(): void {
   window.addEventListener("message", (e: MessageEvent) => {
     try {
     const raw = e.data;
-    // isHostToWebview で拒否したメッセージは黙って捨てず [drop] を記録する。
     if (!isHostToWebview(raw)) {
       console.warn("[drop] invalid host message", (raw as { type?: unknown })?.type);
       return;
@@ -2217,12 +2082,10 @@ function initMessageBus(): void {
     switch (msg.type) {
       case "init": {
         const initAt = performance.now();
-        // captureScrollCarry は destroy より先に呼ぶ。後では DOM が外れて測れない。
         const scrollCarries = new Map([...tabs].map(([tabId, t]) => [tabId, t.captureScrollCarry()]));
         for (const t of tabs.values()) t.destroy();
         tabs.clear();
         overviews.clear();
-        // pager はタブの DOM と同じ寿命。残すと作り直したタブへ旧世代の応答が当たる。
         for (const tabId of [...historyPagers.keys()]) dropHistoryPager(tabId);
         for (const tabId of [...convPagers.keys()]) dropConvPager(tabId);
         lastWorkModels.clear();
@@ -2231,9 +2094,7 @@ function initMessageBus(): void {
         hostDroppedAtInstall.clear();
         initReceived = true;
         if (initRetryTimer) clearTimeout(initRetryTimer);
-        // PROTOCOL_VERSION の食い違いでは止めずに注記する。詳細ログが黙って空になる理由を出す。
         const versionMismatch = msg.protocolVersion !== PROTOCOL_VERSION;
-        // タブを描く前に入れる。後から入れると描画済みの本文が Windows 前提の拒否のまま残る（R-CNV-12）
         setFileLinkHostPlatform(msg.hostWindows ?? true);
         setFileLinkSystemAppExtensions(msg.systemAppExtensions);
         for (const snap of msg.tabs) {
@@ -2241,7 +2102,6 @@ function initMessageBus(): void {
             addTab(snap, scrollCarries.get(snap.tabId) ?? savedScrollCarry(snap.tabId));
           } catch (error) {
             reportWebviewDiagnostic("error", `init tab failed: ${String(error)}`);
-            // addTab は再生より先に tabs へ入れるので、外さないと壊れたタブが activate の候補に残る（verify-webview-wiring#sol-2）。
             discardTab(snap.tabId);
           }
         }
@@ -2263,14 +2123,12 @@ function initMessageBus(): void {
         }
         const first = tabs.keys().next().value ?? null;
         const chosen = activeTabId && tabs.has(activeTabId) ? activeTabId : first;
-        // setActiveTab は同じタブへの切替では inputEl を書き換えないので、ここで下書きを戻す。
         if (chosen) {
           inputEl.value = drafts.get(chosen) ?? "";
           autosizeComposer();
           activateFirstUsableTab(chosen);
         }
         activeTabAfterInit = activeTabId;
-        // init の受信から活性タブが載るまでを測る。Date.now を使わない（verify-time-buckets#TB-7）。
         const activeSnap = msg.tabs.find((t) => t.tabId === chosen);
         reportWebviewDiagnostic(
           "first-paint",
@@ -2285,7 +2143,6 @@ function initMessageBus(): void {
         const t = tabs.get(msg.tabId);
         if (msg.events.some((event) => event.kind === "conversation_opened")) overviews.get(msg.tabId)?.setOrchestration(undefined);
         if (t) for (const ev of msg.events) t.handleEvent(ev);
-        // 新しく追加された行にも syncVisibility で表示切替を当てる。
         if (t) overviews.get(msg.tabId)?.syncVisibility();
         break;
       }
@@ -2325,8 +2182,6 @@ function initMessageBus(): void {
             }
           }
         }
-        // 追送 preview は描く（verify-conversation-history#CHmut-C39）。ただし convTouched なら描かない。renderResumePreview は
-        // 末尾へ足すので、過去の会話が live の表示より後ろに並ぶ（verify-conversation-history#CHmut-C39b）。
         const previewMessages = "previewMessages" in msg ? msg.previewMessages : undefined;
         if (previewMessages !== undefined && !coord.convTouched) {
           tabs.get(msg.tabId)?.renderResumePreview(previewMessages);
@@ -2359,7 +2214,6 @@ function initMessageBus(): void {
         lastWorkModels.set(msg.tabId, msg.model);
         const model = displayWorkModel(msg.tabId, msg.model);
         overviews.get(msg.tabId)?.update(model);
-        // src/webview/tab.ts#applyWorkModel; src/webview/tab.ts#applyLogModel
         tabs.get(msg.tabId)?.applyWorkModel(model);
         break;
       }
@@ -2375,7 +2229,6 @@ function initMessageBus(): void {
       }
       case "semanticModel": {
         tabs.get(msg.tabId)?.observeSessionTime(msg.model?.timeBuckets?.firstAt, "session");
-        // Host は semanticView が有効なときだけ送るので view を真にする（verify-webview-wiring#S3-3）。
         lastSemanticModels.set(msg.tabId, { model: msg.model, view: true });
         overviews.get(msg.tabId)?.updateSemantic(displaySemanticModel(msg.tabId, msg.model), true);
         break;
@@ -2388,6 +2241,7 @@ function initMessageBus(): void {
       }
       case "userSettings": {
         applyAccent(msg.appearance);
+        setDisplayName(msg.displayName ?? "");
         applyUserSettings(msg);
         refreshComposer();
         break;
@@ -2409,7 +2263,6 @@ function initMessageBus(): void {
         break;
       }
       case "llmFindingDiagnostics": {
-        // 最後に観測したのが明示 off なら payload を描かない（verify-webview-wiring#D5-5）。
         if (llmDiagnosticsAllowed === false) {
           console.warn("[drop] llm diagnostics while disabled", msg.tabId);
           break;
@@ -2434,7 +2287,6 @@ function initMessageBus(): void {
         break;
       }
       case "historyChunkResult": {
-        // 作業ログと会話の両方の pager がこの応答を使うので、requestId で振り分ける。
         const convPager = convPagers.get(msg.tabId);
         if (convPager !== undefined && convPager.requestId === msg.requestId) {
           if (convPager.timer !== undefined) clearTimeout(convPager.timer);
@@ -2475,7 +2327,6 @@ function initMessageBus(): void {
         break;
       }
       case "tabCreated": {
-        // init が同じ tabId を先に運んでいることがある。重ねて addTab すると閉じても古い DOM が残る（verify-webview-wiring#TR-13）。
         if (tabs.has(msg.tab.tabId)) {
           rebuildTabInPlace(msg.tab, false);
           if (msg.activate && activeTabId === activeTabAfterInit) setActiveTab(msg.tab.tabId);
@@ -2517,11 +2368,10 @@ function initMessageBus(): void {
       case "models": {
         const t = tabs.get(msg.tabId);
         if (t) {
-          t.models = msg.models;
+          t.setModels(msg.models);
           if (activeTabId === msg.tabId) {
             renderAuth(t);
             if (!authPickerEl.classList.contains("hidden")) {
-              // openAuthPicker で開き直すとカーソルとフォーカスが飛ぶので、開いたまま作り直す。
               renderAuthPicker();
               syncMenuCursor(authPickerEl, "ap-item-");
             }
@@ -2539,7 +2389,6 @@ function initMessageBus(): void {
           if (activeTabId === msg.tabId) {
             renderAuth(t);
             if (!authPickerEl.classList.contains("hidden")) {
-              // openAuthPicker で開き直すとカーソルとフォーカスが飛ぶので、開いたまま作り直す。
               renderAuthPicker();
               syncMenuCursor(authPickerEl, "ap-item-");
             }
@@ -2575,7 +2424,6 @@ function initMessageBus(): void {
           if (activeTabId === msg.tabId) {
             renderAuth(t);
             if (!authPickerEl.classList.contains("hidden")) {
-              // openAuthPicker で開き直すとカーソルとフォーカスが飛ぶので、開いたまま作り直す。
               renderAuthPicker();
               syncMenuCursor(authPickerEl, "ap-item-");
             }
@@ -2592,14 +2440,25 @@ function initMessageBus(): void {
         break;
       }
       case "attachments": {
-        // 差分でなく全量で attachmentsByTab を置き換える。差分だと応答の入れ違いで消えた添付が戻る。
         if (msg.items.length === 0) attachmentsByTab.delete(msg.tabId);
         else attachmentsByTab.set(msg.tabId, msg.items);
         if (activeTabId === msg.tabId) renderAttachments();
         break;
       }
       case "sessions": {
-        applySessionChunk(msg.requestId, msg.sessions, msg.complete, msg.degraded, msg.source, msg.nextCursor, msg.append);
+        applySessionChunk(msg.requestId, msg.sessions, msg.complete, msg.degraded, msg.source, msg.nextCursor, msg.append, msg.showHidden);
+        break;
+      }
+      case "sessionRenamed": {
+        applySessionRenamed(msg.sessionId, msg.title, msg.requestId);
+        break;
+      }
+      case "sessionHiddenChanged": {
+        applySessionHiddenChanged(msg.sessionId, msg.hidden);
+        break;
+      }
+      case "sessionListActionFailed": {
+        applySessionListActionFailed(msg.reason, msg.sessionId, msg.action, msg.requestId);
         break;
       }
       case "analysisFailed": {
@@ -2620,13 +2479,11 @@ function initMessageBus(): void {
         persistState();
         break;
       }
-      case "cachedUsage": {
-        cachedUsageFetchedAt = msg.fetchedAtMs;
-        for (const l of msg.limits) {
-          if (rateLimits.has(l.type)) continue;
-          // rateLimits と同じ単位で届くので換算しない。
-          rateLimits.set(l.type, { utilization: l.utilization, resetsAt: l.resetsAt, isUsingOverage: false });
-        }
+      case "accountUsage": {
+        if (msg.replyTo !== accountUsageRequestId) break;
+        accountUsageRequestId = null;
+        accountUsage = { seq: msg.seq, fetchedAtMs: msg.fetchedAtMs, state: msg.state, rows: msg.rows };
+        settleAccountUsageRequest();
         if (!usagePanelEl.classList.contains("hidden")) renderUsagePanel();
         break;
       }
@@ -2667,7 +2524,6 @@ function initMessageBus(): void {
           drafts.delete(msg.tabId);
           attachmentsByTab.delete(msg.tabId);
           forgottenTabIds.add(msg.tabId);
-          // persistState より先に activeTabId を外す。残すと persistState が閉じたタブの下書きを書き戻す。
           if (activeTabId === msg.tabId) activeTabId = null;
           persistState();
           const next = [...tabs.keys()][0] ?? null;
@@ -2683,8 +2539,6 @@ function initMessageBus(): void {
   });
 }
 
-// R-CNV-11: 添付の実体は Host が持ち、attachmentsByTab は描画用の写し。送信の積荷をここから作らない。document の破棄で消え、
-// 送信時のタブを取り違える。
 const attachmentsByTab = new Map<string, PendingAttachmentInfo[]>();
 
 function attachmentsOf(tabId: string | null): PendingAttachmentInfo[] {
@@ -2699,7 +2553,6 @@ function renderAttachments(): void {
       const wrap = document.createElement("div");
       wrap.className = "attachment";
       const img = document.createElement("img");
-      // 読み込み完了の時点では折り返し後のレイアウトがまだ読めないので、次のタスクで reflowComposer の settle を呼ぶ。
       const settleAfterLayout = (): void => { setTimeout(settle, 0); };
       img.onload = settleAfterLayout;
       img.onerror = settleAfterLayout;
@@ -2723,7 +2576,6 @@ const ALLOWED_IMAGE_TYPES = ["image/png", "image/jpeg", "image/gif", "image/webp
 
 function addImageFile(file: File, mediaType: string): void {
   if (!ALLOWED_IMAGE_TYPES.includes(mediaType)) return;
-  // R-CNV-11: 宛先は読み取り開始時のタブで固定する。onload で activeTabId を引き直すと、読み取り中の切替で別の会話へ入る。
   const tabId = activeTabId;
   if (!tabId) return;
   if (attachmentsOf(tabId).length >= IMAGE_MAX_COUNT) return;
@@ -2740,7 +2592,6 @@ function addImageFile(file: File, mediaType: string): void {
   reader.readAsDataURL(file);
 }
 
-// R-CNV-11: latestPickFilesReqId と pickFilesTabId は同時に更新する。片方だけだと受理される応答の宛先が別の要求のタブになる。
 let pickFilesSeq = 0;
 let latestPickFilesReqId = -1;
 let pickFilesTabId: string | null = null;
@@ -2757,9 +2608,7 @@ function openFilePicker(): void {
 }
 
 function onPickedFiles(reqId: number, paths: string[], images: ImageAttachment[]): void {
-  // 古いダイアログ応答で入力欄を書き換えない（R-CNV-05）
   if (reqId !== latestPickFilesReqId) return;
-  // 宛先はダイアログを開いた時点のタブ。ダイアログは待たされるので activeTabId は動きうる
   if (pickFilesTabId) {
     for (const im of images) {
       vscode.postMessage({
@@ -2773,21 +2622,17 @@ function onPickedFiles(reqId: number, paths: string[], images: ImageAttachment[]
   insertFilePaths(paths);
 }
 
-// コンポーザ（送信/中断ボタン・入力欄・添付・新規タブ・書き出し）のリスナ登録。
-// 文の並びがリスナの登録順なので、入れ替えてはならない。
 function initComposer(): void {
   actionBtn.onclick = () => {
     const t = activeTab();
     if (!t) return;
     if (t.turnState === "idle") send();
     else if (activeTabId) {
-      // Host は中断中への遷移をイベントで通知しないので、ここで setTurnState する。
       t.setTurnState("interrupting");
       vscode.postMessage({ type: "interrupt", tabId: activeTabId });
     }
   };
   inputEl.addEventListener("keydown", (e) => {
-    // keyCode 229 は isComposing を立てない IME 確定（Windows の一部 IME）
     if (e.key !== "Enter" || e.isComposing || e.keyCode === 229) return;
     if (e.shiftKey === (composerSendKey() === "shiftEnter")) {
       e.preventDefault();
@@ -2814,7 +2659,6 @@ function initComposer(): void {
   };
   convNextBtn.onclick = () => {
     activeTab()?.scrollToLatest();
-    // 既に最下部なら scroll イベントが出ないので、syncWorklogBackfillScroll を直接呼ぶ。
     if (activeTabId) syncWorklogBackfillScroll(activeTabId);
   };
 
@@ -2869,7 +2713,6 @@ function initGlobalShortcuts(): void {
     if (key === "f" && !e.shiftKey) {
       e.preventDefault();
       e.stopPropagation();
-      // openFindBar の先入れ検索がスクロールするので、遡り待ちを先に諦める。
       abandonAwaitedScrollAnchor();
       openFindBar();
     } else if (key === "w" && !e.shiftKey) {
@@ -2919,7 +2762,6 @@ function renderCtxChip(): void {
     }
     const label = document.createElement("span");
     label.textContent = ctxLabel(editorContext);
-    // 狭い幅では省略記号で切るため、全文は title に残す（R-DSP-03）
     label.title = ctxLabel(editorContext);
     const rm = document.createElement("button");
     rm.className = "ctx-chip-remove";
@@ -2935,8 +2777,6 @@ function renderCtxChip(): void {
   });
 }
 
-// 実測（probe-commands）で応答0文字＝無反応だったコマンド（/doctor は応答があるため対象外）。素通しすると打っても
-// 何も起きないので、理由と代替手段を会話へ出す。
 const UNSUPPORTED_TERMINAL_HINT = new Map<string, string>([
   ["/config", l10n.t("Edit ~/.claude/settings.json directly (model and effort can be changed from the chips).")],
 ]);
@@ -2953,14 +2793,12 @@ const UNSUPPORTED_TERMINAL_COMMANDS = new Map<string, string>(
 
 function send(): void {
   const running = activeTab()?.turnState !== "idle";
-  // 中断中のターンへ入力を混ぜない。inputEl は消さず再送できるようにする。
   if (activeTab()?.turnState === "interrupting") {
     activeTab()?.addBlock("system warn", l10n.t("Cannot send while interrupting."));
     return;
   }
   const text = inputEl.value.trim();
   if (text === "/clear") {
-    // R-SES-08: 実行中はローカルで先に拒否し、入力欄は消さない
     const ct = activeTab();
     if (ct && ct.turnState !== "idle") {
       ct.addBlock("system warn", l10n.t("Cannot use /clear during a turn. Wait for completion or interrupt, then try again."));
@@ -2984,28 +2822,22 @@ function send(): void {
     if (t && t.models.length === 0) {
       t.addBlock("system", l10n.t("Loading models. This may take a few seconds after starting a conversation."));
     } else {
-      // /model 経路はフォーカスが入力欄にあるので、閉じたら入力欄へ戻す。
-      // 開くのは現在のクリックディスパッチ完了後にする（▶ボタン送信のとき、
-      // 気泡が document の外側クリック判定に届いて開いた直後に閉じられるため）
       queueMicrotask(() => openAuthPicker(inputEl));
     }
     return;
   }
-  // 素通しすると CLI のセッション色が変わるだけで拡張の見た目は変わらないので、openThemePicker を送る。
   if (text === "/color" || text === "/theme") {
     clearComposerInput();
     persistState();
     vscode.postMessage({ type: "openThemePicker" });
     return;
   }
-  // 素通しすると CLI が端末用のピッカーを出そうとして何も起きないので、openHistPanel を開く。
   if (text === "/resume" || text === "/history") {
     clearComposerInput();
     persistState();
-    queueMicrotask(openHistPanel); // ▶クリックの気泡で即閉じされるのを避ける（M-1と同じ理由）
+    queueMicrotask(openHistPanel);
     return;
   }
-  // 素通しすると CLI がこのセッションだけに適用し、拡張側の状態と設定ファイルが食い違うので setEffort を送る。
   if (text === "/effort" || text.startsWith("/effort ")) {
     clearComposerInput();
     persistState();
@@ -3022,16 +2854,12 @@ function send(): void {
     }
     return;
   }
-  // /usage は既存の使用量ポップアップを開く。素通しすると CLI が端末用の画面を出そうとして
-  // 応答が0文字になり何も起きないため（実測済み）。
   if (text === "/usage" || text.startsWith("/usage ")) {
     clearComposerInput();
     persistState();
-    queueMicrotask(openUsagePanel); // ▶クリックの気泡で即閉じされるのを避ける（M-1と同じ理由）
+    queueMicrotask(openUsagePanel);
     return;
   }
-  // /rename はローカルで受ける。SDK へ素通しすると custom-title が JSONL に書かれず、
-  // タブ名にも履歴一覧にも反映されない（R-SES-05）。実行中でも受ける（ターンへは投入しない）
   const rename = /^\/rename(?:\s+([\s\S]*))?$/.exec(text);
   if (rename !== null) {
     const t = activeTab();
@@ -3048,10 +2876,8 @@ function send(): void {
     }
     return;
   }
-  // UNSUPPORTED_TERMINAL_COMMANDS は先頭の語で引く。完全一致だと引数付きが素通しになる。
   const unsupportedTerminalCommand = UNSUPPORTED_TERMINAL_COMMANDS.get(text.split(/\s+/)[0]);
   if (unsupportedTerminalCommand !== undefined) {
-    // 出力先のタブが無いときは clearComposerInput を呼ばない。
     const t = activeTab();
     if (!t) return;
     clearComposerInput();
@@ -3060,17 +2886,16 @@ function send(): void {
     return;
   }
   if ((!text && attachmentsOf(activeTabId).length === 0) || !activeTabId) return;
-  // 発言は Host が記録して返す user_message で描く。ここで描くのは hydration の loading 中の楽観バブルだけ。
   clearComposerInput();
   persistState();
   const t = activeTab();
+  t?.clearCancelledHandoffNotice();
   if (t && !running) {
     t.pendingSend = true;
     t.setTurnState("running");
   } else if (t && running) {
     t.addBlock("system", l10n.t("Added to the running turn"));
   }
-  // R-CNV-11: images は楽観バブルの表示用で、送信には載せない。添付欄はここで消さない。消すと Host が拒否した送信で添付が失われる。
   const shown = attachmentsOf(activeTabId);
   const images = shown.length > 0 ? shown.map((im) => ({ mediaType: im.mediaType, data: im.data })) : undefined;
   const finalText = editorContext
@@ -3098,7 +2923,6 @@ function send(): void {
   }
 }
 
-// webview の周期実行はこの単一タイマーだけに置く（verify-webview-wiring#D6-8）。タブごとに持つと閉じたタブで止め漏れる。
 function initTicker(): void {
   setInterval(() => {
     const nowMs = Date.now();
@@ -3110,17 +2934,12 @@ function initTicker(): void {
   }, 1000);
 }
 
-// 下の init 列がトップレベル副作用の登録順を決める。並べ替えない。import の並びに依存させると、import の自動整列で検査を
-// 通ったまま振る舞いが変わる。src/webview/dom.ts の DOM 生成は import 時に走るのでこの列に入れない（check-load-order）。
-
-// 例外通報は init 列より先に登録する。後ろに置くと初期化中の例外で通報も sendReady も失われる（verify-webview-wiring#sol-2）。
 window.addEventListener("error", (event) => {
   reportWebviewDiagnostic("error", event.error ?? event.message);
 });
 window.addEventListener("unhandledrejection", (event) => {
   reportWebviewDiagnostic("error", event.reason);
 });
-// 1 つが投げても残りの初期化と sendReady まで到達させる（verify-webview-wiring#sol-2）。
 for (const [name, step] of [
   ["initLogsScroll", initLogsScroll],
   ["initUsagePanel", initUsagePanel],
@@ -3140,7 +2959,5 @@ for (const [name, step] of [
     reportWebviewDiagnostic("error", `init ${name} failed: ${String(error)}`);
   }
 }
-// initMessageBus より後に送る。先に送ると最初の init を取りこぼす。
 sendReady();
-// sendReady まで到達したので、bundle より前に置いた起動監視を止める。
 window.__laisoraBootstrap?.complete();

@@ -154,9 +154,6 @@ export class ArtifactServer {
       return;
     }
     if (parts.length === 4 && parts[3] === "raw") {
-      // /raw を直接開いてもラッパーと同じ制約にする。default-src 'none' はフォーム送信と base 差し替えを
-      // 止めない（form-action / base-uri は default-src に fallback しない）。ヘッダの sandbox で
-      // iframe 無しでも opaque origin に落とす
       this.send(response, 200, `${artifact.mime}; charset=utf-8`, artifact.content, {
         "Content-Security-Policy":
           "default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; img-src data:; form-action 'none'; base-uri 'none'; sandbox allow-scripts;",

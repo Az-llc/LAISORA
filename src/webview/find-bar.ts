@@ -35,7 +35,6 @@ export function clearHighlights(): void {
   currentIndex = -1;
 }
 
-// 過去を読み込んでいる間の件数は母集合の途中。確定値に見せると「2 回しか出てこない」と結論される（R-DSP-03）
 function countSuffix(): string {
   const state = activeTab()?.convHistoryLoadState() ?? null;
   if (state === "loading") return l10n.t(" (loading history)");
@@ -47,13 +46,11 @@ function updateCount(current: number, total: number): void {
   findCountEl.textContent = `${current} / ${total}${countSuffix()}`;
 }
 
-// 読み込み状態が変わったときに件数の注記だけ描き直す（検索はやり直さない）
 export function refreshFindCount(): void {
   if (!isFindBarOpen()) return;
   updateCount(currentMarks.length === 0 ? 0 : currentIndex + 1, currentMarks.length);
 }
 
-// anchor="end": 先頭へ prepend された後の再検索。現在位置を末尾からの距離で保ち、スクロールも動かさない
 export function runSearch(query: string, preserveIndex = false, anchor: "start" | "end" = "start"): void {
   if (debounceTimer !== undefined) {
     clearTimeout(debounceTimer);
@@ -85,8 +82,6 @@ export function runSearch(query: string, preserveIndex = false, anchor: "start" 
       if (tag === "script" || tag === "style" || tag === "textarea" || tag === "input") {
         return NodeFilter.FILTER_REJECT;
       }
-      // .code-copy-status は視覚的非表示（clip-path）。当てるとハイライトが見えないまま
-      // 件数だけ増え、コピー後 2 秒だけ「見つかったのにどこも光らない」になる
       if (
         parent.closest(".find-bar") ||
         parent.closest(".turn-label") ||
@@ -196,8 +191,6 @@ export function findNext(dir: 1 | -1): void {
 
 export function refreshFind(anchor: "start" | "end" = "start"): void {
   if (!isFindBarOpen()) return;
-  // 入力のデバウンス待ちを取り消さない。取り消すと途中の入力値で確定検索が走り、
-  // 待ちが明けたときの検索が prepend 分も数えるので後回しで足りる（M-4。CH-U32d）
   if (debounceTimer !== undefined) return;
   runSearch(findInputEl.value, true, anchor);
 }

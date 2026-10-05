@@ -17,6 +17,11 @@ export function claudeModelIdLabel(model: string): string {
   return model.replace(/\[1m\]$/, "").replace(/-\d{8}$/, "");
 }
 
+export const EXTERNAL_RUN_TOOL_SUFFIX = "__laisora_external__run";
+export function isExternalRunTool(toolName: string): boolean {
+  return toolName.endsWith(EXTERNAL_RUN_TOOL_SUFFIX);
+}
+
 export const AGY_EFFORTS = ["low", "medium", "high"] as const;
 export function splitAgyModel(id: string): { model: string; effort: string } {
   const at = id.lastIndexOf("-");
@@ -25,7 +30,7 @@ export function splitAgyModel(id: string): { model: string; effort: string } {
     ? { model: id.slice(0, at), effort } : { model: id, effort: "" };
 }
 export function agyModelChoices(list?: ExternalModelsState): Array<{ model: string; efforts: string[] }> {
-  if (list?.state !== "ok") return []; // R-ORC-12
+  if (list?.state !== "ok") return [];
   const choices = new Map<string, Set<string>>();
   for (const entry of list.models) {
     const { model, effort } = splitAgyModel(entry.id);
@@ -70,10 +75,10 @@ export interface ExecutorDefinition {
   listModels?: (probe: ExecutorProbe) => Promise<ExternalModelList>;
 }
 export function isExecutorId(value: unknown): value is ExecutorId {
-  return typeof value === "string" && Object.hasOwn(EXECUTORS, value); // R-ORC-12
+  return typeof value === "string" && Object.hasOwn(EXECUTORS, value);
 }
 export function isExternalExecutorId(value: unknown): value is ExternalExecutorId {
-  return isExecutorId(value) && EXECUTORS[value].kind === "external"; // R-ORC-12
+  return isExecutorId(value) && EXECUTORS[value].kind === "external";
 }
 export function isExternalModel(value: unknown): value is string {
   return typeof value === "string" && (value === "" || /^[A-Za-z0-9][A-Za-z0-9._:-]*$/.test(value));
@@ -86,19 +91,19 @@ async function detectVersion(probe: ExecutorProbe): Promise<ExternalDetection> {
   const result = await probe.capture(["--version"]);
   const reason = result.timeout ? "timeout" : result.spawnCode ? `spawn-error:${result.spawnCode}`
     : result.code !== 0 ? `exit:${result.code ?? -1}` : !result.output.trim() ? "empty-output" : undefined;
-  if (result.spawnCode) return { state: "failed", path: probe.path, reason: `spawn-error:${result.spawnCode}` }; // R-ORC-20
+  if (result.spawnCode) return { state: "failed", path: probe.path, reason: `spawn-error:${result.spawnCode}` };
   return reason ? { state: "found", path: probe.path, versionNote: reason } : { state: "found", path: probe.path, version: result.output.trim() };
 }
 function executorResult(output: string, code: number | null, read: (value: string) => { answer: string; completed: boolean; failed: boolean; refused?: boolean; usage?: TokenUsage }) {
   let value: ReturnType<typeof read>;
   try { value = read(output); }
   catch { value = { answer: "", completed: false, failed: true }; }
-  const ok = code === 0 && value.completed && !value.failed && !!value.answer.trim(); // R-ORC-13
+  const ok = code === 0 && value.completed && !value.failed && !!value.answer.trim();
   return { outcome: value.refused ? "refused" as const : ok ? "ok" as const : "failed" as const,
     answer: ok ? value.answer : "External executor failed.", usage: value.usage };
 }
 export function tokenUsage(raw: unknown): TokenUsage | undefined {
-  if (!raw || typeof raw !== "object") return undefined; // R-ORC-14, R-ORC-15
+  if (!raw || typeof raw !== "object") return undefined;
   const entries = Object.entries(raw).filter(([key, value]) =>
     ["input_tokens", "cached_input_tokens", "output_tokens", "reasoning_output_tokens", "cache_read_input_tokens", "cache_creation_input_tokens", "total_tokens", "thinking_tokens", "cache_read_tokens"].includes(key)
     && typeof value === "number" && Number.isFinite(value) && value >= 0);
@@ -107,32 +112,31 @@ export function tokenUsage(raw: unknown): TokenUsage | undefined {
 
 export function parseAgyModels(output: string): ExternalModelList {
   const models: ExternalModel[] = [];
-  // agy 1.2.7 は案内文を stderr へ出し、stdout は先頭行からモデル。行位置で捨てると先頭のモデルが落ちる。モデル行だけがタブを持つ
   for (const line of output.split(/\r?\n/).filter((entry) => entry.includes("\t"))) {
     const id = line.split("\t")[0];
-    if (!id || !isExternalModel(id) || models.some((model) => model.id === id)) continue; // R-ORC-12
+    if (!id || !isExternalModel(id) || models.some((model) => model.id === id)) continue;
     models.push({ id, label: id });
-    if (models.length === 100) break; // R-ORC-12
+    if (models.length === 100) break;
   }
   return models.length ? { state: "ok", models } : { state: "failed", reason: "empty-model-list" };
 }
 
 export function parseCodexModels(result: unknown): (ExternalModelList & { nextCursor?: string | null }) {
-  if (!result || typeof result !== "object") return { state: "failed", reason: "invalid-model-list" }; // R-ORC-12
+  if (!result || typeof result !== "object") return { state: "failed", reason: "invalid-model-list" };
   const page = result as Record<string, unknown>;
   if (!Array.isArray(page.data) || !(page.nextCursor === null || typeof page.nextCursor === "string")) {
-    return { state: "failed", reason: "invalid-model-list" }; // R-ORC-12
+    return { state: "failed", reason: "invalid-model-list" };
   }
   const models: ExternalModel[] = [];
   for (const item of page.data) {
-    if (!item || !item.id || !isExternalModel(item.id) || models.some((model) => model.id === item.id)) continue; // R-ORC-12
+    if (!item || !item.id || !isExternalModel(item.id) || models.some((model) => model.id === item.id)) continue;
     if (!Array.isArray(item.supportedReasoningEfforts) || !item.supportedReasoningEfforts.every((effort: unknown) =>
       effort && typeof effort === "object" && typeof (effort as Record<string, unknown>).reasoningEffort === "string")) {
-      return { state: "failed", reason: "invalid-model-efforts" }; // R-ORC-12
+      return { state: "failed", reason: "invalid-model-efforts" };
     }
     models.push({ id: item.id, label: typeof item.displayName === "string" ? item.displayName : item.id,
       efforts: CODEX_EFFORTS.filter((effort) => item.supportedReasoningEfforts.some((value: { reasoningEffort: string }) => value.reasoningEffort === effort)) });
-    if (models.length === 100) break; // R-ORC-12
+    if (models.length === 100) break;
   }
   return { state: "ok", models, nextCursor: page.nextCursor };
 }
@@ -143,7 +147,7 @@ export const EXECUTORS: Record<ExecutorId, ExecutorDefinition> = {
     id: "claude", writable: true, displayName: "Claude", kind: "agent", efforts: CLAUDE_EFFORTS,
     models: (list) => list?.state === "ok"
       ? list.models.map(({ id, label }) => ({ model: id, label, efforts: id === "haiku" ? [] : CLAUDE_EFFORTS }))
-      : ["haiku", "sonnet", "opus"].map((model) => ({ model, efforts: model === "haiku" ? [] : CLAUDE_EFFORTS })), // R-ORC-25
+      : ["haiku", "sonnet", "opus"].map((model) => ({ model, efforts: model === "haiku" ? [] : CLAUDE_EFFORTS })),
     fallbackEfforts: (model) => model === "haiku" ? [] : CLAUDE_EFFORTS,
     normalize: (row) => ({ ...row, efforts: row.model === "haiku" ? [] : row.efforts }),
     legacy: (entry) => [
@@ -172,7 +176,7 @@ export const EXECUTORS: Record<ExecutorId, ExecutorDefinition> = {
     }),
     listModels: async (probe) => {
       const result = await probe.capture(["models"]);
-      if (result.timeout || result.code !== 0 || result.reason || result.output.length > 1_000_000) return { state: "failed", reason: result.timeout ? "timeout" : result.spawnCode === "ENOENT" ? "not-installed" : "model-list-failed" }; // R-ORC-12
+      if (result.timeout || result.code !== 0 || result.reason || result.output.length > 1_000_000) return { state: "failed", reason: result.timeout ? "timeout" : result.spawnCode === "ENOENT" ? "not-installed" : "model-list-failed" };
       return parseAgyModels(result.output);
     },
   },
@@ -218,7 +222,7 @@ export function rowEfforts(row: ExecutorRow, lists?: ExternalModels): readonly s
 }
 export function rowComplete(row: ExecutorRow, lists?: ExternalModels): boolean {
   return !!row.model && (row.efforts.length > 0
-    || rowEfforts(row, lists).length === 0 && EXECUTORS[row.executor].fallbackEfforts(row.model).length === 0); // R-ORC-10, R-ORC-12
+    || rowEfforts(row, lists).length === 0 && EXECUTORS[row.executor].fallbackEfforts(row.model).length === 0);
 }
 export function canonicalExecutorEfforts(executor: ExecutorId, efforts: readonly string[]): string[] {
   return EXECUTORS[executor].efforts.filter((effort) => efforts.includes(effort));

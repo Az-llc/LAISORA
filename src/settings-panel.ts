@@ -12,12 +12,14 @@ import {
   refreshExternalDetection,
   writeApiKeyPolicy,
   writeAccentSetting,
+  writeDisplayName,
   writeLearningEnabled,
   writeProfileSources,
   writeComposerSendKey,
   writeFileLinkSetting,
   writeOrchestrationSetting,
   writeRestoreTabsOnStartup,
+  writeInitialModel,
 } from "./gateway-host-actions";
 
 let settingsPanel: vscode.WebviewPanel | null = null;
@@ -37,14 +39,12 @@ export function openSettingsPanel(context: vscode.ExtensionContext, detect?: Par
     ],
   });
   settingsPanel = panel;
-  // HTML を評価可能にする前に受信口を開く（逆順だと画面の settingsPageReady を取りこぼす）
   panel.webview.onDidReceiveMessage((raw: unknown) => void handleSettingsPageMessage(panel.webview, raw, detect));
   panel.webview.html = settingsPageHtml({
     cspSource: panel.webview.cspSource,
     nonce: randomBytes(16).toString("base64"),
     scriptUri: String(panel.webview.asWebviewUri(vscode.Uri.joinPath(context.extensionUri, "dist", "settings.js"))),
     cssUri: String(panel.webview.asWebviewUri(vscode.Uri.joinPath(context.extensionUri, "media", "settings.css"))),
-    // 判定は src/webview/l10n-boot.ts#selectWebviewL10nBundle と同一（ja 前方一致だけが ja）
     lang: String(vscode.env.language ?? "").toLowerCase().startsWith("ja") ? "ja" : "en",
   });
   panel.onDidChangeViewState(() => { if (panel.visible) postSettingsState(); });
@@ -70,6 +70,7 @@ export async function handleSettingsPageMessage(webview: vscode.Webview, raw: un
       void webview.postMessage({ type: "conductorPreview", requestId: raw.requestId, ...projectConductorPreview(raw.policy) });
       return;
     case "researchModelProfiles":
+      await loadSettingsProfiles();
       requestModelProfileResearch(raw.targets, raw.purpose);
       break;
     case "openVsCodeSettings":
@@ -81,6 +82,9 @@ export async function handleSettingsPageMessage(webview: vscode.Webview, raw: un
     case "setAccentSetting":
       await writeAccentSetting(raw.setting, raw.value);
       break;
+    case "setDisplayName":
+      await writeDisplayName(raw.value);
+      break;
     case "setComposerSendKey":
       await writeComposerSendKey(raw.sendKey);
       break;
@@ -91,6 +95,9 @@ export async function handleSettingsPageMessage(webview: vscode.Webview, raw: un
       if (!updateClaudeCodeSettings({ autoContinueAtUsageLimit: raw.enabled }).ok) {
         void vscode.window.showWarningMessage(l10n.t("LAISORA: Could not save the setting."));
       }
+      break;
+    case "setInitialModel":
+      await writeInitialModel(raw.model);
       break;
     case "setRestoreTabsOnStartup":
       await writeRestoreTabsOnStartup(raw.enabled);
@@ -108,15 +115,11 @@ export async function handleSettingsPageMessage(webview: vscode.Webview, raw: un
       await writeFileLinkSetting(raw.setting, raw.setting === "openWithSystemApp" ? raw.value : raw.enabled);
       break;
   }
-  // 書込みを待つ間に閉じられた画面へは送らない（R-DSP-01）
-  // 書込みが失敗しても、上位の層が値を持っていても、画面は構成から読み直した値へ戻る（R-DSP-01）。
-  // 値が変わらない書込みでは構成変更の通知が出ないことがあるので、成功時もこの返送を省かない。画面の押下ロックは replyTo でだけ解ける
   if (raw.type === "settingsPageReady" && settingsPanel?.webview === webview) {
     void webview.postMessage(settingsStateMessage());
   }
-  if (settingsPanel?.webview !== webview) return; // R-DSP-01
+  if (settingsPanel?.webview !== webview) return;
   if (raw.type === "recheckExternalExecutors" || raw.type === "settingsPageReady" && !refreshedPages.has(webview)) {
-    // R-ORC-39: consume the page's automatic attempt before any await, including failures.
     refreshedPages.add(webview);
     const pending = refreshExternalDetection(detect, () => {
       if (settingsPanel?.webview === webview) void webview.postMessage(settingsStateMessage());
@@ -124,12 +127,12 @@ export async function handleSettingsPageMessage(webview: vscode.Webview, raw: un
     void webview.postMessage(settingsStateMessage());
     void pending.then(async () => {
       await loadSettingsProfiles();
-      if (settingsPanel?.webview === webview) void webview.postMessage(settingsStateMessage()); // R-ORC-20: completion belongs to the requesting page.
+      if (settingsPanel?.webview === webview) void webview.postMessage(settingsStateMessage());
     });
   }
   await loadSettingsProfiles();
   const reply = settingsStateMessage();
-  if (settingsPanel?.webview !== webview) return; // R-DSP-01
+  if (settingsPanel?.webview !== webview) return;
   if ("requestId" in raw) reply.replyTo = raw.requestId;
   void webview.postMessage(reply);
 }

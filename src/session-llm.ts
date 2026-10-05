@@ -44,7 +44,6 @@ interface AnalysisExecutionProfile {
   effectiveEffort?: string;
 }
 
-// 分析入力に使った親 transcript の読みの結果（読み直し、または保持分の hydration coverage）
 interface AnalysisHistoryRead {
   readFailed: boolean;
   malformedLineCount: number;
@@ -64,7 +63,7 @@ function createLlmClientForSession(
     cwd,
     claudeCodeExecutablePath: configuredClaudeExecutablePath(cfg),
     sdkClaudeCodeVersion: sdkClaudeCodeVersion(),
-    apiKeyPolicy: normalizeApiKeyPolicy(cfg.get("claude.apiKeyPolicy", "inherit")), // R-GW-05
+    apiKeyPolicy: normalizeApiKeyPolicy(cfg.get("claude.apiKeyPolicy", "inherit")),
   });
 }
 
@@ -76,8 +75,6 @@ export class SessionLlm {
 
   private async resolveAnalysisExecutionProfile(): Promise<AnalysisExecutionProfile | "model_unresolved" | null> {
     const cwd = resolveSessionCwd(this.host) ?? process.cwd();
-    // R-ANL-03: チャットの明示選択（modelOverride）→ 実測（effectiveModel）→ 送信前に CLI が報告した applied 値。
-    // settings の model は applied が無いときだけ使う（resume の CLI は settings ではなく記録の model で走る）
     const modelOverrideVal = this.host.modelOverride ?? this.host.effectiveModel ?? this.host.appliedModel ?? undefined;
     const effortOverrideVal = this.host.effortOverride ?? this.host.effectiveEffort ?? this.host.appliedEffort ?? undefined;
     try {
@@ -103,7 +100,6 @@ export class SessionLlm {
               if (!modelVal) modelVal = settings.effective.model ?? undefined;
             }
           } catch {
-            // resolveSettings failure
           } finally {
             if (timeoutHandle !== undefined) clearTimeout(timeoutHandle);
           }
@@ -114,8 +110,6 @@ export class SessionLlm {
         typeof modelVal === "string" && modelVal.trim().length > 0
           ? ({ kind: "explicit", value: modelVal.trim() } as const)
           : ({ kind: "unresolved" } as const);
-      // 分析サブプロセスは settingSources: [] で走る。model 未指定で流すとチャットとは別の
-      // SDK 既定で実行され、黙って別モデルへ課金される（IC-07）
       if (requestedModel.kind === "unresolved") {
         output.appendLine(
           `[${this.host.title}] resolveAnalysisExecutionProfile: model を解決できませんでした（override・実測・CLI の applied・resolveSettings のいずれからも取得できない）`
@@ -139,11 +133,6 @@ export class SessionLlm {
     }
   }
 
-  // transcript 層で欠けた分（読めなかった子・上限で読まなかった子・読み取りの途中失敗・破損行）を
-  // 分析入力の被覆へ載せる。窓落ちと予算切りだけを申告すると、欠けた母集合の上で
-  // 「検証を通った」と名乗る（R-DSP-01。W-R24-1 / W-R24-2）
-  // 親 transcript の読取失敗・破損行は、実際に入力へ使った読み（読み直しならその結果、保持分なら hydration の
-  // coverage）から立てる。hydration 時の値を読み直し成功後にも名乗ると、直った欠落を申告し続ける（M-3。W-R24-3）
   private transcriptGapSummary(historyRead: AnalysisHistoryRead): TranscriptGapSummary | undefined {
     const c = this.host.workModel.coverage;
     const gaps: TranscriptGapSummary = {
@@ -157,15 +146,12 @@ export class SessionLlm {
     return Object.keys(gaps).length > 0 ? gaps : undefined;
   }
 
-  // 分析の入力。collectSummaryInput と同じ理由で、切り詰めが起きたセッションは JSONL から全件を読み直す。
-  // 読めなければ保持分で代用し sessionHeadMissing を立てる（プロンプトの被覆行と分析ビューの入力行に出る）
   private async collectAnalysisEvents(): Promise<{
     events: readonly LlmAnalysisInputEvent[];
     sessionHeadMissing: boolean;
     historyRead: AnalysisHistoryRead;
   }> {
     const c = this.host.workModel.coverage;
-    // 保持分をそのまま使う経路の親 transcript の欠落は hydration の coverage が唯一の観測
     const heldRead: AnalysisHistoryRead = {
       readFailed: c.historyReadError !== undefined,
       malformedLineCount: c.historyMalformedLineCount ?? 0,
@@ -199,7 +185,6 @@ export class SessionLlm {
     run: NonNullable<Session["llmRun"]>,
     info: LlmAnalysisProgress
   ): void {
-    // abort 後の古い callback が、後続の実行へ進捗を上書きしない。
     if (this.host.llmRun !== run) return;
     const progress = {
       stage: info.stage,
@@ -224,27 +209,16 @@ export class SessionLlm {
     );
   }
 
-  // 起動経路はここ1本だけ。fold / debounce タイマー / snapshot / ターン終了から呼ばないこと。
-  // 1 fold ごとに semanticHash が変わる = キャッシュミス = 実 API 呼び出しで、実測プロンプトは
-  // 最大 150,799 bytes 規模。手動トリガ・ストリーミング中拒否・自動再実行なし・single flight の
-  // 4つが唯一のコスト制御なので、どれも緩めない。
-  // 拒否は LlmFindingReportView を合成せず、llmAnalysisRunState の refusal（要求元タブの分析欄の
-  // 実行行）+ Output に留める（合成すると「未実行」が unavailable として描かれ、裁定A-3 の3状態の
-  // 区別が崩れる。R-ANL-11）
   async requestLlmAnalysis(): Promise<void> {
     const refusal = this.llmAnalysisRefusal();
     if (refusal !== null) {
       output.appendLine(`[${this.host.title}] LLM分析を実行しませんでした: ${refusal}`);
-      // 実行しない場合も running:false を返す。webview は押した瞬間に「分析中…」へ
-      // 切り替えており、返さないと張り付いたままになる
       this.store.post({ type: "llmAnalysisRunState", tabId: this.host.tabId, running: false, refusal });
       return;
     }
     const base = this.host.semantic.semanticBasePayload();
     const l3 = base?.l3;
     if (base === undefined || l3 === undefined) {
-      // 導出の例外を「記録がまだありません」へすり替えない。内部の失敗を利用者の状態否定に
-      // 読み替えると、待っても直らない状態を「まだ」と説明することになる（R-DSP-01）
       const failure = this.host.semantic.semanticDerivationFailure();
       const reason =
         failure === null
@@ -260,9 +234,6 @@ export class SessionLlm {
       return;
     }
 
-    // 実行枠の予約は最初の await より前に置く。llmAnalysisRefusal() の guard と占有の間に
-    // await があると、2 回押下・2 タブ同時押下の両方が guard を通過して実 API を 2 回叩く。
-    // 以降のすべての離脱経路（profile 解決失敗・例外・abort）で必ず解放すること
     const abort = new AbortController();
     const activeRun: NonNullable<Session["llmRun"]> = { base, abort };
     this.host.llmRun = activeRun;
@@ -287,7 +258,6 @@ export class SessionLlm {
           "LAISORA: Analysis was cancelled because the model of this conversation could not be determined (the analysis must run on the same model as the conversation)."
         );
       output.appendLine(`[${this.host.title}] LLM分析を実行しませんでした: ${reason}`);
-      // 画面へは lastAttemptFailedReason（分析欄の attemptFailed）だけで出す。toast を重ねない
       this.host.semantic.scheduleSemanticModelPost();
       return;
     }
@@ -329,6 +299,7 @@ export class SessionLlm {
       } else {
         outcome = await runLlmAnalysis({
           enabled: true,
+          learningEnabled: getLaisoraConfiguration().get<boolean>("learning.enabled", false) === true,
           client: createLlmClientForSession(this.host, profile),
           cache: this.host.llmCache,
           input,
@@ -354,14 +325,8 @@ export class SessionLlm {
     }
 
     if (this.host.closed) return;
-    // 中断は例外ではなく戻り値（client_aborted）で返る。設定 off と abort 済みの両方をここで弾く
     if (!llmAnalysisEnabled()) return;
     if (abort.signal.aborted) return;
-    // fold が進んでいたら捨てる。ここで再実行すると1操作1課金の不変条件が壊れる
-    if (this.host.semantic.semanticBasePayload() !== base) {
-      output.appendLine(`[${this.host.title}] LLM分析: 作業ログが進んだため結果を破棄しました`);
-      return;
-    }
 
     if (outcome.state !== "ready") {
       this.host.lastAttemptFailedReason =
@@ -409,12 +374,8 @@ export class SessionLlm {
       return;
     }
 
-    // outcome.state === "ready"
     this.host.lastAttemptFailedReason = null;
     const candidate: PersistedAnalysisArtifact = {
-      // artifactId は採番せず analysisRunId をそのまま使う。cache hit は同じ analysisRunId を
-      // 返すので、下の filter + push が同一 ID の upsert になり件数が増えない（IC-08）。
-      // randomUUID にすると同内容の artifact が別 ID で積み上がり 20 件枠を食い潰す
       artifactId: outcome.analysisRunId,
       generatedAt: outcome.result.provenance.analysisGeneratedAt,
       analyzedRevision: base.revision,
@@ -514,14 +475,9 @@ export class SessionLlm {
   private llmAnalysisRefusal(): string | null {
     if (!semanticViewEnabled()) return l10n.t("LAISORA: The semantic model is disabled (setting laisora.workLog.semanticView).");
     if (!llmAnalysisEnabled()) return l10n.t("LAISORA: LLM analysis is disabled (setting laisora.workLog.llmAnalysis).");
-    // ターン中に始めた実行は fold が進んだ後に着地し、fold 後の着地を捨てる規則で支払い済みの結果を
-    // 捨てることになる（R-ANL-05 / R-ANL-06）。
-    // streamOpen()（会話の生存）で拒むと、warmup が送信前から会話を作るため全タブで常に拒否される
-    // 拒むのは起動中とターン実行中だけ
     if (this.host.starting !== null || (this.host.conversation !== null && !this.host.conversation.isClosed && this.host.conversation.state !== "idle")) {
       return l10n.t("LAISORA: LLM analysis cannot start while a turn is running (wait for it to finish and try again).");
     }
-    // single flight（R-ANL-22）
     if (this.host.llmRun !== null) return l10n.t("LAISORA: LLM analysis is already running in this tab.");
     if (this.store.llmAnalysisInFlightCount() > 0) return l10n.t("LAISORA: LLM analysis is running in another tab.");
     return null;

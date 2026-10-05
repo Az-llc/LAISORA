@@ -146,17 +146,14 @@ const CONFIDENCE_WEIGHT: Record<string, number> = {
 export function orderFindings(findings: readonly ActionFinding[]): ActionFinding[] {
   if (findings.every(f => f.impact.unit === "count" && f.impact.calculation.op === "cardinality")) return [...findings];
   return [...findings].sort((a, b) => {
-    // 1. ms descending
     const aMs = a.impact.unit === "ms" ? a.impact.value : -1;
     const bMs = b.impact.unit === "ms" ? b.impact.value : -1;
     if (aMs !== bMs) return bMs - aMs;
 
-    // 2. count descending
     const aCount = a.impact.unit === "count" ? a.impact.value : -1;
     const bCount = b.impact.unit === "count" ? b.impact.value : -1;
     if (aCount !== bCount) return bCount - aCount;
 
-    // 3. confidence descending
     const aConf = CONFIDENCE_WEIGHT[a.confidence] ?? 0;
     const bConf = CONFIDENCE_WEIGHT[b.confidence] ?? 0;
     return bConf - aConf;
@@ -273,6 +270,7 @@ export function buildFindingEvidenceLine(evidence: Array<PersistedEvidenceChip |
 }
 
 export interface FindingSessionPromptInput {
+  learningEnabled?: boolean;
   analysisSdk?: AnalysisSdk;
   sessionRef: string;
   models: string[] | null;
@@ -302,7 +300,7 @@ export function buildFindingSessionPrompt(input: FindingSessionPromptInput): str
     l10n.t("Improvement direction: {0}", stepsStr),
     l10n.t("Destination: {0}", destinationStr),
     l10n.t("Evidence: {0}", evidenceStr),
-    ACTION_DESTINATION_NORMS.text,
+    input.learningEnabled === false ? ACTION_DESTINATION_NORMS.forLearning(false) : ACTION_DESTINATION_NORMS.text,
     l10n.t("Consult the official documentation and best practices for your model environment, and address the cause using an appropriate approach. Go beyond a one-off workaround and aim to prevent recurrence within an appropriate scope."),
   ].join("\n");
 }

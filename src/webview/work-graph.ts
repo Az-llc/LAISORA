@@ -1,11 +1,10 @@
-// Host の区分を描く。縮尺は buildScale、表示の既定値は defaultGraphHidden（R-DSP-44 / R-DSP-45）。
-// 依存の辺を描かない。観測できる証跡が記録に無く、描けば推測になる（R-DSP-11）。
-// 「時間重複 N 件」を数として出さない。重なりは軸の上にそのまま描く（R-DSP-10）。
 import * as l10n from "@vscode/l10n";
 import type { SemanticModelPayload, TimeBucketsCoverage, WorkAgentNode, WorkModelPayload } from "../protocol";
-import type { AgentSpanView, BackgroundTaskSpanView, RequestBlockView, TimeBucket, TimeBucketView } from "../time-buckets";
-import { AgentInspector, type InspectorAxis } from "./agent-inspector";
-import { formatDateTime, formatDuration, clock, dayClock } from "./format";
+import type { AgentSpanView, BackgroundTaskSpanView, PlanBlockStepView, RequestBlockView, TimeBucket, TimeBucketView } from "../time-buckets";
+import type { AgentInspector, InspectorAxis } from "./agent-inspector";
+import { failureCount } from "./failure-count";
+import { formatDuration, clock, dayClock } from "./format";
+import { formatDateTime } from "./l10n";
 import { termSpan, type TermKey } from "./term";
 
 export const NO_WORK_SUMMARY_TEXT = l10n.t("No work summary yet.");
@@ -16,8 +15,6 @@ export function agentLabel(a: { description?: string }): string {
 
 type WorkCoverageView = WorkModelPayload["coverage"];
 
-// src/work-model.ts#WorkCoverage には無く、src/webview/main.ts が添える。
-// 描き手は droppedEventCount からの引き算で導かない。live の切り詰めで増えた分は画面に描き終えている（R-DSP-01）。
 export interface CoverageBackfillHint {
   backfillPendingCount?: number;
   backfillStalled?: boolean;
@@ -34,12 +31,9 @@ export interface CoverageRow {
   detail?: string;
 }
 
-// 概要と文言を共有する。複製しない（verify-work-graph#G-1d）。onlyProblems は graphCoverageRows だけが立てる（R-DSP-01 / R-DSP-48）。
 export function coverageRows(coverage: WorkCoverageView & CoverageBackfillHint, timeBuckets?: TimeBucketsCoverage, onlyProblems = false): CoverageRow[] {
-  // 集計に入っていないものだけを入れる。表示を絞っただけのものは detailParts へ。
   const summaryGaps: string[] = [];
   const reasons: string[] = [];
-  // 読めなかった記録を 0 本として描くと、並列していたセッションが直列に見える（R-DSP-01）。
   if (timeBuckets?.sessionReadError !== undefined) {
     summaryGaps.push(l10n.t("Could not fully read the session record, so measured times are not shown"));
     reasons.push(timeBuckets.sessionReadError);
@@ -63,15 +57,12 @@ export function coverageRows(coverage: WorkCoverageView & CoverageBackfillHint, 
   if (coverage.unreadableAgentCount !== undefined) {
     summaryGaps.push(l10n.t("{0} subagents are unreadable", coverage.unreadableAgentCount));
   }
-  // 遡っても戻らない欠落なので、表示を絞っただけの「直近のみ」と別の言葉で書く（R-DSP-03）。
   if (coverage.omittedTranscriptCount !== undefined) {
     summaryGaps.push(l10n.t("Records for {0} subagents were not read and are not included in the totals", coverage.omittedTranscriptCount));
   }
   if (coverage.untrackedBackgroundCount !== undefined) {
     summaryGaps.push(l10n.t("{0} background tasks are no longer tracked and are not included in the totals", coverage.untrackedBackgroundCount));
   }
-  // summaryCauseExplained が偽のときだけ「先頭の作業は集計外」と書く。原因が分かっているのにその文へ倒すと、
-  // 読取失敗や復元失敗を先頭切り詰めと断定する（R-DSP-01, verify-work-graph#G-COV-7mut）。
   let summaryCauseExplained = false;
   if (coverage.hydrationUnconfirmed === "loading") {
     summaryCauseExplained = true;
@@ -101,19 +92,14 @@ export function coverageRows(coverage: WorkCoverageView & CoverageBackfillHint, 
     summaryCauseExplained = true;
     summaryGaps.push(l10n.t("The input of {0} Task tool calls could not be parsed, so they are not included in the totals", coverage.unparsedTaskInputCount));
   }
-  // 件数の集計は通っているので summaryCauseExplained を立てない。
   if (coverage.evidenceFoldErrorCount !== undefined) {
     summaryGaps.push(l10n.t("{0} events are missing from the evidence index, so status and analysis lack their evidence", coverage.evidenceFoldErrorCount));
   }
-  // 古い表示を現在として残さない（verify-work-graph#G-COV-8mut）。
   if (coverage.semanticDerivationFailed === "stale") {
     summaryGaps.push(l10n.t("Building the status failed; the status and graph are as of the last success"));
   } else if (coverage.semanticDerivationFailed === "unavailable") {
     summaryGaps.push(l10n.t("Building the status failed; the status and graph cannot be shown"));
   }
-  // droppedEventCount を summaryGaps へ入れない。Host は reduceWorkModel と evidenceIndex を全イベントに当ててから
-  // trimEventLog するので、概要の数字は先頭を含む。欠けるのは実行ログの行と LLM 分析の入力だけで、details 側の文が担う
-  // （R-DSP-01, verify-work-graph#G-COV-6mut）。欠落を並べながら「セッション全体」と名乗らない（R-DSP-01）。
   const summaryParts = [
     coverage.summary !== "complete"
       ? summaryCauseExplained
@@ -125,10 +111,7 @@ export function coverageRows(coverage: WorkCoverageView & CoverageBackfillHint, 
     ...summaryGaps,
   ];
   const backfillPending = coverage.backfillPendingCount ?? 0;
-  // src/webview/main.ts は遡りが尽きるか止まるまで 0 を渡す（R-TAB-08）。
   const unreachable = coverage.backfillUnreachableCount ?? 0;
-  // 読み終わって欠けだけが残った画面を「直近のみ」と呼ばない（R-DSP-01 / R-DSP-23）。
-  // 欠けの判定を details より先に見る。Host の details が complete でも、この画面に出せなかった行があれば「すべて表示」と言わない（R-DSP-01）。
   const detailParts = [
     onlyProblems || (backfillPending === 0 && unreachable > 0)
       ? l10n.t("Details: partially missing")
@@ -136,17 +119,13 @@ export function coverageRows(coverage: WorkCoverageView & CoverageBackfillHint, 
         ? l10n.t("Details: all shown")
         : l10n.t("Details: recent only"),
   ];
-  // omittedToolCount と omittedMessageCount は初期表示から外した総数で、現在の未読込件数ではない。backfillDone の後は「すべて表示」と矛盾するので出さない。
   if (!coverage.backfillDone && coverage.omittedToolCount !== undefined) {
     detailParts.push(l10n.t("{0} tools are not shown in the initial view", coverage.omittedToolCount));
   }
   if (!coverage.backfillDone && coverage.omittedMessageCount !== undefined) {
     detailParts.push(l10n.t("{0} messages are not shown in the initial view", coverage.omittedMessageCount));
   }
-  // 「破棄」と書かない。落ちたのは実行ログの行だけで、集計は落とす前に畳んである（R-DSP-01 / R-DSP-23, verify-work-overview#O-77b）。
-  // 裏読みで戻る分と記録からも読めなかった分を同じ文にしない（R-TAB-08）。
   if (!coverage.backfillDone) {
-    // backfillPending と unreachable は同じ未表示分を数えるので、足さない。
     const stalled = coverage.backfillStalled === true ? Math.max(backfillPending, unreachable) : 0;
     if (stalled > 0) {
       detailParts.push(l10n.t("Loading {0} older events into the run log has stalled", stalled));
@@ -157,7 +136,6 @@ export function coverageRows(coverage: WorkCoverageView & CoverageBackfillHint, 
           : l10n.t("Loading {0} older events into the run log", backfillPending)
       );
     }
-    // R-DSP-03: 記録からも読めなかった件数は注記で出す。読込停止の注記が出るときは、同じ未表示分を stalled が数えている。
     if (unreachable > 0 && stalled === 0) {
       detailParts.push(
         l10n.t("{0} older events could not be read from the record, so they are not shown in the run log", unreachable)
@@ -170,7 +148,6 @@ export function coverageRows(coverage: WorkCoverageView & CoverageBackfillHint, 
   if (coverage.depthLimitedAgentCount !== undefined) {
     detailParts.push(l10n.t("{0} deeply nested items have unconfirmed hierarchy", coverage.depthLimitedAgentCount));
   }
-  // R-DSP-23: complete で付記の無い行は出さない。
   const rows: CoverageRow[] = [];
   if ((coverage.summary !== "complete" && (!onlyProblems || !summaryCauseExplained)) || summaryGaps.length > 0) {
     rows.push({
@@ -190,7 +167,6 @@ export function coverageRows(coverage: WorkCoverageView & CoverageBackfillHint, 
   return rows;
 }
 
-// R-DSP-48: 通常の読込中と初期表示の絞り込みは行にしない。normalized がそれらの値を落としてから行を作る。
 export function graphCoverageRows(coverage: WorkCoverageView & CoverageBackfillHint, timeBuckets?: TimeBucketsCoverage): CoverageRow[] {
   const normalized = { ...coverage, details: "complete" as const,
     omittedToolCount: undefined, omittedMessageCount: undefined,
@@ -207,14 +183,13 @@ const PAD_R = 8;
 const AXIS_H = 22;
 const ROW_H = 36;
 const FOLD_PX = 30;
-// 長い待ちを畳まないと、1 ブロックが画面の大半を占める（R-DSP-21）。
 const FOLD_MIN_MS = 5 * 60_000;
 const MINI_ARIA_LABEL = l10n.t("Activity distribution across the whole session. Click to zoom in on the rows at that time");
 const MINI_UNFRAMED_ARIA_LABEL = l10n.t("The visible range covers every row. Click to center the rows at that time");
 const GRID_MS = 15 * 60_000;
 const LABEL_MS = 2 * GRID_MS;
 const HOUR_MS = 2 * LABEL_MS;
-export type GraphCategory = "g" | "t" | "a" | "wait" | "sub";
+export type GraphCategory = "g" | "t" | "d" | "a" | "wait" | "sub";
 export function defaultGraphHidden(): Set<GraphCategory> { return new Set(["wait"]); }
 export function elapsedLabel(ms: number): string {
   const minutes = Math.floor(Math.max(0, ms) / 60_000);
@@ -224,16 +199,10 @@ const ZOOM_ARIA_LABEL = l10n.t("Press anywhere on the minimap to move the visibl
 const MINI_HINT = l10n.t("Drag to move · Double-click for whole");
 const HINT_MIN_PX = 200;
 const MIN_WINDOW_ROWS = 3;
-// pointerdown の preventDefault が互換 mouse イベントを抑え、実機では枠の dblclick が届かない（E2E-3b 実測）。
-// ダブル押下は pointerdown の並びから自前で判定する。猶予は setTimeout で測る（時計を検査と共有し、
-// 実時間の経過に依らない）。解除するのは 2 回目が枠（data-part=window）の上のときだけ —
-// ミニマップ全域は「その時刻へ移す」入口で、枠外の連打は移動であって全体復帰ではない
 const MINI_DBL_MS = 400;
 const MINI_DBL_PX = 6;
-// 再フォーカスの focus() は既定でフォーカス先をスクロールポート内へ寄せ、窓（可視帯）を動かす
 const FOCUS_NO_SCROLL: FocusOptions = { preventScroll: true };
 
-// window の横軸は viewRange が可視帯から毎回解く。anchor・anchorIndex・rowCount は、測れないときの代替値と reanchor の基準でしかない。
 type Zoom = { kind: "all" } | { kind: "window"; anchor: RowKey; anchorIndex: number; rowCount: number };
 const ZOOM_ALL: Zoom = { kind: "all" };
 
@@ -260,7 +229,6 @@ interface PortMetrics {
   rowCount: number;
 }
 
-// 実装は src/webview/tab.ts#Tab の graphScrollPort。rect の top は .log-head の下端、bottom は #logs の下端で、測れないときは undefined。
 export interface GraphScrollPort {
   rect(): { top: number; bottom: number } | undefined;
   scrollBy(deltaPx: number): void;
@@ -276,11 +244,13 @@ type RowKey = string;
 
 interface GraphRow {
   key: RowKey;
-  kind: "block" | "agent" | "bg";
+  kind: "block" | "step" | "agent" | "bg";
+  step?: PlanBlockStepView;
   block?: RequestBlockView;
   agent?: AgentSpanView;
   bgTask?: BackgroundTaskSpanView;
   parentBlock?: RequestBlockView;
+  parentStep?: PlanBlockStepView;
 }
 
 type FoldKind = "reply" | "confirm" | "unobserved";
@@ -335,8 +305,13 @@ function span(className: string, text: string): HTMLElement {
 }
 
 
-function bucketClass(bucket: TimeBucket): "g" | "t" | "a" {
-  return bucket === "generate" ? "g" : bucket === "tool" ? "t" : "a";
+function bucketClass(bucket: TimeBucket): "g" | "t" | "d" | "a" {
+  return bucket === "generate" ? "g" : bucket === "tool" ? "t" : bucket === "delegation" ? "d" : "a";
+}
+
+function bucketWord(bucket: TimeBucket): string {
+  return bucket === "generate" ? l10n.t("LLM generation") : bucket === "tool" ? l10n.t("Tool execution")
+    : bucket === "delegation" ? l10n.t("Waiting for subagent") : l10n.t("Waiting for your answer");
 }
 
 function segTitle(word: string, start: number, end: number | null, extra?: string): string {
@@ -351,10 +326,9 @@ function titled<T extends SVGElement>(el: T, text: string): T {
   return el;
 }
 
-// R-DSP-11: 起点が継承値のブロックは durationMs が null で、数字を出さない。
 function blockDuration(b: RequestBlockView, end: number): string {
   if (b.durationMs === null) return l10n.t("Not measured");
-  return formatDuration(b.running ? Math.max(b.durationMs, end - b.start) : b.durationMs);
+  return `${b.metrics?.provisional ? "≈" : ""}${formatDuration(b.running ? Math.max(b.durationMs, end - b.start) : b.durationMs)}`;
 }
 
 function clip(text: string, max: number): string {
@@ -362,7 +336,6 @@ function clip(text: string, max: number): string {
   return line.length > max ? `${line.slice(0, max - 1)}…` : line;
 }
 
-// R-DSP-44: 非表示の待ちは、他の行が重なっていても幅を持たない（verify-work-graph-scale#GS-1）。
 export function buildScale(start: number, end: number, waits: readonly WaitFold[], linearWidth: number, offset: number,
   hidden: ReadonlySet<GraphCategory> = defaultGraphHidden(), compress = true): Scale {
   const gaps = waits.map((w) => ({ ...w, start: Math.max(start, w.start), end: Math.min(end, w.end),
@@ -434,7 +407,6 @@ export function graphTotalText(scale: Pick<Scale, "cutMs" | "elapsedTotal">): st
     : l10n.t("Total {0}", elapsedLabel(scale.elapsedTotal));
 }
 
-// R-DSP-47: 終端、HOUR_MS の刻み、LABEL_MS の刻みの順に場所を取る（verify-work-graph-scale#GS-2）。
 export function graphTickLabels(scale: Scale, measure: (text: string) => number = (text) => text.length * 6): { t: number; elapsed: number; x: number; anchor: "start" | "middle" | "end"; text: string }[] {
   const taken: { lo: number; hi: number }[] = [];
   const labels: ReturnType<typeof graphTickLabels> = [];
@@ -549,7 +521,6 @@ export class WorkGraph {
     this.legendEl.setAttribute("aria-label", l10n.t("Graph legend"));
     this.noteEl = document.createElement("div");
     this.noteEl.className = "wg-note";
-    // 軸のラベルは読み上げない。合計は totalEl、時刻の範囲は zoomRangeEl が読み上げの対象になる。
     this.axisEl = svgEl("svg", { class: "wg-axis", "aria-hidden": "true" });
     this.totalEl = span("wg-total", "");
     this.timelineEl = document.createElement("div");
@@ -566,13 +537,11 @@ export class WorkGraph {
     this.chartEl = svgEl("svg", { class: "wg-chart", role: "group", "aria-label": l10n.t("Timeline of request blocks and subagents") });
     this.chartEl.addEventListener("keydown", (e) => this.onKeyDown(e));
     this.chartPaneEl.appendChild(this.chartEl);
-    // 行選択の情報パネルを置かない。行から開く AgentInspector と内容が二重になる（verify-work-graph#G-56）。
     this.bodyEl.appendChild(this.chartPaneEl);
     this.emptyEl = span("wg-empty", NO_WORK_SUMMARY_TEXT);
     this.stageEl.append(this.headEl, this.bodyEl, this.emptyEl, this.inspector.rootEl);
     this.rootEl.append(this.coverageEl, this.noteEl, this.stageEl);
 
-    // 本番からは呼ばれない検査の駆動点（verify-work-graph#G-COV-8, verify-work-graph#G-64, verify-work-graph#G-92）。
     (this.rootEl as HTMLElement & {
       laisoraSemanticUpdate?: (model: SemanticModelPayload | undefined, semanticView?: boolean) => void;
       laisoraTick?: (nowMs: number) => void;
@@ -585,7 +554,6 @@ export class WorkGraph {
     (this.rootEl as HTMLElement & {
       laisoraOpenAgent?: (agentId: string) => boolean;
     }).laisoraOpenAgent = (agentId) => this.openAgentByWorkAgentId(agentId);
-    // headless（--dump-dom）では ResizeObserver が描画機会まで届かないので、検査はここから同じ経路を叩く（verify-work-graph#G-94）。
     (this.rootEl as HTMLElement & { laisoraPortResized?: () => void }).laisoraPortResized = () => this.onPortResized();
     if (typeof ResizeObserver !== "undefined") {
       const observer = new ResizeObserver(() => this.onPortResized());
@@ -599,7 +567,6 @@ export class WorkGraph {
     if (this.visible) this.scheduleRender();
   }
 
-  // pendingReanchor の適用は測れるときに限る。#logs は会話面と共用なので、測れないまま適用すると会話のスクロールを動かす（verify-work-graph#G-100b）。
   onPortScroll(): void {
     const measurable = this.scrollPort?.rect() !== undefined;
     if (measurable && this.pendingReanchor !== 0) {
@@ -618,7 +585,7 @@ export class WorkGraph {
 
   setVisible(visible: boolean): void {
     if (visible && !this.visible) {
-      this.hiddenCategories = defaultGraphHidden(); // R-DSP-45
+      this.hiddenCategories = defaultGraphHidden();
       this.dirty = true;
     }
     this.visible = visible;
@@ -670,7 +637,7 @@ export class WorkGraph {
       this.openRow(row);
       return true;
     }
-    this.inspector.open({ kind: "agent", agentId, label: agent?.description || agentId });
+    this.inspector.open({ kind: "agent", agentId, label: agentLabel(agent ?? {}) });
     return agent !== undefined;
   }
 
@@ -738,11 +705,9 @@ export class WorkGraph {
     this.rowHeight = this.narrow ? 44 : ROW_H;
     this.rootEl.classList.toggle("wg-narrow", this.narrow);
     this.renderNote(view);
-    // 末尾の状態は Host の tail を使い、intervals から推定しない（R-DSP-15）。
     const tail = view.tail ?? { main: null, anyOpen: true };
     const end = this.windowEnd(view);
     this.rows = this.buildRows(view);
-    // 高さを先に伸ばす。後だと reanchor の scrollBy が旧 scrollHeight で clamp される
     this.chartEl.setAttribute("height", String(this.rows.length * this.rowHeight + 8));
     this.reanchor();
     const range = this.viewRange(view, end);
@@ -761,7 +726,6 @@ export class WorkGraph {
     const lastAt = view.lastAt as number;
     const uStart = Math.max(lastAt, range.start);
     const uEnd = Math.min(end, range.end);
-    // 折り目の閾値 FOLD_MIN_MS は buildScale だけが掛ける。ここで重ねて掛けない。
     if (!tail.anyOpen && uEnd > uStart) {
       waits.push({ start: uStart, end: uEnd, kind: "unobserved" });
     } else if (tail.main === "confirm" && uEnd > uStart) {
@@ -802,13 +766,26 @@ export class WorkGraph {
     const placed = new Set<string>();
     for (const block of view.blocks) {
       rows.push({ key: `block:${block.blockId}`, kind: "block", block });
+      for (const step of block.steps ?? []) {
+        rows.push({ key: `step:${block.blockId}:${step.key}`, kind: "step", step, parentBlock: block });
+        for (const agent of view.agents) {
+          if (agent.blockId !== block.blockId || agent.stepKey !== step.key) continue;
+          placed.add(`agent:${agent.toolUseId}`);
+          rows.push({ key: `agent:${agent.toolUseId}`, kind: "agent", agent, parentBlock: block, parentStep: step });
+        }
+        for (const bg of view.backgroundTasks ?? []) {
+          if (bg.blockId !== block.blockId || bg.stepKey !== step.key) continue;
+          placed.add(`bg:${bg.toolUseId}`);
+          rows.push({ key: `bg:${bg.toolUseId}`, kind: "bg", bgTask: bg, parentBlock: block, parentStep: step });
+        }
+      }
       for (const agent of view.agents) {
-        if (agent.blockId !== block.blockId) continue;
+        if (agent.blockId !== block.blockId || placed.has(`agent:${agent.toolUseId}`)) continue;
         placed.add(`agent:${agent.toolUseId}`);
         rows.push({ key: `agent:${agent.toolUseId}`, kind: "agent", agent, parentBlock: block });
       }
       for (const bg of view.backgroundTasks ?? []) {
-        if (bg.blockId !== block.blockId) continue;
+        if (bg.blockId !== block.blockId || placed.has(`bg:${bg.toolUseId}`)) continue;
         placed.add(`bg:${bg.toolUseId}`);
         rows.push({ key: `bg:${bg.toolUseId}`, kind: "bg", bgTask: bg, parentBlock: block });
       }
@@ -824,18 +801,27 @@ export class WorkGraph {
     return rows;
   }
 
+  private drawPlanMarkers(g: SVGElement, block: RequestBlockView, scale: Scale, range: ResolvedRange, cy: number): void {
+    for (const marker of block.userMessages ?? []) {
+      if (marker.at < range.start || marker.at > range.end) continue;
+      const mark = svgEl("path", { d: `M ${scale.x(marker.at)} ${cy - 9} v 18`, class: "wg-user-marker wg-group-line" });
+      titled(mark, marker.text);
+      g.appendChild(mark);
+    }
+  }
+
   private renderLegend(view: TimeBucketView): void {
     this.legendEl.textContent = "";
-    // 第 2 要素は src/webview/term.ts#TermKey の値なので l10n.t を通さない。表示ラベルは termSpan が付ける。
     this.legendEl.append(span("wg-code", "KEY"), span("wg-caption", l10n.t("Legend")));
     const items: [GraphCategory, TermKey][] = [
       ["g", "LLM generation"],
       ["t", "Tool execution"],
+      ["d", "Waiting for subagent"],
       ["a", "Waiting for your answer"],
       ["wait", "Waiting for reply"],
       ["sub", "Subagent"],
     ];
-    const totals = { g: view.main.generateMs, t: view.main.toolMs, a: view.main.confirmMs, wait: view.main.replyMs, sub: view.bars.subMs };
+    const totals = { g: view.main.generateMs, t: view.main.toolMs, d: view.main.subagentWaitMs, a: view.main.confirmMs, wait: view.main.replyMs, sub: view.bars.subMs };
     for (const [cls, label] of items) {
       const item = document.createElement("button");
       item.type = "button";
@@ -876,7 +862,6 @@ export class WorkGraph {
   private renderNote(view: TimeBucketView): void {
     this.noteEl.textContent = "";
     this.noteEl.hidden = true;
-    // fidelity が inherited のとき境界イベントの時刻は継承値で、返信待ちが生成へ積まれた数字になる（R-DSP-15, verify-work-graph#G-58）。
     if (view.fidelity === "inherited") {
       this.noteEl.hidden = false;
       this.noteEl.dataset.fidelity = "inherited";
@@ -884,11 +869,11 @@ export class WorkGraph {
     }
     if (view.droppedIntervalCount > 0 || view.droppedBlockCount > 0) {
       this.noteEl.hidden = false;
-      this.noteEl.append(span("wg-note-line", l10n.t("Older records were dropped because of the limit ({0} intervals · {1} request blocks).", view.droppedIntervalCount, view.droppedBlockCount)));
+      this.noteEl.append(span("wg-note-line", l10n.t("Older records were dropped because of the limit ({0} intervals · {1} work blocks).", view.droppedIntervalCount, view.droppedBlockCount)));
     }
   }
 
-  private renderMini(view: TimeBucketView, end: number, tail: { main: "generate" | "tool" | "confirm" | null; anyOpen: boolean }, range: ResolvedRange): void {
+  private renderMini(view: TimeBucketView, end: number, tail: TimeBucketView["tail"], range: ResolvedRange): void {
     const mini = this.miniEl;
     mini.textContent = "";
     const defs = svgEl("defs", {});
@@ -916,15 +901,17 @@ export class WorkGraph {
     if (!this.hiddenCategories.has("wait")) mini.appendChild(svgEl("rect", { x: 0, y: 4, width: px(lastAt), height: 16, class: "wg-seg-wait", rx: 2 }));
     for (const i of view.intervals) {
       if (i.bucket === "reply" || this.hiddenCategories.has(bucketClass(i.bucket))) continue;
-      mini.appendChild(svgEl("rect", { x: px(i.start), y: 4, width: Math.max(0.8, px(i.end) - px(i.start)), height: 16, class: `wg-seg wg-seg-${bucketClass(i.bucket)}` }));
+      const thin = i.bucket === "delegation";
+      mini.appendChild(svgEl("rect", { x: px(i.start), y: thin ? 8 : 4, width: Math.max(0.8, px(i.end) - px(i.start)), height: thin ? 8 : 16, class: `wg-seg wg-seg-${bucketClass(i.bucket)}` }));
     }
     if (end > lastAt) {
       if (tail.main !== null && !this.hiddenCategories.has(bucketClass(tail.main))) {
+        const thin = tail.main === "delegation";
         const ext = svgEl("rect", {
           x: px(lastAt),
-          y: 4,
+          y: thin ? 8 : 4,
           width: Math.max(0.8, px(end) - px(lastAt)),
-          height: 16,
+          height: thin ? 8 : 16,
           class: `wg-seg wg-seg-${bucketClass(tail.main)} open`,
           rx: 2,
         });
@@ -1009,7 +996,7 @@ export class WorkGraph {
     }
   }
 
-  private renderChart(view: TimeBucketView, scale: Scale, end: number, range: ResolvedRange, tail: { main: "generate" | "tool" | "confirm" | null; anyOpen: boolean }): void {
+  private renderChart(view: TimeBucketView, scale: Scale, end: number, range: ResolvedRange, tail: TimeBucketView["tail"]): void {
     const svg = this.chartEl;
     svg.textContent = "";
     const defs = svgEl("defs", {});
@@ -1029,7 +1016,6 @@ export class WorkGraph {
     svg.setAttribute("width", String(scale.width));
     svg.setAttribute("height", String(height));
 
-    // R-DSP-46: 圧縮の印を行の区間の外に描かない（verify-work-graph-scale#GS-3）。
     for (const { t } of scale.ticks) {
       const x = Math.round(scale.x(t)) + .5;
       svg.appendChild(svgEl("line", { x1: x, y1: 0, x2: x, y2: height - 6, class: "wg-tick-line" }));
@@ -1057,14 +1043,13 @@ export class WorkGraph {
       const cy = y + (this.narrow ? 37 : 18);
       const labelY = y + 14;
       const labelEnd = (this.narrow ? scale.width : this.labelWidth) - 28;
-      const labelStart = row.kind === "block" ? (this.narrow ? 20 : 24) : (this.narrow ? 32 : 40);
+      const labelStart = row.kind === "block" ? (this.narrow ? 20 : 24) : row.parentStep ? (this.narrow ? 44 : 56) : (this.narrow ? 32 : 40);
       const addLabels = (name: string, meta: string, duration: string, full = name, model?: string, durationNote?: string): void => {
         const label = svgEl("text", { x: labelStart, y: labelY, class: "wg-lbl" });
         const value = svgEl("text", { x: labelEnd, y: labelY, "text-anchor": "end", class: "wg-row-value" });
         value.textContent = duration;
         if (durationNote !== undefined) titled(value, durationNote);
         const sub = svgEl("text", { x: labelStart, y: labelY + 13, class: "wg-lbl-dim" });
-        // 付ける前の要素では getComputedStyle が行ごとの太さとテーマのフォントを返さないので、測る前に付ける。
         g.append(label, value, sub);
         if (canvas) canvas.font = fontOf(value);
         const durationWidth = canvas ? canvas.measureText(duration).width : duration.length * 11.5;
@@ -1090,7 +1075,6 @@ export class WorkGraph {
         number.textContent = String(blockNumber).padStart(2, "0");
         g.append(number);
       }
-      // 窓外の行を消さない。端に欠片の棒を描かず、窓との前後を示す（verify-work-graph#G-87b）。
       const outside = this.outside(row, range, end);
       if (outside !== undefined) {
         g.dataset.outside = outside;
@@ -1106,7 +1090,7 @@ export class WorkGraph {
         const b = row.block;
         const bEnd = this.blockEnd(b, end);
         const meta = [clock(b.anchorAt), b.toolCount > 0 ? l10n.t("{0} main-agent tool calls", b.toolCount) : "", b.agentCount > 0 ? l10n.t("{0} subagents", b.agentCount) : ""].filter(Boolean).join(" · ");
-        const untilNext = b.durationMs !== null && view.blocks[view.blocks.length - 1] !== b ? l10n.t("Until the next request") : undefined;
+        const untilNext = b.durationMs !== null && view.blocks[view.blocks.length - 1] !== b ? b.kind === "plan" ? l10n.t("Until the next work block") : l10n.t("Until the next request") : undefined;
         addLabels(b.text, meta, blockDuration(b, bEnd), b.text, undefined, untilNext);
         if (drawBars && b.end > range.start) {
           const x0 = scale.x(Math.max(b.anchorAt, range.start));
@@ -1125,12 +1109,13 @@ export class WorkGraph {
           const s = Math.max(hostS, range.start);
           const e = Math.min(hostE, range.end);
           if (e <= s) continue;
-          const seg = svgEl("rect", { x: scale.x(s), y: cy - (this.narrow ? 5 : 6), width: Math.max(1.2, scale.x(e) - scale.x(s)), height: this.narrow ? 10 : 12, class: `wg-seg wg-seg-${bucketClass(i.bucket)}` });
+          const half = this.segHalf(i.bucket);
+          const seg = svgEl("rect", { x: scale.x(s), y: cy - half, width: Math.max(1.2, scale.x(e) - scale.x(s)), height: half * 2, class: `wg-seg wg-seg-${bucketClass(i.bucket)}` });
           seg.dataset.bucket = i.bucket;
-          const word = i.bucket === "generate" ? l10n.t("LLM generation") : i.bucket === "tool" ? l10n.t("Tool execution") : l10n.t("Waiting for your answer");
+          const word = bucketWord(i.bucket);
           const clipSeg = this.clipped(hostS, hostE, range);
           if (clipSeg !== undefined) seg.dataset.clipped = clipSeg;
-          titled(seg, segTitle(word, s, e, clipSeg !== undefined ? l10n.t("Continues outside the window") : undefined));
+          titled(seg, `${b.metrics?.provisional ? "≈" : ""}${segTitle(word, s, e, clipSeg !== undefined ? l10n.t("Continues outside the window") : undefined)}`);
           g.appendChild(seg);
         }
         if (drawBars && b.running && tail.main !== null && !this.hiddenCategories.has(bucketClass(tail.main)) && this.running && end > (view.lastAt as number) && (view.lastAt as number) < range.end) {
@@ -1138,24 +1123,39 @@ export class WorkGraph {
             const lastAtVal = view.lastAt as number;
             const extX0 = scale.x(Math.max(lastAtVal, range.start));
             const extX1 = scale.x(Math.min(end, range.end));
+            const half = this.segHalf(tail.main);
             const ext = svgEl("rect", {
               x: extX0,
-              y: cy - (this.narrow ? 5 : 6),
+              y: cy - half,
               width: Math.max(1.2, extX1 - extX0),
-              height: this.narrow ? 10 : 12,
+              height: half * 2,
               class: `wg-seg wg-seg-${bucketClass(tail.main)} open`,
             });
             ext.dataset.bucket = tail.main;
             ext.dataset.tail = "main";
             const clipExt = this.clipped(lastAtVal, end, range);
             if (clipExt !== undefined) ext.dataset.clipped = clipExt;
-            const word = tail.main === "generate" ? l10n.t("LLM generation") : tail.main === "tool" ? l10n.t("Tool execution") : l10n.t("Waiting for your answer");
+            const word = bucketWord(tail.main);
             titled(ext, segTitle(word, lastAtVal, null, clipExt !== undefined ? l10n.t("Continues outside the window") : undefined));
             g.appendChild(ext);
           }
         }
         if (b.running) g.classList.add("running");
-        g.setAttribute("aria-label", `${l10n.t("Request block")} ${clip(b.text, 40)} ${clock(b.anchorAt)} ${blockDuration(b, bEnd)}${untilNext === undefined ? "" : ` (${untilNext})`}${outsideSuffix}`);
+        if (drawBars && b.kind === "plan") this.drawPlanMarkers(g, b, scale, range, cy);
+        g.setAttribute("aria-label", `${b.kind === "plan" ? l10n.t("Work block") : l10n.t("Request block")} ${clip(b.text, 40)} ${clock(b.anchorAt)} ${blockDuration(b, bEnd)}${untilNext === undefined ? "" : ` (${untilNext})`}${outsideSuffix}`);
+      } else if (row.kind === "step" && row.step !== undefined) {
+        const step = row.step;
+        const stop = step.endedAt === null && row.parentBlock?.running ? this.blockEnd(row.parentBlock, end) : step.end ?? row.parentBlock?.end ?? end;
+        addLabels(step.title, step.removed ? l10n.t("Removed") : step.status === "completed" ? l10n.t("Completed") : step.status === "in_progress" ? l10n.t("Running") : l10n.t("Pending"),
+          step.durationMs === null ? "—" : `${step.provisional ? "≈" : ""}${formatDuration(step.durationMs)}`);
+        if (drawBars && step.startedAt !== null && stop > step.startedAt) {
+          const start = Math.max(step.startedAt, range.start);
+          const finish = Math.min(stop, range.end);
+          if (finish > start) g.appendChild(titled(svgEl("rect", { x: scale.x(start), y: cy - 3,
+            width: Math.max(1.2, scale.x(finish) - scale.x(start)), height: 6, class: "wg-step-bar wg-row-bg", stroke: "currentColor" }),
+            `${step.provisional ? "≈" : ""}${segTitle(step.title, step.startedAt, stop)}`));
+        }
+        g.setAttribute("aria-label", `${step.title} ${step.durationMs === null ? l10n.t("Not measured") : `${step.provisional ? "≈" : ""}${formatDuration(step.durationMs)}`}${outsideSuffix}`);
       } else if (row.agent !== undefined) {
         const a = row.agent;
         const aEnd = this.agentEnd(a, end);
@@ -1172,12 +1172,14 @@ export class WorkGraph {
           g.appendChild(bar);
         }
         if (a.open && this.running) g.classList.add("running");
-        g.setAttribute("aria-label", `${l10n.t("Subagent")} ${clip(a.description || a.toolUseId, 40)} ${clock(a.start)} ${formatDuration(aEnd - a.start)}${outsideSuffix}`);
+        const name = agentLabel(a);
+        g.setAttribute("aria-label", `${a.description ? `${l10n.t("Subagent")} ` : ""}${clip(name, 40)} ${clock(a.start)} ${formatDuration(aEnd - a.start)}${outsideSuffix}`);
       } else if (row.kind === "bg" && row.bgTask !== undefined) {
         const bg = row.bgTask;
         const bgEnd = this.bgEnd(bg, end);
         const desc = bg.description || bg.taskId;
-        addLabels(`↻ ${desc}`, l10n.t("Background"), formatDuration(bgEnd - bg.start), desc);
+        const word = bg.subagent ? l10n.t("Subagent") : l10n.t("Background");
+        addLabels(bg.subagent ? desc : `↻ ${desc}`, word, formatDuration(bgEnd - bg.start), desc);
         if (drawBars && !this.hiddenCategories.has("sub")) {
           const x0 = scale.x(Math.max(bg.start, range.start));
           const x1 = scale.x(Math.min(bgEnd, range.end));
@@ -1186,11 +1188,11 @@ export class WorkGraph {
           bar.dataset.bucket = "sub";
           const clipBg = this.clipped(bg.start, bgEnd, range);
           if (clipBg !== undefined) bar.dataset.clipped = clipBg;
-          titled(bar, segTitle(l10n.t("Background"), bg.start, bg.open && this.running ? null : bgEnd, clipBg !== undefined ? l10n.t("Continues outside the window") : undefined));
+          titled(bar, segTitle(word, bg.start, bg.open && this.running ? null : bgEnd, clipBg !== undefined ? l10n.t("Continues outside the window") : undefined));
           g.appendChild(bar);
         }
         if (bg.open && this.running) g.classList.add("running");
-        g.setAttribute("aria-label", `${l10n.t("Background")} ${clip(desc, 40)} ${clock(bg.start)} ${formatDuration(bgEnd - bg.start)}${outsideSuffix}`);
+        g.setAttribute("aria-label", `${word} ${clip(desc, 40)} ${clock(bg.start)} ${formatDuration(bgEnd - bg.start)}${outsideSuffix}`);
       }
       if (this.canOpen(row)) {
         const open = svgEl("text", { x: (this.narrow ? scale.width : this.labelWidth) - 14, y: labelY + 7, class: "wg-open", "aria-hidden": "true" });
@@ -1208,9 +1210,11 @@ export class WorkGraph {
     });
   }
 
+  private segHalf(bucket: TimeBucket): number {
+    if (bucket === "delegation") return this.narrow ? 3 : 4;
+    return this.narrow ? 5 : 6;
+  }
 
-
-  // R-DSP-10: 開いても中身の無い行に開く印を出さない。
   private canOpen(row: GraphRow): boolean {
     if (row.kind === "block") return row.block?.kind !== "command";
     return row.agent !== undefined && this.workAgentIdFor(row.agent) !== undefined;
@@ -1251,7 +1255,7 @@ export class WorkGraph {
       this.inspector.open({
         kind: "agent",
         agentId,
-        label: a.description || a.toolUseId,
+        label: agentLabel(a),
         meta: [a.subagentType, a.model, formatDuration(a.end - a.start)].filter((v) => v !== undefined && v !== "").join(" · "),
         axis: this.axisFor(a.start, a.end),
         stats: { toolCount: a.toolCount, failCount: a.failCount },
@@ -1271,19 +1275,21 @@ export class WorkGraph {
     }
   }
 
-  private blockRows(b: RequestBlockView): [TermKey | Node, string][] {
+  private blockRows(b: RequestBlockView): [TermKey | Node, string | Node][] {
     const text = (s: string) => document.createTextNode(s);
-    const rows: [TermKey | Node, string][] = [
-      [text(l10n.t("Kind")), l10n.t("Request block (a person's message)")],
+    const duration = (ms: number) => `${b.metrics?.provisional ? "≈" : ""}${formatDuration(ms)}`;
+    const rows: [TermKey | Node, string | Node][] = [
+      [text(l10n.t("Kind")), b.kind === "plan" ? l10n.t("Work block") : l10n.t("Request block (a person's message)")],
       [text(l10n.t("Start")), formatDateTime(b.anchorAt)],
       [text(l10n.t("Elapsed")), blockDuration(b, b.end)],
     ];
-    if (b.generateMs !== null) rows.push(["LLM generation", formatDuration(b.generateMs)]);
-    rows.push(["Tool execution", formatDuration(b.toolMs)]);
-    rows.push(["Waiting for your answer", formatDuration(b.confirmMs)]);
-    if (b.replyMs !== null) rows.push(["Waiting for reply", formatDuration(b.replyMs)]);
+    if (b.generateMs !== null) rows.push(["LLM generation", duration(b.generateMs)]);
+    rows.push(["Tool execution", duration(b.toolMs)]);
+    if (b.subagentWaitMs > 0) rows.push(["Waiting for subagent", duration(b.subagentWaitMs)]);
+    rows.push(["Waiting for your answer", duration(b.confirmMs)]);
+    if (b.replyMs !== null) rows.push(["Waiting for reply", duration(b.replyMs)]);
     rows.push([text(l10n.t("Tool operations")), l10n.t("{0} calls", b.toolCount)]);
-    rows.push([text(l10n.t("Failures")), l10n.t("{0} items", b.failCount)]);
+    rows.push([text(l10n.t("Failures")), failureCount(b.failCount)]);
     if (b.agentCount > 0) rows.push(["Subagent", `${b.agentCount}`]);
     return rows;
   }
@@ -1346,7 +1352,6 @@ export class WorkGraph {
     return { start: firstAt, end, axisStart: firstAt, axisEnd: end, framed: false };
   }
 
-  // 窓の時間区間を解くのはここだけ。
   private viewRange(view: TimeBucketView, end: number): ResolvedRange {
     if (this.zoom.kind !== "window") {
       this.lastBand = undefined;
@@ -1375,8 +1380,6 @@ export class WorkGraph {
     return this.bandRange(band, view, end);
   }
 
-  // 可視帯 [i, j) → 時間区間。ブロックが時間軸を分割するので帯のブロック集合 B は連続した区間になる。
-  // 帯の先頭の子行（親が B に無い）は自分の start まで左端を下げるだけで、親の頭までは伸ばさない
   private bandRange(band: Band, view: TimeBucketView, end: number): ResolvedRange {
     const firstAt = view.firstAt as number;
     const B: RequestBlockView[] = [];
@@ -1410,8 +1413,6 @@ export class WorkGraph {
     return { start: s, end: e, axisStart: firstAt, axisEnd: end, framed: s > firstAt || e < end, band: { i: band.i, j: band.j, running } };
   }
 
-  // pinTop は .log-head の下端に .wg-head の高さを足した位置（sticky で貼り付いたときの .wg-head の下端）。
-  // rowCount はポート高でなく pinTop から取る。貼り付く前後で揺れない。
   private measurePort(): PortMetrics | undefined {
     const r = this.scrollPort?.rect();
     if (r === undefined) return undefined;
@@ -1431,7 +1432,6 @@ export class WorkGraph {
 
   private bandOf(m: PortMetrics): Band {
     const n = this.rows.length;
-    // +1px: scrollTop の丸めで行の上端が pin より 1px 下に落ちても前の行を帯の先頭にしない
     let i = clampInt(Math.floor((m.portTop - m.rowsTop + 1) / this.rowHeight), 0, Math.max(0, n - 1));
     const j = Math.min(n, i + m.rowCount);
     if (j - i < MIN_WINDOW_ROWS) i = Math.max(0, j - MIN_WINDOW_ROWS);
@@ -1478,13 +1478,11 @@ export class WorkGraph {
     else this.pendingReanchor += delta;
   }
 
-  // scroll イベントは次の描画機会まで遅れるので、scrollBy の後に onPortScroll を直接呼ぶ。後から届くイベントは同じ帯なら何もしない。
   private alignTo(i: number, m: PortMetrics): void {
     this.scrollPort?.scrollBy(m.rowsTop + i * this.rowHeight - m.pinTop);
     this.onPortScroll();
   }
 
-  // 帯内で全体が見えている行は動かさない。動かすと 2 回目のクリックが別の行に当たる。
   private centerRow(key: RowKey): void {
     const k = this.rows.findIndex((r) => r.key === key);
     if (k < 0) return;
@@ -1493,7 +1491,6 @@ export class WorkGraph {
     const band = this.bandOf(m);
     const rowTop = m.rowsTop + k * this.rowHeight;
     const inBand = band.i <= k && k < band.j;
-    // ±1px: sticky の貼り付き位置と pin の計算が小数で 1px ずれても、帯の先頭行のクリックで行が跳ねない
     const fullyVisible = rowTop >= m.portTop - 1 && rowTop + this.rowHeight <= m.portBottom + 1;
     if (inBand && fullyVisible) return;
     const n = this.rows.length;
@@ -1521,7 +1518,6 @@ export class WorkGraph {
     }
   }
 
-  // anchorIndex は比べない。reanchor が動かしても同じ行を指す。window 内で帯が動いたときの読み上げは onMiniPointerUp が担う。
   private setZoom(z: Zoom, announce: boolean): void {
     const prev = this.zoom;
     if (prev.kind === "all" && z.kind === "all") return;
@@ -1555,6 +1551,10 @@ export class WorkGraph {
   }
 
   private rowSpan(row: GraphRow, end: number): [number, number] {
+    if (row.kind === "step" && row.step !== undefined) {
+      return [row.step.startedAt ?? row.parentBlock?.start ?? 0,
+        row.step.endedAt === null && row.parentBlock?.running ? this.blockEnd(row.parentBlock, end) : row.step.end ?? row.parentBlock?.end ?? 0];
+    }
     if (row.kind === "block" && row.block !== undefined) {
       return [row.block.anchorAt, this.blockEnd(row.block, end)];
     }
@@ -1664,7 +1664,6 @@ export class WorkGraph {
     this.drag = undefined;
     this.miniEl.classList.remove("dragging");
     if (!d.moved) return;
-    // 掴んで動かした後の押下は移動の続きで、ダブル押下の 1 回目ではない（verify-work-graph#G-90h）。
     this.clearMiniDown();
     this.announcePending = true;
     this.dirty = true;

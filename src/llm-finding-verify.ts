@@ -151,7 +151,6 @@ export function verifyActionFindings(
       });
     }
 
-    // 1. evidence_missing: Check if all evidenceIds and calculation factIds exist in alias / facts table
     const allEvidenceIds = [...finding.evidenceIds, ...finding.impact.calculation.factIds];
     const missingIds = allEvidenceIds.filter(
       (id) => !input.aliases.canonicalOf.has(id) && !input.facts.has(id)
@@ -165,7 +164,6 @@ export function verifyActionFindings(
       });
     }
 
-    // 2. evidence_not_primary: Must contain at least one primary evidence (E/U/M/D/G)
     const hasPrimary = finding.evidenceIds.some((id) => isPrimaryEvidence(id));
     if (!hasPrimary) {
       rejections.push({
@@ -176,11 +174,9 @@ export function verifyActionFindings(
       });
     }
 
-    // 3 & 6. impact calculation & unit match
     const calc = finding.impact.calculation;
     const impact = finding.impact;
 
-    // M-4: calculation.factIds must require facts.has(id) for all ops (identity, sum, cardinality)
     const missingFactIds = calc.factIds.filter((fid) => !input.facts.has(fid));
     if (missingFactIds.length > 0) {
       rejections.push({
@@ -275,8 +271,6 @@ export function verifyActionFindings(
       }
     }
 
-
-    // 4. action_missing: steps must be non-empty and have non-whitespace strings
     if (
       !Array.isArray(finding.action.steps) ||
       finding.action.steps.length === 0 ||
@@ -290,7 +284,6 @@ export function verifyActionFindings(
       });
     }
 
-    // 5. destination_kind_incompatible
     if (!isActionKindCompatible(finding.action.destination, finding.action.kind)) {
       rejections.push({
         stage: "verify",

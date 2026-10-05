@@ -1,6 +1,7 @@
 import type { AnalysisConclusion, AnalysisEvidence, AnalysisFinding, AnalysisReport, SpanStat, ToolStat } from "../analysis";
 import { vscode } from "./dom";
-import { formatDateTime, formatDuration, formatTokenCount } from "./format";
+import { formatDuration, formatTokenCount } from "./format";
+import { formatDateTime } from "./l10n";
 import { termSpan } from "./term";
 import * as l10n from "@vscode/l10n";
 
@@ -21,7 +22,6 @@ function toolTable(tools: ToolStat[]): HTMLTableElement {
   ]), tools.map((tool) => tool.elapsedMs));
 }
 
-// 未計測だけ「—」、測れた 0 は 0（R-DSP-11）
 function spanAgentTokensText(span: SpanStat): string {
   if (span.agentTokensUnmeasured === "all") return "—";
   return span.agentTokensUnmeasured === "partial" ? l10n.t("{0} (partially not measured)", formatTokenCount(span.agentTokens)) : formatTokenCount(span.agentTokens);
@@ -41,7 +41,6 @@ function findingBlock(finding: AnalysisFinding): HTMLElement {
   if (finding.at) { const at = document.createElement("div"); at.className = "act"; at.textContent = finding.at; block.appendChild(at); } return block;
 }
 
-// スクリプト側の証跡行。LLM への導線（LLMで深掘り）は置かない（R-ANL-14）
 function evidenceItem(evidence: AnalysisEvidence, sessionId: string, filePath: string): HTMLElement {
   const item = document.createElement("li"); item.className = "analysis-evidence";
   const title = document.createElement("b"); title.textContent = evidence.title;
@@ -54,8 +53,6 @@ function evidenceItem(evidence: AnalysisEvidence, sessionId: string, filePath: s
 }
 
 function conclusion(container: HTMLElement, data: AnalysisConclusion, sessionId: string, filePath: string, noneText: string): void {
-  // 「要確認」のバッジと適用規則は出さない。母集団のせいでほぼ全セッションに点く（ツール 50 件以上で 99.5%）ため
-  // 情報量が無い（R-DSP-10 / R-ANL-10）。「停止推奨」だけは連続失敗の実観測なので残す
   if (data.status === "stop") {
     section(container, l10n.t("Conclusion")); const summary = document.createElement("div"); summary.className = "analysis-conclusion";
     const badge = document.createElement("span"); badge.className = `analysis-badge ${data.status}`; badge.textContent = l10n.t("Stop Recommended");
@@ -72,7 +69,6 @@ function conclusion(container: HTMLElement, data: AnalysisConclusion, sessionId:
     const text = document.createElement("div"); text.textContent = action.text; item.appendChild(text); actions.appendChild(item); }); container.appendChild(actions);
 }
 
-// {n} の穴に用語ノード（termSpan）を差し込む。文を丸ごと 1 キーにしたまま破線下線の注記を保つ（R-DSP-12）
 function fillSlots(template: string, slots: Node[]): Node[] {
   const out: Node[] = [];
   template.split(/(\{\d+\})/).forEach((part) => {
@@ -101,9 +97,6 @@ function baselineLegend(report: AnalysisReport): HTMLElement | null {
   legend.append(...fillSlots(l10n.t(". Per metric, if {0} or {1} is below 5, absolute thresholds are used."), [termSpan("exposure n"), termSpan("nonzero n")]));
   return legend;
 }
-// 読めなかった行があることを、判定と同じ画面に出す。判定そのものは格上げしない
-// （観測していないシグナルを主張しないため）。注記が無いと、破損した記録が
-// 「通常どおり」という肯定的な安全宣言になる（R-DSP-01 / R-DSP-03）
 function appendCoverageNote(container: HTMLElement, report: AnalysisReport): void {
   const text = report.coverage?.note;
   if (!text) return;
@@ -113,14 +106,10 @@ function appendCoverageNote(container: HTMLElement, report: AnalysisReport): voi
   container.appendChild(note);
 }
 
-// 欠落があるときは「無い」と言い切らない。読めた範囲についてだけ述べる
 function scopedNoneText(report: AnalysisReport, whole: string, scoped: string): string {
   return report.coverage?.note ? scoped : whole;
 }
 
-// 走査の失敗を「比較できるベースラインがない」と言い換えない（R-DSP-01）。文言は Host が
-// baselineNote に組み立てて渡す。ここで baselineMode を見て分岐すると、読めなかった件数を
-// 知らないまま否定を断言することになる
 function appendBaselineNote(container: HTMLElement, report: AnalysisReport): void {
   const note = report.baselineNote;
   if (!note) return;
@@ -132,7 +121,6 @@ export function renderAnalysisView(container: HTMLElement, sessionId: string, fi
   container.textContent = "";
   if (report.conclusion.status === "complete") {
     const quiet = document.createElement("div"); quiet.className = "analysis-quiet-complete";
-    // 全量を読めていないときに「通常どおり」と名乗らない。読めた範囲の話だと明示する
     quiet.textContent = scopedNoneText(report, l10n.t("Completed — normal session"), l10n.t("Completed — normal in the part that could be read"));
     container.appendChild(quiet);
     appendCoverageNote(container, report);
@@ -142,8 +130,6 @@ export function renderAnalysisView(container: HTMLElement, sessionId: string, fi
   }
   const title = document.createElement("h1"); title.className = "analysis-h1"; title.textContent = l10n.t("Session Analysis");
   const sub = document.createElement("div"); sub.className = "analysis-sub"; sub.textContent = `${report.title} · ${formatDateTime(report.startedAt)} · ${report.model || "?"}`; container.append(title, sub);
-  // 注記は結論より前。後ろに置くと、証拠と行動の一覧の下（多くの場合スクロールしないと
-  // 見えない位置）へ押し出され、利用者は判定だけを見て信用する
   appendCoverageNote(container, report);
   conclusion(container, report.conclusion, sessionId, filePath, scopedNoneText(report, l10n.t("No review-required or stop-recommended signals."), l10n.t("No review-required or stop-recommended signals in the part that could be read.")));
   const legend = baselineLegend(report); if (legend) container.appendChild(legend);

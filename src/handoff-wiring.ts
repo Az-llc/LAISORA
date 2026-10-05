@@ -10,7 +10,13 @@ import { claudeConfigDir } from "./claude-env";
 import { resolveHandoffRuntime } from "./claudeHost";
 import { openResumedSession } from "./resume-hydration";
 import type { Session } from "./session";
-import { handoffDecisionLineCount } from "./handoff-envelope";
+import {
+  handoffDecisionCounts,
+  handoffDecisionLineCount,
+  handoffContextUsageKey,
+  handoffUnreadableLinesKey,
+  type HandoffContextUsage,
+} from "./handoff-envelope";
 import {
   HANDOFF_DETAIL_MAX_BYTES,
   HandoffRunner,
@@ -30,12 +36,9 @@ import { displayTitleFromSummary } from "./session-list";
 import { sessionSummaryOf } from "./session-list-wiring";
 import type { SessionStore } from "./store-surfaces";
 
-// 取得後の追記で分割境界を変えないよう、sendHandoffDetailPart は handoffDetailSources の内容を使う。
 export const handoffDetailSources = new Map<string, { runId: string; detail: HandoffDetail }>();
 
 const handoffRuns = new Map<string, { runId: string; runner: HandoffRunner | null }>();
-
-// src/handoff-runner.ts#COMPACT_HEARTBEAT_GRACE_MS を全体の締め切りへ流用しない。
 
 export function handoffPersist(): { get(k: string): unknown; update(k: string, v: unknown): Promise<void> } {
   return {
@@ -65,6 +68,7 @@ export async function readHandoffRecords(filePath: string): Promise<HandoffRecor
 
 async function runHandoff(st: SessionStore, sender: vscode.Webview, target: Session): Promise<void> {
   const runId = randomUUID();
+  const profile = inheritedProfile(target);
   const source = { sessionId: target.resumeSessionId ?? target.auth?.sessionId ?? "", title: target.title };
   const fail = (reason: string, detail?: string, tabId: string = target.tabId): void => {
     st.post({
@@ -82,8 +86,11 @@ async function runHandoff(st: SessionStore, sender: vscode.Webview, target: Sess
     });
   };
   const busy = (): boolean => (target.conversation?.state ?? "idle") !== "idle";
+  const sourceConversation = target.conversation;
+  const sourceGeneration = target.logicalGeneration;
+  const contextUsage: HandoffContextUsage = { before: null, after: "pending" };
+  let snapshotWrite: Promise<void> = Promise.resolve();
 
-  // R-HND-07: 画面側の操作可否だけに頼らず、runHandoff でも開始可否を確認する。
   if (busy()) {
     fail("source_busy");
     return;
@@ -92,7 +99,6 @@ async function runHandoff(st: SessionStore, sender: vscode.Webview, target: Sess
     fail("already_running");
     return;
   }
-  // 並行要求が予約前に通過しないよう、handoffRuns への予約まで非同期処理を挟まない。
   const reservation: { runId: string; runner: HandoffRunner | null } = { runId, runner: null };
   handoffRuns.set(target.tabId, reservation);
   try {
@@ -110,7 +116,7 @@ async function runHandoff(st: SessionStore, sender: vscode.Webview, target: Sess
     try {
       runtime = await resolveHandoffRuntime(
         configuredClaudeExecutablePath(cfg),
-        normalizeApiKeyPolicy(cfg.get("claude.apiKeyPolicy", "inherit")) // R-GW-05
+        normalizeApiKeyPolicy(cfg.get("claude.apiKeyPolicy", "inherit"))
       );
     } catch (e) {
       fail("fork_failed", String(e));
@@ -122,6 +128,9 @@ async function runHandoff(st: SessionStore, sender: vscode.Webview, target: Sess
       cwd,
       claudeExecutablePath: runtime.claudeExecutablePath,
       env: runtime.env,
+      model: profile.model ?? undefined,
+      effort: profile.effort ?? undefined,
+      settingSources: cfg.get<Array<"user" | "project" | "local">>("claude.settingSources", ["user", "project", "local"]),
       lookupSessionFileById: async (id) => lookupSessionFile(id),
       readRecords: readHandoffRecords,
       fs: handoffFs,
@@ -141,6 +150,10 @@ async function runHandoff(st: SessionStore, sender: vscode.Webview, target: Sess
           source,
         });
       },
+      onForkCreated: (forkSessionId) => {
+        snapshotWrite = handoffPersist().update(handoffContextUsageKey(forkSessionId), { ...contextUsage }).catch((error) =>
+          output.appendLine("[handoff] context snapshot could not be saved: " + String(error)));
+      },
       onProgress: (info) => {
         st.post({
           type: "handoffStatus",
@@ -155,7 +168,6 @@ async function runHandoff(st: SessionStore, sender: vscode.Webview, target: Sess
       },
     });
     reservation.runner = runner;
-    // 復元中はタブ名が未解決の場合があるため、src/session-list-wiring.ts#sessionSummaryOf で名前を取得する。
     let sourceTitle = target.title;
     try {
       const summary = await sessionSummaryOf(source.sessionId);
@@ -163,6 +175,10 @@ async function runHandoff(st: SessionStore, sender: vscode.Webview, target: Sess
     } catch (error) {
       output.appendLine(`[${target.title}] handoff source title unresolved; using tab title: ${String(error)}`);
     }
+    const sourceUnchanged = (): boolean =>
+      !target.closed && target.conversation === sourceConversation && target.logicalGeneration === sourceGeneration;
+    const before = sourceUnchanged() ? await sourceConversation?.captureHandoffContextUsage() ?? null : null;
+    contextUsage.before = sourceUnchanged() ? before : null;
     const outcome: HandoffOutcome = await runner.run({
       sourceSessionId: source.sessionId,
       sourceTitle,
@@ -170,55 +186,53 @@ async function runHandoff(st: SessionStore, sender: vscode.Webview, target: Sess
       sourceBusy: busy,
     });
     if (!outcome.ok) {
+      const forkSessionId = outcome.forkSessionId;
+      if (forkSessionId !== undefined && (await lookupSessionFile(forkSessionId)).reason === "not_found") {
+        void snapshotWrite.then(() => handoffPersist().update(handoffContextUsageKey(forkSessionId), undefined)).catch((error) =>
+          output.appendLine("[handoff] context snapshot could not be removed: " + String(error)));
+      }
       fail(outcome.reason, outcome.detail);
       return;
     }
-    // R-HND-08: 開始時の選択をキャッシュせず、src/handoff-runner.ts#shouldActivateForkTab に完了時の選択を渡す。
+    const contextUsageKey = handoffContextUsageKey(outcome.forkSessionId);
+    if (outcome.unreadableLineCount > 0) {
+      void handoffPersist().update(handoffUnreadableLinesKey(outcome.forkSessionId), outcome.unreadableLineCount).catch((error) =>
+        output.appendLine("[handoff] unreadable line count could not be saved: " + String(error)));
+    }
     const opened = await openResumedSession(st, {
       sessionId: outcome.forkSessionId,
       filePath: outcome.forkFilePath,
       activate: shouldActivateForkTab(st.activeTabIdOf(sender), target.tabId),
-      inherit: inheritedProfile(target),
+      inherit: profile,
       knownCwd: cwd,
     });
     if (!opened.tabPosted || opened.session === undefined) {
-      // 表示の失敗で完成した複製を消さない。再取得先は outcome.forkSessionId。
       fail("tab_failed");
       return;
     }
     const forkSession = opened.session;
+    const decisions = outcome.detail?.decisions;
     forkSession.handoffSource = {
+      contextUsage,
       sessionId: source.sessionId,
       title: sourceTitle,
       ...(outcome.compact !== undefined ? { compact: outcome.compact } : {}),
       utteranceCount: outcome.utteranceCount,
-      ...(outcome.detail?.decisions !== undefined
-        ? { decisionCount: handoffDecisionLineCount(outcome.detail.decisions) }
+      ...(outcome.unreadableLineCount > 0 ? { unreadableLineCount: outcome.unreadableLineCount } : {}),
+      ...(decisions !== undefined
+        ? { decisionCount: handoffDecisionLineCount(decisions), decisions: handoffDecisionCounts(decisions) }
         : {}),
-      // R-HND-10: 再読込後の展開要求と同じ識別子を使う（src/protocol.ts#restoredHandoffRunId）。
       detailRunId: restoredHandoffRunId(outcome.forkSessionId),
     };
     if (outcome.unreadableLineCount > 0) {
       output.appendLine(`[handoff] ${runId} F の ${outcome.unreadableLineCount} 行を JSON として読めなかった（逐語が欠けている可能性）`);
     }
-    // 本文で状態通知を膨らませない。展開内容は sendHandoffDetailPart で返す。
-    const decisions = outcome.detail?.decisions;
     const done = {
       type: "handoffStatus",
       runId,
       state: "done",
-      ...(decisions !== undefined
-        ? {
-            decisions: {
-              total: decisions.entries.length,
-              carried: decisions.carried,
-              extracted: decisions.extracted,
-              removed: decisions.removed,
-              unknownIdRefs: decisions.unknownIdRefs,
-              ...(decisions.warn !== undefined ? { warn: decisions.warn } : {}),
-            },
-          }
-        : {}),
+      contextUsage,
+      ...(decisions !== undefined ? { decisions: handoffDecisionCounts(decisions) } : {}),
       message:
         outcome.unreadableLineCount > 0
           ? l10n.t(
@@ -237,6 +251,17 @@ async function runHandoff(st: SessionStore, sender: vscode.Webview, target: Sess
     }
     st.post({ ...done, tabId: target.tabId });
     st.post({ ...done, tabId: forkSession.tabId });
+    const generation = forkSession.logicalGeneration;
+    void settleHandoffContextUsage(forkSession, contextUsage).then(async () => {
+      if (forkSession.logicalGeneration !== generation) return;
+      if (!target.closed) st.post({ ...done, tabId: target.tabId });
+      if (!forkSession.closed) st.post({ ...done, tabId: forkSession.tabId });
+      await snapshotWrite;
+      await handoffPersist().update(contextUsageKey, { ...contextUsage });
+    }).catch((error) => {
+      output.appendLine("[handoff] context snapshot could not be saved: " + String(error));
+      if (forkSession.logicalGeneration === generation && !forkSession.closed) st.post({ ...done, tabId: forkSession.tabId });
+    });
   } catch (e) {
     fail("commit_failed", String(e));
   } finally {
@@ -244,18 +269,18 @@ async function runHandoff(st: SessionStore, sender: vscode.Webview, target: Sess
   }
 }
 
-// R-HND-10: 同時に届く展開要求の読み取りを handoffDetailRestores で共有する。
 const handoffDetailRestores = new Map<string, Promise<{ runId: string; detail: HandoffDetail } | undefined>>();
 
 async function restoreHandoffDetailSource(
   st: SessionStore,
   tabId: string,
-  runId: string
+  runId: string,
+  cachedRunId: boolean
 ): Promise<{ runId: string; detail: HandoffDetail } | undefined> {
   const session = st.sessions.get(tabId);
   const forkSessionId = session?.resumeSessionId;
   if (session === undefined || forkSessionId === undefined || session.resumeFilePath === undefined) return undefined;
-  if (runId !== restoredHandoffRunId(forkSessionId)) return undefined;
+  if (!cachedRunId && runId !== restoredHandoffRunId(forkSessionId)) return undefined;
   const key = `${tabId}\u0000${runId}`;
   const inFlight = handoffDetailRestores.get(key);
   if (inFlight !== undefined) return inFlight;
@@ -280,13 +305,13 @@ async function restoreHandoffDetailSource(
   return started;
 }
 
-// 他の面の追加要求を誘発しないよう、sendHandoffDetailPart は要求元へだけ応答する（verify-webview-wiring#W-HND-8）。
 async function sendHandoffDetailPart(
   st: SessionStore,
   sender: vscode.Webview,
   tabId: string,
   runId: string,
-  part: number
+  part: number,
+  refresh: boolean
 ): Promise<void> {
   const empty: Extract<HostToWebview, { type: "handoffDetail" }> = {
     type: "handoffDetail",
@@ -297,7 +322,10 @@ async function sendHandoffDetailPart(
     utterances: [],
   };
   const cached = handoffDetailSources.get(tabId);
-  const sourceRef = cached?.runId === runId ? cached : await restoreHandoffDetailSource(st, tabId, runId);
+  const hit = cached?.runId === runId ? cached : undefined;
+  const sourceRef = hit !== undefined && !refresh
+    ? hit
+    : await restoreHandoffDetailSource(st, tabId, runId, hit !== undefined) ?? hit;
   if (sourceRef === undefined) {
     await st.postTo(sender, empty);
     return;
@@ -330,7 +358,6 @@ function jsonByteLength(value: unknown): number {
   return Buffer.byteLength(JSON.stringify(value), "utf8");
 }
 
-// R-HND-08: 元会話の検索失敗も操作した origin に表示し、操作場所から離れた通知にしない。
 async function openHandoffSourceSession(
   st: SessionStore,
   sender: vscode.Webview,
@@ -383,13 +410,11 @@ export async function handleHandoffMessage(
       await runHandoff(st, sender, target!);
       break;
     case "getHandoffDetail":
-      await sendHandoffDetailPart(st, sender, target!.tabId, msg.runId, msg.part);
+      await sendHandoffDetailPart(st, sender, target!.tabId, msg.runId, msg.part, msg.refresh === true);
       break;
     case "cancelHandoff": {
       const active = handoffRuns.get(target!.tabId);
-      // R-HND-08: 取消の受理は src/handoff-runner.ts#HandoffRunner.cancel に委ね、完成後の表示準備を取消と誤通知しない。
       if (active?.runId === msg.runId && active.runner?.cancel()) {
-        // R-HND-08: 取消の表示は src/handoff-runner.ts#HandoffRunner.run の終了を待たない。子プロセスの終了待ちで操作への反応を遅らせない。
         st.post({
           type: "handoffStatus",
           tabId: target!.tabId,
@@ -405,5 +430,24 @@ export async function handleHandoffMessage(
     case "openHandoffSource":
       await openHandoffSourceSession(st, sender, target!, msg.sourceSessionId);
       break;
+  }
+}
+
+export async function settleHandoffContextUsage(session: Pick<Session, "starting" | "conversation" | "closed" | "expectedConversationId">, usage: HandoffContextUsage): Promise<void> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    usage.after = await Promise.race([
+      (async () => {
+        await session.starting;
+        const conversation = session.conversation;
+        if (session.closed || !conversation || conversation.conversationId !== session.expectedConversationId) return null;
+        return await conversation.initialContextUsage;
+      })(),
+      new Promise<null>((resolve) => { timer = setTimeout(() => resolve(null), 10_000); }),
+    ]);
+  } catch {
+    usage.after = null;
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
   }
 }

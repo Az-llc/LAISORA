@@ -1,4 +1,6 @@
 import { ENVELOPE_PREAMBLE } from "./handoff-accept";
+import { isImageRefInfo, isIsoTimestamp, type HandoffDecisionCounts, type ImageRefInfo } from "./protocol";
+export { isHandoffContextUsage } from "./protocol";
 
 export const HANDOFF_TAG = "laisora-handoff";
 export const HANDOFF_SUPPORTED_VERSIONS: readonly string[] = ["2"];
@@ -18,12 +20,11 @@ export interface HandoffUtterance {
   kind: "typed" | "answer";
   text: string;
   questions?: string[];
+  imageRefs?: ImageRefInfo[];
 }
 
 export type HandoffDecisionTag = "GOAL" | "KILLED" | "DECIDED" | "DROPPED";
 
-// 要約のタグ行を機械転記したエントリ（R-HND-11）。g は世代番号で、各世代の日時は
-// その世代の封筒 snapshot.capturedAt が持つのでここには載せない
 export interface HandoffDecisionEntry {
   id: string;
   t: HandoffDecisionTag;
@@ -34,10 +35,7 @@ export interface HandoffDecisionEntry {
 export interface HandoffDecisions {
   preamble: string;
   entries: HandoffDecisionEntry[];
-  // 直前の世代で [DONE] により外された行。1 世代だけ運ぶ（2 世代目で落ちる）
   removedLastGen?: HandoffDecisionEntry[];
-  // 次に採番する番号。removedLastGen が落ちた後も消した id を再利用しないために封筒が運ぶ。
-  // 欄を持たない封筒（この欄より前に書かれたもの）は entries と removedLastGen の最大値から復元する
   nextId?: number;
   carried: number;
   extracted: number;
@@ -47,10 +45,19 @@ export interface HandoffDecisions {
   warn?: { entries: number; bytes: number };
 }
 
-// 展開部に出る行の本数。消した行も本文に出るので、entries が 0 でも removedLastGen があれば
-// 展開部は空にならない
 export function handoffDecisionLineCount(decisions: HandoffDecisions): number {
   return decisions.entries.length + (decisions.removedLastGen?.length ?? 0);
+}
+
+export function handoffDecisionCounts(decisions: HandoffDecisions): HandoffDecisionCounts {
+  return {
+    total: decisions.entries.length,
+    carried: decisions.carried,
+    extracted: decisions.extracted,
+    removed: decisions.removed,
+    unknownIdRefs: decisions.unknownIdRefs,
+    ...(decisions.warn !== undefined ? { warn: decisions.warn } : {}),
+  };
 }
 
 export interface HandoffEnvelopeV2 {
@@ -60,37 +67,45 @@ export interface HandoffEnvelopeV2 {
     sourceSessionId: string;
     forkSessionId: string;
     capturedAt: string;
-    compact?: { preTokens: number; postTokens: number };
+    compact?: HandoffCompactStats;
   };
   userUtterances: HandoffUtterance[];
   decisions?: HandoffDecisions;
 }
 
+export type { HandoffContextMeasurement, HandoffContextUsage } from "./protocol";
+
+export interface HandoffCompactStats {
+  preTokens?: number;
+  postTokens?: number;
+  retainedResponseCount?: number;
+}
+
 export type HandoffParseResult =
-  // decisionsDropped: 封筒は受理したが `decisions` の検証に落ちて省いた。黙って転記の連鎖が
-  // 切れるのを見えるようにするための印で、読み手は記録へ 1 行出す（本文は出さない）
-  | { ok: true; version: "2"; envelope: HandoffEnvelopeV2; raw: string; decisionsDropped?: true }
+  | { ok: true; version: "2"; envelope: HandoffEnvelopeV2; raw: string; decisionsDropped?: true; imageRefsDropped?: true }
   | { ok: false; reason: HandoffRejectReason };
 
 const OPEN_RE = new RegExp(`^<${HANDOFF_TAG}(\\s[^>]*)?>`, "i");
 const VERSION_RE = /version\s*=\s*"([^"]*)"/i;
 const CLOSE_TAG = `</${HANDOFF_TAG}>`;
-const ISO_8601_RE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$/;
 
 function isRecord(v: unknown): v is Record<string, unknown> {
   return typeof v === "object" && v !== null && !Array.isArray(v);
 }
 
-function isCompactMetadata(value: unknown): value is { preTokens: number; postTokens: number } {
-  if (!isRecord(value)) return false;
-  return (
-    typeof value.preTokens === "number" &&
-    Number.isFinite(value.preTokens) &&
-    value.preTokens >= 0 &&
-    typeof value.postTokens === "number" &&
-    Number.isFinite(value.postTokens) &&
-    value.postTokens >= 0
-  );
+function nonNegativeFinite(value: unknown): value is number {
+  return typeof value === "number" && Number.isFinite(value) && value >= 0;
+}
+
+export function parseCompactMetadata(value: unknown): HandoffCompactStats | undefined {
+  if (!isRecord(value)) return undefined;
+  const tokens = nonNegativeFinite(value.preTokens) && nonNegativeFinite(value.postTokens)
+    ? { preTokens: value.preTokens, postTokens: value.postTokens } : {};
+  const retained = typeof value.retainedResponseCount === "number" &&
+    Number.isSafeInteger(value.retainedResponseCount) && value.retainedResponseCount >= 2
+    ? { retainedResponseCount: value.retainedResponseCount } : {};
+  const compact: HandoffCompactStats = { ...tokens, ...retained };
+  return Object.keys(compact).length > 0 ? compact : undefined;
 }
 
 const DECISION_TAG_SET: ReadonlySet<string> = new Set(["GOAL", "KILLED", "DECIDED", "DROPPED"]);
@@ -121,8 +136,6 @@ function nonNegativeInt(value: unknown): number | undefined {
   return typeof value === "number" && Number.isInteger(value) && value >= 0 ? value : undefined;
 }
 
-// 壊れていたら `decisions` だけを落として封筒は受理する（R-HND-11）。ここで封筒ごと落とすと
-// 世代境界の検出（R-HND-09）と引き継ぎ由来レコードの除外（R-HND-06）が同時に壊れる
 function parseDecisions(value: unknown): HandoffDecisions | undefined {
   if (!isRecord(value) || typeof value.preamble !== "string") return undefined;
   const entries = parseDecisionEntries(value.entries);
@@ -171,16 +184,14 @@ function parseV2(parsed: Record<string, unknown>, raw: string): HandoffParseResu
     snapshot.sourceSessionId.length === 0 ||
     typeof snapshot.forkSessionId !== "string" ||
     snapshot.forkSessionId.length === 0 ||
-    typeof snapshot.capturedAt !== "string" ||
-    !ISO_8601_RE.test(snapshot.capturedAt) ||
-    !Number.isFinite(Date.parse(snapshot.capturedAt)) ||
-    (snapshot.compact !== undefined && !isCompactMetadata(snapshot.compact))
+    !isIsoTimestamp(snapshot.capturedAt)
   ) {
     return { ok: false, reason: "schema_mismatch" };
   }
 
   if (!Array.isArray(parsed.userUtterances)) return { ok: false, reason: "schema_mismatch" };
   const utterances: HandoffUtterance[] = [];
+  let imageRefsDropped = false;
   for (let i = 0; i < parsed.userUtterances.length; i++) {
     const value = parsed.userUtterances[i];
     if (
@@ -194,21 +205,30 @@ function parseV2(parsed: Record<string, unknown>, raw: string): HandoffParseResu
     ) {
       return { ok: false, reason: "schema_mismatch" };
     }
+    const rawImageRefs = value.imageRefs;
+    const rawImageRefsArray = Array.isArray(rawImageRefs) ? rawImageRefs : undefined;
+    const validImageRefs = rawImageRefsArray?.filter(isImageRefInfo);
+    if (rawImageRefs !== undefined &&
+      (validImageRefs === undefined || validImageRefs.length !== rawImageRefsArray?.length)) imageRefsDropped = true;
     utterances.push({
       n: value.n,
       at: value.at,
       kind: value.kind,
       text: value.text,
       ...(value.questions !== undefined ? { questions: value.questions as string[] } : {}),
+      ...(validImageRefs !== undefined && (validImageRefs.length > 0 || rawImageRefsArray?.length === 0)
+        ? { imageRefs: validImageRefs } : {}),
     });
   }
 
   const decisions = parsed.decisions === undefined ? undefined : parseDecisions(parsed.decisions);
+  const compact = parseCompactMetadata(snapshot.compact);
 
   return {
     ok: true,
     version: "2",
     ...(parsed.decisions !== undefined && decisions === undefined ? { decisionsDropped: true as const } : {}),
+    ...(imageRefsDropped ? { imageRefsDropped: true as const } : {}),
     raw,
     envelope: {
       schema: HANDOFF_SCHEMA_V2,
@@ -217,9 +237,7 @@ function parseV2(parsed: Record<string, unknown>, raw: string): HandoffParseResu
         sourceSessionId: snapshot.sourceSessionId,
         forkSessionId: snapshot.forkSessionId,
         capturedAt: snapshot.capturedAt,
-        ...(snapshot.compact !== undefined
-          ? { compact: { preTokens: snapshot.compact.preTokens, postTokens: snapshot.compact.postTokens } }
-          : {}),
+        ...(compact !== undefined ? { compact } : {}),
       },
       userUtterances: utterances,
       ...(decisions !== undefined ? { decisions } : {}),
@@ -253,4 +271,16 @@ export function parseHandoffEnvelope(text: string): HandoffParseResult {
 export function buildHandoffEnvelopeV2(env: HandoffEnvelopeV2): string {
   const body = JSON.stringify(env).replace(/</g, "\\u003c");
   return `<${HANDOFF_TAG} version="2">\n${body}\n</${HANDOFF_TAG}>`;
+}
+
+export function handoffContextUsageKey(sessionId: string): string {
+  return "laisora.handoff.contextUsage." + sessionId;
+}
+
+export function handoffUnreadableLinesKey(sessionId: string): string {
+  return "laisora.handoff.unreadableLines." + sessionId;
+}
+
+export function restoredHandoffUnreadableLineCount(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isSafeInteger(value) && value > 0 ? value : undefined;
 }

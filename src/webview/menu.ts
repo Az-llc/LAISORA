@@ -1,6 +1,3 @@
-// フォーカスとキーのリスナは authPickerEl / modeMenuEl（作り直さないコンテナ）に置き、項目は aria-activedescendant の仮想カーソルで指す。
-// 項目へ focus() するロービング tabindex にしない。renderAuthPicker が項目を作り直すと、DOM から外れた要素のフォーカスは body へ移る。
-// キーが inputEl を通らないので、送信・モード巡回・サジェストの捕捉ハンドラと衝突しない。
 import * as l10n from "@vscode/l10n";
 import {
   INPUT_PLACEHOLDER,
@@ -19,7 +16,6 @@ import type { Tab } from "./tab";
 
 const INPUT_PLACEHOLDER_SHIFT_ENTER = l10n.t("Type a message (Shift+Enter to send / Enter for a new line)");
 
-// 正本は Host の userSettings。ここは最後に受け取った値の写し。
 let sendKey: ComposerSendKey = "enter";
 
 export function applyUserSettings(msg: Extract<HostToWebview, { type: "userSettings" }>): void {
@@ -46,11 +42,9 @@ export function sessionMenuSettingsItems(): SessionMenuExtra[] {
 
 interface MenuKbdState {
   container: HTMLElement;
-  // index ではなく menuKey で持つ。再構築で項目数が変わる（取得中の行がモデルの行に置き換わる）。
   cursorKey: string | null;
   opener: HTMLElement;
 }
-// 開いているメニューは高々 1 つ。openModeMenu と openAuthPicker は開く前にもう一方を閉じる。
 let menuKbd: MenuKbdState | null = null;
 let olderMenu: HTMLElement | null = null;
 const OLDER_KEY = "models:older";
@@ -130,7 +124,6 @@ function menuItems(container: HTMLElement): HTMLElement[] {
   );
 }
 
-// メニューを開いた直後と renderAuthPicker の直後に呼ぶ。
 export function syncMenuCursor(container: HTMLElement, idPrefix: string): void {
   if (menuKbd?.container !== container) return;
   const items = menuItems(container);
@@ -142,7 +135,6 @@ export function syncMenuCursor(container: HTMLElement, idPrefix: string): void {
     container.removeAttribute("aria-activedescendant");
     return;
   }
-  // .selected は先頭セクションに限る。後ろのセクションの行へ落ちると ↓ が末尾から先頭へ回り込む。
   const firstSection = container.querySelector(".auth-picker-section");
   const target =
     (menuKbd?.cursorKey ? items.find((el) => el.dataset.menuKey === menuKbd!.cursorKey) : undefined) ??
@@ -151,8 +143,6 @@ export function syncMenuCursor(container: HTMLElement, idPrefix: string): void {
   applyCursorTo(container, idPrefix, target, items);
 }
 
-// 通常の移動では要素を直接指し、cursorKey で引き直さない。引き直しに失敗すると .selected へ落ち、カーソルが既定行へ戻り続ける。
-// 引き直しは再構築後の syncMenuCursor だけが行う。
 function applyCursorTo(
   container: HTMLElement,
   idPrefix: string,
@@ -204,8 +194,7 @@ function menuOpener(chip: HTMLElement): HTMLElement {
 
 function onMenuKeydown(e: KeyboardEvent): void {
   if (!menuKbd || menuKbd.container.classList.contains("hidden")) return;
-  if (e.isComposing) return; // IME変換確定のEnterを決定として拾わない
-  // 修飾キー付きは素通しする。ここで拾うと、メニュー表示中だけタブ切替のショートカットが効かなくなる（R-SES-01）。
+  if (e.isComposing) return;
   if (e.ctrlKey || e.metaKey || e.altKey) return;
   switch (e.key) {
     case "ArrowDown":
@@ -233,23 +222,18 @@ function onMenuKeydown(e: KeyboardEvent): void {
         el.click();
         break;
       }
-      // effort 行は段階送りで既に適用済みなので、Enter は確定＝閉じるだけにする
-      // （click させると意図せずもう1段進んでしまう）
       if (el?.dataset.effortRow) {
         closeCurrentMenu();
         opener.focus();
         break;
       }
-      // 既存の onclick をそのまま起動する（送信・close を全部持っているため、
-      // dataset から postMessage を再構成すると onclick 側の処理が黙って落ちる）。
-      // click() は同期的に close を走らせ menuKbd を null にするので opener は先に退避する。
       el?.click();
       opener.focus();
       break;
     }
     case "Escape": {
       e.preventDefault();
-      e.stopPropagation(); // documentのEscapeハンドラとの二重処理を防ぐ
+      e.stopPropagation();
       if (menuKbd.container === olderMenu) { closeOlderModels(); break; }
       const opener = menuKbd.opener;
       closeCurrentMenu();
@@ -283,7 +267,6 @@ function onMenuKeydown(e: KeyboardEvent): void {
 }
 
 export function closeModeMenu(): void {
-  // フォーカスを持つ要素が隠れるとフォーカスは body へ移るので、隠す前に opener へ戻す。
   if (menuKbd?.container === modeMenuEl && modeMenuEl.contains(document.activeElement)) {
     menuKbd.opener.focus();
   }
@@ -314,7 +297,6 @@ function openModeMenu(): void {
     modeMenuEl.appendChild(item);
   }
   menuKbd = { container: modeMenuEl, cursorKey: null, opener: menuOpener(modeBtn) };
-  // .hidden(display:none) の間は focus 不能なので、必ず解除してから focus する
   modeMenuEl.classList.remove("hidden");
   modeBtn.setAttribute("aria-expanded", "true");
   syncMenuCursor(modeMenuEl, "mm-item-");
@@ -374,7 +356,6 @@ function setEffortLevel(level: string): void {
   vscode.postMessage({ type: "setEffort", tabId: activeTabId, effort: level });
 }
 
-// 既定は段階に入れない（利用者の決定）。
 function stepEffort(dir: 1 | -1): void {
   const t = activeTab();
   if (!t || !activeTabId) return;
@@ -385,10 +366,8 @@ function stepEffort(dir: 1 | -1): void {
   vscode.postMessage({ type: "setEffort", tabId: activeTabId, effort: next });
 }
 
-// /effort から開いたときは effort 欄だけを出す（利用者の要望）。
 let authPickerMode: "all" | "effort" = "all";
 
-// src/webview/tab.ts#Tab の modelOverride は undefined が未選択、null が明示の既定。
 function isSelectedRow(t: Tab | null, model: ModelInfo): boolean {
   const override = t?.modelOverride;
   if (override === undefined) return (t?.auth?.model ?? t?.configModel) === model.id;
@@ -417,7 +396,6 @@ function buildModelRow(
 
   item.onclick = () => {
     if (activeTabId) {
-      // R-CMD-02
       vscode.postMessage({
         type: "setModel",
         tabId: activeTabId,
@@ -425,7 +403,6 @@ function buildModelRow(
       });
     }
     closeAuthPicker();
-    // 確認文をここで出さない。Host が適用と保存の後に modelChanged の notice で返す。選択直後に出すと適用や保存の失敗と矛盾する（R-DSP-01, verify-gateway-wiring#NL-MODEL-1）。
   };
   return item;
 }
@@ -448,7 +425,6 @@ export function renderAuthPicker(): void {
   if (allModels.length === 0) {
     const loading = document.createElement("div");
     loading.className = "mode-menu-item auth-picker-loading";
-    // role を付けて読み上げの対象にし、aria-disabled で menuItems のカーソル対象から外す。
     loading.setAttribute("role", "menuitem");
     loading.setAttribute("aria-disabled", "true");
     loading.textContent = l10n.t("Fetching model list…");
@@ -488,7 +464,6 @@ export function renderAuthPicker(): void {
   effortHeading.textContent = "effort";
   effortSection.appendChild(effortHeading);
 
-  // effort は一覧にせず、1 行の上で段階を送る（Claude Code 拡張と同じ操作）。
   const effortRow = document.createElement("div");
   effortRow.className = "mode-menu-item effort-item";
   effortRow.setAttribute("role", "menuitem");
@@ -533,18 +508,14 @@ export function openAuthPicker(opener?: HTMLElement, focusSection: "model" | "ef
         : "model:default";
   menuKbd = { container: authPickerEl, cursorKey: wanted, opener: opener ?? menuOpener(authEl) };
   renderAuthPicker();
-  // .hidden(display:none) の間は focus 不能なので、必ず解除してから focus する
   authPickerEl.classList.remove("hidden");
   authEl.setAttribute("aria-expanded", "true");
   syncMenuCursor(authPickerEl, "ap-item-");
   authPickerEl.focus();
 }
 
-// src/webview/main.ts 末尾の init 呼び出し列からだけ呼ぶ。文の並びがリスナの登録順なので入れ替えない。
-// 本体で呼び出し時にモジュールの let を読まない。安全性は関数宣言の巻き上げと、登録時に let を読まないことに依存する（TDZ）。
 export function initMenu(): void {
   setSessionMenuExtras(sessionMenuSettingsItems);
-  // リスナ登録は initMenu() の1回だけ（open* の中で登録すると再構築のたび多重登録になる）
   modeMenuEl.addEventListener("keydown", onMenuKeydown);
   authPickerEl.addEventListener("keydown", onMenuKeydown);
   inputEl.addEventListener("keydown", (e) => {
@@ -584,7 +555,6 @@ export function initMenu(): void {
     }
   });
 
-  // 保険のEscape（コンテナ側で捕まえられない状況用。フォーカス復帰はコンテナ側の責務）
   document.addEventListener("keydown", (e) => {
     if (e.key !== "Escape") return;
     if (!authPickerEl.classList.contains("hidden")) {
@@ -594,7 +564,6 @@ export function initMenu(): void {
       e.preventDefault();
       closeModeMenu();
     } else if (!usagePanelEl.classList.contains("hidden")) {
-      // /usage でキーボードから開けるので、キーボードで閉じられる必要がある
       e.preventDefault();
       closeUsagePanel();
     }

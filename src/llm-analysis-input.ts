@@ -24,7 +24,6 @@ export interface GuardrailSignalSummary {
   count: number;
 }
 
-// 入力は本文と時刻だけを読む。JSONL 読み直し（HistoryEvent）は封筒を持たないので NormalizedEvent を要求しない
 export type LlmAnalysisInputEvent = NormalizedEventBody & { timestamp: number };
 
 export interface LlmAnalysisInputContext {
@@ -33,10 +32,7 @@ export interface LlmAnalysisInputContext {
   l3: L3ReportPayload;
   guardrailSignals: GuardrailSignalSummary[];
   contextFiles: ContextFile[];
-  // true = events は Host が保持する直近分だけで、セッション先頭を含まない（JSONL を読めなかった代用）
   sessionHeadMissing?: boolean;
-  // transcript 層で欠けた分。省略 = 欠落を観測していない。窓落ちと予算切りだけを申告すると、
-  // 欠けた母集合の上で「検証を通った」と名乗る（R-DSP-01）
   transcriptGaps?: TranscriptGapSummary;
 }
 
@@ -49,7 +45,6 @@ export interface TranscriptGapSummary {
   evidenceFoldErrorCount?: number;
 }
 
-// 欠落の注記。プロンプトの被覆行と分析ビューの入力行の両方に同じ文で出す。undefined = 欠落なし
 export function formatTranscriptGapNote(gaps: TranscriptGapSummary | undefined): string | undefined {
   if (gaps === undefined) return undefined;
   const parts: string[] = [];
@@ -117,11 +112,9 @@ export interface LlmAnalysisInput {
   items: readonly EventItem[];
 }
 
-// 分析ビューの入力被覆行。webview は文字列を置くだけ（VND-S6）
 export function formatInputCoverageLabel(stats: LlmAnalysisInput["stats"]): string {
   const all = stats.events >= stats.sessionEvents;
   const gapNote = formatTranscriptGapNote(stats.transcriptGaps);
-  // 「全件」は Host が読めた事象の全件であって、記録に欠落があればその外は含まない（R-DSP-01）
   const gapSuffix = gapNote === undefined ? "" : l10n.t(". Record gaps: {0}", gapNote);
   if (stats.sessionHeadMissing) {
     return all
@@ -133,9 +126,6 @@ export function formatInputCoverageLabel(stats: LlmAnalysisInput["stats"]): stri
     : l10n.t("Input: {1} of {0} session events (trimmed to budget){2}", stats.sessionEvents, stats.events, gapSuffix);
 }
 
-// 画面に出ていて独立検証できる指標だけを LLM の事実表（M:<key>）へ渡す。longGapMs / longGapCount /
-// actualConcurrency / fileWriteConflictCount / resourceDependencyCount / observedConstraintChainMs は
-// 状況タブに表示経路が無く独立検証もできないため渡さない（R-DSP-11、D-2）
 export const METRIC_UNIT_MAP: Record<string, "ms" | "count"> = {
   failureCount: "count",
 };
@@ -188,8 +178,6 @@ function buildEventItems(
       userSeq++;
       const messageId = event.turnId ?? `u_${userSeq}`;
       const alias = aliases.aliasOf.get(messageId) ?? `U${userSeq}`;
-      // 人間の発話は正規化時に redact されない唯一の本文で、プロンプトは外へ出る。
-      // cap より先に redact する（途中で切れた断片が redact 対象形を失うのを避ける）
       const userText = redactAbsolutePaths(event.text ?? "").slice(0, 300).replace(/\r?\n/g, " ");
       const line = `${alias} | ${offset} | user | ${userText}`;
       items.push({
@@ -288,14 +276,12 @@ function buildGlobalAliases(context: LlmAnalysisInputContext): CitationAliasTabl
       const id = event.turnId ?? `u_${userCount}`;
       userMessages.push({ messageId: id });
     } else if (event.kind === "tool_call_finished") {
-      // L-6: Only mint E aliases for events that produce rendered lines
       if (event.toolUseId && !events.some((e) => e.toolUseId === event.toolUseId)) {
         events.push({ toolUseId: event.toolUseId });
       }
     }
   }
 
-  // M-5: Only mint M: aliases for metrics in METRIC_UNIT_MAP
   if (context.l3?.analysis?.metrics) {
     for (const key of Object.keys(context.l3.analysis.metrics)) {
       if (METRIC_UNIT_MAP[key] !== undefined) {
@@ -349,10 +335,7 @@ export function buildNumericFactTable(
     }
   }
 
-  // 1. Tool events: duration in ms
   let eventSeq = 0;
-  // W（回避可能なコスト）が根拠として引く E の別名。toolUseId からは引けない
-  // （aliasOf に無いときは連番へ落ちるため、ここで確定した別名を持ち回る）
   const eventAliasOf = new Map<string, string>();
   for (const event of context.events) {
     if (event.kind === "tool_call_finished") {
@@ -372,7 +355,6 @@ export function buildNumericFactTable(
     }
   }
 
-  // 2. User messages: count = 1
   let userSeq = 0;
   for (const event of context.events) {
     if (event.kind === "user_message") {
@@ -389,11 +371,9 @@ export function buildNumericFactTable(
     }
   }
 
-  // 3. Metrics from L3 (L-4 & M-5)
   if (context.l3?.analysis?.metrics) {
     for (const [key, metric] of Object.entries(context.l3.analysis.metrics)) {
       const unit = METRIC_UNIT_MAP[key];
-      // typeof は NaN / Infinity を number として通す。通すとプロンプトへ value=NaN が出る
       if (
         unit !== undefined &&
         metric &&
@@ -413,18 +393,11 @@ export function buildNumericFactTable(
     }
   }
 
-  // 4. Divergences (L-4 & M-6)
   if (context.l3?.divergences?.kinds) {
     let divSeq = 0;
     for (const [k, kind] of Object.entries(context.l3.divergences.kinds)) {
-      // M（指標）と同じ判定。undetermined は「判定できなかった」であって観測ではない。
-      // l3-divergence.ts は undetermined のとき records を空で返すが、その不変条件は
-      // 型にも protocol のガードにも無いので、事実表の側で見る
       if (kind.state !== "observed") continue;
       for (const rec of kind.records) {
-        // magnitude に書き手がいないので既定値を置かない。置くと unit=ms の kind で
-        // 「1 ミリ秒」という測っていない値が事実表に載り R-DSP-11 に反する。
-        // typeof は NaN / Infinity を number として通すので有限性まで見る
         if (typeof rec.magnitude !== "number" || !Number.isFinite(rec.magnitude)) continue;
         divSeq++;
         const alias = aliases.aliasOf.get(rec.divergenceId) ?? `D${divSeq}`;
@@ -445,7 +418,6 @@ export function buildNumericFactTable(
     }
   }
 
-  // 5. Guardrail signals (M-6)
   let gSeq = 0;
   for (const sig of context.guardrailSignals) {
     gSeq++;
@@ -461,13 +433,6 @@ export function buildNumericFactTable(
     });
   }
 
-  // 6. 回避可能なコスト（W）。**対処すれば消えることが計算の定義から保証される時間だけ**を載せる。
-  // E（所要時間）を impact に使うと「成功した処理にかかった時間」が影響として報告される
-  // （R-DSP-01）。
-  // 事実に「無駄」が無い限りプロンプトをどう書いても直らないので、ここで引き算した値を作る。
-  //
-  // `discarded_attempt`: 失敗した呼び出しの所要時間。失敗そのものが無駄なので全額。
-  // 重複（同じ操作の 2 回目以降）は判定キーの実測待ちで未実装。
   let wasteSeq = 0;
   for (const event of context.events) {
     if (event.kind !== "tool_call_finished" || event.isError !== true) continue;
@@ -480,7 +445,6 @@ export function buildNumericFactTable(
       id: alias,
       unit: "ms",
       value: Math.max(0, event.timestamp - started.timestamp),
-      // E の別名を持つ（toolUseId ではない）。renderSliceFacts がスライス判定に使う
       evidenceIds: [eAlias],
       kind: "discarded_attempt",
       toolName: started.toolName,
@@ -512,7 +476,6 @@ export function renderSliceFacts(facts: NumericFactTable, sliceItems: readonly E
     if (id.startsWith("E") || id.startsWith("U")) {
       if (!sliceAliasSet.has(id)) continue;
     }
-    // W は根拠の E がこのスライスに無いと引用しても検算できない（LLM はスライスしか見ない）
     if (id.startsWith("W")) {
       if (!fact.evidenceIds.some((e) => sliceAliasSet.has(e))) continue;
     }
@@ -569,7 +532,6 @@ export function buildLlmAnalysisInput(context: LlmAnalysisInputContext): LlmAnal
 
   const budgetTokens = LLM_INPUT_BUDGET_TOKENS - LLM_RESERVED_TOKENS;
 
-  // Body cap configs:
   const bodyConfigs = [
     { success: 200, fail: 800 },
     { success: 60, fail: 800 },
@@ -583,7 +545,6 @@ export function buildLlmAnalysisInput(context: LlmAnalysisInputContext): LlmAnal
   const totalEventsCount = items.length;
 
   const headNote = context.sessionHeadMissing ? "記録が読めないため Host が保持する直近分のみ。セッション先頭を含まない" : "セッション全件";
-  // transcript 層の欠落も被覆行に載せる。無いときは「なし」と明示し、書き忘れと区別する（R-DSP-03）
   const gapNote = formatTranscriptGapNote(context.transcriptGaps) ?? "なし";
   const coverageString = (range: string, dropped: number) =>
     `(カバレッジ: セッション事象 ${totalEventsCount} 件中 ${totalEventsCount - dropped} 件を入力${dropped > 0 ? "（予算で絞った）" : ""}, 当該スライス範囲 ${range} 件, 入力元: ${headNote}, 記録の欠落: ${gapNote}, contextFilesInSlices: ${contextFilesInSlices}, droppedEvents: ${dropped} 件)`;
@@ -616,11 +577,9 @@ export function buildLlmAnalysisInput(context: LlmAnalysisInputContext): LlmAnal
   if (tokens <= budgetTokens) {
     slices.push({ text: fullPrompt, estTokens: tokens });
   } else {
-    // Slicing needed — compute sliceBudget and degrade in documented order (H-2):
     let prefixTokens = estTokens(commonPrefix + "## 実行イベント列\n\n");
     let sliceBudget = budgetTokens - prefixTokens;
 
-    // Step (i): Drop context files from slices if below MIN_SLICE_EVENT_BUDGET_TOKENS
     if (sliceBudget < MIN_SLICE_EVENT_BUDGET_TOKENS && contextFilesInSlices) {
       contextFilesInSlices = false;
       currentFilesText = "";
@@ -629,7 +588,6 @@ export function buildLlmAnalysisInput(context: LlmAnalysisInputContext): LlmAnal
       sliceBudget = budgetTokens - prefixTokens;
     }
 
-    // Step (ii): Drop body caps further if still below MIN_SLICE_EVENT_BUDGET_TOKENS
     while (sliceBudget < MIN_SLICE_EVENT_BUDGET_TOKENS && selectedConfigIdx < bodyConfigs.length - 1) {
       selectedConfigIdx++;
       selectedConfig = bodyConfigs[selectedConfigIdx];
@@ -642,7 +600,6 @@ export function buildLlmAnalysisInput(context: LlmAnalysisInputContext): LlmAnal
       sliceBudget = MIN_SLICE_EVENT_BUDGET_TOKENS;
     }
 
-    // Greedy slicing
     const rawSlices: { items: EventItem[] }[] = [];
     let currentSliceItems: EventItem[] = [];
     let currentSliceTokens = 0;
@@ -662,7 +619,6 @@ export function buildLlmAnalysisInput(context: LlmAnalysisInputContext): LlmAnal
       rawSlices.push({ items: currentSliceItems });
     }
 
-    // Step (iii): Drop oldest slices if exceeding LLM_MAX_SLICES
     let finalSlices = rawSlices;
     if (finalSlices.length > LLM_MAX_SLICES) {
       const toDropSlices = finalSlices.length - LLM_MAX_SLICES;

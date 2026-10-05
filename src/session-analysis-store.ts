@@ -36,16 +36,12 @@ export function artifactModelLabels(
   };
 }
 
-// 保存の状態フィールド（persistedArtifacts / baseRefByArtifactId / ownerState 等）は Session に残す。
-// ここは関数だけを持ち、状態は host 経由で読む
 export class SessionAnalysisStore {
   constructor(
     private readonly host: Session,
     private readonly store: SessionStore
   ) {}
 
-  // hydration 中は永続化処理と内部状態更新を続けたまま UI post だけを
-  // artifact ごとの最終状態へ畳む。Phase 3 / 失敗確定の後に一度だけ流す
   postPersistenceState(
     msg: Extract<HostToWebview, { type: "analysisPersistenceState" }>
   ): void {
@@ -231,7 +227,7 @@ export class SessionAnalysisStore {
       freshnessLabel = l10n.t("Analysis of the current record");
     } else if (this.host.baseRefByArtifactId.has(selectedArt.artifactId)) {
       freshness = "stale";
-      freshnessLabel = l10n.t("The record was updated after the analysis (analyzed at revision {0})", selectedArt.analyzedRevision);
+      freshnessLabel = l10n.t("The conversation has continued since this analysis");
     } else {
       freshness = "restored-unverifiable";
       freshnessLabel = l10n.t("Analysis from before the restart (currency cannot be verified)");
@@ -257,7 +253,6 @@ export class SessionAnalysisStore {
     const findingsCount = selectedArt.report.findings.length;
     const rejectedCount = selectedArt.report.rejectedCount;
     const slicesCount = selectedArt.report.slices;
-    // usage の無い結果を 0 tok と書かない（R-DSP-11）
     const tokLabel = selectedArt.report.usage
       ? `${((selectedArt.report.usage.inputTokens + selectedArt.report.usage.outputTokens) / 1000).toFixed(1)}k tok`
       : null;

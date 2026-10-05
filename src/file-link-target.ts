@@ -26,18 +26,14 @@ export function isWindowsUncPath(value: string): boolean {
   return /^\\\\[^\\]/.test(value) && !isWindowsDevicePath(value);
 }
 
-// Windows reads any two leading separators in either direction as a UNC share or device namespace (\\server, //server, /\server, \\.\, \\?\).
 export function isNetworkOrDevicePath(value: string): boolean {
   return /^[\\/]{2}/.test(value);
 }
 
 export interface FileLinkPlatform {
-  // The platform of the Extension Host that resolves and opens the file, never the webview's.
   windows: boolean;
 }
 
-// Win32 maps these names to devices in every directory, with any extension and ignoring trailing spaces/dots
-// (C:\work\con.txt and C:con are the console). Opening one can block the Extension Host on device I/O.
 export function hasWindowsReservedDeviceName(value: string): boolean {
   return value
     .split(/[\\/]/)
@@ -48,12 +44,10 @@ export function hasWindowsReservedDeviceName(value: string): boolean {
     );
 }
 
-// C:foo is relative to the current directory of drive C, which the Host does not control.
 export function isWindowsDriveRelativePath(value: string): boolean {
   return /^[A-Za-z]:(?![\\/])/.test(value);
 }
 
-// NTFS reads name:stream as an alternate data stream. Only the drive colon (C:) is a path character.
 export function hasNonDriveColon(value: string): boolean {
   return value.indexOf(":", /^[A-Za-z]:/.test(value) ? 2 : 0) !== -1;
 }
@@ -71,7 +65,6 @@ function hasNegativeColonLocation(value: string): boolean {
 }
 
 export function parseFileLinkTarget(target: string, platform: FileLinkPlatform): FileLinkTarget | null {
-  // R-CNV-12: model output is untrusted; only the documented file-target grammar crosses into Host resolution.
   if (
     target.length === 0 ||
     target.length > FILE_LINK_TARGET_MAX_LEN ||
@@ -112,7 +105,6 @@ export function parseFileLinkTarget(target: string, platform: FileLinkPlatform):
   if (resource.length === 0) return null;
 
   if (/^file:/i.test(resource)) {
-    // R-CNV-12: a file URI with an authority (file://host/, including localhost) or a path that starts with two separators names a network share or device.
     if (!/^file:(?:\/\/\/|\/)(?![\\/]|%5C|%2F)/i.test(resource)) return null;
     try {
       const url = new URL(resource);
@@ -149,8 +141,6 @@ export function parseFileLinkTarget(target: string, platform: FileLinkPlatform):
   } catch {
     return null;
   }
-  // R-CNV-12: UNC shares and device paths never become links, whatever the outside-workspace settings say. On a Windows
-  // Host, drive-relative paths, reserved device names and alternate data streams do not either.
   if (
     hasControlCharacter(decodedResource) ||
     isNetworkOrDevicePath(decodedResource) ||

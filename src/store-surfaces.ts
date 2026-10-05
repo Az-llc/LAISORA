@@ -21,17 +21,10 @@ import { persistOpenTabs } from "./session-list-wiring";
 import { postSettingsState } from "./settings-panel";
 import { TAB_LIMIT_DEFAULT, resolveTabLimit, scopeMaxForTabs } from "./tab-limits";
 
-// 復帰時の同期再生を減らすため、RESTORE_TAIL_EVENT_MAX は src/webview/main.ts#REPLAY_MAX より小さく保つ。
 export const RESTORE_TAIL_EVENT_MAX = 150;
 
-// 画面側の読み込み失敗でも沈黙したままにしないため、WEBVIEW_BOOTSTRAP_TIMEOUT_MS で起動待ちを診断する。
 const WEBVIEW_BOOTSTRAP_TIMEOUT_MS = 5000;
-// 再送による回復を妨げないよう、INIT_COALESCE_WINDOW_MS は src/webview/main.ts#INIT_RETRY_DELAY_MS より短く保つ。
 const INIT_COALESCE_WINDOW_MS = 300;
-// VS Code は面が可視になるまで webview からのメッセージを保留するので、可視化の直後に届く ready には
-// 可視化で送った init が既に応えている。RESTORE_INIT_SUPPRESS_MS はその ready だけを抑止する窓で、
-// 下限は可視化から ready 到達までの実測、上限は再送 ready が続けて窓へ入らない
-// src/webview/main.ts#INIT_RETRY_DELAY_MS 未満（verify-webview-wiring#sol-15e）。
 const RESTORE_INIT_SUPPRESS_MS = 800;
 
 interface WebviewSurface {
@@ -41,7 +34,6 @@ interface WebviewSurface {
   initInFlight: boolean;
   readyInitAt?: number;
   restoreInitAt?: number;
-  // restoredInitPosted を restoreInitAt で代用しない。配送失敗時の抑止解除は restoreVisible を参照。
   restoredInitPosted?: boolean;
   activeTabId?: string;
   fillQueue?: string[];
@@ -52,9 +44,7 @@ export class SessionStore {
   readonly sessions = new Map<string, Session>();
   readonly analysisStorage: AnalysisStorage;
   readonly rosterEvidenceDirectory: string | undefined;
-  // R-ANL-24: 再開後も外部実行を表示するための orchestrationRunsDirectory。
   readonly orchestrationRunsDirectory: string | undefined;
-  // 操作元へ結果が届かなくならないよう、配信先を activeWebview に限定しない。配送は post が担う。
   activeWebview: vscode.Webview | null = null;
   panel: vscode.WebviewPanel | null = null;
   private tabCounter = 0;
@@ -95,7 +85,6 @@ export class SessionStore {
 
   postTo(webview: vscode.Webview | null, msg: HostToWebview): Promise<boolean> {
     if (!webview) return Promise.resolve(false);
-    // 非表示中の配送を保存済みと扱わない。復帰時は restoreVisible から表示を再構成する。
     if (this.surfaces.get(webview)?.visible === false) return Promise.resolve(false);
     return Promise.resolve(webview.postMessage(msg)).then((delivered) => {
       if (delivered && (msg.type === "init" || msg.type === "tabRestored")) {
@@ -150,11 +139,9 @@ export class SessionStore {
     surface.bootstrapTimer = undefined;
   }
 
-  // initForReady の束ねと restoreVisible の抑止は別の時計を使う。復帰時の配送を再送待ちにしない（verify-webview-wiring#sol-11a）。
   async initForReady(webview: vscode.Webview): Promise<void> {
     const surface = this.surfaces.get(webview);
     if (!surface) return;
-    // restoreInitAt は配送完了前から抑止する。失敗時の解除は restoreVisible が担う。
     const sinceRestore = surface.restoreInitAt === undefined ? undefined : Date.now() - surface.restoreInitAt;
     if (sinceRestore !== undefined && sinceRestore < RESTORE_INIT_SUPPRESS_MS) {
       output.appendLine(
@@ -172,7 +159,6 @@ export class SessionStore {
     surface.initInFlight = true;
     this.cancelRestoreFill(webview);
     try {
-      // 復帰後の再送で全件再生へ戻さない（verify-webview-wiring#sol-16a）。
       const plan = surface.restoredInitPosted === true ? this.restoreInitPlan(surface) : undefined;
       const delivered = await this.postTo(webview, {
         type: "init",
@@ -186,7 +172,6 @@ export class SessionStore {
         `[webview] ${sinceActivation()} ${delivered ? "init sent" : "init not delivered"} (cause=ready, ` +
           `deferred=${plan?.deferredTabIds.length ?? 0}, omittedHead=${plan?.omittedHeadCount ?? 0})`
       );
-      // R-TAB-08: 後続の配送を外すと読み込み中のまま残る（verify-webview-wiring#sol-13a）。
       if (plan !== undefined && plan.deferredTabIds.length > 0) {
         this.scheduleRestoreFill(webview, plan.deferredTabIds);
       }
@@ -202,10 +187,8 @@ export class SessionStore {
     output.appendLine(`[webview] ${sinceActivation()} visibility=${visible}`);
     if (visible) {
       this.armBootstrapTimeout(webview);
-      // 可視化時の配送を外すと最初の描画が再送待ちになる（verify-webview-wiring#sol-11a）。
       this.restoreVisible(webview, true);
     } else {
-      // 再作成された画面へ古い配送実績を適用しないよう、setVisible で時計をリセットする。
       surface.readyInitAt = undefined;
       surface.restoreInitAt = undefined;
       surface.restoredInitPosted = undefined;
@@ -213,10 +196,8 @@ export class SessionStore {
     }
   }
 
-  // armSuppression は可視化まで保留された要求に対する抑止。detach による配信先の復帰では使わない。
   restoreVisible(webview: vscode.Webview, armSuppression = false): void {
     const surface = this.surfaces.get(webview);
-    // 可視化と同時に届く要求にも間に合うよう、restoreInitAt は配送結果を待たずに設定する（verify-webview-wiring#sol-11a）。
     const postedAt = Date.now();
     if (armSuppression && surface) surface.restoreInitAt = postedAt;
     if (surface) surface.restoredInitPosted = true;
@@ -229,7 +210,6 @@ export class SessionStore {
       systemAppExtensions: configuredSystemAppExtensions(),
       tabs: plan.tabs,
     }).then((delivered) => {
-      // 配送失敗時の抑止解除を外すと初期化できない（verify-webview-wiring#sol-11b）。
       if (!delivered && surface && surface.restoreInitAt === postedAt) surface.restoreInitAt = undefined;
       output.appendLine(
         `[webview] ${sinceActivation()} init posted (cause=restore, delivered=${delivered}, ` +
@@ -282,7 +262,6 @@ export class SessionStore {
     return this.surfaces.get(webview)?.activeTabId;
   }
 
-  // 初期表示の配送を集計待ちにしないよう、scheduleRestoreFill は後続タブの導出を遅延させる。
   private scheduleRestoreFill(webview: vscode.Webview, tabIds: string[]): void {
     const surface = this.surfaces.get(webview);
     if (!surface) return;
@@ -325,7 +304,7 @@ export class SessionStore {
   createSession(): Session {
     const s = new Session(this, ++this.tabCounter);
     this.sessions.set(s.tabId, s);
-    postSettingsState(); // R-LRN-18: src/settings-panel.ts#postSettingsState keeps research availability current after a tab is added.
+    postSettingsState();
     return s;
   }
 
@@ -333,7 +312,6 @@ export class SessionStore {
     return [...this.sessions.values()].map((s) => s.snapshotForSurface());
   }
 
-  // 同時実行枠はタブを増やしても増やさない。拡張全体の件数は llmAnalysisInFlightCount で数える。
   llmAnalysisInFlightCount(): number {
     let count = 0;
     for (const s of this.sessions.values()) if (s.llmRun !== null) count++;
@@ -341,7 +319,6 @@ export class SessionStore {
   }
 }
 
-// R-SES-03: 上限をキャッシュせず tabLimit で引き直し、既存タブにも設定変更を反映する。
 export function warnTabLimit(): void {
   void vscode.window.showWarningMessage(l10n.t("LAISORA: The tab limit ({0}) has been reached.", tabLimit()));
 }
@@ -351,7 +328,6 @@ export function tabLimit(): number {
   try {
     raw = getLaisoraConfiguration().get<unknown>("tabLimit", TAB_LIMIT_DEFAULT);
   } catch {
-    // R-SES-03
     raw = TAB_LIMIT_DEFAULT;
   }
   return resolveTabLimit(raw);
@@ -363,7 +339,7 @@ export function currentScopeMax(): number {
 
 export function openNewConversationTab(st: SessionStore, initialize?: (session: Session) => void): Session | undefined {
   if (st.sessions.size >= tabLimit()) {
-    warnTabLimit(); // R-SES-03
+    warnTabLimit();
     return undefined;
   }
   const session = st.createSession();
@@ -388,8 +364,6 @@ export async function handleSurfaceMessage(
       st.markReady(sender);
       output.appendLine(`[webview] ${sinceActivation()} ready received`);
       await st.initForReady(sender);
-      // R-CNV-11: postAttachments（verify-attachment#AT-05）。
-      // R-OPS-10: pendingAttachments.sweep（verify-attachment#AT-11）。
       const dropped = pendingAttachments.sweep(new Set(st.sessions.keys()));
       if (dropped.length > 0) {
         output.appendLine(`[attachment] released ${dropped.length} orphan slot(s)`);
@@ -397,7 +371,6 @@ export async function handleSurfaceMessage(
       for (const tabId of pendingAttachments.tabIdsWithAttachments()) {
         postAttachments(st, tabId);
       }
-      // 復元中の事前起動は起動ディレクトリと観測時刻の確定を待つ（verify-restore-first-turn#RFT-1）。
       for (const s of st.sessions.values()) {
         if (s.resuming && s.hydration === null) continue;
         warmup(s);
@@ -407,7 +380,6 @@ export async function handleSurfaceMessage(
     case "webviewDiagnostic":
       output.appendLine(`[webview] ${msg.kind}: ${msg.message}`);
       break;
-    // 復帰時の配送に間に合わせるため、noteActiveTab で面ごとの選択を保持する（verify-webview-wiring#sol-13a）。
     case "activeTab":
       st.noteActiveTab(sender, msg.tabId);
       break;
@@ -417,6 +389,7 @@ export async function handleSurfaceMessage(
     }
     case "closeTab": {
       target!.closed = true;
+      target!.cancelResumePreparation();
       pendingAttachments.release(msg.tabId);
       handoffDetailSources.delete(target!.tabId);
       target!.semantic.clearSemanticModelPostTimer();
@@ -427,11 +400,10 @@ export async function handleSurfaceMessage(
       releaseConversationHistory(historyScopeKey(target!));
       st.sessions.delete(msg.tabId);
       void persistOpenTabs();
-      // R-SES-07: 置き換えの通知順序を逆にすると空の画面を挟む（verify-tab-restore#TR-LASTm2）。
       const replacement = st.sessions.size === 0 ? st.createSession() : null;
       if (replacement) st.post({ type: "tabCreated", tab: replacement.snapshot(), activate: true });
       st.post({ type: "tabClosed", tabId: msg.tabId });
-      postSettingsState(); // R-LRN-18: src/settings-panel.ts#postSettingsState must observe any replacement tab before publishing availability.
+      postSettingsState();
       void target!
         .disposeConversation()
         .then(() => output.appendLine(`[${target!.title}] タブ閉鎖: dispose 完了`))
@@ -440,7 +412,6 @@ export async function handleSurfaceMessage(
       break;
     }
     case "clearTab": {
-      // R-SES-08: 起動待ちも拒否対象。待機後に送信が始まりうるため（verify-tab-restore#TR-CLR）。
       const s = target!;
       if (s.starting || (s.conversation && s.conversation.state !== "idle")) {
         s.pushEvent({

@@ -1,4 +1,5 @@
 {
+  "config.laisora.claude.initialModel.description": "Initial model for new conversations. Empty means Off (Claude's normal settings). Running conversations and Resume are unchanged.",
   "config.laisora.learning.enabled.description": "Deliver learned rules, provide the learning record tool, and record deliveries and model changes in laisora-learning, with or without orchestration. Applies at the next conversation process start. Disabled by default; when disabled, learning records are not read or written.",
   "extension.description": "Focus on conversations with AI agents, review their work, and turn work logs into improvements inside VS Code.",
   "capabilities.untrustedWorkspaces": "Trust this workspace before running Claude Code.",
@@ -34,7 +35,8 @@
   "config.laisora.orchestration.conductorPolicy.description": "Additional user policy appended after the generated conductor instruction; takes effect from the next session.",
   "config.orchestration.externalTimeoutMinutes": "External executor wait limit in minutes; takes effect from the next session.",
   "config.laisora.fileLinks.openWithSystemApp.description": "Extensions opened with the OS default app inside the workspace and conversation folder. Use lowercase extensions with a leading dot. Executable and script extensions are ignored. User setting only.",
-  "config.laisora.appearance.accentColor.description": "Accent colour for current position, YOU and emphasis. Buttons and keyboard focus keep theme colours. High contrast always follows the theme.",
+  "config.laisora.appearance.displayName.description": "Name shown instead of YOU: the speaker label in the chat, the YOU column heading, the decision and machine-check cards, and the user heading of the Markdown export. Empty keeps YOU (User in the export). Leading and trailing spaces are removed, line breaks are not allowed, and only the first 20 characters are used.",
+  "config.laisora.appearance.accentColor.description": "Accent colour for the current position, your label and emphasis. Buttons and keyboard focus keep theme colours. High contrast always follows the theme.",
   "config.laisora.appearance.accentColor.theme": "Follow theme (default)",
   "config.laisora.appearance.accentColor.blue": "Blue",
   "config.laisora.appearance.accentColor.orange": "Orange",

@@ -1,7 +1,3 @@
-// Context Handoff の activeTasks 射影。本番の Host 経路からは import しない（esbuild の単体出力 dist/handoff-capsule.mjs として検査が読む）。
-// evidence-index / semantic-model へ書き戻さない。attemptProgressStates は state 文字列しか返さないため、
-// unavailableReason / assignmentRefs / lastProgressAt / blocker はここで導出する。
-// Task の鍵は SemanticModel.assignments から取り、ここで帰属を再解決しない（Guardrail の taskId と同じ関数・同じ入力で一致させる）
 import {
   assignmentRefOf,
   isAssignmentActiveAt,
@@ -15,14 +11,12 @@ import type { Assignment } from "./semantic-model";
 
 export type HandoffAssignmentInput = Pick<Assignment, "agentRunId" | "taskNodeId" | "startedAt">;
 
-// state を投影できなかった理由。「done で終わった」と「観測地平の外」を潰さない
 export type HandoffUnavailableReason =
   | "ended_by_done"
   | "ended_by_assignment_close"
   | "out_of_horizon"
   | "no_attributed_progress";
 
-// state=undetermined の理由
 export type HandoffStateUndeterminedReason = "multiple_active_assignments";
 
 export interface HandoffActiveTask {
@@ -45,7 +39,6 @@ function horizonOf(index: SemanticEvidenceIndex): number {
   return horizon;
 }
 
-// 当該 Assignment scoped の最終 verified 遷移（deriveAssignmentProgressStates と同じ選別規則）
 function scopedTransitions(index: SemanticEvidenceIndex): Map<string, ProgressTransitionRecord> {
   const out = new Map<string, ProgressTransitionRecord>();
   for (const t of index.progressTransitions) {
@@ -56,7 +49,6 @@ function scopedTransitions(index: SemanticEvidenceIndex): Map<string, ProgressTr
   return out;
 }
 
-// 有効0件のとき、なぜ投影できないのかを1つに決める
 function unavailableReasonFor(
   refs: string[],
   byRef: Map<string, DelegationRecord>,
@@ -87,7 +79,6 @@ export function buildActiveTasks(
   const taskRefs = new Map<string, string[]>();
   for (const d of index.delegations) {
     const taskNodeId = taskNodeIdByKey.get(`agentRun:${d.agentId}@${d.startedAt}`);
-    // Assignment は委任 1 件につき 1 件（deriveAssignments）。無い委任は別 evidence 由来なので鍵を作らない
     if (taskNodeId === undefined) continue;
     const tid = progressSubjectKey(taskNodeId);
     const list = taskRefs.get(tid) ?? [];
@@ -115,7 +106,6 @@ export function buildActiveTasks(
       continue;
     }
     if (valid.length > 1) {
-      // task-level の undetermined は「有効 Assignment が複数」。単数 ref へ潰さない
       out.push({
         taskId,
         state: "undetermined",
@@ -132,7 +122,6 @@ export function buildActiveTasks(
         state: s,
         assignmentRefs: valid,
         lastProgressAt: last?.at,
-        // blocker は emitter 由来の自由文で絶対パスを含みうる
         ...(last?.blocker !== undefined ? { blocker: redactAbsolutePaths(last.blocker) } : {}),
       });
       continue;

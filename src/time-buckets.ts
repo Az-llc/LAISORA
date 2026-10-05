@@ -1,20 +1,21 @@
-// 経過時間の 4 区分（LLM 生成 / ツール実行 / LLM の確認待ち / 返信待ち）と依頼ブロックの算出。
-// 入力は L1.5 の NormalizedEvent 列（history / live 共通）。evidenceHash / semanticHash の入力には
-// 入れない（hash 射影は evidence-index.ts の hashProjection と semantic-model.ts の入力列で列挙式）。
 import type { NormalizedEvent } from "./protocol";
 import { redactAbsolutePaths } from "./path-redaction";
-import { isPureCommandWrapper } from "./human-input-vocabulary";
-import { isBookkeepingTool } from "./work-model";
+import { isPureCommandWrapper, INJECTED_TAG_RE, STEER_TAG_RE } from "./human-input-vocabulary";
+import { isBookkeepingTool, foldPlanDeclarationText, parseTaskIntentFromRawInput, taskCreateKeyFromResult, type TaskIntent, type WorkModelState } from "./work-model";
+import { planStepKey, planStepAt, transitionPlanStep, type PlanStepTiming, type PlanStepTransition } from "./plan-steps";
+import type { PlanUsage, PlanTokenTotal } from "./plan-usage";
+import { isExternalRunTool } from "./orchestration-executors";
 import * as l10n from "@vscode/l10n";
 
-export type TimeBucket = "generate" | "tool" | "confirm" | "reply";
+export type TimeBucket = "generate" | "tool" | "delegation" | "confirm" | "reply";
 export type TimeLane = "main" | "sub";
 export type TimeFidelity = "record" | "inherited";
 
-// 人の入力を待つツール。区間が「ツール実行」ではなく「LLM の確認待ち」になる。
-// AskUserQuestion だけにする（ExitPlanMode の待ちは実測で無視できる短さ）。
 export const HUMAN_INPUT_WAIT_TOOLS: ReadonlySet<string> = new Set(["AskUserQuestion"]);
 export const DELEGATION_TOOL_NAMES: ReadonlySet<string> = new Set(["Agent", "Task"]);
+export function isSubagentWaitTool(toolName: string): boolean {
+  return DELEGATION_TOOL_NAMES.has(toolName) || isExternalRunTool(toolName);
+}
 export const MAX_TIME_TOOL_INTERVALS = 8192;
 export const MAX_TIME_BLOCKS = 500;
 export const MAX_BLOCK_TEXT = 600;
@@ -23,7 +24,8 @@ export const MAIN_MODEL_TOP_COUNT = 3;
 const TASK_NOTIFICATION_MARKER = "A task-notification fires each time this agent stops";
 
 export function isRequestMessageText(text: string): boolean {
-  return !isPureCommandWrapper(text) && !text.includes(TASK_NOTIFICATION_MARKER);
+  const human = text.trim();
+  return human.length > 0 && !isPureCommandWrapper(human) && (!INJECTED_TAG_RE.test(human) || STEER_TAG_RE.test(human)) && !human.includes(TASK_NOTIFICATION_MARKER);
 }
 
 export interface TurnSpan {
@@ -32,15 +34,76 @@ export interface TurnSpan {
   end: number;
 }
 
-// メインの応答記録 1 件の観測。at はその記録の時刻、model はその応答を出した model
+export interface AppendList<T> {
+  readonly buffer: T[];
+  readonly size: number;
+}
+
+export function emptyAppendList<T>(): AppendList<T> {
+  return { buffer: [], size: 0 };
+}
+
+function appendItem<T>(list: AppendList<T>, item: T): AppendList<T> {
+  const buffer = list.buffer.length === list.size ? list.buffer : list.buffer.slice(0, list.size);
+  buffer.push(item);
+  return { buffer, size: list.size + 1 };
+}
+
+export function appendListItems<T>(list: AppendList<T>): T[] {
+  return list.buffer.slice(0, list.size);
+}
+
+export interface KeyedLog<V> {
+  readonly entries: { key: string; value: V }[];
+  readonly size: number;
+  readonly positions: Map<string, number[]>;
+  readonly keys: string[];
+  readonly keyCount: number;
+}
+
+export function emptyKeyedLog<V>(): KeyedLog<V> {
+  return { entries: [], size: 0, positions: new Map(), keys: [], keyCount: 0 };
+}
+
+export function keyedGet<V>(log: KeyedLog<V>, key: string): V | undefined {
+  const at = log.positions.get(key);
+  if (at === undefined) return undefined;
+  for (let i = at.length - 1; i >= 0; i--) if (at[i] < log.size) return log.entries[at[i]].value;
+  return undefined;
+}
+
+function keyedSet<V>(log: KeyedLog<V>, key: string, value: V): KeyedLog<V> {
+  let { entries, positions, keys } = log;
+  if (entries.length !== log.size) {
+    entries = entries.slice(0, log.size);
+    keys = keys.slice(0, log.keyCount);
+    positions = new Map();
+    entries.forEach((entry, i) => {
+      const at = positions.get(entry.key);
+      if (at === undefined) positions.set(entry.key, [i]);
+      else at.push(i);
+    });
+  }
+  let keyCount = log.keyCount;
+  const at = positions.get(key);
+  if (at === undefined) {
+    positions.set(key, [entries.length]);
+    keys.push(key);
+    keyCount++;
+  } else at.push(entries.length);
+  entries.push({ key, value });
+  return { entries, size: log.size + 1, positions, keys, keyCount };
+}
+
+export function keyedValues<V>(log: KeyedLog<V>): V[] {
+  return log.keys.slice(0, log.keyCount).map(key => keyedGet(log, key)!);
+}
+
 export interface ModelMark {
   at: number;
   model: string;
 }
 
-// sameTurn: 直前の地点と同じターン。同じターンで同じ model が続く地点は最後の 1 つだけ残しても割り当ては変わらない。
-// ターンをまたいで畳むと前のターンの地点が消えて unknown に落ちる。
-// 上限超過は古い側を捨てる。捨てた地点より前のターンは直前の model を持たず unknown に落ちる（R-DSP-01）
 export function pushModelMark(marks: ModelMark[], at: number, model: string, sameTurn = false): ModelMark[] {
   const last = marks[marks.length - 1];
   if (sameTurn && last !== undefined && last.model === model && at >= last.at) {
@@ -58,7 +121,6 @@ export interface ToolInterval {
   end: number;
   isError: boolean;
   turnId: string;
-  // lane==="sub" のときの委任 toolUseId（parentToolUseId）
   agentId?: string;
 }
 
@@ -66,10 +128,7 @@ export interface DelegationSpan {
   toolUseId: string;
   turnId: string;
   startedAt: number;
-  // 親側の tool_call_finished。foreground は子の終了、background は起動 ACK（実測: 親 7 秒 / 子 19〜29 分）
   ackEndedAt?: number;
-  // 裁定A2: async（background）委任の完了は task-notification でのみ確定する。起動 ACK・子ツール
-  // 終端では閉じない。resume（裁定A1: SendMessage 成功の resumedAgentId）で undefined へ戻り再び open
   notifiedEndedAt?: number;
   isBackground: boolean;
   firstChildAt?: number;
@@ -80,20 +139,16 @@ export interface DelegationSpan {
   model?: string;
 }
 
-// 背景 Bash（run_in_background）。委任ではないので DelegationSpan と分ける（メイン棒の計算は
-// 「委任でないツールの和集合」で、混ぜると過小になる）。開始は tool_call_started、id は ACK、
-// 終端は task_notification。ACK までの区間は mainTools 側に同期実行として残る
 export interface BackgroundTaskSpan {
   toolUseId: string;
+  toolName: string;
   turnId: string;
   startedAt: number;
   ackAt: number;
   taskId: string;
   description: string;
   notifiedEndedAt?: number;
-  // 終端イベント（query の終端で CLI が kill）または pendingStale の確定
   staleAt?: number;
-  // background_tasks の集合から消えたが通知は未着。次の turn_started で staleAt になる
   pendingStale?: true;
 }
 
@@ -102,14 +157,29 @@ export interface BackgroundTaskSpanView {
   taskId: string;
   turnId: string;
   blockId?: string;
+  stepKey?: string;
   description: string;
+  subagent: boolean;
   start: number;
   end: number;
   open: boolean;
   endSource: "notification" | "stale" | "open";
 }
 
-export type RequestBlockKind = "say" | "command" | "interrupt";
+export type RequestBlockKind = "say" | "command" | "interrupt" | "plan";
+
+export interface PlanBlockStepRecord extends PlanStepTiming {
+  taskKey: string;
+  transitions: PlanStepTransition[];
+}
+export interface PlanBlockMetrics {
+  provisional?: boolean;
+  generateMs: number | null; toolMs: number | null; subagentWaitMs: number | null; subagentOnlyMs: number | null;
+  decisionWaitMs: number | null; replyWaitMs: number | null; tokens: PlanTokenTotal | null;
+}
+export interface PlanBlockStepView extends PlanStepTiming, PlanBlockMetrics {
+  end: number | null; durationMs: number | null; longest: boolean; parallel: boolean;
+}
 
 export interface RequestBlockRecord {
   blockId: string;
@@ -118,6 +188,10 @@ export interface RequestBlockRecord {
   text: string;
   start: number;
   turnId: string | null;
+  goal?: string;
+  closedAt?: number;
+  steps?: PlanBlockStepRecord[];
+  userMessages?: { at: number; text: string }[];
 }
 
 export interface TimeBucketState {
@@ -125,46 +199,86 @@ export interface TimeBucketState {
   inheritedBoundaryCount: number;
   firstAt?: number;
   lastAt?: number;
-  turnSpans: TurnSpan[];
+  turnSpans: AppendList<TurnSpan>;
   openTurn?: { turnId: string; startedAt: number };
-  openTools: Record<string, { at: number; toolName: string; lane: TimeLane; parentToolUseId: string | null; turnId: string; description?: string }>;
+  openTools: Record<string, { at: number; toolName: string; lane: TimeLane; parentToolUseId: string | null; turnId: string; description?: string; taskIntent?: TaskIntent }>;
+  planText?: WorkModelState["planText"];
+  planDeclarationBlockId?: string;
   mainTools: ToolInterval[];
   subTools: ToolInterval[];
-  delegations: Record<string, DelegationSpan>;
-  delegationOrder: string[];
-  backgroundTasks: Record<string, BackgroundTaskSpan>;
-  backgroundTaskOrder: string[];
+  delegations: KeyedLog<DelegationSpan>;
+  delegationsByAgent: KeyedLog<string[]>;
+  backgroundTasks: KeyedLog<BackgroundTaskSpan>;
+  backgroundByTask: KeyedLog<string[]>;
+  unsettledBackground: string[];
   blocks: RequestBlockRecord[];
+  numberedRequests?: NumberedRequests;
+  requestNumbers: KeyedLog<RequestNumberEntry>;
   droppedIntervalCount: number;
   droppedBlockCount: number;
 }
 
-// R-DSP-34: preserve canonical LOG numbers before its request retention evicts them.
-export function attachTimeBucketRequestNumbers(state: TimeBucketState, requests: readonly { turnIds: readonly string[]; number: string }[]): TimeBucketState {
+type NumberedRequests = readonly { turnIds: readonly string[]; number: string }[];
+interface RequestNumberEntry {
+  number: string;
+  next: string;
+}
+
+function requestNumberOf(log: KeyedLog<RequestNumberEntry>, turnId: string): string | undefined {
+  let entry = keyedGet(log, turnId);
+  let id = turnId;
+  for (let hops = 0; entry !== undefined && entry.next !== id && hops < log.keyCount; hops++) {
+    const following = keyedGet(log, entry.next);
+    if (following === undefined) break;
+    id = entry.next;
+    entry = following;
+  }
+  return entry?.number;
+}
+
+export function attachTimeBucketRequestNumbers(state: TimeBucketState, requests: NumberedRequests): TimeBucketState {
   const numbers = new Map(requests.flatMap(request => request.turnIds.map(id => [id, request.number] as const)));
-  let changed = false;
+  const seen = new Set(state.numberedRequests ?? []);
+  let requestNumbers = state.requestNumbers;
+  let renumbered = false;
+  for (const request of requests) {
+    if (seen.has(request)) continue;
+    request.turnIds.forEach((id, i) => {
+      const cached = keyedGet(requestNumbers, id);
+      const next = i + 1 < request.turnIds.length ? request.turnIds[i + 1] : id;
+      if (cached === undefined) requestNumbers = keyedSet(requestNumbers, id, { number: request.number, next });
+      else if (cached.number !== request.number || cached.next === id && next !== id) {
+        if (cached.number !== request.number) renumbered = true;
+        requestNumbers = keyedSet(requestNumbers, id, { number: request.number, next: cached.next === id ? next : cached.next });
+      }
+    });
+  }
+  let changed = state.numberedRequests !== requests || requestNumbers !== state.requestNumbers;
   const blocks = state.blocks.map(block => {
-    const number = block.turnId === null ? undefined : numbers.get(block.turnId);
+    const number = block.turnId === null ? undefined
+      : numbers.get(block.turnId) ?? (renumbered ? requestNumberOf(requestNumbers, block.turnId) : undefined);
     if (number === undefined || number === block.requestNumber) return block;
     changed = true;
     return { ...block, requestNumber: number };
   });
-  return changed ? { ...state, blocks } : state;
+  return changed ? { ...state, blocks, numberedRequests: requests, requestNumbers } : state;
 }
 
 export function createTimeBucketState(): TimeBucketState {
   return {
     fidelity: "record",
     inheritedBoundaryCount: 0,
-    turnSpans: [],
+    turnSpans: emptyAppendList(),
     openTools: {},
     mainTools: [],
     subTools: [],
-    delegations: {},
-    delegationOrder: [],
-    backgroundTasks: {},
-    backgroundTaskOrder: [],
+    delegations: emptyKeyedLog(),
+    delegationsByAgent: emptyKeyedLog(),
+    backgroundTasks: emptyKeyedLog(),
+    backgroundByTask: emptyKeyedLog(),
+    unsettledBackground: [],
     blocks: [],
+    requestNumbers: emptyKeyedLog(),
     droppedIntervalCount: 0,
     droppedBlockCount: 0,
   };
@@ -172,6 +286,63 @@ export function createTimeBucketState(): TimeBucketState {
 
 function isWindowKind(kind: string): boolean {
   return kind.startsWith("tool_call_") || kind === "user_message" || kind.startsWith("turn_");
+}
+
+function appendWorkBlock(state: TimeBucketState, block: Omit<RequestBlockRecord, "blockId">): TimeBucketState {
+  const blocks = [...state.blocks, { ...block, requestNumber: block.requestNumber ?? (block.turnId === null ? undefined : requestNumberOf(state.requestNumbers, block.turnId)),
+    blockId: `block:${state.blocks.length + state.droppedBlockCount + 1}` }];
+  const dropped = Math.max(0, blocks.length - MAX_TIME_BLOCKS);
+  return { ...state, blocks: dropped ? blocks.slice(dropped) : blocks, droppedBlockCount: state.droppedBlockCount + dropped };
+}
+
+function applyPlanTask(state: TimeBucketState, intent: TaskIntent, at: number, turnId: string, result: string): TimeBucketState {
+  let index = state.blocks.length - 1;
+  if (intent.kind === "update") {
+    while (index >= 0 && !state.blocks[index].steps?.some(step => step.taskKey === intent.taskKey)) index--;
+    if (index < 0) return state;
+  } else if (state.blocks[index]?.kind !== "plan" || state.blocks[index].closedAt !== undefined) {
+    const title = intent.kind === "todo" ? intent.items.find(item => item.status !== "completed")?.description : intent.subject;
+    if (!title?.trim()) return state;
+    const declared = state.blocks.find(block => block.blockId === state.planDeclarationBlockId);
+    const goal = declared?.closedAt === undefined && declared?.steps?.length === 0 ? declared.goal : undefined;
+    state = appendWorkBlock(state, { kind: "plan", goal, text: goal ?? redactAbsolutePaths(title), start: at, turnId, steps: [], userMessages: [] });
+    index = state.blocks.length - 1;
+    if (goal) state = { ...state, planDeclarationBlockId: state.blocks[index].blockId };
+  }
+  const block = state.blocks[index];
+  const steps = (block.steps ?? []).map(step => ({ ...step, transitions: [...step.transitions] }));
+  const source = intent.kind === "todo" ? {} : { source: "tasks" as const };
+  const items = intent.kind === "todo" ? intent.items : intent.kind === "create"
+    ? [{ taskKey: taskCreateKeyFromResult(intent.toolUseId, result), description: intent.subject, status: intent.status }]
+    : [];
+  if (intent.kind === "update") {
+    const existing = steps.find(step => step.taskKey === intent.taskKey)!;
+    items.push({ taskKey: intent.taskKey, description: intent.subject ?? existing.title, status: intent.status ?? existing.status });
+  }
+  let order = steps.reduce((latest, step) => step.transitions.reduce((maximum, change) => Math.max(maximum, change.order), latest), 0);
+  const present = new Set<string>();
+  for (const item of items) {
+    const key = planStepKey(source, item);
+    if (present.has(key)) continue;
+    present.add(key);
+    let step = steps.find(value => value.key === key);
+    if (!step) {
+      if (intent.kind === "todo" && item.status === "completed") continue;
+      step = { key, taskKey: item.taskKey, title: redactAbsolutePaths(item.description), status: "unknown", removed: false, startedAt: null, endedAt: null, transitions: [] };
+      steps.push(step);
+    }
+    const removed = intent.kind === "update" && intent.deleted === true;
+    if (transitionPlanStep(step, at, item.status, removed)) step.transitions.push({ at, active: !removed && item.status === "in_progress", order: ++order });
+    step.title = redactAbsolutePaths(item.description);
+  }
+  if (intent.kind === "todo") for (const step of steps) {
+    if (present.has(step.key) || step.removed) continue;
+    transitionPlanStep(step, at, step.status, true);
+    step.transitions.push({ at, active: false, order: ++order });
+  }
+  const blocks = [...state.blocks];
+  blocks[index] = { ...block, steps, text: block.goal ?? steps.find(step => !step.removed && step.status !== "completed")?.title ?? block.text };
+  return { ...state, blocks };
 }
 
 function pushBounded(list: ToolInterval[], item: ToolInterval, state: { droppedIntervalCount: number }): ToolInterval[] {
@@ -188,22 +359,53 @@ function withoutPendingStale(span: BackgroundTaskSpan): BackgroundTaskSpan {
   return rest;
 }
 
-// 開いている背景のうち pick が真のものを staleAt で閉じる。n は touch() 済みの次状態
 function staleOpenBackground(
   state: TimeBucketState,
   n: TimeBucketState,
   ts: number,
   pick: (span: BackgroundTaskSpan) => boolean
 ): TimeBucketState {
-  let changed = false;
-  const next = { ...n.backgroundTasks };
-  for (const [toolUseId, span] of Object.entries(state.backgroundTasks)) {
+  const settled = new Set<string>();
+  for (const toolUseId of state.unsettledBackground) {
+    const span = keyedGet(state.backgroundTasks, toolUseId)!;
     if (span.notifiedEndedAt !== undefined || span.staleAt !== undefined || !pick(span)) continue;
-    next[toolUseId] = { ...withoutPendingStale(span), staleAt: ts };
-    changed = true;
+    n.backgroundTasks = keyedSet(n.backgroundTasks, toolUseId, { ...withoutPendingStale(span), staleAt: ts });
+    settled.add(toolUseId);
   }
-  if (changed) n.backgroundTasks = next;
+  if (settled.size > 0) n.unsettledBackground = n.unsettledBackground.filter(id => !settled.has(id));
   return n;
+}
+
+function putDelegation(n: TimeBucketState, from: KeyedLog<DelegationSpan>, d: DelegationSpan): void {
+  const before = keyedGet(from, d.toolUseId);
+  n.delegations = keyedSet(from, d.toolUseId, d);
+  if (d.transcriptAgentId !== undefined && d.transcriptAgentId !== before?.transcriptAgentId) {
+    n.delegationsByAgent = keyedSet(n.delegationsByAgent, d.transcriptAgentId,
+      [...keyedGet(n.delegationsByAgent, d.transcriptAgentId) ?? [], d.toolUseId]);
+  }
+}
+
+function delegationOfAgent(state: TimeBucketState, agentId: string, pick: (d: DelegationSpan) => boolean): DelegationSpan | undefined {
+  let found: DelegationSpan | undefined;
+  let foundAt = Infinity;
+  for (const toolUseId of keyedGet(state.delegationsByAgent, agentId) ?? []) {
+    const d = keyedGet(state.delegations, toolUseId);
+    if (d === undefined || d.transcriptAgentId !== agentId || !pick(d)) continue;
+    const at = state.delegations.positions.get(toolUseId)![0];
+    if (at < foundAt) {
+      found = d;
+      foundAt = at;
+    }
+  }
+  return found;
+}
+
+function unsettledBackgroundOfTask(state: TimeBucketState, taskId: string): BackgroundTaskSpan | undefined {
+  for (const toolUseId of keyedGet(state.backgroundByTask, taskId) ?? []) {
+    const b = keyedGet(state.backgroundTasks, toolUseId)!;
+    if (b.notifiedEndedAt === undefined && b.staleAt === undefined) return b;
+  }
+  return undefined;
 }
 
 export function foldTimeBuckets(state: TimeBucketState, event: NormalizedEvent): TimeBucketState {
@@ -216,35 +418,62 @@ export function foldTimeBuckets(state: TimeBucketState, event: NormalizedEvent):
   }
 
   switch (event.kind) {
+    case "assistant_message_uuid":
+      if (state.planText?.turnId === event.turnId) touch().planText = { ...state.planText, recordEnded: true };
+      return next;
+    case "assistant_text_delta": {
+      if (ts === undefined) return next;
+      const folded = foldPlanDeclarationText(state.planText, event.turnId, event.text, ts);
+      touch().planText = folded.text;
+      if (folded.declarations.length) {
+        touch().firstAt = Math.min(next.firstAt ?? ts, ts);
+        touch().lastAt = Math.max(next.lastAt ?? ts, ts);
+      }
+      for (const declaration of folded.declarations) {
+        const goal = redactAbsolutePaths(declaration.goal).trim();
+        if (!goal) continue;
+        const current = next.blocks.at(-1);
+        if (current?.kind === "plan" && !current.goal && current.closedAt === undefined && !current.userMessages?.length) {
+          next = { ...next, blocks: [...next.blocks.slice(0, -1), { ...current, goal, text: goal }] };
+        } else next = appendWorkBlock(next, { kind: "plan", goal, text: goal, start: ts, turnId: event.turnId, steps: [], userMessages: [] });
+        next = { ...next, planDeclarationBlockId: next.blocks.at(-1)!.blockId };
+      }
+      return next;
+    }
+    case "compact_boundary": {
+      if (event.priorGeneration !== true || ts === undefined) return next;
+      const current = state.blocks.at(-1);
+      if (current?.kind === "plan" && current.closedAt === undefined) touch().blocks = [...state.blocks.slice(0, -1), { ...current, closedAt: ts }];
+      touch().planText = undefined;
+      touch().planDeclarationBlockId = undefined;
+      touch().lastAt = Math.max(next.lastAt ?? ts, ts);
+      return next;
+    }
     case "background_tasks": {
-      // REPLACE のレベル信号。追跡中が集合に無ければ pendingStale、戻れば取り消す。
-      // 即 stale にしない（CLI は通知の 1ms 前に空集合を送る）
       const alive = new Set(event.tasks.filter((t) => t.ambient !== true).map((t) => t.id));
       let n0: TimeBucketState | undefined;
-      for (const [toolUseId, span] of Object.entries(state.backgroundTasks)) {
+      for (const toolUseId of state.unsettledBackground) {
+        const span = keyedGet(state.backgroundTasks, toolUseId)!;
         if (span.notifiedEndedAt !== undefined || span.staleAt !== undefined) continue;
         const gone = !alive.has(span.taskId);
         if (gone === (span.pendingStale === true)) continue;
         n0 ??= touch();
-        n0.backgroundTasks = { ...n0.backgroundTasks, [toolUseId]: gone ? { ...span, pendingStale: true } : withoutPendingStale(span) };
+        n0.backgroundTasks = keyedSet(n0.backgroundTasks, span.toolUseId, gone ? { ...span, pendingStale: true } : withoutPendingStale(span));
       }
       return n0 ?? next;
     }
     case "turn_started": {
       if (ts !== undefined) {
-        // pendingStale の確定。集合から消えたまま通知が来ずにターン境界へ来た
         state = staleOpenBackground(state, touch(), ts, (span) => span.pendingStale === true);
       }
       const n = touch();
-      // 境界イベントが継承時刻なら 4 区分の根拠を失う。継承値かどうかの印は NormalizedEvent に無く、
-      // live の user_message は provenance を持たないため turn_started の provenance で粗く立てる（R-DSP-15）
       if (event.provenance?.path !== "history") {
         n.inheritedBoundaryCount = state.inheritedBoundaryCount + 1;
         n.fidelity = "inherited";
       }
       if (ts === undefined) return n;
       if (state.openTurn !== undefined) {
-        n.turnSpans = [...state.turnSpans, { turnId: state.openTurn.turnId, start: state.openTurn.startedAt, end: Math.max(state.openTurn.startedAt, ts) }];
+        n.turnSpans = appendItem(state.turnSpans, { turnId: state.openTurn.turnId, start: state.openTurn.startedAt, end: Math.max(state.openTurn.startedAt, ts) });
       }
       const pending = n.blocks.at(-1);
       if (pending?.turnId === null) n.blocks = [...n.blocks.slice(0, -1), { ...pending, turnId: event.turnId }];
@@ -259,21 +488,23 @@ export function foldTimeBuckets(state: TimeBucketState, event: NormalizedEvent):
     case "turn_interrupted":
     case "turn_failed": {
       if (ts !== undefined && event.kind !== "turn_completed") {
-        // query の終端。CLI が背景を kill する。turn_completed は継続中なので触らない
         state = staleOpenBackground(state, touch(), ts, () => true);
       }
       if (state.openTurn === undefined || ts === undefined) return next;
       const n = touch();
-      n.turnSpans = [...state.turnSpans, { turnId: state.openTurn.turnId, start: state.openTurn.startedAt, end: Math.max(state.openTurn.startedAt, ts) }];
+      n.turnSpans = appendItem(state.turnSpans, { turnId: state.openTurn.turnId, start: state.openTurn.startedAt, end: Math.max(state.openTurn.startedAt, ts) });
       n.openTurn = undefined;
       return n;
     }
     case "user_message": {
-      // 引数無しのスラッシュコマンドは往復に数えない。history 経路では同じ入力が user_message を生まないので、
-      // live との差はここで吸収する
-      // バックグラウンド委任の完了通知を往復にしない。user 記録だが人の発言ではない（R-DSP-10）
-      if (!isRequestMessageText(event.text)) return next;
       if (ts === undefined) return next;
+      if (!isRequestMessageText(event.text)) return next;
+      const current = state.blocks.at(-1);
+      if (current?.kind === "plan" && current.closedAt === undefined && (current.steps ?? []).some(step => !step.removed && step.status !== "completed")) {
+        touch().blocks = [...state.blocks.slice(0, -1), { ...current, userMessages: [...current.userMessages ?? [],
+          { at: ts, text: redactAbsolutePaths(event.text.trim().split(/\r?\n/, 1)[0]).slice(0, MAX_BLOCK_TEXT) }] }];
+        return next;
+      }
       const n = touch();
       const text = redactAbsolutePaths(event.text.trim()).slice(0, MAX_BLOCK_TEXT);
       const block: RequestBlockRecord = {
@@ -295,6 +526,11 @@ export function foldTimeBuckets(state: TimeBucketState, event: NormalizedEvent):
       if (ts === undefined) return next;
       const n = touch();
       const lane: TimeLane = event.parentToolUseId === null ? "main" : "sub";
+      let taskIntent = event.taskIntentStructured;
+      if (!taskIntent && lane === "main" && ["TodoWrite", "TaskCreate", "TaskUpdate"].includes(event.toolName)) {
+        try { taskIntent = parseTaskIntentFromRawInput(event.toolName, JSON.parse(event.inputPreview), event.toolUseId); }
+        catch { taskIntent = undefined; }
+      }
       n.openTools = {
         ...state.openTools,
         [event.toolUseId]: {
@@ -303,90 +539,70 @@ export function foldTimeBuckets(state: TimeBucketState, event: NormalizedEvent):
           lane,
           parentToolUseId: event.parentToolUseId,
           turnId: event.turnId,
+          ...(taskIntent ? { taskIntent } : {}),
           ...(event.inputSummary !== undefined ? { description: redactAbsolutePaths(event.inputSummary).slice(0, 200) } : {}),
         },
       };
-      if (lane === "main" && DELEGATION_TOOL_NAMES.has(event.toolName) && state.delegations[event.toolUseId] === undefined) {
-        n.delegations = {
-          ...state.delegations,
-          [event.toolUseId]: {
-            toolUseId: event.toolUseId,
-            turnId: event.turnId,
-            startedAt: ts,
-            isBackground: event.isBackground === true || event.delegation?.isBackground === true,
-            description: redactAbsolutePaths(event.delegation?.description ?? "").slice(0, 200),
-            subagentType: event.delegation?.subagentType ?? event.subagentType,
-            model: event.delegation?.subagentModel ?? event.subagentModel,
-          },
-        };
-        n.delegationOrder = [...state.delegationOrder, event.toolUseId];
+      if (lane === "main" && DELEGATION_TOOL_NAMES.has(event.toolName) && keyedGet(state.delegations, event.toolUseId) === undefined) {
+        putDelegation(n, state.delegations, {
+          toolUseId: event.toolUseId,
+          turnId: event.turnId,
+          startedAt: ts,
+          isBackground: event.isBackground === true || event.delegation?.isBackground === true,
+          description: redactAbsolutePaths(event.delegation?.description ?? "").slice(0, 200),
+          subagentType: event.delegation?.subagentType ?? event.subagentType,
+          model: event.delegation?.subagentModel ?? event.subagentModel,
+        });
       } else if (lane === "sub" && event.parentToolUseId !== null) {
-        const d = state.delegations[event.parentToolUseId];
+        const d = keyedGet(state.delegations, event.parentToolUseId);
         if (d !== undefined) {
-          n.delegations = {
-            ...state.delegations,
-            [d.toolUseId]: {
-              ...d,
-              firstChildAt: d.firstChildAt === undefined ? ts : Math.min(d.firstChildAt, ts),
-              lastChildAt: d.lastChildAt === undefined ? ts : Math.max(d.lastChildAt, ts),
-            },
-          };
+          putDelegation(n, state.delegations, {
+            ...d,
+            firstChildAt: d.firstChildAt === undefined ? ts : Math.min(d.firstChildAt, ts),
+            lastChildAt: d.lastChildAt === undefined ? ts : Math.max(d.lastChildAt, ts),
+          });
         }
       }
       return n;
     }
     case "tool_call_finished": {
-      // 裁定A2/A1 の観測は openTools と独立に届く（taskNotification の toolUseId は合成 ID で、
-      // 対応する tool_call_started が無い）ため、openTools の guard より前に処理する
       if (ts !== undefined && event.taskNotification !== undefined) {
         const agentId = event.taskNotification.agentId;
         const n0 = touch();
-        // 同一 agentId は複数回通知されうるため、開いている（未通知の）委任だけを閉じる
-        const hit = Object.values(n0.delegations).find(
-          (d) => d.transcriptAgentId === agentId && d.notifiedEndedAt === undefined
-        );
-        if (hit !== undefined) {
-          n0.delegations = { ...n0.delegations, [hit.toolUseId]: { ...hit, notifiedEndedAt: ts } };
-        }
+        const hit = delegationOfAgent(n0, agentId, (d) => d.notifiedEndedAt === undefined);
+        if (hit !== undefined) putDelegation(n0, n0.delegations, { ...hit, notifiedEndedAt: ts });
       }
       if (ts !== undefined && event.taskNotification !== undefined) {
-        const agentId = event.taskNotification.agentId;
         const n0 = touch();
-        const bg = Object.values(n0.backgroundTasks).find(
-          (b) => b.taskId === agentId && b.notifiedEndedAt === undefined && b.staleAt === undefined
-        );
+        const bg = unsettledBackgroundOfTask(n0, event.taskNotification.agentId);
         if (bg !== undefined) {
-          n0.backgroundTasks = { ...n0.backgroundTasks, [bg.toolUseId]: { ...withoutPendingStale(bg), notifiedEndedAt: ts } };
+          n0.backgroundTasks = keyedSet(n0.backgroundTasks, bg.toolUseId, { ...withoutPendingStale(bg), notifiedEndedAt: ts });
+          n0.unsettledBackground = n0.unsettledBackground.filter(id => id !== bg.toolUseId);
         }
       }
       if (ts !== undefined && event.resumedAgentId !== undefined && event.isError !== true) {
         const n0 = touch();
-        const hit = Object.values(n0.delegations).find(
-          (d) => d.transcriptAgentId === event.resumedAgentId && d.notifiedEndedAt !== undefined
-        );
-        if (hit !== undefined) {
-          n0.delegations = { ...n0.delegations, [hit.toolUseId]: { ...hit, notifiedEndedAt: undefined } };
-        }
+        const hit = delegationOfAgent(n0, event.resumedAgentId, (d) => d.notifiedEndedAt !== undefined);
+        if (hit !== undefined) putDelegation(n0, n0.delegations, { ...hit, notifiedEndedAt: undefined });
       }
       const open = state.openTools[event.toolUseId];
       if (open === undefined || ts === undefined) return next;
       const n = touch();
       const { [event.toolUseId]: _, ...rest } = state.openTools;
       n.openTools = rest;
-      // 背景 Bash の起動 ACK。ACK までは同期区間として mainTools に残し、ここから先は別配列で追う
-      if (open.lane === "main" && event.backgroundTaskId !== undefined && event.isError !== true && n.backgroundTasks[event.toolUseId] === undefined) {
-        n.backgroundTasks = {
-          ...n.backgroundTasks,
-          [event.toolUseId]: {
-            toolUseId: event.toolUseId,
-            turnId: open.turnId,
-            startedAt: open.at,
-            ackAt: ts,
-            taskId: event.backgroundTaskId,
-            description: open.description ?? open.toolName,
-          },
-        };
-        n.backgroundTaskOrder = [...n.backgroundTaskOrder, event.toolUseId];
+      if (open.lane === "main" && event.backgroundTaskId !== undefined && event.isError !== true && keyedGet(n.backgroundTasks, event.toolUseId) === undefined) {
+        n.backgroundTasks = keyedSet(n.backgroundTasks, event.toolUseId, {
+          toolUseId: event.toolUseId,
+          toolName: open.toolName,
+          turnId: open.turnId,
+          startedAt: open.at,
+          ackAt: ts,
+          taskId: event.backgroundTaskId,
+          description: open.description ?? open.toolName,
+        });
+        n.backgroundByTask = keyedSet(n.backgroundByTask, event.backgroundTaskId,
+          [...keyedGet(n.backgroundByTask, event.backgroundTaskId) ?? [], event.toolUseId]);
+        n.unsettledBackground = [...n.unsettledBackground, event.toolUseId];
       }
       const interval: ToolInterval = {
         toolUseId: event.toolUseId,
@@ -400,41 +616,36 @@ export function foldTimeBuckets(state: TimeBucketState, event: NormalizedEvent):
       if (open.lane === "main") n.mainTools = pushBounded(state.mainTools, interval, n);
       else n.subTools = pushBounded(state.subTools, interval, n);
       const parentKey = open.lane === "main" ? event.toolUseId : open.parentToolUseId;
-      const d = parentKey !== null ? (n.delegations[parentKey] ?? state.delegations[parentKey]) : undefined;
+      const d = parentKey !== null ? (keyedGet(n.delegations, parentKey) ?? keyedGet(state.delegations, parentKey)) : undefined;
       if (d !== undefined) {
         const updated: DelegationSpan = { ...d };
         if (open.lane === "main") {
           updated.ackEndedAt = interval.end;
           if (event.asyncLaunchedAgentId !== undefined) {
             updated.transcriptAgentId = event.asyncLaunchedAgentId;
-            // run_in_background が入力に無い background 委任（ハーネス既定が background の版。
-            // 実測: 会話 e0fff61a の 34 委任すべてで入力にフラグ無し）は起動入力から判定できない。
-            // ACK が async 起動を告げた事実（asyncLaunchedAgentId）で background と確定する。
-            // これが無いと ACK（数秒）で閉じて並列数と棒が壊れる（TB-21）
             updated.isBackground = true;
           }
         } else {
           updated.lastChildAt = d.lastChildAt === undefined ? interval.end : Math.max(d.lastChildAt, interval.end);
         }
-        n.delegations = { ...(n.delegations === state.delegations ? state.delegations : n.delegations), [d.toolUseId]: updated };
+        putDelegation(n, n.delegations, updated);
       }
-      return n;
+      return open.lane === "main" && open.taskIntent && !event.isError
+        ? applyPlanTask(n, open.taskIntent, ts, open.turnId, event.resultPreview) : n;
     }
     case "subagent_info": {
-      const d = state.delegations[event.toolUseId];
+      const d = keyedGet(state.delegations, event.toolUseId);
       if (d === undefined || (event.model === undefined || d.model === event.model) &&
         (event.agentId === undefined || d.transcriptAgentId === event.agentId)) return next;
       const n = touch();
-      n.delegations = { ...state.delegations, [event.toolUseId]: { ...d,
-        model: event.model ?? d.model, transcriptAgentId: event.agentId ?? d.transcriptAgentId } };
+      putDelegation(n, state.delegations, { ...d,
+        model: event.model ?? d.model, transcriptAgentId: event.agentId ?? d.transcriptAgentId });
       return n;
     }
     default:
       return next;
   }
 }
-
-// ---------- 区間集合の演算（閉区間の配列。結果は昇順・非重複） ----------
 
 export type Span = [number, number];
 
@@ -489,18 +700,13 @@ export function measureSpans(spans: readonly Span[]): number {
   return total;
 }
 
-// ---------- 導出 ----------
-
 export interface TimeBucketTotals {
-  // null = 実測できていない区分。0 と書くと「無かった」を主張する（R-DSP-01）
   generateMs: number | null;
   toolMs: number;
+  subagentWaitMs: number;
   confirmMs: number;
   replyMs: number | null;
-  // サブエージェントだけが稼働していた時間（メインのターン・ツール外で、返信待ちではない）。
-  // generateMs + toolMs + confirmMs + replyMs + subOnlyMs = spanMs
   subOnlyMs: number | null;
-  // null = 最初の境界が継承時刻で、経過の起点が測れていない（R-DSP-11）
   spanMs: number | null;
 }
 
@@ -518,9 +724,9 @@ export interface AgentSpanView {
   toolUseId: string;
   turnId: string;
   blockId?: string;
+  stepKey?: string;
   start: number;
   end: number;
-  // 終了が観測されていない（実行中または記録が途切れている）。end は lastAt
   open: boolean;
   isBackground: boolean;
   description: string;
@@ -531,8 +737,6 @@ export interface AgentSpanView {
   failCount: number;
   toolMs: number;
   generateMs: number;
-  // 端点の出どころ。"child-transcript" は host が子 transcript の先頭/末尾で上書きしたもの。
-  // "notification" は task-notification（裁定A2: async 委任の完了信号）
   endSource: "child-transcript" | "child-tools" | "ack" | "open" | "notification";
 }
 
@@ -540,40 +744,40 @@ export interface RequestBlockView {
   blockId: string;
   requestNumber: string | null;
   processingMs: number | null;
-  strip: { processingPercent: number; replyPercent: number; remainderPercent: number } | null;
+  strip: { generatePercent: number; toolPercent: number; subagentWaitPercent: number; confirmPercent: number; replyPercent: number; remainderPercent: number } | null;
   kind: RequestBlockKind;
   text: string;
   start: number;
   end: number;
-  // fidelity=inherited のとき start は継承値なので、ブロック内で最初に実時刻を持つイベントの時刻
   anchorAt: number;
-  // null = start が継承値（fidelity=inherited）。数字にすると継承した時刻からの差を経過として出す（R-DSP-11）
   durationMs: number | null;
   turnIds: string[];
-  // isBookkeepingTool を除く。failCount も同じ母集団
   toolCount: number;
   failCount: number;
   agentCount: number;
   generateMs: number | null;
   toolMs: number;
+  subagentWaitMs: number;
   confirmMs: number;
   replyMs: number | null;
   running: boolean;
+  goal?: string;
+  closedAt?: number;
+  steps?: PlanBlockStepView[];
+  userMessages?: { at: number; text: string }[];
+  metrics?: PlanBlockMetrics;
 }
 
 export interface MainModelTimeEntry {
-  // unknown = model を観測する前のターン（R-DSP-01）。other = 上位 MAIN_MODEL_TOP_COUNT 以外を畳んだもの
   kind: "model" | "other" | "unknown";
   label: string;
   model: string | null;
   foldedModelCount: number | null;
   generateMs: number;
-  // totalMs に対する比（0..1）と整数の百分率。totalMs が 0 なら null
   share: number | null;
   percent: number | null;
 }
 
-// R-DSP-49: deriveMainByModel; TimeBucketView
 export interface MainTimeByModelView {
   totalMs: number;
   generateMs: number;
@@ -588,13 +792,10 @@ export interface TimeBucketView {
   inheritedBoundaryCount: number;
   firstAt: number | null;
   lastAt: number | null;
-  // null = 継承時刻を含む（経過を測っていない）。firstAt / lastAt は実時刻を持つイベントの端で、軸の位置には使える
   spanMs: number | null;
   main: TimeBucketTotals;
   sub: { generateMs: number; toolMs: number; spanMs: number };
-  // R-DSP-49: deriveTimeBuckets の mainBarMs と subSpan。
-  bars: { totalMs: number | null; mainMs: number | null; subMs: number };
-  // null = model の地点を渡されていない（live の fold）か、継承時刻で生成時間を測っていない（R-DSP-11）
+  bars: { totalMs: number | null; mainMs: number | null; toolMs: number | null; subMs: number };
   mainByModel: MainTimeByModelView | null;
   agentCount: number;
   maxParallelAgents: number;
@@ -602,7 +803,7 @@ export interface TimeBucketView {
   maxConcurrency: number;
   turnOpen: boolean;
   tail: {
-    main: "generate" | "tool" | "confirm" | null;
+    main: "generate" | "tool" | "delegation" | "confirm" | null;
     anyOpen: boolean;
   };
   intervals: TimeBucketInterval[];
@@ -635,9 +836,6 @@ function sweepMax(spans: readonly Span[]): number {
   return max;
 }
 
-// ターンごとに生成時間を model へ割り当てる。地点はメインの応答記録ごとの観測（その応答を出した model）。
-// ターン内の地点 m は前の地点（またはターン開始）から m までの生成を持ち、最後の地点の後はターン終端まで同じ model。
-// ターン内に地点が無ければ直前の地点の model が続いている。直前の地点が無いターンは unknown（R-DSP-01）
 export function deriveMainByModel(
   turns: readonly TurnSpan[],
   generate: readonly Span[],
@@ -648,7 +846,6 @@ export function deriveMainByModel(
   const byModel = new Map<string, number>();
   let unknownMs = 0;
   let covered = -Infinity;
-  // 割り当てる窓は時刻の昇順にしか進まないので、生成区間の走査位置を持ち越す（窓ごとに先頭から走査すると O(N²)）
   let gi = 0;
   const credit = (model: string | undefined, s0: number, s1: number): void => {
     const start = Math.max(s0, covered);
@@ -712,7 +909,6 @@ export function deriveMainByModel(
     });
   }
   if (totalMs <= 0) return { totalMs, generateMs, models, toolMs, toolShare: null, toolPercent: null };
-  // 同じ輪に並ぶ百分率は最大剰余で丸め、和を 100 に揃える
   const parts = [...models.map((m) => m.generateMs), toolMs];
   const percents = largestRemainderPercents(parts, totalMs);
   models.forEach((m, i) => {
@@ -739,11 +935,6 @@ export function deriveTimeBuckets(
   state: TimeBucketState,
   options?: {
     childSpans?: readonly ChildTranscriptSpan[];
-    // MED-1 / 裁定H-1 と同じゲート（semantic-model.ts openAsyncStatusOf の鏡像）。
-    // 通知の無い background 委任を「実行中（open）」と主張できるのは、ストリーム継続中に
-    // 現プロセスで ACK/再開を観測した委任だけ。省略時（fold 単体・transcript 再読込）は
-    // ゲート無し = 裁定A2 のみで決める（resume 復元の旧委任を open のまま出すと、
-    // 終了済みセッションの並列数が残る）
     streamOpen?: boolean;
     liveDelegationAgentIds?: ReadonlySet<string>;
     modelMarks?: readonly ModelMark[];
@@ -755,7 +946,7 @@ export function deriveTimeBuckets(
   const end = lastAt ?? 0;
   const inherited = state.inheritedBoundaryCount > 0;
 
-  const turnSpansAll: TurnSpan[] = [...state.turnSpans];
+  const turnSpansAll: TurnSpan[] = appendListItems(state.turnSpans);
   if (state.openTurn !== undefined && lastAt !== null) {
     turnSpansAll.push({ turnId: state.openTurn.turnId, start: state.openTurn.startedAt, end: Math.max(state.openTurn.startedAt, end) });
   }
@@ -763,7 +954,6 @@ export function deriveTimeBuckets(
 
   const confirmSpans = state.mainTools.filter((t) => HUMAN_INPUT_WAIT_TOOLS.has(t.toolName)).map((t) => [t.start, t.end] as Span);
   const allMainToolSpans = state.mainTools.map((t) => [t.start, t.end] as Span);
-  // 未終了のメインツールは lastAt まで実行中として数える
   for (const open of Object.values(state.openTools)) {
     if (open.lane !== "main" || lastAt === null) continue;
     const span: Span = [open.at, Math.max(open.at, end)];
@@ -771,19 +961,17 @@ export function deriveTimeBuckets(
     if (HUMAN_INPUT_WAIT_TOOLS.has(open.toolName)) confirmSpans.push(span);
   }
   const confirmUnion = unionSpans(confirmSpans);
-  // 確認待ちを返信待ちへ畳まない。畳むと「LLM からの確認を減らす」が改善方向として見えなくなる（R-DSP-16）
-  const toolUnion = subtractSpans(unionSpans(allMainToolSpans), confirmUnion);
-  // R-DSP-49: nonDelegationToolSpans; DELEGATION_TOOL_NAMES; nonDelegationToolUnion
+  const callUnion = subtractSpans(unionSpans(allMainToolSpans), confirmUnion);
   const nonDelegationToolSpans = state.mainTools
-    .filter((t) => !DELEGATION_TOOL_NAMES.has(t.toolName))
+    .filter((t) => !isSubagentWaitTool(t.toolName))
     .map((t) => [t.start, t.end] as Span);
   for (const open of Object.values(state.openTools)) {
-    if (open.lane !== "main" || lastAt === null || DELEGATION_TOOL_NAMES.has(open.toolName)) continue;
+    if (open.lane !== "main" || lastAt === null || isSubagentWaitTool(open.toolName)) continue;
     nonDelegationToolSpans.push([open.at, Math.max(open.at, end)]);
   }
-  const nonDelegationToolUnion = subtractSpans(unionSpans(nonDelegationToolSpans), confirmUnion);
+  const toolUnion = subtractSpans(unionSpans(nonDelegationToolSpans), confirmUnion);
+  const subagentWaitUnion = subtractSpans(callUnion, toolUnion);
 
-  // 子 transcript の端点で上書きする。DelegationRecord.endedAt（起動 ACK）から作ってはいけない
   const childByToolUseId = new Map<string, ChildTranscriptSpan>();
   for (const c of options?.childSpans ?? []) childByToolUseId.set(c.toolUseId, c);
   const subToolsByAgent = new Map<string, ToolInterval[]>();
@@ -794,9 +982,8 @@ export function deriveTimeBuckets(
     subToolsByAgent.set(t.agentId, list);
   }
   const agents: AgentSpanView[] = [];
-  for (const toolUseId of state.delegationOrder) {
-    const d = state.delegations[toolUseId];
-    if (d === undefined) continue;
+  for (const d of keyedValues(state.delegations)) {
+    const toolUseId = d.toolUseId;
     const child = childByToolUseId.get(toolUseId);
     let start = d.startedAt;
     let spanEnd: number | undefined;
@@ -806,10 +993,6 @@ export function deriveTimeBuckets(
       options?.streamOpen !== false &&
       (liveGateIds === undefined || (d.transcriptAgentId !== undefined && liveGateIds.has(d.transcriptAgentId)));
     if (d.isBackground && d.notifiedEndedAt === undefined && claimableRunning) {
-      // 裁定A2: background 委任の完了は task-notification でのみ確定する。子 transcript の
-      // 末尾レコード時刻は「そこまで書けている」事実であって完了ではなく、実行中の子にも
-      // 常に存在する（使うと resume タブで実行中の委任が閉じて見える。TB-20/21）。
-      // resume（裁定A1）で notifiedEndedAt が消えると再び open になる
       if (child?.startedAt !== undefined) start = child.startedAt;
       spanEnd = undefined;
       endSource = "open";
@@ -818,7 +1001,6 @@ export function deriveTimeBuckets(
       spanEnd = child.endedAt;
       endSource = "child-transcript";
     } else if (d.isBackground && d.notifiedEndedAt !== undefined) {
-      // notified かつ子 transcript 端点なし。通知時刻で閉じる
       spanEnd = d.lastChildAt !== undefined ? Math.max(d.notifiedEndedAt, d.lastChildAt) : d.notifiedEndedAt;
       endSource = "notification";
     } else if (d.ackEndedAt !== undefined) {
@@ -850,11 +1032,9 @@ export function deriveTimeBuckets(
       endSource: open ? "open" : endSource,
     });
   }
-  // 背景 Bash。通知・終端・pendingStale 確定のどれかで閉じ、それ以外は H-1 ゲートを通るときだけ open
   const backgroundTasks: BackgroundTaskSpanView[] = [];
-  for (const toolUseId of state.backgroundTaskOrder) {
-    const b = state.backgroundTasks[toolUseId];
-    if (b === undefined) continue;
+  const subagentBackgroundSpans: Span[] = [];
+  for (const b of keyedValues(state.backgroundTasks)) {
     const liveGateIds = options?.liveDelegationAgentIds;
     const claimableRunning =
       options?.streamOpen !== false && (liveGateIds === undefined || liveGateIds.has(b.taskId));
@@ -870,52 +1050,61 @@ export function deriveTimeBuckets(
       bgEnd = undefined;
       endSource = "open";
     }
+    const subagent = isSubagentWaitTool(b.toolName);
     backgroundTasks.push({
-      toolUseId,
+      toolUseId: b.toolUseId,
       taskId: b.taskId,
       turnId: b.turnId,
       description: b.description,
+      subagent,
       start: b.startedAt,
       end: Math.max(b.startedAt, bgEnd ?? end),
       open: bgEnd === undefined,
       endSource,
     });
+    if (subagent) subagentBackgroundSpans.push([b.startedAt, Math.max(b.startedAt, bgEnd ?? end)]);
   }
   const agentSpans = agents.map((a) => [a.start, a.end] as Span);
   const bgSpans = backgroundTasks.map((t) => [t.start, t.end] as Span);
-  const subActiveUnion = unionSpans(agentSpans);
+  const subActiveUnion = unionSpans([...agentSpans, ...subagentBackgroundSpans]);
 
   const whole: Span[] = firstAt !== null && lastAt !== null ? [[firstAt, lastAt]] : [];
-  const generateSpans = subtractSpans(turnUnion, unionSpans([...toolUnion, ...confirmUnion]));
-  // ターン境界の無い記録（人間発話レコードを持たない transcript）でもツール区間は稼働なので、
-  // 稼働 = ターン ∪ ツール ∪ 確認待ち ∪ サブエージェント。これで恒等式が全記録で成立する
-  const mainActiveUnion = unionSpans([...turnUnion, ...toolUnion, ...confirmUnion]);
+  const generateSpans = subtractSpans(turnUnion, unionSpans([...callUnion, ...confirmUnion]));
+  const mainActiveUnion = unionSpans([...turnUnion, ...callUnion, ...confirmUnion]);
   const activeUnion = unionSpans([...mainActiveUnion, ...subActiveUnion]);
-  // 返信待ち = 経過 − 稼働。ターンをまたぐ空白だけを数え、サブエージェントの作業時間を
-  // 返信待ちに数えない（R-DSP-15）
   const replySpans = subtractSpans(whole, activeUnion);
-  // 経過窓へ切る。子 transcript の終端が親の lastAt より後だと、切らない限り 5 項の合計が経過を超える
   const subOnlySpans = intersectSpans(subtractSpans(subActiveUnion, mainActiveUnion), whole);
+  const metrics = (start: number | null, stop: number): PlanBlockMetrics => {
+    const interval: Span[] = start === null ? [] : [[start, stop]];
+    const measured = start !== null;
+    const amount = (spans: readonly Span[], available = true): number | null => measured && available ? measureSpans(intersectSpans(spans, interval)) : null;
+    return { generateMs: amount(generateSpans, !inherited), toolMs: amount(toolUnion),
+      subagentWaitMs: amount(subagentWaitUnion), subagentOnlyMs: amount(subOnlySpans, !inherited), decisionWaitMs: amount(confirmUnion),
+      replyWaitMs: amount(replySpans, !inherited), tokens: null };
+  };
 
   const toolMs = measureSpans(intersectSpans(toolUnion, whole));
+  const subagentWaitMs = measureSpans(intersectSpans(subagentWaitUnion, whole));
   const confirmMs = measureSpans(intersectSpans(confirmUnion, whole));
   const generateMs = measureSpans(intersectSpans(generateSpans, whole));
   const replyMs = measureSpans(replySpans);
   const subOnlyMs = measureSpans(subOnlySpans);
-  const mainBarMs = generateMs + measureSpans(intersectSpans(nonDelegationToolUnion, whole));
+  const mainBarMs = generateMs + toolMs;
   const mainByModel =
     inherited || options?.modelMarks === undefined
       ? null
-      : deriveMainByModel(turnSpansAll, intersectSpans(generateSpans, whole), mainBarMs - generateMs, options.modelMarks);
+      : deriveMainByModel(turnSpansAll, intersectSpans(generateSpans, whole), toolMs, options.modelMarks);
   const subGenerate = agents.reduce((acc, a) => acc + a.generateMs, 0);
   const subTool = agents.reduce((acc, a) => acc + a.toolMs, 0);
   const subSpan = agents.reduce((acc, a) => acc + Math.max(0, a.end - a.start), 0);
+  const subBarMs = subagentBackgroundSpans.reduce((acc, [s0, s1]) => acc + (s1 - s0), subSpan);
 
   const intervals: TimeBucketInterval[] = [];
   if (!inherited) {
     for (const [s0, s1] of generateSpans) intervals.push({ bucket: "generate", lane: "main", start: s0, end: s1 });
   }
   for (const [s0, s1] of toolUnion) intervals.push({ bucket: "tool", lane: "main", start: s0, end: s1 });
+  for (const [s0, s1] of subagentWaitUnion) intervals.push({ bucket: "delegation", lane: "main", start: s0, end: s1 });
   const bgUnion = unionSpans(bgSpans);
   const withBgOverlap = (interval: TimeBucketInterval): TimeBucketInterval => {
     const overlap = measureSpans(intersectSpans([[interval.start, interval.end]], bgUnion));
@@ -928,33 +1117,62 @@ export function deriveTimeBuckets(
   }
   intervals.sort((a, b) => a.start - b.start || a.end - b.end);
 
+  const allSteps = state.blocks.flatMap(block => (block.steps ?? []).map(step => ({ ...step, closedAt: block.closedAt, blockId: block.blockId, key: `${block.blockId}\n${step.key}`, stepKey: step.key })));
+  const allTransitions = new Map(allSteps.map(step => [step.key, step.transitions]));
+  const attribute = (agent: AgentSpanView | BackgroundTaskSpanView, launchedAt: number, blockId: string) => {
+    const step = planStepAt(allSteps.filter(value => value.closedAt === undefined || launchedAt < value.closedAt), allTransitions, launchedAt);
+    agent.blockId = step?.blockId ?? blockId;
+    agent.stepKey = step?.stepKey;
+  };
   const blocks: RequestBlockView[] = [];
   for (let i = 0; i < state.blocks.length; i++) {
     const b = state.blocks[i];
     const nextStart = i + 1 < state.blocks.length ? state.blocks[i + 1].start : end;
-    const bEnd = Math.max(b.start, nextStart);
+    const bEnd = Math.max(b.start, b.closedAt ?? nextStart);
     const bspan: Span[] = [[b.start, bEnd]];
     const turnIds = turnSpansAll.filter((t) => t.start >= b.start && t.start < bEnd).map((t) => t.turnId);
     if (b.turnId !== null && !turnIds.includes(b.turnId)) turnIds.unshift(b.turnId);
     const blockTools = state.mainTools.filter((t) => t.start >= b.start && t.start < bEnd);
     const tools = blockTools.filter((t) => !isBookkeepingTool(t.toolName));
-    const blockAgents = agents.filter((a) => a.start >= b.start && a.start < bEnd);
-    for (const a of blockAgents) a.blockId = b.blockId;
-    for (const t of backgroundTasks) if (t.start >= b.start && t.start < bEnd) t.blockId = b.blockId;
+    const launchedHere = (at: number) => at >= b.start && (at < bEnd || i === state.blocks.length - 1 && at === bEnd);
+    const blockAgents = agents.filter((a) => launchedHere(keyedGet(state.delegations, a.toolUseId)!.startedAt));
+    for (const a of blockAgents) {
+      attribute(a, keyedGet(state.delegations, a.toolUseId)!.startedAt, b.blockId);
+    }
+    for (const t of backgroundTasks) if (launchedHere(t.start)) {
+      attribute(t, t.start, b.blockId);
+    }
     const firstReal = blockTools.length > 0 ? Math.min(...blockTools.map((t) => t.start)) : undefined;
-    const running = state.openTurn !== undefined && i === state.blocks.length - 1;
+    const running = state.openTurn !== undefined && b.closedAt === undefined && i === state.blocks.length - 1;
     const generate = measureSpans(intersectSpans(generateSpans, bspan));
     const tool = measureSpans(intersectSpans(toolUnion, bspan));
+    const subagentWait = measureSpans(intersectSpans(subagentWaitUnion, bspan));
     const confirm = measureSpans(intersectSpans(confirmUnion, bspan));
     const reply = measureSpans(intersectSpans(replySpans, bspan));
-    const processing = generate + tool + confirm;
+    const processing = generate + tool + subagentWait + confirm;
     const elapsed = bEnd - b.start;
+    const steps: PlanBlockStepView[] = (b.steps ?? []).map(step => {
+      const stop = step.startedAt === null ? null : Math.min(step.endedAt ?? end, b.closedAt ?? end);
+      return { key: step.key, title: redactAbsolutePaths(step.title), status: step.status, removed: step.removed,
+        startedAt: step.startedAt, endedAt: step.endedAt, end: stop,
+        durationMs: inherited || stop === null ? null : Math.max(0, stop - step.startedAt!), longest: false, parallel: false,
+        ...metrics(step.startedAt, stop ?? bEnd), provisional: running };
+    });
+    const activeSpans = (step: PlanBlockStepRecord): Span[] => step.transitions.flatMap((change, index) => change.active
+      ? [[change.at, Math.min(step.transitions[index + 1]?.at ?? end, b.closedAt ?? end)] as Span] : []);
+    const stepSpans = (b.steps ?? []).map(activeSpans);
+    for (let j = 0; j < steps.length; j++) steps[j].parallel = stepSpans.some((spans, k) => k !== j && measureSpans(intersectSpans(stepSpans[j], spans)) > 0);
+    const longest = steps.reduce<PlanBlockStepView | undefined>((winner, step) => step.durationMs !== null && (winner?.durationMs == null || step.durationMs > winner.durationMs) ? step : winner, undefined);
+    if (longest) longest.longest = true;
     blocks.push({
       blockId: b.blockId,
       requestNumber: b.requestNumber ?? null,
       processingMs: inherited ? null : processing,
       strip: inherited || elapsed === 0 ? null : {
-        processingPercent: processing / elapsed * 100,
+        generatePercent: generate / elapsed * 100,
+        toolPercent: tool / elapsed * 100,
+        subagentWaitPercent: subagentWait / elapsed * 100,
+        confirmPercent: confirm / elapsed * 100,
         replyPercent: reply / elapsed * 100,
         remainderPercent: Math.max(0, elapsed - processing - reply) / elapsed * 100,
       },
@@ -969,56 +1187,56 @@ export function deriveTimeBuckets(
       failCount: tools.filter((t) => t.isError).length,
       agentCount: blockAgents.length,
       generateMs: inherited ? null : measureSpans(intersectSpans(generateSpans, bspan)),
-      toolMs: measureSpans(intersectSpans(toolUnion, bspan)),
+      toolMs: tool,
+      subagentWaitMs: subagentWait,
       confirmMs: measureSpans(intersectSpans(confirmUnion, bspan)),
       replyMs: inherited ? null : measureSpans(intersectSpans(replySpans, bspan)),
       running,
+      ...(b.kind === "plan" ? { goal: b.goal, ...(b.closedAt === undefined ? {} : { closedAt: b.closedAt }), steps, userMessages: b.userMessages ?? [], metrics: { ...metrics(b.start, bEnd), provisional: running } } : {}),
     });
   }
 
   const maxParallelAgents = sweepMax(agentSpans);
   const openMainTools = Object.values(state.openTools).filter((o) => o.lane === "main");
   const confirmOpen = openMainTools.some((o) => HUMAN_INPUT_WAIT_TOOLS.has(o.toolName));
-  // 現在値と最大値は同じ母集団（確認待ちを除いたメインの往復 + 委任 + 背景タスク）。片方だけ数えると、
-  // 動作中のメインの往復が並列数に出ない・現在値が最大値を超える、のどちらかになる
   const turnParallel = state.openTurn !== undefined && !confirmOpen ? 1 : 0;
   const currentParallel = turnParallel + agents.filter((a) => a.open).length + backgroundTasks.filter((t) => t.open).length;
-  // 現在値は到達済みの同時実行数なので、最大値がそれを下回る画面を作らない
   const maxConcurrency = Math.max(sweepMax([...subtractSpans(turnUnion, confirmUnion), ...agentSpans, ...bgSpans]), currentParallel);
 
-  // tail は Host 事実で view は intervals から判定しない（R-DSP-15）
-  const tailMain: "generate" | "tool" | "confirm" | null =
+  const tailMain: TimeBucketView["tail"]["main"] =
     confirmOpen
       ? "confirm"
-      : openMainTools.length > 0
+      : openMainTools.some((o) => !isSubagentWaitTool(o.toolName))
         ? "tool"
-        : state.openTurn !== undefined
-          ? "generate"
-          : null;
+        : openMainTools.length > 0
+          ? "delegation"
+          : state.openTurn !== undefined
+            ? "generate"
+            : null;
   const tailAnyOpen = tailMain !== null || agents.some((a) => a.open) || backgroundTasks.some((t) => t.open);
   const tail = { main: tailMain, anyOpen: tailAnyOpen };
 
-  return {
+  const view: TimeBucketView = {
     fidelity: state.fidelity,
     inheritedBoundaryCount: state.inheritedBoundaryCount,
     firstAt,
     lastAt,
     spanMs: inherited ? null : spanMs,
     main: {
-      // 実測できていない区分を 0 と書かない。0 は「無かった」を主張する（R-DSP-01）
       generateMs: inherited ? null : generateMs,
       toolMs,
+      subagentWaitMs,
       confirmMs,
       replyMs: inherited ? null : replyMs,
       subOnlyMs: inherited ? null : subOnlyMs,
       spanMs: inherited ? null : spanMs,
     },
     sub: { generateMs: subGenerate, toolMs: subTool, spanMs: subSpan },
-    // R-DSP-49: mainBarMs; subSpan
     bars: {
       mainMs: inherited ? null : mainBarMs,
-      subMs: subSpan,
-      totalMs: inherited ? null : mainBarMs + subSpan,
+      toolMs: inherited ? null : toolMs,
+      subMs: subBarMs,
+      totalMs: inherited ? null : mainBarMs + subBarMs,
     },
     mainByModel,
     agentCount: agents.length,
@@ -1034,25 +1252,63 @@ export function deriveTimeBuckets(
     droppedIntervalCount: state.droppedIntervalCount,
     droppedBlockCount: state.droppedBlockCount,
   };
+  return view;
 }
 
-// JSONL の読み直し（measured）で数値を差し替えるとき、live の fold（live）が持つ「今」の状態は残す。
-// readSessionHistory は末尾で turn_completed を合成し、子 transcript の末尾レコードで endedAt を立てるので、
-// 読み直しの値だけだと開いているターンも動作中のサブエージェントも全て閉じた形になる
-// （概要の「現在」・実行中の往復・並列数・グラフの伸びる帯が出なくなる — R-DSP-20 / R-DSP-06 / R-TAB-09）。
-// 数値（4 区分・棒・経過・区間）は measured、状態（turnOpen / blocks[].running / agents[].open /
-// backgroundTasks[].open / currentParallel / 開いている区間の終端）は live から取る。live の fold は async 委任を
-// task-notification で閉じ resume で開き直す（裁定A2/A1）ので、開閉どちらの向きも live を正とする
-// （measured は末尾合成で常に閉じた形になるため、開く向きだけでなく閉じる向きも live に任せる）
+export function projectWorkBlockTokens(view: TimeBucketView, usage: PlanUsage): TimeBucketView {
+  const total = (slices: PlanUsage["blocks"][number]["slices"], start: number | null, end: number): PlanTokenTotal | null => {
+    if (start === null) return null;
+    let result: PlanTokenTotal | null = null;
+    for (const slice of slices) {
+      const overlap = Math.max(0, Math.min(end, slice.end) - Math.max(start, slice.start));
+      if (overlap <= 0) continue;
+      result ??= { tokens: 0, cacheRead: 0 };
+      const ratio = overlap / Math.max(1, slice.end - slice.start);
+      result.tokens += slice.tokens * ratio;
+      result.cacheRead += slice.cacheRead * ratio;
+    }
+    return result;
+  };
+  const byId = new Map(usage.blocks.map(block => [block.blockId, block]));
+  const allSlices = usage.blocks.flatMap(block => block.slices);
+  return { ...view, blocks: view.blocks.map(block => {
+    if (block.kind !== "plan") return block;
+    const observed = byId.get(block.blockId);
+    const slices = observed?.slices ?? [];
+    return { ...block, metrics: { ...block.metrics!, tokens: slices.length && observed
+      ? { tokens: observed.tokens, cacheRead: observed.cacheRead } : null },
+      steps: block.steps?.map(step => ({ ...step, tokens: total(allSlices, step.startedAt, step.end ?? block.end) })) };
+  }) };
+}
+
+export function currentWorkBlock(state: TimeBucketState): RequestBlockRecord | undefined { const block = state.blocks.at(-1); return block?.closedAt === undefined ? block : undefined; }
+
+function retainObserved<T extends object>(measured: T, live: T): T {
+  return { ...measured, ...Object.fromEntries(Object.entries(live).filter(([, value]) => value !== null && value !== undefined)) };
+}
+
+function refreshCurrentPlan(measured: RequestBlockView, live: RequestBlockView, provisional: boolean): RequestBlockView {
+  const steps = new Map(measured.steps?.map(step => [step.key, step]));
+  for (const step of live.steps ?? []) {
+    const previous = steps.get(step.key);
+    steps.set(step.key, { ...(previous ? { ...retainObserved(previous, step), longest: step.durationMs === null ? previous.longest : step.longest } : step), provisional });
+  }
+  const messages = new Map([...measured.userMessages ?? [], ...live.userMessages ?? []].map(message => [`${message.at}:${message.text}`, message]));
+  return { ...retainObserved(measured, live),
+    metrics: { ...(measured.metrics && live.metrics ? retainObserved(measured.metrics, live.metrics) : live.metrics ?? measured.metrics!), provisional },
+    steps: [...steps.values()].map(step => ({ ...step, provisional })), userMessages: [...messages.values()].sort((a, b) => a.at - b.at) };
+}
+
 export function overlayLiveTimeBucketState(measured: TimeBucketView, live: TimeBucketView): TimeBucketView {
   const liveAgents = new Map(live.agents.map((a) => [a.toolUseId, a]));
   const agents: AgentSpanView[] = measured.agents.map((a) => {
     const l = liveAgents.get(a.toolUseId);
-    if (l === undefined || l.open === a.open) return a;
-    if (l.open) return { ...a, open: true, end: Math.max(a.end, l.end), endSource: "open" };
-    return { ...a, open: false, end: l.end, endSource: l.endSource };
+    if (l === undefined) return a;
+    const attributed = { ...a, blockId: l.blockId, stepKey: l.stepKey };
+    if (l.open === a.open) return attributed;
+    if (l.open) return { ...attributed, open: true, end: Math.max(a.end, l.end), endSource: "open" };
+    return { ...attributed, open: false, end: l.end, endSource: l.endSource };
   });
-  // live で観測済みだが読み直しにまだ無いサブエージェント（読み直しは境界イベントから 1.5 秒遅れる）
   for (const l of live.agents) {
     if (measured.agents.some((a) => a.toolUseId === l.toolUseId)) continue;
     agents.push(l);
@@ -1060,9 +1316,11 @@ export function overlayLiveTimeBucketState(measured: TimeBucketView, live: TimeB
   const liveBg = new Map(live.backgroundTasks.map((t) => [t.toolUseId, t]));
   const backgroundTasks: BackgroundTaskSpanView[] = measured.backgroundTasks.map((t) => {
     const l = liveBg.get(t.toolUseId);
-    if (l === undefined || l.open === t.open) return t;
-    if (l.open) return { ...t, open: true, end: Math.max(t.end, l.end), endSource: "open" };
-    return { ...t, open: false, end: l.end, endSource: l.endSource };
+    if (l === undefined) return t;
+    const attributed = { ...t, blockId: l.blockId, stepKey: l.stepKey };
+    if (l.open === t.open) return attributed;
+    if (l.open) return { ...attributed, open: true, end: Math.max(t.end, l.end), endSource: "open" };
+    return { ...attributed, open: false, end: l.end, endSource: l.endSource };
   });
   for (const l of live.backgroundTasks) {
     if (measured.backgroundTasks.some((t) => t.toolUseId === l.toolUseId)) continue;
@@ -1072,21 +1330,27 @@ export function overlayLiveTimeBucketState(measured: TimeBucketView, live: TimeB
     ...agents.map((a) => [a.start, a.end] as Span),
     ...backgroundTasks.map((t) => [t.start, t.end] as Span),
   ];
-  // 確認待ちの判定は live の tail（Host 事実）。overlay は区間を持たないので confirmUnion を作り直さない
   const turnParallel = live.turnOpen && live.tail.main !== "confirm" ? 1 : 0;
   const mergedParallel = turnParallel + agents.filter((a) => a.open).length + backgroundTasks.filter((t) => t.open).length;
-  const blocks: RequestBlockView[] = measured.blocks.map((b) => ({ ...b, running: false }));
+  const blocks: RequestBlockView[] = measured.blocks.map(block => ({ ...block, running: false }));
   const liveLast = live.blocks[live.blocks.length - 1];
-  if (live.turnOpen && liveLast !== undefined && liveLast.running) {
-    // 往復の対応は順序（blockId は fold が付ける通し番号）。本文で取ると、直前と同じ本文の依頼が
-    // 読み直しにまだ無いとき、直前の往復が「現在」になり新しい往復が消える（R-DSP-20 / R-TAB-09）。
-    // 読み直しは live の接頭辞なので、対応するのは読み直しの末尾に限る
-    const at = blocks.findIndex((b) => b.blockId === liveLast.blockId);
-    if (at >= 0 && at === blocks.length - 1) {
-      blocks[at] = { ...blocks[at], running: true, end: Math.max(blocks[at].end, liveLast.end) };
-    } else {
-      // live の最後の往復が読み直しにまだ無い。数値は継承時刻由来なので出さない（R-DSP-11）
-      blocks.push({ ...liveLast, durationMs: null, generateMs: null, replyMs: null, processingMs: null, strip: null, running: true });
+  if (liveLast !== undefined && (liveLast.running || (live.lastAt ?? 0) > (measured.lastAt ?? 0))) {
+    const currentLast = blocks.at(-1);
+    const sameOpening = currentLast !== undefined && currentLast.kind === liveLast.kind
+      && (currentLast.goal !== undefined ? currentLast.goal === liveLast.goal
+        : liveLast.goal === undefined && (currentLast.text === liveLast.text
+          || currentLast.kind === "plan" && currentLast.steps?.some(step => liveLast.steps?.some(value => value.key === step.key))))
+      && liveLast.start <= (measured.lastAt ?? currentLast.end) && liveLast.end >= currentLast.start;
+    const at = currentLast?.blockId === liveLast.blockId && (currentLast.start === liveLast.start || sameOpening) ? blocks.length - 1 : -1;
+    if (at >= 0 && at === blocks.length - 1 && blocks[at].closedAt === undefined) {
+      const current = blocks[at];
+      const refresh = liveLast.kind === "plan" && current.kind === "plan"
+        && (live.lastAt ?? 0) >= (measured.lastAt ?? 0);
+      const provisional = liveLast.running || (live.lastAt ?? 0) > (measured.lastAt ?? 0);
+      blocks[at] = { ...(refresh ? refreshCurrentPlan(current, liveLast, provisional) : current), start: current.start, anchorAt: current.anchorAt,
+        requestNumber: current.requestNumber ?? liveLast.requestNumber, running: liveLast.running, end: Math.max(current.end, liveLast.end) };
+    } else if (blocks.length === 0 || liveLast.start > blocks[blocks.length - 1].start) {
+      blocks.push(liveLast.kind === "plan" ? refreshCurrentPlan(liveLast, liveLast, true) : { ...liveLast, durationMs: null, generateMs: null, replyMs: null, processingMs: null, strip: null, running: liveLast.running });
     }
   }
   return {
@@ -1096,8 +1360,6 @@ export function overlayLiveTimeBucketState(measured: TimeBucketView, live: TimeB
     blocks,
     agentCount: agents.length,
     currentParallel: mergedParallel,
-    // 読み直しは live より遅れるので、merged にしか無い区間の分だけ measured の最大値が足りない。
-    // measured 側はターン区間を含むため捨てられず、下界の最大を取る（過大申告はしない）
     maxConcurrency: Math.max(measured.maxConcurrency, sweepMax(mergedSpans), mergedParallel),
     turnOpen: live.turnOpen,
     tail: live.tail,

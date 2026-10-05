@@ -11,7 +11,6 @@ import { readSessionHistory } from "./session-transcript";
 import type { Session } from "./extension";
 import type { SessionStore } from "./store-surfaces";
 
-// セッション概要の要約の保存先（R-DSP-25）。sessionId → { text, model, generatedAt }
 export const SESSION_SUMMARY_STORE_KEY = "laisora.sessionSummary.v1";
 const SESSION_SUMMARY_STORE_MAX = 500;
 
@@ -68,14 +67,10 @@ export class SessionSummaryWiring {
     return this.host.ownerState.kind === "pinned" ? this.host.ownerState.ownerId : undefined;
   }
 
-  // 保存先は完了時点の Session から summaryPersistKey() で引き直すので、生成中に /clear や
-  // resume が入った結果をそのまま書き戻すと、旧会話の要約が新会話の ID で永続保存される（W-SUM-6）
   private supersededSince(logicalGenerationAtStart: number): boolean {
     return this.host.logicalGeneration !== logicalGenerationAtStart;
   }
 
-  // resetLogicalSession 専用。写しと hydration 済みフラグを落とさないと、旧会話の要約が
-  // 新しい世代の snapshot に載り続ける（保存先の鍵は世代とともに変わる）
   resetForLogicalSession(): void {
     this.nameRun?.abort();
     this.nameRun = null;
@@ -85,13 +80,11 @@ export class SessionSummaryWiring {
     this.summaryHydrated = false;
   }
 
-  // 保存済みの要約は resume を跨いで sessionId で引く（R-DSP-25「結果は保存する」）
   hydratedSessionSummary(): { text: string; model: string } | null {
     if (!this.summaryHydrated) {
       this.summaryHydrated = true;
       if (this.host.sessionSummary === null) {
         const key = this.summaryPersistKey();
-        // 検収ハーネスの stub context は globalState を持たない。無ければ保存なし（写しも空）として動く
         const gs = extensionContext?.globalState;
         if (key !== undefined && gs !== undefined) {
           const store = gs.get<Record<string, { text?: unknown; model?: unknown }>>(SESSION_SUMMARY_STORE_KEY);
@@ -105,8 +98,6 @@ export class SessionSummaryWiring {
     return this.host.sessionSummary;
   }
 
-  // failure は実行しなかった / 生成できなかった理由。既存の要約（summary）と同じ便で運ぶので、
-  // 失敗の通知が保存済みの要約を消さない（R-DSP-25 / R-DSP-01）
   private postSessionSummaryState(running: boolean, saveFailed = false, failure?: string): void {
     const summary = this.host.sessionSummary;
     this.store.post({
@@ -141,14 +132,11 @@ export class SessionSummaryWiring {
     let saveFailed = false;
     let failure: string | undefined;
     try {
-      // R-DSP-25 / R-ANL-21. R-ORC-04: haiku takes no effort.
       const modelId = "haiku";
 
       const { userTexts, toolCalls, agentCount, readFailure } = await this.collectSummaryInput();
       if (this.supersededSince(logicalGenerationAtStart)) return;
       if (userTexts.length === 0) {
-        // R-SES-09。「記録が無い」と「記録を確かめられなかった」を分ける。読み直しに失敗しただけのときに
-        // 前者を名乗ると、発言が多数あるセッションについて存在の否定を断言する
         const reason =
           readFailure === undefined
             ? "要約する記録がまだありません"
@@ -168,7 +156,7 @@ export class SessionSummaryWiring {
       output.appendLine(`[${this.host.title}] 要約を開始します（トークンを消費します・モデル: ${modelId}）`);
       const result = await generateSessionSummaryViaSdk({
         modelId,
-        apiKeyPolicy: normalizeApiKeyPolicy(getLaisoraConfiguration().get("claude.apiKeyPolicy", "inherit")), // R-GW-05
+        apiKeyPolicy: normalizeApiKeyPolicy(getLaisoraConfiguration().get("claude.apiKeyPolicy", "inherit")),
         cwd: resolveSessionCwd(this.host) ?? process.cwd(),
         prompt: (naming ? buildSessionNamePrompt : buildSummaryPrompt)(buildSessionDigest(userTexts, toolCalls, agentCount)),
         signal: abort.signal,
@@ -191,14 +179,10 @@ export class SessionSummaryWiring {
     } catch (error) {
       const superseded = this.supersededSince(logicalGenerationAtStart);
       output.appendLine(`[${this.host.title}] 要約${superseded ? "を中断（論理セッションの切替）" : "に失敗"}: ${String(error)}`);
-      // /clear などによる中断は利用者の操作の結果なので、失敗として通知しない
       if (superseded) return;
-      // 実際に何が起きたかを理由付きで出す（R-DSP-01）。全文は Output にある
       const reason = (error instanceof Error ? error.message : String(error)).slice(0, 120);
       failure = l10n.t("LAISORA: Summary failed — {0}", reason);
     } finally {
-      // 同一性で見る。世代交代後に始まった新しい実行の running 表示を、中断された旧実行が消さない。
-      // 失敗理由も同じ便に載せるので、旧実行の失敗が新しい実行の状態を巻き戻さない
       if (naming && this.nameRun === abort) {
         this.nameRun = null;
         this.store.post(suggestion !== undefined
@@ -206,18 +190,11 @@ export class SessionSummaryWiring {
           : { type: "sessionNameSuggestion", tabId: this.host.tabId, reason: failure ?? l10n.t("Could not generate a session name.") });
       } else if (!naming && this.host.summaryRun === abort) {
         this.host.summaryRun = null;
-        // 保存に失敗した要約を「保存済み」と表示させない（R-DSP-01 / R-DSP-25）
         this.postSessionSummaryState(false, saveFailed, failure);
       }
     }
   }
 
-  // 要約の入力。fold 側の this.host.events は上限到達で先頭から切り詰められる（droppedEventCount）ため、
-  // 切り詰めが起きているセッションでは JSONL（全期間の集計と同じ出所 — R-TAB-07 の whole-session 経路）
-  // から読み直す。JSONL が読めなければ切り詰め済みイベント列で代用し、readFailure に理由を載せる。
-  // 分類は「どこで失敗したか」だけで決める。例外文の部分一致で原因を名乗ると、OS の別の失敗まで
-  // 同じ対処へ誘導する（R-DSP-01 と同型）。readFailure を「読めたが空だった」ときに立てないこと。
-  // 立てると、発言の無いセッションについて「読めませんでした」と逆向きの誤りを断言する（R-DSP-01）
   private async collectSummaryInput(): Promise<{
     userTexts: string[];
     toolCalls: number;
@@ -251,8 +228,6 @@ export class SessionSummaryWiring {
     return summaryInputFromEvents(this.host.events);
   }
 
-  // 保存できたら true。cap の理由: globalState は拡張全体で共有される保存域で、上限なしに貯めると
-  // state の読み書き全体が肥大化する。溢れても黙って捨てず、最古の分だけ削除してログに残す（新しい方を保持）
   private async persistSessionSummary(): Promise<boolean> {
     const summary = this.host.sessionSummary;
     if (summary === null) return false;

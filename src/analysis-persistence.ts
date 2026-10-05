@@ -109,7 +109,6 @@ export type SaveResult =
   | { kind: "rejected"; reason: "schema_violation" }
   | { kind: "failed"; reason: "update_error" | "stringify_error" };
 
-// Persisted history is bounded by the storage backend, not by arbitrary report cardinality or byte caps.
 function isRecord(v: unknown): v is Record<string, unknown> {
   return typeof v === "object" && v !== null && !Array.isArray(v);
 }
@@ -326,7 +325,6 @@ function decodeArtifact(raw: unknown): DecodeCheckResult<PersistedAnalysisArtifa
     return { ok: false, reason: typeof raw.analysisSdk !== "string" ? "bad_type" : "bad_enum" };
   }
 
-  // requestedModel
   if (!isRecord(raw.requestedModel)) return { ok: false, reason: "bad_type" };
   let requestedModel: PersistedAnalysisArtifact["requestedModel"];
   if (raw.requestedModel.kind === "explicit") {
@@ -342,7 +340,6 @@ function decodeArtifact(raw: unknown): DecodeCheckResult<PersistedAnalysisArtifa
     return { ok: false, reason: "bad_enum" };
   }
 
-  // requestedEffort
   if (!isRecord(raw.requestedEffort)) return { ok: false, reason: "bad_type" };
   let requestedEffort: PersistedAnalysisArtifact["requestedEffort"];
   const effortLevels: EffortLevel[] = ["low", "medium", "high", "xhigh", "max"];
@@ -359,7 +356,6 @@ function decodeArtifact(raw: unknown): DecodeCheckResult<PersistedAnalysisArtifa
     return { ok: false, reason: "bad_enum" };
   }
 
-  // executedModels
   let executedModels: string[] | null = null;
   if (raw.executedModels !== null) {
     if (!Array.isArray(raw.executedModels)) return { ok: false, reason: "bad_type" };
@@ -371,7 +367,6 @@ function decodeArtifact(raw: unknown): DecodeCheckResult<PersistedAnalysisArtifa
     executedModels = [...raw.executedModels];
   }
 
-  // report
   const repDec = decodeReport(raw.report);
   if (!repDec.ok) return repDec;
 
@@ -509,7 +504,6 @@ export function saveArtifact(
 ): Promise<SaveResult> {
   const job = async (): Promise<SaveResult> => {
     const ownerStorage = storage.forSession?.(ownerId) ?? storage;
-    // 1. candidate preflight
     let s: string;
     try {
       s = JSON.stringify(candidate);
@@ -522,7 +516,6 @@ export function saveArtifact(
       return { kind: "rejected", reason: "schema_violation" };
     }
 
-    // 2. read-modify-write on loaded store deep copy (IC-03.4)
     const currentStore = loadStore(ownerStorage, log);
     const next: AnalysisStore = structuredClone(currentStore);
 
@@ -532,15 +525,12 @@ export function saveArtifact(
       next.sessions[ownerId] = entry;
     }
 
-    // Dedupe
     entry.artifacts = entry.artifacts.filter((a) => a.artifactId !== candidate.artifactId);
     entry.artifacts.push(candidate);
     entry.updatedAt = Math.max(entry.updatedAt, candidate.generatedAt);
 
-    // Sort ascending by (generatedAt, artifactId)
     entry.artifacts.sort(compareArtifactAsc);
 
-    // 3. storage write
     try {
       await ownerStorage.update(ANALYSIS_STORE_KEY, next);
       return { kind: "saved" };

@@ -1,4 +1,3 @@
-// R-DSP-25
 import type { Options as ClaudeCodeOptions } from "@anthropic-ai/claude-agent-sdk" with { "resolution-mode": "import" };
 import type * as ClaudeCodeSdk from "@anthropic-ai/claude-agent-sdk" with { "resolution-mode": "import" };
 import { buildClaudeEnv, describeSdkErrorResult } from "./claude-env";
@@ -6,7 +5,6 @@ import { RENAME_TITLE_MAX, type ApiKeyPolicy } from "./protocol";
 import { resolveClaudeCodeStartup } from "./claudeCliResolver";
 import * as l10n from "@vscode/l10n";
 
-// R-DSP-25
 export function buildSummaryPrompt(digest: string): string {
   return [
     l10n.t("Below is an excerpt from one session's record. Summarize what this session did in 1–2 sentences (under 120 characters)."),
@@ -95,7 +93,7 @@ export async function generateSessionSummaryViaSdk(
       permissionMode: "default",
       persistSession: false,
       cwd: opts.cwd,
-      env: buildClaudeEnv(process.env, opts.apiKeyPolicy).env, // R-GW-05
+      env: buildClaudeEnv(process.env, opts.apiKeyPolicy).env,
       outputFormat: {
         type: "json_schema",
         schema: {

@@ -20,13 +20,9 @@ export interface L3Basis {
 export type L3UnavailableReason =
   | "no_attempt_input"
   | "no_execution_window_input"
-  // 両側 unknownEffects=false の対が存在しないと resource 系の辺は構造的に生じない。
-  // 「辺が 0 本」を「競合なし」と書かないための分岐
   | "no_footprint_input"
   | "edge_limit_exceeded"
-  // 窓を持つ Task はあるが逐次（非重複）の対が1件も無い
   | "no_serial_pair"
-  // 観測制約辺（observed_data_dep ∪ resource_conflict の非重複対）が 0 本
   | "no_constraint_edges";
 
 export interface L3MetricBase {
@@ -64,7 +60,6 @@ export interface SerializationPair {
 }
 
 export interface SerializationAttemptPair {
-  // ソート済み nodeId を "|" で連結した決定論的 id。配列添字を期待値の係留先にしないため
   pairId: string;
   attemptAId: string;
   attemptBId: string;
@@ -75,12 +70,10 @@ export interface SerializationAttemptPair {
 export interface L3SerializationProfile {
   pairs: SerializationPair[];
   counts: Record<SerializationClassification, number>;
-  // Attempt 対の serialization。Task 対とは別に数え、Task 対の値へ加算する
   attemptPairs: SerializationAttemptPair[];
   attemptPairCounts: Record<SerializationClassification, number>;
   basis: L3Basis;
   coverage: SemanticCoverage;
-  // 「母集合が構造的に空」と「3分類すべて 0」を出力上区別する（unavailable を 0 と描かない）
   state: "observed" | "unavailable";
   reason?: L3UnavailableReason;
 }
@@ -94,7 +87,6 @@ export interface EstimateValue {
   coverage: Coverage;
 }
 
-// 単一値。state="estimated" のとき EstimateValue の各フィールドを平坦に持つ
 export interface L3ParallelizationEstimate {
   valueMs?: number;
   estimateType?: EstimateValue["estimateType"];
@@ -151,8 +143,6 @@ function weakerCoverage(a: Coverage, b: Coverage): Coverage {
   return COVERAGE_RANK[a] <= COVERAGE_RANK[b] ? a : b;
 }
 
-// 指標固有の軸は**降格のみ**適用する。上書きにすると model 側が partial（prefix-truncated 等）
-// でも指標が complete を主張しうる
 function coverageWith(
   model: SemanticModel,
   patch?: Partial<Pick<SemanticCoverage, "timing" | "dependency" | "artifact" | "identity" | "detail">>
@@ -213,8 +203,6 @@ function pairKey(a: string, b: string): string {
   return a < b ? `${a}|${b}` : `${b}|${a}`;
 }
 
-// Task 対単位の relation 索引。dd/rc は Attempt 端点を parentId で
-// Task へ射影する（contains/executes は非保存 — P1-B）
 function buildPairRelations(model: SemanticModel): Map<string, PairRelations> {
   const attemptTask = new Map<string, string>();
   for (const a of attemptNodesOf(model)) {
@@ -276,10 +264,6 @@ function taskUnknownEffects(t: TaskDefinitionNode): boolean | undefined {
   return fp.unknownEffects;
 }
 
-// Attempt 対の serialization 観測。
-// Task 対（deriveSerializationProfile）へ加算する第2の単位で、Task 対の値は変更しない。
-// 分類入力は当該 Attempt 自身の footprint / unknownEffects / 実行窓に限る。
-// 兄弟 Attempt や親の非委任 segment を OR した Task 集約値を使わない。
 function deriveSerializationAttemptPairs(model: SemanticModel): {
   pairs: SerializationAttemptPair[];
   counts: Record<SerializationClassification, number>;
@@ -287,7 +271,6 @@ function deriveSerializationAttemptPairs(model: SemanticModel): {
   const taskOf = (a: ExecutionAttemptNode): string | undefined =>
     typeof a.parentId === "string" && a.parentId.startsWith("task:") ? a.parentId : undefined;
 
-  // 母集団: endedAt 確定かつ Task 帰属。scanAttemptPairs（l3-divergence.ts）と同一
   const attempts = attemptNodesOf(model)
     .filter((a) => a.endedAt !== undefined && taskOf(a) !== undefined)
     .sort((x, y) => x.startedAt - y.startedAt || (x.nodeId < y.nodeId ? -1 : 1));
@@ -310,7 +293,6 @@ function deriveSerializationAttemptPairs(model: SemanticModel): {
     for (let j = i + 1; j < attempts.length; j++) {
       const a = attempts[i];
       const b = attempts[j];
-      // 同一 TaskDefinition 内は precedence があるため対象外
       if (taskOf(a) === taskOf(b)) continue;
       const aEnd = a.endedAt!;
       const bEnd = b.endedAt!;
@@ -337,7 +319,6 @@ function deriveSerializationAttemptPairs(model: SemanticModel): {
   return { pairs, counts };
 }
 
-// serializationProfile（観測辺のみを判定入力にする）
 function deriveSerializationProfile(
   model: SemanticModel,
   relations: Map<string, PairRelations>
@@ -386,8 +367,6 @@ function deriveSerializationProfile(
   const basis: L3Basis = { nodeIds: tasks.map((t) => t.nodeId), edgeIds: [], evidence: [] };
   const coverage = coverageWith(model);
 
-  // 裁定H3: 母集合が空（窓を持つ Task が2件未満 / 逐次対が1件も無い）と
-  // 「3分類すべて 0」を区別する。裁定L5: 辺上限到達時は分類入力が欠けている
   let reason: L3UnavailableReason | undefined;
   if (model.coverage.detail === "partial") {
     reason = "edge_limit_exceeded";
@@ -419,15 +398,11 @@ const PARALLELIZATION_ASSUMPTIONS = [
   "no_resource_contention",
 ];
 
-// 除外規則: 同一 Task 内 Attempt（単位が TaskDefinition 間である時点で対象外）/
-// observed_data_dep / resource_conflict / unknownEffects / overlaps。結果は単一値
 function deriveParallelizationEstimate(
   model: SemanticModel,
   relations: Map<string, PairRelations>
 ): L3ParallelizationEstimate {
   const tasks = taskNodesOf(model).filter((t) => t.executionWindow !== undefined);
-  // 裁定L6: 欠けているのは Task ではなく executionWindow（timing 入力）。
-  // 裁定L5: 辺上限到達時は除外規則の入力が欠けており候補群を確定できない
   const gateReason: L3UnavailableReason | undefined =
     model.coverage.detail === "partial"
       ? "edge_limit_exceeded"
@@ -464,7 +439,6 @@ function deriveParallelizationEstimate(
   for (const stageTasks of byStage.values()) {
     if (stageTasks.length < 2) continue;
 
-    // unknownEffects=true（不明含む）の Task は候補ですらなく undetermined（保守的既定）
     const pool = stageTasks.filter((t) => taskUnknownEffects(t) === false);
     for (const t of stageTasks) {
       if (taskUnknownEffects(t) !== false) undeterminedTaskIds.add(t.nodeId);
@@ -549,9 +523,6 @@ function deriveParallelizationEstimate(
   };
 }
 
-// endedAt 確定の Attempt をノード（重み = durationMs）、observed_data_dep ∪
-// resource_conflict のうち overlaps しない対を辺（向きは全順序 (endedAt, startedAt, nodeId) の前→後）
-// とする DAG の最長路。観測辺は依存の完全集合ではない（「クリティカルパス」と呼ばない）
 function attemptOrder(a: ExecutionAttemptNode, b: ExecutionAttemptNode): number {
   if (a.endedAt! !== b.endedAt!) return a.endedAt! - b.endedAt!;
   if (a.startedAt !== b.startedAt) return a.startedAt - b.startedAt;
@@ -574,12 +545,10 @@ function deriveObservedConstraintChain(model: SemanticModel): L3Metric {
     const u = byId.get(e.from);
     const v = byId.get(e.to);
     if (u === undefined || v === undefined || u === v) continue;
-    // overlaps（deriveEdges と同じ strict <）する対は辺にしない
     if (Math.max(u.startedAt, v.startedAt) < Math.min(u.endedAt!, v.endedAt!)) continue;
     const [from, to] = attemptOrder(u, v) < 0 ? [u, v] : [v, u];
     edges.push({ edgeId: e.edgeId, from: from.nodeId, to: to.nodeId });
   }
-  // unknownEffects=true の Attempt は辺を張れず、鎖から漏れうる
   const unknownEffectCount = allAttempts.filter((a) => a.footprint.unknownEffects).length;
   const chainCov = coverageWith(model, unknownEffectCount > 0 ? { artifact: "partial" } : undefined);
   if (edges.length === 0) {
@@ -594,7 +563,6 @@ function deriveObservedConstraintChain(model: SemanticModel): L3Metric {
   for (const e of edges) adj.get(e.from)!.push(e);
 
   const weightOf = (a: ExecutionAttemptNode): number => a.elapsedMs > 0 ? a.elapsedMs : Math.max(0, a.endedAt! - a.startedAt);
-  // ノードは全順序で並んでおり辺は前→後にしか向かないので、順に緩和すれば最長路が確定する
   const best = new Map<string, { cost: number; nodeIds: string[]; edgeIds: string[] }>();
   for (const a of attempts) best.set(a.nodeId, { cost: weightOf(a), nodeIds: [a.nodeId], edgeIds: [] });
   for (const u of attempts) {
@@ -607,7 +575,6 @@ function deriveObservedConstraintChain(model: SemanticModel): L3Metric {
       }
     }
   }
-  // 鎖は辺 1 本以上の路に限る。辺を持たない単独 Attempt を制約鎖として数えると、長い単独作業が鎖を偽装する
   let longest = { cost: 0, nodeIds: [] as string[], edgeIds: [] as string[] };
   for (const a of attempts) {
     const b = best.get(a.nodeId)!;
@@ -633,7 +600,6 @@ function deriveActualConcurrency(model: SemanticModel): L3Metric {
   if (attempts.length === 0) {
     return unavailable(metricId, "no_attempt_input", cov);
   }
-  // 区間 sweep。端点一致（前の終了=次の開始）は非重複（deriveEdges overlaps と同じ strict <）
   const points: { at: number; delta: number }[] = [];
   for (const a of attempts) {
     const end = a.endedAt ?? Infinity;
@@ -651,9 +617,6 @@ function deriveActualConcurrency(model: SemanticModel): L3Metric {
     (e) =>
       e.kind === "overlaps" && e.from.startsWith("attempt:") && e.to.startsWith("attempt:")
   );
-  // 裁定H2: sweep が開区間を ∞ とみなす規約は overlaps 辺生成（semantic-model.ts の
-  // Math.min(aEnd, bEnd) with Infinity）と同一。ただし開区間が値へ寄与しうる以上、
-  // 他の union 系と同じく timing を降格する
   return observed(
     metricId,
     max,
@@ -683,7 +646,6 @@ function deriveTaskMetricSets(model: SemanticModel): L3TaskMetricSet[] {
               edgeIds: [],
               evidence: capEvidence(task.evidence),
             },
-            // 裁定M1: window の coverage は降格のみ（coverageWith が weaker を取る）
             coverageWith(model, { timing: task.executionWindow.coverage })
           )
         : unavailable("taskDurationMs", "no_execution_window_input", cov, undefined, {
@@ -714,27 +676,15 @@ function deriveTaskMetricSets(model: SemanticModel): L3TaskMetricSet[] {
   return out;
 }
 
-// 裁定M4: model 単独では longGap 入力を運べない（SemanticModel は宣言フィールドのみで、
-// Payload 往復・spread・structuredClone を跨いでも意味が変わらないことが前提）。
-// deriveSemanticModel(state, evidence) と同じ2入力にし、evidence 由来の値は evidence から読む。
-// model と evidence は同一 fold 由来の対で渡すこと（対応しない組でも型は通る）
 export function deriveL3(model: SemanticModel, evidence: SemanticEvidenceIndex): L3Report {
   const attempts = attemptNodesOf(model);
   const cov = coverageWith(model);
 
-  // longGap（裁定A3: 入力は evidence.longGaps。走査済みで該当ゼロ = observed 0）
   let longGapMs: L3Metric;
   let longGapCount: L3Metric;
   {
-    // 裁定M6: 閾値判定は fold 側（evidence-index の IDLE_GAP_MS）が単一出所。
-    // L3 で再フィルタしない（二重定義になり、閾値変更時に静かに食い違う）
     const longGaps = evidence.longGaps;
-    // gap は Attempt/Task へ帰属させない（LongGapRecord は at と durationMs のみを持ち、
-    // 区間を含む Attempt へ結びつけるのは帰属の推定になる — 裁定L4 の埋められない側）
     const basis: L3Basis = { nodeIds: [], edgeIds: [], evidence: [] };
-    // 裁定C4: MAX_LONG_GAPS 超過で捨てられた記録も合計へ足す。捨てたのは個々の記録であって
-    // 合計時間と件数は evidence 側に残っているため、総量は欠測ではない（列挙だけが欠ける
-    // ので detail のみ降格する）。count だけ読んで ms を落とすと合計が過少になる
     const droppedCount = evidence.coverage.longGaps;
     const droppedMs = evidence.droppedLongGapMs;
     const gapCov = coverageWith(model, droppedCount > 0 ? { detail: "partial" } : undefined);
@@ -755,12 +705,6 @@ export function deriveL3(model: SemanticModel, evidence: SemanticEvidenceIndex):
     );
   }
 
-  // failureCount（原始集計の写し）。L1 は 1 件の失敗を段落側に 1 回だけ記帳する（自レーンは failCount、
-  // 委任配下は深さを問わず childFailCount）。委任 Attempt の failCount / childFailCount は同じ失敗を
-  // Agent 単位で見直した値なので、段落 Attempt と合算すると二重になる（HANDOFF）。
-  // 委任 Attempt を足すのは、その段落が段落 Attempt に束ねられていない（dispatch だけの段落は L2 が落とす）ときだけ。
-  // segmentIds が空の委任 Attempt はどの段落の代役でもないので足さない（空配列では some() が常に false になり、
-  // 交差判定だけでは「束ねられていない段落」と同じ扱いで素通りする）
   let failureCount: L3Metric;
   if (attempts.length === 0) {
     failureCount = unavailable("failureCount", "no_attempt_input", cov);
@@ -794,9 +738,6 @@ export function deriveL3(model: SemanticModel, evidence: SemanticEvidenceIndex):
 
   const actualConcurrency = deriveActualConcurrency(model);
 
-  // 裁定H1（B2 と同型）: resource 系の辺は両側 unknownEffects=false のときだけ張られる。
-  // 評価可能な対が構造的に 1 組も無いなら「辺 0 本」は競合の不在ではないので
-  // observed 0 と書かない（観測できなかったことを競合しないとして扱わない）
   const footprintObservable = attempts.filter((a) => a.footprint.unknownEffects === false);
   const footprintGate: L3UnavailableReason | undefined =
     attempts.length === 0
@@ -807,8 +748,6 @@ export function deriveL3(model: SemanticModel, evidence: SemanticEvidenceIndex):
       ? "no_footprint_input"
       : undefined;
 
-  // 裁定M5: undetermined の母集合は「overlaps した対のうち unknownEffects で
-  // 判定できなかったもの」。全 Attempt 総当たりだと母集合が意図とずれる
   const attemptById = new Map(attempts.map((a) => [a.nodeId, a]));
   const overlapAttemptEdges = model.edges.filter(
     (e) => e.kind === "overlaps" && attemptById.has(e.from) && attemptById.has(e.to)
@@ -820,7 +759,6 @@ export function deriveL3(model: SemanticModel, evidence: SemanticEvidenceIndex):
     if (a.footprint.unknownEffects || b.footprint.unknownEffects) undeterminedOverlapPairs++;
   }
 
-  // fileWriteConflictCount: resource_conflict のうち overlaps する対（実際に同時に触った）
   let fileWriteConflictCount: L3Metric;
   {
     const overlapPairs = new Set(overlapAttemptEdges.map((e) => pairKey(e.from, e.to)));
@@ -845,7 +783,6 @@ export function deriveL3(model: SemanticModel, evidence: SemanticEvidenceIndex):
           );
   }
 
-  // resourceDependencyCount: observed_data_dep 辺の件数（Footprint 由来の観測のみ）
   let resourceDependencyCount: L3Metric;
   {
     const ddEdges = model.edges.filter((e) => e.kind === "observed_data_dep");
@@ -866,7 +803,6 @@ export function deriveL3(model: SemanticModel, evidence: SemanticEvidenceIndex):
           );
   }
 
-  // unknownEffectRatio: unknownEffects=true の Attempt 割合
   let unknownEffectRatio: L3Metric;
   if (attempts.length === 0) {
     unknownEffectRatio = unavailable("unknownEffectRatio", "no_attempt_input", cov);

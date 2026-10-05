@@ -67,10 +67,8 @@ export function loadContextFiles(cwd: string, configDir: string = claudeConfigDi
     }
   };
 
-  // 1. <cwd>/CLAUDE.md
   tryAdd(join(cwd, "CLAUDE.md"), "CLAUDE.md");
 
-  // 2. <cwd>/.claude/rules/*.md
   const projectRulesDir = join(cwd, ".claude", "rules");
   if (existsSync(projectRulesDir)) {
     try {
@@ -83,13 +81,10 @@ export function loadContextFiles(cwd: string, configDir: string = claudeConfigDi
     } catch {}
   }
 
-  // Labels stay "~/.claude" when CLAUDE_CONFIG_DIR is unset so default users' analysis input does not change.
   const label = process.env.CLAUDE_CONFIG_DIR ? "$CLAUDE_CONFIG_DIR" : "~/.claude";
 
-  // 3. ~/.claude/CLAUDE.md
   tryAdd(join(configDir, "CLAUDE.md"), `${label}/CLAUDE.md`);
 
-  // 4. ~/.claude/rules/*.md
   const userRulesDir = join(configDir, "rules");
   if (existsSync(userRulesDir)) {
     try {
@@ -102,7 +97,6 @@ export function loadContextFiles(cwd: string, configDir: string = claudeConfigDi
     } catch {}
   }
 
-  // 5. ~/.claude/projects/<slug>/memory/MEMORY.md
   const slug = slugForCwd(cwd);
   const memoryPath = join(configDir, "projects", slug, "memory", "MEMORY.md");
   tryAdd(memoryPath, `${label}/projects/${slug}/memory/MEMORY.md`);

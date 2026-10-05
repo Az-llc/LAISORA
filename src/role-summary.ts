@@ -1,7 +1,3 @@
-// メインの処理は入れない。役割は実行時に記録されたものを使い、今の設定で付け替えない（R-ANL-23）。
-// サブエージェントの役割の根拠は、LAISORA が注入した役割表の記録（src/roster-evidence.ts）だけ。
-// agentKey の形をした名前から役割を組み立てない: 利用者が同じ形の名前で作ったエージェントにも役割が付く。
-// 開始時点で有効な記録に無い委任（記録の無い過去のセッション・役割表に無い名前）は role=null。名前の語から役割を推し量らない（R-DSP-01）
 import * as l10n from "@vscode/l10n";
 import type { ExternalRunRecord } from "./orchestration-external";
 import { EXECUTORS } from "./orchestration-roster";
@@ -9,7 +5,6 @@ import type { WorkAgentNode, WorkPhaseView } from "./protocol";
 import { attributeSubagent, type RosterEvidence } from "./roster-evidence";
 import { externalTokens } from "./webview/plan-view";
 
-// shade は役割内で executor·model·effort の組が初めて現れた順。これ以上は同じ値に畳む
 export const ROLE_SHADE_MAX = 3;
 
 export type RoleValueSource = "measured" | "requested";
@@ -27,10 +22,8 @@ export interface RoleRunView {
   startedAt: number | null;
   running: boolean;
   outcome: ExternalRunRecord["outcome"] | null;
-  // null = 測れていない（実行中・終了を観測していない・記録から復元しただけ・使用量の記録が無い）。0 にしない（R-DSP-11）
   durationMs: number | null;
   tokens: number | null;
-  // 役割の合計に対する百分率（区切りの幅）。自分か合計が null なら null
   timePercent: number | null;
   tokenPercent: number | null;
 }
@@ -39,13 +32,11 @@ export interface RoleView {
   role: string | null;
   label: string;
   count: number;
-  // null = どの実行も測れていない。partial = 測れていない実行を含む
   totalMs: number | null;
   totalMsPartial: boolean;
   totalTokens: number | null;
   totalTokensPartial: boolean;
   running: boolean;
-  // 役割の中で最大の合計に対する百分率（棒の長さ）
   timeWidthPercent: number | null;
   tokenWidthPercent: number | null;
   runs: RoleRunView[];
@@ -53,10 +44,7 @@ export interface RoleView {
 
 export interface RoleSummaryView {
   roles: RoleView[];
-  // 概要の rollup へ畳まれたサブエージェントの数から、記録から復元して一覧に載せた数を引いたもの（下限 0）。
-  // rollup は ID を持たないので、復元したものが rollup 由来かどうかは突き合わせられない
   omittedSubagentCount: number;
-  // 保存域の外部実行の記録を読めなかった分。あれば一覧から外部実行が欠けている可能性がある（R-ANL-24 / R-DSP-01）
   externalRunsCoverage?: ExternalRunsCoverage;
 }
 
@@ -140,7 +128,6 @@ const percentOf = (part: number | null, whole: number | null): number | null =>
 const byStart = (a: { startedAt: number | null }, b: { startedAt: number | null }): number =>
   a.startedAt === null ? (b.startedAt === null ? 0 : 1) : b.startedAt === null ? -1 : a.startedAt - b.startedAt;
 
-// 役割の並びは最初の実行の開始順（開始時刻の無いものは後ろ）。同時刻は出現順
 export function deriveRoleSummary(input: {
   phases: readonly WorkPhaseView[];
   unlinkedAgents: readonly WorkAgentNode[];

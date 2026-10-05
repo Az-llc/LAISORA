@@ -1,13 +1,15 @@
 import { captureToolIntentInput } from "./webview/status-line";
-import { subagentResultForDisplay } from "./subagent-result";
+import { localCommandOutput, taskNotificationDisplayFields, taskNotificationPreview, toolResultPreview } from "./transcript-display";
 import type { HostArtifactAccess } from "./artifact-access";
-import type { AssistantUsage, EventProvenance, ImageRefInfo, NormalizedEventBody, RestoredAgent, ResumePreviewMessage } from "./protocol";
+import type { AssistantUsage, AskUserQuestionSpec, EventProvenance, ImageRefInfo, NormalizedEventBody, RestoredAgent, RestoredApprovalCard, ResumePreviewMessage, TaskNotificationInfo } from "./protocol";
+import type { ConversationMessage } from "./conversation-history";
 import { assistantUsageFromRaw, RESUME_PREVIEW_MESSAGE_MAX, summarizeToolInput } from "./protocol";
 import type { WorkCoverage } from "./work-model";
-import { extractResumeSignals, extractStage0ToolFields, parseTaskNotification, RESUME_SIGNAL_TOOL_NAMES } from "./tool-observation";
+import { extractResumeSignals, extractStage0ToolFields, isResumeSignalToolName, parseTaskNotification } from "./tool-observation";
 import { redactAbsolutePaths, redactOptional } from "./path-redaction";
 import {
   formatRefusalMessage,
+  extractAssistantTextBlocks,
   isApiErrorFrame,
   isRefusalErrorProse,
   parseRefusalNotice,
@@ -31,10 +33,6 @@ export interface HistoryEvent {
   body: NormalizedEventBody & { provenance: EventProvenance };
   timestamp: number;
   hostArtifacts?: HostArtifactAccess[];
-  // longGap の境界時刻（このイベントより前に起きたもの）。イベントを生まない
-  // 注入レコード（task-notification / 引数なしコマンドラッパ等）は L1.5 に現れないため、
-  // 走査へは NormalizedEvent ではなくこの側チャネルで渡す（裁定C2。humanMessageTimes と同型）。
-  // 最後のイベントより後ろの境界は、間隔を閉じる相手が居ないので載せない
   gapBoundaries?: number[];
 }
 
@@ -49,9 +47,7 @@ export interface ReplayedTool {
 export interface SessionTranscript {
   title: string;
   recordedModel?: string;
-  // uuid は会話の遡り（Phase 2）で重複を弾くための表示専用の識別子。
-  // 無いレコードもありうるので optional（無い場合は重複判定の対象外になる）
-  messages: Array<{ role: "user" | "assistant"; text: string; uuid?: string; imageRefs?: ImageRefInfo[]; model?: string; timestamp: number }>;
+  messages: TranscriptMessage[];
   tools: ReplayedTool[];
   summaryInput: {
     messages: Array<{ role: "user" | "assistant"; text: string }>;
@@ -59,15 +55,16 @@ export interface SessionTranscript {
   };
   coverage: WorkCoverage;
   malformedLineCount: number;
-  // read-set を渡したときだけ返る。境界で切れた末尾行の件数で、malformedLineCount とは別勘定
   boundaryPartialExcludedCount?: number;
   readError?: string;
   claudeCodeVersion?: string;
 }
 
+type TranscriptMessage = Omit<ConversationMessage, "uuid"> & { uuid?: string };
+
 const REPLAY_MESSAGE_MAX = 80;
 const REPLAY_TOOL_MAX = 200;
-const MAX_SUBAGENT_TRANSCRIPT_BYTES = 8 * 1024 * 1024; // 8MB
+const MAX_SUBAGENT_TRANSCRIPT_BYTES = 8 * 1024 * 1024;
 const RESUME_TAIL_MAX_BYTES = 1024 * 1024;
 const RESUME_TAIL_MAX_RECORDS = 1500;
 const RESUME_CAPTURE_CHUNK_BYTES = 64 * 1024;
@@ -133,10 +130,6 @@ async function captureParentBoundary(
       recordedModel = typeof model === "string" && model.length > 0 && !model.startsWith("<") ? model : undefined;
     }
   };
-  // FP-1: timestamp 探索は preview と同じ 1MiB を上限とし、末尾に timestamp 欠落レコードが
-  // 続くファイルで Phase 1 前の走査が O(size) 化するのを防ぐ。超過時は undefined へ縮退。
-  // parentEndOffset の境界探索自体は打ち切らない（0 に縮退すると捕捉履歴が空になり、
-  // capture 前の内容が hydration からも live からも拾われなくなる）
   const scanFloor = Math.max(0, size - RESUME_TAIL_MAX_BYTES);
 
   while (position > 0) {
@@ -202,9 +195,6 @@ export async function captureResumeReadSet(parentPath: string): Promise<ResumeRe
     } catch (error) {
       if ((error as { code?: unknown }).code !== "ENOENT") throw error;
     }
-    // FP-1: subagent は 1 セッションで実測 113 件まで増える。stat を直列に await すると
-    // libuv の threadpool が塞がっているとき件数ぶんの待ちが積み上がり、Phase 1 が伸びる。
-    // Promise.all は入力順を保つので names.sort() の順序は変わらない
     const sizes = await Promise.all(names.map((name) => stat(`${subagentsDir}/${name}`)));
     for (let i = 0; i < names.length; i++) {
       subagents.push({ path: `${subagentsDir}/${names[i]}`, size: sizes[i].size });
@@ -219,7 +209,6 @@ export function createParseYielder(): () => Promise<void> | undefined {
   return () => {
     recordCount++;
     if (recordCount < 500 && Date.now() - startedAt < 8) return;
-    // Phase 2 / FP-1: parse の連続占有を500 recordsまたは8msに制限する。
     return new Promise<void>((resolve) => setImmediate(() => {
       recordCount = 0;
       startedAt = Date.now();
@@ -228,18 +217,12 @@ export function createParseYielder(): () => Promise<void> | undefined {
   };
 }
 
-// 世代境界の述語（R-HND-09）。preview / replay / 裏読み / 要約詳細の再抽出が共有する。
-// **配列 index を読み手の外へ出さないこと**: uuid を持たないレコードを readConversationMessages は
-// push せず readSessionTranscript は push するので、index を共有すると片方で前世代が漏れるか
-// 当世代が削れる。共有してよいのは「どのレコードで真になるか」だけ
 export function isHandoffGenerationBoundary(
   record: Record<string, unknown>,
   sessionId: string | undefined
 ): boolean {
   if (sessionId === undefined || sessionId.length === 0) return false;
   if (record.type !== "user") return false;
-  // sidechain は子エージェントの実行。ここで弾かないと、sidechain を先に落とす読み手と
-  // 述語を先に呼ぶ読み手で境界がずれる（片方だけ前世代を返す）
   if (record.isSidechain === true) return false;
   const parsed = parseHandoffEnvelope(verbatimTextOf(record));
   return parsed.ok && parsed.version === "2" && parsed.envelope.snapshot.forkSessionId === sessionId;
@@ -263,13 +246,10 @@ export async function readResumePreviewTail(
 
   if (start > 0) {
     const firstNewline = buffer.indexOf(0x0a);
-    // FP-1 / R-TAB-08 / R-CNV-02: 1MiB内に境界が無い巨大単一行はpreview 0件へ縮退する。
     if (firstNewline < 0) return [];
     buffer = buffer.subarray(firstNewline + 1);
   }
 
-  // FP-1（v1 Phase 1）: 改行境界を確認できた行だけを parse する。未終端の末尾行は
-  // 書込途中でありえ、read-set 境界（parentEndOffset）外のレコードでもある。
   const lastNewline = buffer.lastIndexOf(0x0a);
   if (lastNewline < 0) return [];
   buffer = buffer.subarray(0, lastNewline + 1);
@@ -277,6 +257,8 @@ export async function readResumePreviewTail(
   const lines = buffer.toString("utf8").split("\n");
   if (lines.length > 0 && lines[lines.length - 1] === "") lines.pop();
   const acceptRecord = createRecordUuidFilter();
+  const queuedSources = queuedPromptSources(lines);
+  const seenQueuedPrompts = new Set<string>();
   const messages: ResumePreviewMessage[] = [];
   const maybeYield = createParseYielder();
   let recordsScanned = 0;
@@ -291,11 +273,11 @@ export async function readResumePreviewTail(
     if (isHandoffGenerationBoundary(obj, sessionId)) break;
     if (!acceptRecord(obj) || obj.isSidechain === true) continue;
     const uuid = typeof obj.uuid === "string" ? obj.uuid : "";
-    if (!uuid) continue;
-    if (obj.type === "user") {
-      const text = extractHumanUserText(obj);
-      if (text) {
-        const imageRefs = extractImageRefs(asRecord(obj.message)?.content, uuid);
+    if (obj.type === "user" || obj.type === "attachment") {
+      const prompt = extractHumanUserPrompt(obj, queuedSources, seenQueuedPrompts);
+      if (prompt) {
+        const { text, imageRefs, uuid } = prompt;
+        if (!uuid) continue;
         messages.push({
           uuid,
           role: "user",
@@ -304,8 +286,9 @@ export async function readResumePreviewTail(
         });
       }
     } else if (obj.type === "assistant") {
+      if (!uuid) continue;
       const message = asRecord(obj.message);
-      const text = extractText(message?.content);
+      const text = extractAssistantRecordText(message?.content, obj.narration_block_indexes);
       if (text && !isRefusalErrorProse(obj, message)) {
         const rawModel = message?.model;
         const model = typeof rawModel === "string" && rawModel.length > 0 && !rawModel.startsWith("<") ? rawModel : undefined;
@@ -332,13 +315,6 @@ interface ParentTurnSpan {
   endedAt: number;
 }
 
-// provider transcript は会話系統の fork でメッセージ全体（message/timestamp/uuid 一致・
-// parentUuid だけ違う）を再追記することがある。2 回目は観測事実ではなくファイルの
-// アーティファクトで、数えると幻のツール失敗・偽の longGap が出る。この判定は **record 単位**で、block 単位の
-// seenToolUseIds / seenToolResultIds とは別物 — あちらは重複レコード内の tool_use /
-// tool_result しか落とさず、assistant テキストと usage は素通しする。
-// 重複は 1 ファイル内の再追記なので Set も 1 ファイルにつき 1 個で閉じる。
-// uuid を持たない record 種は素通しする
 export function createRecordUuidFilter(): (record: { uuid?: unknown }) => boolean {
   const seen = new Set<string>();
   return (record) => {
@@ -387,17 +363,11 @@ export async function readSessionHistory(
   events: HistoryEvent[];
   coverage: WorkCoverage;
   claudeCodeVersion?: string;
-  // 引き継ぎ封筒（forkSessionId === generationSessionId）のレコード時刻。
-  // 呼び出し側が当世代だけを取り出すための境界で、events 自体は切っていない
   generationStartAt?: number;
   malformedLineCount: number;
-  // ゲートで捨てた task-notification の計数。破棄は fold 到達前で
-  // EvidenceIndex からは観測できないため、Adapter 側の hash 非入力カウンタとして持つ
   droppedTaskNotificationCount: number;
   boundaryPartialExcludedCount?: number;
   readError?: string;
-  // subagents/ の一覧だけが読めなかった（親は読めている）。readError に畳むと呼び出し側が
-  // 「履歴なし」と扱う
   subagentsReadError?: string;
 }> {
   const coverage: WorkCoverage = {
@@ -433,28 +403,20 @@ export async function readSessionHistory(
   }
 
   const rawEvents: RawHistoryItem[] = [];
-  // 世代境界より前に現れた compact_boundary。events は切らない（作業ログ・集計は全世代）ので、
-  // 会話面が落とせるよう印だけを付ける対象（R-HND-13）
   const preBoundaryCompacts = new Set<RawHistoryItem>();
   const parentTurns: ParentTurnSpan[] = [];
   const seenToolUseIds = new Set<string>();
   const seenToolResultIds = new Set<string>();
 
-  // task-notification は tool_result block を持たない注入 user record のため、合成 toolUseId
-  // （既存 placement に一致しない）で tool_call_finished に載せる。序数は agentId 単位で
-  // live（claude-normalizer）と同じ規則にする（同一 task-id の複数回通知）
   const notificationOrdinals = new Map<string, number>();
-  // live（claude-normalizer）と同じゲート: 起動ACK/resume で実在を観測した agentId のみ
-  // イベント化する。無条件だと観測範囲外の通知が reducer の revision を進め、
-  // 委任ゼロの既存セッションでも semanticHash が変わる
   const observedAsyncAgentIds = new Set<string>();
-  // 背景 Bash の task id は別集合。observedAsyncAgentIds は「起動を告知したのに子 transcript が無い
-  // サブエージェント」の検出にも使うので、Bash を混ぜると背景 Bash が全て読み取り不能な子として数えられる
   const observedBackgroundTaskIds = new Set<string>();
   const resumeSignalToolNames = new Map<string, string>();
   let droppedTaskNotificationCount = 0;
-  const makeNotificationFields = (text: string) => {
-    const notification = parseTaskNotification(text);
+  const makeNotificationFields = (text: string | TaskNotificationInfo, record?: Record<string, unknown>) => {
+    const notification = typeof text === "string" ? parseTaskNotification(text, {
+      trustedOrigin: asRecord(record?.origin)?.kind === "task-notification",
+    }) : text;
     if (!notification) return null;
     if (!observedAsyncAgentIds.has(notification.agentId) && !observedBackgroundTaskIds.has(notification.agentId)) {
       droppedTaskNotificationCount++;
@@ -464,9 +426,7 @@ export async function readSessionHistory(
     notificationOrdinals.set(notification.agentId, ordinal);
     return {
       toolUseId: `task-notification:${notification.agentId}:${ordinal}`,
-      // 本文は載せない（<summary>/<output-file> の自由文が S0-4 のパス漏えい検査対象になる。
-      // fold が使うのは taskNotification の構造化値のみ）
-      resultPreview: "",
+      resultPreview: taskNotificationPreview(notification),
       taskNotification: notification,
     };
   };
@@ -484,7 +444,6 @@ export async function readSessionHistory(
   let turnOrdinal = 0;
   let currentTurnId: string | null = null;
   let lastTurnActivityTimestamp = 0;
-  // steering envelope（非人間）で閉じた turn の後続。次の root レコードで開く
   let pendingSilentTurn = false;
   const openPendingSilentTurn = (at: number): void => {
     if (!pendingSilentTurn) return;
@@ -505,9 +464,6 @@ export async function readSessionHistory(
   let inlineSidechainSkipped = 0;
   const gapBoundaries: number[] = [];
   let subagentTranscriptsRead = 0;
-  // subagents/ に列挙できた子 transcript の agentId。observedAsyncAgentIds との差が
-  // 「親が起動 ACK で告知したのに実体が無い」子になる（読めたが失敗した分は
-  // omittedTranscriptCount 側で既に数えているのでここへ入れて二重計上を防ぐ）
   const listedSubagentAgentIds = new Set<string>();
   const seenAssistantUsageMessageIds = new Set<string>();
   let lastRootModel: string | null = null;
@@ -542,6 +498,8 @@ export async function readSessionHistory(
       : await readFile(parentFilePath, "utf8");
     const acceptParentRecord = createRecordUuidFilter();
     const parentLines = parentText.split("\n");
+    const queuedSources = queuedPromptSources(parentLines);
+    const seenQueuedPrompts = new Set<string>();
     const parentEndsAtBoundary = parentText.endsWith("\n");
     const maybeYieldParent = createParseYielder();
 
@@ -580,10 +538,6 @@ export async function readSessionHistory(
         cwd = obj.cwd;
       }
 
-      // 親 JSONL に inline される sidechain record は子エージェントの実行であり、
-      // 親パスで拾うと (a) 子の発話が親 turn に混入 (b) parentToolUseId=null で登録され、
-      // 正しい帰属を持つ subagents/ 側の同一 toolUseId が dedup で負ける。
-      // subagents/ が無いログでは欠落側へ倒れるため、件数を coverage へ明示する
       if (obj.isSidechain === true) {
         inlineSidechainSkipped++;
         continue;
@@ -593,8 +547,6 @@ export async function readSessionHistory(
       const recordTime = Number.isFinite(rawTs) ? rawTs : lastParentTimestamp;
       lastParentTimestamp = recordTime;
 
-      // 世代境界の時刻だけを控える。ここでイベントを落とさない: 作業ログと集計は前世代を含める。
-      // 切るかどうかは呼び出し側が決める（会話の書き出しだけが切る）
       if (generationSessionId !== undefined && isHandoffGenerationBoundary(obj, generationSessionId)) {
         generationStartAt = recordTime;
       }
@@ -609,20 +561,26 @@ export async function readSessionHistory(
         flushPendingUsage();
       }
 
-      if (obj.type === "user") {
-        // 注入レコード・引数なしコマンドラッパは longGap の境界（裁定C1/C2）。
-        // tool_result を持つレコードは tool_call_finished が境界になるのでここでは要らない
+      const localOutput = localCommandOutput(obj);
+      if (localOutput !== undefined) {
+        const item: RawHistoryItem = {
+          body: { kind: "local_command_output", text: localOutput,
+            ...(typeof obj.uuid === "string" ? { uuid: obj.uuid } : {}), provenance: { path: "history" } },
+          timestamp: recordTime, sourcePriority: 0, fileOrder: parentOrderCounter++,
+        };
+        if (generationSessionId !== undefined && generationStartAt === undefined) preBoundaryCompacts.add(item);
+        rawEvents.push(item);
+        continue;
+      }
+
+      if (obj.type === "user" || extractQueuedPromptRecord(obj) !== null) {
         const joinedText = joinTextBlocks(content);
         if (isGapBoundaryText(joinedText)) {
           gapBoundaries.push(recordTime);
         }
-        const humanText = extractHumanUserText(obj);
-        // CLI が差し込んだ user レコード（/compact 後の継続行など）。発言ではないが turn は開く
-        const cliInsertedText = humanText === null ? extractCliInsertedUserText(obj) : null;
-        // steering envelope: 非人間・非境界。次ターン先頭の user レコードとして
-        // 記録された形は live 側で result → 暗黙 startTurn になるため、turn だけ分割し
-        // user_message は作らない。tool_result 境界で消費された形は attachment レコードで
-        // ここへ来ない。turn を開いていない位置の steer レコードは外部ログの防御として無視する
+        const prompt = extractHumanUserPrompt(obj, queuedSources, seenQueuedPrompts);
+        const humanText = prompt?.text ?? null;
+        const cliInsertedText = obj.type === "user" && humanText === null ? extractCliInsertedUserText(obj) : null;
         if (humanText === null && currentTurnId !== null && STEER_TAG_RE.test(joinedText)) {
           const completedTime = lastTurnActivityTimestamp || recordTime;
           rawEvents.push({
@@ -634,14 +592,19 @@ export async function readSessionHistory(
           if (parentTurns.length > 0) {
             parentTurns[parentTurns.length - 1].endedAt = completedTime;
           }
-          // live は次の root message_start で暗黙 startTurn するため、turn_started はここではなく
-          // 次の root レコード（assistant / tool_result）の時刻で開く（openPendingSilentTurn）。
-          // 後続レコードが無ければ turn は開かない（live も message_start が来なければ開かない）
           currentTurnId = null;
           pendingSilentTurn = true;
         }
-        if (humanText || cliInsertedText !== null) {
-          // steer 直後の人間発話: silent turn は開かず、人間発話の turn がそれを引き継ぐ
+        const absorbedMidTurn = extractQueuedPromptRecord(obj) !== null && prompt !== null && currentTurnId !== null;
+        if (absorbedMidTurn && prompt !== null) {
+          rawEvents.push({
+            body: { kind: "user_message", turnId: currentTurnId, text: prompt.text,
+              ...(prompt.imageRefs ? { imageRefs: prompt.imageRefs } : {}), provenance: { path: "history" } },
+            timestamp: recordTime, sourcePriority: 0, fileOrder: parentOrderCounter++,
+          });
+          lastTurnActivityTimestamp = recordTime;
+        }
+        if (!absorbedMidTurn && (prompt !== null || cliInsertedText !== null)) {
           pendingSilentTurn = false;
           if (currentTurnId !== null) {
             const completedTime = lastTurnActivityTimestamp || recordTime;
@@ -681,14 +644,13 @@ export async function readSessionHistory(
             fileOrder: parentOrderCounter++,
           });
 
-          if (humanText) {
-            const userUuid = typeof obj.uuid === "string" && obj.uuid.length > 0 ? obj.uuid : undefined;
-            const imageRefs = extractImageRefs(content, userUuid);
+          if (prompt !== null) {
+            const imageRefs = prompt.imageRefs;
             rawEvents.push({
               body: {
                 kind: "user_message",
                 turnId: currentTurnId,
-                text: humanText,
+                text: prompt.text,
                 ...(imageRefs ? { imageRefs } : {}),
                 provenance: { path: "history" },
               },
@@ -708,8 +670,6 @@ export async function readSessionHistory(
             seenToolResultIds.add(toolUseId);
             openPendingSilentTurn(recordTime);
 
-            // live（claude-normalizer）と同一規則: 配列 content は text 要素の join。
-            // 表現が経路で割れると TaskCreate の resultPreview 由来 taskKey が経路依存になる
             const raw = Array.isArray(toolResult.content)
               ? toolResult.content
                   .filter((c: unknown) => asRecord(c)?.type === "text")
@@ -718,7 +678,7 @@ export async function readSessionHistory(
               : typeof toolResult.content === "string"
                 ? toolResult.content
                 : "";
-            const preview = redactAbsolutePaths(subagentResultForDisplay(raw)).slice(0, 2000);
+            const preview = toolResultPreview(toolResult.content);
             const isError = toolResult.is_error === true;
             const turnId = currentTurnId ?? "replay-turn-1";
             lastTurnActivityTimestamp = recordTime;
@@ -744,10 +704,8 @@ export async function readSessionHistory(
           }
         }
 
-        // task-notification は turn 活動時刻（lastTurnActivityTimestamp）に含めない:
-        // ターン間に届く注入であり、含めると既存セッションの turn 窓・子イベント帰属が変わる
         for (const text of collectNotificationTexts(content)) {
-          const fields = makeNotificationFields(text);
+          const fields = makeNotificationFields(text, obj);
           if (!fields) continue;
           rawEvents.push({
             body: {
@@ -764,7 +722,7 @@ export async function readSessionHistory(
         }
       } else if (obj.type === "assistant") {
         openPendingSilentTurn(recordTime);
-        const text = extractText(content);
+        const text = extractAssistantRecordText(content, obj.narration_block_indexes);
         const refusalStop = parseRefusalStop(message);
         const refusalIsErrorProse = refusalStop !== null && isApiErrorFrame(obj);
         const turnId = currentTurnId ?? "replay-turn-1";
@@ -849,7 +807,7 @@ export async function readSessionHistory(
             const toolUseId = typeof toolUse.id === "string" ? toolUse.id : "";
             if (toolUseId.length === 0 || seenToolUseIds.has(toolUseId)) continue;
             seenToolUseIds.add(toolUseId);
-            if (RESUME_SIGNAL_TOOL_NAMES.has(toolUse.name)) {
+            if (isResumeSignalToolName(toolUse.name)) {
               resumeSignalToolNames.set(toolUseId, toolUse.name);
             }
 
@@ -901,13 +859,22 @@ export async function readSessionHistory(
           sourcePriority: 0,
           fileOrder: parentOrderCounter++,
         };
-        // 境界はこの先のレコードで見つかるので、印はここでは付けられない（封筒が無い記録で
-        // 全件が前世代になる）。候補として控え、境界が実在したときだけ events 組み立てで印を付ける
         if (generationSessionId !== undefined && generationStartAt === undefined) {
           preBoundaryCompacts.add(item);
         }
         rawEvents.push(item);
       } else if (obj.type === "system") {
+        if (obj.subtype === "task_notification" && typeof obj.task_id === "string" && obj.task_id) {
+          const tokens = asRecord(obj.usage)?.total_tokens;
+          const fields = makeNotificationFields({ agentId: obj.task_id,
+            ...(typeof obj.tool_use_id === "string" && obj.tool_use_id ? { toolUseId: obj.tool_use_id } : {}),
+            ...(typeof obj.status === "string" && obj.status ? { status: obj.status } : {}),
+            ...(typeof tokens === "number" && Number.isSafeInteger(tokens) && tokens >= 0 ? { tokens } : {}),
+            ...taskNotificationDisplayFields(obj.summary, obj.result) });
+          if (fields) rawEvents.push({ body: { kind: "tool_call_finished", turnId: currentTurnId ?? "replay-turn-1",
+            isError: false, ...fields, provenance: { path: "history" } },
+            timestamp: recordTime, sourcePriority: 0, fileOrder: parentOrderCounter++ });
+        }
         const notice = parseRefusalNotice(obj);
         if (notice) {
           const fallback = refusalFallbackEvent(notice, currentTurnId);
@@ -929,14 +896,10 @@ export async function readSessionHistory(
           });
         }
       } else if (obj.type === "attachment") {
-        // task-notification は2つの形で届く。ターン間に直接注入される場合は user record だが、
-        // キューへ積まれて後から流し込まれた場合は attachment record（本文は attachment.prompt）
-        // になる。user だけを見ていると後者が丸ごと落ち、async 委任の完了信号が来ないまま
-        // endedAt が undefined で残る（裁定A2 は ACK では確定させないので、通知が唯一の確定源）。
         const prompt = asRecord(obj.attachment)?.prompt;
         if (typeof prompt === "string") {
           for (const text of collectNotificationTexts(prompt)) {
-            const fields = makeNotificationFields(text);
+            const fields = makeNotificationFields(text, obj);
             if (!fields) continue;
             rawEvents.push({
               body: {
@@ -1011,7 +974,6 @@ export async function readSessionHistory(
               metaMap.set(agentId, metaObj.toolUseId);
             }
           } catch {
-            // meta parse error ignored
           }
         }
 
@@ -1042,8 +1004,6 @@ export async function readSessionHistory(
             }
           }
 
-          // isAllowedPath 検査は呼び手供給の captured.path（ResumeReadSet）を
-          // outside-session-store 契約へ縛るガード。readdir 由来経路は親 dir 検査済みで実質不変
           if (fileSize > MAX_SUBAGENT_TRANSCRIPT_BYTES || !isAllowedPath(effectiveChildPath)) {
             coverage.details = "prefix-truncated";
             coverage.omittedTranscriptCount = (coverage.omittedTranscriptCount ?? 0) + 1;
@@ -1118,7 +1078,7 @@ export async function readSessionHistory(
                     : typeof toolResult.content === "string"
                       ? toolResult.content
                       : "";
-                  const preview = redactAbsolutePaths(subagentResultForDisplay(raw)).slice(0, 2000);
+                  const preview = toolResultPreview(toolResult.content);
                   const isError = toolResult.is_error === true;
                   const resumeSignals = extractResumeSignals(resumeSignalToolNames.get(toolUseId), raw);
                   if (resumeSignals?.asyncLaunchedAgentId) observedAsyncAgentIds.add(resumeSignals.asyncLaunchedAgentId);
@@ -1142,7 +1102,7 @@ export async function readSessionHistory(
                 }
               }
               for (const text of collectNotificationTexts(content)) {
-                const fields = makeNotificationFields(text);
+                const fields = makeNotificationFields(text, obj);
                 if (!fields) continue;
                 rawEvents.push({
                   body: {
@@ -1164,7 +1124,7 @@ export async function readSessionHistory(
                 const toolUseId = typeof toolUse.id === "string" ? toolUse.id : "";
                 if (toolUseId.length === 0 || seenToolUseIds.has(toolUseId)) continue;
                 seenToolUseIds.add(toolUseId);
-                if (RESUME_SIGNAL_TOOL_NAMES.has(toolUse.name)) {
+                if (isResumeSignalToolName(toolUse.name)) {
                   resumeSignalToolNames.set(toolUseId, toolUse.name);
                 }
 
@@ -1200,6 +1160,26 @@ export async function readSessionHistory(
                   fileOrder: childOrderCounter++,
                 });
               }
+            } else if (obj.type === "attachment") {
+              const prompt = asRecord(obj.attachment)?.prompt;
+              if (typeof prompt === "string") {
+                for (const text of collectNotificationTexts(prompt)) {
+                  const fields = makeNotificationFields(text, obj);
+                  if (!fields) continue;
+                  rawEvents.push({
+                    body: {
+                      kind: "tool_call_finished",
+                      turnId,
+                      isError: false,
+                      ...fields,
+                      provenance: { path: "history" },
+                    },
+                    timestamp: recordTime,
+                    sourcePriority: childFileIndex,
+                    fileOrder: childOrderCounter++,
+                  });
+                }
+              }
             }
           }
         }
@@ -1227,13 +1207,12 @@ export async function readSessionHistory(
     return a.fileOrder - b.fileOrder;
   });
 
-  // 単調性は直前の timestamp 昇順ソート自体が保証する（累積 max クランプは不要）
   const events: HistoryEvent[] = rawEvents.map((item) => {
     const ev: HistoryEvent = {
       body:
         generationStartAt !== undefined &&
         preBoundaryCompacts.has(item) &&
-        item.body.kind === "compact_boundary"
+        (item.body.kind === "compact_boundary" || item.body.kind === "local_command_output")
           ? { ...item.body, priorGeneration: true as const }
           : item.body,
       timestamp: item.timestamp,
@@ -1244,9 +1223,6 @@ export async function readSessionHistory(
     return ev;
   });
 
-  // 境界時刻を「その時刻以降で最初のイベント」へ前置として配る。rawEvents へ混ぜないのは
-  // fileOrder / seq がずれて L1.5 のイベント列そのもの（= WorkModel / SemanticModel）が
-  // 動くため。最後のイベントより後ろの境界は間隔を閉じられないので捨てる
   gapBoundaries.sort((a, b) => a - b);
   let boundaryCursor = 0;
   for (const ev of events) {
@@ -1257,17 +1233,11 @@ export async function readSessionHistory(
     if (attached.length > 0) ev.gapBoundaries = attached;
   }
 
-  // inline sidechain のスキップは、subagents/ から同じ実行を読めた場合は欠落ではない。
-  // 子 transcript を1つも読めなかった場合のみ「1論理 transcript 分の欠落」として明示する
   if (inlineSidechainSkipped > 0 && subagentTranscriptsRead === 0) {
     coverage.details = "prefix-truncated";
     coverage.omittedTranscriptCount = (coverage.omittedTranscriptCount ?? 0) + 1;
   }
 
-  // resume 側は subagents/ ごと引き継がれないことがある。readdir が ENOENT だと
-  // entries.length===0 で子読み込みブロックを素通りするため、ここで突合しないと
-  // 「委任が無かったセッション」と区別がつかず、225 イベント少ないまま
-  // coverage が complete で返る（構造は変えず availability として持つ）
   const missingAnnouncedTranscripts = [...observedAsyncAgentIds].filter(
     (id) => !listedSubagentAgentIds.has(id)
   ).length;
@@ -1288,34 +1258,20 @@ export async function readSessionHistory(
   };
 }
 
-// 会話ログの遡り（History Lazy Loading Phase 2）専用の読み手。
-// readSessionTranscript とは別に置く: 向こうは tools / results / coverage / title / cwd まで
-// 組み立てる resume 経路の正本で、ページングのたびに全部を作り直すのは重すぎる
-// （実測で transcript は最大 14MB）。本文の取り出し規則は共有する — extractHumanUserText /
-// extractText を別実装にすると、遡って出した本文と復元した本文の見え方がずれる。
-//
-// 返すのは presentation 用の最小項目だけ。ここから作った payload は pushEvent を通さない。
 export async function readConversationMessages(
   filePath: string,
   isAllowedPath: (filePath: string) => boolean,
   resumeReadSet?: ResumeReadSet,
   sessionId?: string
 ): Promise<{
-  messages: Array<{ uuid: string; role: "user" | "assistant"; text: string; timestamp: number; imageRefs?: ImageRefInfo[] }>;
+  messages: ConversationMessage[];
   malformedLineCount: number;
-  // uuid を持たないレコードは識別できず重複を検出できないので運ばない。件数は突合へ回す
   droppedWithoutUuidCount: number;
   boundaryPartialExcludedCount?: number;
   readError?: string;
   handoffEnvelope?: HandoffEnvelopeV2;
 }> {
-  const messages: Array<{
-    uuid: string;
-    role: "user" | "assistant";
-    text: string;
-    timestamp: number;
-    imageRefs?: ImageRefInfo[];
-  }> = [];
+  const messages: ConversationMessage[] = [];
   let malformedLineCount = 0;
   let droppedWithoutUuidCount = 0;
   let boundaryPartialExcludedCount = 0;
@@ -1352,6 +1308,9 @@ export async function readConversationMessages(
 
   const lines = text.split("\n");
   const acceptRecord = createRecordUuidFilter();
+  const queuedSources = queuedPromptSources(lines);
+  const seenQueuedPrompts = new Set<string>();
+  const approvalResults = indexApprovalResults(lines);
   let lastTimestamp = 0;
   const endsAtBoundary = text.endsWith("\n");
   const maybeYield = createParseYielder();
@@ -1380,11 +1339,18 @@ export async function readConversationMessages(
     if (obj.isSidechain === true) continue;
     if (isHandoffGenerationBoundary(obj, sessionId)) cutFrom = messages.length;
     lastTimestamp = recordTimestamp(obj.timestamp, lastTimestamp);
-    const uuid = typeof obj.uuid === "string" ? obj.uuid : "";
-    if (obj.type === "user") {
-      const body = extractHumanUserText(obj);
-      if (!body) {
-        // Forked logs retain earlier generations. The last envelope is the current handoff.
+    const localOutput = localCommandOutput(obj);
+    if (localOutput !== undefined) {
+      const uuid = typeof obj.uuid === "string" ? obj.uuid : "";
+      if (!uuid) { droppedWithoutUuidCount++; continue; }
+      messages.push({ uuid, role: "system", text: localOutput, timestamp: lastTimestamp });
+      continue;
+    }
+    const approvalMessages = extractRestoredApprovalMessages(obj, approvalResults, lastTimestamp);
+    const prompt = extractHumanUserPrompt(obj, queuedSources, seenQueuedPrompts);
+    const uuid = prompt?.uuid ?? (typeof obj.uuid === "string" ? obj.uuid : "");
+    if (obj.type === "user" || obj.type === "attachment") {
+      if (prompt === null) {
         {
           const raw = verbatimTextOf(obj);
           if (raw.startsWith("<laisora-handoff")) {
@@ -1400,7 +1366,7 @@ export async function readConversationMessages(
         droppedWithoutUuidCount++;
         continue;
       }
-      const imageRefs = extractImageRefs(asRecord(obj.message)?.content, uuid);
+      const { text: body, imageRefs } = prompt;
       messages.push({
         uuid,
         role: "user",
@@ -1410,10 +1376,14 @@ export async function readConversationMessages(
       });
     } else if (obj.type === "assistant") {
       const message = asRecord(obj.message);
-      const body = extractText(message?.content);
-      if (!body || isRefusalErrorProse(obj, message)) continue;
+      const body = extractAssistantRecordText(message?.content, obj.narration_block_indexes);
+      if (!body || isRefusalErrorProse(obj, message)) {
+        messages.push(...approvalMessages);
+        continue;
+      }
       if (uuid.length === 0) {
         droppedWithoutUuidCount++;
+        messages.push(...approvalMessages);
         continue;
       }
       const rawModel = message?.model;
@@ -1426,6 +1396,7 @@ export async function readConversationMessages(
         ...(model ? { model } : {}),
       });
     }
+    messages.push(...approvalMessages);
   }
   return {
     messages: messages.slice(cutFrom),
@@ -1442,7 +1413,8 @@ export async function readSessionTranscript(
   resumeReadSet?: ResumeReadSet,
   sessionId?: string
 ): Promise<SessionTranscript> {
-  const messages: Array<{ role: "user" | "assistant"; text: string; uuid?: string; imageRefs?: ImageRefInfo[]; model?: string; timestamp: number }> = [];
+  const acceptNarrationRecord = createRecordUuidFilter();
+  const messages: TranscriptMessage[] = [];
   const tools: Array<ReplayedTool & { toolUseId: string }> = [];
   const results = new Map<string, { isError: boolean; preview: string }>();
   let lastTimestamp = 0;
@@ -1471,7 +1443,9 @@ export async function readSessionTranscript(
         ? await readUtf8Prefix(filePath, resumeReadSet.parentEndOffset)
         : await readFile(filePath, "utf8");
       const lines = text.split("\n");
-      // ループ内の `text` は本文抽出結果に覆われるので、境界判定はここで確定させる
+      const queuedSources = queuedPromptSources(lines);
+      const seenQueuedPrompts = new Set<string>();
+      const approvalResults = indexApprovalResults(lines);
       const endsAtBoundary = text.endsWith("\n");
       const maybeYield = createParseYielder();
       for (let lineIndex = 0; lineIndex < lines.length; lineIndex++) {
@@ -1505,12 +1479,17 @@ export async function readSessionTranscript(
         const content = message?.content;
         lastTimestamp = recordTimestamp(obj.timestamp, lastTimestamp);
         if (isHandoffGenerationBoundary(obj, sessionId)) cutFrom = messages.length;
-        if (obj.type === "user") {
-          const text = extractHumanUserText(obj);
-          if (text) {
+        const localOutput = localCommandOutput(obj);
+        if (localOutput !== undefined) {
+          messages.push({ role: "system", text: localOutput,
+            uuid: typeof obj.uuid === "string" ? obj.uuid : undefined, timestamp: lastTimestamp });
+          continue;
+        }
+        if (obj.type === "user" || obj.type === "attachment") {
+          const prompt = extractHumanUserPrompt(obj, queuedSources, seenQueuedPrompts);
+          if (prompt !== null) {
+            const { text, uuid, imageRefs } = prompt;
             if (!title) title = text.split("\n")[0];
-            const uuid = typeof obj.uuid === "string" && obj.uuid.length > 0 ? obj.uuid : undefined;
-            const imageRefs = extractImageRefs(content, uuid);
             messages.push({
               role: "user",
               text,
@@ -1523,17 +1502,7 @@ export async function readSessionTranscript(
             for (const block of content) {
               const toolResult = asRecord(block);
               if (toolResult?.type !== "tool_result" || typeof toolResult.tool_use_id !== "string") continue;
-              // live（claude-normalizer）と同一規則: 配列 content は text 要素の join。
-              // 表現が経路で割れると TaskCreate の resultPreview 由来 taskKey が経路依存になる
-              const raw = Array.isArray(toolResult.content)
-                ? toolResult.content
-                    .filter((c: unknown) => asRecord(c)?.type === "text")
-                    .map((c: unknown) => String(asRecord(c)?.text ?? ""))
-                    .join("\n")
-                : typeof toolResult.content === "string"
-                  ? toolResult.content
-                  : "";
-              const preview = redactAbsolutePaths(subagentResultForDisplay(raw)).slice(0, 2000);
+              const preview = toolResultPreview(toolResult.content);
               const isError = toolResult.is_error === true;
               results.set(toolResult.tool_use_id, { isError, preview });
             }
@@ -1543,7 +1512,10 @@ export async function readSessionTranscript(
             const model = message?.model;
             recordedModel = typeof model === "string" && model.length > 0 && !model.startsWith("<") ? model : undefined;
           }
-          const text = extractText(content);
+          const blocks = extractAssistantTextBlocks(content, obj.narration_block_indexes);
+          const hasNarration = Array.isArray(content) && content.some((block, index) => asRecord(block)?.type === "thinking" && blocks[index].length > 0);
+          const text = obj.isSidechain === true || (hasNarration && !acceptNarrationRecord(obj))
+            ? "" : extractAssistantRecordText(content, obj.narration_block_indexes);
           if (text && !isRefusalErrorProse(obj, message)) {
             const rawModel = message?.model;
             const model = typeof rawModel === "string" && rawModel.length > 0 && !rawModel.startsWith("<") ? rawModel : undefined;
@@ -1566,6 +1538,7 @@ export async function readSessionTranscript(
             }
           }
         }
+        messages.push(...extractRestoredApprovalMessages(obj, approvalResults, lastTimestamp));
       }
     } catch (error) {
       readError = String(error);
@@ -1577,8 +1550,6 @@ export async function readSessionTranscript(
     coverage.details = "prefix-truncated";
   }
   const allTools = tools.map((tool) => withResult(tool, results));
-  // 窓取りは世代の切り出しより後ろ（R-HND-09）。先に窓を取ると前世代のぶんで 80 件が埋まる。
-  // summaryInput は切らない（分析・要約の入力は分析の契約側）
   const generationMessages = messages.slice(cutFrom);
   const omittedMessageCount = Math.max(0, generationMessages.length - REPLAY_MESSAGE_MAX);
   const omittedToolCount = Math.max(0, allTools.length - REPLAY_TOOL_MAX);
@@ -1595,7 +1566,7 @@ export async function readSessionTranscript(
     title,
     messages: generationMessages.slice(-REPLAY_MESSAGE_MAX),
     tools: allTools.slice(-REPLAY_TOOL_MAX),
-    summaryInput: { messages, tools: allTools },
+    summaryInput: { messages: messages.filter((m): m is TranscriptMessage & { role: "user" | "assistant" } => !m.restoredApproval && m.role !== "system"), tools: allTools },
     coverage,
     malformedLineCount,
     ...(resumeReadSet ? { boundaryPartialExcludedCount } : {}),
@@ -1800,10 +1771,144 @@ function asRecord(value: unknown): Record<string, any> | null {
   return typeof value === "object" && value !== null ? value as Record<string, any> : null;
 }
 
-function extractText(content: unknown): string {
-  if (typeof content === "string") return content.trim();
+interface ApprovalResultRecord {
+  text: string;
+  answers?: Record<string, string>;
+  behavior?: "allow" | "deny" | "withdrawn";
+  isError?: boolean;
+}
+
+function stringAnswers(value: unknown): Record<string, string> | undefined {
+  const obj = asRecord(value);
+  if (!obj || Array.isArray(value) || !Object.values(obj).every((answer) => typeof answer === "string")) return undefined;
+  return Object.keys(obj).length > 0 ? obj as Record<string, string> : undefined;
+}
+
+function approvalBehavior(value: unknown): ApprovalResultRecord["behavior"] {
+  return value === "allow" || value === "deny" || value === "withdrawn" ? value : undefined;
+}
+
+interface ApprovalRestoreIndex {
+  results: Map<string, ApprovalResultRecord>;
+  seen: Set<string>;
+}
+
+function indexApprovalResults(lines: readonly string[]): ApprovalRestoreIndex {
+  const results = new Map<string, ApprovalResultRecord>();
+  for (const line of lines) {
+    const record = parseRecord(line);
+    if (!record || record.isSidechain === true) continue;
+    if (record.type === "approval_resolved" && typeof record.requestId === "string") {
+      results.set(record.requestId, { text: "", answers: stringAnswers(record.answers), behavior: approvalBehavior(record.behavior) });
+    }
+    if (record.type !== "user") continue;
+    const content = asRecord(record.message)?.content;
+    if (!Array.isArray(content)) continue;
+    const detail = content.filter((block) => asRecord(block)?.type === "tool_result").length === 1 ? asRecord(record.toolUseResult) : null;
+    for (const block of content) {
+      const result = asRecord(block);
+      if (result?.type !== "tool_result" || typeof result.tool_use_id !== "string") continue;
+      results.set(result.tool_use_id, {
+        text: joinTextBlocks(result.content),
+        answers: stringAnswers(detail?.answers),
+        behavior: approvalBehavior(detail?.behavior),
+        isError: result.is_error === true,
+      });
+    }
+  }
+  return { results, seen: new Set() };
+}
+
+function redactCardValue(value: unknown): unknown {
+  if (typeof value === "string") return redactAbsolutePaths(value);
+  if (Array.isArray(value)) return value.map(redactCardValue);
+  const record = asRecord(value);
+  return record ? Object.fromEntries(Object.entries(record).map(([key, entry]) => [redactAbsolutePaths(key), redactCardValue(entry)])) : value;
+}
+
+function restoredQuestions(input: Record<string, unknown>): AskUserQuestionSpec | undefined {
+  if (!Array.isArray(input.questions) || input.questions.length === 0) return undefined;
+  const questions = [];
+  for (const raw of input.questions) {
+    const q = asRecord(raw);
+    if (!q || typeof q.question !== "string" || !Array.isArray(q.options)) return undefined;
+    const options = [];
+    for (const rawOption of q.options) {
+      const option = asRecord(rawOption);
+      if (!option || typeof option.label !== "string") return undefined;
+      options.push({ label: option.label, ...(typeof option.description === "string" ? { description: option.description } : {}) });
+    }
+    questions.push({ question: q.question, ...(typeof q.header === "string" ? { header: q.header } : {}), multiSelect: q.multiSelect === true, options });
+  }
+  return { questions };
+}
+
+function recordedQuestionAnswers(text: string, questions: AskUserQuestionSpec): Record<string, string> | undefined {
+  const prefix = "User has answered your questions: ";
+  const suffix = /\. You can now continue(?: with the user's answers in mind)?\.$/.exec(text);
+  if (!text.startsWith(prefix) || !suffix) return undefined;
+  const body = text.slice(prefix.length, suffix.index);
+  const names = questions.questions.map((q) => q.question.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"));
+  const entries = [...body.matchAll(new RegExp(`(?:^|, )"(${names.join("|")})"="`, "g"))];
+  if (!entries.length || entries[0].index !== 0 || new Set(entries.map((e) => e[1])).size !== entries.length) return undefined;
+  const answers: Record<string, string> = {};
+  for (let i = 0; i < entries.length; i++) {
+    const end = i + 1 < entries.length ? entries[i + 1].index : body.length;
+    if (body[end - 1] !== '"') return undefined;
+    answers[entries[i][1]] = body.slice(entries[i].index! + entries[i][0].length, end - 1);
+  }
+  return answers;
+}
+
+function extractRestoredApprovalMessages(
+  record: Record<string, unknown>,
+  index: ApprovalRestoreIndex,
+  timestamp: number
+): ConversationMessage[] {
+  if (record.isSidechain === true) return [];
+  const content = asRecord(record.message)?.content;
+  const uses = record.type === "approval_request"
+    ? [{ id: record.requestId, name: record.toolName, input: record.input ?? record.inputJson ?? record.rawInputJson }]
+    : record.type === "assistant" && Array.isArray(content) ? content.filter((b) => asRecord(b)?.type === "tool_use") : [];
+  const messages: ConversationMessage[] = [];
+  for (const raw of uses) {
+    const use = asRecord(raw);
+    if (!use || typeof use.id !== "string" || !use.id || typeof use.name !== "string") continue;
+    if (index.seen.has(use.id)) continue;
+    const result = index.results.get(use.id);
+    const rejected = result?.isError === true && /^(?:Error: )?User rejected tool use\b/.test(result.text);
+    if (record.type !== "approval_request" && use.name !== "AskUserQuestion" && use.name !== "ExitPlanMode" && !result?.behavior && !rejected) continue;
+    index.seen.add(use.id);
+    let input = use.input;
+    if (typeof input === "string") {
+      try { input = JSON.parse(input); } catch { input = { recordedInput: input }; }
+    }
+    const questions = use.name === "AskUserQuestion" ? restoredQuestions(asRecord(input) ?? {}) : undefined;
+    let answers = result?.answers;
+    if (!answers && questions && result?.text) answers = recordedQuestionAnswers(result.text, questions);
+    const resolution: RestoredApprovalCard["resolution"] = result?.behavior === "allow" ? "allowed"
+      : result?.behavior === "deny" || rejected ? "denied"
+      : result?.behavior === "withdrawn" ? "withdrawn"
+      : answers ? "answered" : result?.isError ? "failed" : "unknown";
+    const restoredApproval = redactCardValue({
+      requestId: use.id, toolName: use.name, inputJson: JSON.stringify(redactCardValue(input ?? {})),
+      ...(questions ? { questions } : {}), ...(answers ? { answers } : {}), resolution,
+    }) as RestoredApprovalCard;
+    messages.push({ uuid: `approval:${use.id}`, role: "assistant", text: "", timestamp, restoredApproval });
+  }
+  return messages;
+}
+
+function extractAssistantRecordText(content: unknown, narrationBlockIndexes?: unknown): string {
+  const texts = extractAssistantTextBlocks(content, narrationBlockIndexes);
+  const hasNarration = Array.isArray(content) && content.some((block, index) => asRecord(block)?.type === "thinking" && texts[index].length > 0);
+  return hasNarration ? texts.join("") : extractText(content);
+}
+
+function extractText(content: unknown, trim = true): string {
+  if (typeof content === "string") return trim ? content.trim() : content;
   if (!Array.isArray(content)) return "";
-  return content
+  const text = content
     .filter((block): block is { type: string; text: string } => {
       return typeof block === "object" && block !== null &&
         (block as { type?: unknown }).type === "text" &&
@@ -1811,8 +1916,8 @@ function extractText(content: unknown): string {
     })
     .map((block) => block.text)
     .filter((text) => !text.startsWith("<ide_") && !text.startsWith("<system-reminder>"))
-    .join("\n")
-    .trim();
+    .join("\n");
+  return trim ? text.trim() : text;
 }
 
 export function extractImageRefs(
@@ -1840,17 +1945,17 @@ export function extractImageRefs(
   return refs.length > 0 ? refs : undefined;
 }
 
-// user レコードの表示本文。isMeta（CLI が書いた user レコード）の分岐だけを呼び出し側へ出す。
-// 2 つの入口が同じ抑止（封筒・コマンドラッパ・Caveat・中断通知）を共有しないと、
-// 片方だけが `<local-command-caveat>` を本文として通す
 function extractUserRecordText(obj: Record<string, unknown>): string | null {
   if (obj.type !== "user" || obj.isSidechain) return null;
-  // R-HND-06: compact summaries are model output even though JSONL stores them as user records.
   if (obj.isCompactSummary === true) return null;
   const origin = asRecord(obj.origin);
   if (origin && origin.kind !== "human") return null;
   const text = extractText(asRecord(obj.message)?.content);
-  if (!text) return null;
+  if (!text) {
+    if (joinTextBlocks(asRecord(obj.message)?.content).trim()) return null;
+    return extractImageRefs(asRecord(obj.message)?.content, typeof obj.uuid === "string" ? obj.uuid : undefined) ? "" : null;
+  }
+  if (text.startsWith("<local-command-stdout>")) return null;
   if (LAISORA_ENVELOPE_RE.test(text)) return null;
   if (INJECTED_TAG_RE.test(text)) {
     const args = COMMAND_ARGS_RE.exec(text)?.[1]?.trim();
@@ -1864,19 +1969,55 @@ function extractUserRecordText(obj: Record<string, unknown>): string | null {
   return text;
 }
 
-// `isMeta` は「利用者が打っていない user レコード」の CLI 側の印。実測（2026-09-16・
-// ~/.claude/projects 1076 本 / 355909 行）では、この印だけが本文を人間発話として通していた。
-// `isVisibleInTranscriptOnly` は単独では 1 件も通さない（必ず isCompactSummary と同時）ので表に足さない
 export function extractHumanUserText(obj: Record<string, unknown>): string | null {
-  return obj.isMeta === true ? null : extractUserRecordText(obj);
+  const record = extractQueuedPromptRecord(obj) ?? obj;
+  return record.isMeta === true ? null : extractUserRecordText(record);
 }
 
-// CLI が user レコードとして差し込んだ行。人間発話ではないので user_message にしない
-// （work-model / evidence-index / l3 / time-buckets / タイトル / 逐語の全てに混入する）。
-// turn 境界の判定にだけ使い、画面はラベルで「利用者の発言ではない」と示す。
-// 返るのは extractUserRecordText を通った本文だけなので、`<laisora-handoff>` / `<laisora-steer>`
-// の封筒・`<local-command-*>`・skill の前置き（`Base directory for this skill:`）では null になり turn は開かない。
-// 開くのは /compact 後の継続行のような、タグを持たない素の本文
+export function extractQueuedPromptRecord(obj: Record<string, unknown>): Record<string, unknown> | null {
+  const attachment = asRecord(obj.attachment);
+  if (obj.type !== "attachment" || attachment?.type !== "queued_command" || attachment.commandMode !== "prompt") return null;
+  if (obj.isSidechain === true || obj.isMeta === true || attachment.isMeta === true) return null;
+  const origin = asRecord(attachment.origin) ?? asRecord(obj.origin);
+  if (origin && origin.kind !== "human") return null;
+  return { ...obj, type: "user", origin, message: { content: attachment.prompt } };
+}
+
+export function extractHumanUserPrompt(obj: Record<string, unknown>, queuedSources?: ReadonlyMap<string, string | undefined>, seenQueuedPrompts?: Set<string>): {
+  text: string; uuid?: string; imageRefs?: ImageRefInfo[]; content: unknown;
+} | null {
+  const queued = extractQueuedPromptRecord(obj);
+  const record = queued ?? obj;
+  const text = extractHumanUserText(record);
+  if (text === null) return null;
+  const recordUuid = typeof obj.uuid === "string" && obj.uuid.length > 0 ? obj.uuid : undefined;
+  if (!queued && recordUuid && queuedSources?.has(recordUuid)) return null;
+  const sourceUuid = asRecord(obj.attachment)?.source_uuid;
+  const uuid = queued && typeof sourceUuid === "string" && sourceUuid.length > 0 ? sourceUuid : recordUuid;
+  if (queued && uuid && queuedSources?.has(uuid) && queuedSources.get(uuid) !== recordUuid) return null;
+  if (queued && uuid && seenQueuedPrompts) {
+    if (seenQueuedPrompts.has(uuid)) return null;
+    seenQueuedPrompts.add(uuid);
+  }
+  const content = asRecord(record.message)?.content;
+  const rawText = queued ? extractText(content, false) : "";
+  return { text: queued && rawText.trim() === text ? rawText : text,
+    uuid, content, imageRefs: extractImageRefs(content, recordUuid) };
+}
+
+function queuedPromptSources(lines: readonly string[]): Map<string, string | undefined> {
+  const sources = new Map<string, string | undefined>();
+  for (const line of lines) {
+    const record = parseRecord(line);
+    if (!record || !extractQueuedPromptRecord(record) || !extractHumanUserPrompt(record)) continue;
+    const source = asRecord(record.attachment)?.source_uuid;
+    if (typeof source === "string" && source.length > 0 && !sources.has(source)) {
+      sources.set(source, typeof record.uuid === "string" ? record.uuid : undefined);
+    }
+  }
+  return sources;
+}
+
 export function extractCliInsertedUserText(obj: Record<string, unknown>): string | null {
   return obj.isMeta === true ? extractUserRecordText(obj) : null;
 }
@@ -1887,15 +2028,9 @@ export interface VerbatimUtterance {
   kind: "typed" | "answer";
   text: string;
   questions?: string[];
+  imageRefs?: ImageRefInfo[];
 }
 
-// 逐語で運ぶ範囲は 1 世代分（R-HND-02）。世代の切れ目は前回の
-// 引き継ぎ封筒であって compact 境界ではない。世代の途中で自動 compact が起きても切らない
-// （切ると直近の判断がまとめて落ち、切れる位置が自動 compact のタイミング任せになって、失われた範囲が利用者から見えない）。
-// それ以前の世代は要約の連鎖と、履歴に残る各世代の封筒が運ぶ。
-// compact の性能向上に合わせて範囲を見直す余地がある。変えるならこの関数だけを直し、
-// 絞る方向に変えるなら落とした件数を画面に出すこと（黙って消さない）
-// 封筒の検出には生の本文が要る。extractHumanUserText は封筒を非人間として null にするので使えない
 function verbatimTextOf(record: Record<string, unknown>): string {
   const message = record.message;
   const content =
@@ -1931,10 +2066,12 @@ export function extractVerbatimUserUtterances(
   const utterances: VerbatimUtterance[] = [];
   let lastAt = "";
   const generationStart = verbatimGenerationStart(records);
+  const queuedSources = queuedPromptSources(records.map((record) => JSON.stringify(record)));
+  const seenQueuedPrompts = new Set<string>();
   for (let index = 0; index < records.length; index++) {
     const record = records[index];
+    if (record.isSidechain === true) continue;
     if (index < generationStart) {
-      // 範囲外でも時刻は拾う。timestamp を持たないレコードの補完に使う
       if (typeof record.timestamp === "string") lastAt = record.timestamp;
       continue;
     }
@@ -1961,9 +2098,10 @@ export function extractVerbatimUserUtterances(
       continue;
     }
 
-    const text = extractHumanUserText(record);
-    if (text !== null) {
-      utterances.push({ n: utterances.length + 1, at: lastAt, kind: "typed", text });
+    const prompt = extractHumanUserPrompt(record, queuedSources, seenQueuedPrompts);
+    if (prompt !== null) {
+      utterances.push({ n: utterances.length + 1, at: lastAt, kind: "typed", text: prompt.text,
+        ...(prompt.imageRefs ? { imageRefs: prompt.imageRefs } : {}) });
     }
   }
   return utterances;

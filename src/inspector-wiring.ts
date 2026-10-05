@@ -18,7 +18,6 @@ import {
 import { inspectorSessionFile, inspectorSessionFileLookup, sessionIdForOutput } from "./session-files";
 import type { SessionStore } from "./store-surfaces";
 
-// Inspectorの最新要求はsurfaceごとに分離する。sidebarの新要求がpanelの応答を失効させない。
 const inspectorRequests = new WeakMap<vscode.Webview, Map<string, string>>();
 const inspectorSurfaceIds = new WeakMap<vscode.Webview, string>();
 
@@ -95,8 +94,6 @@ export async function handleInspectorMessage(
       const agent = inspectorAgentForSession(session, msg.agentId);
       setLatestInspectorRequest(sender, session.tabId, msg.requestId);
       if (!sessionFile) {
-        // 走査に失敗しただけのときに session-unavailable を返さない。あの文言は
-        // 「まだ利用できません」＝待てば出る、で、待っても直らない待ちへ誘導する（E-09 / R-DSP-01）
         const reason: AgentInspectorErrorReason =
           sessionLookup.reason === "scan_failed" ? "session-scan-failed" : "session-unavailable";
         output.appendLine(

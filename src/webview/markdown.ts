@@ -30,10 +30,6 @@ function svgElement<K extends keyof SVGElementTagNameMap>(name: K): SVGElementTa
 
 const COPY_REVERT_MS = 2000;
 
-// コピーボタンの唯一の作り方。コードブロック・返信フッター・発言フッターが同じ作法を通る
-// （アイコン差し替え + role=status の視覚的非表示テキスト + 2 秒で元へ戻す）。
-// source は呼び出しのたびに評価する: 返信の原文は後続 chunk の統合で伸びるため、
-// 生成時の文字列を捕まえると古い本文をコピーする。
 export function createCopyButton(
   className: string,
   idleTitle: string,
@@ -57,8 +53,6 @@ export function createCopyButton(
     button.title = idleTitle;
     button.setAttribute("aria-label", idleTitle);
   };
-  // 実行中でも disabled にしない。押した直後に disabled にするとフォーカスが body へ落ち、
-  // キーボードだけで操作している利用者が戻り先を失う。二重押しは in-flight で弾く
   let inFlight = false;
   button.addEventListener("click", async () => {
     if (inFlight) return;

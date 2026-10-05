@@ -44,6 +44,8 @@ export class UsageLimitResume {
 
   constructor(private readonly runtime: ResumeRuntime) {}
 
+  get pendingResumeAt(): number | null { return this.pendingAt ?? null; }
+
   cancel(): void {
     this.suppressed = true;
     this.stoppedDelegates.clear();
@@ -58,13 +60,10 @@ export class UsageLimitResume {
   }
 
   delegateStopped(agentId: string): void {
-    // R-CNV-40: observedDelegateStops survives firing and cancellation until a resume is observed.
     if (this.observedDelegateStops.has(agentId)) return;
     this.observedDelegateStops.add(agentId);
-    // R-CNV-41: cancel suppresses late stops as well as the existing reservation.
     if (this.suppressed) return;
     this.stoppedDelegates.add(agentId);
-    // R-CNV-40: merge into pendingAt instead of allocating another reservation.
     if (this.pendingAt === undefined) this.reserveForDelegates();
   }
 
@@ -75,12 +74,10 @@ export class UsageLimitResume {
       if (this.stoppedDelegates.size > 0) this.reserveForDelegates();
     }
     if (event.kind === "tool_call_finished") {
-      // R-CNV-41: a successful resume retires the stop and permits a later stop of the same agent.
       if (!event.isError && event.resumedAgentId !== undefined) {
         this.observedDelegateStops.delete(event.resumedAgentId);
         this.forgetDelegate(event.resumedAgentId);
       }
-      // R-CNV-40: repeated failed notifications must not cancel and recreate the reservation.
       if (event.taskNotification?.status === "completed" || event.taskNotification?.status === "stopped") {
         this.forgetDelegate(event.taskNotification.agentId);
       }
@@ -94,16 +91,12 @@ export class UsageLimitResume {
       this.dropMain();
       this.attempts = 0;
       this.automaticTurn = false;
-      // R-CNV-40: latestRateLimit may belong to a delegate whose stop notification is still in flight.
-      // R-CNV-41: only manualSend lifts suppressed; main success does not undo cancellation.
     }
     if (event.kind !== "turn_failed" || this.endedTurn === event.turnId) return;
     this.endedTurn = event.turnId;
-    // R-CNV-25 / R-CNV-26: only an eligible failure can add a main reservation.
     if (event.errorKind !== "usage_limit" || this.suppressed || (this.pendingAt !== undefined && this.pendingMain)) return;
     if (this.exhausted()) return;
     const rate = this.latestRateLimit;
-    // R-CNV-25: the main failure is observed after the turn becomes idle.
     if (!this.runtime.live()) return;
     const at = this.reservationTime(rate, rate?.resetsAt ?? event.resetsAt);
     if (at === undefined) return;
@@ -111,7 +104,6 @@ export class UsageLimitResume {
     this.reserve(at);
   }
 
-  // R-CNV-25 / R-CNV-40: reservationTime gates automatic inputs using rate and subscription.
   private reservationTime(rate: RateLimitNotice | undefined, resetsAt: number | null | undefined): number | undefined {
     if (!this.runtime.enabled() || !this.subscription || rate?.status !== "rejected"
       || rate.isUsingOverage || rate.overageInUse === true || typeof resetsAt !== "number" || !Number.isFinite(resetsAt)) return undefined;
@@ -119,7 +111,6 @@ export class UsageLimitResume {
     return at - this.runtime.now() > 86_400_000 ? undefined : at;
   }
 
-  // R-CNV-26 / R-CNV-41: MAX_AUTOMATIC_ATTEMPTS applies to the shared injection path.
   private exhausted(): boolean {
     if (!this.automaticTurn || this.attempts < MAX_AUTOMATIC_ATTEMPTS) return false;
     this.cancel();
@@ -127,7 +118,6 @@ export class UsageLimitResume {
     return true;
   }
 
-  // R-CNV-40 / R-CNV-41: reserveForDelegates shares reservationTime and exhausted with the main path.
   private reserveForDelegates(): void {
     if (this.suppressed || !this.runtime.connected() || this.exhausted()) return;
     const at = this.reservationTime(this.latestRateLimit, this.latestRateLimit?.resetsAt);
@@ -135,7 +125,6 @@ export class UsageLimitResume {
   }
 
   private reserve(at: number): void {
-    // R-CNV-40: coalescing must not fire before a later observed reset.
     if (this.pendingAt !== undefined && at <= this.pendingAt) return;
     if (this.timer !== undefined) this.runtime.clearTimer(this.timer);
     this.pendingAt = at;
@@ -153,40 +142,31 @@ export class UsageLimitResume {
     }
   }
 
-  // R-CNV-41: events that end the main reservation keep the delegate part.
   private dropMain(): void {
     this.pendingMain = false;
-    // R-CNV-41: retiring pendingMain must not suppress later delegate notifications.
     if (this.stoppedDelegates.size === 0) this.clearReservation();
   }
 
   private forgetDelegate(agentId: string): void {
-    // R-CNV-41: preserve any other stoppedDelegates and pendingMain.
     if (!this.stoppedDelegates.delete(agentId)) return;
     if (this.stoppedDelegates.size === 0 && !this.pendingMain) this.clearReservation();
   }
 
   private arm(delay?: number): void {
     const at = this.pendingAt;
-    // R-CNV-26: clearReservation invalidates pending callbacks.
     if (at === undefined) return;
     const timer = this.runtime.setTimer(() => {
-      // R-CNV-26 / R-CNV-40: ignore callbacks from a replaced or already fired timer.
       if (this.timer !== timer) return;
       this.timer = undefined;
       if (this.pendingAt !== at) return;
-      // R-CNV-26 / R-CNV-41: connection loss cancels even while deferring.
       if (!this.runtime.connected()) { this.cancel(); return; }
-      // R-CNV-26 / R-CNV-41: re-read settings at the deadline, including while busy.
       if (this.runtime.now() >= at && !this.runtime.enabled()) { this.cancel(); return; }
       if (!this.runtime.live()) {
         this.dropMain();
         if (this.pendingAt !== at) return;
-        // R-CNV-41: a running main turn defers the delegate input instead of receiving it mid-turn.
         this.arm(this.runtime.now() < at ? undefined : LIVENESS_TICK_MS);
         return;
       }
-      // R-CNV-25: LIVENESS_TICK_MS callbacks before the deadline cannot inject.
       if (this.runtime.now() < at) { this.arm(); return; }
       const text = usageLimitResumeText(this.pendingMain, [...this.stoppedDelegates]);
       this.pendingAt = undefined;

@@ -1,10 +1,3 @@
-// セッションJSONLのルールベース解析（LLM不使用・コストゼロ）。
-// データ源: ~/.claude/projects/<slug>/<sessionId>.jsonl（Claude Code 全クライアント共通ストア）
-//
-// このモジュールは第3タブの「参考区画」（裁定A4）。操作分類・人間発言判定・
-// longGap 閾値は自前で持たず共有出所から import する。ここへ tool 名の集合や
-// タスク帰属規則を再導入しないこと — 帰属は L2 の Attempt（ownerState/parentId）が正本。
-
 import * as l10n from "@vscode/l10n";
 import { readFileSync } from "node:fs";
 import { open } from "node:fs/promises";
@@ -16,7 +9,7 @@ export interface AnalysisFinding {
   severity: "warn" | "notice";
   title: string;
   detail: string;
-  at?: string; // 時刻ヒント
+  at?: string;
 }
 
 export type ConclusionStatus = "complete" | "review" | "stop";
@@ -25,12 +18,9 @@ export type BaselineMetric = "toolFailureRate" | "turnDurationMs" | "outputToken
 type SparseBaselineMetric = "toolFailureRate" | "agentTokenRatio" | "failureLoopFrequency";
 
 export interface SparseBaseline {
-  /** Fraction of exposed baseline sessions where this metric occurs at all. */
   occurrenceRate: number;
-  /** Sessions in which this metric could have been measured. */
   sampleCount: number;
   nonzeroSampleCount: number;
-  /** Median in the non-zero cohort; null means no baseline occurrence. */
   nonzeroMedian: number | null;
 }
 
@@ -38,9 +28,7 @@ export interface PersonalBaseline {
   version: 5;
   calculatedAt: number;
   sessionCount: number;
-  /** Continuous measures only; sparse measures use occurrence + non-zero median. */
   metrics: Record<BaselineMetric, number | null>;
-  /** Usable sample size per metric; sparse counts are exposure cohorts. */
   metricSampleCounts: Record<BaselineMetric, number>;
   metricNonzeroSampleCounts: Record<BaselineMetric, number>;
   sparseMetrics: Record<SparseBaselineMetric, SparseBaseline>;
@@ -96,21 +84,11 @@ export interface SpanStat {
   agentTokensUnmeasured: "all" | "partial" | null;
 }
 
-// 読めなかった行の数。0 でないとき、この分析は全量ではない。
-// 数えずに捨てると、破損した記録が「完了 — 通常どおりのセッション」という
-// 肯定的な安全宣言になる（破損行にツール失敗が入っていても 0 件として集計され、
-// status が complete に倒れるため）。判定を格上げするのではなく注記を付けるために使う
-// （観測していないシグナルを主張しない。R-DSP-01 / R-DSP-03）
-// note は Host が組み立てた注記そのもの（健全なら null）。分析ビュー側で
-// 件数を比較して文言を作らない（VND-S6。0 件畳みと不可用表示は Host の責務）
 export interface AnalysisCoverage {
   malformedLines: number;
   note: string | null;
 }
 
-// ベースライン母集団（~/.claude/projects の走査）で読めなかったものの内訳。
-// 読めなかったものを 0 件へ畳むと「比較できるベースラインがない」という否定の断言になる（R-DSP-01）。
-// readSessions は 90 日窓に入り走査できた記録の件数で、母集団の分母ではない
 export interface BaselineScanDegradation {
   rootFailed: boolean;
   unreadableProjects: number;
@@ -119,9 +97,6 @@ export interface BaselineScanDegradation {
   readSessions: number;
 }
 
-// 「他のセッションが無い」と「他のセッションを読めなかった」を分ける。この関数が知っているのは
-// 後者だけなので、走査が失敗しているときに前者を名乗らない（R-DSP-01。session-list.ts#sessionScanNote と同型）。
-// 注記の文言は Host 側のここで組み立てる。分析ビューで件数を比較して合成しない（VND-S6）
 export function baselineScanNote(
   mode: AnalysisReport["baselineMode"],
   scan: BaselineScanDegradation | undefined
@@ -168,9 +143,6 @@ export interface AnalysisReport {
   outputTokens: number;
   agentCount: number;
   agentTokens: number;
-  // agentTokens は結果本文の subagent_tokens を拾えた Agent 呼び出しの和。拾えなかった呼び出しは
-  // 0 ではなく未計測なので、表示側が 0 を測定値として印字しないよう区分と注記を Host で作る
-  // （R-DSP-11。同 repo の baseline 側は agentTokenRatio を null にして同じ扱い）
   agentTokensUnmeasured: "all" | "partial" | null;
   agentTokensNote: string | null;
   model: string;
@@ -184,12 +156,9 @@ export interface AnalysisReport {
   conclusion: AnalysisConclusion;
   findings: AnalysisFinding[];
   tools: ToolStat[];
-  // タスク別の集計は持たない。タスク帰属は L2 の Attempt（ownerState/parentId）が正本で、ここで再実装すると
-  // 「後段のビューが独自のタスク帰属を持たない」が破れる
   skills: SpanStat[];
 }
 
-/** The deliberately small per-session payload persisted in the baseline cache. */
 export interface BaselineSessionMetrics {
   turns: number;
   metrics: Record<BaselineMetric, number | null>;
@@ -296,9 +265,6 @@ export function calculatePersonalBaselineFromSessions(sessions: BaselineSessionM
 
 const SESSION_READ_CHUNK_BYTES = 1024 * 1024;
 
-// 行はバイト列の 0x0a で切り、行ごとに utf8 へ復号する。0x0a は多バイト列の途中に現れないので
-// readFileSync(path, "utf8").split("\n") と同じ行列になる（末尾の空セグメント・CR の残置・BOM も同じ）。
-// StringDecoder や行ごとの trim へ置き換えると、凍結済みの数値が変わりうる
 export async function forEachSessionLine(filePath: string, onLine: (line: string) => void, chunkBytes = SESSION_READ_CHUNK_BYTES): Promise<void> {
   const file = await open(filePath, "r");
   try {
@@ -337,8 +303,6 @@ export function analyzeSessionFile(
   return analyzer.next(null).value as AnalysisReport;
 }
 
-// activate からのベースライン走査が使う。同期読みへ戻すと記録の総量ぶん拡張ホストが止まる
-// （W-BSL-3）
 export async function analyzeSessionFileAsync(
   filePath: string,
   baseline: PersonalBaseline | null = null,
@@ -368,7 +332,6 @@ function* sessionAnalyzer(
   let activeTurnStartedAt: number | null = null;
   const completedTurnDurations: number[] = [];
   let normalEnd = false;
-  // skill 帰属のみ（直近の Skill 起動）。タスク帰属は L2 の Attempt が正本なのでここには無い
   let currentSkill: string | null = null;
 
   const acceptRecord = createRecordUuidFilter();
@@ -382,20 +345,17 @@ function* sessionAnalyzer(
     try {
       o = JSON.parse(line);
     } catch {
-      // 読み飛ばすが数える。数えないと、破損行に入っていた失敗が 0 件として集計され、
-      // 画面が「完了 — 通常どおりのセッション」という太鼓判を出す
       malformedLines++;
       continue;
     }
     if (!acceptRecord(o)) continue;
     const t = ts(o);
     if (t) {
-      // 非単調ログ(ファイル順≠時系列)でも startedAt≤endedAt を保証するため min/max で更新する
       if (startedAt === null || t < startedAt) startedAt = t;
       if (endedAt === null || t > endedAt) endedAt = t;
       timestamps.push(t);
     }
-    if (o.isSidechain) continue; // サブエージェント内部はエージェント行に集約
+    if (o.isSidechain) continue;
 
     const humanText = extractHumanUserText(o);
     if (humanText) {
@@ -420,7 +380,7 @@ function* sessionAnalyzer(
         if (b?.type !== "tool_use" || typeof b.id !== "string") continue;
         const name = String(b.name ?? "?");
         const input = b.input ?? {};
-        if (CLAUDE_VOCABULARY.task.has(name)) continue; // 記帳系は作業ツールとして数えない
+        if (CLAUDE_VOCABULARY.task.has(name)) continue;
         if (name === "Skill" && input && typeof input === "object") {
           const s = (input as Record<string, unknown>).skill;
           if (typeof s === "string") currentSkill = s;
@@ -448,7 +408,6 @@ function* sessionAnalyzer(
     }
   }
 
-  // ---- 集計 ----
   const tools = new Map<string, ToolStat>();
   const skills = new Map<string, SpanStat>();
   let toolFails = 0;
@@ -498,13 +457,11 @@ function* sessionAnalyzer(
     tools.set(u.name, t);
     if (u.skill) bump(skills, u.skill, dur, !!u.isError, tok, agentMeasured);
   }
-  // span 単位も全体と同じ区分。拾えなかった呼び出しの 0 を測定値として印字させない（R-DSP-11）
   for (const s of skills.values()) {
     const c = spanAgentCalls.get(s.name);
     s.agentTokensUnmeasured = c === undefined || c.measured === c.agents ? null : c.measured === 0 ? "all" : "partial";
   }
 
-  // ---- 異常検出（ルールベース） ----
   const findings: AnalysisFinding[] = [];
   for (const t of tools.values()) {
     if (t.count >= 4 && t.fails / t.count >= 0.5) {
@@ -515,7 +472,6 @@ function* sessionAnalyzer(
       });
     }
   }
-  // 同一入力の再試行（連続する同名・同入力の失敗）
   for (let i = 1; i < order.length; i++) {
     const a = order[i - 1];
     const b = order[i];
@@ -531,7 +487,7 @@ function* sessionAnalyzer(
         detail: l10n.t("A failed call was re-run with the same arguments and failed the same way. A sign of not learning from the failure."),
         at: `${fmtTime(a.ts, locale)} / ${fmtTime(b.ts, locale)}`,
       });
-      break; // 代表1件
+      break;
     }
   }
   const evidence: AnalysisEvidence[] = [];
@@ -551,9 +507,6 @@ function* sessionAnalyzer(
     });
   };
 
-  // Stop roots are deduplicated by (tool, error signature). A three-failure stop
-  // is valid only inside one human turn or for the same signature; five requires
-  // the same signature. Different-turn, different-cause failures remain review.
   const loopRootKeys = new Set<string>();
   const recordFailureLoop = (use: ToolUse, count: number, reason: string) => {
     const signature = errorFingerprint(use) ?? "unfingerprinted";
@@ -619,7 +572,6 @@ function* sessionAnalyzer(
   const averageTurnDurationMs = completedTurnDurations.length ? completedTurnDurations.reduce((total, duration) => total + duration, 0) / completedTurnDurations.length : 0;
   const failureLoopCount = loopRootKeys.size;
   const measuredTokens = agentTokens + outputTokens;
-  // An Agent invocation without measured tokens is unknown, not a literal zero.
   const currentMetrics: Record<BaselineMetric, number | null> = {
     toolFailureRate: order.length ? toolFails / order.length : null,
     turnDurationMs: averageTurnDurationMs || null,
@@ -658,13 +610,9 @@ function* sessionAnalyzer(
     return value.multiple !== null ? l10n.t("{0}x the baseline median (n={1})", value.multiple.toFixed(1), value.sampleCount ?? 0) : l10n.t("baseline comparison unavailable (n={0})", value.sampleCount ?? 0);
   };  const isAbnormal = (value: AnalysisMetric, fallback: boolean): boolean => {
     if (value.value === null) return false;
-    // Each metric has its own minimum sample size. Do not let a well-sampled
-    // token metric make an under-sampled agent or failure metric relative.
     if (!baseline || (value.sampleCount ?? 0) < MIN_BASELINE_SESSIONS || (value.nonzeroSampleCount ?? 0) < MIN_BASELINE_SESSIONS) return fallback;
     if (SPARSE_METRICS.has(value.key)) {
       const rareOccurrence = (value.occurrenceRate ?? 1) < 0.1;
-      // Common events require a size increase. A rare occurrence is itself weak
-      // evidence and is displayed alongside its non-zero-cohort multiple.
       return value.value > 0 && (rareOccurrence || (value.multiple !== null && value.multiple >= 2));
     }
     return (value.multiple ?? 0) >= 2;
@@ -709,8 +657,7 @@ function* sessionAnalyzer(
     ],
     evidence,
     actions: evidence.length ? evidence.map((item) => ({ evidenceId: item.id, text: actionFor(item.signal) })) : [{ text: l10n.t("Resume this session only if necessary.") }],
-  };  // startedAt/endedAt は min/max 更新済みなので、この差がソート済み時刻列の全幅と一致する。
-  // ギャップも時系列ソート済み列から取り、idle ≤ total と active+idle=total を保証する
+  };
   const sortedTs = [...timestamps].sort((a, b) => a - b);
   const totalElapsedMs = startedAt !== null && endedAt !== null ? endedAt - startedAt : 0;
   const idleGaps = sortedTs

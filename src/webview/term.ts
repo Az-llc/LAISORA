@@ -1,8 +1,5 @@
 import * as l10n from "@vscode/l10n";
 
-// 用語の注記（R-DSP-12）。難しい語は平易語へ言い換えず、破線下線＋マウスオーバーで説明する。
-// 注記は語の意味の説明であって別名ではない（R-DSP-13: 言い換え・造語を作らない）
-// キーは英語の正準語。呼び出し側は termSpan(キー) と l10n.t(キー) の両方で同じ英語リテラルを使う
 export const TERM_NOTES = {
   "Waiting for your answer": {
     label: l10n.t("Waiting for your answer"),
@@ -14,7 +11,7 @@ export const TERM_NOTES = {
   },
   "Subagent": {
     label: l10n.t("Subagent"),
-    note: l10n.t("A separate LLM started by the main LLM with the Agent tool. Runs in parallel"),
+    note: l10n.t("A separate LLM started by the main LLM with the Agent tool, or an external agent started in the background. Runs in parallel"),
   },
   "Background": {
     label: l10n.t("Background"),
@@ -34,11 +31,15 @@ export const TERM_NOTES = {
   },
   "LLM generation": {
     label: l10n.t("LLM generation"),
-    note: l10n.t("Time the LLM spent generating responses and tool calls (the remainder of a turn after tool execution and waiting for confirmation)"),
+    note: l10n.t("Time the LLM spent generating responses and tool calls (the remainder of a turn after tool execution, waiting for subagents and waiting for confirmation)"),
   },
   "Tool execution": {
     label: l10n.t("Tool execution"),
-    note: l10n.t("Time from calling a tool until its result returns"),
+    note: l10n.t("Time from calling a tool until its result returns. Waiting for a subagent started with the Agent tool or for an external agent is not included"),
+  },
+  "Waiting for subagent": {
+    label: l10n.t("Waiting for subagent"),
+    note: l10n.t("Time the main LLM waited for the result of a subagent it started with the Agent tool or of an external agent, while no other tool was running"),
   },
   "Baseline": {
     label: l10n.t("Baseline"),
@@ -54,12 +55,10 @@ export const TERM_NOTES = {
   },
 } satisfies Record<string, { label: string; note: string }>;
 
-// termSpan へ翻訳済みの語を渡すと注記が消える。キー以外を型で弾く
 export type TermKey = keyof typeof TERM_NOTES;
 
 export function termSpan(term: TermKey): Node {
   const entry = TERM_NOTES[term];
-  // 説明文の無い語には破線下線を付けない。装飾だけ付けると説明があると誤らせる（R-DSP-12）
   if (entry === undefined) return document.createTextNode(term);
   const el = document.createElement("span");
   el.className = "term-note";

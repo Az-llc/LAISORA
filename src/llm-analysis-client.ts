@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { ACTION_DESTINATIONS, ACTION_KINDS } from "./llm-action-policy";
+import { ACTION_DESTINATIONS, ACTION_KINDS, analysisActionDestinations } from "./llm-action-policy";
 import type { CitationAliasTable } from "./llm-citation-alias";
 import type { LlmAnalysisInput, NumericFactTable } from "./llm-analysis-input";
 import {
@@ -25,6 +25,7 @@ import type { LlmAnalysisOutputLanguage } from "./llm-analysis-prompt";
 export interface LlmAnalysisRequest {
   promptVersion: string;
   outputLanguage: LlmAnalysisOutputLanguage;
+  learningEnabled: boolean;
   modelId: string;
   prompt: string;
   signal: AbortSignal;
@@ -270,8 +271,14 @@ export function valueSpecToJsonSchema(spec: ValueSpec): Record<string, unknown> 
   }
 }
 
-export function llmFindingsJsonSchema(): Record<string, unknown> {
-  const findingSchema = valueSpecToJsonSchema({ t: "object", fields: ACTION_FINDING_FIELDS });
+export function llmFindingsJsonSchema(learningEnabled = true): Record<string, unknown> {
+  const actionFields = ACTION_FIELDS.map(field => field.key === "destination"
+    ? { ...field, spec: { t: "enum" as const, values: analysisActionDestinations(learningEnabled) } }
+    : field);
+  const findingFields = ACTION_FINDING_FIELDS.map(field => field.key === "action"
+    ? { ...field, spec: { t: "object" as const, fields: actionFields } }
+    : field);
+  const findingSchema = valueSpecToJsonSchema({ t: "object", fields: findingFields });
   return {
     type: "object",
     properties: {
@@ -322,6 +329,7 @@ export interface LlmFindingCacheKey {
   inputVersion: string;
   promptVersion: string;
   outputLanguage: LlmAnalysisOutputLanguage;
+  learningEnabled: boolean;
   contentHash: string;
 }
 
@@ -341,6 +349,7 @@ export function llmFindingCacheKeyString(key: LlmFindingCacheKey): string {
     key.inputVersion,
     key.promptVersion,
     key.outputLanguage,
+    key.learningEnabled !== false,
     key.contentHash,
   ]);
 }
@@ -455,8 +464,6 @@ export interface LlmAnalysisProgress {
   event: "call_started" | "call_finished";
   stage: LlmAnalysisCallStage;
   callIndex: number;
-  // 実際に投げる予定の呼び出し数。maxCalls を分母に使うと 2 スライスのとき「1/7」と表示され、
-  // 画面が到達しない上限を名乗る
   plannedCalls: number;
   maxCalls: number;
   sliceIndex: number;
@@ -506,6 +513,7 @@ export interface LlmAnalysisRunInput {
   input: LlmAnalysisInput;
   promptVersion: string;
   outputLanguage: LlmAnalysisOutputLanguage;
+  learningEnabled: boolean;
   model: FindingVerificationModel;
   analysis: { semanticHash: string };
   provenance: LlmAnalysisProvenanceInput;
@@ -599,6 +607,7 @@ export async function runLlmAnalysis(input: LlmAnalysisRunInput): Promise<LlmAna
     inputVersion: input.input.version,
     promptVersion: input.promptVersion,
     outputLanguage: input.outputLanguage,
+    learningEnabled: input.learningEnabled,
     contentHash,
   };
 
@@ -728,6 +737,7 @@ export async function runLlmAnalysis(input: LlmAnalysisRunInput): Promise<LlmAna
         const generation = client.generate({
           promptVersion: input.promptVersion,
           outputLanguage: input.outputLanguage,
+          learningEnabled: input.learningEnabled,
           modelId: client.modelId,
           prompt: slice.text,
           signal: callController.signal,
@@ -743,8 +753,6 @@ export async function runLlmAnalysis(input: LlmAnalysisRunInput): Promise<LlmAna
         ]);
 
         if (settled === ABORTED) {
-          // 総時間切れは onParentAbort 経由でこの呼び出しも落とすので callTimedOut は偽のまま。
-          // 先に立った側が「どちらの上限で落ちたか」になる
           return {
             state: "unavailable",
             reason: callTimedOut || totalTimedOut ? "client_timeout" : "client_aborted",
@@ -791,7 +799,6 @@ export async function runLlmAnalysis(input: LlmAnalysisRunInput): Promise<LlmAna
       totalCandidatesCount += parsed.candidateCount;
       allSchemaRejections.push(...parsed.rejections);
 
-      // Verify slice findings
       const verified = verifyActionFindings({
         model: input.model,
         analysis: input.analysis,
@@ -835,8 +842,6 @@ export async function runLlmAnalysis(input: LlmAnalysisRunInput): Promise<LlmAna
         for (const eid of finding.evidenceIds) citedIds.add(eid);
         for (const fid of finding.impact.calculation.factIds) citedIds.add(fid);
       }
-      // Merge only needs the facts supporting accepted findings, including dependent evidence.
-      // Keep the full fact table for final verification below.
       const mergeFacts = new Map<string, NonNullable<ReturnType<NumericFactTable["get"]>>>();
       for (const id of citedIds) {
         const alias = input.input.aliases.aliasOf.get(id) ?? id;
@@ -912,6 +917,7 @@ export async function runLlmAnalysis(input: LlmAnalysisRunInput): Promise<LlmAna
         const generation = client.generate({
           promptVersion: input.promptVersion,
           outputLanguage: input.outputLanguage,
+          learningEnabled: input.learningEnabled,
           modelId: client.modelId,
           prompt: mergePromptText,
           signal: mergeCallController.signal,

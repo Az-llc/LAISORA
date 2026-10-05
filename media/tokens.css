@@ -5,6 +5,9 @@
   --l-chart-c3: color-mix(in srgb, var(--laisora-accent) 45%, var(--vscode-editor-background));
   --l-chart-c4: color-mix(in srgb, var(--laisora-accent) 25%, var(--vscode-editor-background));
   --l-chart-tool: color-mix(in srgb, var(--vscode-descriptionForeground) 45%, var(--vscode-editor-background));
+  --l-chart-unobserved: color-mix(in srgb, var(--vscode-descriptionForeground) 22%, var(--vscode-editor-background));
+  --l-chart-wait: color-mix(in srgb, var(--vscode-descriptionForeground) 16%, var(--vscode-editor-background));
+  --l-chart-track: color-mix(in srgb, var(--vscode-descriptionForeground) 12%, var(--vscode-editor-background));
   --l-title: 18px;
   --l-heading: 14px;
   --l-body: 13px;

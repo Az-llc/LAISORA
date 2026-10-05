@@ -1,4 +1,5 @@
 {
+  "config.laisora.claude.initialModel.description": "新しい会話の初期モデル。空欄はオフ（Claude の通常の設定）。実行中の会話と再開には影響しません。",
   "config.laisora.learning.enabled.description": "laisora-learning の現役対策を配信し、学習記録ツールを提供し、配信とモデル変更を記録します。編成の有効・無効に依りません。次の会話プロセス起動から適用します。既定は無効で、無効時は学習記録の読み書きを行いません。",
   "extension.description": "VS CodeでAIエージェントとの会話に集中し、作業状況の確認とログ分析による改善を進められます。",
   "capabilities.untrustedWorkspaces": "Claude Codeを実行するには、このワークスペースを信頼する必要があります。",
@@ -34,7 +35,8 @@
   "config.laisora.orchestration.conductorPolicy.description": "生成されたコンダクター指示の後に追加する利用者の方針。次のセッションから有効。",
   "config.orchestration.externalTimeoutMinutes": "外部実行の待ち時間（分）。次のセッションから有効になります。",
   "config.laisora.fileLinks.openWithSystemApp.description": "ワークスペースと会話フォルダ内で OS の既定アプリで開く拡張子。先頭にドットを付けた小文字で指定します。実行ファイルやスクリプトの拡張子は無視されます。ユーザー設定のみ。",
-  "config.laisora.appearance.accentColor.description": "現在位置、YOU、強調のアクセントカラー。ボタンとキーボードのフォーカス枠はテーマ色を使い、ハイコントラストでは常にテーマに従います。",
+  "config.laisora.appearance.displayName.description": "YOU の代わりに表示する名前。チャットの発言者ラベル、YOU 列の見出し、判断・実機確認のカード、Markdown 書き出しの利用者の見出しに使います。空欄では YOU（書き出しでは User）のままです。前後の空白は除き、改行は使えず、先頭の 20 文字だけを使います。",
+  "config.laisora.appearance.accentColor.description": "現在位置、あなたのラベル、強調のアクセントカラー。ボタンとキーボードのフォーカス枠はテーマ色を使い、ハイコントラストでは常にテーマに従います。",
   "config.laisora.appearance.accentColor.theme": "テーマに合わせる（既定）",
   "config.laisora.appearance.accentColor.blue": "青",
   "config.laisora.appearance.accentColor.orange": "橙",

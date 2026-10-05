@@ -9,8 +9,6 @@ export function normalizeProgressTracking(value: unknown): ProgressTrackingMode 
   return value === "instrument" || value === "observe" || value === "off" ? value : "observe";
 }
 
-// Guardrail / Handoff / work-graph が pp1 束縛の鍵を得る単一出所。
-// Task nodeId は `task:<semanticTaskId>`、Attempt nodeId は `attempt:<toolUseId>`
 export function progressSubjectKey(nodeId: string): string {
   if (nodeId.startsWith("task:")) {
     return nodeId.slice("task:".length);

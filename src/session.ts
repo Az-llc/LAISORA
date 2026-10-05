@@ -1,5 +1,4 @@
 import { randomUUID } from "node:crypto";
-import { projectPlanUsage } from "./plan-usage";
 
 import * as l10n from "@vscode/l10n";
 import {
@@ -56,6 +55,7 @@ import {
   TabSnapshot,
   LlmUnavailableReason,
   type LlmAnalysisRunProgress,
+  type HandoffSourceSnapshot,
   isInternalSlashCommand,
   projectWorkModel,
   requiresTimestamp,
@@ -85,7 +85,6 @@ import {
 } from "./work-model";
 import type { HostArtifactAccess } from "./artifact-access";
 
-// RESUME_DISPLAY_BYPASS_KINDS は復元待ちでも操作を続けるための表示経路。正式な反映は journalLiveEvent の記録から行う。
 const RESUME_DISPLAY_BYPASS_KINDS: ReadonlySet<string> = new Set([
   "approval_request",
   "approval_resolved",
@@ -102,11 +101,9 @@ export class Session {
   events: NormalizedEvent[] = [];
   workModel: WorkModelState = createWorkModelState();
   evidenceIndex: SemanticEvidenceIndex = createEvidenceIndex();
-  // 親の記録だけでは深い階層を復元できないため、restoredAgents を別に保持する。
   restoredAgents: RestoredAgent[] = [];
   guardrail: GuardrailState = createGuardrailState();
   guardrailLiveSince?: number;
-  // イベント由来の liveGuardrailSignalIds は時刻比較で登録しない（src/event-fold.ts#foldEventState）。履歴と現在の観測は同時刻になりうる。
   liveGuardrailSignalIds = new Set<string>();
   readonly guardrailRunner = new SessionGuardrail(this, () => this.semantic.semanticDerivation());
   readonly semantic: SessionSemantic;
@@ -115,9 +112,9 @@ export class Session {
   readonly summaryRunner: SessionSummaryWiring;
   sessionFacts: SessionFactsAccumulator = initialSessionFacts();
   readonly learningFacts?: () => LearningFacts | undefined = () => this.conversation?.learningFacts;
-  // 旧プロセスの委任を実行中と再主張しないための liveDelegationAgentIds（verify-webview-wiring#S3-5）。
+  learningEvidenceSource?: string;
+  learningDedicated?: boolean;
   liveDelegationAgentIds = new Set<string>();
-  // liveDelegationAgentIds は同じ集合を変更するため、導出のキャッシュには liveDelegationRev を使う。
   liveDelegationRev = 0;
   backgroundActivity: BackgroundActivityState = createBackgroundActivityState();
   timestampContractViolations = 0;
@@ -129,7 +126,6 @@ export class Session {
     abort: AbortController;
     progress?: { value: LlmAnalysisRunProgress; observedAtMs: number };
   } | null = null;
-  // R-DSP-25: sessionSummary を保存の正本にしない（src/session-summary-wiring.ts#SESSION_SUMMARY_STORE_KEY）。
   sessionSummary: { text: string; model: string } | null = null;
   summaryRun: AbortController | null = null;
   llmResult: {
@@ -152,20 +148,17 @@ export class Session {
   seq = 0;
   generation = 1;
   conversation: ClaudeConversation | null = null;
-  // 起動待ちは src/conversation-lifecycle.ts#ensureConversation と共有し、並行送信による重複起動を防ぐ。
   starting: Promise<void> | null = null;
+  resumePreparation: { ready: Promise<void>; release: () => void } | null = null;
   closed = false;
   clearing = false;
   expectedConversationId: string | null = null;
-  // detachedConversationIds は resetLogicalSession で消さない。破棄待ちの旧会話も拒否する。
   readonly detachedConversationIds = new Set<string>();
   cwd = "";
-  // events の切り詰め後も認証表示を保持するため、snapshot は auth を使う。
   auth: AuthStatus | null = null;
   lastContextTotalTokens: number | null = null;
 
   autoTitled = false;
-  // R-SES-05: autoTitled と titleRefreshed を兼用しない。名前の解決完了は src/session-list-wiring.ts#refreshTabTitle が決める。
   titleRefreshed = false;
   titleRefreshing = false;
   permissionMode: PermissionModeId = resolveInitialMode();
@@ -173,9 +166,9 @@ export class Session {
   models: ModelInfo[] = [];
   discoveredModels: Pick<ModelInfo, "id" | "label" | "description" | "resolvedModel">[] = [];
   modelOverride: string | null | undefined;
+  initialModel: string | null | undefined;
   effectiveModel: string | null | undefined;
   effectiveEffort: "low" | "medium" | "high" | "xhigh" | "max" | undefined;
-  // configuredEffort は表示専用。起動設定へ流用せず、src/claude-settings.ts#effortDisplayFromSnapshot の判定に従う。
   configuredEffort: ConfiguredEffort | undefined;
   configuredEffortSnapshot: ConfiguredEffortSnapshot | undefined;
   configuredEffortGeneration = 0;
@@ -186,26 +179,15 @@ export class Session {
   recordedModel: string | undefined;
   defaultEffort: ConfiguredEffort | undefined;
   resumeSessionId: string | undefined;
-  handoffSource?: {
-    sessionId: string;
-    title?: string;
-    compact?: { preTokens: number; postTokens: number };
-    utteranceCount?: number;
-    detailRunId?: string;
-    decisionCount?: number;
-  };
-  // 復元中の再利用は resuming で防ぐ。clearing は記録の読み取り前に解除される（src/resume-hydration.ts#openResumedSession）。
+  handoffSource?: HandoffSourceSnapshot;
   resuming = false;
   hydration: ResumeHydration | null = null;
-  // 復元失敗後の部分値を確定表示へ戻さないための hydrationCoverageUnconfirmed。
   hydrationCoverageUnconfirmed = false;
   resumeFilePath: string | undefined;
   effortOverride: "low" | "medium" | "high" | "xhigh" | "max" | undefined;
   profileChangeTail: Promise<void> = Promise.resolve();
   historyFingerprint: string | null = null;
-  // conversationAnchorUuids は件数へ置き換えない。表示側と登録側で読める記録が異なる（src/conversation-history.ts#registerConversationHistory）。
   conversationAnchorUuids: string[] = [];
-  // R-DSP-03: 読めなかった記録を完全な履歴と見せないための conversationHistoryGaps。
   conversationHistoryGaps: { malformedLineCount: number; droppedWithoutUuidCount: number } | undefined = undefined;
 
   constructor(private readonly store: SessionStore, index: number) {
@@ -220,8 +202,9 @@ export class Session {
     return this.lastEventTimestamp;
   }
 
-  // 同じ会話のプロセス再起動で resetLogicalSession を呼ばない。履歴の継続を保つ。
   resetLogicalSession(): void {
+    this.initialModel = undefined;
+    this.cancelResumePreparation();
     this.hydration = null;
     this.hydrationCoverageUnconfirmed = false;
     this.expectedConversationId = null;
@@ -258,7 +241,6 @@ export class Session {
     this.evidenceIndex = createEvidenceIndex();
     this.sessionFacts = initialSessionFacts();
     this.restoredAgents = [];
-    // 旧会話の導出結果を持ち越さない（verify-llm-wiring#W-SD-3）。
     this.semantic.semanticMemo = null;
     this.semantic.semanticDerivationFailedLast = false;
     this.semantic.lastGoodSemanticPayload = undefined;
@@ -266,7 +248,6 @@ export class Session {
     this.semantic.transcriptTimeBucketsCoverage = undefined;
     this.semantic.transcriptTimeBucketsDirty = false;
     this.semantic.clearTranscriptTimeBucketsTimer();
-    // 要約のリセットを外すと旧会話の内容が残る（verify-llm-wiring#W-SUM-6c）。
     this.summaryRunner.resetForLogicalSession();
     this.resumeSessionId = undefined;
     this.handoffSource = undefined;
@@ -292,11 +273,28 @@ export class Session {
     this.guardrailRunner.clearGuardrailRefreshTimer();
     this.guardrailRunner.clearGuardrailTickTimer();
     this.discardLlmAnalysis();
-    // src/llm-analysis-client.ts#LlmFindingCache.clear は実行中の処理を中断しないため、先に discardLlmAnalysis を通す。
     this.llmCache.clear();
   }
 
-  // resetDiscardedProfileForResume は履歴の再利用用。明示選択した設定を引き継ぐ resetLogicalSession には含めない。
+  beginResumePreparation(): NonNullable<Session["resumePreparation"]> {
+    this.cancelResumePreparation();
+    let release!: () => void;
+    const ready = new Promise<void>((resolve) => { release = resolve; });
+    const preparation = { ready, release };
+    this.resumePreparation = preparation;
+    return preparation;
+  }
+
+  finishResumePreparation(preparation: NonNullable<Session["resumePreparation"]>): void {
+    if (this.resumePreparation !== preparation) return;
+    this.resumePreparation = null;
+    preparation.release();
+  }
+
+  cancelResumePreparation(): void {
+    if (this.resumePreparation !== null) this.finishResumePreparation(this.resumePreparation);
+  }
+
   resetDiscardedProfileForResume(): void {
     this.modelOverride = undefined;
     this.effortOverride = undefined;
@@ -309,12 +307,10 @@ export class Session {
     this.llmResult = null;
   }
 
-  // 設定の再有効化で支払い済みの結果を使えるよう、abortLlmAnalysisRun では結果とキャッシュを保持する。
   abortLlmAnalysisRun(): void {
     this.llmRun?.abort.abort();
   }
 
-  // 窓取りは連続とは限らないため、搬送する範囲は src/event-window.ts#windowEvents に従う。
   registerHistorySnapshot(): void {
     if (this.events.length === 0) return;
     const scopeKey = historyScopeKey(this);
@@ -340,7 +336,7 @@ export class Session {
     if (h.workPostDirty) {
       h.workPostDirty = false;
       this.store.post({ type: "planUsage", tabId: this.tabId,
-        state: projectPlanUsage(this.sessionFacts.planUsage, this.evidenceIndex.timeBuckets.blocks) });
+        state: this.semantic.projectedPlanUsage() });
       this.store.post({ type: "workModel", tabId: this.tabId, model: this.semantic.projectedWorkModel() });
     }
     if (h.semanticPostDirty) {
@@ -356,7 +352,6 @@ export class Session {
     h.persistencePosts.clear();
   }
 
-  // R-SES-02: 旧プロセスの背景活動を再主張しないため、backgroundActivitySnapshot は streamOpen を参照する。
   backgroundActivitySnapshot(): BackgroundActivitySnapshot {
     return this.streamOpen() ? backgroundActivitySnapshotOf(this.backgroundActivity) : emptyBackgroundActivitySnapshot();
   }
@@ -411,7 +406,6 @@ export class Session {
     }
   }
 
-  // 到着時の判定を再生時にやり直さない。復元待ちの間にも会話プロセスは交代しうる（src/event-fold.ts#EventMeta）。
   private journalLiveEvent(
     h: ResumeHydration,
     partial: NormalizedEventBody & { provenance?: EventProvenance },
@@ -419,7 +413,6 @@ export class Session {
     meta?: EventMeta,
     clientToken?: string
   ): void {
-    // 切り離した会話の扱いは detachedConversationIds。
     if (conversationId !== undefined && this.detachedConversationIds.has(conversationId)) {
       output.appendLine(`[${this.title}] [drop] detached conversation event: ${partial.kind}`);
       return;
@@ -429,7 +422,6 @@ export class Session {
         this.expectedConversationId &&
         conversationId !== this.expectedConversationId
     );
-    // 到着時の判定順序は src/event-fold.ts#foldEventState に合わせる。
     const guardrailOnly = GUARDRAIL_ONLY_EVENT_KINDS.has(partial.kind);
     const commandsChanged = partial.kind === "commands_changed";
     let verdict: HydrationVerdict = "accepted";
@@ -450,7 +442,6 @@ export class Session {
         h.arrivalTimestamp = meta.timestamp;
       }
     }
-    // 棄却した記録の境界も finalizeHydrationFailure へ運び、待ち時間の集計に使う。
     const entry: HydrationJournalEntry = {
       journalEventId: `${h.attemptId}#${++h.journalSeq}`,
       partial,
@@ -476,7 +467,6 @@ export class Session {
       backendId: "claude",
       conversationId: conversationId ?? this.conversation?.conversationId ?? "pending",
       generation: this.generation,
-      // 失敗時にも表示済みのイベントを同定できるよう、finalizeHydrationFailure と採番を合わせる。
       seq: h.liveSeqBase + h.acceptedSinceBuffering,
       timestamp: meta?.timestamp ?? h.arrivalTimestamp ?? 0,
     } as NormalizedEvent;
@@ -544,6 +534,8 @@ export class Session {
   snapshot(): TabSnapshot {
     this.registerHistorySnapshot();
     const semanticView = semanticViewEnabled();
+    const semanticModel = semanticView ? this.semantic.semanticModelPostPayload() : undefined;
+    const planUsage = this.semantic.projectedPlanUsage(semanticModel?.timeBuckets?.blocks);
     return {
       tabId: this.tabId,
       title: this.title,
@@ -561,29 +553,29 @@ export class Session {
         modelFallback: this.modelFallback,
         appliedEffort: this.appliedEffort,
         recordedModel: this.recordedModel,
-        configModel: this.configuredEffortSnapshot?.resolvedModel,
+        configModel: this.initialModel ? undefined : this.configuredEffortSnapshot?.resolvedModel,
         modelOverride: this.modelOverride,
         effortOverride: this.effortOverride,
         resumeSessionId: this.resumeSessionId,
         resumeFilePath: this.resumeFilePath,
         handoffSource: this.handoffSource,
         workModel: this.semantic.projectedWorkModel(),
-        planUsage: projectPlanUsage(this.sessionFacts.planUsage, this.evidenceIndex.timeBuckets.blocks),
+        planUsage,
         semanticView,
-        semanticModel: semanticView ? this.semantic.semanticModelPostPayload() : undefined,
+        semanticModel,
         llmAnalysisEnabled: llmAnalysisEnabled(),
         ...this.llmAnalysisSnapshotFields(),
         sessionSummary: this.summaryRunner.hydratedSessionSummary() ?? undefined,
         sessionSummaryRunning: this.summaryRun !== null,
         llmDiagnostics: llmDiagnosticsAudience() !== "off" && llmAnalysisEnabled(),
         backgroundActivity: this.backgroundActivitySnapshot(),
+        autoResumeAt: this.conversation?.pendingAutoResumeAt ?? null,
         events: this.events,
         ...(this.hydration === null ? {} : { resumeHydration: this.hydrationSnapshotState() }),
       },
     };
   }
 
-  // 再表示で送信済みの発言を失わないため、hydrationPreviewMessages は到着記録も参照する。
   hydrationPreviewMessages(h: ResumeHydration): ResumePreviewMessage[] {
     const merged: ResumePreviewMessage[] = [...h.previewMessages];
     for (const entry of h.journal) {
@@ -604,7 +596,6 @@ export class Session {
       : merged;
   }
 
-  // 復元待ちの再表示で即時表示の値を失わないため、hydrationProjected は到着記録も参照する。
   private hydrationProjected(h: ResumeHydration): {
     auth: AuthStatus | null;
     commands: SlashCommandInfo[];
@@ -642,7 +633,6 @@ export class Session {
     };
   }
 
-  // 未確定の記録は resumePreviewSnapshot で表示する。
   resumePreviewSnapshot(h: ResumeHydration): TabSnapshot {
     const loading = h.phase !== "failed";
     const base = projectWorkModel(this.workModel, this.restoredAgents);
@@ -664,7 +654,7 @@ export class Session {
         modelFallback: this.modelFallback,
         appliedEffort: this.appliedEffort,
         recordedModel: this.recordedModel,
-        configModel: this.configuredEffortSnapshot?.resolvedModel,
+        configModel: this.initialModel ? undefined : this.configuredEffortSnapshot?.resolvedModel,
         modelOverride: this.modelOverride,
         effortOverride: this.effortOverride,
         resumeSessionId: this.resumeSessionId,
@@ -687,14 +677,13 @@ export class Session {
         sessionSummaryRunning: this.summaryRun !== null,
         llmDiagnostics: llmDiagnosticsAudience() !== "off" && llmAnalysisEnabled(),
         backgroundActivity: this.backgroundActivitySnapshot(),
-        // 復元失敗後の送信済みの発言は events を参照する。
+        autoResumeAt: this.conversation?.pendingAutoResumeAt ?? null,
         events: loading ? [] : this.events,
         resumeHydration: this.hydrationSnapshotState(),
       },
     };
   }
 
-  // R-TAB-08 / R-CNV-02: deferredSnapshot の空の記録を読了と見せない。中身は src/store-surfaces.ts#SessionStore.drainRestoreFill が運ぶ。
   deferredSnapshot(): TabSnapshot {
     return {
       tabId: this.tabId,
@@ -714,7 +703,7 @@ export class Session {
         modelFallback: this.modelFallback,
         appliedEffort: this.appliedEffort,
         recordedModel: this.recordedModel,
-        configModel: this.configuredEffortSnapshot?.resolvedModel,
+        configModel: this.initialModel ? undefined : this.configuredEffortSnapshot?.resolvedModel,
         modelOverride: this.modelOverride,
         effortOverride: this.effortOverride,
         resumeSessionId: this.resumeSessionId,
@@ -726,21 +715,19 @@ export class Session {
         sessionSummary: this.summaryRunner.hydratedSessionSummary() ?? undefined,
         sessionSummaryRunning: this.summaryRun !== null,
         llmDiagnostics: llmDiagnosticsAudience() !== "off" && llmAnalysisEnabled(),
-        // R-SES-02: 再生する記録のない面でも backgroundActivitySnapshot で背景活動を復元する。
         backgroundActivity: this.backgroundActivitySnapshot(),
+        autoResumeAt: this.conversation?.pendingAutoResumeAt ?? null,
         events: [],
       },
     };
   }
 
-  // R-TAB-07: 搬送の窓取りで集計を部分値へ戻さない。窓の選択は src/event-window.ts#windowEvents に委ねる。
   restoreSnapshot(): TabSnapshot {
     const h = this.hydration;
     if (h !== null && h.phase !== "complete") return this.resumePreviewSnapshot(h);
     const full = this.snapshot();
     if (this.events.length <= RESTORE_TAIL_EVENT_MAX) return full;
     const tail = windowEvents(this.events, RESTORE_TAIL_EVENT_MAX);
-    // 省略件数の受理条件は src/protocol.ts#isHostToWebview に従う。
     if (tail.droppedCount <= 0) return full;
     const kept = new Set(tail.events);
     let hasConvEvent = false;
@@ -771,7 +758,6 @@ export class Session {
     return this.snapshot();
   }
 
-  // 失敗後の部分値の扱いは hydrationCoverageUnconfirmed。
   finalizeHydrationFailure(h: ResumeHydration, reason: string, surface: boolean): void {
     h.buffering = false;
     h.phase = "failed";
@@ -823,7 +809,6 @@ export class Session {
       if (surface) this.store.post({ type: "tabRenamed", tabId: this.tabId, title: this.title });
     }
     if (surface) {
-      // 確定した発言を届ける前に楽観表示を撤去する（finalizeHydrationFailure）。
       for (const clientToken of withdrawTokens) {
         this.store.post({
           type: "resumeHydrationState",
@@ -842,7 +827,6 @@ export class Session {
       });
       h.workPostDirty = true;
       h.semanticPostDirty = true;
-      // 閉じたタブへの配送は src/store-surfaces.ts#SessionStore.post が拒否しないため、surface の判定内で通知する。
       this.flushHydrationPosts(h);
       this.semantic.scheduleTranscriptTimeBuckets();
     }
@@ -854,7 +838,6 @@ export class Session {
     if (conv) await conv.dispose();
   }
 
-  // 起動途中の会話も切り離し対象にする。src/conversation-lifecycle.ts#ensureConversationInner は開始前に expectedConversationId を設定する。
   detachConversation(): ClaudeConversation | null {
     const conv = this.conversation;
     this.conversation = null;
@@ -884,11 +867,9 @@ export function historyTranscriptScopeKey(session: Session): string {
   return `${historyScopeKey(session)}:transcript`;
 }
 
-// isUnusedSession を記録の空判定へ置き換えない。事前起動だけでもイベントが残る。
 export function isUnusedSession(s: Session): boolean {
   if (s.closed || s.clearing || s.resuming) return false;
   if (s.conversation && s.conversation.state !== "idle") return false;
-  // R-HND-09: 記録を読めなくても引き継ぎカードを上書きしないため、handoffSource を確認する。
   if (s.handoffSource !== undefined) return false;
   const used = s.events.some(
     (e) =>

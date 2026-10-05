@@ -1,13 +1,9 @@
-// ROLES の根拠: LAISORA が会話へ注入した役割表と、注入中に起動フックが観測したサブエージェントの agentKey。
-// セッションごとに Host の保存域へ残し、再起動・resume 後も実行時の役割で数える（R-ANL-23）。
-// 記録するのは agentKey・役割・要求 model / effort・時刻・agent_id だけ。プロンプト・説明文・認証情報は入れない。
 import { createHash, randomUUID } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { mkdir, open, rename, unlink } from "node:fs/promises";
 import * as path from "node:path";
 
 export const ROSTER_EVIDENCE_VERSION = 1;
-// 超過は古い側から捨てる。捨てた範囲の実行は根拠を失い other に落ちる（推し量らない。R-DSP-01）
 export const MAX_ROSTER_INJECTIONS = 64;
 export const MAX_AGENT_STARTS = 1000;
 export const MAX_INJECTED_AGENTS = 256;
@@ -19,7 +15,6 @@ export interface InjectedAgentDefinition {
   effort: string | null;
 }
 
-// at はその役割表で会話を起動した時刻。次の記録の at まで有効。agents が空 = 注入していない
 export interface RosterInjection {
   at: number;
   agents: InjectedAgentDefinition[];
@@ -69,7 +64,6 @@ function decodeStart(raw: unknown): AgentStartObservation | undefined {
   };
 }
 
-// 形の合わない項目は捨てる（素通しすると保存域へ任意の文字列が載る）
 export function decodeRosterEvidence(raw: unknown): RosterEvidence | undefined {
   if (!raw || typeof raw !== "object") return undefined;
   const r = raw as Record<string, unknown>;
@@ -100,7 +94,6 @@ export function injectionOf(
 
 const sameAgents = (a: RosterInjection, b: RosterInjection): boolean => JSON.stringify(a.agents) === JSON.stringify(b.agents);
 
-// 和集合。続けて同じ役割表の記録は最初の 1 件に畳む（有効範囲は変わらない）
 export function mergeRosterEvidence(a: RosterEvidence, b: RosterEvidence): RosterEvidence {
   const all = [...a.injections, ...b.injections].sort((x, y) => x.at - y.at);
   const injections: RosterInjection[] = [];
@@ -134,8 +127,6 @@ export function hasInjectedRoster(evidence: RosterEvidence): boolean {
   return evidence.injections.some((i) => i.agents.length > 0);
 }
 
-// 実行の開始時点で有効だった役割表に agentKey があるときだけ役割を返す。起動フックの観測があれば
-// その agentKey と時刻を使う。どちらも無ければ undefined（other）
 export function attributeSubagent(
   evidence: RosterEvidence,
   run: { agentType?: string; transcriptAgentId?: string; startedAt?: number }
@@ -160,7 +151,6 @@ export function rosterEvidenceFile(directory: string, sessionId: string): string
   return path.join(directory, `${digest(sessionId)}.json`);
 }
 
-// 読めない・壊れた記録は空として扱い、ファイルは残す（次の書き込みで置き換わる）
 export function readRosterEvidence(directory: string, sessionId: string, log: (line: string) => void = () => {}): RosterEvidence {
   let text: string;
   try {

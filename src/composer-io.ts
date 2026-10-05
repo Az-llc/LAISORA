@@ -8,6 +8,7 @@ import { readFile, stat } from "node:fs/promises";
 import { dirname, extname, isAbsolute, join, parse, relative, resolve, sep, win32 } from "node:path";
 
 import { pathIsInside, realPathOrNearestSync } from "./agent-inspector";
+import { lexicalPathIsInsideForEarlyRejectOnly, type RealPath } from "./path-containment";
 import { ArtifactServer, type ArtifactMime } from "./artifactServer";
 import type { Session } from "./extension";
 import {
@@ -21,6 +22,7 @@ import {
   type FileLinkTarget,
 } from "./file-link-target";
 import { artifactServer, output, setArtifactServer } from "./host-context";
+import { configuredDisplayName } from "./claude-settings";
 import {
   IMAGE_MAX_BASE64_LEN,
   PICKED_FILE_MAX_COUNT,
@@ -36,7 +38,7 @@ import { readSessionHistory } from "./session-transcript";
 import type { SessionStore } from "./store-surfaces";
 import { recordSeparator } from "./webview/commit-boundary";
 
-function createExportSink(lines: string[]): {
+function createExportSink(lines: string[], userHeading: string): {
   push: (ev: NormalizedEventBody) => void;
   flush: () => void;
 } {
@@ -51,12 +53,11 @@ function createExportSink(lines: string[]): {
     switch (ev.kind) {
       case "user_message":
         flush();
-        lines.push("## User", "", ev.text, "");
+        lines.push(userHeading, "", ev.text, "");
         break;
-      // 復元由来でも見出しを分けない（createExportSink、R-CNV-19）。
       case "replayed_message":
         flush();
-        lines.push(ev.role === "user" ? "## User" : "## Assistant", "", ev.text, "");
+        lines.push(ev.role === "user" ? userHeading : "## Assistant", "", ev.text, "");
         break;
       case "assistant_text_delta":
         assistantBuf += (recordEnded ? recordSeparator(assistantBuf) : "") + ev.text;
@@ -67,7 +68,6 @@ function createExportSink(lines: string[]): {
         break;
       case "tool_call_started":
         flush();
-        // src/protocol.ts#summarizeToolInput の要約を優先する。切り詰め済みのプレビューは完全な構文を保証しない。
         lines.push(
           `> ⚙ ${ev.toolName}: \`${(ev.inputSummary ?? ev.inputPreview).slice(0, 200).replace(/`/g, "'")}\``,
           ""
@@ -88,8 +88,6 @@ function createExportSink(lines: string[]): {
   return { push, flush };
 }
 
-// 縮退時の重複除去を省くと復元済みの会話が重なる（verify-export-markdown#EXmut-2）。
-// 引き継ぎ後は復元範囲を世代境界の代わりに使う（verify-export-markdown#EX-8）。
 function heldEventsForExport(events: readonly NormalizedEvent[], handoff: boolean): NormalizedEvent[] {
   let replayedFrom: number | undefined;
   for (const ev of events) {
@@ -111,9 +109,9 @@ function heldEventsForExport(events: readonly NormalizedEvent[], handoff: boolea
   });
 }
 
-// 保持分だけを完全なログとして渡さない（verify-export-markdown#EXmut-1 / verify-export-markdown#EX-3、R-CNV-19 / R-DSP-01 / R-DSP-03）。
 async function buildExportMarkdown(s: Session): Promise<string> {
   const dateLocale = String(vscode.env.language ?? "").toLowerCase().startsWith("ja") ? "ja-JP" : "en-US";
+  const userHeading = `## ${configuredDisplayName() || "User"}`;
   const lines: string[] = [`# ${s.title}`, "", l10n.t("- Exported: {0}", new Date().toLocaleString(dateLocale)), `- cwd: ${s.cwd}`];
   if (s.handoffSource !== undefined) {
     const source = s.handoffSource.title !== undefined && s.handoffSource.title.length > 0
@@ -128,7 +126,6 @@ async function buildExportMarkdown(s: Session): Promise<string> {
     degraded = "session-file-not-resolved";
   } else {
     try {
-      // 子の読取失敗は親の会話の欠損ではない（src/session-transcript.ts#readSessionHistory）。
       history = await readSessionHistory(ref.file, isInSessionStore, { generationSessionId: ref.sessionId });
       if (history.readError !== undefined) degraded = history.readError;
       else if (history.events.length === 0) degraded = "empty-record";
@@ -139,13 +136,13 @@ async function buildExportMarkdown(s: Session): Promise<string> {
   if (degraded !== undefined || history === undefined) {
     output.appendLine(`[${s.title}] export: falling back to held events (${degraded ?? "empty-record"})`);
     lines.push(l10n.t("- Note: the record could not be read, so only the part held in memory was exported."), "");
-    const sink = createExportSink(lines);
+    const sink = createExportSink(lines, userHeading);
     for (const ev of heldEventsForExport(s.events, s.handoffSource !== undefined)) sink.push(ev);
     sink.flush();
     return lines.join("\n");
   }
   lines.push("");
-  const sink = createExportSink(lines);
+  const sink = createExportSink(lines, userHeading);
   const from = history.generationStartAt;
   let recordEnd = 0;
   const tail = {
@@ -180,8 +177,6 @@ async function buildExportMarkdown(s: Session): Promise<string> {
     },
     () => false
   );
-  // 履歴と実行中のターン識別子は採番元が異なる（src/session-transcript.ts#readSessionHistory / src/claude-normalizer.ts#ClaudeLiveNormalizer）。
-  // 応答中の本文は時刻だけで分けない（verify-export-markdown#EXmut-3）。
   const openTurnId = openLiveTurnId(s.events);
   let openTurnText = "";
   for (const ev of s.events) {
@@ -211,7 +206,6 @@ async function buildExportMarkdown(s: Session): Promise<string> {
   return lines.join("\n");
 }
 
-// 応答中でも本文の一部は記録済みになりうる。時刻だけでは未記録の続きと分離できない（verify-export-markdown#EXmut-3）。
 function openLiveTurnId(events: readonly NormalizedEvent[]): string | undefined {
   let open: string | undefined;
   for (const ev of events) {
@@ -245,7 +239,6 @@ const PICK_IMAGE_MEDIA_TYPES: Record<string, ImageAttachment["mediaType"]> = {
   ".webp": "image/webp",
 };
 
-// 画像にできない選択もパスとして入力へ残す（pickComposerFiles、R-CNV-05）。
 async function pickComposerFiles(
   imageSlots: number,
   cwd: string | undefined
@@ -267,8 +260,6 @@ async function pickComposerFiles(
         }
       } catch {}
     }
-    // src/protocol.ts#PICKED_FILE_MAX_COUNT の超過で返答全体を拒否されないようにする（R-CNV-05）。
-    // パスの枠を使い切っても PICK_IMAGE_MEDIA_TYPES に合う添付の処理は続ける。
     if (paths.length >= PICKED_FILE_MAX_COUNT) continue;
     paths.push(vscode.workspace.asRelativePath(uri));
   }
@@ -306,7 +297,6 @@ function hasSymlinkBelowRoot(root: string, target: string): boolean | null {
 
 const LINK_CHAIN_DEPTH_MAX = 32;
 
-// Inspect link targets with linkChainReachesNetworkOrDevice before following them with I/O.
 function linkChainReachesNetworkOrDevice(target: string, depth: number): boolean {
   if (depth > LINK_CHAIN_DEPTH_MAX || isNetworkOrDevicePath(target)) return true;
   const absolute = resolve(target);
@@ -328,7 +318,6 @@ function linkChainReachesNetworkOrDevice(target: string, depth: number): boolean
   return false;
 }
 
-// R-CNV-12: isWindowsReservedOrStreamPath guards against device I/O and paths with platform-specific interpretation.
 function isWindowsReservedOrStreamPath(value: string): boolean {
   return (
     process.platform === "win32" &&
@@ -338,7 +327,6 @@ function isWindowsReservedOrStreamPath(value: string): boolean {
 
 export const READ_ONLY_FILE_SCHEME = "laisora-readonly";
 const readOnlyApprovals = new Map<string, string>();
-// approvalKey normalizes Unicode because macOS may return a canonically equivalent spelling of the approved path.
 const approvalKey = (fsPath: string): string => {
   const normalized = fsPath.normalize("NFC");
   return process.platform === "linux" ? normalized : normalized.toLowerCase();
@@ -382,7 +370,6 @@ export function createReadOnlyFileProvider(): vscode.FileSystemProvider {
 }
 
 export function registerReadOnlyFileProvider(): vscode.Disposable | undefined {
-  // registerReadOnlyFileProvider also runs with verification stubs that omit the registration API.
   return vscode.workspace.registerFileSystemProvider?.(READ_ONLY_FILE_SCHEME, createReadOnlyFileProvider(), {
     isCaseSensitive: process.platform === "linux",
     isReadonly: true,
@@ -398,7 +385,6 @@ export async function openConversationFile(session: Session, rawTarget: string, 
 
   const relativePath =
     parsed.kind === "path" && !isAbsolute(parsed.resource) && !win32.isAbsolute(parsed.resource);
-  // isWindowsReservedOrStreamPath must run before resolution erases the drive-relative form.
   if ((relativePath && session.cwd.length === 0) || (parsed.kind === "path" && isWindowsReservedOrStreamPath(parsed.resource))) {
     void vscode.window.showWarningMessage(l10n.t("LAISORA: This file link cannot be opened."));
     return;
@@ -417,7 +403,6 @@ export async function openConversationFile(session: Session, rawTarget: string, 
     return;
   }
 
-  // R-CNV-12: openConversationFile must establish an allowed root or outside-file policy before candidate I/O.
   const rootCandidates = [
     ...(session.cwd.length === 0 ? [] : [session.cwd]),
     ...(vscode.workspace.workspaceFolders ?? []).map((folder) => folder.uri.fsPath),
@@ -427,14 +412,13 @@ export async function openConversationFile(session: Session, rawTarget: string, 
     return;
   }
 
-  // R-CNV-12: within preflightRoot, hasSymlinkBelowRoot must precede candidate realpath resolution to avoid following unapproved shares.
   const roots = rootCandidates
     .map((raw) => ({ raw: resolve(raw), real: realPathOrNearestSync(raw) }))
-    .filter((root): root is { raw: string; real: string } => root.real !== null);
+    .filter((root): root is { raw: string; real: RealPath } => root.real !== null);
   const preflightRoot = roots
     .flatMap((root) => [root.raw, root.real])
     .find((root) =>
-      pathIsInside(normalizeWindowsVolumeCase(root), normalizeWindowsVolumeCase(candidate))
+      lexicalPathIsInsideForEarlyRejectOnly(normalizeWindowsVolumeCase(root), normalizeWindowsVolumeCase(candidate))
     );
   if (preflightRoot === undefined) {
     const config = vscode.workspace.getConfiguration("laisora");
@@ -444,7 +428,6 @@ export async function openConversationFile(session: Session, rawTarget: string, 
       );
       return;
     }
-    // R-CNV-12: linkChainReachesNetworkOrDevice prevents following links into unapproved shares before realpath resolution.
     if (isNetworkOrDevicePath(candidate) || linkChainReachesNetworkOrDevice(candidate, 0)) {
       void vscode.window.showWarningMessage(l10n.t("LAISORA: This file link cannot be opened."));
       return;
@@ -539,7 +522,6 @@ async function openResolvedFile(
     if (answer !== open) return;
   }
 
-  // R-CNV-12: approvedReadOnlyUri preserves write protection when the default editor opens the file.
   const uri = outside?.readOnly ? approvedReadOnlyUri(realCandidate) : vscode.Uri.file(realCandidate);
   let document: vscode.TextDocument | undefined;
   try {
@@ -564,12 +546,10 @@ async function openResolvedFile(
     return;
   }
   if (outside !== null) return;
-  // R-CNV-12: openResolvedFile must not let Explorer replace the conversation in the side bar.
   if (!fromEditorPanel) return;
   if (vscode.workspace.getConfiguration("laisora").get<boolean>("fileLinks.revealInExplorer", true) === false) return;
 
   try {
-    // openResolvedFile must pass the opened URI because a custom editor may not yet be active.
     await vscode.commands.executeCommand("revealInExplorer", uri);
   } catch {
     void vscode.window.showWarningMessage(

@@ -32,8 +32,6 @@ import { STEER_LEVEL_BY_MODE, buildSteeringEnvelope, steeringInstruction, type S
 
 const GUARDRAIL_TICK_MS = 15_000;
 
-// guardrail / liveGuardrailSignalIds / guardrailLiveSince は EventFoldDraft（event-fold.ts）の
-// 必須メンバーなので Session 側に残す。ここへ移すと foldEventState(this, …) の構造的部分型が壊れる
 export interface SessionGuardrailHost {
   readonly title: string;
   readonly conversation: ClaudeConversation | null;
@@ -46,7 +44,6 @@ export class SessionGuardrail {
   private guardrailRefreshTimer: ReturnType<typeof setTimeout> | null = null;
   private guardrailTickTimer: ReturnType<typeof setTimeout> | null = null;
   notifiedGuardrailSignalIds = new Set<string>();
-  // signal 単位の実行台帳（自動実行の冪等性。鍵の揺れに依存しない）。transient 失敗は記録しない
   guardrailLedger: GuardrailActionLedger = {};
   reportedSignalIds = new Set<string>();
   pendingReportSignalIds: string[] = [];
@@ -75,9 +72,6 @@ export class SessionGuardrail {
       | undefined
   ) {}
 
-  // 判定閾値・composite は guardrail.ts の既定のまま。設定から読むのは autoMaxLevel だけ（0..3 に正規化）
-  // 偽 vscode のハーネス（verify-history-wiring 等）は workspace.getConfiguration を持たない。
-  // 素で呼ぶと refresh 本体ごと throw し、report が一度も走らないまま全検査が green になる
   guardrailPolicy(): GuardrailPolicy {
     let raw: unknown = 1;
     try {
@@ -91,8 +85,6 @@ export class SessionGuardrail {
     };
   }
 
-  // Level 2/3 の実行面。envelope は純粋関数で組み、Conversation の型付き
-  // 経路へ渡す。user_message / タブ命名 / turn は生成しない（GR-26）
   private sendSteering(
     mode: SteeringMode,
     trigger: "auto" | "manual",
@@ -153,16 +145,12 @@ export class SessionGuardrail {
     const outcome: GuardrailActionOutcome = fn
       ? fn.call(this.guardrailExecutor, decision, signals, trigger)
       : { ok: false, reason: "unsupported", message: "executor が実装されていません" };
-    // transient（not_running / interrupting / closed）は会話状態が変われば通るので台帳に載せない。
-    // queued と terminal 失敗（invalid / redaction / unsupported）は載せ、同 level を再送しない
     if (outcome.ok || outcome.transient !== true) {
       this.guardrailLedger = recordLedger(this.guardrailLedger, decision.signalIds, level);
     }
     return outcome;
   }
 
-  // 自動実行。選定は純粋関数 selectAutoActions（signal 台帳・live 観測・running）。
-  // Level 4 は選定結果に現れない
   private autoExecuteGuardrail(decisions: readonly GuardrailDecision[]): void {
     const conv = this.host.conversation;
     const running = conv !== null && !conv.isClosed && conv.state === "running";
@@ -211,8 +199,6 @@ export class SessionGuardrail {
         : ({ ok: false, reason: "closed", message: "会話が未接続です。", transient: true } as const);
     const outcome = classifyReportSendOutcome(result);
     if (outcome.kind === "sent") {
-      // 直近 1 通ぶんだけ保持する。会話世代の生涯ぶんを溜めると、backend 死亡時に
-      // 配信済みの全 signal が pending へ戻り新しい会話へ再送され続ける
       this.generationSentSignalIds = new Set(sendIds);
     }
     const settled = settleReportSend(
@@ -316,8 +302,6 @@ export class SessionGuardrail {
             `[${this.host.title}] [guardrail] dropped ${delta} signal(s) at detection (total=${this.host.guardrail.droppedSignalCount}, cap=${MAX_SIGNALS})`
           );
         }
-        // divergence 由来 signal は refresh で fold されるため provenance を持たない。閉じ側時刻が
-        // live 開始より厳密に後のものだけ live とみなす（同時刻は history 側へ倒す）
         if (this.host.guardrailLiveSince !== undefined) {
           for (const s of this.host.guardrail.signals) {
             if (s.confidence === "divergence" && s.lastAt > this.host.guardrailLiveSince) this.host.liveGuardrailSignalIds.add(s.signalId);

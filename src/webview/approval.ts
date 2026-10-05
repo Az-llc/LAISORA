@@ -1,9 +1,63 @@
 import * as l10n from "@vscode/l10n";
 import { renderMarkdownInto } from "./markdown";
+import type { RestoredApprovalCard } from "../protocol";
+import { askHeading, askOptionContent } from "./ask-view";
+import { youAnchor } from "./you-items";
 
-// ---------- 承認カードの可読表示 ----------
+export function buildRestoredApprovalCard(card: RestoredApprovalCard, tabId: string): HTMLElement {
+  const div = document.createElement("div");
+  div.className = "block approval replayed resolved";
+  div.id = youAnchor(tabId, `approval:${card.requestId}`);
+  div.dataset.approval = card.requestId;
+  const det = document.createElement("details");
+  det.className = "approval-det";
+  det.open = card.resolution === "unknown";
+  const title = document.createElement("summary");
+  title.className = "approval-title";
+  title.textContent = card.questions ? l10n.t("Question: {0}", card.toolName) : l10n.t("Approval request: {0}", card.toolName);
+  det.append(title);
+  if (card.questions) {
+    div.classList.add("askq-approval");
+    card.questions.questions.forEach((q, index) => {
+      const question = document.createElement("section");
+      question.className = "askq-item laisora-ask ask-decide";
+      question.append(...askHeading("decide", q.question, `${index + 1} / ${card.questions!.questions.length}`, q.header));
+      const options = document.createElement("div");
+      options.className = "ask-options";
+      q.options.forEach((option, optionIndex) => {
+        const row = document.createElement("div");
+        row.className = "ask-option";
+        row.append(...askOptionContent(optionIndex, option.label, option.description));
+        options.append(row);
+      });
+      question.append(options);
+      det.append(question);
+    });
+  } else {
+    const raw = document.createElement("details");
+    const heading = document.createElement("summary");
+    heading.textContent = l10n.t("Show raw data (JSON)");
+    const pre = document.createElement("pre");
+    pre.textContent = card.inputJson;
+    raw.append(heading, pre);
+    det.append(raw);
+  }
+  div.append(det);
+  for (const [question, answer] of Object.entries(card.answers ?? {})) {
+    div.append(approvalField(l10n.t("Answer"), l10n.t("Answer: {0} → {1}", question, answer)));
+  }
+  const verdict = document.createElement("div");
+  verdict.className = "approval-verdict";
+  verdict.textContent = card.resolution === "answered" ? l10n.t("Answered (recorded)")
+    : card.resolution === "allowed" ? l10n.t("✔ Allowed")
+    : card.resolution === "denied" ? l10n.t("✕ Denied")
+    : card.resolution === "withdrawn" ? l10n.t("Withdrawn")
+    : card.resolution === "failed" ? l10n.t("Recorded tool result is an error; approval outcome is unknown")
+    : l10n.t("The approval outcome could not be recovered from the transcript");
+  div.append(verdict);
+  return div;
+}
 
-// ラベル付きの1項目（値はテキスト or 整形済みブロック）
 function approvalField(label: string, value: string, mono = false): HTMLElement {
   const wrap = document.createElement("div");
   wrap.className = "approval-field";
@@ -24,9 +78,6 @@ function approvalLead(text: string): HTMLElement {
   return el;
 }
 
-// 承認要求の「何を求められているか」を人が読める形に組み立てる。
-// inputJson は context を含まない純粋な入力JSON（ホストが付与）。無い/壊れている場合は
-// inputSummary か汎用文にフォールバックし、原データは呼び出し側の details に残る。
 export function buildApprovalBody(toolName: string, inputJson?: string, inputSummary?: string): HTMLElement[] {
   let obj: Record<string, unknown> | null = null;
   if (inputJson) {
@@ -67,8 +118,6 @@ export function buildApprovalBody(toolName: string, inputJson?: string, inputSum
       out.push(approvalLead(l10n.t("Will write a file (an existing file will be overwritten).")));
       const fp = str(obj.file_path);
       if (fp) out.push(approvalField(l10n.t("File"), fp));
-      // 空文字は「ファイルを空にする」という重要な操作なので、値の有無ではなくキーの
-      // 存在で判定して必ず出す
       if (typeof obj.content === "string") {
         out.push(approvalField(l10n.t("Content"), clip(obj.content, 1500) || l10n.t("(Empty — the file will be emptied)"), true));
       }
@@ -84,7 +133,6 @@ export function buildApprovalBody(toolName: string, inputJson?: string, inputSum
         out.push(approvalField(l10n.t("Before"), clip(obj.old_string, 800) || l10n.t("(Empty)"), true));
       }
       if (typeof obj[newKey] === "string") {
-        // 空文字＝削除。欄ごと消すと「何が起きるか」が伝わらない
         out.push(approvalField(l10n.t("After"), clip(obj[newKey] as string, 800) || l10n.t("(Empty — delete)"), true));
       }
       if (obj.replace_all === true) out.push(approvalField(l10n.t("Scope"), l10n.t("Replace all matching occurrences")));
@@ -127,11 +175,6 @@ export function buildApprovalBody(toolName: string, inputJson?: string, inputSum
     }
     default: {
       out.push(approvalLead(inputSummary ? `${toolName}: ${inputSummary}` : l10n.t("Allow {0} to run?", toolName)));
-      // 未知ツールは主要フィールドを総当たりで並べる。ただし
-      // - 件数上限（MCPツール等で数百キー来てもDOMが膨らまない）
-      // - 資格情報らしきキーは伏せる（原データ側は折りたたみで保護されているのに、
-      //   既定表示だけ無防備になるのを防ぐ）
-      // - 非文字列は欠落させず存在だけ示す
       const SECRET_RE = /(key|token|secret|password|passwd|credential|auth)/i;
       let shown = 0;
       const entries = Object.entries(obj);

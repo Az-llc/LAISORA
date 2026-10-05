@@ -1,20 +1,14 @@
-// 既存要素の取得（getElementById）と VS Code API ハンドルの唯一の入口。
-// createElement / addEventListener 等は各モジュールに残る。この入口が守るのは取得の評価順だけ。
-// テンプレート書き込みは init 関数に包まない: 値 import された時点で必ず走ることが、
-// 「要素取得はテンプレートより後」を規律ではなくモジュールグラフで保証する仕組みそのもの。
-// この保証は本モジュールの値 import が、import もトップレベルの DOM 参照も持たない葉（@vscode/l10n）
-// だけであることに依存する（それ以外の import を足すな）。
 import * as l10n from "@vscode/l10n";
 import type { WebviewToHost } from "../protocol";
 
 type VsCodeWebviewApi = {
   postMessage(msg: WebviewToHost): void;
   getState():
-    | { activeTabId: string | null; drafts?: Record<string, string>; askChecks?: Record<string, Record<string, boolean[]>>; askDismissed?: Record<string, string[]>; askDismissedMessages?: string[]; askCheckedMessages?: Record<string, boolean[]>; views?: Record<string, "conv" | "work">; analysisViews?: Record<string, "script" | "ai">; workViews?: Record<string, "summary" | "graph" | "analysis" | "log"> }
+    | { activeTabId: string | null; drafts?: Record<string, string>; askChecks?: Record<string, Record<string, boolean[]>>; askDismissed?: Record<string, string[]>; askDismissedMessages?: string[]; askResolved?: Record<string, string[]>; askResolvedMessages?: string[]; askCheckedMessages?: Record<string, boolean[]>; views?: Record<string, "conv" | "work">; analysisViews?: Record<string, "script" | "ai">; workViews?: Record<string, "summary" | "graph" | "analysis" | "log"> }
     | undefined;
   setState(s: {
     activeTabId: string | null;
-    drafts?: Record<string, string>; askChecks?: Record<string, Record<string, boolean[]>>; askDismissed?: Record<string, string[]>; askDismissedMessages?: string[]; askCheckedMessages?: Record<string, boolean[]>;
+    drafts?: Record<string, string>; askChecks?: Record<string, Record<string, boolean[]>>; askDismissed?: Record<string, string[]>; askDismissedMessages?: string[]; askResolved?: Record<string, string[]>; askResolvedMessages?: string[]; askCheckedMessages?: Record<string, boolean[]>;
     views?: Record<string, "conv" | "work">;
     analysisViews?: Record<string, "script" | "ai">;
     workViews?: Record<string, "summary" | "graph" | "analysis" | "log">;
@@ -25,7 +19,6 @@ declare function acquireVsCodeApi(): VsCodeWebviewApi;
 
 declare global {
   interface Window {
-    // dom.ts が acquireVsCodeApi() を唯一1度だけ呼ぶ。先行 bootstrap は取得済みの場合だけ参照する。
     __laisoraVscodeApi?: VsCodeWebviewApi;
     __laisoraBootstrap?: { complete(): void };
   }
@@ -35,19 +28,35 @@ export const vscode = acquireVsCodeApi();
 window.__laisoraVscodeApi = vscode;
 
 const app = document.getElementById("app")!;
-// 静的な骨組みのみ。${} に入れてよいのは l10n.t(リテラル) だけ — 翻訳バンドルは拡張同梱で信頼境界内。
-// 実行時の動的値（セッション名・出力・設定値）を混ぜた瞬間に XSS になる（動的テキストは textContent 経由）。
 app.innerHTML = `
   <header id="topbar">
     <nav id="tabbar" role="tablist" aria-label="${l10n.t("Conversation tabs")}"></nav>
     <button hidden id="exportbtn" title="${l10n.t("Export conversation to Markdown")}" aria-label="${l10n.t("Export conversation to Markdown")}">↧</button>
-    <button id="histbtn" title="${l10n.t("Resume from history")}" aria-label="${l10n.t("Resume from history")}" aria-haspopup="menu" aria-expanded="false">🕘</button>
+    <button id="histbtn" type="button" title="${l10n.t("Resume from history")}" aria-label="${l10n.t("Resume from history")}" aria-haspopup="dialog" aria-expanded="false" aria-controls="histpanel"><span class="l-icon l-icon-history" aria-hidden="true"></span></button>
     <button hidden id="handoffbtn" title="${l10n.t("Hand off to a new conversation (keeps the original conversation and copies the summary and messages)")}" aria-label="${l10n.t("Hand off to a new conversation")}">⇉</button>
     <button id="newtab" title="${l10n.t("New conversation")}" aria-label="${l10n.t("New conversation")}">＋</button>
     <div id="session-actions-slot"></div>
-    <div id="histpanel" class="hist-panel hidden" role="menu">
-      <input id="histsearch" type="text" placeholder="${l10n.t("Search by title")}" />
-      <div id="histlist"></div>
+    <div id="histpanel" class="hist-panel hidden" role="dialog" aria-label="${l10n.t("Resume from history")}">
+      <header class="hist-head">
+        <div class="hist-head-line">
+          <span class="hist-code"><b>HISTORY</b><span>${l10n.t("Resume from history")}</span></span>
+          <span id="histcount" class="hist-count" aria-live="polite"></span>
+        </div>
+        <div id="histtools" class="hist-tools">
+          <div class="hist-search">
+            <span class="l-icon l-icon-search" aria-hidden="true"></span>
+            <input id="histsearch" type="text" role="combobox" aria-expanded="true" aria-autocomplete="list" aria-controls="histlist" autocomplete="off" spellcheck="false" placeholder="${l10n.t("Search by title")}" aria-label="${l10n.t("Search by title")}" />
+            <button id="histclear" class="hist-clear" type="button" title="${l10n.t("Clear search")}" aria-label="${l10n.t("Clear search")}" hidden>×</button>
+          </div>
+        </div>
+      </header>
+      <div id="histnote"></div>
+      <div id="histlist" class="hist-list" role="listbox" aria-label="${l10n.t("Sessions")}" tabindex="0"></div>
+      <div id="histnotice" class="hist-notice" role="status" hidden></div>
+      <footer id="histfoot" class="hist-foot">
+        <span id="histprogress" class="hist-progress" role="status"></span>
+        <span class="hist-keys" aria-hidden="true"><span><kbd>↑↓</kbd>${l10n.t("Select")}</span><span><kbd>Enter</kbd>${l10n.t("Open")}</span><span><kbd>F2</kbd>${l10n.t("Rename session")}</span><span><kbd>Del</kbd>${l10n.t("Remove from the list")}</span><span><kbd>Esc</kbd>${l10n.t("Close")}</span></span>
+      </footer>
     </div>
   </header>
   <div id="findbar" class="find-bar hidden" role="search">
@@ -113,6 +122,13 @@ export const handoffBtn = document.getElementById("handoffbtn") as HTMLButtonEle
 export const histPanelEl = document.getElementById("histpanel") as HTMLDivElement;
 export const histSearchEl = document.getElementById("histsearch") as HTMLInputElement;
 export const histListEl = document.getElementById("histlist") as HTMLDivElement;
+export const histCountEl = document.getElementById("histcount") as HTMLSpanElement;
+export const histToolsEl = document.getElementById("histtools") as HTMLDivElement;
+export const histClearBtn = document.getElementById("histclear") as HTMLButtonElement;
+export const histNoteEl = document.getElementById("histnote") as HTMLDivElement;
+export const histNoticeEl = document.getElementById("histnotice") as HTMLDivElement;
+export const histFootEl = document.getElementById("histfoot") as HTMLElement;
+export const histProgressEl = document.getElementById("histprogress") as HTMLSpanElement;
 export const ctxChipEl = document.getElementById("ctxchip") as HTMLDivElement;
 export const usagePanelEl = document.getElementById("usagepanel") as HTMLDivElement;
 export const attachmentsEl = document.getElementById("attachments")!;

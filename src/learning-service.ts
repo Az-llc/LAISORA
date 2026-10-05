@@ -123,7 +123,6 @@ export class LearningService {
     return this.serial(async () => {
       if (!writer.enabled) return { ok: false, code: "disabled", requirement: "R-LRN-07" };
       if (!writer.rootVerified) return { ok: false, code: "caller-unverified", requirement: "R-LRN-12" };
-      // R-LRN-15: retries must pass admission before any cached result can be returned.
       const validated = validateLearningInput(submitted);
       if (!validated.ok) return { ok: false, code: validated.code, requirement: validated.requirement, ...(validated.field ? { field: validated.field } : {}) };
       const requestId = submitted && typeof submitted === "object" && "requestId" in submitted ? submitted.requestId : undefined;

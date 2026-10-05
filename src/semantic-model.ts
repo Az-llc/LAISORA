@@ -12,7 +12,7 @@ import type {
 import { assignmentRefOf, deriveAssignmentProgressStates } from "./evidence-index";
 import { progressSubjectKey } from "./progress-protocol";
 import type { TaskStatus, WorkCoverage, WorkModelState, WorkStatus } from "./work-model";
-import { findToolPlacement, type WorkAgent, type WorkSegment } from "./work-model";
+import { findToolPlacement, semanticRevision, type WorkAgent, type WorkSegment } from "./work-model";
 import { deriveTimeBuckets, type ChildTranscriptSpan, type TimeBucketView } from "./time-buckets";
 import { deriveExecLogFindings, execLogFindingsEmptyLabel, type ExecLogFindingView, type ExecLogMark } from "./exec-log-marks";
 
@@ -85,18 +85,15 @@ export interface SemanticNodeBase {
   drilldown: "available" | "aggregate-only";
 }
 
-// R1
 export interface GoalNode extends SemanticNodeBase {
   kind: "goal";
 }
 
-// R2
 export interface StageNode extends SemanticNodeBase {
   kind: "stage";
   stageState: "undetermined";
 }
 
-// R3
 export interface TaskIdentity {
   semanticTaskId: string;
   taskKeys: string[];
@@ -128,10 +125,8 @@ export interface TaskDefinitionNode extends SemanticNodeBase {
   executionWindow?: TaskExecutionWindow;
 }
 
-// R4
 export interface ExecutionAttemptNode extends SemanticNodeBase {
   kind: "attempt";
-  // subagentType ヒューリスティック（R4.3）のみ。宣言入力ではない
   agentTypeRole?: AttemptRole;
   observedRole?: AttemptRole;
   reconciledRole: {
@@ -230,32 +225,18 @@ export interface SemanticModel {
   delegationMismatchCount: number;
   taskReopened: TaskReopenedEvent[];
   reworkCandidates: ReworkCandidate[];
-  // nodes / edges と独立。Attempt の identity・基数・parentId には影響しない
   assignments: Assignment[];
-  // Attempt nodeId → pp1 state（Assignment 単位集約を Host 側で適用した結果）。
-  // webview は再集計せずこの値を表示する。done は投影されない
   attemptProgressStates?: Record<string, string>;
-  // pp1 の L3 入力。deriveDivergences は SemanticModel のみを
-  // 受け取るため、progress と scope 照合の基準ディレクトリはここで供給する。
-  // progress は Host-only（webview へは projectSemanticModel が落とす）
   progress?: ProgressL3Input;
-  // 経過時間の 4 区分・依頼ブロック・サブエージェント区間（R-DSP-15/16/17/20/21）。
-  // semanticHash 非入力。省略可能（undefined = 未着）
   timeBuckets?: TimeBucketView;
-  // 「1 つ目のプロンプト」の本文（R-DSP-02）。Goal title（1 行目 200 字）とは別に全文を運ぶ
   firstPromptText?: string;
-  // 実行ログの印と、その飛び先になる所見の見出し（R-TAB-06）。semanticHash 非入力。省略可能（undefined = 未着）
   execLogMarks?: ExecLogMark[];
   execLogFindings?: ExecLogFindingView[];
   execLogFindingsEmptyLabel?: string;
 }
 
-// baseDir / writes[].canonicalPath は Host-only（流出防止）
 export interface ProgressL3Input {
   transitions: readonly ProgressTransitionRecord[];
-  // 鍵はいずれも assignmentRefOf(delegation)。値は Assignment（taskNodeId）と
-  // その委任の root Attempt nodeId（入れ子委任は Attempt を持たないため root へ束ねる）。
-  // root 委任が保持上限で淘汰された委任は Attempt を持たないため attemptNodeId 側に鍵が無い
   assignmentTaskIdByRef: Record<string, string>;
   assignmentAttemptNodeIdByRef: Record<string, string>;
   assignmentRoleByRef: Record<string, string>;
@@ -275,7 +256,6 @@ function determineSemanticMode(state: WorkModelState, evidence: SemanticEvidence
   return "fallback";
 }
 
-// R1
 function deriveGoalNode(
   mode: SemanticMode,
   evidence: SemanticEvidenceIndex,
@@ -294,7 +274,6 @@ function deriveGoalNode(
   };
 }
 
-// Stage は常に unsegmented
 function deriveStageNodes(goalNodeId: string): StageNode[] {
   return [
     {
@@ -339,7 +318,6 @@ function extractTodoContent(taskKey: string): string | undefined {
   return raw;
 }
 
-// R3
 function deriveTaskDefinitions(
   defaultStageNodeId: string,
   state: WorkModelState,
@@ -353,14 +331,11 @@ function deriveTaskDefinitions(
   const tasks: TaskDefinitionNode[] = [];
   const coveredTaskKeys = new Set<string>();
 
-  // 1. evidence.bindings 由来
   for (const binding of evidence.bindings) {
     for (const k of binding.taskKeys) {
       coveredTaskKeys.add(k);
     }
 
-    // partial は content-derived キーを
-    // **跨いで**統合した場合のみ（連続性の主張が heuristic になるため）
     const todoKeysCount = binding.taskKeys.filter((k) => k.startsWith("todo:")).length;
     const identityCoverage: Coverage = todoKeysCount >= 2 ? "partial" : "complete";
 
@@ -430,7 +405,6 @@ function deriveTaskDefinitions(
     });
   }
 
-  // 2. binding に無い記帳キー（state.tasks / transitionSummaries）由来
   const additionalKeys = new Set<string>();
   for (const st of state.tasks) {
     if (!coveredTaskKeys.has(st.taskKey)) {
@@ -520,8 +494,6 @@ function deriveTaskDefinitions(
   return tasks;
 }
 
-// union 規則の単一実装。l3-analysis.ts もこれを使う（再実装すると
-// 「重なった区間を二重に数えない」規則が2箇所へ分岐する）
 export function calculateIntervalUnion(intervals: [number, number][]): number {
   if (intervals.length === 0) return 0;
   const valid = intervals
@@ -561,8 +533,6 @@ function collectAllAgents(state: WorkModelState): WorkAgent[] {
   return Array.from(agentMap.values());
 }
 
-// 子孫収集の正本は delegations の parentToolUseId 連鎖。reducer の parentAgentId 連鎖は
-// background 入れ子で切れる（deriveAgentRuns の上のコメントと同じ理由）
 function collectDescendantAgentIds(
   rootToolUseId: string,
   rootAgentId: string,
@@ -611,9 +581,6 @@ function deduplicateArtifacts(records: ArtifactAccessRecord[]): HostArtifactAcce
   return Array.from(artifactMap.values());
 }
 
-// 入力は dedupe 前の生レコードを渡す。dedupe は read→write へ mode を潰すため、
-// dedupe 後から作ると read+write 両方した artifact が readSet から消え
-// observed_data_dep が壊滅する
 function deriveFootprintFromArtifacts(
   artifacts: ReadonlyArray<Pick<HostArtifactAccess, "artifactId" | "mode">>,
   hasUnknownEffects: boolean,
@@ -658,7 +625,6 @@ function determineObservedRole(
   if (hasWrite) {
     return "implement";
   }
-  // classifyOperation が verify のみ（phase 分類経由の近似 — r1 M13）
   if (allPhasesVerify) {
     return "verify";
   }
@@ -672,8 +638,6 @@ function determineObservedRole(
   return "unknown";
 }
 
-// R4.3: AttemptRole 値との完全一致 + reviewer- 前置一致のみ。語彙表の拡張は
-// 仕様外（目的推定の禁止と同根 — r1 M19 で縮小）
 function agentTypeRoleOf(agentType: string | undefined): AttemptRole | undefined {
   if (!agentType) return undefined;
   const t = agentType.toLowerCase();
@@ -682,8 +646,6 @@ function agentTypeRoleOf(agentType: string | undefined): AttemptRole | undefined
   return undefined;
 }
 
-// "declared_only" は agentTypeRole のみ観測できた状態（宣言入力ではない。protocol.ts の
-// SEMANTIC_RECONCILE_STATES と名前を揃えている）
 function reconcileRole(
   agentTypeRole?: AttemptRole,
   observedRole?: AttemptRole
@@ -710,19 +672,7 @@ function reconcileRole(
   return { state: "unknown", value: undefined };
 }
 
-// Assignment / AgentSpan — AgentRun と TaskDefinition の「時間付き帰属」。
-// nodes / edges とは独立した兄弟コレクションで、Attempt の identity・基数・parentId を一切変えない
-// （Attempt を Assignment のために再parent・分割しない）。
-//
-// 委任 1 件 = Assignment 1 件。taskNodeId は root Attempt の帰属先
-// （active-task なら owner Task、undetermined なら Attempt 自身）。agentId 一致・6C 推定・
-// reopen は禁止（reopen は { at } しか持たず Task を運ばない）。
-//
-// 1 AgentRun に対し配列で複数区間を持てる形にしてある。現 corpus には mid-execution の
-// 追加 Task 帰属 carrier が 0 件のため単一区間しか生成されないが、それは corpus の性質であって
-// 仕様ではない（単一区間を前提にした最適化・型の単数化をしないこと）。
 export interface Assignment {
-  // 決定論的 id。配列添字を参照先にしないため（採番・順序に依存させない）
   assignmentId: string;
   agentRunId: string;
   taskNodeId: string;
@@ -733,9 +683,6 @@ export interface Assignment {
   derivation: Derivation;
 }
 
-// 入れ子委任は Attempt を持たない（P1-D）ので root の委任（parentToolUseId === null）へ束ねる。
-// root が保持上限（MAX_DELEGATIONS）で淘汰され辿れないときは undefined: その委任に対応する
-// Attempt ノードは存在しないので、呼び手は `attempt:<toolUseId>` を鍵にしてはならない
 function rootDelegationOf(
   toolUseId: string,
   delByToolUseId: Map<string, DelegationRecord>
@@ -758,8 +705,6 @@ export function deriveAssignments(
   const out: Assignment[] = [];
   for (const del of evidence.delegations) {
     const rootDel = rootDelegationOf(del.toolUseId, delByToolUseId);
-    // 帰属規則は resolveAttemptOwnership と同一実装（第 2 実装を作らない）。
-    // root が淘汰済みなら undetermined として stage 直下（存在しない nodeId を鍵にしない）
     const taskNodeId =
       rootDel === undefined
         ? defaultStageNodeId
@@ -775,20 +720,15 @@ export function deriveAssignments(
       derivation: { source: "observed", certainty: "confirmed" },
     });
   }
-  // 順序を id で確定させる（導出順・配列位置を意味に持ち込まない）
   out.sort((a, b) => (a.assignmentId < b.assignmentId ? -1 : a.assignmentId > b.assignmentId ? 1 : 0));
   return out;
 }
 
-// active-task → undetermined の 2 段。
-// parentToolUseId → placement → segment.taskKey の規則は持たない: Attempt 化される委任は親発行のみで
-// parentToolUseId が常に null のため到達不能
 function resolveAttemptOwnership(
   del: DelegationRecord,
   tasks: TaskDefinitionNode[],
   defaultParentId: string
 ): { parentId: string; ownerState: "structural" | "active-task" | "undetermined" } {
-  // 1. activeTaskKeyAtStart（activeAmbiguousAtStart=true なら不使用）
   if (del.activeTaskKeyAtStart && !del.activeAmbiguousAtStart) {
     const task = tasks.find((t) => t.identity.taskKeys.includes(del.activeTaskKeyAtStart!));
     if (task) {
@@ -796,7 +736,6 @@ function resolveAttemptOwnership(
     }
   }
 
-  // 2. 不可
   return { parentId: defaultParentId, ownerState: "undetermined" };
 }
 
@@ -811,7 +750,6 @@ function assignCanonicalOrder(attempts: ExecutionAttemptNode[]): void {
   }
 
   for (const group of attemptsByParent.values()) {
-    // 1. 全順序ソート: startedAt → seq → 最小 toolUseId → nodeId
     group.sort((a, b) => {
       if (a.startedAt !== b.startedAt) return a.startedAt - b.startedAt;
       const seqA = a.evidence.find((e): e is EventEvidenceRef => e.kind === "event")?.seq ?? Infinity;
@@ -825,7 +763,6 @@ function assignCanonicalOrder(attempts: ExecutionAttemptNode[]): void {
       return a.nodeId.localeCompare(b.nodeId);
     });
 
-    // 2. 時間区間が重なる対を検出
     const overlappingNodeIds = new Set<string>();
     for (let i = 0; i < group.length; i++) {
       const a = group[i];
@@ -837,7 +774,6 @@ function assignCanonicalOrder(attempts: ExecutionAttemptNode[]): void {
         const bStart = b.startedAt;
         const bEnd = b.endedAt ?? Infinity;
 
-        // 重なり判定: max(aStart, bStart) < min(aEnd, bEnd)
         if (Math.max(aStart, bStart) < Math.min(aEnd, bEnd)) {
           overlappingNodeIds.add(a.nodeId);
           overlappingNodeIds.add(b.nodeId);
@@ -845,7 +781,6 @@ function assignCanonicalOrder(attempts: ExecutionAttemptNode[]): void {
       }
     }
 
-    // 3. ordinalWithinTask の付与 (重なるものは undefined)
     let ordinal = 1;
     for (const a of group) {
       if (overlappingNodeIds.has(a.nodeId)) {
@@ -904,8 +839,6 @@ function populateTaskExecutionInfo(
       tokens = totalTokens;
     }
 
-    // approval は Task 単位（WorkPhaseState の伝播先）。グローバル判定にすると
-    // 無関係な Task に承認待ちが灯る（r1 M6）
     const taskPhaseIds = new Set<string>();
     for (const a of taskAttempts) {
       for (const segId of a.anchors.segmentIds) {
@@ -949,7 +882,6 @@ function populateTaskExecutionInfo(
   }
 }
 
-// R4
 export function deriveAttempts(
   state: WorkModelState,
   evidence: SemanticEvidenceIndex,
@@ -961,13 +893,10 @@ export function deriveAttempts(
   const allAgents = collectAllAgents(state);
   const delegationToolUseIds = new Set(evidence.delegations.map((d) => d.toolUseId));
 
-  // 1. 委任 Attempt (DelegationRecord ごと)
   const delegatedAttempts: ExecutionAttemptNode[] = [];
   const delegationSegmentIds = new Set<string>();
 
   for (const del of evidence.delegations) {
-    // P1-D: Attempt=コンダクターの1 dispatch。入れ子委任は AgentRun 側の勘定であり
-    // Attempt ノードを作らない（凍結期待値: 親dispatch 2 : AgentRun 10）
     if (del.parentToolUseId !== null) {
       continue;
     }
@@ -1036,11 +965,6 @@ export function deriveAttempts(
 
     let statusValue: WorkStatus = "unknown";
     if (del.endedAt === undefined && (del.transcriptAgentId !== undefined || del.isBackground === true)) {
-      // 裁定H-1: async ACK後〜完了通知前の窓（reopen 中を含む）。reducer は dispatch の
-      // tool_result で completed を確定済みのため、rootAgent.status より先に判定しないと
-      // completed 表示に化ける。running/completed への推定は禁止で、値は呼び出し側が観測した
-      // 「ストリーム継続中か」と「この委任を live で観測したか」だけで決まる（openAsyncStatusOf）
-      // transcript 未観測の background 宣言委任は live 観測が成立し得ないため定数 stale
       statusValue =
         del.transcriptAgentId !== undefined ? openAsyncStatusOf(del.transcriptAgentId) : "stale";
     } else if (rootAgent?.status) {
@@ -1102,7 +1026,6 @@ export function deriveAttempts(
     });
   }
 
-  // 2. 非委任 Attempt (同一 TaskDefinition に帰属する連続 segment 群を1 Attempt に束ねる)
   const nonDelegatedSegments = state.segments.filter((s) => {
     if (delegationSegmentIds.has(s.segmentId) && s.toolCount <= 1) {
       return false;
@@ -1110,9 +1033,6 @@ export function deriveAttempts(
     return true;
   });
 
-  // E4（R4.2）の非委任側適用: ambiguity="multiple-active-tasks" の
-  // 区間で開かれた segment の taskKey は帰属に使わない（r1 M2）。
-  // 判定は todoTransitions から segment 開始時点の in_progress 件数を再構成する
   const ambiguityEvents = [...evidence.todoTransitions].sort((a, b) => a.at - b.at);
   const ambiguousAt = (ts: number): boolean => {
     const st = new Map<string, string>();
@@ -1148,8 +1068,6 @@ export function deriveAttempts(
         (t) => t > currentGroup[currentGroup.length - 1].startedAt && t <= seg.startedAt
       );
 
-    // 切断は別 TaskDefinition への移動のみ（R4.1 規則3a）。両側とも Task 未解決の
-    // ときだけ taskKey 変化で切る（同一 TaskDefinition 内の別 taskKey で切ると Q2 が水増し — r1 M3）
     const isTaskChanged =
       currentGroup.length > 0 &&
       (taskId !== undefined || currentTaskId !== undefined
@@ -1182,8 +1100,6 @@ export function deriveAttempts(
       ? tasks.find((t) => t.identity.taskKeys.includes(taskKey))
       : undefined;
 
-    // R4.2 の ownerState は帰属解決手段の確度。非委任の segment.taskKey 帰属は
-    // 構造ヒューリスティックなので最良でも structural
     const ownerState = task ? ("structural" as const) : ("undetermined" as const);
     const parentId = task ? task.nodeId : defaultStageNodeId;
 
@@ -1210,12 +1126,6 @@ export function deriveAttempts(
 
     const segFailCount = group.reduce((sum, s) => sum + s.failCount, 0);
 
-    // toolPlacements はツール終了時に消えるため、完全履歴の導出時点では常に空で、placement 経由の帰属は成立しない。
-    // 親（ownerAgentId 無し）のアクセスを群の時刻窓で帰属させる。
-    // 窓は半開区間 [start, end)（両端閉だと隣接群の境界一致で1アクセスが
-    // 二重帰属し、偽の rc/dd が合成される — r3 M-R3-1）。
-    // 委任 dispatch 自体に載るアクセスは委任 Attempt が toolUseId で claim する
-    // ため窓側から除外（二重帰属防止 — r3 M-R3-2）
     const groupEnd = endedAt ?? Infinity;
     const inWindow = (at: number) => at >= startedAt && (endedAt === undefined ? true : at < groupEnd);
     const matchingArtifacts = evidence.artifactAccesses.filter(
@@ -1275,7 +1185,6 @@ export function deriveAttempts(
 
   const allAttempts = [...delegatedAttempts, ...nonDelegatedAttempts];
 
-  // 3. Task ごとの writeSet を集計し、observedRole & reconciledRole を確定
   const taskWriteSets = new Map<string, Set<string>>();
   for (const a of allAttempts) {
     if (a.parentId && a.parentId.startsWith("task:")) {
@@ -1309,19 +1218,13 @@ export function deriveAttempts(
     a.reconciledRole = reconcileRole(a.agentTypeRole, observedRole);
   }
 
-  // 4. Canonical Order 付与
   assignCanonicalOrder(allAttempts);
 
-  // 5. TaskDefinitionNode の executionSummary & executionWindow 充足
   populateTaskExecutionInfo(tasks, allAttempts, state);
 
   return allAttempts;
 }
 
-// 階層の正本は evidence.delegations の parentToolUseId 連鎖。
-// L2a（state.agents）の spawnDepth を使わない理由: background 委任は tool_result が
-// 即時返るため placement が子 spawn より先に消え、reducer の親子連鎖が background
-// 入れ子で機能しない（reducer 側では全件 depth 1 になる）
 export function deriveAgentRuns(
   state: WorkModelState,
   evidence: SemanticEvidenceIndex,
@@ -1360,8 +1263,6 @@ export function deriveAgentRuns(
       del.parentToolUseId !== null && delByToolUseId.has(del.parentToolUseId)
         ? `agentRun:agent:${del.parentToolUseId}`
         : undefined;
-    // root が保持上限淘汰で delegations から消えている場合、その Attempt は存在しない
-    // ため parentId を張らない（dangling 防止 — r2 M-R5）
     const root = rootOf(del.toolUseId);
     const rootDel = delByToolUseId.get(root);
     const parentId =
@@ -1445,12 +1346,10 @@ function findTaskForTaskKey(
   return undefined;
 }
 
-// cause "review" を返さない: reviews 辺は candidate のみで、candidate を確定値の根拠にしない
 function determineReopenCause(
   reopen: { taskKey: string; at: number },
   evidence: SemanticEvidenceIndex
 ): "user-change" | "unknown" {
-  // user-change: 再開の直前に人間発言がある
   if (
     isHumanMessageBetweenLastTransitionAndReopen(
       reopen.at,
@@ -1468,7 +1367,6 @@ function deriveTaskReopened(evidence: SemanticEvidenceIndex): TaskReopenedEvent[
   const events: TaskReopenedEvent[] = [];
 
   for (const trans of evidence.todoTransitions) {
-    // R6a: completed → 非終端 (in_progress / pending) への明示遷移のみ
     if (trans.from === "completed" && (trans.to === "in_progress" || trans.to === "pending")) {
       const cause = determineReopenCause({ taskKey: trans.taskKey, at: trans.at }, evidence);
       const evidenceRefs: EvidenceRef[] = [];
@@ -1501,11 +1399,6 @@ function deriveReviewsEdges(
 ): SemanticEdge[] {
   const edgeMap = new Map<string, SemanticEdge>();
 
-  // reviews 辺は candidate / inferred のみ。L2 グラフ表示と L3 の件数（attemptPairReviewsRelated）にだけ使い、判定入力にしない。
-  // 1. 親（コンダクター自筆）Attempt はレビュー主体から除外する
-  // 2. exec ゲートは effectGaps 件数で近似する（mcp__/未知ツール・path 欠落も含む広い述語）
-  // 3. 交差判定は norm 済みイベントに限定せず全 artifactAccesses を使う
-  // 4. depth>=2 の subagent reviewer は Attempt を持たないので発火しない
   {
     const taskTransitions = evidence.todoTransitions.filter((t) => t.taskKey.startsWith("task:"));
     const todoTransitions = evidence.todoTransitions.filter((t) => t.taskKey.startsWith("todo:"));
@@ -1517,7 +1410,7 @@ function deriveReviewsEdges(
     };
 
     interface ActorAcc {
-      actorId: string | undefined; // undefined = 親
+      actorId: string | undefined;
       reads: ArtifactAccessRecord[];
       writes: ArtifactAccessRecord[];
       readIds: Set<string>;
@@ -1550,7 +1443,7 @@ function deriveReviewsEdges(
     const actors = Array.from(actorMap.values());
     for (const r of actors) {
       if (r.writes.length > 0 || r.reads.length === 0) continue;
-      if (r.actorId === undefined) continue; // 親 reviewer は from ノード非一意のため対象外
+      if (r.actorId === undefined) continue;
       const attemptNode = attemptNodes.find(
         (a) => a.nodeId === `attempt:${r.actorId!.replace(/^agent:/, "")}`
       );
@@ -1569,7 +1462,7 @@ function deriveReviewsEdges(
         r.reads.some((re) => re.artifactId === we.artifactId && we.at < re.at)
       );
       if (intersecting.length === 0) continue;
-      if (r.execCount > 0) continue; // blocked: 自身の exec
+      if (r.execCount > 0) continue;
 
       const targets = new Map<string, ArtifactAccessRecord[]>();
       for (const { we } of intersecting) {
@@ -1605,7 +1498,6 @@ function deriveReviewsEdges(
   return Array.from(edgeMap.values());
 }
 
-// R6a-2: 間接シグナルは candidate 別格保持・taskReopened へ昇格させない
 function deriveReworkCandidates(
   taskNodes: TaskDefinitionNode[],
   attemptNodes: ExecutionAttemptNode[],
@@ -1677,7 +1569,6 @@ function buildAttemptAccessMap(
     }
 
     if (a.anchors.segmentIds.length > 0) {
-      // deriveAttempts の非委任経路と同じ帰属規則（半開区間・dispatch claim 除外）
       const matching = evidence.artifactAccesses.filter(
         (acc) =>
           acc.ownerAgentId === undefined &&
@@ -1697,7 +1588,6 @@ function buildAttemptAccessMap(
 
 const MAX_EDGES_PER_KIND = 2000;
 
-// contains/executes は保存しない（parentId が正本）。
 function deriveEdges(
   nodes: SemanticNode[],
   evidence: SemanticEvidenceIndex,
@@ -1722,13 +1612,10 @@ function deriveEdges(
     return true;
   }
 
-  // 1. R5 reviews 辺
   for (const edge of reviewsEdges) {
     addEdge(edge);
   }
 
-  // 2. R7 observed_before
-  // (a) 同一 TaskDefinition 配下の Attempt 間 (canonical order 隣接・非重複)
   const attemptsByTask = new Map<string, ExecutionAttemptNode[]>();
   for (const a of attemptNodes) {
     if (a.parentId && a.parentId.startsWith("task:")) {
@@ -1771,7 +1658,6 @@ function deriveEdges(
     }
   }
 
-  // (b) TaskDefinition 間 (同一 Stage 配下の executionWindow 隣接・非重複)
   const tasksByStage = new Map<string, TaskDefinitionNode[]>();
   for (const t of taskNodes) {
     if (t.parentId && t.executionWindow) {
@@ -1811,8 +1697,6 @@ function deriveEdges(
     }
   }
 
-  // 4. R7 overlaps
-  // (a) Attempt 間 (実区間重なり)
   for (let i = 0; i < attemptNodes.length; i++) {
     const a = attemptNodes[i];
     const aStart = a.startedAt;
@@ -1837,7 +1721,6 @@ function deriveEdges(
     }
   }
 
-  // (b) TaskDefinition 間 (executionWindow 実区間重なり)
   const tasksWithWindow = taskNodes.filter((t) => t.executionWindow !== undefined);
   for (let i = 0; i < tasksWithWindow.length; i++) {
     const a = tasksWithWindow[i];
@@ -1863,7 +1746,6 @@ function deriveEdges(
     }
   }
 
-  // 5. R7 observed_data_dep (Attempt A.writeSet ∩ B.readSet ≠ ∅ かつ A の write が B の read より先行。unknownEffects=true の対には張らない)
   const attemptAccessMap = buildAttemptAccessMap(attemptNodes, evidence);
 
   for (let i = 0; i < attemptNodes.length; i++) {
@@ -1918,7 +1800,6 @@ function deriveEdges(
     }
   }
 
-  // 6. R7 resource_conflict (writeSet∩writeSet ≠ ∅ または writeSet∩(readSet∪execSet) ≠ ∅。同一 Attempt 内は除外。unknownEffects=true の対には張らない)
   for (let i = 0; i < attemptNodes.length; i++) {
     const a = attemptNodes[i];
     if (a.footprint.unknownEffects) continue;
@@ -1966,19 +1847,10 @@ export function deriveSemanticModel(
     conversationId?: string;
     streamOpen?: boolean;
     liveDelegationAgentIds?: ReadonlySet<string>;
-    // scope 照合の基準ディレクトリ（Host-only）
     baseDir?: string;
-    // R-DSP-49: childSpans; src/time-buckets.ts#deriveTimeBuckets
     childSpans?: readonly ChildTranscriptSpan[];
   }
 ): SemanticModel {
-  // 裁定H-1: 起動ACK後〜完了通知前の async 委任の status。streamOpen はイベントストリームが
-  // 導出時点で継続中という取得経路非依存の観測事実（live/history の分岐ではない）。
-  // 継続中なら running、終端済み（既定）なら実行継続を証明できないため stale（既存の
-  // undetermined 語彙。completed にも running にも推定しない）。
-  // liveDelegationAgentIds（MED-1）: 指定時は、継続中ストリームで実際に ACK/再開を観測した
-  // transcriptAgentId だけが running。resume 復元・旧プロセス由来の未終端委任は、ストリームが
-  // 開いていても実行継続を証明できないため stale。省略時は従来どおり streamOpen のみで決まる
   const liveIds = options?.liveDelegationAgentIds;
   const openAsyncStatusOf = (transcriptAgentId: string): WorkStatus =>
     options?.streamOpen === true && (liveIds === undefined || liveIds.has(transcriptAgentId))
@@ -1990,7 +1862,6 @@ export function deriveSemanticModel(
   const defaultStageNodeId = stageNodes[0].nodeId;
   const taskNodes = deriveTaskDefinitions(defaultStageNodeId, state, evidence, mode);
 
-  // R6a の再開時刻マップ（deriveAttempts の Attempt 分割に渡す）
   const reopenTimes = new Map<string, number[]>();
   for (const t of evidence.todoTransitions) {
     if (t.from === "completed" && (t.to === "in_progress" || t.to === "pending")) {
@@ -2000,13 +1871,9 @@ export function deriveSemanticModel(
     }
   }
 
-  // R4〜R7
   const attemptNodes = deriveAttempts(state, evidence, taskNodes, reopenTimes, defaultStageNodeId, openAsyncStatusOf);
   const agentRunNodes = deriveAgentRuns(state, evidence, openAsyncStatusOf);
 
-  // 不変条件:「drilldown="aggregate-only" は evidence が aggregate だけの状態と一致する」。
-  // 各生成箇所で literal を書くと10箇所が独立に腐るため、最終ノード集合に対して一度だけ導出する。
-  // evidence は空でもよい。空のときの drilldown は available（drilldown は二値）。
   const nodes: SemanticNode[] = [goalNode, ...stageNodes, ...taskNodes, ...attemptNodes, ...agentRunNodes].map(
     (n) => {
       const drilldown = deriveDrilldown(n.evidence);
@@ -2030,7 +1897,6 @@ export function deriveSemanticModel(
     state.coverage.summary === "prefix-truncated" ||
     state.coverage.details === "prefix-truncated";
 
-  // R8
   const timingCoverage: Coverage =
     state.coverage.summary === "prefix-truncated" || state.coverage.details === "prefix-truncated"
       ? "partial"
@@ -2047,8 +1913,6 @@ export function deriveSemanticModel(
     artifactCoverage = "partial";
   }
 
-  // 依存の宣言入力は無い。観測辺（observed_data_dep 等）は依存の完全集合ではないため
-  // complete / partial を主張しない
   const dependencyCoverage: Coverage = "unavailable";
 
   const hasPartialIdentity = taskNodes.some(
@@ -2070,8 +1934,6 @@ export function deriveSemanticModel(
 
   const conflictCount = attemptNodes.filter((a) => a.reconciledRole.state === "conflict").length;
 
-  // 構造判定（L2a の WorkAgent 観測）と delegation フィールド判定
-  // （evidence.delegations）の食い違いを数える。両辺を同一ソースから作ると恒真になる
   const observedAgentIds = new Set(collectAllAgents(state).map((a) => a.agentId));
   const delAgentIds = new Set(evidence.delegations.map((d) => d.agentId));
   let delegationMismatchCount = 0;
@@ -2082,17 +1944,12 @@ export function deriveSemanticModel(
     if (!delAgentIds.has(agentId)) delegationMismatchCount++;
   }
 
-  // evidence.hash 射影外だがモデル出力に影響する入力
-  // （humanMessageTimes=cause / firstHumanMessageLine=Goal title / conversationId=Goal nodeId /
-  // longGaps=longGapMs・longGapCount）は semanticHash 側の入力列に含める
-  // fh はユーザー文なので JSON 化で区切り文字インジェクションを封じる（r3 L-R3-1）
   const semanticHash = createHash("sha256")
     .update(
-      `v1|${state.revision}|${evidence.hash}|hm:${evidence.humanMessageTimes.join(",")}` +
+      `v1|${semanticRevision(state)}|${evidence.hash}|hm:${evidence.humanMessageTimes.join(",")}` +
         `|fh:${JSON.stringify(evidence.firstHumanMessageLine ?? "")}|cid:${JSON.stringify(options?.conversationId ?? "")}` +
         `|lg:${evidence.longGaps.map((g) => `${g.at}+${g.durationMs}`).join(",")}` +
         `|lgd:${evidence.coverage.longGaps}/${evidence.droppedLongGapMs}` +
-        // pp1 progress は evidence.hash 射影外だがモデル出力へ影響しうる入力
         `|pp:${evidence.progressTransitions
           .map((p) => `${p.resolvedAssignmentRef ?? ""}:${p.state}@${p.at}:${p.ownershipVerified ? 1 : 0}`)
           .join(",")}|ppi:${evidence.invalidProgressCount}`
@@ -2101,8 +1958,6 @@ export function deriveSemanticModel(
 
   const assignments = deriveAssignments(evidence, taskNodes, defaultStageNodeId);
   const progress = buildProgressL3Input(evidence, assignments, options?.baseDir);
-  // evidence-index 側の鍵は progressSubjectKey(attempt nodeId)。Attempt nodeId へ戻す
-  // （鍵の逆変換を書かず、delegations を走査して同じ関数で引く）
   const assignmentProgressStates = deriveAssignmentProgressStates(evidence);
   const attemptProgressStates: Record<string, string> = {};
   for (const d of evidence.delegations) {
@@ -2128,8 +1983,6 @@ export function deriveSemanticModel(
     assignments,
     ...(progress !== undefined ? { progress } : {}),
     ...(Object.keys(attemptProgressStates).length > 0 ? { attemptProgressStates } : {}),
-    // open の主張は openAsyncStatusOf と同じゲート（MED-1 / 裁定H-1）を通す。resume 復元の
-    // 旧 background 委任を open のまま出すと、終了済みセッションの並列数が残る
     timeBuckets: deriveTimeBuckets(evidence.timeBuckets, {
       childSpans: options?.childSpans ?? [],
       ...(options?.streamOpen !== undefined ? { streamOpen: options.streamOpen } : {}),
@@ -2145,9 +1998,6 @@ export function deriveSemanticModel(
   return model;
 }
 
-// pp1 の L3 入力を evidence と Assignment から組み立てる。
-// pp1 側（progress）と observed 側（writes・verification 観測）を別キーで渡し、比較器が両者を混ぜない。
-// pp1 emission が1件も無くても observed writes は供給する（observed-only アーム）
 function buildProgressL3Input(
   evidence: SemanticEvidenceIndex,
   assignments: readonly Assignment[],
@@ -2185,10 +2035,6 @@ function buildProgressL3Input(
     });
   }
 
-  // completion を裏付ける observed evidence の時刻列。パス名からの推測はしない（自然言語/
-  // 文字列推測の禁止と同型）。観測事実だけを使う: (1) 読み戻し（read アクセス）、
-  // (2) コマンド実行の観測（effectGaps = exec_unknown 等の効果不明呼び出し）。
-  // pp1 の evidence 文字列の真偽は入力にしない
   const verificationsByTaskId: Record<string, number[]> = {};
   const pushVerification = (taskId: string | undefined, at: number) => {
     if (taskId === undefined) return;

@@ -44,10 +44,8 @@ import { readConversationMessages, readSessionHistory } from "./session-transcri
 import { currentScopeMax, type SessionStore } from "./store-surfaces";
 
 const HISTORY_CHUNK_MIN_ITEMS = 200;
-// src/history-window.ts#snapChunkStart の境界補正は HISTORY_CHUNK_RESPONSE_BYTES に収まることを保証しない。
 const HISTORY_CHUNK_MIN_ITEMS_LADDER = [HISTORY_CHUNK_MIN_ITEMS, 50, 12, 3, 1];
 const HISTORY_CHUNK_RESPONSE_BYTES = INSPECTOR_RESPONSE_BYTES;
-// 件数だけでは搬送予算を保証できない（CONVERSATION_CHUNK_RESPONSE_BYTES）。
 const CONVERSATION_CHUNK_ITEMS_LADDER = [40, 16, 6, 2, 1];
 const CONVERSATION_CHUNK_RESPONSE_BYTES = INSPECTOR_RESPONSE_BYTES;
 const CONVERSATION_TEXT_MAX = 20000;
@@ -103,7 +101,6 @@ async function postWorklogTranscriptError(
   });
 }
 
-// clampConversationText の切断位置はサロゲートペアを分断しないこと。
 function clampConversationText<T extends { text: string }>(m: T, maxItems: number): T {
   const limit = maxItems <= 2 ? CONVERSATION_TEXT_MAX : Math.floor(CONVERSATION_TEXT_MAX / 4);
   if (m.text.length <= limit) return m;
@@ -220,7 +217,6 @@ export async function handleHistoryMessage(
         break;
       }
       try {
-        // src/history-window.ts#cursorForAnchor の終端と不正な要求を混同しない。
         let cursor: string | undefined;
         if (msg.cursor !== undefined) cursor = msg.cursor;
         else if (msg.anchor !== undefined) cursor = cursorForAnchor(scopeKey, msg.anchor).cursor;
@@ -259,12 +255,9 @@ export async function handleHistoryMessage(
           }
         }
         if (chunkResponse === undefined && cursor !== undefined) {
-          // ターン境界では HISTORY_CHUNK_RESPONSE_BYTES に収まらない履歴も読み進められるよう、
-          // ターン内で分割する（src/history-window.ts#cursorForAnchor）。
           const page = nextHistoryChunk({ scopeKey, cursor, minItems: 1 });
           const partialResponse = (drop: number, items?: NormalizedEvent[]) => {
             const first = page.items[drop];
-            // 終端の判定は src/history-window.ts#cursorForAnchor に揃える。
             const handle = cursorForAnchor(scopeKey, {
               generation: first.generation,
               seq: first.seq,
@@ -298,7 +291,6 @@ export async function handleHistoryMessage(
           }
           if (best !== -1) chunkResponse = partialResponse(best);
           else {
-            // 大きなイベントでも履歴の読み込みを継続するため、本文を切り詰める（fitEventForTransport、R-CNV-01）。
             const drop = page.items.length - 1;
             const overhead = Buffer.byteLength(JSON.stringify(partialResponse(drop, [])), "utf8");
             const only = stripHistoryChunkImages([page.items[drop]])[0];
@@ -356,14 +348,12 @@ export async function handleHistoryMessage(
             ? session.conversationAnchorUuids
             : [msg.anchorUuid, ...session.conversationAnchorUuids];
         if (cursor === undefined || !hasConversationHistory(scopeKey)) {
-          // ページ要求ごとの記録の再走査で拡張ホストを塞がないよう、登録済みの履歴を再利用する（hasConversationHistory）。
           const lookup: SessionFileLookup =
             session.resumeFilePath !== undefined
               ? { path: session.resumeFilePath, reason: null }
               : lookupSessionFile(session.resumeSessionId ?? session.auth?.sessionId ?? "");
           const filePath = lookup.path;
           if (filePath === null) {
-            // 走査失敗を読了として扱わない（R-CNV-02、postConversationHistoryError）。
             await postConversationHistoryError(
               st, sender, session, msg.requestId, generation,
               lookup.reason === "scan_failed" ? "session-scan-failed" : "session-unavailable",
@@ -371,7 +361,6 @@ export async function handleHistoryMessage(
             );
             break;
           }
-          // 世代境界は src/session-transcript.ts#readConversationMessages に揃える（R-CNV-01 / R-HND-09）。
           const read = await readConversationMessages(
             filePath,
             isInSessionStore,
@@ -500,14 +489,12 @@ export async function handleHistoryMessage(
             anchorCursor = cursorForAnchor(scopeKey, msg.anchor).cursor;
             anchorResolved = true;
           } catch (error) {
-            // 再登録時も別の表示面が持つカーソルを保つ（verify-history-wiring#W-R49-5）。
             if (!(error instanceof HistoryWindowError) || error.reason !== "unknown-anchor") throw error;
             needsTranscriptScope = true;
           }
         }
         if (needsTranscriptScope) {
           if (msg.anchor === undefined) throw new HistoryWindowError("invalid-cursor");
-          // 採番の対応は src/resume-hydration.ts#foldHistoryEvents による復元が前提（verify-history-wiring#W-R49-4）。
           if (session.workModel.coverage.source !== "provider-transcript") {
             await postWorklogTranscriptError(
               st, sender, session, msg.requestId, generation, "history-unavailable"
@@ -552,9 +539,7 @@ export async function handleHistoryMessage(
           }
           const anchor = msg.anchor;
           const draft = createHydrationDraft(session);
-          // 再起動後も読み手の識別子に合わせる（src/history-window.ts#cursorForAnchor）。
           draft.generation = anchor.generation;
-          // 保持窓を使うと切り詰め済みの先頭が届かない（verify-history-wiring#Wmut-R49-3）。
           const scopeEvents: NormalizedEvent[] = [];
           const outcome = await foldHistoryEvents(
             draft,

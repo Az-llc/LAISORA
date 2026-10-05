@@ -1,4 +1,4 @@
-import { subagentResultForDisplay } from "./subagent-result";
+import { localCommandOutput, taskNotificationDisplayFields, taskNotificationPreview, toolResultPreview } from "./transcript-display";
 import { createHash, randomUUID } from "node:crypto";
 import * as l10n from "@vscode/l10n";
 import type { Hash } from "node:crypto";
@@ -13,11 +13,10 @@ import type {
 import { captureToolIntentInput } from "./webview/status-line";
 import { assistantUsageFromRaw, summarizeToolInput } from "./protocol";
 import type { HostArtifactAccess } from "./artifact-access";
-import { extractResumeSignals, extractStage0ToolFields, RESUME_SIGNAL_TOOL_NAMES } from "./tool-observation";
+import { extractResumeSignals, extractStage0ToolFields, isResumeSignalToolName } from "./tool-observation";
 import { redactAbsolutePaths, redactOptional } from "./path-redaction";
+import type { LearningToolResult } from "./learning-ingestion";
 
-// Only CLI-generated local-command replies are UI notices. Ordinary model/user
-// text and the original transcript must retain their original language.
 export function localizeLocalCommandReply(record: Record<string, unknown>, text: string): string {
   const message = record.message as Record<string, unknown> | undefined;
   if (message?.model !== "<synthetic>" || !record.local_command_source) return text;
@@ -44,9 +43,6 @@ export function localizeLocalCommandReply(record: Record<string, unknown>, text:
 export interface NormalizedOutMeta {
   timestamp?: number;
   hostArtifacts?: HostArtifactAccess[];
-  // longGap の境界時刻（このイベントより前に起きたもの）。イベントを生まない
-  // 事象（起動未観測で破棄した task-notification）を走査へ渡す側チャネル（裁定C2）。
-  // history 側は HistoryEvent.gapBoundaries が同じ役割を持つ
   gapBoundaries?: readonly number[];
 }
 
@@ -60,11 +56,12 @@ export interface ClaudeLiveNormalizerOptions {
   isClosed?: () => boolean;
   usageLimitPrefixes?: string[];
   onDelegateUsageLimitStop?: (agentId: string) => void;
+  onRawToolUse?: (toolUseId: string, tool: string, input: Record<string, unknown>, parent?: string) => void;
+  onRawToolResult?: (result: LearningToolResult) => void;
 }
 
 export const DELEGATE_API_ERROR_MARKER = "Agent terminated early due to an API error: ";
 
-// R-CNV-40: DELEGATE_API_ERROR_MARKER separates the description from usageLimitPrefixes.
 export function isDelegateUsageLimitSummary(summary: string, usageLimitPrefixes: readonly string[]): boolean {
   const at = summary.lastIndexOf(DELEGATE_API_ERROR_MARKER);
   if (at < 0) return false;
@@ -84,6 +81,76 @@ interface AssistantTextEvidenceState {
 const ASSISTANT_TEXT_EVIDENCE_MAX_MESSAGES = 128;
 const ASSISTANT_TEXT_EVIDENCE_MAX_FINALS = 8;
 const ASSISTANT_TEXT_EVIDENCE_PREFIX_BYTES = 64 * 1024;
+
+function signatureBytesField(bytes: Uint8Array, wanted: number): Uint8Array | undefined {
+  let offset = 0;
+  let found: Uint8Array | undefined;
+  const varint = (): number | undefined => {
+    let value = 0;
+    for (let shift = 0; shift < 70 && offset < bytes.length; shift += 7) {
+      const byte = bytes[offset++];
+      value += (byte & 127) * 2 ** shift;
+      if (!Number.isSafeInteger(value)) return undefined;
+      if ((byte & 128) === 0) return value;
+    }
+    return undefined;
+  };
+  while (offset < bytes.length) {
+    const tag = varint();
+    if (tag === undefined || tag < 8) return undefined;
+    const field = Math.floor(tag / 8);
+    switch (tag & 7) {
+      case 0:
+        if (varint() === undefined) return undefined;
+        break;
+      case 1: offset += 8; break;
+      case 2: {
+        const size = varint();
+        if (size === undefined || size > bytes.length - offset) return undefined;
+        if (field === wanted) found = bytes.subarray(offset, offset + size);
+        offset += size;
+        break;
+      }
+      case 5: offset += 4; break;
+      default: return undefined;
+    }
+    if (offset > bytes.length) return undefined;
+  }
+  return found;
+}
+
+function isNarrationSignature(signature: unknown): boolean {
+  if (typeof signature !== "string") return false;
+  try {
+    const bytes = Uint8Array.from(atob(signature), char => char.charCodeAt(0));
+    const envelope = signatureBytesField(bytes, 2);
+    const metadata = envelope && signatureBytesField(envelope, 1);
+    const kind = metadata && signatureBytesField(metadata, 8);
+    return kind !== undefined && Buffer.from(kind).equals(Buffer.from("narration"));
+  } catch {
+    return false;
+  }
+}
+
+export function extractAssistantTextBlocks(content: unknown, narrationBlockIndexes?: unknown): string[] {
+  if (typeof content === "string") return [content];
+  if (!Array.isArray(content)) return [];
+  // An explicit frame classification is authoritative, including an empty list.
+  const indexes = narrationBlockIndexes === undefined ? undefined
+    : Array.isArray(narrationBlockIndexes) ? narrationBlockIndexes : [];
+  return content.map((value, index) => {
+    if (typeof value !== "object" || value === null) return "";
+    const block = value as Record<string, unknown>;
+    if (block.type === "text" && typeof block.text === "string") return block.text;
+    if (block.type === "thinking" && typeof block.thinking === "string" &&
+        (indexes !== undefined ? indexes.includes(index) : isNarrationSignature(block.signature))) return block.thinking;
+    return "";
+  });
+}
+
+export function extractAssistantText(content: unknown, narrationBlockIndexes?: unknown): string {
+  return extractAssistantTextBlocks(content, narrationBlockIndexes).join("");
+}
 
 export function parseAliases(aliases: unknown): string[] | undefined {
   return Array.isArray(aliases) && aliases.length > 0 && aliases.every((alias) => typeof alias === "string")
@@ -108,23 +175,15 @@ export interface RefusalNotice {
   refusedUserMessageUuid: string | null;
 }
 
-// CLI は同じ値を 2 通りに直列化する。SDK ストリームは snake_case、transcript は camelCase で、
-// claude.exe 内に `is_api_error_message` ⇄ `isApiErrorMessage` の相互変換が実在する。
-// 片側だけ読むと経路によって静かに素通りする
 function dualString(record: Record<string, unknown>, snake: string, camel: string): string | null {
   const raw = record[snake] ?? record[camel];
   return typeof raw === "string" && raw.length > 0 ? raw : null;
 }
 
-// このフレームの本文はモデルの発話ではなく CLI が生成したエラー文である、という印。
-// sdk.d.ts には出ない @internal フィールド
 export function isApiErrorFrame(record: Record<string, unknown>): boolean {
   return record.isApiErrorMessage === true || record.is_api_error_message === true;
 }
 
-// message.stop_reason / stop_details は Messages API の形のまま両経路を素通りする（snake_case）。
-// stop_details.category は open string で、新カテゴリはスキーマ更新に先行してワイヤに乗るため
-// 既知値の allowlist で分岐しない
 export function parseRefusalStop(message: unknown): RefusalStop | null {
   if (typeof message !== "object" || message === null) return null;
   const msg = message as Record<string, unknown>;
@@ -143,15 +202,10 @@ function uuidList(raw: unknown): string[] {
   return Array.isArray(raw) ? raw.filter((uuid): uuid is string => typeof uuid === "string" && uuid.length > 0) : [];
 }
 
-// SDK の全フレームが必ず持つ wire uuid（sdk.d.ts で必須）。撤回はこの uuid でメッセージを指名する。
-// message.id とは別の名前空間で、1 フレーム＝1 uuid（多ブロックはブロックごとの派生 uuid）
 export function parseWireUuid(record: Record<string, unknown>): string | null {
   return typeof record.uuid === "string" && record.uuid.length > 0 ? record.uuid : null;
 }
 
-// 置き換える側のフレームに載る撤回指示。到着時に指名されたメッセージを退去させ、このフレームを
-// その正本の置き換えとして扱う。ターン末 model_refusal_fallback の retracted_message_uuids とは
-// 冪等（sdk.d.ts）。単語 1 つのキーなので dualString のような綴りの分岐は生じない
 export function parseSupersedes(record: Record<string, unknown>): string[] {
   return uuidList(record.supersedes);
 }
@@ -163,7 +217,6 @@ export function parseRefusalNotice(record: Record<string, unknown>): RefusalNoti
   const retracted = record.retracted_message_uuids ?? record.retractedMessageUuids;
   return {
     hasFallback: record.subtype === "model_refusal_fallback",
-    // scope を持たない CLI は session（＝本スレッドの切替）として扱う（sdk.d.ts）
     scopeIsLocal: record.scope === "local",
     originalModel: dualString(record, "original_model", "originalModel"),
     fallbackModel: dualString(record, "fallback_model", "fallbackModel"),
@@ -175,7 +228,6 @@ export function parseRefusalNotice(record: Record<string, unknown>): RefusalNoti
   };
 }
 
-// 拒否フレームの本文は捨てず、通知の本文として運ぶ（フォールバックありは refusalFallbackEvent の message、それ以外は error）。カテゴリは未知の値でも必ず出す
 export function formatRefusalMessage(parts: {
   content: string | null;
   explanation: string | null;
@@ -185,7 +237,6 @@ export function formatRefusalMessage(parts: {
   return parts.category && !head.includes(parts.category) ? `${head} [${parts.category}]` : head;
 }
 
-// A single-segment slash token redacts to itself minus the slash, so keeping it discloses nothing (verify-refusal#RF-REDACT).
 const SINGLE_SEGMENT_SLASH_TOKEN = /(?<=^|[\s("'`])\/[A-Za-z][\w-]*(?![\w/\\-]|\.[\w/\\])/g;
 
 function redactRefusalText(text: string): string {
@@ -194,7 +245,6 @@ function redactRefusalText(text: string): string {
   return redactAbsolutePaths(masked).replace(/\u0000(\d+)\u0000/g, (_, index: string) => kept[Number(index)]);
 }
 
-// R-GW-07: refusalFallbackEvent requires the model identities; malformed notices retain the error path.
 export function refusalFallbackEvent(notice: RefusalNotice, turnId: string | null): Extract<NormalizedEventBody, { kind: "model_refusal_fallback" }> | undefined {
   if (!notice.hasFallback || !notice.originalModel || !notice.fallbackModel) return undefined;
   return {
@@ -212,8 +262,6 @@ export function formatRefusalReason(category: string | null): string {
   return category ? `model_refusal: ${category}` : "model_refusal";
 }
 
-// 拒否フレームのうち、本文が CLI 生成のエラー文であるもの。吹き出しへ出さない対象。
-// isApiErrorFrame が偽の拒否フレームは部分応答を運びうるので本文を捨てない
 export function isRefusalErrorProse(record: Record<string, unknown>, message: unknown): boolean {
   return parseRefusalStop(message) !== null && isApiErrorFrame(record);
 }
@@ -240,50 +288,30 @@ export class ClaudeLiveNormalizer {
   private lastCompletedTurnId: string | null = null;
   private lastCompletedAssistantTextEvidence: AssistantTextEvidenceState | null = null;
   private lastAssistantError: string | null = null;
-  // 回復していない refusal（フォールバックが走らなかった側）。refusal ターンの result の
-  // subtype / is_error は未特定（transcript が result を記録しないため実記録から観測できない）
-  // ので、result の形に依らずターンを失敗として閉じる
   private refusalWithoutFallback: RefusalStop | null = null;
-  // 同一の refusal で assistant フレームと system 通知の両方から二重に通知しない
   private refusalNoticeEmitted = false;
-  // ラベル未付与の assistant 本文を出したか（R-DSP-26）。本文を伴わないフレーム（tool_use だけ）で
-  // ラベルを出すと、次に来る本文が前のフレームの uuid で撤回されうる
   private unlabeledAssistantText = false;
+  // Record identity, independent of ordinary-text reconciliation and turn resets.
+  private emittedNarrationUuids = new Set<string>();
   private lastRootModel: string | null = null;
   private subagentModelReported = new Set<string>();
-  // 委任 toolUseId → spawn したターン。background 委任の sidechain イベントは root turn 終了後
-  // にも届くため、currentTurnId でなく起点ターンへ帰属させる（直前ターンへの帰属は、background
-  // 実行中に次の root turn が始まると誤帰属になる）。
   private delegationTurnByToolUseId = new Map<string, string>();
   private usageLimitPrefixes: string[] = [];
   private notificationOrdinals = new Map<string, number>();
-  // 起動ACK/resume で実在を観測した agentId だけ通知イベント化する。無条件に emit すると
-  // 観測範囲外の通知が reducer の revision を進め、委任ゼロの既存セッションでも
-  // semanticHash が変わる（fold 側ではどの委任にも一致せず no-op なのに）
   private observedAsyncAgentIds = new Set<string>();
   private usageLimitStopNotificationIds = new Set<string>();
-  // 背景 Bash の task id。observedAsyncAgentIds と分けるのは session-transcript と同じ理由（役割が違う）
   private observedBackgroundTaskIds = new Set<string>();
-  // 次の emit に相乗りさせる gap 境界時刻（emit を伴わない事象の搬送先）
+  private mcpTaskByToolUseId = new Map<string, string>();
   private pendingGapBoundaries: number[] = [];
   private taskEndTimes = new Map<string, number>();
-  // SDK の result / system / stream_event は自前の timestamp を持たない（SDK 実測）。
-  // 時刻の無い emit を消費側が Date.now() で埋めると導出へ実時刻が混入し、
-  // live と history で segment の endedAt が食い違う。
-  // 直近に観測した時刻を引き継ぐ。「自前の時計を持たないイベントは、最後に観測した時計より前ではない」
   private lastObservedTimestamp?: number;
-  // partial stream と completed assistant snapshot は同じ本文を二重に運ぶ。message id ごとに
-  // 観測済み stream 本文と completed snapshot を突合し、欠けた末尾だけを fallback にする。
-  // 完了後に遅延 snapshot が来ても偽ターンを作らないよう turn 境界を越えて保持するが、
-  // 常駐会話で無制限に増えないよう直近だけに制限する。
   private rootAssistantMessageId: string | null = null;
   private activeRootAssistantTextEvidence: AssistantTextEvidenceState | null = null;
   private assistantTextEvidence = new Map<string, AssistantTextEvidenceState>();
   private resumeSignalToolNames = new Map<string, string>();
+  private learningTools = new Map<string, { tool: string; input: unknown }>();
   private emittedAssistantUsageMessageIds = new Set<string>();
   private rootAssistantUsage: ReturnType<typeof assistantUsageFromRaw> = {};
-  // ゲートで捨てた task_notification の計数。破棄は fold 到達前で
-  // EvidenceIndex からは観測できないため、Adapter 側の hash 非入力カウンタとして持つ
   droppedTaskNotificationCount = 0;
 
   constructor(private readonly opts: ClaudeLiveNormalizerOptions) {
@@ -320,8 +348,6 @@ export class ClaudeLiveNormalizer {
     this.refusalWithoutFallback = null;
     this.refusalNoticeEmitted = false;
     this.unlabeledAssistantText = false;
-    // send() は SDK record より先に呼ばれるため meta を渡せない。2ターン目以降は直近の
-    // provider timestamp を引き継ぎ、Session の timestamp 契約で開始境界が落ちないようにする。
     const startMeta =
       meta?.timestamp === undefined && this.lastObservedTimestamp !== undefined
         ? { ...meta, timestamp: this.lastObservedTimestamp }
@@ -386,9 +412,14 @@ export class ClaudeLiveNormalizer {
     const record = msg as Record<string, unknown>;
     const ownTs = parseTimestamp(msg);
     if (ownTs !== undefined) this.lastObservedTimestamp = ownTs;
-    // 先頭の時刻無しイベント（rate_limit / init 等）は引き継ぐ元が無いので undefined のまま
     const ts = ownTs ?? this.lastObservedTimestamp;
     const defaultMeta: NormalizedOutMeta | undefined = ts !== undefined ? { timestamp: ts } : undefined;
+    const localOutput = localCommandOutput(record);
+    if (localOutput !== undefined) {
+      this.emit({ kind: "local_command_output", text: localOutput,
+        ...(typeof record.uuid === "string" ? { uuid: record.uuid } : {}) }, defaultMeta);
+      return;
+    }
 
     switch (record.type) {
       case "system":
@@ -431,6 +462,12 @@ export class ClaudeLiveNormalizer {
               kind: "permission_denied",
               turnId: this.currentTurnId,
               toolName: typeof record.tool_name === "string" ? record.tool_name : "unknown",
+              ...(record.decision_reason_type === "classifier" && typeof record.decision_reason === "string" && (
+                record.decision_reason === "Classifier unavailable" ||
+                record.decision_reason === "Auto mode unavailable — stopped after repeated responses with no safety verdict" ||
+                (record.decision_reason.startsWith("Auto mode could not evaluate this action and is blocking it for safety —") &&
+                  !record.decision_reason.includes(" — a safety check separate from auto mode blocked this request because of earlier conversation content — it isn't about the action itself"))
+              ) ? { classifierUnavailable: true } : {}),
               reason:
                 typeof record.decision_reason_type === "string"
                   ? record.decision_reason_type
@@ -477,18 +514,17 @@ export class ClaudeLiveNormalizer {
             typeof record.tool_use_id === "string" && record.task_id && record.tool_use_id) {
             this.emit({ kind: "subagent_info", turnId: this.currentTurnId,
               toolUseId: record.tool_use_id, agentId: record.task_id }, defaultMeta);
+          } else if (record.task_type === "mcp_task" && typeof record.task_id === "string" &&
+            typeof record.tool_use_id === "string" && record.task_id && record.tool_use_id) {
+            this.observedBackgroundTaskIds.add(record.task_id);
+            this.mcpTaskByToolUseId.set(record.tool_use_id, record.task_id);
           }
         } else if (record.subtype === "task_updated") {
-          // patch.end_time は task_notification（同一 task_id・直後に届く）の唯一の時刻源。
-          // system メッセージ自体は timestamp を持たない（SDK 実測）
           const patch = record.patch as Record<string, unknown> | undefined;
           if (typeof record.task_id === "string" && typeof patch?.end_time === "number") {
             this.taskEndTimes.set(record.task_id, patch.end_time);
           }
         } else if (record.subtype === "task_notification") {
-          // live では task-notification は user record として届かず（SDK 実測）、
-          // この system メッセージが唯一の搬送形。history 側は注入 user record の XML を
-          // parseTaskNotification で読む — 経路ごとに入力の形は違うが出力イベントは同一
           if (typeof record.task_id === "string" && record.task_id.length > 0) {
             const usage = record.usage as { total_tokens?: unknown } | null | undefined;
             const tokens = usage?.total_tokens;
@@ -502,13 +538,12 @@ export class ClaudeLiveNormalizer {
                   ? { status: record.status }
                   : {}),
                 ...(typeof tokens === "number" && Number.isSafeInteger(tokens) && tokens >= 0 ? { tokens } : {}),
+                ...taskNotificationDisplayFields(record.summary, record.result),
               },
               this.taskEndTimes.has(record.task_id)
                 ? { timestamp: this.taskEndTimes.get(record.task_id) }
                 : defaultMeta
             );
-            // R-CNV-40: only agents whose launch or resume this process observed; a replayed stop of an
-            // unobserved agent must not reserve an input (verify-usage-limit-resume#DR-narrow)
             if (
               emitted &&
               this.observedAsyncAgentIds.has(record.task_id) &&
@@ -516,7 +551,6 @@ export class ClaudeLiveNormalizer {
               typeof record.summary === "string" &&
               isDelegateUsageLimitSummary(record.summary, this.usageLimitPrefixes)
             ) {
-              // R-CNV-40: usageLimitStopNotificationIds also rejects old stops replayed after a resume.
               const notificationId = typeof record.uuid === "string" ? record.uuid : undefined;
               if (notificationId && this.usageLimitStopNotificationIds.has(notificationId)) break;
               if (notificationId) this.usageLimitStopNotificationIds.add(notificationId);
@@ -589,7 +623,6 @@ export class ClaudeLiveNormalizer {
             evidence.streamHash.update(bytes);
             evidence.streamBytes += bytes.length;
           }
-          // 通常とは逆に completed snapshot が先着した場合も、後着deltaで本文を二重化しない。
           if (evidence === undefined || evidence.finalDigests.size === 0) {
             this.emit(
               {
@@ -688,7 +721,23 @@ export class ClaudeLiveNormalizer {
           );
         }
         const content = Array.isArray(msgObj?.content) ? (msgObj.content as Record<string, unknown>[]) : [];
-        if (parentToolUseId === null) {
+        const blockTexts = extractAssistantTextBlocks(content, record.narration_block_indexes);
+        const hasNarration = content.some((block, index) => block.type === "thinking" && blockTexts[index].length > 0);
+        if (parentToolUseId === null && hasNarration) {
+          // CLI records contain one completed block. Defensive combined records use
+          // HEAD's text aggregation in content order, before the unchanged tool loop.
+          const uuid = parseWireUuid(record);
+          if ((uuid === null || !this.emittedNarrationUuids.has(uuid)) &&
+              !(parseRefusalStop(msgObj) !== null && isApiErrorFrame(record))) {
+            const turnId = this.currentTurnId ?? this.lastCompletedTurnId ?? this.startTurn(undefined, defaultMeta);
+            const unlabeledText = this.unlabeledAssistantText;
+            if (uuid !== null) this.emittedNarrationUuids.add(uuid);
+            this.emit({ kind: "assistant_text_delta", turnId, text: localizeLocalCommandReply(record, blockTexts.join("")), recordUuid: uuid }, defaultMeta);
+            if (uuid !== null) this.emit({ kind: "assistant_message_uuid", turnId, uuid }, defaultMeta);
+            this.unlabeledAssistantText = unlabeledText;
+          }
+          this.emitRetraction(parseSupersedes(record), defaultMeta);
+        } else if (parentToolUseId === null) {
           const finalText = content
             .filter((block) => block.type === "text" && typeof block.text === "string" && block.text.length > 0)
             .map((block) => block.text as string)
@@ -696,9 +745,6 @@ export class ClaudeLiveNormalizer {
           const refusalStop = parseRefusalStop(msgObj);
           const refusalIsErrorProse = refusalStop !== null && isApiErrorFrame(record);
           if (refusalStop !== null) {
-            // result は currentTurnId が無いと何もしない。本文抑止でこのフレームは暗黙 startTurn の
-            // 経路を通らないので、開いていなければここで開く（開かないと分類が消える）。
-            // startTurn は下の 2 つの状態を消すので、必ず先に呼ぶ
             if (this.currentTurnId === null) this.startTurn(undefined, defaultMeta);
             this.refusalWithoutFallback = refusalStop;
             if (!this.refusalNoticeEmitted) {
@@ -717,17 +763,9 @@ export class ClaudeLiveNormalizer {
               );
             }
           }
-          // 別 message の遅延 final が本文を足さずに届いたとき、未ラベルの本文は進行中の message のもの。
-          // ここでラベルを出すと進行中の本文が遅延側の uuid を名乗り、webview はその時点で記録が
-          // 閉じたとみなす（R-CNV-09: 実行中送信の後ろで進行中の記録が割れる）
           let foreignFinalWithoutText = false;
           if (finalText.length > 0 && !refusalIsErrorProse) {
             const messageId = typeof msgObj?.id === "string" && msgObj.id.length > 0 ? msgObj.id : null;
-            // 進行中の message と別の id を名乗る final（＝前ターンの遅延 final が新ターンの
-            // ストリーム中に届く並び）は、進行中の evidence を provisional として渡さない。
-            // 渡すと bindAssistantTextEvidence が旧 id を進行中 evidence へ張り替え、
-            // 旧本文を進行中ストリームと突合し、rootAssistantMessageId まで旧 id へ倒れる。
-            // 結果、進行中 message の final が dedupe されず本文が二重に出る。
             const isActiveMessage =
               messageId === null ||
               this.rootAssistantMessageId === null ||
@@ -757,8 +795,6 @@ export class ClaudeLiveNormalizer {
                 fallbackText = "";
                 replaceReconciled = false;
               } else {
-                // 非prefixは欠落末尾として安全に合成できない。全文を黙って捨てず、契約違反を
-                // 観測可能にした上で completed snapshot 自体を別deltaとして保持する。
                 this.opts.log(
                   `[contract] assistant final text does not reconcile with stream ` +
                     `(messageId=${messageId}, streamBytes=${evidence.streamBytes}, ` +
@@ -779,14 +815,8 @@ export class ClaudeLiveNormalizer {
               }
             }
             if (fallbackText.length > 0) {
-              // message_start/result との関連付けが欠けても、completed snapshot 自体は本文の
-              // observable evidence。捨てずに同じ時刻で暗黙ターンを作り、表示可能にする。
               const turnId =
                 this.currentTurnId ?? this.lastCompletedTurnId ?? this.startTurn(undefined, defaultMeta);
-              // 暗黙startTurnは新message用stateを初期化するため、final-only経路では直後に
-              // completed snapshotのstateを戻してresult/遅延再送まで同じmessageとして扱う。
-              // 進行中の別messageがあるときは戻さない（戻すと以後のstream deltaが
-              // 旧messageのevidenceへ積まれ、進行中messageのfinalが重複本文として出る）
               if (isActiveMessage) {
                 this.activeRootAssistantTextEvidence = evidence;
                 this.rootAssistantMessageId = messageId;
@@ -795,12 +825,8 @@ export class ClaudeLiveNormalizer {
             }
             foreignFinalWithoutText = !isActiveMessage && fallbackText.length === 0;
           }
-          // 撤回は「退去させてから、このフレームを正本の置き換えとして扱う」順（sdk.d.ts）。
-          // このフレーム自身のラベルより先に出す
           this.emitRetraction(parseSupersedes(record), defaultMeta);
           const wireUuid = parseWireUuid(record);
-          // 拒否フレームは本文を抑止するが、ストリームで出した本文はもう画面にある。
-          // ここでラベルを付けないと、その本文を後から名指しで撤回できない
           if (wireUuid !== null && this.unlabeledAssistantText && this.currentTurnId !== null && !foreignFinalWithoutText) {
             this.unlabeledAssistantText = false;
             this.emit(
@@ -815,18 +841,22 @@ export class ClaudeLiveNormalizer {
             typeof block.id === "string" &&
             block.id &&
             typeof block.name === "string" &&
-            RESUME_SIGNAL_TOOL_NAMES.has(block.name)
+            isResumeSignalToolName(block.name)
           ) {
             this.resumeSignalToolNames.set(block.id, block.name);
           }
-          // sidechain（parentToolUseId あり）は root turn 終了後にも届くため、起点ターンへ帰属
-          // させて捨てない。binding が無い sidechain は現行 turn へフォールバックせず破棄する
-          // （binding evict・途中復元・未観測 spawn 由来を別 turn へ誤帰属させない）。
-          // root の tool_use は従来どおり進行中ターンが必要
           const attributedTurnId =
             parentToolUseId !== null
               ? this.delegationTurnByToolUseId.get(parentToolUseId)
               : this.currentTurnId;
+          if (block.type === "tool_use") {
+            const id = typeof block.id === "string" ? block.id : "";
+            const tool = typeof block.name === "string" ? block.name : "unknown";
+            if (id) {
+              this.learningTools.set(id, { tool, input: block.input });
+              this.opts.onRawToolUse?.(id, tool, typeof block.input === "object" && block.input !== null ? block.input as Record<string, unknown> : {}, parentToolUseId ?? undefined);
+            }
+          }
           if (block.type === "tool_use" && attributedTurnId) {
             const blockName = typeof block.name === "string" ? block.name : "";
             const blockId = typeof block.id === "string" ? block.id : "";
@@ -896,7 +926,6 @@ export class ClaudeLiveNormalizer {
       case "user": {
         const msgObj = record.message as Record<string, unknown> | undefined;
         const content = msgObj?.content;
-        // sidechain の tool_result も started と同じ規則で起点ターンへ帰属させる（Step 3.5）
         const resultParentToolUseId =
           typeof record.parent_tool_use_id === "string" ? record.parent_tool_use_id : null;
         const resultTurnId =
@@ -908,8 +937,7 @@ export class ClaudeLiveNormalizer {
             if (
               typeof block === "object" &&
               block !== null &&
-              block.type === "tool_result" &&
-              resultTurnId
+              block.type === "tool_result"
             ) {
               const text = Array.isArray(block.content)
                 ? block.content
@@ -920,25 +948,33 @@ export class ClaudeLiveNormalizer {
                   ? block.content
                   : "";
               const toolUseId = typeof block.tool_use_id === "string" ? block.tool_use_id : "";
-              const resumeSignals = extractResumeSignals(this.resumeSignalToolNames.get(toolUseId), text);
+              const tool = this.learningTools.get(toolUseId);
+              const resumeSignalToolName = this.resumeSignalToolNames.get(toolUseId);
+              const extractedResumeSignals = extractResumeSignals(resumeSignalToolName, text);
+              if (!(resumeSignalToolName?.startsWith("mcp__") && extractedResumeSignals?.backgroundTaskId)) {
+                this.opts.onRawToolResult?.({ toolUseId, tool: tool?.tool ?? "unknown", input: tool?.input,
+                  parentToolUseId: resultParentToolUseId ?? undefined, text, isError: block.is_error === true,
+                  ...(ts !== undefined ? { at: new Date(ts).toISOString() } : {}) });
+              }
+              this.learningTools.delete(toolUseId);
+              const resumeSignals = extractedResumeSignals
+                ?? (this.mcpTaskByToolUseId.has(toolUseId) ? { backgroundTaskId: this.mcpTaskByToolUseId.get(toolUseId)! } : undefined);
               if (resumeSignals?.asyncLaunchedAgentId) {
                 this.observedAsyncAgentIds.add(resumeSignals.asyncLaunchedAgentId);
               }
               if (resumeSignals?.resumedAgentId) {
                 this.observedAsyncAgentIds.add(resumeSignals.resumedAgentId);
               }
-              // 背景 Bash の通知もここで受理する。登録しないと emitTaskNotification のゲートで捨てられ、
-              // 完了が永久に観測されない
               if (resumeSignals?.backgroundTaskId) {
                 this.observedBackgroundTaskIds.add(resumeSignals.backgroundTaskId);
               }
-              this.emit(
+              if (resultTurnId) this.emit(
                 {
                   kind: "tool_call_finished",
                   turnId: resultTurnId,
                   toolUseId,
                   isError: block.is_error === true,
-                  resultPreview: redactAbsolutePaths(subagentResultForDisplay(text)).slice(0, 2000),
+                  resultPreview: toolResultPreview(block.content),
                   ...(resumeSignals ?? {}),
                 },
                 defaultMeta
@@ -1075,20 +1111,16 @@ export class ClaudeLiveNormalizer {
     record: Record<string, unknown>,
     meta?: NormalizedOutMeta
   ): void {
-    // 通知は完全な監査記録で、置き換える側のフレームの supersedes と冪等（sdk.d.ts）。
-    // 拒否の通知（model_refusal_fallback または error）より先に出す＝画面から退去させてから通知ブロックを積む
     this.emitRetraction(notice.retractedMessageUuids, meta);
     const message = formatRefusalMessage(notice);
     if (notice.hasFallback) {
       const fallback = refusalFallbackEvent(notice, this.currentTurnId);
       if (fallback) this.emit(fallback, meta);
-      // scope=local は subagent / 側質問だけの切替でセッションのモデルは変わらない
       if (!notice.scopeIsLocal) {
         this.refusalWithoutFallback = null;
         this.lastRootModel = notice.fallbackModel;
       }
       if (!fallback) this.emit({ kind: "error", message, fatal: false }, meta);
-      // 切替後のターンで再び拒否されたら、それは別の refusal として通知する
       this.refusalNoticeEmitted = false;
       return;
     }
@@ -1175,16 +1207,9 @@ export class ClaudeLiveNormalizer {
     return Buffer.concat([prefix, bytes.subarray(0, remaining)]);
   }
 
-  // task-notification は tool_result block を持たないため、合成 toolUseId
-  // （既存カード・placement に一致しない）で tool_call_finished に載せる。
-  // 序数は agentId 単位: 同一 task-id の複数回通知を live/history で同じ ID 列にする
   private emitTaskNotification(notification: TaskNotificationInfo, meta?: NormalizedOutMeta): boolean {
     if (!this.observedAsyncAgentIds.has(notification.agentId) && !this.observedBackgroundTaskIds.has(notification.agentId)) {
       this.droppedTaskNotificationCount++;
-      // 破棄してもイベントの無い「委任完了の到着」という事実は残る。history 側の
-      // 注入 user レコードと同じ扱いで gap 境界にする（裁定C1/C2）。
-      // system メッセージは自前の timestamp を持たず、時刻源は task_updated の
-      // end_time だけなので、それが無い通知は境界を置けない（既知の残余）
       if (meta?.timestamp !== undefined) this.pendingGapBoundaries.push(meta.timestamp);
       return false;
     }
@@ -1196,8 +1221,7 @@ export class ClaudeLiveNormalizer {
         turnId: this.currentTurnId ?? "",
         toolUseId: `task-notification:${notification.agentId}:${ordinal}`,
         isError: false,
-        // 本文は載せない（history 側と同じ理由: 自由文がパス漏えい検査対象。構造化値のみ運ぶ）
-        resultPreview: "",
+        resultPreview: taskNotificationPreview(notification),
         taskNotification: notification,
       },
       meta
@@ -1210,8 +1234,6 @@ export class ClaudeLiveNormalizer {
     meta?: NormalizedOutMeta
   ): void {
     const provenance: EventProvenance = body.provenance ?? { path: "live" };
-    // 本文を出した経路が 3 つある（stream delta / 遅延 stream / completed snapshot の欠落末尾）。
-    // どれか 1 つで印を付け忘れると、そのターンの撤回だけが静かに効かなくなる
     if (body.kind === "assistant_text_delta") this.unlabeledAssistantText = true;
     let outMeta = meta;
     if (this.pendingGapBoundaries.length > 0) {

@@ -12,6 +12,27 @@ export function sessionNameMenuPlacement(left: number, right: number, width: num
   return "inline";
 }
 
+export function bindTitleEditor(input: HTMLInputElement, commit: (title: string) => void, cancel: (byKey: boolean) => void): void {
+  let composing = false;
+  input.type = "text";
+  input.required = true;
+  input.maxLength = RENAME_TITLE_MAX;
+  input.setAttribute("aria-label", l10n.t("Session name"));
+  input.addEventListener("compositionstart", () => { composing = true; });
+  input.addEventListener("compositionend", () => { composing = false; });
+  input.onkeydown = event => {
+    if (event.isComposing || composing || event.keyCode === 229) return;
+    if (event.key === "Enter") {
+      event.preventDefault(); event.stopPropagation();
+      const value = input.value.trim();
+      if (value) commit(value);
+    } else if (event.key === "Escape") {
+      event.preventDefault(); event.stopPropagation(); cancel(true);
+    }
+  };
+  input.onblur = () => cancel(false);
+}
+
 export function createSessionHeader(tabId: string, title: string, send: (message: WebviewToHost) => void) {
   const root = document.createElement("div");
   root.className = "session-heading";
@@ -34,10 +55,6 @@ export function createSessionHeader(tabId: string, title: string, send: (message
   form.className = "session-rename-form";
   form.hidden = true;
   const input = document.createElement("input");
-  input.type = "text";
-  input.required = true;
-  input.maxLength = RENAME_TITLE_MAX;
-  input.setAttribute("aria-label", l10n.t("Session name"));
   const pencil = document.createElement("span");
   pencil.className = "session-name-pencil";
   const edit = document.createElement("button");
@@ -64,7 +81,6 @@ export function createSessionHeader(tabId: string, title: string, send: (message
   failure.setAttribute("role", "status");
   failure.hidden = true;
   let pending = false;
-  let composing = false;
   let focusSuggestion = false;
   const suggestionButtons: HTMLButtonElement[] = [];
   const setPending = (value: boolean) => {
@@ -72,8 +88,6 @@ export function createSessionHeader(tabId: string, title: string, send: (message
     loading.hidden = !value;
     for (const button of suggestionButtons) button.disabled = value;
   };
-  input.addEventListener("compositionstart", () => { composing = true; });
-  input.addEventListener("compositionend", () => { composing = false; });
   const closeDropdown = () => { dropdown.hidden = true; edit.setAttribute("aria-expanded", "false"); };
   const closeForm = (focus = false) => {
     focusSuggestion = false;
@@ -99,7 +113,6 @@ export function createSessionHeader(tabId: string, title: string, send: (message
     setPending(false);
     if ("title" in message) {
       const value = message.title.trim();
-      // R-ANL-21: an edit opened before arrival cleared `pending`, so manual typing is never overwritten.
       if (value) send({type: "renameTab", tabId, title: value});
     } else {
       failure.textContent = message.reason.replace(/\s+/g, " ").trim();
@@ -108,20 +121,7 @@ export function createSessionHeader(tabId: string, title: string, send: (message
     }
   };
   form.onsubmit = event => { event.preventDefault(); };
-  input.onkeydown = event => {
-    // IME confirmation must not submit the session name.
-    if (event.isComposing || composing || event.keyCode === 229) return;
-    if (event.key === "Enter") {
-      event.preventDefault(); event.stopPropagation();
-      const value = input.value.trim();
-      if (!value) return;
-      send({type: "renameTab", tabId, title: value});
-      closeForm(true);
-    } else if (event.key === "Escape") {
-      event.preventDefault(); event.stopPropagation(); closeForm(true);
-    }
-  };
-  input.onblur = () => closeForm();
+  bindTitleEditor(input, value => { send({type: "renameTab", tabId, title: value}); closeForm(true); }, byKey => closeForm(byKey));
   form.append(input);
   const action = (text: string, icon: string, run: () => void, host: HTMLElement = panel) => {
     const button = document.createElement("button");

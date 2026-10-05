@@ -5,31 +5,73 @@ export interface PlanTokenTotal { tokens: number; cacheRead: number }
 export interface PlanUsageSlice extends PlanTokenTotal { start: number; end: number }
 export interface PlanUsageBlock extends PlanTokenTotal { blockId: string; slices: PlanUsageSlice[] }
 export interface PlanUsage { blocks: PlanUsageBlock[] }
-export interface PlanUsageAccumulator {
-  messages: Record<string, { at: number; usage: AssistantUsage }>;
+interface UsageMessage { at: number; usage: AssistantUsage }
+interface UsageEntry { id: string; value: UsageMessage; previous: number | undefined }
+interface UsageLog { entries: UsageEntry[]; heads: Map<string, number> }
+
+export class PlanUsageAccumulator {
+  private constructor(private readonly log: UsageLog, private readonly length: number) {}
+
+  static empty(): PlanUsageAccumulator { return new PlanUsageAccumulator({ entries: [], heads: new Map() }, 0); }
+
+  get(messageId: string): UsageMessage | undefined {
+    let index = this.log.heads.get(messageId);
+    while (index !== undefined && index >= this.length) index = this.log.entries[index].previous;
+    return index === undefined ? undefined : this.log.entries[index].value;
+  }
+
+  withMessage(messageId: string, value: UsageMessage): PlanUsageAccumulator {
+    let log = this.log;
+    if (this.length !== log.entries.length) {
+      const entries = log.entries.slice(0, this.length);
+      const heads = new Map<string, number>();
+      entries.forEach((entry, index) => heads.set(entry.id, index));
+      log = { entries, heads };
+    }
+    log.entries.push({ id: messageId, value, previous: log.heads.get(messageId) });
+    log.heads.set(messageId, this.length);
+    return new PlanUsageAccumulator(log, this.length + 1);
+  }
+
+  *values(): IterableIterator<UsageMessage> {
+    const seen = new Set<string>();
+    for (let index = this.length - 1; index >= 0; index--) {
+      const entry = this.log.entries[index];
+      if (!seen.has(entry.id)) { seen.add(entry.id); yield entry.value; }
+    }
+  }
 }
 
 export function foldPlanUsage(state: PlanUsageAccumulator | undefined, messageId: string, at: number, usage: AssistantUsage): PlanUsageAccumulator {
-  const messages = state?.messages ?? {};
-  const previous = messages[messageId];
+  const accumulator = state ?? PlanUsageAccumulator.empty();
+  const previous = accumulator.get(messageId);
   const merged = { ...previous?.usage };
   for (const key of ["inputTokens", "cacheCreationInputTokens", "cacheReadInputTokens", "outputTokens"] as const) {
     const value = usage[key];
     if (value !== undefined && Number.isFinite(value) && value >= 0) merged[key] = Math.max(merged[key] ?? 0, value);
   }
-  return { messages: { ...messages, [messageId]: { at: previous?.at ?? at, usage: merged } } };
+  return accumulator.withMessage(messageId, { at: previous?.at ?? at, usage: merged });
 }
 
-export function projectPlanUsage(state: PlanUsageAccumulator | undefined, blocks: readonly RequestBlockRecord[]): PlanUsage {
+export function projectPlanUsage(state: PlanUsageAccumulator | undefined, blocks: readonly Pick<RequestBlockRecord, "blockId" | "start">[]): PlanUsage {
   const result: PlanUsage = { blocks: blocks.map(block => ({ blockId: block.blockId, tokens: 0, cacheRead: 0, slices: [] })) };
-  for (const { at, usage } of Object.values(state?.messages ?? {})) {
-    const index = blocks.findIndex((block, i) => at >= block.start && (i + 1 === blocks.length || at < blocks[i + 1].start));
+  const slices = blocks.map(() => new Map<number, PlanUsageSlice>());
+  for (const { at, usage } of state?.values() ?? []) {
+    if (usage.inputTokens === undefined && usage.cacheCreationInputTokens === undefined && usage.outputTokens === undefined) continue;
+    let low = 0;
+    let high = blocks.length;
+    while (low < high) {
+      const middle = (low + high) >>> 1;
+      if (blocks[middle].start <= at) low = middle + 1;
+      else high = middle;
+    }
+    const index = low - 1;
     if (index < 0) continue;
     const block = result.blocks[index];
     const start = Math.max(blocks[index].start, Math.floor(at / 1000) * 1000);
     const end = Math.min(start + 1000, blocks[index + 1]?.start ?? Infinity);
-    let slice = block.slices.find(value => value.start === start);
-    if (!slice) { slice = { start, end, tokens: 0, cacheRead: 0 }; block.slices.push(slice); }
+    let slice = slices[index].get(start);
+    if (!slice) { slice = { start, end, tokens: 0, cacheRead: 0 }; slices[index].set(start, slice); block.slices.push(slice); }
     const tokens = (usage.inputTokens ?? 0) + (usage.cacheCreationInputTokens ?? 0) + (usage.outputTokens ?? 0);
     const cacheRead = usage.cacheReadInputTokens ?? 0;
     slice.tokens += tokens;
@@ -41,18 +83,14 @@ export function projectPlanUsage(state: PlanUsageAccumulator | undefined, blocks
   return result;
 }
 
-// messageCount は数値を持つ応答、unmeasuredMessageCount は usage はあるが数値を 1 つも持たない応答。
-// usage そのものが無い応答は assistant_usage を生まないので数えられない
 export interface MainTokenTotal extends PlanTokenTotal { messageCount: number; unmeasuredMessageCount: number; partial: boolean }
 
-// assistant_usage はメインの記録だけ（サブエージェントは発行しない）なので、これはセッション全体の本体分。
-// 数値の観測が 1 件も無ければ null（空の usage を測った 0 にしない。R-DSP-11）
 export function summarizeMainTokens(state: PlanUsageAccumulator | undefined): MainTokenTotal | null {
   let tokens = 0;
   let cacheRead = 0;
   let messageCount = 0;
   let unmeasuredMessageCount = 0;
-  for (const { usage } of Object.values(state?.messages ?? {})) {
+  for (const { usage } of state?.values() ?? []) {
     if (usage.inputTokens === undefined && usage.cacheCreationInputTokens === undefined && usage.outputTokens === undefined) {
       unmeasuredMessageCount++;
       continue;

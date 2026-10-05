@@ -12,7 +12,6 @@ type AttachedView = AttachedAnalysisView;
 type EvidenceNavigation = { has(toolUseId: string): boolean; navigate(toolUseId: string): void };
 
 export interface LlmEntrySlots {
-  // 入口の行。切り替えはここへ足し、.llm-run の中には入れない（入口の行はボタンとトークン消費の明示だけ — R-ANL-07）
   row: HTMLElement;
   targets?: { label: string; toolCalls: number };
 }
@@ -101,7 +100,6 @@ function renderCompletion(
       line.appendChild(el("span", "llm-completion-findings", l10n.t("Findings {0}", attached.findingsCount)));
       line.appendChild(el("span", "llm-completion-rejected", l10n.t("Rejected {0}", attached.rejectedCount)));
       line.appendChild(el("span", "llm-completion-models", attached.modelsLabel));
-      // null は使用量を観測していない。「0k tok」と書かない（R-DSP-11）
       if (typeof attached.tokensLabel === "string") {
         line.appendChild(el("span", "llm-completion-tokens", attached.tokensLabel));
       }
@@ -286,7 +284,6 @@ export function renderLlmActionView(
   }
 
   const attached = attachedOf(view);
-  // disabled / 不在では保存済みの結果が見えていないだけなので「履歴なし」と言わない（R-DSP-01）
   if (view !== undefined && view.state !== "disabled") {
     container.appendChild(renderHistory(attached, tabId));
   }

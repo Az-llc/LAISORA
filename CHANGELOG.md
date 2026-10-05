@@ -1,5 +1,51 @@
 # Changelog
 
+## 1.4.0
+
+- **Learning ledger v2.** The ledger now holds model-specific usage knowledge: each line names the
+  model, role and effort it applies to, and is labelled as a recurring failure, public source,
+  provisional observation or measurement. The conductor records what it saw with new observe,
+  propose and public tools, and the knowledge reaches delegates as one "Model usage knowledge"
+  section. This corrects the 1.2.0 statement: candidates are not delivered until adopted, and new
+  general findings are no longer accepted. Old learning records, including general records, are
+  deleted once at startup.
+- **Work segmented by PLAN steps.** GRAPH, SUMMARY and ANALYSIS split the work by the steps of the
+  plan, with per-step time, waits and tokens.
+- **Subagent wait.** Waiting for subagents and external delegates is its own category on GRAPH,
+  SUMMARY, ANALYSIS and STEPS, and no longer counts as tool execution. Background external runs
+  are counted like background subagents.
+- **Design unified.** The inspector, history list, handoff card and SUMMARY colours follow the same
+  layout and theme colours as GRAPH and ANALYSIS. Inspector tabs move with the arrow keys.
+- **History list: rename and hide.** Each row can be renamed (same as renaming the tab) or hidden
+  from the list; hiding keeps the record.
+- **Display name.** `laisora.appearance.displayName` replaces "YOU" in the conversation, the YOU
+  column, decision cards and Markdown export. The settings page is redesigned.
+- **YOU and PLAN stay visible** for the whole conversation, and showing or hiding PLAN keeps your
+  reading position.
+- **Usage panel shows current values.** Opening the panel fetches plan usage again instead of
+  showing an outdated cached value.
+- **Initial model (opt-in).** `laisora.claude.initialModel` sets the model for new conversations.
+- **Conversation stays responsive during external runs.** You can talk to the conductor while an
+  external delegate works, and stopping waits for its processes to end.
+- Handoff: context size is measured at capture and after resume, the card shows it, and the
+  unsupported automatic re-compaction is stopped.
+- Text written between tool calls appears in CHAT and history as its own segment.
+- Status line shows the usage-limit wait; the PLAN loader spins only while work runs; the
+  pending-decision count appears once per view.
+- One model-name resolver for the chip, turn labels, dividers, fallback notices and settings.
+- Conversations start with ultracode off; LAISORA does not support it.
+- Fixes: sends made while a resumed conversation prepares its history are kept; withdrawn
+  approvals are no longer shown as denials; specific tool refusal reasons are kept; learning
+  observations are accepted when the conductor model has a context suffix such as `[1m]`.
+- Fixes: resuming a very long session no longer stalls while its time views are rebuilt; renaming
+  a session no longer marks its LLM analysis as out of date; a delegated run is kept when the
+  learning ledger cannot be written, and the conversation is then reported as incompletely
+  observed instead of undercounted; an internal error while preparing a delegated task is
+  reported as such instead of as an over-long prompt.
+- Learning safeguards fail closed: a write is treated as protected, and a project-specific claim
+  is refused, when the files needed to decide cannot be read.
+- Agent SDK 0.3.289 (bundled Claude Code CLI 2.1.289).
+
 ## 1.3.0
 
 - **GRAPH redesigned.** The axis is elapsed time. Hidden waits are cut from both the axis and the

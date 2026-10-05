@@ -10,7 +10,6 @@ export type RedactionCheckResult =
 
 const HOST_ONLY_KEYS = ["canonicalPath", "baseDir", "sourceRoot", "cwd"];
 
-// Producer and send-boundary checks must share the same absolute-path detector.
 export function checkEnvelopeRedaction(envelopeText: string): RedactionCheckResult {
   const violations: RedactionViolation[] = [];
   for (const key of HOST_ONLY_KEYS) {

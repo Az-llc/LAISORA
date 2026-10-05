@@ -33,11 +33,8 @@ export interface HistoryCursorHandle {
 }
 
 export interface HistoryChunkRequest {
-  // tabId + generation。cursor を別タブ・別世代へ流用させない（agent-inspector の scopeKey と同規約）
   scopeKey: string;
   cursor: string;
-  // 最低件数であって上限ではない。ここから turn 境界まで古い側へ伸びる。
-  // webview からは受け取らない（protocol.ts:445「Host が発行した不透明tokenだけを往復する」）
   minItems: number;
 }
 
@@ -60,7 +57,6 @@ export interface HistoryWindowStats {
   events: number;
   indexEntries: number;
   cursors: number;
-  // events 本体は Host の配列を参照で持つだけなので、ここへ含めるのは参照・索引・token の増分のみ
   estimatedBytes: number;
 }
 
@@ -111,17 +107,12 @@ export function registerHistoryWindow(
   let identityBytes = 0;
   for (let i = 0; i < events.length; i++) {
     const key = eventIdentity(events[i]);
-    // 同一識別子が2件あると cursor が別位置を指しうる。登録時点で落として fail-closed にする
     if (index.has(key)) throw new HistoryWindowError("ambiguous-identity");
     index.set(key, i);
     identityBytes += key.length * IDENTITY_CHAR_BYTES;
   }
   scopes.delete(scopeKey);
-  // 索引は登録時に1度だけ作る。呼び出し側が配列を in-place で書き換えると索引が古くなり
-  // cursor が別位置を指す（欠落・重複が無言で出る）。浅いコピーを持って切り離す
   scopes.set(scopeKey, { events: events.slice(), index, identityBytes });
-  // scopeMax はタブ上限からの導出値。固定値へ戻すと生きているタブのスコープを捨て、
-  // そのタブの遡りが history-unavailable で行き止まりになる（R-SES-04）
   while (scopes.size > scopeMax) {
     const oldest = scopes.keys().next().value as string | undefined;
     if (oldest === undefined) break;
@@ -133,17 +124,10 @@ export function releaseHistoryWindow(scopeKey: string): void {
   dropScope(scopeKey);
 }
 
-// 登録済みかを見るだけ。touchScope を通さないのは LRU 順を動かさないため（問い合わせで
-// 順序が変わると、退避されるスコープが観測行為で変わる）。呼び出し側が「登録済みだから
-// 再登録しない」判断に使うので、退避済みを登録済みと答えると以後そのスコープは二度と
-// 登録されない
 export function hasHistoryWindow(scopeKey: string): boolean {
   return scopes.has(scopeKey);
 }
 
-// 再登録が cursor を全部落とす（registerHistoryWindow → dropScope）ため、内容が同じなら
-// 呼ばない、を呼び出し側が判断するための指紋。件数と両端の識別子だけで足りるのは、
-// events が末尾追加でしか伸びないから（途中挿入・並べ替えは pushEvent に存在しない）
 export function historyWindowFingerprint(events: readonly NormalizedEvent[]): string {
   if (events.length === 0) return "0";
   return `${events.length}:${eventIdentity(events[0])}:${eventIdentity(events[events.length - 1])}`;
@@ -162,8 +146,6 @@ export function nextHistoryChunk(request: HistoryChunkRequest): HistoryChunkPage
   const { scopeKey, cursor, minItems } = request;
   if (!Number.isInteger(minItems) || minItems < 1) throw new HistoryWindowError("invalid-request");
   const reg = touchScope(scopeKey);
-  // token は読み取りで消費しない。消費すると chunk の搬送・描画が失敗したときに同じ cursor で
-  // 再要求できず prepend が行き止まりになる。agent-inspector の単回消費とはここが違う
   const state = cursors.get(cursor);
   if (state === undefined || state.scopeKey !== scopeKey) throw new HistoryWindowError("invalid-cursor");
   const anchorIndex = reg.index.get(state.anchorKey);
@@ -220,11 +202,6 @@ function touchScope(scopeKey: string): Registration {
   return reg;
 }
 
-// windowEvents は「先頭が turn_started であるか、先頭より前に turn_started が存在しない」窓しか
-// 返さない（event-window.ts:8-11）。prefix へ max=1 で当てると、その不変条件を満たす頭が1件だけ
-// 返り、それが prepend 方向のスナップ位置になる。本文の結合は
-// src/webview/tab.ts#prependPastConvEvents が担い、開始イベントを前提にしない。
-// turn 境界の規則をここへ書き写して第2実装にしないこと。
 function snapChunkStart(reg: Registration, minIndex: number): number {
   if (minIndex <= 0) return 0;
   const head = windowEvents(reg.events.slice(0, minIndex + 1), 1).events[0];

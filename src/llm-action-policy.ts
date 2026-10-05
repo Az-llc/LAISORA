@@ -54,8 +54,18 @@ export function isActionKindCompatible(destination: ActionDestination, kind: Act
   return allowed !== undefined && allowed.includes(kind);
 }
 
-export function renderDestinationActionKindsSection(): string {
-  return ACTION_DESTINATIONS.map(
+export function analysisActionDestinations(learningEnabled: boolean): readonly ActionDestination[] {
+  return learningEnabled ? ACTION_DESTINATIONS : ACTION_DESTINATIONS.filter(destination => destination !== "runtime_rule");
+}
+
+export function renderAnalysisDestinationPrompt(prompt: string, learningEnabled: boolean): string {
+  if (learningEnabled) return prompt;
+  return prompt.split("\n").filter(line => !line.startsWith("- runtime_rule"))
+    .join("\n");
+}
+
+export function renderDestinationActionKindsSection(learningEnabled = true): string {
+  return analysisActionDestinations(learningEnabled).map(
     (dest) => `- ${dest}: ${DESTINATION_ACTION_KINDS[dest].join(", ")}`
   ).join("\n");
 }
@@ -70,7 +80,6 @@ export function actionDestinationLabel(destination: ActionDestination | "project
     case "memory": return l10n.t("Project facts and memory");
     case "skill": return l10n.t("Skill instructions and workflows");
     case "rules": return l10n.t("Ongoing behavioral rules");
-    // claude_md is the destination value the analysis prompt emits and saved artifacts carry; the label names the SDK's instruction file.
     case "claude_md":
     case "project_guidance":
       if (sdk === "claude") return l10n.t("Project instructions (CLAUDE.md)");
@@ -101,7 +110,10 @@ export const ACTION_KIND_LABELS: Record<ActionKind, string> = {
 };
 
 export const ACTION_DESTINATION_NORMS = {
+  forLearning(learningEnabled: boolean): string {
+    return learningEnabled ? this.text : l10n.t("Choose the improvement destination by its purpose: mechanism changes tools, infrastructure, or automated checks; memory records project facts; skill changes skill instructions or workflows; rules defines durable behavioral constraints; claude_md supplies project entry information, basic commands, and links to authoritative sources. File placement is decided during improvement. Resolved cases remain useful material, not instructions to repeat completed fixes.");
+  },
   get text(): string {
-    return l10n.t("Choose the improvement destination by its purpose: mechanism changes tools, infrastructure, or automated checks; runtime_rule is a temporary workaround for evidenced model-specific behavior; memory records project facts; skill changes skill instructions or workflows; rules defines durable behavioral constraints; claude_md supplies project entry information, basic commands, and links to authoritative sources. File placement is decided during improvement. Resolved cases remain useful material, not instructions to repeat completed fixes.");
+    return l10n.t("Choose the improvement destination by its purpose: mechanism changes tools, infrastructure, or automated checks; runtime_rule records evidenced model-specific usage only in LAISORA's learning ledger through observe; memory records project facts; skill changes skill instructions or workflows; rules defines durable behavioral constraints; claude_md supplies project entry information, basic commands, and links to authoritative sources. File placement is decided during improvement. Resolved cases remain useful material, not instructions to repeat completed fixes.");
   },
 };

@@ -16,7 +16,7 @@ export interface OrchestrationView {
 }
 
 export function orchestrationViewForConversation(conv: ClaudeConversation, current: Partial<ClaudeHostOptions>): OrchestrationView | undefined {
-  if (!conv.orchestrationActive) return undefined; // R-ORC-38
+  if (!conv.orchestrationActive) return undefined;
   return projectOrchestrationView(conv.orchestrationRoster, conv.orchestrationExternalRoster,
     conv.orchestrationSettingsChanged(current), conv.observedAgentSettings, conv.observedAgentRuns,
     conv.orchestrationRuns.filter((run) => run.kind === "external"));
@@ -26,7 +26,7 @@ const USAGE_KEYS = ["input_tokens", "cached_input_tokens", "output_tokens", "rea
   "cache_read_input_tokens", "cache_creation_input_tokens", "total_tokens", "thinking_tokens", "cache_read_tokens"];
 
 function metadata(value: unknown): value is string {
-  return typeof value === "string" && /^[A-Za-z0-9][A-Za-z0-9._:\[\]-]*$/.test(value); // R-GW-05, R-ORC-14
+  return typeof value === "string" && /^[A-Za-z0-9][A-Za-z0-9._:\[\]-]*$/.test(value);
 }
 
 function observed(value: unknown): string | null { return metadata(value) ? value : null; }
@@ -53,19 +53,19 @@ export function projectOrchestrationView(
       const applied = settings.get(agent.agent_id);
       const agentType = observed(applied?.agentType);
       return { agentId: observed(agent.agent_id) ?? "unknown", agentType,
-        role: roleByAgentKey.get(agentType ?? "") ?? null, // R-ORC-22
+        role: roleByAgentKey.get(agentType ?? "") ?? null,
         model: observed(applied?.model), effort: observed(applied?.effort),
         firstSeenAt: agent.firstSeenAt, lastActivityAt: agent.lastActivityAt, usage: usageView(agent.usage) };
-    }).sort((a, b) => b.lastActivityAt.localeCompare(a.lastActivityAt)).slice(0, 50), // R-ORC-23
+    }).sort((a, b) => b.lastActivityAt.localeCompare(a.lastActivityAt)).slice(0, 50),
     runs: runs.map(({ cwd, role, executor, model, effort, outcome, startedAt, endedAt, durationMs, usage }) =>
       ({ ...(typeof cwd === "string" ? { cwd } : {}), role, executor, ...(metadata(model) ? { model } : {}), ...(metadata(effort) ? { effort } : {}), outcome, startedAt, endedAt, durationMs, usage: usageView(usage) }))
-      .sort((a, b) => b.startedAt.localeCompare(a.startedAt)).slice(0, 50), // R-ORC-23
+      .sort((a, b) => b.startedAt.localeCompare(a.startedAt)).slice(0, 50),
   };
 }
 
 function object(value: unknown, keys: string[]): value is Record<string, unknown> {
   return !!value && typeof value === "object" && !Array.isArray(value)
-    && Object.keys(value).length === keys.length && Object.keys(value).every((key) => keys.includes(key)); // R-ORC-14
+    && Object.keys(value).length === keys.length && Object.keys(value).every((key) => keys.includes(key));
 }
 function finite(value: unknown): value is number { return typeof value === "number" && Number.isFinite(value) && value >= 0; }
 function isoTimestampShape(value: unknown): boolean {
@@ -80,7 +80,7 @@ function executor(value: unknown): boolean { return isExternalExecutorId(value);
 
 export function isOrchestrationView(value: unknown): value is OrchestrationView {
   if (!object(value, ["roster", "settingsChanged", "agents", "runs"]) || typeof value.settingsChanged !== "boolean"
-    || !object(value.roster, ["agents", "external"])) return false; // R-ORC-22, R-ORC-14
+    || !object(value.roster, ["agents", "external"])) return false;
   return Array.isArray(value.roster.agents) && value.roster.agents.every((row) =>
     object(row, ["role", "agentKey", "model", "effort"]) && metadata(row.role) && row.agentKey === `laisora-${row.role}-${row.model}${row.effort === null ? "" : `-${row.effort}`}`
     && metadata(row.model) && nullableMetadata(row.effort))
@@ -96,7 +96,7 @@ export function isOrchestrationView(value: unknown): value is OrchestrationView 
       object(row, ["role", "executor", "outcome", "startedAt", "endedAt", "durationMs", "usage", ...(row?.cwd === undefined ? [] : ["cwd"]), ...(row?.model === undefined ? [] : ["model"]), ...(row?.effort === undefined ? [] : ["effort"])])
       && (row.cwd === undefined || typeof row.cwd === "string")
       && (row.model === undefined || metadata(row.model)) && (row.effort === undefined || metadata(row.effort))
-      && metadata(row.role) && executor(row.executor) && ["ok", "failed", "timeout", "refused"].includes(row.outcome as string)
+      && metadata(row.role) && executor(row.executor) && ["ok", "failed", "timeout", "refused", "stopped"].includes(row.outcome as string)
       && isoTimestampShape(row.startedAt) && isoTimestampShape(row.endedAt) && finite(row.durationMs) && usageShape(row.usage));
 }
 
@@ -107,7 +107,7 @@ export class OrchestrationViewPublisher {
   constructor(private readonly read: () => OrchestrationView | undefined, private readonly post: (view: OrchestrationView) => void) {}
 
   schedule(): void {
-    if (this.timer !== undefined) return; // R-ORC-23
+    if (this.timer !== undefined) return;
     const delay = Math.max(0, 500 - (Date.now() - this.lastPost));
     if (delay === 0) this.flush();
     else this.timer = setTimeout(() => { this.timer = undefined; this.schedule(); }, delay);
@@ -115,7 +115,7 @@ export class OrchestrationViewPublisher {
 
   private flush(): void {
     const view = this.read();
-    if (view === undefined) return; // R-ORC-38
+    if (view === undefined) return;
     this.lastPost = Date.now();
     this.post(view);
   }

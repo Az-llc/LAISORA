@@ -3,10 +3,12 @@ import { toolIntentLabel } from "./status-line";
 import type { OrchestrationView, PlanContext, WorkAgentNode, WorkModelPayload } from "../protocol";
 import type { PlanUsage, PlanTokenTotal } from "../plan-usage";
 import type { TaskStatus, WorkStatus } from "../work-model";
+import { planStepKey, planStepAt, transitionPlanStep } from "../plan-steps";
+export { normalizePlanContent, planStepKey } from "../plan-steps";
 
 export interface PlanLane {
   id: string; agent: string; title: string; start: number | null; elapsed: number | null;
-  status: WorkStatus; tokens: number | null; cacheRead: number; external: boolean;
+  status: WorkStatus | "stopped"; tokens: number | null; cacheRead: number; external: boolean;
 }
 export interface PlanStep {
   key: string; number: number; title: string; activeForm?: string; status: TaskStatus;
@@ -18,8 +20,6 @@ export interface PlanView {
   goal: string; steps: PlanStep[]; now: PlanLane[]; current: number | null; completed: number;
   elapsed: number | null; claude: PlanTokenTotal | null; external: PlanTokenTotal | null; partial: boolean;
 }
-
-export function normalizePlanContent(value: string): string { return value.normalize("NFKC").trim().replace(/\s+/g, " "); }
 
 export function externalTokens(usage: OrchestrationView["runs"][number]["usage"]): PlanTokenTotal | null {
   if (usage === null) return null;
@@ -35,7 +35,6 @@ export function externalTokens(usage: OrchestrationView["runs"][number]["usage"]
 export function derivePlanView(model: WorkModelPayload | undefined, orchestration: OrchestrationView | undefined,
   usage: PlanUsage | undefined, nowMs: number, context: PlanContext | undefined = model?.planContext): PlanView {
   const declaration = model?.planDeclaration;
-  // R-DSP-43: nothing recorded before the handoff enters the window; the Host already dropped the older declaration.
   const floor = model?.planBoundaryAt ?? Number.NEGATIVE_INFINITY;
   if (context) {
     const start = Math.max(context.start, floor);
@@ -78,8 +77,7 @@ export function derivePlanView(model: WorkModelPayload | undefined, orchestratio
       let step = view.steps.find(value => value.key === key);
       if (entry.removed) {
         if (step) {
-          step.removed = true;
-          if (step.startedAt !== null && step.endedAt === null) step.endedAt = entry.at;
+          transitionPlanStep(step, entry.at, step.status, true);
           transitions.get(key)!.push({ at: entry.at, active: false, order: ++order });
         }
         continue;
@@ -92,12 +90,8 @@ export function derivePlanView(model: WorkModelPayload | undefined, orchestratio
         view.steps.push(step);
         transitions.set(key, []);
       }
-      if (step.status !== item.status || step.removed) {
+      if (transitionPlanStep(step, entry.at, item.status)) {
         transitions.get(key)!.push({ at: entry.at, active: item.status === "in_progress", order: ++order });
-        if (item.status === "in_progress") {
-          step.startedAt ??= entry.at;
-          step.endedAt = null;
-        } else if (item.status === "completed") step.endedAt = entry.at;
       }
       step.status = item.status;
       step.activeForm = item.activeForm;
@@ -106,8 +100,7 @@ export function derivePlanView(model: WorkModelPayload | undefined, orchestratio
     }
     for (const step of view.steps) {
       if (entry.source === "tasks" || present.has(step.key) || step.removed || step.resumeOf !== undefined) continue;
-      step.removed = true;
-      if (step.startedAt !== null && step.endedAt === null) step.endedAt = entry.at;
+      transitionPlanStep(step, entry.at, step.status, true);
       transitions.get(step.key)!.push({ at: entry.at, active: false, order: ++order });
     }
     hasPlan = true;
@@ -129,15 +122,7 @@ export function derivePlanView(model: WorkModelPayload | undefined, orchestratio
     const description = nodes.get(agentId)?.description;
     if (description) step.title = l10n.t("Resumed: {0}", description);
   });
-  const stepAt = (at: number): PlanStep | undefined => {
-    let winner: PlanStep | undefined;
-    let latest = -1;
-    for (const step of view.steps) {
-      const change = transitions.get(step.key)!.filter(value => value.at <= at).at(-1);
-      if (change?.active && change.order > latest) { winner = step; latest = change.order; }
-    }
-    return winner;
-  };
+  const stepAt = (at: number): PlanStep | undefined => planStepAt(view.steps, transitions, at);
   const current = view.steps.find(step => !step.removed && step.status === "in_progress");
   view.current = current?.number ?? null;
   view.goal ||= current?.title ?? "";
@@ -219,7 +204,7 @@ export function derivePlanView(model: WorkModelPayload | undefined, orchestratio
   for (const [index, run] of (orchestration?.runs ?? []).entries()) {
     const tokens = externalTokens(run.usage);
     attach({ id: `external:${run.startedAt}:${index}`, agent: run.role, title: [run.executor, run.model, run.effort].filter(Boolean).join(" · "),
-      start: Date.parse(run.startedAt), elapsed: run.durationMs, status: run.outcome === "ok" ? "completed" : "failed",
+      start: Date.parse(run.startedAt), elapsed: run.durationMs, status: run.outcome === "ok" ? "completed" : run.outcome === "stopped" ? "stopped" : "failed",
       tokens: tokens?.tokens ?? null, cacheRead: tokens?.cacheRead ?? 0, external: true });
   }
   for (const tool of model?.planTools ?? []) attach({ id: `tool:${tool.id}`, agent: "Claude", title: toolIntentLabel(tool.name, tool.intentInput),
@@ -229,10 +214,4 @@ export function derivePlanView(model: WorkModelPayload | undefined, orchestratio
   if (external.length && external.every(lane => lane.tokens !== null)) view.external = {
     tokens: external.reduce((sum, lane) => sum + lane.tokens!, 0), cacheRead: external.reduce((sum, lane) => sum + lane.cacheRead, 0) };
   return view;
-}
-
-// PLAN の手順の同一性。TaskCreate / TaskUpdate は task id（改名しても同じ手順）、TodoWrite は正規化した文面。
-// "\n" は normalizePlanContent を通らないので、task id と TodoWrite の文面は衝突しない
-export function planStepKey(entry: { source?: "tasks" }, item: { taskKey: string; description: string }): string {
-  return (entry.source === "tasks" || item.taskKey.startsWith("task:")) ? `task\n${item.taskKey}` : normalizePlanContent(item.description);
 }

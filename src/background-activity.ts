@@ -1,7 +1,5 @@
 import type { NormalizedEvent } from "./protocol";
 
-// R-SES-02: 各配列の上限。protocol.ts#isBackgroundActivitySnapshot が同じ値で拒否するので、fold 側で必ず収める
-// （超えた snapshot は init ごと捨てられ、全タブが空になる）
 export const BACKGROUND_ACTIVITY_LIST_MAX = 256;
 
 export interface BackgroundTaskEntry {
@@ -18,17 +16,10 @@ export interface DelegationEntry {
   background: boolean;
 }
 
-// タブの点灯・帯の背景側の材料。webview の Tab と Host の foldEventState が同じ規則でこれを畳む。
-// work-model の backgroundTasks 索引・EventFoldDraft.liveDelegationAgentIds とは閉じ方が違う別系統
 export interface BackgroundActivityState {
-  // 最後の background_tasks（レベル信号）から ambient を除いた集合。差分を取らず丸ごと置き換える（sdk.d.ts）
   tasks: BackgroundTaskEntry[];
-  // task_notification を観測した task id。CLI の集合は完了後も残ることがあり、そのまま数えると件数が嘘になる
   finishedTaskIds: Set<string>;
-  // 完了か再開を既に観測した task id。遡りの古い完了は、これより新しい観測が無い id にだけ効かせる
   lifecycleSeenIds: Set<string>;
-  // key = 委任の toolUseId。ターン境界で消さない: background 委任は turn_completed の後も動き続ける（R-SES-02）。
-  // 回収の条件は applyActivityEvent が決める
   delegations: Map<string, DelegationEntry>;
 }
 
@@ -62,8 +53,6 @@ export function backgroundActivitySnapshotOf(state: BackgroundActivityState): Ba
   };
 }
 
-// snapshot の値は Host がログ全体を畳んだ現在値。置き換えた id を全て観測済みにしないと、
-// 後から遡りで届く古い完了が現在の点灯を覆す（R-SES-02。CH-S1c と同じ規則）
 export function backgroundActivityFromSnapshot(snap: BackgroundActivitySnapshot): BackgroundActivityState {
   const state = createBackgroundActivityState();
   state.tasks = snap.tasks.map((t) => ({ ...t }));
@@ -127,7 +116,6 @@ function enforceCaps(state: BackgroundActivityState): void {
   }
 }
 
-// 戻り値は点灯・帯の材料が変わったか（background_tasks は常に true）
 export function applyActivityEvent(state: BackgroundActivityState, ev: NormalizedEvent): boolean {
   let changed = false;
   switch (ev.kind) {
@@ -137,7 +125,6 @@ export function applyActivityEvent(state: BackgroundActivityState, ev: Normalize
       changed = true;
       break;
     case "tool_call_started":
-      // 開始点はここだけ。どれが委任かは reducer の判定（ev.work.agents）に従うので、Host は ev.work を載せた後に畳む
       if (
         ev.provenance?.path !== "history" &&
         ev.work?.placement !== undefined &&
@@ -152,9 +139,6 @@ export function applyActivityEvent(state: BackgroundActivityState, ev: Normalize
       }
       break;
     case "tool_call_finished": {
-      // 裁定A2: 起動 ACK は完了ではない。background 委任を閉じるのは task-notification と、
-      // work reducer が stale と確定した id（src/work-model.ts#settlePendingStale）。
-      // 裁定A1: SendMessage の resumedAgentId は同じ委任が再び動き出した観測
       const d = state.delegations.get(ev.toolUseId);
       if (d !== undefined) {
         if (ev.asyncLaunchedAgentId !== undefined && !ev.isError) {
@@ -183,18 +167,14 @@ export function applyActivityEvent(state: BackgroundActivityState, ev: Normalize
     }
     case "turn_interrupted":
     case "turn_failed":
-      // query ごと落ちるので委任も残らない
       changed = state.delegations.size > 0;
       state.delegations.clear();
       break;
     case "conversation_closed":
     case "conversation_opened":
-      // 信号源のプロセスが消えた／入れ替わった。集合はレベル信号でしか訂正されないので、ここで消さないと固着する。
-      // 中断の打ち切り経路は conversation_closed を出さずに次のプロセスを起こすので、conversation_opened でも消す
       changed = clearProcessActivity(state);
       break;
   }
-  // R-SES-11: use the reducer's stale judgement, including turn-start recovery.
   for (const toolUseId of ev.work?.staled ?? []) {
     const delegation = state.delegations.get(toolUseId);
     if (delegation?.running) {
@@ -206,8 +186,6 @@ export function applyActivityEvent(state: BackgroundActivityState, ev: Normalize
   return changed;
 }
 
-// chunk は live より古く、chunk 同士は新しい側から届く。chunk 内は時系列順なので末尾から走査し、
-// id ごとに最も新しい完了/再開だけを採る
 export function notePastLifecycle(
   state: BackgroundActivityState,
   events: readonly NormalizedEvent[],

@@ -3,9 +3,6 @@ import * as vscode from "vscode";
 import type { ArtifactServer } from "./artifactServer";
 import type { SessionStore } from "./extension";
 
-// activate が注入するホスト単位の状態。読み手は `export let` の live binding をそのまま参照する。
-// getter で包むと呼び出し側の綴りが変わり、束ね後の文字列へ変異を注入している検査の的
-// （output.appendLine( など）が一斉に外れる。書き込みは import binding へ代入できないので setter を通す。
 export let output: vscode.OutputChannel;
 export let extensionContext: vscode.ExtensionContext | null = null;
 export let activationT0 = Date.now();
@@ -15,7 +12,6 @@ export function sinceActivation(): string {
 export let artifactServer: ArtifactServer | null = null;
 export let store: SessionStore | null = null;
 
-// disposeHooked は再表示をまたいで保持し、src/extension.ts#activate で破棄通知の重複登録を防ぐ。
 export const disposeHooked = new WeakSet<vscode.WebviewView>();
 
 export function setActivationT0(at: number): void {

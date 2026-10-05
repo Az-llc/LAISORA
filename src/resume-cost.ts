@@ -37,7 +37,6 @@ export function parseUsageTurns(lines: Iterable<string>): UsageTurns {
     if (record.type !== "assistant" || !recordValue(record.message) || record.message.usage == null) continue;
     const usage = record.message.usage;
     const atMs = typeof record.timestamp === "string" ? Date.parse(record.timestamp) : NaN;
-    // R-ANL-17: invalid usage must be counted instead of becoming a zero-cost turn.
     if (!recordValue(usage) || !Number.isFinite(atMs) ||
         !["input_tokens", "cache_creation_input_tokens", "cache_read_input_tokens", "output_tokens"]
           .every(key => usage[key] === undefined || (typeof usage[key] === "number" && Number.isFinite(usage[key]) && usage[key] >= 0))) {

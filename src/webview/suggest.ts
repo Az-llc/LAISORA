@@ -1,4 +1,3 @@
-// 入力サジェスト（/コマンド・@ファイル）。
 import * as l10n from "@vscode/l10n";
 import { inputEl, suggestEl, vscode } from "./dom";
 import { activeTab, persistState } from "./main";
@@ -6,7 +5,6 @@ import { activeTab, persistState } from "./main";
 type SuggestKind = "command" | "file";
 interface SuggestState {
   kind: SuggestKind;
-  // トリガー文字（/ or @）の textarea 内インデックス
   triggerIndex: number;
   items: string[];
   descriptions: Map<string, string>;
@@ -48,7 +46,7 @@ function renderSuggest(): void {
       const descEl = document.createElement("span");
       descEl.className = "suggest-desc";
       descEl.textContent = desc;
-      row.title = desc; // 幅不足で省略されても全文が見える
+      row.title = desc;
       row.appendChild(descEl);
     }
     row.onclick = () => {
@@ -62,8 +60,6 @@ function renderSuggest(): void {
 
 function commitSuggest(idx: number): void {
   if (!suggestState) return;
-  // caret移動（矢印/Home/End/クリック）でtriggerIndexが陳腐化していないか確認。
-  // ズレていれば（例: "/rev" 入力後にHomeでcaretが先頭へ戻った状態でEnter）何もせず閉じる。
   const curCaret = inputEl.selectionStart ?? inputEl.value.length;
   const expectedChar = suggestState.kind === "command" ? "/" : "@";
   if (curCaret < suggestState.triggerIndex) {
@@ -89,8 +85,6 @@ function commitSuggest(idx: number): void {
   inputEl.focus();
 }
 
-// ファイル選択ダイアログで選ばれたパスを入力欄へ入れる。@ 補完の確定と同じ差し込み方を
-// 通すので、ダイアログ経由と手打ち補完で入力欄の文字列が食い違わない
 export function insertFilePaths(paths: readonly string[]): void {
   if (paths.length === 0) return;
   const caret = inputEl.selectionStart ?? inputEl.value.length;
@@ -147,15 +141,13 @@ function updateFileSuggest(triggerIndex: number, query: string): void {
 }
 
 export function handleFilesResponse(reqId: number, paths: string[]): void {
-  if (reqId !== latestFileReqId) return; // 古い応答は破棄
+  if (reqId !== latestFileReqId) return;
   if (!suggestState || suggestState.kind !== "file") return;
   suggestState.items = paths;
   suggestState.selected = 0;
   renderSuggest();
 }
 
-// トリガー検出: "/" は行頭、または直前が空白かつクエリ1文字以上で行途中でも発火。
-// "@" は行頭 or 直前が空白なら行途中でも（クエリ0文字から）発火。
 function detectTrigger(): { kind: SuggestKind; triggerIndex: number; query: string } | null {
   const caret = inputEl.selectionStart ?? inputEl.value.length;
   const value = inputEl.value;
@@ -165,7 +157,6 @@ function detectTrigger(): { kind: SuggestKind; triggerIndex: number; query: stri
   if (slash !== -1) {
     const prevChar = slash === 0 ? "" : beforeCaret[slash - 1];
     const query = beforeCaret.slice(slash + 1);
-    // クエリが空の場合は誤爆防止のため行頭のみ発火。行途中は1文字以上入力されてから発火。
     const queryOk = slash === 0 ? true : query.length > 0;
     if ((slash === 0 || /\s/.test(prevChar)) && !query.includes(" ") && queryOk) {
       return { kind: "command", triggerIndex: lineStart + slash, query };
@@ -192,16 +183,12 @@ function refreshSuggest(): void {
   else updateFileSuggest(trig.triggerIndex, trig.query);
 }
 
-// リスナ登録は main.ts 末尾の init 呼び出し列からのみ行う（登録順の権威はそこ1箇所）。
-// この本体に「呼び出し時にモジュールレベルの let を読む文」を足さないこと（TDZ）。
 export function initSuggest(): void {
   inputEl.addEventListener("input", (e) => {
     if ((e as InputEvent).isComposing) return;
     refreshSuggest();
   });
 
-  // caret移動（クリック/矢印キー/Home/End）でもトリガー判定を再評価し、
-  // caretがトリガー範囲外に出た場合はサジェストを閉じる（陳腐化した triggerIndex での誤コミット防止）。
   inputEl.addEventListener("click", () => {
     refreshSuggest();
   });
@@ -212,7 +199,6 @@ export function initSuggest(): void {
     }
   });
 
-  // キャプチャフェーズで登録し、既存の Enter=送信ハンドラより先に処理する
   inputEl.addEventListener(
     "keydown",
     (e) => {

@@ -18,7 +18,6 @@ export interface SdkLlmAnalysisClientOptions {
   cwd: string;
   claudeCodeExecutablePath?: string;
   sdkClaudeCodeVersion?: string;
-  // 省略時は buildClaudeEnv の既定（subscriptionOnly）に倒れる（R-GW-05）
   apiKeyPolicy?: ApiKeyPolicy;
   deps?: Partial<SdkLlmAnalysisClientDeps>;
 }
@@ -97,15 +96,14 @@ class SdkLlmAnalysisClient implements LlmAnalysisClient {
         persistSession: false,
         includePartialMessages: true,
         cwd: this.cwd,
-        env: buildClaudeEnv(process.env, this.apiKeyPolicy).env, // R-GW-05
+        env: buildClaudeEnv(process.env, this.apiKeyPolicy).env,
         outputFormat: {
           type: "json_schema",
-          schema: llmFindingsJsonSchema(),
+          schema: llmFindingsJsonSchema(request.learningEnabled),
         },
         abortController,
         settingSources: [],
-        // R-ANL-02: 分析対象外の coding preset・作業環境を分析指示へ混ぜない。
-        systemPrompt: llmAnalysisSystemPrompt(request.outputLanguage),
+        systemPrompt: llmAnalysisSystemPrompt(request.outputLanguage, request.learningEnabled),
       };
       if (this.modelId.length > 0) {
         options.model = this.modelId;
@@ -124,7 +122,6 @@ class SdkLlmAnalysisClient implements LlmAnalysisClient {
 
       for await (const message of stream) {
         if (request.signal.aborted) break;
-        // SDK の管理通知や接続維持だけでは、LLM が生成を進めた証拠にならない。
         if (
           message.type === "assistant" ||
           (message.type === "stream_event" &&
@@ -149,7 +146,6 @@ class SdkLlmAnalysisClient implements LlmAnalysisClient {
         if (message.modelUsage && isRecord(message.modelUsage)) {
           models = Object.keys(message.modelUsage);
         }
-        // result がターンの完了通知。後続の管理通知やプロセス終端を待たない。
         break;
       }
     } finally {

@@ -5,21 +5,26 @@ import { open } from "node:fs/promises";
 import { join } from "node:path";
 import type * as ClaudeCodeSdk from "@anthropic-ai/claude-agent-sdk" with { "resolution-mode": "import" };
 
-import { claudeProjectsDir } from "./claude-env";
-import { getLaisoraConfiguration } from "./claude-settings";
+import { homedir } from "node:os";
+import { AccountUsageFetcher, rateLimitsViaUsageCommand } from "./account-usage";
+import { claudeConfigDir, claudeProjectsDir } from "./claude-env";
+import { configuredClaudeExecutablePath, getLaisoraConfiguration, resolveSessionCwd } from "./claude-settings";
+import { resolveClaudeCodeStartup } from "./claudeCliResolver";
+import { sdkClaudeCodeVersion } from "./claudeHost";
 import type { Session } from "./extension";
 import { extensionContext, output, sinceActivation, store } from "./host-context";
 import {
+  ACCOUNT_USAGE_TIMEOUT_MS,
   SESSION_ID_RE,
+  normalizeApiKeyPolicy,
   type ImageAttachment,
   type SessionListItem,
   type SessionScanDegradation,
   type WebviewToHost,
 } from "./protocol";
 import {
-  appendSessionRecord,
+  appendSessionRecordOnFreshLine,
   errText,
-  readCachedUsage,
   resolveSessionImage,
   sessionTranscriptRef,
 } from "./session-files";
@@ -44,11 +49,8 @@ export function rememberSession(session: Session): void {
         error => output.appendLine(`[history] Could not save LAISORA session index: ${String(error)}`));
     }
   }
-  // 呼び出し元はセッション id が確定・変化した点（初回ターン完了・resume・ハンドオフ）と一致する
   void persistOpenTabs();
 }
-
-// ---------- 起動時のタブ復元（laisora.restoreTabsOnStartup） ----------
 
 const OPEN_TABS_KEY = "history.laisoraOpenTabs";
 
@@ -60,7 +62,6 @@ export interface PersistedOpenTab {
   order: number;
 }
 
-// 消費点で毎回読む（tabLimit と同じ理由）。偽 vscode のハーネスは供給しないキーで throw する
 export function restoreTabsOnStartupEnabled(): boolean {
   try {
     return getLaisoraConfiguration().get<boolean>("restoreTabsOnStartup", true) !== false;
@@ -74,7 +75,6 @@ function openTabEntries(): PersistedOpenTab[] {
   const seen = new Set<string>();
   for (const s of store?.sessions.values() ?? []) {
     if (s.closed) continue;
-    // セッション id を持たないタブ（一度も送信していない）は復元するものが無いので載せない
     const sessionId = s.resumeSessionId ?? s.auth?.sessionId;
     if (!sessionId || seen.has(sessionId)) continue;
     seen.add(sessionId);
@@ -90,8 +90,6 @@ function openTabEntries(): PersistedOpenTab[] {
   return entries;
 }
 
-// 一覧は workspaceState に置く。globalState は全ウィンドウで共有され、別ウィンドウの一覧で上書きされる。
-// ?. は偽 vscode のハーネスが workspaceState を供給しないため
 function openTabsMemento(): vscode.Memento | undefined {
   return extensionContext?.workspaceState;
 }
@@ -102,8 +100,6 @@ function openTabsPersistFailed(error: unknown): void {
   output.appendLine(`[history] Could not save the open tab list: ${String(error)}`);
 }
 
-// 同期に投げない。呼び出し元（closeTab / clearTab / rememberSession）は `void` で呼んだ後に
-// タブの閉鎖・初期化の続きを実行するので、ここで投げるとその操作が途中で止まる（R-SES-01）
 export function persistOpenTabs(): Promise<void> {
   try {
     const entries = openTabEntries();
@@ -127,7 +123,6 @@ export function readPersistedOpenTabs(): PersistedOpenTab[] {
   for (const item of raw) {
     if (typeof item !== "object" || item === null) continue;
     const r = item as Record<string, unknown>;
-    // ファイル名へ連結する前に絞る（契約 session-tabs）
     if (typeof r.sessionId !== "string" || !SESSION_ID_RE.test(r.sessionId) || seen.has(r.sessionId)) continue;
     seen.add(r.sessionId);
     entries.push({
@@ -140,14 +135,31 @@ export function readPersistedOpenTabs(): PersistedOpenTab[] {
   }
   return entries.sort((a, b) => a.order - b.order);
 }
+const HIDDEN_SESSIONS_KEY = "history.hiddenSessions";
+export function hiddenSessionIds(): Set<string> {
+  const raw = extensionContext?.globalState.get<unknown>(HIDDEN_SESSIONS_KEY, []);
+  return new Set(Array.isArray(raw) ? raw.filter((id): id is string => typeof id === "string" && SESSION_ID_RE.test(id)) : []);
+}
+let hiddenSessionsWrite: Promise<void> = Promise.resolve();
+function updateHiddenSessions(sessionId: string, hidden: boolean): Promise<void> {
+  const write = hiddenSessionsWrite.then(async () => {
+    const context = extensionContext;
+    if (!context) throw new Error("extension context unavailable");
+    const ids = hiddenSessionIds();
+    if (hidden) ids.add(sessionId); else ids.delete(sessionId);
+    await context.globalState.update(HIDDEN_SESSIONS_KEY, [...ids]);
+  });
+  hiddenSessionsWrite = write.then(undefined, () => undefined);
+  return write;
+}
+
 type HistorySource = "laisora" | "claude";
-const historyPages = new Map<HistorySource, { token: number; candidates: SessionCandidate[] }>();
+const historyPages = new Map<string, { token: number; candidates: SessionCandidate[] }>();
 
 const originCache = new Map<string, "claude" | "unknown">();
 async function historicalOrigin(file: string): Promise<"claude" | "unknown"> {
   const cached = originCache.get(file);
   if (cached) return cached;
-  // Read metadata only. A truncated or absent origin is unknown, never proof of ownership.
   const handle = await open(file, "r").catch(() => undefined);
   if (!handle) return "unknown";
   let origin: "claude" | "unknown" = "unknown";
@@ -161,30 +173,13 @@ async function historicalOrigin(file: string): Promise<"claude" | "unknown"> {
         if (typeof record.entrypoint !== "string") continue;
         origin = record.entrypoint === "cli" || record.entrypoint === "claude-vscode" ? "claude" : "unknown";
         break;
-      } catch { /* incomplete metadata stays unclassified */ }
+      } catch { }
     }
     originCache.set(file, origin);
   } catch { return "unknown"; } finally { await handle.close(); }
   return origin;
 }
 
-// ---------- resume: Claude Code セッションストア（~/.claude/projects）の列挙・読取 ----------
-
-// セッション一覧（全プロジェクト横断・mtime降順）。タイトル・cwd・mtime の解決は SDK の
-// listSessions に委ねる（公式 /resume ピッカーと同じ解決器: customTitle > aiTitle >
-// 最後の発言 > 最初の発言。head/tail 各 64KB + sidecar custom-title.json を読む）。
-// includeProgrammatic を false にしないこと。SDK 経由で動く LAISORA 自身のセッションが
-// 落ち、実測で 40 件中 38 件が一覧から消える。
-// SDKSessionInfo は filePath を持たないので、sessionId → パスの対応だけ readdir で作る
-// （ファイル本体は読まない）。組み立ては session-list.ts の純関数。
-// SDK は dist へ束ねてあるが、esbuild は ESM 依存の評価を最初の require まで遅延させる
-// （dist/extension.js の init_sdk）。この評価は同期で、初回だけ二桁〜三桁 ms かかる。
-// この費用は webview の ready ハンドラが払い終えている: warmup → ClaudeConversation.start() の
-// 第一文が同じ require を同期で通す（claudeHost.ts の start）。listSessions を出すのは
-// webview の openHistPanel だけで、その postMessage は同じ経路の ready より後にしか
-// 起きないため、履歴一覧の解決がこの評価を背負うことはない。
-// ここへ先払いを足さないこと: 評価は既に済んでいるので、残る仕事は存在しない UUID の getSessionInfo だけになり、
-// 冷間で readdir と多数の stat が走って利用者の履歴要求と競合する
 let sessionSdk: Pick<typeof ClaudeCodeSdk, "getSessionInfo"> | undefined;
 function sessionInfoSdk(): Pick<typeof ClaudeCodeSdk, "getSessionInfo"> {
   if (sessionSdk === undefined) {
@@ -193,21 +188,6 @@ function sessionInfoSdk(): Pick<typeof ClaudeCodeSdk, "getSessionInfo"> {
   return sessionSdk;
 }
 
-// 単一セッションの summary を SDK から引く。一覧（listSessions）と同じ解決器なので、
-// 一覧とタブ名が食い違わない。自前で custom-title を読みに行くと解決器の写しになり腐る。
-// 先頭行の取り出し・空判定・切り詰めをここでやらないこと。displayTitleFromSummary と
-// 二重の正規化になり、先頭行が空の summary で一覧（無題）とタブ（据え置き）が割れる（R-SES-05）
-// 公式の単体解決器を叩く唯一の場所。通常のタブ名（sessionSummaryOf 経由）と履歴一覧が
-// 同じ呼び出しを通る（R-SES-05）。
-// R-LRN-18: research titles use a persisted custom title before history resolution on reload.
-// dir は渡さない。SDK の dir は「実 cwd」で、これを SDK 側が Jf() で符号化して
-// ~/.claude/projects/<符号化名> を組み立てる（sdk.mjs er / Ci）。こちらが readdir で
-// 知っているのは符号化後のディレクトリ名で、Jf は非可逆（[^a-zA-Z0-9]→'-'・200 字超は
-// 切り詰め＋ハッシュ）なため cwd は復元できない。逆変換は禁止（別プロジェクトの
-// セッションを掴む — session-list.ts の toSessionListItems 参照）
-// onError は「例外で解決できなかった」と「要約を持たないので読み飛ばす」を呼び出し側で
-// 区別するためにある。区別しないと、解決が全滅した一覧が 0 件として complete し、
-// 画面が「セッションが見つかりません」と断言する（R-DSP-01）
 async function sessionInfoOf(
   sessionId: string,
   onError?: (err: unknown) => void
@@ -237,17 +217,11 @@ export function setInitialTabTitle(session: Session, title: string): void {
 export function persistInitialTabTitle(session: Session): void {
   const initial = initialTabTitles.get(session);
   if (initial?.generation !== session.logicalGeneration || session.closed || session.clearing || session.titleRefreshing) return;
-  // R-LRN-18: persist as soon as init supplies a transcript ID; terminal events retry missing files or failed IO.
   session.titleRefreshing = true;
   void refreshTabTitle(session);
 }
 
-// 初期固定名は custom-title として保存し、それ以外は履歴一覧と同じ値へ付け直す。
-// autoTitled は読まない（初回発言で固定すると summary の変化と食い違う — R-SES-05）。
 export async function refreshTabTitle(session: Session): Promise<void> {
-  // SDK が system/init の session_id として報告した「今書いているセッション」の id だけを使う。
-  // expectedConversationId は claudeHost が自前で振る randomUUID で SDK へ渡らないため、
-  // getSessionInfo が必ず空を返す（このタブ名は二度と変わらなくなる）
   const sessionId = session.auth?.sessionId;
   const generation = session.logicalGeneration;
   try {
@@ -256,22 +230,25 @@ export async function refreshTabTitle(session: Session): Promise<void> {
     const initial = initialTabTitles.get(session);
     if (initial?.generation === generation) {
       const ref = sessionTranscriptRef(session);
-      if (!ref) return; // R-SES-05: persist the initial title through formatCustomTitleRecord.
+      if (!ref) return;
+      let written: boolean;
       try {
-        await appendSessionRecord(ref.file, formatCustomTitleRecord(ref.sessionId, initial.title));
+        written = await queueRename(ref.sessionId, async () => {
+          if (initialTabTitles.get(session) !== initial || session.logicalGeneration !== generation || session.closed) return false;
+          await writeCustomTitle(ref.file, ref.sessionId, initial.title);
+          return true;
+        });
       } catch (error) {
         output.appendLine(`R-LRN-18: Could not save the research tab title: ${String(error)}`);
         return;
       }
-      if (session.logicalGeneration !== generation || session.closed) return; // R-LRN-18
+      if (!written || session.logicalGeneration !== generation || session.closed) return;
       initialTabTitles.delete(session);
       session.titleRefreshed = true;
       return;
     }
     const summary = await sessionSummaryOf(sessionId);
-    // 解決できないときは既存のタブ名を保ち、印も立てない。次のターンで再試行する（R-SES-05）
     if (summary === undefined) return;
-    // await をまたぐ間に /clear や resume で別セッションになったタブへ名前を入れない
     if (session.logicalGeneration !== generation || session.closed) return;
     session.titleRefreshed = true;
     const title = displayTitleFromSummary(summary, sessionId);
@@ -279,42 +256,37 @@ export async function refreshTabTitle(session: Session): Promise<void> {
     session.title = title;
     store?.post({ type: "tabRenamed", tabId: session.tabId, title });
   } finally {
-    // 世代が変わっていたら resetLogicalSession が既に降ろしている。降ろし直すと
-    // 新世代の起動中フラグを消して二重起動を許す
     if (session.logicalGeneration === generation) session.titleRefreshing = false;
   }
 }
 
-// セッション一覧（全プロジェクト横断・mtime 降順）を、確定した行から逐次 emit する。
-// sdk.listSessions を await すると、全件を解決し終えるまで冷間で 8〜12 秒何も出ない。
-// 走査は自前の readdir+stat（本文は読まない）で、タイトル・cwd の解決だけを
-// 公式の単体解決器へ委ねる。解決器が同じなので一覧とタブ名は一致する（R-SES-05）。
-//
-// 候補は SESSION_LIST_LIMIT より深く取り、解決できない候補は行の枠を消費させずに読み飛ばす。
-// SDK の listSessions も同じことをしている（sdk.mjs iHe: `if(!h) continue` で limit 件
-// 埋まるまで候補を進める）。上位 40 件で打ち切ると、要約を持たない候補や UUID でない
-// ファイル名の分だけ行が減る。
 let sessionListRequestSeq = 0;
+const accountUsageFetcher = new AccountUsageFetcher((line) => output.appendLine(line));
+export function releaseAccountUsageWaiter(webview: vscode.Webview): void {
+  accountUsageFetcher.release(webview);
+}
+export function disposeAccountUsage(): void {
+  accountUsageFetcher.dispose();
+}
 
 async function listPastSessions(
   requestId: number,
   emit: (sessions: SessionListItem[], complete: boolean, degraded?: SessionScanDegradation, nextCursor?: string) => void,
-  options: { source?: HistorySource; cursor?: string } = {}
+  options: { source?: HistorySource; cursor?: string; showHidden?: boolean } = {}
 ): Promise<void> {
   const listStartT = Date.now();
   const root = claudeProjectsDir();
   const entries: SessionCandidate[] = [];
   for (const session of store?.sessions.values() ?? []) rememberSession(session);
   const known = usedSessionPaths();
+  const hidden = hiddenSessionIds();
   const source = options.source ?? "claude";
-  const savedPage = historyPages.get(source);
+  const pageKey = `${source}:${options.showHidden === true}`;
+  const savedPage = historyPages.get(pageKey);
   const cursorParts = options.cursor?.split(":").map(Number);
   const continuation = cursorParts && savedPage?.token === cursorParts[0] ? savedPage : undefined;
   const offset = continuation ? cursorParts![1] : 0;
 
-  // 読めなかったものを種類別に数える。ここを数えないと、走査が失敗しても complete=true・
-  // 0 件で返り、画面が「セッションが見つかりません」と断言する（R-DSP-01。Google Drive 同期下で
-  // 現実に起こる）。emit へ渡すこと自体を消すと verify-session-list#SL-34b が落ちる
   const degradation: SessionScanDegradation = {
     rootFailed: false,
     unreadableProjects: 0,
@@ -331,9 +303,6 @@ async function listPastSessions(
       ? { ...degradation }
       : undefined;
   try {
-    // withFileTypes でディレクトリだけに絞る。保存先直下に同期のロックファイル等があると
-    // readdir が ENOTDIR で落ち、健全なのに「1 個のプロジェクトを読めません」を出し続ける
-    // （警告が常時点灯すると誰も読まなくなる）
     if (continuation) {
       entries.push(...continuation.candidates);
     } else for (const entry of readdirSync(root, { withFileTypes: true })) {
@@ -356,8 +325,6 @@ async function listPastSessions(
       }
     }
   } catch (err) {
-    // ENOENT は「まだ 1 件も会話していない」＝本当に 0 件。障害として警告すると、
-    // 新規導入の利用者に常時「保存先を読めません」を出すことになる
     if ((err as { code?: unknown }).code !== "ENOENT") {
       degradation.rootFailed = true;
       output.appendLine(`[history] 保存先を読めません: ${root} — ${errText(err)}`);
@@ -368,8 +335,6 @@ async function listPastSessions(
   if (degradation.statFailed > 0) {
     output.appendLine(`[history] stat できないファイル ${degradation.statFailed} 件（候補から除外・req ${requestId}）`);
   }
-  // Older releases did not record ownership. Unknown SDK histories remain accessible,
-  // explicitly marked, rather than being relabelled as official Claude Code sessions.
   if (!continuation && options.source) {
     for (let i = 0; i < entries.length; i += 4) {
       await Promise.all(entries.slice(i, i + 4).map(async c => {
@@ -378,11 +343,12 @@ async function listPastSessions(
     }
   }
   const candidates = continuation ? entries : rankSessionCandidates(entries).filter(c =>
-    !options.source || (source === "laisora"
+    (options.showHidden === true || !hidden.has(c.sessionId)) &&
+    (!options.source || (source === "laisora"
       ? !!known[c.sessionId] || originCache.get(c.filePath) !== "claude"
-      : !known[c.sessionId] && originCache.get(c.filePath) === "claude"));
+      : !known[c.sessionId] && originCache.get(c.filePath) === "claude")));
   const token = continuation?.token ?? requestId;
-  if (!continuation) historyPages.set(source, {token, candidates});
+  if (!continuation) historyPages.set(pageKey, {token, candidates});
   const pathBySessionId = candidatePathIndex(candidates);
   const scanDoneT = Date.now();
   output.appendLine(
@@ -391,17 +357,13 @@ async function listPastSessions(
 
   let firstRowT = 0;
   let resolveStarts = 0;
-  // この要求で最初に始めた 1 件の所要。SESSION_RESOLVE_FIRST_BATCH = 1 なので単独計測になる。
-  // プロセス全体の一度きりの費用ではない（要求ごとに毎回出る）。SDK のモジュール評価は
-  // ready ハンドラの warmup が払い終えており、評価後の getSessionInfo に一度きりの費用は
-  // 無い（実測: 初回 5ms・同 id 1ms・別 id 2ms）。三桁〜四桁 ms が出たら、
-  // それはこの 1 件の I/O か同時実行との競合
   let firstResolveMs = -1;
   let rowsSent = 0;
   const { sent, scanned, nextIndex } = await streamSessionRows(
     candidates.slice(offset),
     pathBySessionId,
     async (c) => {
+      if (options.showHidden !== true && hidden.has(c.sessionId)) return undefined;
       const first = ++resolveStarts === 1;
       const t = first ? Date.now() : 0;
       const info = await sessionInfoOf(c.sessionId, (err) => {
@@ -415,10 +377,7 @@ async function listPastSessions(
     },
     (sessions: SessionListItem[], complete: boolean) => {
       rowsSent += sessions.length;
-      // 最後の emit の直前に判定する。候補はあったのに 1 行も出せなかったのなら、
-      // それは「無い」ではなく「出せなかった」。getSessionInfo は壊れた記録に対して
-      // 例外を投げずに undefined を返すことがあり、resolveFailed だけでは捕まらない
-      if (complete && rowsSent === 0 && candidates.length > 0) {
+      if (complete && rowsSent === 0 && resolveStarts > 0) {
         degradation.unresolvedCandidates = candidates.length;
         output.appendLine(
           `[history] 候補 ${candidates.length} 件から 1 行も解決できません（req ${requestId}）`
@@ -431,8 +390,9 @@ async function listPastSessions(
             `（解決 ${resolveStarts}件・先頭解決 ${firstResolveMs}ms・req ${requestId}）`
         );
       }
-      if (source === "laisora") for (const row of sessions) {
-        if (!known[row.sessionId]) row.originUnverified = true;
+      for (const row of sessions) {
+        if (source === "laisora" && !known[row.sessionId]) row.originUnverified = true;
+        if (hidden.has(row.sessionId)) row.hidden = true;
       }
       emit(sessions, false, degraded());
     }
@@ -443,49 +403,134 @@ async function listPastSessions(
   );
 }
 
+function writeCustomTitle(file: string, sessionId: string, title: string): Promise<void> {
+  return appendSessionRecordOnFreshLine(file, sessionId, formatCustomTitleRecord(sessionId, title));
+}
+
+const renameQueues = new Map<string, Promise<void>>();
+function queueRename<T>(sessionId: string, run: () => Promise<T>): Promise<T> {
+  const result = (renameQueues.get(sessionId) ?? Promise.resolve()).then(run);
+  const tail = result.then(() => undefined, () => undefined);
+  renameQueues.set(sessionId, tail);
+  void tail.then(() => { if (renameQueues.get(sessionId) === tail) renameQueues.delete(sessionId); });
+  return result;
+}
+
+function applyCustomTitle(st: SessionStore, s: Session, sessionId: string, title: string): void {
+  s.title = displayTitleFromSummary(title, sessionId);
+  initialTabTitles.delete(s);
+  s.autoTitled = true;
+  st.post({ type: "tabRenamed", tabId: s.tabId, title: s.title });
+}
+
+interface RenameTarget {
+  ref: { sessionId: string; file: string };
+  generation: number;
+}
+
+function renameTargetOf(s: Session): RenameTarget | null {
+  const ref = sessionTranscriptRef(s);
+  return ref === null ? null : { ref, generation: s.logicalGeneration };
+}
+
+function renameTargetIsCurrent(s: Session, target: RenameTarget): boolean {
+  if (s.closed || s.logicalGeneration !== target.generation) return false;
+  const ref = sessionTranscriptRef(s);
+  return ref !== null && ref.sessionId === target.ref.sessionId && ref.file === target.ref.file;
+}
+
+async function renameOpenSession(
+  st: SessionStore,
+  s: Session,
+  rawTitle: string,
+  target: RenameTarget | null,
+  requestId?: string
+): Promise<{ title: string } | { reason: string }> {
+  const refuse = (reason: string) => {
+    s.pushEvent({ kind: "error", message: reason, fatal: false });
+    return { reason };
+  };
+  if (target === null) return refuse(l10n.t("/rename can be used once the session file is determined (try again after the first response)."));
+  if (!renameTargetIsCurrent(s, target)) {
+    output.appendLine(`[history] Dropped a rename for a session the tab no longer shows: ${target.ref.sessionId}`);
+    if (s.closed) return { reason: "stale-rename-target" };
+    return refuse(l10n.t("/rename: The name was not saved because the tab now shows another session."));
+  }
+  const { ref, generation } = target;
+  const title = normalizeTitleValue(rawTitle);
+  if (title === null) return refuse(l10n.t("Usage: /rename <new name>"));
+  try {
+    await writeCustomTitle(ref.file, ref.sessionId, title);
+  } catch (error) {
+    return refuse(l10n.t("/rename: Could not write to the session file ({0})", String(error)));
+  }
+  const shown = displayTitleFromSummary(title, ref.sessionId);
+  if (!s.closed && s.logicalGeneration === generation) applyCustomTitle(st, s, ref.sessionId, title);
+  st.post({ type: "sessionRenamed", sessionId: ref.sessionId, title: shown, ...(requestId !== undefined ? { requestId } : {}) });
+  return { title };
+}
+
+function openSessionsOf(st: SessionStore, sessionId: string): Session[] {
+  return [...st.sessions.values()].filter(s =>
+    !s.closed && (s.resumeSessionId ?? s.auth?.sessionId) === sessionId && sessionTranscriptRef(s)?.sessionId === sessionId);
+}
+
+async function renameListedSession(st: SessionStore, msg: Extract<WebviewToHost, { type: "renameSession" }>): Promise<void> {
+  const reply = msg.requestId !== undefined ? { requestId: msg.requestId } : {};
+  const fail = (reason: string) => st.post({ type: "sessionListActionFailed", sessionId: msg.sessionId, action: "rename", reason, ...reply });
+  const [first, ...others] = openSessionsOf(st, msg.sessionId);
+  if (first) {
+    const generations = new Map(others.map(s => [s, s.logicalGeneration]));
+    const result = await renameOpenSession(st, first, msg.title, renameTargetOf(first), msg.requestId);
+    if ("reason" in result) { fail(result.reason); return; }
+    for (const [s, generation] of generations) {
+      if (!s.closed && s.logicalGeneration === generation) applyCustomTitle(st, s, msg.sessionId, result.title);
+    }
+    return;
+  }
+  const title = normalizeTitleValue(msg.title);
+  if (title === null) { fail(l10n.t("Enter a name.")); return; }
+  try {
+    await writeCustomTitle(msg.filePath, msg.sessionId, title);
+  } catch (error) {
+    output.appendLine(`[history] Could not save the name: ${msg.sessionId} — ${errText(error)}`);
+    fail(l10n.t("Could not save the name ({0})", errText(error)));
+    return;
+  }
+  st.post({ type: "sessionRenamed", sessionId: msg.sessionId, title: displayTitleFromSummary(title, msg.sessionId), ...reply });
+}
+
 export async function handleSessionFileMessage(
   st: SessionStore,
-  msg: Extract<WebviewToHost, { type: "renameTab" | "listSessions" | "requestCachedUsage" | "sessionImageRequest" | "openSessionImage" }>,
+  msg: Extract<WebviewToHost, { type: "renameTab" | "renameSession" | "setSessionHidden" | "listSessions" | "requestAccountUsage" | "accountUsagePanelClosed" | "sessionImageRequest" | "openSessionImage" }>,
   sender: vscode.Webview,
   target: Session | undefined
 ): Promise<void> {
   switch (msg.type) {
     case "renameTab": {
-      // /rename を SDK へ素通しすると custom-title が JSONL に書かれず、タブ名にも履歴一覧にも反映されない。
-      // Host が CLI と同じレコードを書き、タブ名は履歴一覧と同じ解決器（displayTitleFromSummary）を通す（R-SES-05）
-      const s = target!;
-      const ref = sessionTranscriptRef(s);
-      // R-SES-09
-      if (ref === null) {
-        s.pushEvent({
-          kind: "error",
-          message: l10n.t("/rename can be used once the session file is determined (try again after the first response)."),
-          fatal: false,
-        });
-        break;
-      }
-      const title = normalizeTitleValue(msg.title);
-      if (title === null) {
-        s.pushEvent({ kind: "error", message: l10n.t("Usage: /rename <new name>"), fatal: false });
-        break;
-      }
-      const generation = s.logicalGeneration;
+      const accepted = renameTargetOf(target!);
+      if (accepted === null) await renameOpenSession(st, target!, msg.title, null);
+      else await queueRename(accepted.ref.sessionId, () => renameOpenSession(st, target!, msg.title, accepted));
+      break;
+    }
+    case "renameSession": {
+      await queueRename(msg.sessionId, () => renameListedSession(st, msg));
+      break;
+    }
+    case "setSessionHidden": {
       try {
-        await appendSessionRecord(ref.file, formatCustomTitleRecord(ref.sessionId, title));
+        await updateHiddenSessions(msg.sessionId, msg.hidden);
       } catch (error) {
-        s.pushEvent({
-          kind: "error",
-          message: l10n.t("/rename: Could not write to the session file ({0})", String(error)),
-          fatal: false,
+        output.appendLine(`[history] Could not save the hidden sessions: ${msg.sessionId} — ${errText(error)}`);
+        st.post({
+          type: "sessionListActionFailed",
+          sessionId: msg.sessionId,
+          action: msg.hidden ? "hide" : "unhide",
+          reason: l10n.t("Could not save the hidden sessions ({0})", errText(error)),
         });
         break;
       }
-      // 書き込み待ちの間に /clear や resume で別セッションになったタブへ名前を入れない
-      if (s.closed || s.logicalGeneration !== generation) break;
-      s.title = displayTitleFromSummary(title, ref.sessionId);
-      initialTabTitles.delete(s);
-      s.autoTitled = true;
-      st.post({ type: "tabRenamed", tabId: s.tabId, title: s.title });
+      st.post({ type: "sessionHiddenChanged", sessionId: msg.sessionId, hidden: msg.hidden });
       break;
     }
     case "listSessions": {
@@ -493,20 +538,34 @@ export async function handleSessionFileMessage(
       await listPastSessions(
         requestId,
         (sessions: SessionListItem[], complete: boolean, degraded?: SessionScanDegradation, nextCursor?: string) => {
-          // パネルを開き直すと新しい実行が始まる。古い実行の行は送らない
           if (requestId !== sessionListRequestSeq) return;
-          st.post({ type: "sessions", requestId, sessions, complete, degraded, source: msg.source, nextCursor, append: msg.cursor !== undefined });
+          st.post({ type: "sessions", requestId, sessions, complete, degraded, source: msg.source, showHidden: msg.showHidden, nextCursor, append: msg.cursor !== undefined });
         },
-        {source: msg.source, cursor: msg.cursor}
+        {source: msg.source, cursor: msg.cursor, showHidden: msg.showHidden}
       );
       break;
     }
-    case "requestCachedUsage": {
-      // 実測: CLI は利用率を実APIコールを伴うターンでしか送ってこないため、
-      // 起動直後は LAISORA 側に何も無い。CLI 自身が ~/.claude.json の
-      // cachedUsageUtilization に最後の取得結果を残しているので、それを初期表示に使う。
-      const cached = readCachedUsage();
-      if (cached) st.post({ type: "cachedUsage", ...cached });
+    case "requestAccountUsage": {
+      const conversation = target?.conversation && !target.conversation.isClosed ? target.conversation : undefined;
+      const cfg = getLaisoraConfiguration();
+      const apiKeyPolicy = normalizeApiKeyPolicy(cfg.get("claude.apiKeyPolicy", "inherit"));
+      const snapshot = await accountUsageFetcher.request(sender, {
+        identity: JSON.stringify([claudeConfigDir(), apiKeyPolicy, target?.auth?.credentialSource ?? null, target?.auth?.apiKeySource ?? null]),
+        ...(conversation ? { viaConversation: (signal: AbortSignal) => conversation.planUsageRateLimits(ACCOUNT_USAGE_TIMEOUT_MS, signal) } : {}),
+        viaUsageCommand: (signal) =>
+          rateLimitsViaUsageCommand({
+            cwd: (target ? resolveSessionCwd(target) : undefined) ?? homedir(),
+            apiKeyPolicy,
+            signal,
+            resolveExecutablePath: async () =>
+              (await resolveClaudeCodeStartup(configuredClaudeExecutablePath(cfg), sdkClaudeCodeVersion())).executable.path,
+          }),
+      });
+      if (snapshot) void st.postTo(sender, { type: "accountUsage", replyTo: msg.requestId, ...snapshot });
+      break;
+    }
+    case "accountUsagePanelClosed": {
+      accountUsageFetcher.release(sender);
       break;
     }
     case "sessionImageRequest": {

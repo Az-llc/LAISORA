@@ -18,7 +18,6 @@ export const DEFAULT_ACCENT_SETTINGS: AccentSettings = {
   accentCustomLight: ACCENT_PRESETS.orange.light,
   accentCustomDark: ACCENT_PRESETS.orange.dark,
 };
-// focusBorder first: most built-in themes leave textLink.foreground undefined, so it stays VS Code's default blue in every theme.
 export const THEME_ACCENT = "var(--vscode-focusBorder, var(--vscode-textLink-foreground))";
 
 export function isAccentColor(value: unknown): value is AccentColor {

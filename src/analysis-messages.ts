@@ -26,10 +26,8 @@ export async function handleAnalysisMessage(
 ): Promise<void> {
   switch (msg.type) {
     case "analyzeCurrent": {
-      // src/session-files.ts#lookupSessionFile で対象を解決し、表示側に任意のパスを選ばせない。
       const sid = target!.resumeSessionId ?? target!.auth?.sessionId;
       if (!sid) {
-        // 理由を src/webview/main.ts#showAnalysisFailure へ渡し、操作した分析画面へ返す（R-SES-09 / R-ANL-11）。
         void st.postTo(sender, {
           type: "analysisFailed",
           kind: "script",
@@ -43,7 +41,6 @@ export async function handleAnalysisMessage(
         output.appendLine(
           `[analysis] ${found.reason} session=${sid}` + (found.reason === "scan_failed" ? ` — ${found.detail}` : "")
         );
-        // src/session-files.ts#lookupSessionFile の走査失敗を、記録の不在と混同しない（R-DSP-01）。
         void st.postTo(sender, {
           type: "analysisFailed",
           kind: "script",
@@ -105,12 +102,10 @@ export async function handleAnalysisMessage(
       const isoTime = art ? new Date(art.generatedAt).toISOString() : new Date().toISOString();
       const currentBase = s.semantic.semanticBasePayload();
 
-      // currentBase との参照同一性も確認し、古い要求と保存結果のハッシュの一致だけで実行しない（R-ANL-02）。
       if (!finding || !base || base !== currentBase || base.semanticHash !== msg.semanticHash) {
         output.appendLine(
           `[${s.title}] startFindingSession 拒否: 分析結果が更新されています (runId=${msg.analysisRunId})`
         );
-        // 拒否理由を src/webview/main.ts#showAnalysisFailure で所見のある分析画面へ返す（R-ANL-02 / R-ANL-11）。
         void st.postTo(sender, {
           type: "analysisFailed",
           kind: "action",
@@ -132,6 +127,7 @@ export async function handleAnalysisMessage(
       const filePath = s.resumeFilePath ?? (sessionId ? findSessionFile(sessionId) : undefined);
       const sessionRef = [sessionId, filePath].filter(Boolean).join(" / ") || l10n.t("Tab {0} (session not identified)", s.tabId);
       const prompt = buildFindingSessionPrompt({
+        learningEnabled: getLaisoraConfiguration().get<boolean>("learning.enabled", false) === true,
         analysisSdk: art?.analysisSdk,
         sessionRef,
         models: models ?? null,
@@ -186,6 +182,7 @@ export async function handleAnalysisMessage(
         "",
         l10n.t("When improving, check how it relates to the current target and use only the material that still applies."),
         buildFindingSessionPrompt({
+          learningEnabled: getLaisoraConfiguration().get<boolean>("learning.enabled", false) === true,
           analysisSdk: art.analysisSdk,
           sessionRef,
           models: art.executedModels,

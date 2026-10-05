@@ -6,10 +6,6 @@ import { ANALYSIS_STORE_KEY, decodeAnalysisStore, type AnalysisStorage, type Ana
 
 const digest = (value: string): string => createHash("sha256").update(value).digest("hex");
 
-/** R-ANL-04/05: one file per analysis run, no quota eviction.
- * Reusing an artifactId updates that same cached run, matching saveArtifact's upsert contract.
- * loadArtifacts / saveArtifact reach the files only through forSession.
- */
 export function createAnalysisFileStorage(
   directory: string,
   log: (line: string) => void = () => {},

@@ -1,6 +1,3 @@
-// 状況タブの時間 4 区分をセッション自身の JSONL から導出する（U-1 案 b）。
-// live のターン境界（user_message / turn_started）は継承時刻で fold 由来の値が inherited になるため、
-// history と同じ readSessionHistory を通して読み直す。開き方（新規 / resume）で値が変わらない（R-TAB-07）
 import type { NormalizedEvent, TimeBucketsCoverage } from "./protocol";
 import { readSessionHistory, readSubagentAgents, type HistoryEvent } from "./session-transcript";
 import {
@@ -9,10 +6,13 @@ import {
   deriveTimeBuckets,
   foldTimeBuckets,
   pushModelMark,
+  projectWorkBlockTokens,
   type ChildTranscriptSpan,
   type ModelMark,
   type TimeBucketView,
 } from "./time-buckets";
+
+import { foldPlanUsage, projectPlanUsage, type PlanUsageAccumulator } from "./plan-usage";
 
 import { createWorkModelState, reduceWorkModel } from "./work-model";
 
@@ -21,7 +21,6 @@ export interface TranscriptIds {
   generation: number;
 }
 
-// R-DSP-49: childSpansOf; src/time-buckets.ts#deriveTimeBuckets
 export function childSpansOf(
   agents: ReadonlyArray<{ toolUseId: string; startedAt?: number; endedAt?: number }>
 ): ChildTranscriptSpan[] {
@@ -42,14 +41,11 @@ export function timeBucketsFromHistory(
   let modelMarks: ModelMark[] = [];
   let currentModel: string | undefined;
   let markedInTurn = false;
+  let usage: PlanUsageAccumulator | undefined;
   let seq = 0;
   for (const e of events) {
     const body = e.body;
     if (body.kind === "turn_started") markedInTurn = false;
-    // model の観測は foldTimeBuckets（evidence-index 経由で semantic の導出に入る）へ渡さず、読み直しの側だけで拾う。
-    // model_observed は変化した記録にしか出ないので、応答ごとの model は「直前の変化の model」で、
-    // 応答記録ごとの観測はメインの本文・ツール呼び出しのイベントの時刻で取る。変化点だけで割ると、
-    // 同じターンで A の応答の後に B へ変わったとき A の生成まで B に数える
     if (body.kind === "model_observed") {
       if (e.timestamp > 0) {
         currentModel = body.model;
@@ -75,17 +71,18 @@ export function timeBucketsFromHistory(
       generation: ids.generation,
     } as NormalizedEvent;
     state = foldTimeBuckets(state, ev);
+    if (ev.kind === "assistant_usage" && ev.parentToolUseId === null) usage = foldPlanUsage(usage, ev.messageId, e.timestamp, ev.usage);
     if (ev.kind === "turn_started" || ev.kind === "user_message") {
       requests = reduceWorkModel(requests, ev);
       state = attachTimeBucketRequestNumbers(state, requests.requests ?? []);
     }
   }
-  return deriveTimeBuckets(state, { childSpans, modelMarks });
+  const view = deriveTimeBuckets(state, { childSpans, modelMarks });
+  return projectWorkBlockTokens(view, projectPlanUsage(usage, view.blocks));
 }
 
 export interface TranscriptTimeBucketsRead {
   view: TimeBucketView | undefined;
-  // undefined = 欠落なし。読めなかった subagents/ を 0 本として view へ畳まない（R-DSP-11）
   coverage: TimeBucketsCoverage | undefined;
 }
 
@@ -110,8 +107,6 @@ export async function readTranscriptTimeBucketsWithCoverage(
   ids: TranscriptIds
 ): Promise<TranscriptTimeBucketsRead> {
   const history = await readSessionHistory(file, isAllowedPath);
-  // 読めなかった transcript から 0 件の 4 区分を作らない。fold 由来の値（inherited）に留める（R-DSP-11）
-  // subagents/ の一覧が読めない場合も view を作らない（子を 0 本として描くと直列に見える。TB-41）
   const sessionReadError = history.readError ?? history.subagentsReadError;
   if (sessionReadError !== undefined) return { view: undefined, coverage: { sessionReadError } };
   const restored = await readSubagentAgents(file, isAllowedPath);

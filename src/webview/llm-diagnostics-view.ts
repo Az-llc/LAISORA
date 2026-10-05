@@ -1,6 +1,3 @@
-// LLM finding の診断面。棄却された LLM finding と棄却理由の内訳を描く唯一のモジュールで、
-// 概要・分析のどちらの画面へも差し込まない（Host がオプトイン時だけ送る
-// llmFindingDiagnostics 専用）。
 import * as l10n from "@vscode/l10n";
 import type { LlmFindingDiagnosticsPayload } from "../protocol";
 

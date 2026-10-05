@@ -1,8 +1,8 @@
 import { randomUUID } from "node:crypto";
 import { join } from "node:path";
-import { pathIsInside } from "./path-containment";
+import { pathIsInside, realPath, type RealPath } from "./path-containment";
 export { pathIsInside, realPathOrNearestSync } from "./path-containment";
-import { open, readFile, readdir, realpath, stat } from "node:fs/promises";
+import { open, readFile, readdir, stat } from "node:fs/promises";
 import type {
   AgentInspectorCoverage,
   AgentInspectorErrorReason,
@@ -14,6 +14,7 @@ import type {
 } from "./protocol";
 import { summarizeToolInput } from "./protocol";
 import { claudeProjectsDir } from "./claude-env";
+import { extractResumeSignals } from "./tool-observation";
 
 export const INSPECTOR_TOOL_PAGE_SIZE = 25;
 export const INSPECTOR_MESSAGE_PAGE_SIZE = 20;
@@ -35,8 +36,6 @@ export class AgentInspectorReadError extends Error {
   }
 }
 
-// ENOENT だけが「無い」。それ以外（EACCES・EPERM・同期ロック等）は有無を確かめられなかった
-// ので read-failed に detail を付ける。同じ理由へ畳むと「まだ利用できません」（待てば出る）へ誘導する（R-DSP-01）
 function notFoundOrReadFailed(notFound: AgentInspectorErrorReason): (err: unknown) => never {
   return (err) => {
     if ((err as { code?: unknown })?.code === "ENOENT") throw new AgentInspectorReadError(notFound);
@@ -51,7 +50,6 @@ export interface AgentInspectorReadRequest {
   agentTranscriptId?: string;
   section: AgentInspectorSection;
   cursor?: string;
-  // tabId + generation。cursorを別タブ・別世代へ流用させない。
   scopeKey: string;
 }
 
@@ -109,9 +107,9 @@ export function agentInspectorCacheStatsForTest(): { entries: number; bytes: num
 export async function readAgentInspectorPage(
   request: AgentInspectorReadRequest
 ): Promise<AgentInspectorReadResult> {
-  const root = await realpath(request.sessionStoreRoot ?? claudeProjectsDir())
+  const root = await realPath(request.sessionStoreRoot ?? claudeProjectsDir())
     .catch(notFoundOrReadFailed("session-unavailable"));
-  const sessionPath = await realpath(request.sessionFilePath)
+  const sessionPath = await realPath(request.sessionFilePath)
     .catch(notFoundOrReadFailed("session-unavailable"));
   await assertRegularFileInside(root, sessionPath, "session-unavailable");
   if (!sessionPath.toLowerCase().endsWith(".jsonl")) {
@@ -119,11 +117,11 @@ export async function readAgentInspectorPage(
   }
 
   const subagentDir = `${sessionPath.slice(0, -".jsonl".length)}/subagents`;
-  const realSubagentDir = await realpath(subagentDir)
+  const realSubagentDir = await realPath(subagentDir)
     .catch(notFoundOrReadFailed("agent-unavailable"));
   assertInside(root, realSubagentDir, "agent-unavailable");
   const located = await locateAgent(realSubagentDir, request.toolUseId, request.agentTranscriptId);
-  const transcriptPath = await realpath(located.transcriptPath)
+  const transcriptPath = await realPath(located.transcriptPath)
     .catch(notFoundOrReadFailed("transcript-unavailable"));
   assertInside(realSubagentDir, transcriptPath, "transcript-unavailable");
   const fileStat = await stat(transcriptPath)
@@ -296,7 +294,7 @@ export async function readAgentInspectorPage(
 }
 
 async function locateAgent(
-  realSubagentDir: string,
+  realSubagentDir: RealPath,
   toolUseId: string,
   agentTranscriptId?: string
 ): Promise<LocatedAgent> {
@@ -311,7 +309,7 @@ async function locateAgent(
   let bytesRead = 0;
   let byteLimitReached = false;
   for (const name of limited) {
-    const metaPath = await realpath(join(realSubagentDir, name)).catch(() => null);
+    const metaPath = await realPath(join(realSubagentDir, name)).catch(() => null);
     if (!metaPath) continue;
     assertInside(realSubagentDir, metaPath, "agent-unavailable");
     const metaStat = await stat(metaPath).catch(() => null);
@@ -450,16 +448,21 @@ function toolItems(records: readonly Record<string, unknown>[]): {
   items: AgentInspectorToolItem[];
   previewTruncated: boolean[];
 } {
-  const results = new Map<string, { isError: boolean; preview: string; truncated: boolean }>();
+  const results = new Map<string, { isError: boolean; backgroundLaunch: boolean; preview: string; truncated: boolean }>();
+  const toolNames = new Map<string, string>();
   for (const record of records) {
     const content = asRecord(record.message)?.content;
     if (!Array.isArray(content)) continue;
     for (const block of content) {
       const value = asRecord(block);
+      if (value?.type === "tool_use" && typeof value.id === "string" && typeof value.name === "string") toolNames.set(value.id, value.name);
       if (value?.type !== "tool_result" || typeof value.tool_use_id !== "string") continue;
       const raw = typeof value.content === "string" ? value.content : JSON.stringify(value.content) ?? "";
       const preview = clipUtf8(raw, 4096);
-      results.set(value.tool_use_id, { isError: value.is_error === true, preview, truncated: preview.length !== raw.length });
+      const isError = value.is_error === true;
+      const signals = isError ? undefined : extractResumeSignals(toolNames.get(value.tool_use_id), toolResultText(value.content));
+      const backgroundLaunch = signals?.backgroundTaskId !== undefined || signals?.asyncLaunchedAgentId !== undefined;
+      results.set(value.tool_use_id, { isError, backgroundLaunch, preview, truncated: preview.length !== raw.length });
     }
   }
   const items: AgentInspectorToolItem[] = [];
@@ -484,6 +487,7 @@ function toolItems(records: readonly Record<string, unknown>[]): {
         inputSummary,
         inputPreview,
         isError: result?.isError,
+        ...(result?.backgroundLaunch ? { backgroundLaunch: true as const } : {}),
         resultPreview,
       });
       previewTruncated.push(
@@ -494,6 +498,16 @@ function toolItems(records: readonly Record<string, unknown>[]): {
     }
   }
   return { items, previewTruncated };
+}
+
+function toolResultText(content: unknown): string {
+  if (typeof content === "string") return content;
+  if (!Array.isArray(content)) return "";
+  return content
+    .map((block) => asRecord(block))
+    .filter((block) => block?.type === "text")
+    .map((block) => String(block?.text ?? ""))
+    .join("\n");
 }
 
 function messageItems(records: readonly Record<string, unknown>[]): {
@@ -642,8 +656,8 @@ function asRecord(value: unknown): Record<string, any> | null {
 }
 
 async function assertRegularFileInside(
-  root: string,
-  target: string,
+  root: RealPath,
+  target: RealPath,
   reason: AgentInspectorErrorReason
 ): Promise<void> {
   assertInside(root, target, reason);
@@ -651,6 +665,6 @@ async function assertRegularFileInside(
   if (!info?.isFile()) throw new AgentInspectorReadError(reason);
 }
 
-function assertInside(root: string, target: string, reason: AgentInspectorErrorReason): void {
+function assertInside(root: RealPath, target: RealPath, reason: AgentInspectorErrorReason): void {
   if (!pathIsInside(root, target)) throw new AgentInspectorReadError(reason);
 }

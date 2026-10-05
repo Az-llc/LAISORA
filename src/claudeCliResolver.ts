@@ -5,7 +5,6 @@ import { delimiter, dirname, extname, isAbsolute, join, resolve } from "node:pat
 import * as l10n from "@vscode/l10n";
 
 export interface ResolvedClaudeCodeExecutable {
-  /** A native executable, a JavaScript entry point, or the non-Windows `claude` command. */
   path: string;
   source: "configuration" | "PATH";
   shimPath?: string;
@@ -71,8 +70,6 @@ async function resolveShimTarget(shimPath: string): Promise<string> {
   }
 
   const shimDirectory = dirname(shimPath);
-  // npm の .cmd/.ps1 シムは cli.js を指す。現行 Claude Code は bin/claude.exe を同梱するため、
-  // どちらもシムのディレクトリを前提に解決してから SDK へ渡す。
   const knownTargets = [
     join(shimDirectory, ...CLI_PACKAGE, "cli.js"),
     join(shimDirectory, ...CLI_PACKAGE, "bin", "claude.exe"),
@@ -109,20 +106,30 @@ async function resolveCandidate(
   return { path: candidate, source };
 }
 
-/** Create a resolver with an isolated cache. Exported for deterministic fixture tests. */
+function createCacheThatForgetsFailures<T>(): (key: string, create: () => Promise<T>) => Promise<T> {
+  let cached: { key: string; promise: Promise<T> } | undefined;
+  return (key, create) => {
+    if (cached?.key === key) return cached.promise;
+    const promise = create();
+    cached = { key, promise };
+    promise.catch(() => {
+      if (cached?.promise === promise) cached = undefined;
+    });
+    return promise;
+  };
+}
+
 export function createClaudeCodeExecutableResolver(environment?: Partial<ResolverEnvironment>) {
   const env: ResolverEnvironment = {
     platform: environment?.platform ?? process.platform,
     pathValue: environment?.pathValue ?? process.env.PATH,
     cwd: environment?.cwd ?? process.cwd(),
   };
-  let cached: { configuredPath: string; promise: Promise<ResolvedClaudeCodeExecutable> } | undefined;
+  const cache = createCacheThatForgetsFailures<ResolvedClaudeCodeExecutable>();
 
   return (configuredPath?: string): Promise<ResolvedClaudeCodeExecutable> => {
     const configured = configuredPath?.trim() ?? "";
-    if (cached?.configuredPath === configured) return cached.promise;
-
-    const promise = (async () => {
+    return cache(configured, async () => {
       if (configured) {
         if (!isAbsolute(configured)) {
           throw cliNotFoundError(l10n.t("The configured executablePath must be an absolute path"));
@@ -133,26 +140,17 @@ export function createClaudeCodeExecutableResolver(environment?: Partial<Resolve
         return resolveCandidate(configured, "configuration", env.platform);
       }
 
-      // Unix 系の CLI はシムを経由せず shell: false の spawn で実行できる。
-      // PATH の独自探索は Windows の .cmd/.ps1 対策に限定する。
       if (env.platform !== "win32") return { path: "claude", source: "PATH" as const };
 
       const candidate = await findOnPath(env.pathValue);
       if (!candidate) throw cliNotFoundError();
       return resolveCandidate(candidate, "PATH", env.platform);
-    })();
-    cached = { configuredPath: configured, promise };
-    // 失敗はキャッシュしない: CLI 導入や PATH 修復の後、再起動なしで次の解決が再試行できるようにする
-    promise.catch(() => {
-      if (cached?.promise === promise) cached = undefined;
     });
-    return promise;
   };
 }
 
 const resolveForProcess = createClaudeCodeExecutableResolver();
 
-/** Resolve the SDK executable asynchronously and cache it until executablePath changes. */
 export function resolveClaudeCodeExecutable(configuredPath?: string): Promise<ResolvedClaudeCodeExecutable> {
   return resolveForProcess(configuredPath);
 }
@@ -162,7 +160,6 @@ function minorVersion(version: string): string | undefined {
   return match ? `${match[1]}.${match[2]}` : undefined;
 }
 
-/** Read the CLI version without a shell and without blocking the extension host. */
 export function checkClaudeCodeVersion(
   executablePath: string,
   sdkVersion?: string,
@@ -211,28 +208,16 @@ export function checkClaudeCodeVersion(
   });
 }
 
-let cachedStartup: { cacheKey: string; promise: Promise<ResolvedClaudeCodeStartup> } | undefined;
+const startupCache = createCacheThatForgetsFailures<ResolvedClaudeCodeStartup>();
 
-/**
- * Resolve and inspect the CLI once for the active executablePath setting. Replacing that
- * setting creates a new cache entry; opening tabs or running warmup does not.
- */
 export function resolveClaudeCodeStartup(
   configuredPath: string | undefined,
   sdkVersion?: string
 ): Promise<ResolvedClaudeCodeStartup> {
   const cacheKey = `${configuredPath?.trim() ?? ""}\u0000${sdkVersion ?? ""}`;
-  if (cachedStartup?.cacheKey === cacheKey) return cachedStartup.promise;
-  const promise = (async () => {
+  return startupCache(cacheKey, async () => {
     const executable = await resolveClaudeCodeExecutable(configuredPath);
     const version = await checkClaudeCodeVersion(executable.path, sdkVersion);
     return { executable, version };
-  })();
-  cachedStartup = { cacheKey, promise };
-  // 失敗はキャッシュしない（実行ファイル解決と同じ理由。version検査失敗は警告扱いでrejectしないが、
-  // 解決失敗のrejectをここで恒久化しないことが再試行可能性の条件）
-  promise.catch(() => {
-    if (cachedStartup?.promise === promise) cachedStartup = undefined;
   });
-  return promise;
 }

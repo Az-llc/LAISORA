@@ -73,12 +73,6 @@ function parsePath(p: string): ParsedPath {
   };
 }
 
-// canonical 形は正規化済み絶対パス（スラッシュ区切り・ドライブレター小文字・`.`/`..` 解決）。
-// repo-relative 化は行わない: 相対化の基準（cwd）は live と history で同値が保証されず
-// （resume が record の cwd を書き潰す）、基準が揺れると同一ファイルの
-// artifactId が経路ごとに割れる。
-// symlink/junction の実体解決は行わない（history 経路ではファイルが既に存在しない場合があり、
-// fs 解決を挟むと live と history で結果が割れる）。
 export function canonicalizeArtifactPath(rawPath: string, baseDir: string): string {
   const trimmed = rawPath.trim();
   if (trimmed.length === 0) return "";
@@ -94,10 +88,6 @@ export function canonicalizeArtifactPath(rawPath: string, baseDir: string): stri
   return parsed.segments.join("/");
 }
 
-// Windows はパスの大文字小文字を区別しないため、同一性判定（hash 入力）のみ小文字へ畳む。
-// canonicalPath はドライブレター小文字化を除き原表記を保つ。
-// 同一ファイル判定は必ず artifactId（case-folded）で行うこと — canonicalPath の
-// 文字列比較は大小文字差で割れる（競合計算の前提）
 export function artifactIdOf(canonicalPath: string): string {
   return createHash("sha256").update(canonicalPath.toLowerCase(), "utf8").digest("hex").slice(0, 16);
 }
@@ -115,9 +105,6 @@ export function projectArtifactAccess(host: HostArtifactAccess): ProjectedArtifa
   return projected;
 }
 
-// pp1 progress の wire 名。no-op ツールのため無効果として扱う。
-// mcp__ 分岐より先に判定しないと unavailable に落ち、当該 Attempt が unknownEffects=true になって
-// observed_data_dep 走査から丸ごと外れる（KNOWN_NO_EFFECT_TOOLS の例外集合への追加であり、input キー由来の分類規則は変えない）
 export const PROGRESS_WIRE_TOOL_NAME = "mcp__laisora_progress__progress";
 
 const KNOWN_NO_EFFECT_TOOLS = new Set([
@@ -136,17 +123,6 @@ export interface ArtifactExtraction {
   effectClass: EffectClass;
 }
 
-// 分類規則: delegate はツール名（Agent/Task）、以降は input キー由来で
-// 上から順に先着一致（write/read(path キー) → exec_unknown(command) → search(pattern) → other）。
-// other の内訳はツール名で coverage を割り当てる（mcp__/未知 = unavailable・既知無効果 = complete）。
-// 順序は load-bearing: command を持つ Write が corpus に1件実在し、
-// exec 判定を先に置くとこの write が exec に化ける。
-// delegate/search の coverage は complete（Agent 呼び出しや Glob/Grep を含む Attempt を unknownEffects=true にしない）
-// （委任の効果は子イベントで観測される。search はファイル効果を持たない）。
-// 前提: delegate=complete は子 transcript が同一 Attempt へ取り込まれて初めて成立する。
-// 現状の history 合成は親 JSONL のみのため、footprint 導出の前に
-// 子取り込みが必須 — この順序を破ると「委任のみの Attempt が
-// unknownEffects=false かつ空 footprint」という偽の並列化可能判定を作る。
 export function extractArtifactAccesses(
   toolName: string,
   input: Record<string, unknown> | undefined,
@@ -185,8 +161,6 @@ export function extractArtifactAccesses(
     return { artifacts: [], effectCoverage: "complete", effectClass: "search" };
   }
 
-  // KNOWN 判定を mcp__ 判定より先に置く（progress wire は mcp__ 接頭辞を持つため。
-  // 既存の KNOWN 名に mcp__ 接頭辞は無く、この順序入替で他ツールの分類は変わらない）
   if (KNOWN_NO_EFFECT_TOOLS.has(toolName)) {
     return { artifacts: [], effectCoverage: "complete", effectClass: "none" };
   }

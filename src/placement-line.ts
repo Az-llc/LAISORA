@@ -1,0 +1,1 @@
+export const PLACEMENT_LINE = "Decide where knowledge belongs yourself and do not ask the user: permanent project controls → the project's .claude/rules; cross-project controls → user-level rules; CLAUDE.md/AGENTS.md → purpose, overview, how to proceed, pointers; facts, preferences, corrections → auto memory; model-specific usage → LAISORA's learning ledger only.";

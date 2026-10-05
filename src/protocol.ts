@@ -1,20 +1,16 @@
 import { isToolIntentInput, type ToolIntentInput } from "./webview/status-line";
 import { isAccentSettings, isAccentSettingValue, type AccentSettings, type AccentSetting } from "./accent";
+import { isDisplayName } from "./display-name";
 import { normalizeSystemAppExtension } from "./file-link-open-mode";
 import { isPlanUsage, type MainTokenTotal } from "./plan-usage";
 import type { FailureSummaryView } from "./exec-log-marks";
+import type { HandoffCompactStats } from "./handoff-envelope";
 import type { RoleSummaryView } from "./role-summary";
 import type { ExecutorId } from "./orchestration-executors";
 import { isExternalTimeout, isExternalDetection, isExternalModels, type ExternalModels, type ExternalDetection } from "./orchestration-roster";
 import { isOrchestrationSettingRoster, type OrchestrationSettingRow } from "./orchestration-roster";
 import { isOrchestrationView, type OrchestrationView } from "./orchestration-view";
 export type { OrchestrationView } from "./orchestration-view";
-// ready の cursor を Host は読まない（src/store-surfaces.ts#SessionStore.initForReady）。差分再送は配線されていない。
-
-// work-model.ts が protocol.ts から取るのは NormalizedEvent の型だけなので、
-// こちらから値を取っても実行時の循環にはならない。逆向き（work-model.ts が protocol.ts の
-// 値を使う）を足すと循環するので足さないこと。
-// phaseStateOf をここで再実装しない（分類の実装は work-model.ts の1つに限る）。
 import * as l10n from "@vscode/l10n";
 import { FILE_LINK_TARGET_MAX_LEN } from "./file-link-target";
 export { FILE_LINK_TARGET_MAX_LEN } from "./file-link-target";
@@ -34,9 +30,8 @@ import type {
   WorkTotals,
 } from "./work-model";
 import type { EffectCoverage, ProjectedArtifactAccess } from "./artifact-access";
+import type { TimeBucket, TimeBucketView } from "./time-buckets";
 import type { AnalysisFactsView, SummaryAnalysisView } from "./analysis-facts-view";
-// type-only に保つこと: semantic-model.ts と l3-divergence.ts は node:crypto を実行時 import しており、
-// 値を取ると browser バンドル（dist/webview.js）が壊れる。
 import type { Coverage, ExecutionAttemptNode, SemanticModel, SemanticNode } from "./semantic-model";
 import type { L3Report, SerializationClassification } from "./l3-analysis";
 import type {
@@ -48,8 +43,6 @@ import type {
 import type { LlmAnalysisProvenance, RejectedFinding } from "./llm-finding-verify";
 import type { HandoffDecisionEntry, HandoffDecisions } from "./handoff-envelope";
 
-// 再読込前の webview は Host と版がずれうる。src/webview/main.ts が init の protocolVersion と突き合わせて利用者へ出す。
-// バリアントの追加では上げない（verify-history-wiring#W-0b）。
 export const PROTOCOL_VERSION = 5;
 
 export type BackendId = "claude" | "codex";
@@ -69,22 +62,19 @@ export interface DelegationInfo {
   isBackground?: boolean;
 }
 
-// CLI の task-notification を写す（src/tool-observation.ts#parseTaskNotification）。toolUseId は初回完了では dispatch の id、
-// resume 後は SendMessage の id を指す。
 export interface TaskNotificationInfo {
   agentId: string;
   toolUseId?: string;
   status?: string;
-  // 同じ agentId の再通知は置き換える量で、足し合わせない（src/work-model.ts#recordNotifiedTokens）。
   tokens?: number;
+  summary?: string;
+  result?: string;
 }
 
-// 待機状態（queued）は emitter から到達不能なので加えない。受理する集合は src/tool-observation.ts#PROGRESS_STATES。
 export type ProgressState = "active" | "blocked" | "review" | "done";
 
 export interface ProgressEmission {
   pp: "pp1";
-  // subagent は task id を知らずに pp1 を出すので省略できる。空の値は src/tool-observation.ts#extractProgressEmission が emission ごと捨てる（verify-progress#PX-22）。
   taskId?: string;
   state: ProgressState;
   activity?: string;
@@ -99,7 +89,6 @@ export interface EventEnvelope {
   generation: number;
   seq: number;
   timestamp: number;
-  // 詳細ログのカード配置は work だけで決める（verify-detail-cards#C-1b）。保存される event に載せるので、再生も live と同じ配置になる。
   work?: WorkEventInfo;
   provenance?: EventProvenance;
 }
@@ -115,7 +104,6 @@ export interface ModelRefusalFallback {
   turnId: string | null;
   refusedUserMessageUuid: string | null;
   message: string;
-  // R-GW-09: set only by the Host on live session-scope fallbacks (src/conversation-lifecycle.ts#noteFallbackRevert).
   autoRevert?: FallbackAutoRevertStart;
 }
 
@@ -130,14 +118,12 @@ export function sameModel(a: string | null | undefined, b: string | null | undef
   return resolved(a) === resolved(b);
 }
 
-// Returns the same object when nothing changes: src/webview/tab.ts#Tab.handleEvent refreshes the chrome only on a new state (verify-refusal#RF-MSAME).
 export function applyFallbackModel(state: ModelFallbackState | undefined, model: string | null | undefined,
   at: number, models: readonly ModelInfo[] = []): ModelFallbackState | undefined {
   if (!state || !model) return state;
   if (state.resolvedAt === undefined && sameModel(model, fallbackOriginalModel(state), models)) {
     return { ...state, appliedModel: model, resolvedAt: at };
   }
-  // R-GW-09: a resolved fallback re-opens when the session is observed on the fallback model again (verify-refusal#RF-MREOPEN1).
   if (state.resolvedAt !== undefined && sameModel(model, state.notice.fallbackModel, models) &&
     !sameModel(model, state.appliedModel, models)) {
     const { resolvedAt: _resolvedAt, autoRevert: _autoRevert, ...open } = state;
@@ -147,17 +133,17 @@ export function applyFallbackModel(state: ModelFallbackState | undefined, model:
 }
 
 export function resolveFallbackByChoice(state: ModelFallbackState | undefined, model: string | null | undefined,
-  at: number): ModelFallbackState | undefined {
+  at: number, models: readonly ModelInfo[] = []): ModelFallbackState | undefined {
   if (!state) return state;
-  return { ...state, appliedModel: model || state.appliedModel, resolvedAt: state.resolvedAt ?? at };
+  const appliedModel = model === null ? models.find(row => row.id === "default")?.resolvedModel || state.appliedModel
+    : model || state.appliedModel;
+  return { ...state, appliedModel, resolvedAt: state.resolvedAt ?? at };
 }
 
-// R-GW-09: the model the turn started with; a later fallback in the same turn starts from the previous fallback model.
 export function fallbackOriginalModel(state: ModelFallbackState): string {
   return state.turnOriginalModel ?? state.notice.originalModel;
 }
 
-// The model a notice's status line names: the restore target while the notice is the current state (verify-refusal#RF-MCOALESCE3).
 export function fallbackNoticeOriginal(state: ModelFallbackState | undefined,
   notice: Extract<NormalizedEvent, { kind: "model_refusal_fallback" }>): string {
   return state !== undefined && state.notice === notice ? fallbackOriginalModel(state) : notice.originalModel;
@@ -166,7 +152,6 @@ export function fallbackNoticeOriginal(state: ModelFallbackState | undefined,
 export function foldModelFallback(state: ModelFallbackState | undefined, event: NormalizedEvent,
   models: readonly ModelInfo[] = []): ModelFallbackState | undefined {
   if (event.kind === "model_refusal_fallback" && event.scope === "session") {
-    // R-GW-09: same coalescing rule as src/conversation-lifecycle.ts#noteFallbackRevert (verify-refusal#RF-MCOALESCE).
     const coalesced = state !== undefined && state.resolvedAt === undefined && state.notice.turnId === event.turnId;
     return { notice: event, appliedModel: event.fallbackModel, ...(event.autoRevert ? { autoRevert: event.autoRevert } : {}),
       ...(coalesced ? { turnOriginalModel: fallbackOriginalModel(state) } : {}) };
@@ -182,12 +167,10 @@ export function foldModelFallback(state: ModelFallbackState | undefined, event: 
   return state;
 }
 
-// R-CNV-43 (verify-refusal#RF-MREVERT1)
 export function fallbackNeedsConfirmation(state: ModelFallbackState): boolean {
   return state.autoRevert !== "pending" && state.autoRevert !== "applied" && state.autoRevert !== "deferred";
 }
 
-// R-GW-07 (verify-refusal#RF-MREVERT2)
 export function fallbackChipWarning(state: ModelFallbackState | undefined, modelOverride: string | null | undefined,
   models: readonly ModelInfo[]): boolean {
   if (state === undefined || state.resolvedAt !== undefined) return false;
@@ -206,8 +189,6 @@ export interface ModelFallbackState {
   autoRevert?: FallbackAutoRevertStart | FallbackRevertOutcome;
 }
 
-// 欠けた時刻を実時計で補わない: replay が決定的でなくなり、live と history で segment の区切りが食い違う（verify-stage1-public#S1-A4mut）。
-// 欠けた event は src/event-fold.ts#foldEventState が破棄する。時刻を一度も観測していない間は閉じる区切りが無いので gate しない。
 export const TIMESTAMP_REQUIRED_KINDS: readonly string[] = [
   "turn_started",
   "turn_completed",
@@ -225,7 +206,6 @@ export type NormalizedEventBody =
   (
     | { kind: "conversation_opened"; cwd: string; model?: string }
     | { kind: "conversation_closed"; reason: string }
-    // cliInserted: CLI が書いた isMeta の user レコードで開いたターン。本文を user_message にすると利用者の発言として集計・タイトルへ入る。
     | { kind: "turn_started"; turnId: string; cliInserted?: true }
     | { kind: "auto_resume"; state: "pending"; at: number }
     | { kind: "auto_resume"; state: "cancelled" | "fired" | "exhausted" }
@@ -236,7 +216,6 @@ export type NormalizedEventBody =
         turnId: string;
         reason: string;
         errorKind?: "usage_limit";
-        // epoch ms
         resetsAt?: number | null;
         detail?: string;
       }
@@ -247,18 +226,13 @@ export type NormalizedEventBody =
         maxRetries: number;
         retryDelayMs: number;
         errorStatus?: number;
-        // SDK の SDKAssistantMessageError。HTTP 応答の無いリトライでも入る。
         errorType?: string;
       }
-    | { kind: "assistant_text_delta"; turnId: string; text: string }
-    // 直前に流した assistant 本文の wire uuid。SDK の assistant フレームは本文の完結後に届くので、assistant_text_delta には載せられない。
-    // live だけが出す: 撤回された本文は CLI が転記録から消すので history には無い。
+    | { kind: "assistant_text_delta"; turnId: string; text: string; recordUuid?: string | null }
     | { kind: "assistant_message_uuid"; turnId: string; uuid: string }
-    // R-DSP-26: 置き換え側フレームの supersedes とターン末の retracted_message_uuids が同じ uuid を名乗りうる（sdk.d.ts）。
-    // 消費側は同じ uuid の再到着と未知の uuid を何もせずに受ける。
     | { kind: "assistant_retracted"; turnId: string | null; uuids: string[] }
+    | { kind: "local_command_output"; text: string; uuid?: string; priorGeneration?: true }
     | ({ kind: "model_refusal_fallback" } & ModelRefusalFallback)
-    // R-GW-09: recorded by src/conversation-lifecycle.ts#settleFallbackRevert and src/conversation-lifecycle.ts#applyModelChange; the CLI transcript never contains it.
     | { kind: "model_fallback_revert"; turnId: string | null; originalModel: string; outcome: FallbackRevertOutcome }
     | {
         kind: "user_message";
@@ -266,21 +240,18 @@ export type NormalizedEventBody =
         text: string;
         images?: ImageAttachment[];
         imageRefs?: ImageRefInfo[];
-        // R-CNV-16: Host が送信を観測した時刻。envelope の timestamp は継承された順序用の時刻なので代用しない。
-        // timestamp と名付けると EventEnvelope の spread で上書きされる。
         sentAt?: number;
       }
-    // recordedAt（R-CNV-15 / R-CNV-16）: timestamp と名付けると EventEnvelope の spread で上書きされる。
-    // meta.timestamp で運ぶと lastEventTimestamp が過去へ巻き戻る。
     | {
         kind: "replayed_message";
-        role: "user" | "assistant";
+        role: "user" | "assistant" | "system";
         text: string;
         uuid?: string;
         imageRefs?: ImageRefInfo[];
         model?: string;
         recordedAt?: number;
         sentAt?: number;
+        restoredApproval?: RestoredApprovalCard;
       }
     | {
         kind: "tool_call_started";
@@ -289,12 +260,9 @@ export type NormalizedEventBody =
         parentToolUseId: string | null;
         toolName: string;
         inputPreview: string;
-        // inputSummary は Host が切り詰め前の入力から summarizeToolInput で作る。無いときだけ src/webview/format.ts#toolSummary が
-        // 切り詰め済みの inputPreview を JSON.parse して作り直し、読めなければ生 JSON の断片を出す。
         inputSummary?: string;
         intentInput?: ToolIntentInput;
         isBackground?: boolean;
-        // 起動時の宣言値。実際のモデルは後続の subagent_info が持つ。
         subagentType?: string;
         subagentModel?: string;
         subagentEffort?: string;
@@ -302,21 +270,10 @@ export type NormalizedEventBody =
         taskIntentStructured?: TaskIntent;
         artifacts?: ProjectedArtifactAccess[];
         effectCoverage?: EffectCoverage;
-        // src/tool-observation.ts#extractProgressEmission だけが書く。inputPreview から作らない。
         progressEmission?: ProgressEmission;
       }
-    // 最初の sidechain assistant の message.model。起動時の宣言値ではモデルが分からないので、観測値でカード表示を上書きする。
-    // SDKAssistantMessage に effort は無いので effort は運ばない。hooks 入力の effort は src/claudeHost.ts#ClaudeConversation.observeAgentSettings が
-    // オーケストレーション有効時だけ観測し、この event へは載せない。
     | { kind: "subagent_info"; turnId: string | null; toolUseId: string; model?: string; agentId?: string }
-    // root message.model の観測。直前に出した model と同じなら出さない。session scope のフォールバックは
-    // src/claude-normalizer.ts#ClaudeLiveNormalizer.handleRefusalNotice が出さずに直前の model を進め、
-    // src/claude-normalizer.ts#ClaudeLiveNormalizer.rearmRootModelObservation の後は同じ model でも出す
-    // （verify-refusal#RF-RETURN・verify-gateway-wiring#GW-RF14）。表示と foldModelFallback が読み、
-    // その状態は src/conversation-lifecycle.ts#launchModel が使う。
     | { kind: "model_observed"; turnId: string | null; model: string }
-    // turn 境界として扱わない。priorGeneration は src/session-transcript.ts#readSessionHistory だけが立て、
-    // 会話面から外すのは src/conv-renderable.ts#isConvRenderableEvent だけ（R-HND-13）。
     | { kind: "compact_boundary"; trigger: "auto" | "manual"; preTokens?: number; priorGeneration?: true }
     | {
         kind: "tool_call_finished";
@@ -324,14 +281,9 @@ export type NormalizedEventBody =
         toolUseId: string;
         isError: boolean;
         resultPreview: string;
-        // 以下は切り詰め前の結果から src/tool-observation.ts#extractResumeSignals と src/tool-observation.ts#parseTaskNotification が作る。
-        // resultPreview は切り詰め済みなので抽出元にしない。
         asyncLaunchedAgentId?: string;
-        // resume はここでだけ確定する。tool_use の開始で確定すると、失敗した SendMessage でも再開扱いになる。
         resumedAgentId?: string;
-        // 起動 ACK の id。ACK は完了ではなく、完了は taskNotification で受ける。
         backgroundTaskId?: string;
-        // 対応する tool_result が無いので、この event の toolUseId は合成 ID（src/claude-normalizer.ts#ClaudeLiveNormalizer.emitTaskNotification）。
         taskNotification?: TaskNotificationInfo;
       }
     | {
@@ -339,9 +291,7 @@ export type NormalizedEventBody =
         turnId: string | null;
         requestId: string;
         toolName: string;
-        // 要約だけで許可させないため、SDK の文脈まで含む全文を運ぶ。
         rawInputJson: string;
-        // rawInputJson は文脈を連結した表示文で JSON として読めない。入力の構造を読むのは inputJson。
         inputJson?: string;
         inputSummary?: string;
         expiresAt: number | null;
@@ -350,20 +300,16 @@ export type NormalizedEventBody =
     | {
         kind: "approval_resolved";
         requestId: string;
-        behavior: "allow" | "deny";
+        behavior: "allow" | "deny" | "withdrawn";
         resolvedBy: string;
-        // replay で回答を再現できるよう event に残す。
         answers?: Record<string, string>;
       }
-    | { kind: "permission_denied"; turnId: string | null; toolName: string; reason: string }
+    | { kind: "permission_denied"; turnId: string | null; toolName: string; reason: string; classifierUnavailable?: boolean }
     | { kind: "usage_update"; scope: "turn" | "conversation"; turnId: string | null; usage: UsageSnapshot }
-    // root message ごとに 1 回。assistant record の usage.output_tokens は message_start の仮値なので、live は message_delta の usage を使う。
-    // subagent の message は live で取れないものがあるので、両経路とも出さない。消費側は isGuardrailOnlyEventKind で gate する（verify-guardrail-recordings#GR-34）。
     | {
         kind: "assistant_usage";
         turnId: string;
         messageId: string;
-        // null 固定の型が subagent の usage を出さない不変条件を表す。string へ広げると live と history で件数がずれる。
         parentToolUseId: null;
         usage: AssistantUsage;
       }
@@ -377,10 +323,8 @@ export type NormalizedEventBody =
       }
     | { kind: "auth_status"; auth: AuthStatus }
     | { kind: "commands_changed"; commands: SlashCommandInfo[] }
-    // SDKBackgroundTasksChangedMessage は生きている集合の全量（sdk.d.ts）。受信側は集合ごと置き換え、開始と終了を対にして数えない。
     | {
         kind: "background_tasks";
-        // ambient は CLI の housekeeping（sdk.d.ts）。実行中の表示に数えない。
         tasks: Array<{ id: string; type: string; description: string; ambient?: true }>;
       }
     | {
@@ -405,10 +349,6 @@ export function isGuardrailOnlyEventKind(kind: NormalizedEventBody["kind"]): boo
   return GUARDRAIL_ONLY_EVENT_KINDS.has(kind);
 }
 
-// AskUserQuestion ツールの質問構造（機能B）。SDK の AskUserQuestionInput（sdk-tools.d.ts）に対応。
-// answers の形式は同ファイルの AskUserQuestionInput.answers（sdk-tools.d.ts:2395、canUseTool の
-// updatedInput へ注入する側のメンバー）: { [question: string]: string }
-// （質問文をキーに、選択ラベルまたは自由入力を値とする。multiSelect はカンマ区切り）に合わせる。
 export interface AskUserQuestionOption {
   label: string;
   description?: string;
@@ -423,6 +363,15 @@ export interface AskUserQuestionSpec {
   questions: AskUserQuestionItem[];
 }
 
+export interface RestoredApprovalCard {
+  requestId: string;
+  toolName: string;
+  inputJson: string;
+  questions?: AskUserQuestionSpec;
+  answers?: Record<string, string>;
+  resolution: "answered" | "allowed" | "denied" | "withdrawn" | "failed" | "unknown";
+}
+
 export interface AssistantUsage {
   inputTokens?: number;
   cacheCreationInputTokens?: number;
@@ -430,7 +379,6 @@ export interface AssistantUsage {
   outputTokens?: number;
 }
 
-// live と history の両経路がこれを通す（verify-guardrail-recordings#GR-35）。欠けた値を 0 で埋めない。
 export function assistantUsageFromRaw(raw: unknown, includeOutput: boolean): AssistantUsage {
   const r = typeof raw === "object" && raw !== null ? (raw as Record<string, unknown>) : {};
   const pick = (key: string): number | undefined =>
@@ -447,7 +395,6 @@ export function assistantUsageFromRaw(raw: unknown, includeOutput: boolean): Ass
   return out;
 }
 
-// 取れない値を 0 にしない（不明と区別する）。
 export interface UsageSnapshot {
   inputTokens?: number;
   outputTokens?: number;
@@ -468,7 +415,6 @@ export interface AuthStatus {
   billingRealm: "subscription" | "api" | "cloud" | "unknown";
   apiKeySource?: string;
   model?: string;
-  // Optional runtime observation; absence is not a model-default effort claim.
   effort?: "low" | "medium" | "high" | "xhigh" | "max" | null;
   sessionId?: string;
   verifiedAt: number;
@@ -477,7 +423,6 @@ export interface AuthStatus {
   runtime?: RuntimeCapability;
 }
 
-// data は data URL の接頭辞を含まない base64。
 export interface ImageAttachment {
   mediaType: "image/png" | "image/jpeg" | "image/gif" | "image/webp";
   data: string;
@@ -492,26 +437,19 @@ export interface ImageRefInfo {
   mediaType: ImageAttachment["mediaType"];
 }
 
-// R-CNV-11: 未送信の添付の実体は Host が持ち、webview は描くだけ。
 export interface PendingAttachmentInfo {
   id: string;
   mediaType: ImageAttachment["mediaType"];
   data: string;
 }
-// src/pending-attachments.ts#PendingAttachmentStore の採番と同じ字面に保つ。
 export const ATTACHMENT_ID_RE = /^att-[0-9]+$/;
 export const IMAGE_MAX_COUNT = 4;
-// /rename の名前の上限。SDK の解決器は JSONL の末尾 64KB しか読まないので、それに収まらない名前は
-// 履歴一覧で解決されずタブ名と食い違う（R-SES-05）
 export const RENAME_TITLE_MAX = 2000;
 export const IMAGE_MAX_BASE64_LEN = 8_000_000;
 export const SEND_TEXT_MAX_LEN = 1_000_000;
-// src/session-files.ts#lookupSessionFile がこの id をファイル名へ連結する。字面の判定をほかへ複製しない（複製すると片方だけ緩む）。
 export const SESSION_ID_RE = /^[A-Za-z0-9._-]+$/;
-// 多重選択で入力欄が読めなくなる量を差し込ませない上限（R-CNV-05）。
 export const PICKED_FILE_MAX_COUNT = 20;
 
-// SDK実測: PermissionMode は auto / dontAsk を含む6値（sdk.d.ts:2092）
 export type PermissionModeId =
   | "default"
   | "acceptEdits"
@@ -534,28 +472,7 @@ export interface SlashCommandInfo {
   aliases?: string[];
 }
 
-// ターミナルの / ピッカーは CLI 内部の isHidden フラグで候補を絞る（バイナリ内の実装は
-// `commands.filter(c => !c.isHidden)`）。しかし SDK 公開型 SlashCommand は name/description/
-// argumentHint/aliases しか持たず、isHidden は SDK 境界で捨てられる。init メッセージの
-// slash_commands も別基準（`userInvocable !== false`）で作られるため代用にならない
-// （CLI 2.1.226 の同一セッション実測: init も supportedCommands() も同じ56件・集合も一致し、
-// isHidden 付き6件が両方に含まれたまま。list-commands.ts で再現できる）。
-// ⇒ クライアント側から権威データに到達する手段が無いので、以下2段構えで近似する。
-//
-// (1) KNOWN_HIDDEN_COMMANDS: CLI バイナリから抽出した isHidden 実値。説明文に手がかりが無い
-//     ものはこれでしか弾けない（design-consent 等は文面が正規コマンドと区別できない）。
-// (2) 命名規約と description の自己申告: CLI 更新で増えた未知の内部コマンドを、リスト更新前でも
-//     拾うための保険。
-//
-// 更新方法（CLI アップグレード時に再抽出する。上記(1)はバージョン固定の実測値なので放置すると腐る）:
-//   grep -a -o '.\{0,260\}isHidden:!0' "$(npm root -g)/@anthropic-ai/claude-code/bin/claude.exe" \
-//     | grep -o 'name:"[a-zA-Z0-9_-]\{2,40\}"[^}]\{0,240\}isHidden:!0'
-// 抽出後は実際のコマンド一覧と突き合わせ、hidden/visible の振り分けが期待通りかを確認する。
-//
-// 誤検知（正規コマンドを隠す）の実害はサジェストに出ないことだけなので、判定は安全側に倒す。
 const KNOWN_HIDDEN_COMMANDS = new Set([
-  // CLI 2.1.226 実測。supportedCommands() に現れないもの（pro-trial-expired・rate-limit-options・
-  // update）は列挙しても効果が無いため入れていない。
   "__remote-workflow",
   "workflow-launch-exec",
   "design-consent",
@@ -578,8 +495,6 @@ export function isInternalSlashCommand(cmd: SlashCommandInfo): boolean {
   return INTERNAL_COMMAND_DESC_HINTS.some((re) => re.test(cmd.description));
 }
 
-// 切り詰め前の入力に対して Host で呼ぶ。inputPreview は切り詰め済みで JSON として読めないことがあり、
-// src/webview/format.ts#toolSummary の作り直しは失敗すると生 JSON の断片を出す。要約できなければ null を返し、呼び出し側が代替を選ぶ。
 export function summarizeToolInput(toolName: string, input: unknown): string | null {
   if (typeof input !== "object" || input === null) return null;
   const obj = input as Record<string, unknown>;
@@ -628,7 +543,6 @@ export function summarizeToolInput(toolName: string, input: unknown): string | n
   }
 }
 
-// webview に VS Code の command ID を指名させない。対応は src/gateway-host-actions.ts#runHostActionMessage が持つ。
 export const HOST_ACTIONS = ["openSettings", "addClaudeModel"] as const;
 export type HostAction = (typeof HOST_ACTIONS)[number];
 
@@ -636,6 +550,51 @@ export const API_KEY_POLICIES = ["inherit", "subscriptionOnly"] as const;
 export type ApiKeyPolicy = (typeof API_KEY_POLICIES)[number];
 export function normalizeApiKeyPolicy(v: unknown): ApiKeyPolicy {
   return v === "subscriptionOnly" ? "subscriptionOnly" : "inherit";
+}
+
+export const ACCOUNT_USAGE_REUSE_MS = 60_000;
+export const ACCOUNT_USAGE_TIMEOUT_MS = 15_000;
+export const ACCOUNT_USAGE_REPLY_WAIT_MS = 2 * ACCOUNT_USAGE_TIMEOUT_MS + 5_000;
+export const ACCOUNT_USAGE_ROWS_MAX = 32;
+export const ACCOUNT_USAGE_STATES = ["ok", "unavailable", "failed"] as const;
+export type AccountUsageState = (typeof ACCOUNT_USAGE_STATES)[number];
+export interface AccountUsageRow {
+  kind: string;
+  percent: number;
+  resetsAt: number | null;
+  scope?: string;
+  severity?: string;
+}
+export interface AccountUsageSnapshot {
+  seq: number;
+  fetchedAtMs: number;
+  state: AccountUsageState;
+  rows: AccountUsageRow[];
+}
+
+export function isCurrentAccountUsageRow(row: AccountUsageRow, nowMs: number): boolean {
+  return row.resetsAt === null || row.resetsAt > nowMs;
+}
+
+function isRenameRequestId(value: unknown): value is string {
+  return typeof value === "string" && value.length > 0 && value.length <= 100;
+}
+
+function isAccountUsageRequestId(value: unknown): value is string {
+  return typeof value === "string" && value.length > 0 && value.length <= 100;
+}
+
+function isAccountUsageRow(value: unknown): value is AccountUsageRow {
+  if (typeof value !== "object" || value === null) return false;
+  const row = value as Record<string, unknown>;
+  return (
+    Object.keys(row).every((key) => key === "kind" || key === "percent" || key === "resetsAt" || key === "scope" || key === "severity") &&
+    typeof row.kind === "string" && row.kind.length > 0 && row.kind.length <= 100 &&
+    typeof row.percent === "number" && Number.isFinite(row.percent) &&
+    (row.resetsAt === null || (typeof row.resetsAt === "number" && Number.isFinite(row.resetsAt))) &&
+    (row.scope === undefined || (typeof row.scope === "string" && row.scope.length <= 100)) &&
+    (row.severity === undefined || (typeof row.severity === "string" && row.severity.length <= 50))
+  );
 }
 
 export const COMPOSER_SEND_KEYS = ["enter", "shiftEnter"] as const;
@@ -662,16 +621,17 @@ export function isProfileSources(value: unknown): value is ProfileSource[] {
     && new Set(value).size === value.length && value.every(source => PROFILE_SOURCES.includes(source));
 }
 
-// 会話面の WebviewToHost とは受信口が別。requestId は画面が採番し、Host は書込み後の settingsState の replyTo へ写す。
 export type SettingsPageToHost =
   | { type: "settingsPageReady" }
   | { type: "recheckExternalExecutors" }
   | { type: "researchModelProfiles"; targets: string[]; purpose?: "effort" }
   | { type: "previewConductorInstruction"; requestId: number; policy: string }
   | { type: "setAccentSetting"; requestId: number; setting: AccentSetting; value: string }
+  | { type: "setDisplayName"; requestId: number; value: string }
   | { type: "setComposerSendKey"; requestId: number; sendKey: ComposerSendKey }
   | { type: "setApiKeyPolicy"; requestId: number; policy: ApiKeyPolicy }
   | { type: "setAutoContinueAtUsageLimit"; requestId: number; enabled: boolean }
+  | { type: "setInitialModel"; requestId: number; model: string }
   | { type: "setRestoreTabsOnStartup"; requestId: number; enabled: boolean }
   | { type: "setLearningEnabled"; requestId: number; enabled: boolean }
   | { type: "setProfileSources"; requestId: number; sources: ProfileSource[] }
@@ -690,8 +650,7 @@ export interface SettingsProfileProjection {
 }
 export type HostToSettingsPage =
   | { type: "conductorPreview"; requestId: number; text: string; tokens: number }
-  // R-DSP-01: 書込みの後も要求値ではなく、構成から読み直した実効値を返す。replyTo は書込み要求への返送だけが持つ。
-  | ({ type: "settingsState"; appearance?: AccentSettings; composerSendKey: ComposerSendKey; apiKeyPolicy: ApiKeyPolicy; restoreTabsOnStartup: boolean; autoContinueAtUsageLimit: boolean; learningEnabled: boolean; replyTo?: number }
+  | ({ type: "settingsState"; appearance?: AccentSettings; displayName?: string; composerSendKey: ComposerSendKey; apiKeyPolicy: ApiKeyPolicy; restoreTabsOnStartup: boolean; initialModel?: string; autoContinueAtUsageLimit: boolean; learningEnabled: boolean; replyTo?: number }
     & SettingsProfileProjection & Record<FileLinkBooleanSetting, boolean> & { openWithSystemApp: string[] } & { orchestrationEnabled: boolean; orchestrationAgents: OrchestrationSettingRow[]; orchestrationDefaults: OrchestrationSettingRow[]; conductorPolicy: string; conductorPolicyDefault: string; externalTimeoutMinutes: number; externalDetection: Record<ExecutorId, ExternalDetection>; externalModels: ExternalModels });
 
 function isSettingsRequestId(v: unknown): v is number {
@@ -710,9 +669,17 @@ export function isSettingsPageToHost(v: unknown): v is SettingsPageToHost {
   if (t === "setAccentSetting") {
     return isSettingsRequestId(m.requestId) && isAccentSettingValue(m.setting, m.value) && hasOnlyKeys(m, ["type", "requestId", "setting", "value"]);
   }
+  if (t === "setDisplayName") {
+    return isSettingsRequestId(m.requestId) && isDisplayName(m.value) && hasOnlyKeys(m, ["type", "requestId", "value"]);
+  }
   if (t === "setComposerSendKey") {
     return isSettingsRequestId(m.requestId)
       && (COMPOSER_SEND_KEYS as readonly string[]).includes(m.sendKey as string) && hasOnlyKeys(m, ["type", "requestId", "sendKey"]);
+  }
+  if (t === "setInitialModel") {
+    return isSettingsRequestId(m.requestId) && typeof m.model === "string" && m.model.length <= 200
+      && (m.model === "" || /^[A-Za-z0-9][A-Za-z0-9_.:[\]-]*$/.test(m.model))
+      && hasOnlyKeys(m, ["type", "requestId", "model"]);
   }
   if (t === "setApiKeyPolicy") {
     return isSettingsRequestId(m.requestId)
@@ -728,7 +695,6 @@ export function isSettingsPageToHost(v: unknown): v is SettingsPageToHost {
   if (t === "setFileLinkSetting") {
     return isSettingsRequestId(m.requestId)
       && (m.setting === "openWithSystemApp"
-        // R-CNV-20: validate chip writes again at the Host boundary; no workspace target is accepted.
         ? Array.isArray(m.value) && m.value.every((item) => typeof item === "string" && normalizeSystemAppExtension(item) === item)
           && hasOnlyKeys(m, ["type", "requestId", "setting", "value"])
         : (FILE_LINK_BOOLEAN_SETTINGS as readonly string[]).includes(m.setting as string)
@@ -760,9 +726,11 @@ export function isHostToSettingsPage(v: unknown): v is HostToSettingsPage {
     && typeof m.text === "string" && typeof m.tokens === "number" && Number.isFinite(m.tokens);
   if (t === "settingsState") {
     return isSettingsProfiles(m) && (m.appearance === undefined || isAccentSettings(m.appearance))
+      && (m.displayName === undefined || isDisplayName(m.displayName))
       && (COMPOSER_SEND_KEYS as readonly string[]).includes(m.composerSendKey as string)
       && (API_KEY_POLICIES as readonly string[]).includes(m.apiKeyPolicy as string)
       && typeof m.restoreTabsOnStartup === "boolean"
+      && (m.initialModel === undefined || typeof m.initialModel === "string")
       && typeof m.autoContinueAtUsageLimit === "boolean" && typeof m.learningEnabled === "boolean"
       && typeof m.orchestrationEnabled === "boolean" && typeof m.conductorPolicy === "string"
       && typeof m.conductorPolicyDefault === "string"
@@ -771,24 +739,20 @@ export function isHostToSettingsPage(v: unknown): v is HostToSettingsPage {
       && FILE_LINK_BOOLEAN_SETTINGS.every((key) => typeof m[key] === "boolean")
       && Array.isArray(m.openWithSystemApp) && m.openWithSystemApp.every((item) => typeof item === "string")
       && (m.replyTo === undefined || isSettingsRequestId(m.replyTo))
-      && hasOnlyKeys(m, ["type", "appearance", "composerSendKey", "apiKeyPolicy", "restoreTabsOnStartup", "autoContinueAtUsageLimit", "learningEnabled", ...FILE_LINK_SETTINGS, "orchestrationEnabled", "orchestrationAgents", "orchestrationDefaults", "conductorPolicy", "conductorPolicyDefault", "externalTimeoutMinutes", "externalDetection", "externalModels", "replyTo", "profileSources", "researchTargets", "researchUnavailable", "effortUnavailable", "researchText", "conductorPreview"]);
+      && hasOnlyKeys(m, ["type", "initialModel", "appearance", "displayName", "composerSendKey", "apiKeyPolicy", "restoreTabsOnStartup", "autoContinueAtUsageLimit", "learningEnabled", ...FILE_LINK_SETTINGS, "orchestrationEnabled", "orchestrationAgents", "orchestrationDefaults", "conductorPolicy", "conductorPolicyDefault", "externalTimeoutMinutes", "externalDetection", "externalModels", "replyTo", "profileSources", "researchTargets", "researchUnavailable", "effortUnavailable", "researchText", "conductorPreview"]);
   }
   t satisfies never;
   return false;
 }
 
-// tabId は Host が採番して init と tabCreated で渡す。
 export type WebviewToHost =
   | { type: "ready"; cursor: { generation: number; seq: number } | null }
-  // R-CNV-11: images は Host が添付スロットから詰める欄で、isWebviewToHost は images を持つ send を捨てる。
   | { type: "send"; tabId: string; text: string; clientToken?: string; images?: ImageAttachment[] }
-  // 受理しなくても Host は attachments で返す（src/composer-io.ts#handleComposerMessage）。
   | { type: "attachImage"; tabId: string; mediaType: ImageAttachment["mediaType"]; data: string }
   | { type: "removeAttachment"; tabId: string; attachmentId: string }
   | { type: "startHandoff"; tabId: string }
   | { type: "cancelHandoff"; tabId: string; runId: string }
-  // part は 0 起算で、順に要求する。
-  | { type: "getHandoffDetail"; tabId: string; runId: string; part: number }
+  | { type: "getHandoffDetail"; tabId: string; runId: string; part: number; refresh?: true }
   | { type: "openHandoffSource"; tabId: string; sourceSessionId: string }
   | { type: "interrupt"; tabId: string }
   | { type: "cancelAutoResume"; tabId: string }
@@ -797,7 +761,6 @@ export type WebviewToHost =
       tabId: string;
       requestId: string;
       behavior: "allow" | "deny";
-      // 形式は SDK の AskUserQuestionInput.answers。deny では読まない。
       answers?: Record<string, string>;
     }
   | { type: "newTab" }
@@ -807,33 +770,30 @@ export type WebviewToHost =
   | { type: "setModel"; tabId: string; model: string | null; sessionOnly?: boolean }
   | { type: "setEffort"; tabId: string; effort: string | null }
   | { type: "queryFiles"; reqId: number; query: string }
-  // imageSlots は画像として添付できる残り枚数。超えた分と画像でないものは Host がパスとして返す（src/composer-io.ts#pickComposerFiles）。
   | { type: "pickFiles"; reqId: number; imageSlots: number }
   | { type: "openFile"; tabId: string; target: string }
   | { type: "exportTab"; tabId: string }
-  // R-SES-05: Host が記録へ custom-title を書き、タブ名と履歴一覧を同じ解決器で揃える。
   | { type: "renameTab"; tabId: string; title: string }
-  | { type: "listSessions"; source?: "laisora" | "claude"; cursor?: string }
-  // ファイルパスは webview から受け取らず、Host が解決する（src/session-files.ts#lookupSessionFile）。
+  | { type: "listSessions"; source?: "laisora" | "claude"; cursor?: string; showHidden?: boolean }
+  | { type: "renameSession"; sessionId: string; filePath: string; title: string; requestId?: string }
+  | { type: "setSessionHidden"; sessionId: string; hidden: boolean }
   | { type: "analyzeCurrent"; tabId: string }
-  // R-DSP-25: 要約のモデルは Host が決める。webview はモデルを送らない。
   | { type: "summarizeSession"; tabId: string }
   | { type: "suggestSessionName"; tabId: string }
   | { type: "openThemePicker" }
   | { type: "runHostAction"; action: "openSettings" }
   | { type: "runHostAction"; action: "addClaudeModel"; tabId: string }
-  | { type: "requestCachedUsage" }
+  | { type: "requestAccountUsage"; tabId: string; requestId: string }
+  | { type: "requestAccountUsage"; requestId: string }
+  | { type: "accountUsagePanelClosed" }
   | {
       type: "agentInspectorRequest";
       tabId: string;
       agentId: string;
       section: AgentInspectorSection;
       requestId: string;
-      // Host が発行した不透明な token だけを往復する。パス・読み位置・件数は webview から受け取らない。
       cursor?: string;
     }
-  // cursor は Host 発行の不透明な token、anchor は Host が既に渡した generation と seq で初回だけ使う。
-  // パス・読み位置・件数は受け取らない（agentInspectorRequest と同じ規則）。
   | {
       type: "historyChunkRequest";
       tabId: string;
@@ -841,7 +801,6 @@ export type WebviewToHost =
       cursor?: string;
       anchor?: { generation: number; seq: number };
     }
-  // R-TAB-07。cursor と anchor は historyChunkRequest と同じ語彙で、どちらも無い要求も受ける。
   | {
       type: "worklogTranscriptRequest";
       tabId: string;
@@ -849,8 +808,6 @@ export type WebviewToHost =
       cursor?: string;
       anchor?: { generation: number; seq: number };
     }
-  // 表示専用: Host は transcript を読むだけで、読んだものを pushEvent へ入れない。初回は cursor 無しで送る。
-  // anchorUuid は Host が既に渡した識別子で、cursor が Host 側で無効になったときの起点。無いと遡りの位置が黙って巻き戻る。
   | {
       type: "conversationHistoryRequest";
       tabId: string;
@@ -876,7 +833,6 @@ export type WebviewToHost =
       content: string;
       artifactId?: string;
     }
-  // tabId 以外を受け取らない: 課金される呼び出しのパラメータと起動可否は Host が決める。
   | { type: "llmAnalysisRequest"; tabId: string }
   | { type: "setLlmAnalysisEnabled"; enabled: boolean }
   | {
@@ -897,22 +853,18 @@ export type WebviewToHost =
       tabId: string;
       artifactId: string;
     }
-  // first-paint の時刻は document age（performance.now）で、現在時刻を載せない。
-  // orphan-turn-adopted の message は tabId と turnId だけで、本文を載せない（verify-detail-cards#OA-1）。
   | {
       type: "webviewDiagnostic";
       kind: "error" | "ready-retry" | "first-paint" | "orphan-turn-adopted";
       message: string;
     }
-  // intoTabId は候補に過ぎず、使えるかは Host が src/session.ts#isUnusedSession で判定し直す。
   | { type: "resumeSession"; sessionId: string; filePath: string; intoTabId?: string }
-  // live の Session を作り直さず、表示の hydration だけを再試行する。
   | { type: "resumeHydrationRetry"; tabId: string }
-  // 復帰の init は ready を待たずに送るので、見ているタブを先に積むため Host が面ごとに覚える（src/store-surfaces.ts#SessionStore.restoreVisible）。
   | { type: "activeTab"; tabId: string };
 
 export interface SessionListItem {
   originUnverified?: boolean;
+  hidden?: boolean;
   sessionId: string;
   filePath: string;
   title: string;
@@ -920,15 +872,14 @@ export interface SessionListItem {
   mtime: number;
 }
 
-// 1 つの真偽値へ畳まない: どの段で欠けたかを画面から判別できなくなる。
-// resolveFailed は getSessionInfo が例外を投げた件数だけで、要約を持たない候補は数えない。
+export const SESSION_LIST_ACTIONS = ["rename", "hide", "unhide"] as const;
+export type SessionListAction = (typeof SESSION_LIST_ACTIONS)[number];
+
 export interface SessionScanDegradation {
   rootFailed: boolean;
   unreadableProjects: number;
   statFailed: number;
   resolveFailed: number;
-  // getSessionInfo は壊れた記録に例外を投げず undefined を返すことがあり、resolveFailed は増えない。
-  // これが無いと、出せなかった一覧を「見つからない」と断言する。
   unresolvedCandidates: number;
 }
 
@@ -942,11 +893,8 @@ export interface ModelInfo {
   supportedEffortLevels?: string[];
 }
 
-// WorkModelPayload は WorkModelState をそのまま流さない: toolPlacements は大きな内部索引で、segments は詳細カードが持つ。
-// WORK_MODEL_VERSION は payload の形の版で、PROTOCOL_VERSION とは別に上げる。
 export const WORK_MODEL_VERSION = 3;
 
-// projectWorkModel と isWorkAgentNode が同じ上限を使う。ガード側だけに置くと、深い木を復元した payload が丸ごと捨てられる。
 const AGENT_TREE_MAX_DEPTH = 16;
 
 export const OPERATION_KIND_LIST: OperationKind[] = [
@@ -964,11 +912,9 @@ export interface WorkAgentNode {
   runStartedAt?: number;
   intentInput?: ToolIntentInput;
   agentId: string;
-  // transcript 上の id が分かっても agentId を置き換えない。agentId は経路によらない合成 ID で、live と history の同値比較の鍵になる。
   transcriptAgentId?: string;
   parentAgentId: string | null;
   toolUseId: string;
-  // 外すと親の tool 行を DOM から推定し直すことになる。
   parentToolUseId: string | null;
   spawnDepth: number;
   agentType?: string;
@@ -1030,6 +976,7 @@ export interface AgentInspectorToolItem {
   inputSummary?: string;
   inputPreview: string;
   isError?: boolean;
+  backgroundLaunch?: true;
   resultPreview?: string;
 }
 
@@ -1051,9 +998,7 @@ export type AgentInspectorPage =
   | (AgentInspectorPageBase & { section: "report"; text: string });
 
 export type AgentInspectorErrorReason =
-  // 記録がまだ書き出されていない。待てば出る。
   | "session-unavailable"
-  // R-DSP-01: 保存先の走査が失敗し、記録の有無を確かめられなかった。待っても直らないので、session-unavailable や read-failed へ畳まない。
   | "session-scan-failed"
   | "agent-unavailable"
   | "transcript-unavailable"
@@ -1063,8 +1008,6 @@ export type AgentInspectorErrorReason =
   | "response-too-large"
   | "meta-limit";
 
-// src/history-window.ts#HistoryChunkCoverage と構造を合わせる。一致は src/history-serving.ts の代入で tsc が見るが、
-// 非リテラル代入に余剰プロパティ検査は掛からないので、あちらへ足したフィールドはここへ来ないまま webview へ届かない。
 export interface HistoryChunkCoveragePayload {
   returnedCount: number;
   remainingOlderCount: number;
@@ -1079,10 +1022,6 @@ export interface HistoryChunkPagePayload {
   coverage: HistoryChunkCoveragePayload;
 }
 
-// src/history-window.ts#HistoryWindowErrorReason を含む。あちらへ足すと src/history-serving.ts の代入が落ちるが、減らしても落ちないので、
-// 減らすときはここと isHostToWebview の許可を手で消す。
-// R-CNV-01: response-too-large を加えない。大きなイベントは src/history-chunk-fit.ts#fitEventForTransport が切り詰めて送るので、
-// この経路はサイズで失敗しない。加えると再開できない行き止まりが戻る。
 export type HistoryChunkErrorReason =
   | "invalid-cursor"
   | "unknown-anchor"
@@ -1092,14 +1031,14 @@ export type HistoryChunkErrorReason =
   | "stale-request"
   | "host-error";
 
-// src/conversation-history.ts#ConversationMessage と構造を合わせる。uuid は重複挿入の判定に使い、持たないレコードは運ばない。
 export interface ConversationHistoryMessagePayload {
   uuid: string;
-  role: "user" | "assistant";
+  role: "user" | "assistant" | "system";
   text: string;
   timestamp: number;
   imageRefs?: ImageRefInfo[];
   model?: string;
+  restoredApproval?: RestoredApprovalCard;
 }
 
 export interface ConversationHistoryPagePayload {
@@ -1110,7 +1049,6 @@ export interface ConversationHistoryPagePayload {
     returnedCount: number;
     remainingOlderCount: number;
     oldestReached: boolean;
-    // R-DSP-03: page ごとではなく transcript 全体の値。運ばないと、会話が欠けたまま読み終わった表示になる。
     malformedLineCount?: number;
     droppedWithoutUuidCount?: number;
   };
@@ -1121,16 +1059,13 @@ export type ConversationHistoryErrorReason =
   | "unknown-anchor"
   | "history-unavailable"
   | "invalid-request"
-  // 記録が無い。遡る対象が無いので終端として扱う。
   | "session-unavailable"
-  // R-CNV-02: 走査が失敗し、記録の有無を確かめられなかった。終端ではなく一過性の失敗として扱い、session-unavailable と同一視しない。
   | "session-scan-failed"
   | "read-failed"
   | "stale-request"
   | "response-too-large"
   | "host-error";
 
-// CLI の subagent meta.json には effort と時刻が無いので、それらは同名 transcript の先頭と末尾から採る。
 export interface RestoredAgent {
   agentId: string;
   parentAgentId: string | null;
@@ -1152,7 +1087,6 @@ export interface WorkPhaseView extends WorkTotals {
   occurrence?: number;
   operation: PhaseOperation;
   title: string;
-  // 件数の上限は reducer 側の src/work-model.ts#MAX_PHASE_REFS が保つ。
   segmentIds: string[];
   segmentCount: number;
   turnIds: string[];
@@ -1161,18 +1095,15 @@ export interface WorkPhaseView extends WorkTotals {
   startedAt: number;
   endedAt?: number;
   isCurrent: boolean;
-  // 判定は src/work-model.ts#phaseStateOf だけが行い、renderer は描くだけ。
   state: WorkPhaseState;
   compactedPhaseCount?: number;
   agents: WorkAgentNode[];
 }
 
 export interface WorkPlacementView {
-  // rollup へ併合済みの配置は固定の phaseId を持つ（projectWorkEvent が src/work-model.ts#PhaseRef から写す）。
   phaseId: string;
   segmentId?: string;
   taskKey?: string;
-  // agent の子ツールは false。agent を 1 件として数え、二重に数えない。
   counted: boolean;
   ownerToolUseId?: string;
 }
@@ -1220,15 +1151,11 @@ export interface WorkTaskItemView {
 
 export interface WorkEventInfo {
   revision: number;
-  // 変わったときだけ載り、閉じたら null。null を送らないと、ツールを使わないターンで前のカードを現在の作業として出し続ける。
   currentSegmentId?: string | null;
-  // tool_call_started だけに付く。付かないものは reducer が記帳系として扱った（projectWorkEvent）。
   placement?: WorkPlacementView;
-  // 変わった分だけ載る。webview は届いた分を上書きし、差分を計算しない。
   segments?: WorkSegmentView[];
   agents?: WorkAgentStateView[];
   taskTotals?: WorkTaskTotalsView[];
-  // 変わったときに全量を載せる。webview は集合ごと置き換える。
   tasks?: WorkTaskItemView[];
   staled?: string[];
   pendingApprovalCount?: number;
@@ -1248,7 +1175,6 @@ export interface WorkModelPayload {
   planHistoryLostThrough?: number;
   planContext?: PlanContext;
   planTools?: Array<{ id: string; name: string; description: string; startedAt: number; intentInput?: ToolIntentInput }>;
-  // R-SES-11: open foreground calls, including Agent/Task starts outside the replay window.
   runningMainTools?: Array<{ id: string; name: string; startedAt: number; intentInput?: ToolIntentInput }>;
   version: number;
   revision: number;
@@ -1256,14 +1182,11 @@ export interface WorkModelPayload {
   currentPhaseId?: string;
   ambiguity?: "multiple-active-tasks";
   phases: WorkPhaseView[];
-  // 親を特定できない、または AGENT_TREE_MAX_DEPTH を超えたサブエージェント。推測した親へ付けない。
   unlinkedAgents: WorkAgentNode[];
-  // WorkEventInfo の tasks は変わったときにしか載らないので、再生窓から Task 更新が落ちた snapshot ではこれが唯一の復元元（verify-detail-cards#C-13）。
   tasks: WorkTaskItemView[];
   taskTotals: WorkTaskTotalsView[];
 }
 
-// canonical path を webview へ出さない。canonicalPath?: never は、未射影の HostArtifactAccess が構造的部分型として素通りするのを tsc で塞ぐ。
 export type SemanticArtifactView = ProjectedArtifactAccess & { canonicalPath?: never };
 
 export type SemanticAttemptNodeView = Omit<ExecutionAttemptNode, "artifacts"> & {
@@ -1272,8 +1195,6 @@ export type SemanticAttemptNodeView = Omit<ExecutionAttemptNode, "artifacts"> & 
 
 export type SemanticNodeView = Exclude<SemanticNode, ExecutionAttemptNode> | SemanticAttemptNodeView;
 
-// DivergenceRecord の coverage は検出入力の観測度で、record の確からしさではない。これを理由に record を隠さない。
-// 表示側が coverage を見て畳まないよう名前を変えて運ぶ。record を出すかは kind 側の state が決める。
 export type DivergenceRecordView = Omit<DivergenceRecord, "coverage"> & {
   detectionInputCoverage: Coverage;
 };
@@ -1286,18 +1207,13 @@ export type DivergenceReportView = Omit<DivergenceReport, "kinds"> & {
   kinds: Record<DivergenceKind, DivergenceKindReportView>;
 };
 
-// L3Report は canonical path 由来の値を持たないので、nodes と違って射影しない。webview は再集計しない。
 export interface L3ReportPayload {
   facts?: AnalysisFactsView;
   analysis: L3Report;
   divergences: DivergenceReportView;
-  // undefined（未着）と LlmFindingReportView の各 state と、所見 0 件の attached を、それぞれ別の表示にする。
-  // 棄却の件数は rejectedCount だけで運び、棄却した所見の中身は LlmFindingDiagnosticsPayload に閉じる。
   llm?: LlmFindingReportView;
 }
 
-// src/llm-report.ts#unavailableCode が src/llm-analysis-client.ts#LlmAnalysisUnavailableReason から網羅的に写す。
-// string に広げない: 写像漏れを tsc が検出できず、文言の無い理由コードが画面に出る。
 export type LlmUnavailableReason =
   | "not_configured"
   | "model_unresolved"
@@ -1323,7 +1239,6 @@ export type FindingAction =
 export interface AttachedFindingView {
   findingId: string;
   numberLabel: string;
-  // Host が 0 埋めして渡す。webview は採番しない（verify-analysis-b5-data#B5-N1）。
   numberDigits?: string;
   title: string;
   observed: string;
@@ -1341,7 +1256,6 @@ export interface AttachedFindingView {
 export interface HistoryOption {
   artifactId: string;
   label: string;
-  // 選択中の結果の requestedModelLabel / executedModelsLabel と同じ導出（R-ANL-13）。実行 effort は記録に無い
   generatedAtLabel?: string;
   findingsCount?: number;
   requestedModel?: string;
@@ -1363,11 +1277,9 @@ export interface AttachedAnalysisView {
   findingsCount?: number;
   rejectedCount?: number;
   modelsLabel?: string;
-  // null = 分析の使用量を観測していない（R-DSP-11）
   tokensLabel?: string | null;
   slicesCount?: number;
   emptyStateLabel?: string;
-  // Host のメモリにだけ持つ値（src/session.ts#Session.inputCoverageLabelByArtifactId）で、再起動前の artifact には無い。
   inputCoverageLabel?: string;
   historyOptions: HistoryOption[];
   selectedArtifactId: string;
@@ -1383,8 +1295,6 @@ export type LlmFindingReportView =
 
 export type AnalysisPanelView = LlmFindingReportView;
 
-
-// 検証器の内訳はオプトインの診断面に閉じる。SemanticModelPayload から辿れる場所へ移さない。
 export type LlmFindingDiagnosticsPayload =
   | { state: "unavailable"; reason: string }
   | {
@@ -1393,7 +1303,6 @@ export type LlmFindingDiagnosticsPayload =
       provenance: LlmAnalysisProvenance;
       cacheState: "hit" | "miss";
       rejected: RejectedFinding[];
-      // candidate は LLM が出した数で、検証器へ渡った数ではない。candidate に verified を当てるとスキーマ段の棄却が見えなくなる。
       counts: {
         candidate: number;
         schemaRejected: number;
@@ -1405,20 +1314,13 @@ export type LlmFindingDiagnosticsPayload =
       };
     };
 
-// version は src/semantic-model.ts#SEMANTIC_MODEL_SPEC_VERSION で、PROTOCOL_VERSION とは別に上げる。
-// progress は canonical path を含む Host 専用の値で、投影で落とし、型でも外す。
 export interface SemanticModelPayload extends Omit<SemanticModel, "nodes" | "progress"> {
   nodes: SemanticNodeView[];
-  // undefined は未着（導出前か失敗）で、指標の unavailable や観測 0 と同一視しない。
   l3?: L3ReportPayload;
-  // src/transcript-time-buckets.ts が読めなかったもの。省略は欠落なし。読めなかった記録を 0 本として畳むと、並列していたセッションが直列で描かれる（R-DSP-01）。
-  // 任意フィールドにはすべて webview の描き手がある（verify-work-graph#G-COV-4mut）。
   timeBucketsCoverage?: TimeBucketsCoverage;
-  // 並びと集計は Host が決め、webview は集計しない（verify-no-declared#VND-S6, verify-no-declared#VND-S6b）。
   roleSummary?: RoleSummaryView;
   failureSummary?: FailureSummaryView;
   summaryAnalysis?: SummaryAnalysisView;
-  // null = メインの使用量を 1 件も観測していない（R-DSP-11）
   mainTokens?: MainTokenTotal | null;
 }
 
@@ -1478,7 +1380,6 @@ function restoredToNode(agent: RestoredAgent): WorkAgentNode {
     agentId: agent.agentId,
     parentAgentId: agent.parentAgentId,
     toolUseId: agent.toolUseId,
-    // CLI の meta.json は親の tool_use を持たない。推定で埋めると相関先を捏造する。
     parentToolUseId: null,
     spawnDepth: agent.spawnDepth,
     agentType: agent.agentType,
@@ -1498,7 +1399,6 @@ function restoredToNode(agent: RestoredAgent): WorkAgentNode {
   };
 }
 
-// 循環の辺はどちらも採らない。片側だけ採ると、読んだ順で階層が変わる。
 function findCyclicRestoredIds(restoredAgents: readonly RestoredAgent[]): Set<string> {
   const byId = new Map<string, RestoredAgent>();
   for (const agent of restoredAgents) {
@@ -1528,7 +1428,6 @@ function findCyclicRestoredIds(restoredAgents: readonly RestoredAgent[]): Set<st
   return cyclic;
 }
 
-// 分類と帰属をここで足さない。reducer が決めた値と restoredAgents の突き合わせだけを行う。
 export function projectWorkModel(
   state: WorkModelState,
   restoredAgents: readonly RestoredAgent[] = []
@@ -1540,7 +1439,6 @@ export function projectWorkModel(
       restoredByToolUseId.set(agent.toolUseId, agent);
     }
   }
-  // meta の parentAgentId は実 ID なので、合成 ID だけで引くと深い階層の親に届かない。
   const nodeByKey = new Map<string, WorkAgentNode>();
   const levelByNode = new Map<WorkAgentNode, number>();
   const matchedRestoredIds = new Set<string>();
@@ -1548,7 +1446,6 @@ export function projectWorkModel(
   const unlinkedAgents: WorkAgentNode[] = [];
   let depthLimitedCount = 0;
 
-  // AGENT_TREE_MAX_DEPTH を超える辺だけを捨てて根へ回す。木ごと拒否すると、壊れた一部のために payload 全体を失う。
   const attach = (node: WorkAgentNode, parent: WorkAgentNode | undefined, roots: WorkAgentNode[]): void => {
     if (parent === undefined || parent === node) {
       levelByNode.set(node, 0);
@@ -1637,7 +1534,6 @@ export function projectWorkModel(
   }
 
   const cyclicRestoredIds = findCyclicRestoredIds(restoredAgents);
-  // 深い側を先に解決すると親がまだ登録されておらず、階層未確認へ落ちる。
   const pending = restoredAgents
     .filter((agent) => !matchedRestoredIds.has(agent.agentId))
     .slice()
@@ -1654,7 +1550,6 @@ export function projectWorkModel(
 
   return {
     version: WORK_MODEL_VERSION,
-    // R-TAB-07: projectWorkModel
     requests: state.coverage.summary === "complete" && !state.coverage.hydrationUnconfirmed
       ? state.requests?.filter(request => !request.incomplete).map(({ command: _command, cliInserted: _cliInserted, incomplete: _incomplete, ...request }) => request) : undefined,
     planDeclaration: state.planDeclaration,
@@ -1692,14 +1587,11 @@ export function projectWorkModel(
   };
 }
 
-// 変わった集計は revision の一致で選ぶ（reducer が書き換えた枝にだけ現在の revision が入る）。分類の規則をここで再実装しない。
 export function projectWorkEvent(
   previousState: WorkModelState,
   nextState: WorkModelState,
   event: NormalizedEvent
 ): WorkEventInfo | undefined {
-  // 本文デルタには segment が変わったときだけ載せる。毎回載せると保存と送信の量がデルタ数に比例し、
-  // 丸ごと外すとツールを使わないターンで前のカードが現在の作業のまま残る。
   if (event.kind === "assistant_text_delta" && nextState.currentSegmentId === previousState.currentSegmentId) {
     return undefined;
   }
@@ -1713,7 +1605,6 @@ export function projectWorkEvent(
   }
 
   if (event.kind === "tool_call_started") {
-    // 配置が無くても info は必ず付ける。付けないと webview が記帳系と配置の欠落を区別できず、ツール名の表を持つことになる。
     touched = true;
     const placement = findToolPlacement(nextState, event.toolUseId);
     if (placement !== undefined && placement.phaseRef !== undefined) {
@@ -1829,8 +1720,6 @@ export function projectWorkEvent(
   return touched ? info : undefined;
 }
 
-// src/webview/main.ts#REPLAY_MAX で落とした分を Host の coverage へ合流させる（verify-history-prepend#HPmut-13）。
-// renderer 側で分岐すると、概要と詳細が別々の欠落判定を持つ。
 export function withLocalEventDrop(
   payload: WorkModelPayload | undefined,
   droppedCount: number
@@ -2110,7 +1999,6 @@ function isSemanticArtifactView(v: unknown): boolean {
     typeof a.artifactId === "string" &&
     isOptionalString(a.displayName) &&
     SEMANTIC_ARTIFACT_MODES.includes(a.mode as string) &&
-    // SemanticArtifactView の canonicalPath?: never と対の実行時検査。
     !("canonicalPath" in a)
   );
 }
@@ -2302,7 +2190,6 @@ function isL3Basis(v: unknown): boolean {
   );
 }
 
-// reason の語彙をここへ複製しない。複製すると追加時に静かに食い違う。表示側は未知の reason を落とさず未観測として描く。
 function isL3Metric(v: unknown): boolean {
   if (typeof v !== "object" || v === null) return false;
   const m = v as Record<string, unknown>;
@@ -2314,7 +2201,6 @@ function isL3Metric(v: unknown): boolean {
   return false;
 }
 
-// 指標を足すと tsc がここで落ちるよう、配列でなく Record で持つ。
 const L3_METRIC_KEYS: Record<keyof L3Report["metrics"], true> = {
   longGapMs: true,
   longGapCount: true,
@@ -2417,7 +2303,6 @@ function isL3Report(v: unknown): boolean {
   );
 }
 
-// kind を足すと tsc がここで落ちるよう、配列でなく Record で持つ。
 const DIVERGENCE_KIND_KEYS: Record<DivergenceKind, true> = {
   serialization: true,
   unsupported_completion: true,
@@ -2425,8 +2310,6 @@ const DIVERGENCE_KIND_KEYS: Record<DivergenceKind, true> = {
   declared_state_conflict: true,
 };
 
-// declared / observed は unknown 型の拡張点なので形を検査しない。divergenceId は緩めない（verify-work-overview#O-58b）:
-// 所見は ID の引用でしか乖離へ言及できない。ID を持たない l3 は payload ごと落ち、未着の表示になる。
 function isDivergenceRecordView(v: unknown): boolean {
   if (typeof v !== "object" || v === null) return false;
   const r = v as Record<string, unknown>;
@@ -2469,7 +2352,6 @@ function isDivergenceReportView(v: unknown): boolean {
     Object.keys(DIVERGENCE_KIND_KEYS).every((k) => isDivergenceKindReportView(kinds[k])) &&
     isNumber(d.recordCount) &&
     isNumber(d.droppedRecordCount) &&
-    // 診断値が欠けても l3 全体を落とさない。落とすと観測された乖離が画面から消える。
     (d.segmentAnchoredIdCount === undefined || isNumber(d.segmentAnchoredIdCount))
   );
 }
@@ -2627,7 +2509,6 @@ function isActionFinding(v: unknown): boolean {
   );
 }
 
-// 棄却の中身を通常の画面へ運ぶ名前を拒否する。rejectedCount は要約行に出すので含めない。
 const LLM_REPORT_BANNED_KEYS = [
   "rejected",
   "byReason",
@@ -2635,7 +2516,6 @@ const LLM_REPORT_BANNED_KEYS = [
   "candidateCount",
 ];
 
-// 自由文には LLM 本文が混ざりうるので、コードの字面であることだけを検査する。語彙は複製しない（コードを足しても payload を落とさない）。
 const LLM_REASON_CODE_RE = /^[a-z][a-z0-9_]{0,63}$/;
 
 export function isAnalysisPanelView(v: unknown): v is AnalysisPanelView {
@@ -2665,7 +2545,6 @@ export function isLlmFindingReportView(v: unknown): v is LlmFindingReportView {
   return isAnalysisPanelView(v);
 }
 
-// check と reason の語彙を src/llm-finding-verify.ts から複製しない（isL3Metric と同じ理由）。
 function isFindingRejectionView(v: unknown): boolean {
   if (typeof v !== "object" || v === null) return false;
   const r = v as Record<string, unknown>;
@@ -2726,7 +2605,6 @@ function isAnalysisLearningRANL20(v: unknown): boolean {
     && typeof learning.note === "string" && Array.isArray(learning.lines)
     && learning.lines.every(line => typeof line === "string")
     && (learning.state === "unobserved" ? learning.note.length > 0 && learning.lines.length === 0 : learning.lines.length > 0)
-    // R-LRN-09: 未観測に「該当なし」を付けない
     && (learning.empty === undefined || (learning.empty === true && learning.state === "observed" && learning.lines.length === 1));
 }
 
@@ -2805,24 +2683,82 @@ function isSummaryAnalysisView(v: unknown): boolean {
     });
 }
 
-// 他の項目は webview 検査の合成 payload が部分形で送るので、形を問わない。
+const TIME_BUCKET_NAMES: Record<TimeBucket, true> = { generate: true, tool: true, delegation: true, confirm: true, reply: true };
+const TAIL_MAIN_NAMES: Record<NonNullable<TimeBucketView["tail"]["main"]>, true> = { generate: true, tool: true, delegation: true, confirm: true };
+
 function isTimeBucketsPayload(v: unknown): boolean {
   if (typeof v !== "object" || v === null || Array.isArray(v)) return false;
-  const { mainByModel: byModel, blocks } = v as Record<string, unknown>;
+  const { mainByModel: byModel, blocks, agents, backgroundTasks, bars, main, intervals, tail } = v as Record<string, unknown>;
   const percent = (value: unknown) => isNumber(value) && (value as number) >= 0 && (value as number) <= 100;
-  return (byModel === undefined || byModel === null || isMainTimeByModelView(byModel)) &&
+  const duration = (value: unknown) => isNumber(value) && (value as number) >= 0;
+  const record = (value: unknown): value is Record<string, unknown> => typeof value === "object" && value !== null && !Array.isArray(value);
+  return isTimeBarsView(bars) &&
+    (main === undefined || record(main) && (main.subagentWaitMs === undefined || duration(main.subagentWaitMs))) &&
+    (intervals === undefined || isArrayOf(intervals, item => record(item) && typeof item.bucket === "string" && Object.hasOwn(TIME_BUCKET_NAMES, item.bucket))) &&
+    (tail === undefined || record(tail) && (tail.main === undefined || tail.main === null || typeof tail.main === "string" && Object.hasOwn(TAIL_MAIN_NAMES, tail.main))) &&
+    (byModel === undefined || byModel === null || isMainTimeByModelView(byModel)) &&
+    [agents, backgroundTasks].every(items => items === undefined || isArrayOf(items, item => {
+      if (typeof item !== "object" || item === null || Array.isArray(item)) return false;
+      const lane = item as Record<string, unknown>;
+      return (lane.stepKey === undefined || typeof lane.stepKey === "string") &&
+        (items !== backgroundTasks || lane.subagent === undefined || typeof lane.subagent === "boolean");
+    })) &&
     (blocks === undefined || isArrayOf(blocks, value => {
       if (typeof value !== "object" || value === null) return false;
       const block = value as Record<string, unknown>;
+      if (block.kind !== undefined && !["say", "command", "interrupt", "plan"].includes(block.kind as string)) return false;
+      if (block.kind === "plan" && (!isArrayOf(block.steps, isPlanBlockStep) || !isArrayOf(block.userMessages, isPlanBlockMarker) || !isPlanBlockMetrics(block.metrics))) return false;
+      if (block.goal !== undefined && typeof block.goal !== "string") return false;
+      if (block.closedAt !== undefined && !isNumber(block.closedAt)) return false;
+      if (block.steps !== undefined && !isArrayOf(block.steps, isPlanBlockStep)) return false;
+      if (block.userMessages !== undefined && !isArrayOf(block.userMessages, isPlanBlockMarker)) return false;
+      if (block.metrics !== undefined && !isPlanBlockMetrics(block.metrics)) return false;
       if (block.requestNumber !== undefined && block.requestNumber !== null &&
         !(typeof block.requestNumber === "string" && /^\d+$/.test(block.requestNumber))) return false;
       if (block.processingMs !== undefined && block.processingMs !== null &&
         !(isNumber(block.processingMs) && (block.processingMs as number) >= 0)) return false;
+      if (block.subagentWaitMs !== undefined && !duration(block.subagentWaitMs)) return false;
       if (block.strip === undefined || block.strip === null) return true;
       if (typeof block.strip !== "object" || Array.isArray(block.strip)) return false;
       const strip = block.strip as Record<string, unknown>;
-      return percent(strip.processingPercent) && percent(strip.replyPercent) && percent(strip.remainderPercent);
+      return [strip.generatePercent, strip.toolPercent, strip.subagentWaitPercent, strip.confirmPercent, strip.replyPercent, strip.remainderPercent].every(percent);
     }));
+}
+
+function isTimeBarsView(v: unknown): boolean {
+  if (typeof v !== "object" || v === null || Array.isArray(v)) return false;
+  const b = v as Record<string, unknown>;
+  const duration = (x: unknown) => isNumber(x) && (x as number) >= 0;
+  return [b.totalMs, b.mainMs, b.toolMs].every(x => x === null || duration(x)) && duration(b.subMs);
+}
+
+function isPlanBlockMarker(v: unknown): boolean {
+  if (typeof v !== "object" || v === null || Array.isArray(v)) return false;
+  const marker = v as Record<string, unknown>;
+  return isNumber(marker.at) && (marker.at as number) >= 0 && typeof marker.text === "string";
+}
+
+function isPlanBlockMetrics(v: unknown): boolean {
+  if (typeof v !== "object" || v === null || Array.isArray(v)) return false;
+  const m = v as Record<string, unknown>;
+  const duration = (x: unknown) => x === null || isNumber(x) && (x as number) >= 0;
+  const tokens = m.tokens as Record<string, unknown> | null;
+  return (m.provisional === undefined || typeof m.provisional === "boolean") &&
+    [m.generateMs, m.toolMs, m.subagentWaitMs, m.subagentOnlyMs, m.decisionWaitMs, m.replyWaitMs].every(duration) &&
+    (tokens === null || typeof tokens === "object" && !Array.isArray(tokens) && tokens !== null &&
+      isNumber(tokens.tokens) && (tokens.tokens as number) >= 0 && isNumber(tokens.cacheRead) && (tokens.cacheRead as number) >= 0);
+}
+
+function isPlanBlockStep(v: unknown): boolean {
+  if (!isPlanBlockMetrics(v)) return false;
+  const step = v as Record<string, unknown>;
+  const at = (x: unknown) => x === null || isNumber(x) && (x as number) >= 0;
+  return typeof step.key === "string" && typeof step.title === "string" &&
+    ["unknown", "pending", "in_progress", "completed"].includes(step.status as string) &&
+    typeof step.removed === "boolean" && typeof step.longest === "boolean" &&
+    (step.parallel === undefined || typeof step.parallel === "boolean") &&
+    [step.startedAt, step.endedAt, step.end, step.durationMs].every(at) &&
+    (step.startedAt === null || step.end === null || (step.end as number) >= (step.startedAt as number));
 }
 
 function isMainModelTimeEntry(v: unknown): boolean {
@@ -2864,7 +2800,7 @@ function isRoleRunView(v: unknown): boolean {
     isNumber(r.shade) &&
     isNullableNumber(r.startedAt) &&
     typeof r.running === "boolean" &&
-    (r.outcome === null || ["ok", "failed", "timeout", "refused"].includes(r.outcome as string)) &&
+    (r.outcome === null || ["ok", "failed", "timeout", "refused", "stopped"].includes(r.outcome as string)) &&
     isNullableNumber(r.durationMs) && isNullableNumber(r.tokens) &&
     isNullableNumber(r.timePercent) && isNullableNumber(r.tokenPercent)
   );
@@ -2920,11 +2856,29 @@ export type ResumeHydrationPhase = "loading" | "complete" | "failed";
 
 export const RESUME_PREVIEW_MESSAGE_MAX = 80;
 
-// R-HND-11: 書き直しの可能性を知らせるだけに使う。近似一致で重複を消さない（決定を取り違える）。
 export const DECISIONS_REWRITE_RATIO = 0.8;
 
-// R-HND-10: Host と webview が同じ関数で作る。固定値にしない: intoTabId で同じ tabId に別セッションが載ると、
-// 古い展開部の cache が一致して別会話の本文を返す。
+export interface HandoffDecisionCounts {
+  total: number;
+  carried: number;
+  extracted: number;
+  removed: number;
+  unknownIdRefs: number;
+  warn?: { entries: number; bytes: number };
+}
+
+export interface HandoffSourceSnapshot {
+  sessionId: string;
+  title?: string;
+  compact?: HandoffCompactStats;
+  contextUsage?: HandoffContextUsage;
+  utteranceCount?: number;
+  unreadableLineCount?: number;
+  detailRunId?: string;
+  decisionCount?: number;
+  decisions?: HandoffDecisionCounts;
+}
+
 export function restoredHandoffRunId(forkSessionId: string): string {
   return `restored:${forkSessionId}`;
 }
@@ -2971,16 +2925,12 @@ export interface LlmAnalysisRunProgress {
 export type HostToWebview =
   | { type: "planUsage"; tabId: string; state: import("./plan-usage").PlanUsage }
   | { type: "orchestrationView"; tabId: string; state: OrchestrationView }
-  // hostWindows: the Extension Host platform, which decides the Windows-only file-link refusals (R-CNV-12). The webview
-  // treats a missing value as Windows (stricter) and never infers it from its own navigator.
   | { type: "init"; protocolVersion: number; tabs: TabSnapshot[]; hostWindows?: boolean; systemAppExtensions?: string[] }
   | { type: "events"; tabId: string; events: NormalizedEvent[] }
-  // 判別ユニオンで isResumeHydrationStateMessage と同じ制約を型に持たせる。
   | {
       type: "resumeHydrationState";
       tabId: string;
       phase: Exclude<ResumeHydrationPhase, "failed">;
-      // 最初の描画の後に表示専用の preview を追送する欄。tabCreated と tabCleared を二度送らない。
       previewMessages?: ResumePreviewMessage[];
     }
   | {
@@ -3005,46 +2955,30 @@ export type HostToWebview =
       displayEvent?: undefined;
       sendDisposition: ResumeHydrationSendDisposition;
     }
-  // R-HND-08: activate が false になるのは、src/handoff-runner.ts#shouldActivateForkTab が偽を返した引き継ぎタブと、
-  // src/extension.ts#restorePersistedTabs が起動時に復元する先頭以外のタブだけ。他の生産者は true を送る。
   | { type: "tabCreated"; tab: TabSnapshot; activate: boolean }
   | { type: "tabClosed"; tabId: string }
   | { type: "activateTab"; tabId: string }
-  // webview はタブを同じ位置で置き換える。
   | { type: "tabCleared"; tab: TabSnapshot }
-  // init で deferred として送ったタブの中身。受け側は tabCleared と同じ手順で、並びとアクティブ選択を保ったまま作り直す。
   | { type: "tabRestored"; tab: TabSnapshot }
   | { type: "tabRenamed"; tabId: string; title: string }
-  // 要約と逐語の本文は載せない。webview が展開したときだけ getHandoffDetail で取りに行く。
   | {
       type: "handoffStatus";
       tabId: string;
       runId: string;
       state: "running" | "failed" | "done";
       phase?: string;
-      // compact 中の心拍ごとに載る。since は elapsedMs の起点。
       progress?: { heartbeats: number; elapsedMs: number; since: "compact_start" | "result" };
       reason?: string;
       detail?: string;
       message: string;
       source: { sessionId: string; title: string };
       fork?: { sessionId: string; tabId: string; title: string };
-      compact?: { preTokens: number; postTokens: number };
+      compact?: HandoffCompactStats;
+      contextUsage?: HandoffContextUsage;
       utteranceCount?: number;
-      // JSON として読めず捨てた行数。0 は載せない。
       unreadableLineCount?: number;
-      // R-HND-11 / R-HND-12: 件数だけ。本文は handoffDetail の part 0 が運ぶ。
-      decisions?: {
-        total: number;
-        carried: number;
-        extracted: number;
-        removed: number;
-        unknownIdRefs: number;
-        warn?: { entries: number; bytes: number };
-      };
+      decisions?: HandoffDecisionCounts;
     }
-  // 1 通を src/handoff-runner.ts#HANDOFF_DETAIL_MAX_BYTES 以下に分ける。summary は part 0 だけが運ぶ。
-  // total が 0 なのは記録を読めなかった印で、webview はその旨を出す。
   | {
       type: "handoffDetail";
       tabId: string;
@@ -3052,8 +2986,7 @@ export type HostToWebview =
       part: number;
       total: number;
       summary?: string;
-      utterances: { n: number; at: string; kind: "typed" | "answer"; text: string; questions?: string[] }[];
-      // summary と同じく part 0 だけが運ぶ。
+      utterances: { n: number; at: string; kind: "typed" | "answer"; text: string; questions?: string[]; imageRefs?: ImageRefInfo[] }[];
       decisions?: HandoffDecisions;
     }
   | { type: "modeChanged"; tabId: string; mode: PermissionModeId }
@@ -3063,35 +2996,25 @@ export type HostToWebview =
       tabId: string;
       models: ModelInfo[];
     }
-  // R-DSP-01: notice は Host が適用と保存を終えた後の結果文。webview は選択直後に自前で保存済みを出さない。
   | { type: "modelChanged"; tabId: string; model: string | null; notice?: string; applied?: boolean }
   | { type: "effortChanged"; tabId: string; effort: string | null; notice?: string }
   | { type: "configuredEffortChanged"; tabId: string; effort: string | null; model?: string | null; defaultEffort?: string | null; appliedModel?: string | null; appliedEffort?: string | null }
   | { type: "files"; reqId: number; paths: string[] }
-  // キャンセルでも paths と images を空にして返す（無応答にしない）。
   | { type: "pickedFiles"; reqId: number; paths: string[]; images: ImageAttachment[] }
-  // 差分ではなく毎回全量を送り、webview は置き換えるだけにする。
   | { type: "attachments"; tabId: string; items: PendingAttachmentInfo[] }
-  // requestId は listSessions 要求ごとに増え、受け側は新しい実行より小さい requestId の行を捨てる。
-  // complete が偽の到着は確認中で、全件ではない（部分応答を 0 件の根拠にしない）。
-  // degraded は件数が本物でないことだけを運ぶ。complete を偽にして逃がさない（受け側が読み込み中を出し続ける）。
-  | { type: "sessions"; source?: "laisora" | "claude"; nextCursor?: string; append?: boolean; requestId: number; sessions: SessionListItem[]; complete: boolean; degraded?: SessionScanDegradation }
+  | { type: "sessions"; source?: "laisora" | "claude"; showHidden?: boolean; nextCursor?: string; append?: boolean; requestId: number; sessions: SessionListItem[]; complete: boolean; degraded?: SessionScanDegradation }
+  | { type: "sessionRenamed"; sessionId: string; title: string; requestId?: string }
+  | { type: "sessionHiddenChanged"; sessionId: string; hidden: boolean }
+  | { type: "sessionListActionFailed"; sessionId: string; action: SessionListAction; reason: string; requestId?: string }
   | { type: "analysis"; sessionId: string; filePath: string; report: unknown }
-  // R-ANL-11: src/webview/main.ts#showAnalysisFailure が操作元の画面へ理由を描く。要求元の面だけへ返す（全面へ配ると別タブの分析画面に理由が出る）。
-  // kind は失敗した要求で分かれ、script は analyzeCurrent、action は所見からの操作。
   | { type: "analysisFailed"; kind: "script" | "action"; tabId?: string; reason?: string }
   | { type: "composerPrefill"; tabId: string; text: string }
   | { type: "editorContext"; path: string; startLine: number; endLine: number }
-  // snapshot が運ぶものと同じ projectWorkModel の出力。live の更新だけをこの経路で送る。
   | { type: "workModel"; tabId: string; model: WorkModelPayload }
   | { type: "semanticModel"; tabId: string; model: SemanticModelPayload }
   | { type: "llmAnalysisSetting"; enabled: boolean }
-  // snapshot には載せない。ready の応答と設定変更の後に送る。
-  | { type: "userSettings"; appearance?: AccentSettings; composerSendKey: ComposerSendKey }
-  // 保存される event にしない。
+  | { type: "userSettings"; appearance?: AccentSettings; displayName?: string; composerSendKey: ComposerSendKey }
   | { type: "tabNotice"; tabId: string; text: string }
-  // running は snapshot の llmAnalysisRunning と同じ値。failure の limit はタイムアウト以外では欠ける。
-  // R-ANL-11: refusal は実行を始めなかった理由で、failure と同居しない。未実行を分析結果として描かせないための別の欄。
   | {
       type: "llmAnalysisRunState";
       tabId: string;
@@ -3107,7 +3030,6 @@ export type HostToWebview =
       };
       refusal?: string;
     }
-  // R-DSP-25: failure の通知も既存の summary を運ぶので、保存済みの要約を消さない。saveFailed のときは保存済みと表示しない（R-DSP-01）。
   | { type: "sessionSummary"; tabId: string; running: boolean; summary?: { text: string; model: string }; saveFailed?: boolean; failure?: string }
   | { type: "sessionNameSuggestion"; tabId: string; title: string }
   | { type: "sessionNameSuggestion"; tabId: string; reason: string }
@@ -3129,8 +3051,6 @@ export type HostToWebview =
       generation: number;
       reason: AgentInspectorErrorReason;
     }
-  // 保存される event へ入れない: 入れると src/event-fold.ts#EVENT_LOG_MAX を跨いで coverage が反転する。
-  // generation は照合に使わない（CLI の再起動で世代だけ進んでも登録は生きている）。破棄は requestId で判定する。
   | {
       type: "historyChunkResult";
       tabId: string;
@@ -3145,7 +3065,6 @@ export type HostToWebview =
       generation: number;
       reason: HistoryChunkErrorReason;
     }
-  // R-TAB-07。破棄は historyChunkResult と同じく requestId で判定する。
   | {
       type: "worklogTranscriptResult";
       tabId: string;
@@ -3160,7 +3079,6 @@ export type HostToWebview =
       generation: number;
       reason: HistoryChunkErrorReason;
     }
-  // historyChunkResult と同じく、保存される event へ入れず、破棄は requestId で判定する。
   | {
       type: "conversationHistoryResult";
       tabId: string;
@@ -3188,12 +3106,7 @@ export type HostToWebview =
       requestId: string;
       reason: "not-found" | "read-failed" | "invalid-request";
     }
-  // CLI が ~/.claude.json に残す cachedUsageUtilization から読む（src/session-files.ts#readCachedUsage）。
-  | {
-      type: "cachedUsage";
-      fetchedAtMs: number;
-      limits: Array<{ type: string; utilization: number; resetsAt: number | null }>;
-    }
+  | ({ type: "accountUsage"; replyTo: string } & AccountUsageSnapshot)
   | {
       type: "analysisPersistenceState";
       tabId: string;
@@ -3205,7 +3118,6 @@ export type HostToWebview =
 export interface TabSnapshot {
   tabId: string;
   title: string;
-  // R-TAB-08 / R-CNV-02: 空の events は 0 件の主張ではなく、受け側は読み込み中を出す（verify-webview-wiring#sol-13d）。中身は tabRestored で後から届く。
   deferred?: true;
   state: ConversationSnapshot;
 }
@@ -3215,61 +3127,40 @@ export interface ConversationSnapshot {
   cwd: string;
   turnState: "idle" | "running" | "interrupting";
   auth: AuthStatus | null;
-  // 接続前の表示用。auth が届いたらそちらを優先する。
   configModel?: string;
   configEffort?: string;
-  // 設定に effort が無いとき、実行中 CLI が既定として使う effort（get_settings の applied.effort）
   defaultEffort?: string;
-  // 実行中 CLI が次のリクエストで使う model（get_settings の applied.model）。resume では記録の model で、configModel より優先する
   appliedModel?: string;
   modelFallback?: ModelFallbackState;
-  // get_settings の applied.effort。null = CLI が effort を送らない。configEffort / defaultEffort はこれと一致するときだけ立つ
   appliedEffort?: string | null;
   recordedModel?: string;
   permissionMode: PermissionModeId;
   commands?: SlashCommandInfo[];
   models?: ModelInfo[];
-  // null は既定モデルへの上書き。
   modelOverride?: string | null;
   effortOverride?: string | null;
   resumeSessionId?: string;
   resumeFilePath?: string;
-  handoffSource?: {
-    sessionId: string;
-    title?: string;
-    compact?: { preTokens: number; postTokens: number };
-    utteranceCount?: number;
-    detailRunId?: string;
-    // R-HND-11: 消した行を含む決定行の本数。無いと、復元したカードが決定行の展開部を作れない。
-    decisionCount?: number;
-  };
+  handoffSource?: HandoffSourceSnapshot;
   resumeHydration?: ResumeHydrationSnapshotState;
-  // webview にイベントの再 fold で作らせない。
   workModel?: WorkModelPayload;
   planUsage?: import("./plan-usage").PlanUsage;
-  // undefined（未着）と false（設定で明示 off）を同一視しない。true で semanticModel が無ければ未着か導出失敗。
   semanticView?: boolean;
   semanticModel?: SemanticModelPayload;
   llmAnalysisEnabled?: boolean;
   llmAnalysisRunning?: boolean;
-  // 実行中でも最初の呼び出し通知の前は無い。elapsedMs は snapshot の時点まで Host の時計で進めて渡す。
   llmAnalysisProgress?: LlmAnalysisRunProgress;
-  // R-DSP-25: 無ければ webview は最初のプロンプトを表示する。
   sessionSummary?: { text: string; model: string };
   sessionSummaryRunning?: boolean;
-  // 診断設定と分析設定の両方が on のときだけ true。false なら webview は診断パネルを DOM ごと外す。undefined は semanticView と同じく未着。
   llmDiagnostics?: boolean;
-  // 省略した snapshot にだけ載せる（0 件を載せると省略なしの表現が二通りになる）。受け側は窓落ちとして数えて遡る（verify-webview-wiring#sol-15c）。
-  // count は src/event-window.ts#windowEvents の droppedCount と同じ正味の件数。backfilledHead なら events の先頭は戻した turn_started で、次の要素と連続しない。
   headOmitted?: { count: number; hasConvEvent: boolean; backfilledHead: boolean };
-  // R-SES-02: Host が全イベントを畳んだ背景側の現在値。webview は再生の後にこれで置き換える。空は活動なしの確定値。
   backgroundActivity?: BackgroundActivitySnapshot;
+  autoResumeAt?: number | null;
   events: NormalizedEvent[];
 }
 
 export function isWebviewToHost(v: unknown): v is WebviewToHost {
   if (typeof v !== "object" || v === null) return false;
-  // as は網羅の検査のために静的型を絞るだけで、実行時の値は各分岐が検査する。
   const t = (v as { type?: unknown }).type as WebviewToHost["type"];
   const tabId = (v as { tabId?: unknown }).tabId;
 
@@ -3302,18 +3193,32 @@ export function isWebviewToHost(v: unknown): v is WebviewToHost {
     return (
       (sessionOnly === undefined || typeof sessionOnly === "boolean") &&
       typeof tabId === "string" &&
-      (model === null || (typeof model === "string" && model.length <= 100))
+      (model === null || (typeof model === "string" && model.trim() !== "" && model.length <= 100))
     );
   }
   if (t === "listSessions") {
-    const q = v as { source?: unknown; cursor?: unknown };
+    const q = v as { source?: unknown; cursor?: unknown; showHidden?: unknown };
     return (q.source === undefined || q.source === "laisora" || q.source === "claude") &&
-      (q.cursor === undefined || (typeof q.cursor === "string" && /^\d+:\d+$/.test(q.cursor)));
+      (q.cursor === undefined || (typeof q.cursor === "string" && /^\d+:\d+$/.test(q.cursor))) &&
+      (q.showHidden === undefined || typeof q.showHidden === "boolean");
+  }
+  if (t === "renameSession") {
+    const message = v as Record<string, unknown>;
+    return hasOnlyKeys(message, ["type", "sessionId", "filePath", "title", "requestId"]) &&
+      (message.requestId === undefined || isRenameRequestId(message.requestId)) &&
+      typeof message.sessionId === "string" && SESSION_ID_RE.test(message.sessionId) &&
+      typeof message.filePath === "string" && message.filePath.length > 0 && !message.filePath.includes("\0") &&
+      typeof message.title === "string" && message.title.trim().length > 0 && message.title.length <= RENAME_TITLE_MAX;
+  }
+  if (t === "setSessionHidden") {
+    const message = v as Record<string, unknown>;
+    return hasOnlyKeys(message, ["type", "sessionId", "hidden"]) &&
+      typeof message.sessionId === "string" && SESSION_ID_RE.test(message.sessionId) &&
+      typeof message.hidden === "boolean";
   }
   if (t === "openFile") {
     const message = v as Record<string, unknown>;
     const allowed = new Set(["type", "tabId", "target"]);
-    // R-CNV-12: reject payload smuggling and unbounded model-authored targets before Host path resolution.
     return (
       Object.keys(message).every((key) => allowed.has(key)) &&
       typeof message.tabId === "string" &&
@@ -3343,7 +3248,14 @@ export function isWebviewToHost(v: unknown): v is WebviewToHost {
       && Object.keys(m).every((key) => key === "type" || key === "action" || key === "tabId");
     return Object.keys(m).every((key) => key === "type" || key === "action");
   }
-  if (t === "requestCachedUsage") return true;
+  if (t === "accountUsagePanelClosed") return Object.keys(v).every((key) => key === "type");
+  if (t === "requestAccountUsage") {
+    return (
+      Object.keys(v).every((key) => key === "type" || key === "tabId" || key === "requestId") &&
+      isAccountUsageRequestId((v as { requestId?: unknown }).requestId) &&
+      (tabId === undefined || (typeof tabId === "string" && tabId.length > 0 && tabId.length <= 200))
+    );
+  }
   if (t === "agentInspectorRequest") {
     const message = v as Record<string, unknown>;
     const allowed = new Set(["type", "tabId", "agentId", "section", "requestId", "cursor"]);
@@ -3371,7 +3283,6 @@ export function isWebviewToHost(v: unknown): v is WebviewToHost {
     ) {
       return false;
     }
-    // 両方載せた要求を通すと、どちらを起点にするかで返る chunk が変わる（欠落・重複の入口）
     if ((message.cursor === undefined) === (message.anchor === undefined)) return false;
     if (message.cursor !== undefined) {
       return (
@@ -3449,7 +3360,6 @@ export function isWebviewToHost(v: unknown): v is WebviewToHost {
     ) {
       return false;
     }
-    // 両方載せた要求を通すと、どちらを起点にするかで返る chunk が変わる（欠落・重複の入口）
     if (message.cursor !== undefined && message.anchorUuid !== undefined) return false;
     if (
       message.cursor !== undefined &&
@@ -3552,8 +3462,6 @@ export function isWebviewToHost(v: unknown): v is WebviewToHost {
     );
   }
   if (t === "pickFiles") {
-    // R-CNV-05: IMAGE_MAX_COUNT の上限を外すと Host が超過した images を返し、isHostToWebview が pickedFiles ごと落として、
-    // 選んだパスが入力欄へ入らない。整数・非負の検査が守る要件は特定できていない。
     const slots = (v as { imageSlots?: unknown }).imageSlots;
     return (
       typeof (v as { reqId?: unknown }).reqId === "number" &&
@@ -3571,12 +3479,14 @@ export function isWebviewToHost(v: unknown): v is WebviewToHost {
   }
   if (t === "getHandoffDetail") {
     const part = (v as { part?: unknown }).part;
+    const refresh = (v as { refresh?: unknown }).refresh;
     return (
       typeof tabId === "string" &&
       typeof (v as { runId?: unknown }).runId === "string" &&
       typeof part === "number" &&
       Number.isInteger(part) &&
-      part >= 0
+      part >= 0 &&
+      (refresh === undefined || (refresh === true && part === 0))
     );
   }
   if (t === "openHandoffSource") {
@@ -3591,8 +3501,6 @@ export function isWebviewToHost(v: unknown): v is WebviewToHost {
   }
   if (t === "send") {
     const message = v as Record<string, unknown>;
-    // R-CNV-11: images を許可キーに戻さない（verify-attachment#AT-08）。戻すと押した瞬間の activeTabId 宛てに webview の手持ちが載り、
-    // 添付が別の会話へ入る。
     const allowed = new Set(["type", "tabId", "text", "clientToken"]);
     return (
       Object.keys(message).every((key) => allowed.has(key)) &&
@@ -3637,7 +3545,6 @@ export function isWebviewToHost(v: unknown): v is WebviewToHost {
     }
     if (m.answers === undefined) return true;
     if (typeof m.answers !== "object" || m.answers === null) return false;
-    // キー数の上限は SDK の AskUserQuestionInput が許す質問数より大きく取り、キーの水増しを拒む。
     const entries = Object.entries(m.answers as Record<string, unknown>);
     if (entries.length > 8) return false;
     return entries.every(
@@ -3679,7 +3586,6 @@ export function isWebviewToHost(v: unknown): v is WebviewToHost {
       typeof message.artifactId === "string" && message.artifactId.length > 0 && message.artifactId.length <= 200
     );
   }
-  // バリアントを足して分岐を忘れると tsc がここで落ちる。
   t satisfies never;
   return false;
 }
@@ -3721,7 +3627,8 @@ function isAgentInspectorPage(value: unknown): value is AgentInspectorPage {
       if (typeof item !== "object" || item === null) return false;
       const tool = item as Record<string, unknown>;
       return typeof tool.toolUseId === "string" && typeof tool.toolName === "string" &&
-        typeof tool.inputPreview === "string" && isOptionalString(tool.resultPreview);
+        typeof tool.inputPreview === "string" && isOptionalString(tool.resultPreview) &&
+        (tool.backgroundLaunch === undefined || tool.backgroundLaunch === true);
     });
   }
   if (page.section === "messages") {
@@ -3764,9 +3671,6 @@ export function isSessionImageRef(v: unknown): v is SessionImageRef {
   const r = v as Record<string, unknown>;
   if (typeof r.index !== "number" || !Number.isInteger(r.index) || r.index < 0) return false;
   if (r.kind === "record") {
-    // uuid は Host 側で globalStorage 配下のファイル名へ連結される。長さだけを見ていると
-    // `..` を含む値が境界を通り、書き出し先が images/ の外へ出る。実データは corpus 14,888 件
-    // すべてが [A-Za-z0-9_-]・最大 36 文字（2026-09-04 実測）
     return (
       typeof r.uuid === "string" &&
       r.uuid.length > 0 &&
@@ -3801,20 +3705,38 @@ export function isImageRefInfoArray(v: unknown): v is ImageRefInfo[] {
   return Array.isArray(v) && v.every(isImageRefInfo);
 }
 
-// Host が切って送る src/history-serving.ts#CONVERSATION_TEXT_MAX 以上に保つ。下回ると正当な応答を捨て、外すと 1 chunk で postMessage を詰まらせる。
 const CONVERSATION_TEXT_MAX = 20000;
 const CONVERSATION_ITEMS_MAX = 500;
+
+function isRestoredApprovalCard(value: unknown): boolean {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
+  const card = value as Record<string, unknown>;
+  if (typeof card.requestId !== "string" || !card.requestId || typeof card.toolName !== "string" ||
+    typeof card.inputJson !== "string" || !["answered", "allowed", "denied", "withdrawn", "failed", "unknown"].includes(String(card.resolution))) return false;
+  if (card.answers !== undefined && (typeof card.answers !== "object" || card.answers === null || Array.isArray(card.answers) ||
+    !Object.values(card.answers).every((answer) => typeof answer === "string"))) return false;
+  if (card.questions !== undefined) {
+    const spec = card.questions as AskUserQuestionSpec;
+    if (typeof spec !== "object" || spec === null || !Array.isArray(spec.questions) || !spec.questions.every((q) =>
+      typeof q === "object" && q !== null && typeof q.question === "string" && typeof q.multiSelect === "boolean" &&
+      (q.header === undefined || typeof q.header === "string") && Array.isArray(q.options) && q.options.every((option) =>
+        typeof option === "object" && option !== null && typeof option.label === "string" &&
+        (option.description === undefined || typeof option.description === "string")))) return false;
+  }
+  return true;
+}
 
 function isConversationHistoryMessage(value: unknown): boolean {
   if (typeof value !== "object" || value === null) return false;
   const m = value as Record<string, unknown>;
   return (
     typeof m.uuid === "string" && m.uuid.length > 0 && m.uuid.length <= 100 &&
-    (m.role === "user" || m.role === "assistant") &&
+    (m.role === "user" || m.role === "assistant" || m.role === "system") &&
     typeof m.text === "string" && m.text.length <= CONVERSATION_TEXT_MAX &&
     typeof m.timestamp === "number" &&
     (m.imageRefs === undefined || isImageRefInfoArray(m.imageRefs)) &&
-    (m.model === undefined || (typeof m.model === "string" && m.model.length > 0))
+    (m.model === undefined || (typeof m.model === "string" && m.model.length > 0)) &&
+    (m.restoredApproval === undefined || isRestoredApprovalCard(m.restoredApproval))
   );
 }
 
@@ -3862,12 +3784,10 @@ function isWorkTaskTotalsView(item: unknown): boolean {
   );
 }
 
-// 詳細ログはこの値だけで描くので、形が違う event は events ごと落とす。緩めると配置不明のまま描画へ進み、DOM 側の推測が復活する。
 export function isWorkEventInfo(v: unknown): v is WorkEventInfo {
   if (typeof v !== "object" || v === null) return false;
   const info = v as Record<string, unknown>;
   if (!isNumber(info.revision)) return false;
-  // null は segment が閉じた印。isOptionalString は null を弾くので使わない。
   if (info.currentSegmentId !== undefined && info.currentSegmentId !== null) {
     if (typeof info.currentSegmentId !== "string") return false;
   }
@@ -3953,6 +3873,7 @@ function isPlausibleNormalizedEvent(x: unknown): x is NormalizedEvent {
     }
   }
   if (e.kind === "replayed_message") {
+    if (e.restoredApproval !== undefined && !isRestoredApprovalCard(e.restoredApproval)) return false;
     if (e.imageRefs !== undefined && !isImageRefInfoArray(e.imageRefs)) {
       return false;
     }
@@ -4085,7 +4006,6 @@ function isResumeHydrationStateMessage(value: Record<string, unknown>): boolean 
   return true;
 }
 
-// count に 0 を通すと、省略なしの表現が undefined と二通りになり受け側の分岐が二重になる。
 function isHeadOmitted(v: unknown): boolean {
   if (typeof v !== "object" || v === null) return false;
   const h = v as { count?: unknown; hasConvEvent?: unknown; backfilledHead?: unknown };
@@ -4098,7 +4018,6 @@ function isHeadOmitted(v: unknown): boolean {
   );
 }
 
-// R-SES-02: 空の id を拒まない。src/claude-normalizer.ts は task_id の無い要素を空の id で出すので、拒むと init ごと捨てられて全タブが空になる。
 function isBackgroundActivitySnapshot(v: unknown): boolean {
   if (typeof v !== "object" || v === null || Array.isArray(v)) return false;
   const a = v as Record<string, unknown>;
@@ -4134,7 +4053,6 @@ function isTabSnapshotShape(x: unknown): x is TabSnapshot {
   if (typeof x !== "object" || x === null) return false;
   const t = x as { tabId?: unknown; title?: unknown; state?: unknown; deferred?: unknown };
   if (typeof t.tabId !== "string" || typeof t.title !== "string") return false;
-  // false を通すと、deferred でない表現が二通りになり受け側の分岐が二重になる。
   if (t.deferred !== undefined && t.deferred !== true) return false;
   if (typeof t.state !== "object" || t.state === null) return false;
   const s = t.state as Record<string, unknown>;
@@ -4175,6 +4093,7 @@ function isTabSnapshotShape(x: unknown): x is TabSnapshot {
     (s.resumeHydration === undefined || isResumeHydrationSnapshotState(s.resumeHydration)) &&
     (s.headOmitted === undefined || isHeadOmitted(s.headOmitted)) &&
     (s.backgroundActivity === undefined || isBackgroundActivitySnapshot(s.backgroundActivity)) &&
+    (s.autoResumeAt === undefined || s.autoResumeAt === null || isNumber(s.autoResumeAt)) &&
     (s.handoffSource === undefined || isHandoffSource(s.handoffSource)) &&
     Array.isArray(s.events) &&
     (s.events as unknown[]).every(isPlausibleNormalizedEvent)
@@ -4256,10 +4175,56 @@ function isHandoffDecisions(v: unknown): v is HandoffDecisions | undefined {
   );
 }
 
+export interface HandoffContextMeasurement {
+  totalTokens: number;
+  measuredAt: string;
+}
+
+export interface HandoffContextUsage {
+  before: HandoffContextMeasurement | null;
+  after?: HandoffContextMeasurement | null | "pending";
+}
+
+const ISO_8601_RE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$/;
+
+export function isIsoTimestamp(value: unknown): value is string {
+  return typeof value === "string" && ISO_8601_RE.test(value) && Number.isFinite(Date.parse(value));
+}
+
+export function isHandoffContextMeasurement(value: unknown): value is HandoffContextMeasurement {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
+  const item = value as Record<string, unknown>;
+  return typeof item.totalTokens === "number" && Number.isFinite(item.totalTokens) && item.totalTokens >= 0 &&
+    isIsoTimestamp(item.measuredAt);
+}
+
+export function isHandoffContextUsage(value: unknown): value is HandoffContextUsage {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
+  const context = value as Record<string, unknown>;
+  return Object.prototype.hasOwnProperty.call(context, "before") &&
+    (context.before === null || isHandoffContextMeasurement(context.before)) &&
+    (context.after === undefined || context.after === null || context.after === "pending" ||
+      isHandoffContextMeasurement(context.after));
+}
+
+function isHandoffCompactStats(value: unknown): value is HandoffCompactStats | undefined {
+  if (value === undefined) return true;
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
+  const compact = value as Record<string, unknown>;
+  const tokens = (n: unknown): boolean => n === undefined || (typeof n === "number" && Number.isFinite(n) && n >= 0);
+  return tokens(compact.preTokens) && tokens(compact.postTokens) &&
+    (compact.retainedResponseCount === undefined ||
+      (typeof compact.retainedResponseCount === "number" && Number.isSafeInteger(compact.retainedResponseCount) &&
+        compact.retainedResponseCount >= 2));
+}
+
+function isUnreadableLineCount(v: unknown): boolean {
+  return v === undefined || (typeof v === "number" && Number.isSafeInteger(v) && v > 0);
+}
+
 function isHandoffSource(v: unknown): boolean {
   if (typeof v !== "object" || v === null || Array.isArray(v)) return false;
   const h = v as Record<string, unknown>;
-  const compact = h.compact as { preTokens?: unknown; postTokens?: unknown } | undefined;
   return typeof h.sessionId === "string" && SESSION_ID_RE.test(h.sessionId) &&
     (h.title === undefined || typeof h.title === "string") &&
     (h.detailRunId === undefined || typeof h.detailRunId === "string") &&
@@ -4267,10 +4232,10 @@ function isHandoffSource(v: unknown): boolean {
       (typeof h.utteranceCount === "number" && Number.isSafeInteger(h.utteranceCount) && h.utteranceCount >= 0)) &&
     (h.decisionCount === undefined ||
       (typeof h.decisionCount === "number" && Number.isSafeInteger(h.decisionCount) && h.decisionCount >= 0)) &&
-    (compact === undefined ||
-      (typeof compact === "object" && compact !== null &&
-        typeof compact.preTokens === "number" && Number.isFinite(compact.preTokens) && compact.preTokens >= 0 &&
-        typeof compact.postTokens === "number" && Number.isFinite(compact.postTokens) && compact.postTokens >= 0));
+    isUnreadableLineCount(h.unreadableLineCount) &&
+    isHandoffDecisionCounts(h.decisions) &&
+    (h.contextUsage === undefined || isHandoffContextUsage(h.contextUsage)) &&
+    isHandoffCompactStats(h.compact);
 }
 
 function isSessionScanDegradation(v: unknown): boolean {
@@ -4286,10 +4251,8 @@ function isSessionScanDegradation(v: unknown): boolean {
   );
 }
 
-// 送信元は同じ拡張なので、目的は悪意の遮断ではなく protocol 変更時の型崩れの検出。フィールドの改名は受信時にしか検出できない。
 export function isHostToWebview(v: unknown): v is HostToWebview {
   if (typeof v !== "object" || v === null) return false;
-  // as は網羅の検査のために静的型を絞るだけで、実行時の値は各分岐が検査する。
   const t = (v as { type?: unknown }).type as HostToWebview["type"];
   const tabId = (v as { tabId?: unknown }).tabId;
 
@@ -4301,7 +4264,7 @@ export function isHostToWebview(v: unknown): v is HostToWebview {
 
   if (t === "orchestrationView") {
     return typeof tabId === "string" && hasOnlyKeys(v as Record<string, unknown>, ["type", "tabId", "state"])
-      && isOrchestrationView((v as { state?: unknown }).state); // R-ORC-14, R-ORC-22
+      && isOrchestrationView((v as { state?: unknown }).state);
   }
 
   if (t === "init") {
@@ -4311,7 +4274,6 @@ export function isHostToWebview(v: unknown): v is HostToWebview {
       typeof (v as { protocolVersion?: unknown }).protocolVersion === "number" &&
       ((v as { hostWindows?: unknown }).hostWindows === undefined ||
         typeof (v as { hostWindows?: unknown }).hostWindows === "boolean") &&
-      // R-CNV-20: init carries only normalized, non-blocked display extensions.
       (extensions === undefined || (Array.isArray(extensions) &&
         extensions.every((item) => typeof item === "string" && normalizeSystemAppExtension(item) === item))) &&
       Array.isArray(tabs) &&
@@ -4330,7 +4292,6 @@ export function isHostToWebview(v: unknown): v is HostToWebview {
     return isResumeHydrationStateMessage(v as Record<string, unknown>);
   }
   if (t === "tabCreated") {
-    // R-HND-08: activate の欠落を通すと、裏で開く経路が前面へ出す扱いに退化してフォーカスを奪う。
     return (
       isTabSnapshotShape((v as { tab?: unknown }).tab) &&
       typeof (v as { activate?: unknown }).activate === "boolean"
@@ -4347,7 +4308,6 @@ export function isHostToWebview(v: unknown): v is HostToWebview {
     const s = m.state;
     const source = m.source as { sessionId?: unknown; title?: unknown } | undefined;
     const fork = m.fork as { sessionId?: unknown; tabId?: unknown; title?: unknown } | undefined;
-    const compact = m.compact as { preTokens?: unknown; postTokens?: unknown } | undefined;
     const progress = m.progress as { heartbeats?: unknown; elapsedMs?: unknown; since?: unknown } | undefined;
     return (
       typeof tabId === "string" &&
@@ -4373,13 +4333,10 @@ export function isHostToWebview(v: unknown): v is HostToWebview {
           typeof fork.sessionId === "string" &&
           typeof fork.tabId === "string" &&
           typeof fork.title === "string")) &&
-      (compact === undefined ||
-        (typeof compact === "object" &&
-          compact !== null &&
-          typeof compact.preTokens === "number" &&
-          typeof compact.postTokens === "number")) &&
+      isHandoffCompactStats(m.compact) &&
+      (m.contextUsage === undefined || isHandoffContextUsage(m.contextUsage)) &&
       (m.utteranceCount === undefined || typeof m.utteranceCount === "number") &&
-      (m.unreadableLineCount === undefined || typeof m.unreadableLineCount === "number") &&
+      isUnreadableLineCount(m.unreadableLineCount) &&
       isHandoffDecisionCounts(m.decisions)
     );
   }
@@ -4407,7 +4364,8 @@ export function isHostToWebview(v: unknown): v is HostToWebview {
           (item.kind === "typed" || item.kind === "answer") &&
           typeof item.text === "string" &&
           (item.questions === undefined ||
-            (Array.isArray(item.questions) && item.questions.every((q) => typeof q === "string")))
+            (Array.isArray(item.questions) && item.questions.every((q) => typeof q === "string"))) &&
+          (item.imageRefs === undefined || isImageRefInfoArray(item.imageRefs))
         );
       }) &&
       isHandoffDecisions(m.decisions)
@@ -4489,7 +4447,6 @@ export function isHostToWebview(v: unknown): v is HostToWebview {
   if (t === "pickedFiles") {
     const paths = (v as { paths?: unknown }).paths;
     const images = (v as { images?: unknown }).images;
-    // R-CNV-05: 入力欄と添付欄へ差し込む前に形を確かめる。PICKED_FILE_MAX_COUNT の上限は Host 側の切り捨てとの整合で、守る要件は特定できていない。
     return (
       typeof (v as { reqId?: unknown }).reqId === "number" &&
       Array.isArray(paths) &&
@@ -4529,9 +4486,25 @@ export function isHostToWebview(v: unknown): v is HostToWebview {
       )
     );
   }
+  if (t === "sessionRenamed") {
+    const m = v as Record<string, unknown>;
+    return hasOnlyKeys(m, ["type", "sessionId", "title", "requestId"]) && typeof m.sessionId === "string" && typeof m.title === "string" &&
+      (m.requestId === undefined || isRenameRequestId(m.requestId));
+  }
+  if (t === "sessionHiddenChanged") {
+    const m = v as Record<string, unknown>;
+    return hasOnlyKeys(m, ["type", "sessionId", "hidden"]) && typeof m.sessionId === "string" && typeof m.hidden === "boolean";
+  }
+  if (t === "sessionListActionFailed") {
+    const m = v as Record<string, unknown>;
+    return hasOnlyKeys(m, ["type", "sessionId", "action", "reason", "requestId"]) && typeof m.sessionId === "string" &&
+      (SESSION_LIST_ACTIONS as readonly unknown[]).includes(m.action) && typeof m.reason === "string" &&
+      (m.requestId === undefined || isRenameRequestId(m.requestId));
+  }
   if (t === "sessions") {
-    const page = v as { source?: unknown; nextCursor?: unknown; append?: unknown };
+    const page = v as { source?: unknown; showHidden?: unknown; nextCursor?: unknown; append?: unknown };
     if (page.source !== undefined && page.source !== "laisora" && page.source !== "claude") return false;
+    if (page.showHidden !== undefined && typeof page.showHidden !== "boolean") return false;
     if (page.nextCursor !== undefined && (typeof page.nextCursor !== "string" || !/^\d+:\d+$/.test(page.nextCursor))) return false;
     if (page.append !== undefined && typeof page.append !== "boolean") return false;
     const sessions = (v as { sessions?: unknown }).sessions;
@@ -4552,7 +4525,8 @@ export function isHostToWebview(v: unknown): v is HostToWebview {
           typeof (s as { title?: unknown }).title === "string" &&
           typeof (s as { cwd?: unknown }).cwd === "string" &&
           typeof (s as { mtime?: unknown }).mtime === "number" &&
-          ((s as { originUnverified?: unknown }).originUnverified === undefined || typeof (s as { originUnverified?: unknown }).originUnverified === "boolean")
+          ((s as { originUnverified?: unknown }).originUnverified === undefined || typeof (s as { originUnverified?: unknown }).originUnverified === "boolean") &&
+          ((s as { hidden?: unknown }).hidden === undefined || typeof (s as { hidden?: unknown }).hidden === "boolean")
       )
     );
   }
@@ -4560,7 +4534,6 @@ export function isHostToWebview(v: unknown): v is HostToWebview {
     return typeof tabId === "string" && typeof (v as { text?: unknown }).text === "string" && (v as { text: string }).text.length <= 20_000;
   }
   if (t === "analysis") {
-    // report は中身も有無も見ない（src/analysis.ts#AnalysisReport と二重に持たない）。
     return (
       typeof (v as { sessionId?: unknown }).sessionId === "string" &&
       typeof (v as { filePath?: unknown }).filePath === "string"
@@ -4573,7 +4546,6 @@ export function isHostToWebview(v: unknown): v is HostToWebview {
     if (m.kind !== "script" && m.kind !== "action") return false;
     if (tabId !== undefined && (typeof tabId !== "string" || tabId.length === 0 || tabId.length > 200)) return false;
     if (m.reason !== undefined && (typeof m.reason !== "string" || m.reason.length === 0)) return false;
-    // 所見からの操作の拒否は必ず要求元タブと理由を持つ（無いと別タブへ出るか、無言で消える。R-ANL-11）
     return m.kind === "script" || (typeof tabId === "string" && typeof m.reason === "string");
   }
   if (t === "editorContext") {
@@ -4594,7 +4566,9 @@ export function isHostToWebview(v: unknown): v is HostToWebview {
   }
   if (t === "userSettings") {
     const appearance = (v as { appearance?: unknown }).appearance;
+    const displayName = (v as { displayName?: unknown }).displayName;
     return (appearance === undefined || isAccentSettings(appearance))
+      && (displayName === undefined || isDisplayName(displayName))
       && (COMPOSER_SEND_KEYS as readonly string[]).includes((v as { composerSendKey?: unknown }).composerSendKey as string);
   }
   if (t === "tabNotice") {
@@ -4630,7 +4604,6 @@ export function isHostToWebview(v: unknown): v is HostToWebview {
           typeof failure.attemptedCalls === "number" &&
           typeof failure.completedCalls === "number" &&
           typeof failure.plannedCalls === "number")) &&
-      // R-ANL-11: 未実行の理由を実行中・失敗と同居させない。
       (refusal === undefined ||
         (typeof refusal === "string" && refusal.length > 0 && m.running === false && failure === undefined))
     );
@@ -4651,7 +4624,6 @@ export function isHostToWebview(v: unknown): v is HostToWebview {
       typeof tabId === "string" &&
       typeof running === "boolean" &&
       (saveFailed === undefined || saveFailed === true) &&
-      // 失敗理由は終了の便にだけ載る（実行中の便に載ると開始直後に失敗表示が出る。R-DSP-01）
       (failure === undefined || (typeof failure === "string" && failure.length > 0 && running === false)) &&
       (summary === undefined ||
         (typeof summary === "object" && summary !== null &&
@@ -4743,20 +4715,17 @@ export function isHostToWebview(v: unknown): v is HostToWebview {
       (m.reason === "not-found" || m.reason === "read-failed" || m.reason === "invalid-request")
     );
   }
-  if (t === "cachedUsage") {
-    const limits = (v as { limits?: unknown }).limits;
+  if (t === "accountUsage") {
+    const m = v as Record<string, unknown>;
     return (
-      typeof (v as { fetchedAtMs?: unknown }).fetchedAtMs === "number" &&
-      Array.isArray(limits) &&
-      (limits as unknown[]).every(
-        (l) =>
-          typeof l === "object" &&
-          l !== null &&
-          typeof (l as { type?: unknown }).type === "string" &&
-          typeof (l as { utilization?: unknown }).utilization === "number" &&
-          ((l as { resetsAt?: unknown }).resetsAt === null ||
-            typeof (l as { resetsAt?: unknown }).resetsAt === "number")
-      )
+      Object.keys(m).every((key) => key === "type" || key === "replyTo" || key === "seq" || key === "fetchedAtMs" || key === "state" || key === "rows") &&
+      isAccountUsageRequestId(m.replyTo) &&
+      typeof m.seq === "number" && Number.isSafeInteger(m.seq) && m.seq > 0 &&
+      typeof m.fetchedAtMs === "number" && Number.isFinite(m.fetchedAtMs) &&
+      (ACCOUNT_USAGE_STATES as readonly unknown[]).includes(m.state) &&
+      Array.isArray(m.rows) && m.rows.length <= ACCOUNT_USAGE_ROWS_MAX &&
+      m.rows.every(isAccountUsageRow) &&
+      (m.state === "ok" || m.rows.length === 0)
     );
   }
   if (t === "analysisPersistenceState") {
@@ -4769,7 +4738,6 @@ export function isHostToWebview(v: unknown): v is HostToWebview {
     );
   }
 
-  // バリアントを足して分岐を忘れると tsc がここで落ちる。
   t satisfies never;
   return false;
 }

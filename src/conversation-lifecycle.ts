@@ -1,7 +1,7 @@
 import { applyFallbackModel, fallbackOriginalModel, resolveFallbackByChoice, type EventProvenance, type FallbackRevertOutcome, type NormalizedEventBody } from "./protocol";
 import { join } from "node:path";
-import * as vscode from "vscode";
 import { getLaisoraConfiguration } from "./claude-settings";
+import { EXPERIMENT_HOLDOUT_PERCENT } from "./learning-experiment";
 import { cancelPendingModelProfileResearch, finishModelProfileResearch, flushModelProfileResearch } from "./learning-research";
 import { postSettingsState } from "./settings-panel";
 import { persistInitialTabTitle } from "./session-list-wiring";
@@ -41,11 +41,11 @@ const orchestrationPublishers = new WeakMap<ClaudeConversation, OrchestrationVie
 
 export function postOrchestrationView(s: Session): void {
   const conv = s.conversation;
-  if (!conv?.orchestrationActive || s.closed) return; // R-ORC-38
+  if (!conv?.orchestrationActive || s.closed) return;
   let publisher = orchestrationPublishers.get(conv);
   if (publisher === undefined) {
     publisher = new OrchestrationViewPublisher(() => {
-      if (s.closed || s.conversation !== conv) return undefined; // R-ORC-21
+      if (s.closed || s.conversation !== conv) return undefined;
       const current = getLaisoraConfiguration();
       return orchestrationViewForConversation(conv, {
         orchestrationEnabled: current.get<boolean>("orchestration.enabled", false),
@@ -60,7 +60,6 @@ export function postOrchestrationView(s: Session): void {
   publisher.schedule();
 }
 
-// publishConfiguredEffort must also publish model resolution when effort is unchanged.
 function publishConfiguredEffort(st: SessionStore | null | undefined, s: Session): void {
   const shown = effortDisplayFromSnapshot(
     s.configuredEffortSnapshot,
@@ -74,7 +73,7 @@ function publishConfiguredEffort(st: SessionStore | null | undefined, s: Session
     type: "configuredEffortChanged",
     tabId: s.tabId,
     effort: shown.configured ?? null,
-    model: s.configuredEffortSnapshot?.resolvedModel ?? null,
+    model: s.initialModel ? null : s.configuredEffortSnapshot?.resolvedModel ?? null,
     defaultEffort: shown.default ?? null,
     appliedModel: s.appliedModel ?? null,
     ...(s.appliedEffort === undefined ? {} : { appliedEffort: s.appliedEffort }),
@@ -116,14 +115,12 @@ function refreshConfiguredEffort(
     if (applied === undefined || !current() || fallbackReadingStale(s, fallbackAtRequest)) return;
     s.appliedEffort = applied.effort;
     s.appliedModel = applied.model;
+    if (s.initialModel && s.modelOverride === undefined && !s.auth?.model) s.effectiveModel = applied.model;
     s.modelFallback = applyFallbackModel(s.modelFallback, applied.model, Date.now(), s.models);
-    // 設定解決を待たずに適用観測を届ける（publishConfiguredEffort）。
     publishConfiguredEffort(st, s);
   });
 }
 
-// R-GW-07: a reading requested before a newer fallback notice or model observation is stale; a restore record alone
-// does not outdate it (verify-gateway-wiring#GW-RFm12).
 function fallbackReadingMark(s: Session): { notice?: object; model?: string } {
   return { notice: s.modelFallback?.notice, model: s.modelFallback?.appliedModel };
 }
@@ -165,7 +162,6 @@ function profileTargetState(
   return s.generation === processGeneration && s.conversation === conv ? "current" : "restarted";
 }
 
-// 保存失敗の通知先は操作した会話に揃える（applyModelChange / applyEffortChange、R-DSP-01 / R-CMD-02）。
 function settingsWriteFailureText(result: Extract<SettingsWriteResult, { ok: false }>): string {
   return result.reason === "read_failed"
     ? l10n.t("could not read ~/.claude/settings.json (existing settings were not changed)")
@@ -188,9 +184,7 @@ async function applyEffortChange(
   const logicalGeneration = s.logicalGeneration;
   const run = async (): Promise<void> => {
     if (s.closed || s.logicalGeneration !== logicalGeneration) return;
-    // 待機中の再起動で要求を失効させないため、世代は profileChangeTail の待機後に捕捉する。
     const processGeneration = s.generation;
-    // 適用先と保存先を同じ観測点で固定する（verify-gateway-wiring#MC-3）。
     const canonicalModel = canonicalEffortModel(s);
     const conv = s.conversation;
     if (conv !== null && !conv.isClosed) {
@@ -263,7 +257,6 @@ async function applyEffortChange(
   await queued;
 }
 
-// R-GW-09: the automatic restore sends the fallback's original model to the CLI but keeps the tab's own selection (verify-gateway-wiring#GW-RFm16).
 interface FallbackRestore {
   override: string | null | undefined;
   stillWanted: () => boolean;
@@ -272,14 +265,17 @@ interface FallbackRestore {
 async function applyModelChange(
   st: SessionStore,
   s: Session,
-  requested: string | null,
+  requestedRaw: string | null,
   sessionOnly = false,
   restore?: FallbackRestore
 ): Promise<FallbackRevertOutcome | "discarded" | "unwanted"> {
+  const requested =
+    requestedRaw === "default" && !sessionOnly && s.models.some((m) => m.id === "default") ? null : requestedRaw;
   const logicalGeneration = s.logicalGeneration;
   const run = async (): Promise<FallbackRevertOutcome | "discarded" | "unwanted"> => {
     if (s.closed || s.logicalGeneration !== logicalGeneration) return "discarded";
-    // R-GW-09: a choice applied while the restore waited in profileChangeTail wins (verify-gateway-wiring#GW-RFm9).
+    while (s.starting) await s.starting;
+    if (s.closed || s.logicalGeneration !== logicalGeneration) return "discarded";
     if (restore !== undefined && !restore.stillWanted()) return "unwanted";
     const processGeneration = s.generation;
     const previous = s.modelOverride;
@@ -290,11 +286,9 @@ async function applyModelChange(
       } catch (error) {
         const targetState = profileTargetState(s, logicalGeneration, processGeneration, conv);
         if (targetState === "restarted") {
-          // R-GW-09: the restore's recorded "failed" outcome is its only notice (verify-gateway-wiring#GW-RFm23).
           if (restore === undefined) reportProfileRestart(s, "model");
         } else if (targetState === "current") {
           output.appendLine(`[${s.title}] setModel 失敗: ${String(error)}`);
-          // R-GW-09: nothing was selected on the restore path; its recorded "failed" outcome is the notice (verify-gateway-wiring#GW-RFm22).
           if (restore !== undefined) return "failed";
           s.pushEvent({
             kind: "error",
@@ -311,7 +305,6 @@ async function applyModelChange(
       const targetState = profileTargetState(s, logicalGeneration, processGeneration, conv);
       if (targetState === "discard") return "discarded";
       if (targetState === "restarted") {
-        // R-GW-09: the restore's recorded "failed" outcome is its only notice (verify-gateway-wiring#GW-RFm24).
         if (restore === undefined) reportProfileRestart(s, "model");
         return "failed";
       }
@@ -319,16 +312,16 @@ async function applyModelChange(
 
     s.modelOverride = restore === undefined ? requested : restore.override;
     clearObservedEffort(s);
-    const knownRow = requested === null || s.models.length === 0 || s.models.some((m) => m.id === requested);
+    const knownRow = requested === null || s.models.some((m) => m.id === requested);
     const saved: SettingsWriteResult | null = knownRow && !sessionOnly ? updateClaudeCodeSettings({ model: requested }) : null;
-    // src/claudeHost.ts#setModel は認証観測を更新しないため、明示指定を分析・要約へ渡す。
     if (conv !== null && s.conversation === conv) s.effectiveModel = requested;
-    // 適用・保存の結果を確認してから通知文を組む（verify-gateway-wiring#NL-MODEL-1、R-DSP-01 / R-CMD-02）。
     const label = requested === null ? null : s.models.find((m) => m.id === requested)?.label ?? requested;
     const notice = sessionOnly
       ? l10n.t("Changed model to {0} for this conversation.", label ?? "")
       : saved === null
-      ? l10n.t("LAISORA: Changed model to {0} for this session; it was not saved to settings.json because the model is not in the model list.", label ?? "")
+      ? s.models.length === 0
+        ? l10n.t("LAISORA: Changed model to {0} for this session; it was not saved to settings.json because the model list has not loaded yet.", label ?? "")
+        : l10n.t("LAISORA: Changed model to {0} for this session; it was not saved to settings.json because the model is not in the model list.", label ?? "")
       : !saved.ok
         ? label === null
           ? l10n.t("LAISORA: Reset the model to the default for this session, but the change was not saved: {0}.", settingsWriteFailureText(saved))
@@ -337,23 +330,19 @@ async function applyModelChange(
           ? l10n.t("LAISORA: Reset the model to the default (removed model from settings.json).")
           : l10n.t("LAISORA: Changed model to {0} (saved to settings.json).", label);
     const openFallback = s.modelFallback?.resolvedAt === undefined ? s.modelFallback : undefined;
-    s.modelFallback = resolveFallbackByChoice(s.modelFallback, requested, Date.now());
-    // R-GW-09: the recorded restore outcome is the notice for the automatic restore (verify-gateway-wiring#GW-RFm17).
+    s.modelFallback = resolveFallbackByChoice(s.modelFallback, requested, Date.now(), s.models);
     if (restore === undefined) st.post({ type: "modelChanged", tabId: s.tabId, model: requested, notice, applied: true });
-    // R-CNV-43: the explicit choice is recorded so a replay does not reopen the confirmation (verify-gateway-wiring#GW-RFm15).
     if (restore === undefined && openFallback !== undefined) {
       s.pushEvent({ kind: "model_fallback_revert", turnId: openFallback.notice.turnId,
         originalModel: fallbackOriginalModel(openFallback), outcome: "chosen" });
     }
     s.configuredEffortSnapshot = undefined;
-    // 切替前の適用観測を次の表示・分析へ持ち越さない（verify-gateway-wiring#MC-4）。
     s.appliedModel = undefined;
     s.appliedEffort = undefined;
     s.configuredEffortGeneration += 1;
     publishConfiguredEffort(st, s);
     output.appendLine(`[${s.title}] setModel: ${requested ?? "(既定)"} を適用`);
     if (conv === null || conv.isClosed) {
-      // R-GW-09: the restore never starts a process; the next send launches on launchModel (verify-gateway-wiring#GW-RFm18).
       if (restore !== undefined) return "deferred";
       warmup(s);
     } else {
@@ -385,18 +374,15 @@ function noteFallbackRevert(s: Session, conv: ClaudeConversation, ev: LiveEventB
   if (ev.kind !== "model_refusal_fallback" || ev.scope !== "session") return ev;
   if (getLaisoraConfiguration().get<boolean>(FALLBACK_REVERT_SETTING, true) === false) return { ...ev, autoRevert: "off" };
   const pending = s.fallbackRevert;
-  // R-GW-09: a second fallback in the same turn restores the model the turn started with (verify-gateway-wiring#GW-RFm21).
   if (pending?.conversation !== conv || pending.turnId !== ev.turnId || s.modelFallback?.resolvedAt !== undefined) {
     s.fallbackRevert = { conversation: conv, turnId: ev.turnId, originalModel: ev.originalModel, priorOverride: s.modelOverride };
   }
   return { ...ev, autoRevert: "pending" };
 }
 
-// R-GW-09: one attempt per pending fallback (verify-gateway-wiring#GW-RFm4).
 function settleFallbackRevert(st: SessionStore | null | undefined, s: Session, conv: ClaudeConversation, ev: LiveEventBody): void {
   const pending = s.fallbackRevert;
   if (pending === undefined || pending.conversation !== conv) return;
-  // R-GW-09: a notice that arrives outside a turn is settled at once (verify-gateway-wiring#GW-RFm13).
   if (!FALLBACK_REVERT_TURN_END_KINDS.has(ev.kind) && !(ev.kind === "model_refusal_fallback" && conv.state === "idle")) return;
   s.fallbackRevert = undefined;
   const notice = s.modelFallback?.notice;
@@ -409,7 +395,6 @@ function settleFallbackRevert(st: SessionStore | null | undefined, s: Session, c
     record("failed");
     return;
   }
-  // R-GW-09: the next root model is observed even when it is the fallback model again (verify-gateway-wiring#GW-RFm14).
   if (!conv.isClosed) conv.rearmRootModelObservation();
   const logicalGeneration = s.logicalGeneration;
   void applyModelChange(st, s, pending.originalModel, true, { override: pending.priorOverride, stillWanted }).then((result) => {
@@ -417,12 +402,11 @@ function settleFallbackRevert(st: SessionStore | null | undefined, s: Session, c
   });
 }
 
-// R-GW-09: a resumed CLI keeps the transcript's model unless one is passed,
-// so a fallback restored by LAISORA is pinned for the next launch (verify-gateway-wiring#GW-RFm19).
 function launchModel(s: Session): string | null | undefined {
   const fallback = s.modelFallback;
   if (fallback !== undefined && fallback.resolvedAt === undefined) return fallback.appliedModel;
-  if (s.modelOverride !== undefined || fallback === undefined) return s.modelOverride;
+  if (s.modelOverride !== undefined) return s.modelOverride;
+  if (fallback === undefined) return s.initialModel ?? undefined;
   return fallback.autoRevert === "applied" || fallback.autoRevert === "deferred" ? fallback.appliedModel : undefined;
 }
 
@@ -434,7 +418,6 @@ export async function handleConversationMessage(
   switch (msg.type) {
     case "send": {
       target!.conversation?.cancelAutoResume();
-      // 楽観表示の確定・撤去は送信時のトークンで対応付ける（src/protocol.ts#ResumeHydrationSendDisposition）。
       const clientToken = msg.clientToken;
       const disposition = (
         value: "accepted-human" | "accepted-nonhuman" | "rejected"
@@ -446,7 +429,6 @@ export async function handleConversationMessage(
           sendDisposition: { clientToken, disposition: value },
         });
       };
-      // R-SES-08: クリア対象へ投入しない（verify-tab-restore#TR-CLR）。
       if (target!.clearing) {
         target!.pushEvent({
           kind: "error",
@@ -456,7 +438,6 @@ export async function handleConversationMessage(
         disposition("rejected");
         break;
       }
-      // src/session-transcript.ts#extractHumanUserText と非人間入力の扱いを揃える（R-HND-05）。
       if (HUMAN_INPUT_INJECTED_TAG_RE.test(msg.text.trimStart())) {
         target!.pushEvent({
           kind: "error",
@@ -474,7 +455,6 @@ export async function handleConversationMessage(
         disposition("rejected");
         throw e;
       }
-      // 起動待ちの後にも投入先を検証する（R-SES-08、verify-tab-restore#TR-CLR）。
       if (target!.closed || target!.clearing) {
         disposition("rejected");
         break;
@@ -484,7 +464,6 @@ export async function handleConversationMessage(
         if (firstLine) {
           const hydrating = target!.hydration;
           if (hydrating !== null && hydrating.buffering) {
-            // 履歴側の命名を先に適用する（src/resume-hydration.ts#runResumeHydration、R-SES-05）。
             hydrating.liveTitleCandidate = firstLine;
           } else {
             target!.title = displayTitleFromSummary(firstLine, target!.tabId);
@@ -493,12 +472,9 @@ export async function handleConversationMessage(
           }
         }
       }
-      // 非人間コマンドも送信自体は止めない（src/human-input-vocabulary.ts#isNonHumanCommandInput）。
-      // 拒否した送信の添付を保持するための取得境界（src/pending-attachments.ts#pendingAttachments、R-CNV-11）。
       msg.images = pendingAttachments.take(target!.tabId);
       postAttachments(st, target!.tabId);
       if (!isNonHumanCommandInput(msg.text)) {
-        // 確定配送との重複を避けるため、楽観表示と照合できるトークンを渡す（src/protocol.ts#ResumeHydrationSendDisposition）。
         target!.pushEvent(
           { kind: "user_message", turnId: null, text: msg.text, images: msg.images, sentAt: Date.now() },
           undefined,
@@ -509,7 +485,6 @@ export async function handleConversationMessage(
       } else {
         disposition("accepted-nonhuman");
       }
-      // 復元後の送信にも観測済み時刻を引き継ぐ（sessionObservedTimestampSeed）。
       target!.conversation!.send(msg.text, msg.images, sessionObservedTimestampSeed(target!));
       break;
     }
@@ -525,7 +500,6 @@ export async function handleConversationMessage(
     case "setMode":
       target!.permissionMode = msg.mode;
       await target!.conversation?.setPermissionMode(msg.mode);
-      // 永続化の根拠は src/claude-settings.ts#resolveInitialMode。
       if (msg.mode !== "bypassPermissions") {
         void extensionContext?.globalState?.update(PERMISSION_MODE_KEY, msg.mode);
       }
@@ -550,14 +524,18 @@ export function warmup(s: Session): void {
   );
 }
 
-// 到着判定と同じ境界時刻を渡す（src/observed-timestamp-seed.ts#observedTimestampSeed）。
 function sessionObservedTimestampSeed(s: Session): number | undefined {
   const hydrating = s.hydration !== null && s.hydration.buffering ? s.hydration : null;
   return observedTimestampSeed(hydrating?.arrivalTimestamp, s.lastRecordedEventTimestamp);
 }
 
 async function ensureConversation(s: Session): Promise<void> {
+  const logicalGeneration = s.logicalGeneration;
+  if (s.resumePreparation !== null) await s.resumePreparation.ready;
   while (s.starting) await s.starting;
+  if (s.closed || s.logicalGeneration !== logicalGeneration) {
+    throw new Error(l10n.t("The logical session of this tab changed while the conversation was starting (restore or clear)."));
+  }
   const generation = s.logicalGeneration;
   const p = ensureConversationInner(s);
   s.starting = p.catch(() => {
@@ -570,7 +548,6 @@ async function ensureConversation(s: Session): Promise<void> {
 
 async function ensureConversationInner(s: Session): Promise<void> {
   const logicalGenerationAtStart = s.logicalGeneration;
-  // 継続先を固定せず、終了した会話の認証観測から取得する（verify-gateway-wiring#GW-CR-02）。
   let crashResumeSessionId: string | undefined;
   if (s.conversation?.isClosed) {
     s.guardrailRunner.settleConversationLost();
@@ -581,7 +558,6 @@ async function ensureConversationInner(s: Session): Promise<void> {
     s.backgroundActivity = createBackgroundActivityState();
     s.guardrail = clearProcessEphemeral(s.guardrail);
     s.lastContextTotalTokens = null;
-    // 未使用判定は会話を切り離してから行う（src/session.ts#isUnusedSession、verify-gateway-wiring#GW-CR-01）。
     crashResumeSessionId = isUnusedSession(s) ? undefined : s.auth?.sessionId;
   }
   if (s.conversation) return;
@@ -597,16 +573,20 @@ async function ensureConversationInner(s: Session): Promise<void> {
   }
   s.cwd = cwd;
 
-  // 設定の予測を起動時の明示指定へ昇格させない（verify-gateway-wiring#MC-1）。
   invalidateClaudeCodeSettingsCache();
+  if (s.initialModel === undefined && !s.resumeSessionId && !crashResumeSessionId) {
+    s.initialModel = cfg.get<string>("claude.initialModel", "").trim() || null;
+  }
   s.effectiveModel = launchModel(s);
-  // 要求値を適用観測として扱わない（clearObservedEffort）。
   s.effectiveEffort = undefined;
 
   const initialObservedTimestamp = sessionObservedTimestampSeed(s);
 
   const learningEnabled = cfg.get<boolean>("learning.enabled", false) === true;
   const learningConfiguredSnapshot = learningEnabled ? await resolveConfiguredEffortSnapshot(cwd, settingSources) : undefined;
+  if (s.closed || s.logicalGeneration !== logicalGenerationAtStart) {
+    throw new Error(l10n.t("The logical session of this tab changed while the conversation was starting (restore or clear)."));
+  }
   const conv = new ClaudeConversation({
     cwd,
     initialObservedTimestamp,
@@ -623,8 +603,17 @@ async function ensureConversationInner(s: Session): Promise<void> {
     planInstruction: cfg.get<boolean>("claude.planInstruction", true) !== false,
     orchestrationEnabled: cfg.get<boolean>("orchestration.enabled", false) === true,
     learningEnabled,
+    learningEvidenceSource: s.learningEvidenceSource,
+    learningDedicated: s.learningDedicated,
+    learningSwitches: () => {
+      const current = getLaisoraConfiguration();
+      return { enabled: current.get<boolean>("learning.enabled", false), automaticAdoption: current.get<boolean>("learning.automaticAdoption", true),
+        targetInjection: current.get<boolean>("learning.targetInjection", true), observationDelivery: current.get<boolean>("learning.observationDelivery", true),
+        publicDelivery: current.get<boolean>("learning.publicDelivery", true), experiment: current.get<boolean>("learning.experiment", true),
+        guard: current.get<boolean>("learning.guard", true) };
+    },
+    learningHoldoutPercent: () => getLaisoraConfiguration().get<number>("learning.holdoutPercent", EXPERIMENT_HOLDOUT_PERCENT),
     learningDirectory: extensionContext?.globalStorageUri?.fsPath ? join(extensionContext.globalStorageUri.fsPath, "laisora-learning") : undefined,
-    learningScope: vscode.workspace.getWorkspaceFolder?.(vscode.Uri.file(cwd))?.name ?? "global",
     configuredResolvedModel: learningConfiguredSnapshot?.resolvedModel,
     orchestrationAgents: cfg.get<unknown>("orchestration.agents", []),
     externalModels: cachedExternalModels(),
@@ -633,7 +622,7 @@ async function ensureConversationInner(s: Session): Promise<void> {
     conductorPolicy: cfg.get<string>("orchestration.conductorPolicy", ""),
     onLearningRecorded: postSettingsState,
     onOrchestrationChanged: () => {
-      if (s.conversation === conv) postOrchestrationView(s); // R-ORC-21
+      if (s.conversation === conv) postOrchestrationView(s);
     },
     interruptForceKillTimeoutMs: cfg.get("interruptForceKillTimeoutMs", 5000),
     onEvent: (raw, conversationId, meta) => {
@@ -671,15 +660,14 @@ async function ensureConversationInner(s: Session): Promise<void> {
     },
     onApprovalRequest: (req) =>
       new Promise((resolve) => {
-        conv.registerPendingApproval(req.requestId, req.toolName, resolve);
+        conv.registerPendingApproval(req.requestId, req.toolName, resolve, req.toolUseId);
       }),
     log: (m) => output.appendLine(`[${s.title}] ${m}`),
   });
   try {
     s.expectedConversationId = conv.conversationId;
     await conv.start();
-    // 失効時も起動失敗として返す。ensureConversation の呼び出し側は成功後に会話の存在を前提とする。
-    if (s.logicalGeneration !== logicalGenerationAtStart) {
+    if (s.closed || s.logicalGeneration !== logicalGenerationAtStart) {
       void conv.dispose();
       throw new Error(l10n.t("The logical session of this tab changed while the conversation was starting (restore or clear)."));
     }
@@ -692,7 +680,7 @@ async function ensureConversationInner(s: Session): Promise<void> {
       s.applyCommandList(cmds);
     });
     void conv.supportedModels().then((models) => {
-      if (s.conversation !== conv) return;
+      if (s.closed || s.conversation !== conv) return;
       s.discoveredModels = models;
       recomputeModelRows(s);
       rederiveConfiguredEffort(store, s);

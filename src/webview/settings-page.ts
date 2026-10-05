@@ -1,4 +1,6 @@
 import { createAccentSettings } from "./accent-settings";
+import { bindUserLabel, setDisplayName } from "./user-label";
+import { DISPLAY_NAME_MAX, displayNameLength, normalizeDisplayName } from "../display-name";
 import { normalizeSystemAppExtension } from "../file-link-open-mode";
 import { EXECUTORS, DEFAULT_EXECUTOR, canonicalExecutorEfforts, executorModelList, modelSelectionState, isExecutorId, isExternalExecutorId, rowEfforts, rowComplete, type ExecutorRow } from "../orchestration-executors";
 import { modelListStatusText } from "../model-display-name";
@@ -45,7 +47,6 @@ function section(root: HTMLElement, title: string): HTMLElement {
   return card;
 }
 
-// focusTarget を渡さない control は <label for> で結ぶので、id を持つ select / button に限る
 function row(card: HTMLElement, label: string, description: string, control: HTMLElement, focusTarget?: () => HTMLElement | undefined): HTMLElement {
   const serial = ++rowSerial;
   const line = element("div", "settings-row");
@@ -83,7 +84,6 @@ function switchButton(id: string): HTMLButtonElement {
   return button;
 }
 
-// 実効値が届くまでは空の選択肢を選んだまま無効にする（既定値を現在値として名乗らない。R-DSP-01）
 function select<V extends string>(options: Array<[V, string]>): HTMLSelectElement {
   const el = element("select", "settings-select");
   const unknown = element("option", "settings-option-unknown", "");
@@ -109,14 +109,27 @@ const settingsShell = element("div", "settings-shell");
 const settingsNav = element("nav", "settings-nav");
 settingsNav.setAttribute("aria-label", l10n.t("Settings categories"));
 const settingsContent = element("div", "settings-content");
+const settingsMain = element("div", "settings-main");
+const settingsPageHead = element("div", "settings-page-head");
+const settingsPageTitle = element("div", "settings-page-title");
+settingsPageHead.append(settingsPageTitle, element("div", "settings-page-sub", l10n.t("LAISORA Settings")));
+const settingsBody = element("div", "settings-body");
+const settingsToc = element("nav", "settings-toc");
+settingsToc.setAttribute("aria-label", l10n.t("On this page"));
+const settingsTocList = element("ol", "settings-toc-list");
+settingsToc.append(element("div", "l-label settings-toc-label", l10n.t("On this page")), settingsTocList);
+let settingsTocSections: Array<{ heading: HTMLElement; link: HTMLButtonElement }> = [];
 const settingsCategories = [
   { key: "general", title: l10n.t("General") },
   { key: "files", title: l10n.t("File links") },
   { key: "roster", title: l10n.t("Agent roster") },
-].map((category) => {
-  const button = element("button", "settings-segment settings-nav-button", category.title);
+].map((category, index) => {
+  const button = element("button", "settings-tab");
   button.type = "button";
   button.id = `settings-nav-${category.key}`;
+  const number = element("span", "settings-tab-number", String(index + 1).padStart(2, "0"));
+  number.setAttribute("aria-hidden", "true");
+  button.append(number, element("span", "settings-tab-label", category.title));
   const panel = element("div", "settings-category");
   panel.id = `settings-category-${category.key}`;
   panel.setAttribute("aria-labelledby", button.id);
@@ -131,9 +144,42 @@ function activateSettingsCategory(key: string): void {
     category.panel.hidden = !active;
     if (active) category.button.setAttribute("aria-current", "page");
     else category.button.removeAttribute("aria-current");
+    if (active) settingsPageTitle.textContent = category.title;
   }
   vscode.setState({ category: key });
+  renderSettingsToc();
 }
+function renderSettingsToc(): void {
+  const panel = settingsCategories.find((category) => !category.panel.hidden)?.panel;
+  const headings = panel ? Array.from(panel.querySelectorAll<HTMLElement>("h2")) : [];
+  settingsTocSections = headings.map((heading, index) => {
+    const link = element("button", "settings-toc-link");
+    link.type = "button";
+    const number = element("span", "settings-toc-number", String(index + 1).padStart(2, "0"));
+    number.setAttribute("aria-hidden", "true");
+    link.append(number, element("span", "settings-toc-text", heading.textContent ?? ""));
+    link.addEventListener("click", () => {
+      heading.scrollIntoView({ block: "start" });
+      markSettingsToc(heading);
+    });
+    return { heading, link };
+  });
+  settingsTocList.replaceChildren(...settingsTocSections.map(({ link }) => {
+    const item = element("li", "settings-toc-item");
+    item.appendChild(link);
+    return item;
+  }));
+  settingsToc.hidden = settingsTocSections.length < 2;
+  markSettingsToc();
+}
+function markSettingsToc(target?: HTMLElement): void {
+  const current = target ?? [...settingsTocSections].reverse().find(({ heading }) => heading.getBoundingClientRect().top <= 96)?.heading ?? settingsTocSections[0]?.heading;
+  for (const { heading, link } of settingsTocSections) {
+    if (heading === current) link.setAttribute("aria-current", "location");
+    else link.removeAttribute("aria-current");
+  }
+}
+window.addEventListener("scroll", () => markSettingsToc(), { passive: true });
 for (const [index, category] of settingsCategories.entries()) {
   category.button.addEventListener("click", () => activateSettingsCategory(category.key));
   category.button.addEventListener("keydown", (event) => {
@@ -142,26 +188,172 @@ for (const [index, category] of settingsCategories.entries()) {
       activateSettingsCategory(category.key);
       return;
     }
-    if (event.key !== "ArrowUp" && event.key !== "ArrowDown") return; // R-ORC-20
+    if (event.key !== "ArrowUp" && event.key !== "ArrowDown") return;
     event.preventDefault();
     settingsCategories[(index + (event.key === "ArrowDown" ? 1 : -1) + settingsCategories.length) % settingsCategories.length].button.focus();
   });
 }
 const savedSettingsCategory = vscode.getState()?.category;
 activateSettingsCategory(settingsCategories.some((category) => category.key === savedSettingsCategory) ? savedSettingsCategory! : "general");
-settingsShell.append(settingsNav, settingsContent);
+settingsBody.append(settingsContent, settingsToc);
+settingsMain.append(settingsPageHead, settingsBody);
+settingsShell.append(settingsNav, settingsMain);
 root.appendChild(settingsShell);
 const [generalCategory, fileCategory, rosterCategory] = settingsCategories.map((category) => category.panel);
 const accentCard = section(generalCategory, l10n.t("Appearance"));
+const displayNameField = element("div", "settings-name-field");
+const displayNameInput = element("input", "settings-input settings-name-input");
+displayNameInput.id = "setting-display-name";
+displayNameInput.type = "text";
+displayNameInput.placeholder = l10n.t("You");
+displayNameInput.spellcheck = false;
+displayNameInput.autocomplete = "off";
+displayNameInput.disabled = true;
+const displayNameMeta = element("div", "settings-name-meta");
+const displayNameCount = element("span", "settings-name-count");
+displayNameCount.setAttribute("aria-hidden", "true");
+const displayNameReset = element("button", "settings-link", l10n.t("Use the default"));
+displayNameReset.id = "setting-display-name-reset";
+displayNameReset.type = "button";
+displayNameReset.disabled = true;
+displayNameMeta.append(displayNameCount, displayNameReset);
+displayNameField.append(displayNameInput, displayNameMeta);
+const displayNameText = row(accentCard, l10n.t("Display name"), l10n.t("Shown instead of YOU in the chat, the YOU column and the decision and machine-check cards, and used as the user heading of the Markdown export. Leave empty to keep YOU. Up to {0} characters.", DISPLAY_NAME_MAX), displayNameField, () => displayNameInput);
+displayNameText.querySelector("label")!.htmlFor = displayNameInput.id;
+const displayNameRow = displayNameText.parentElement!;
+displayNameRow.classList.add("settings-row-you");
+const displayNameNotice = rowNote(displayNameText, "settings-row-note settings-name-notice", "");
+displayNameNotice.setAttribute("role", "status");
+displayNameNotice.setAttribute("aria-live", "polite");
+displayNameInput.setAttribute("aria-labelledby", displayNameField.getAttribute("aria-labelledby")!);
+displayNameInput.setAttribute("aria-describedby", `${displayNameField.getAttribute("aria-describedby")} ${displayNameNotice.id}`);
+displayNameField.removeAttribute("aria-labelledby");
+displayNameField.removeAttribute("aria-describedby");
+displayNameRow.appendChild(displayNamePreview());
+let pendingDisplayName: number | null = null;
+let queuedDisplayName: string | null = null;
+let displayNameEdited = false;
+function displayNamePreview(): HTMLElement {
+  const preview = element("div", "settings-name-preview");
+  preview.setAttribute("role", "group");
+  const caption = element("div", "l-label settings-preview-caption", l10n.t("Where it appears"));
+  caption.id = "setting-display-name-preview";
+  preview.setAttribute("aria-labelledby", caption.id);
+  const chat = element("div", "settings-preview-chat");
+  const turn = (role: "user" | "assistant", text: string): HTMLElement => {
+    const block = element("div", `settings-preview-turn ${role}`);
+    const label = element("div", "turn-label");
+    label.appendChild(role === "user" ? bindUserLabel(element("span", "turn-label-name")) : element("span", "turn-label-name", "Claude"));
+    block.append(label, element("div", "settings-preview-message", text));
+    return block;
+  };
+  chat.append(element("div", "l-label settings-preview-place", l10n.t("Chat")),
+    turn("user", l10n.t("Add a Mark all done button to the footer.")),
+    turn("assistant", l10n.t("Should it also mark todos hidden by the current filter?")));
+  const markdown = element("div", "settings-preview-export");
+  const markdownHeading = element("span", "settings-preview-md-name");
+  const markdownLine = element("pre", "settings-preview-md");
+  markdownLine.append(element("span", "settings-preview-md-mark", "## "), markdownHeading);
+  markdown.append(element("div", "l-label settings-preview-place", l10n.t("Markdown export")), markdownLine);
+  const left = element("div", "settings-preview-left");
+  left.append(chat, markdown);
+  const youColumn = element("div", "settings-preview-you");
+  const youHead = element("div", "settings-preview-you-head");
+  youHead.append(bindUserLabel(element("span", "you-label")), element("div", "you-heading", l10n.t("Your decisions, approvals and checks")));
+  const card = (kind: string, title: string): HTMLElement => {
+    const item = element("div", "settings-preview-card");
+    const square = element("span", "you-square");
+    square.setAttribute("aria-hidden", "true");
+    const body = element("div", "settings-preview-card-body");
+    const label = element("div", "ask-label");
+    label.append(bindUserLabel(element("span", "ask-label-name")), element("span", "ask-label-kind", ` · ${kind}`));
+    body.append(label, element("div", "settings-preview-card-title", title));
+    item.append(square, body);
+    return item;
+  };
+  youColumn.append(element("div", "l-label settings-preview-place", l10n.t("YOU column")), youHead,
+    card(l10n.t("Decision"), l10n.t("Should it also mark todos hidden by the current filter?")),
+    card(l10n.t("Machine check"), l10n.t("Check the footer buttons in the app")));
+  const grid = element("div", "settings-preview-grid");
+  grid.append(left, youColumn);
+  preview.append(caption, grid);
+  return preview;
+}
+function displayNameInputValue(): string {
+  return normalizeDisplayName(displayNameInput.value);
+}
+function renderDisplayNameInput(): void {
+  const length = displayNameLength(displayNameInputValue());
+  displayNameCount.textContent = `${length} / ${DISPLAY_NAME_MAX}`;
+  displayNameCount.classList.toggle("settings-name-count-full", length >= DISPLAY_NAME_MAX);
+  displayNameReset.disabled = displayNameInput.disabled || displayNameInput.value === "";
+  setDisplayName(displayNameInputValue());
+  const markdownHeading = displayNameRow.querySelector(".settings-preview-md-name");
+  if (markdownHeading) markdownHeading.textContent = displayNameInputValue() || "User";
+}
+function capDisplayNameInput(): void {
+  const raw = displayNameInput.value.replace(/[\r\n]+/g, " ");
+  const entered = displayNameLength(raw);
+  displayNameNotice.textContent = entered > DISPLAY_NAME_MAX ? l10n.t("{0} characters were entered, so the first {1} are used.", entered, DISPLAY_NAME_MAX) : "";
+  if (entered > DISPLAY_NAME_MAX) displayNameInput.value = normalizeDisplayName(raw);
+  else if (raw !== displayNameInput.value) displayNameInput.value = raw;
+}
+displayNameInput.addEventListener("input", (event) => {
+  displayNameEdited = true;
+  if (!(event as InputEvent).isComposing) capDisplayNameInput();
+  renderDisplayNameInput();
+});
+displayNameInput.addEventListener("compositionend", () => {
+  capDisplayNameInput();
+  renderDisplayNameInput();
+});
+function writeDisplayName(value: string): void {
+  if (current === null) return;
+  if (pendingDisplayName !== null) {
+    queuedDisplayName = value;
+    return;
+  }
+  if (value === (current.displayName ?? "")) return;
+  pendingDisplayName = nextRequestId();
+  vscode.postMessage({ type: "setDisplayName", requestId: pendingDisplayName, value });
+}
+displayNameInput.addEventListener("change", () => {
+  displayNameInput.value = displayNameInputValue();
+  displayNameEdited = false;
+  renderDisplayNameInput();
+  writeDisplayName(displayNameInput.value);
+});
+displayNameInput.addEventListener("keydown", (event) => {
+  if (event.key === "Enter" && !event.isComposing) displayNameInput.dispatchEvent(new Event("change"));
+});
+displayNameReset.addEventListener("click", () => {
+  displayNameInput.value = "";
+  displayNameNotice.textContent = "";
+  displayNameEdited = false;
+  renderDisplayNameInput();
+  writeDisplayName("");
+  displayNameInput.focus();
+});
+function renderDisplayName(state: SettingsState): void {
+  if (pendingDisplayName === state.replyTo) {
+    pendingDisplayName = null;
+    const queued = queuedDisplayName;
+    queuedDisplayName = null;
+    if (queued !== null) writeDisplayName(queued);
+  }
+  displayNameInput.disabled = false;
+  if (pendingDisplayName === null && !(displayNameEdited && document.activeElement === displayNameInput)) displayNameInput.value = state.displayName ?? "";
+  renderDisplayNameInput();
+}
 const renderAccent = createAccentSettings(accentCard, (setting, value) => {
   const requestId = nextRequestId();
   vscode.postMessage({ type: "setAccentSetting", requestId, setting, value });
   return requestId;
-}, { row, rowNote, select });
+}, { row, rowNote });
 const chatCard = section(generalCategory, l10n.t("Chat"));
 const learningCard = section(generalCategory, l10n.t("Learning"));
 const learningSwitch = switchButton("setting-learning-enabled");
-row(learningCard, l10n.t("Enable learning"), l10n.t("Changes apply from the next session. Running conversations will not change."), learningSwitch);
+row(learningCard, l10n.t("Enable learning"), l10n.t("Turning learning off stops delivery in running conversations. Turning it on applies from the next conversation. Recording and research remain available."), learningSwitch);
 
 const sendKeySelect = select<ComposerSendKey>([
   ["enter", "Enter"],
@@ -169,6 +361,44 @@ const sendKeySelect = select<ComposerSendKey>([
 ]);
 sendKeySelect.id = "setting-composer-send-key";
 row(chatCard, l10n.t("Send shortcut"), l10n.t("Key that sends the message box contents. The other combination inserts a new line."), sendKeySelect);
+
+const initialModelSelect = select<string>([]);
+initialModelSelect.id = "setting-initial-model";
+const initialModelText = row(chatCard, l10n.t("Initial model"), l10n.t("Choose a model for new conversations. Off uses Claude's normal settings. Running conversations and Resume are unchanged."), initialModelSelect);
+const initialModelNote = rowNote(initialModelText, "settings-row-note", "");
+let pendingInitialModel: number | null = null;
+function renderInitialModel(state: SettingsState): void {
+  if (pendingInitialModel === state.replyTo) pendingInitialModel = null;
+  if (pendingInitialModel !== null) return;
+  const selected = state.initialModel ?? "";
+  const list = state.externalModels.claude;
+  const models = list?.state === "ok" ? list.models : [];
+  initialModelSelect.replaceChildren();
+  for (const model of [{ id: "", label: l10n.t("Off") }, ...models.filter(model => model.id !== "default")]) {
+    const option = element("option", "", model.label);
+    option.value = model.id;
+    initialModelSelect.appendChild(option);
+  }
+  const missing = selected !== "" && !models.some(model => model.id === selected && model.id !== "default");
+  if (missing) {
+    const option = element("option", "", selected);
+    option.value = selected;
+    initialModelSelect.appendChild(option);
+  }
+  initialModelSelect.value = selected;
+  initialModelSelect.disabled = false;
+  initialModelNote.textContent = missing
+    ? l10n.t("The configured model is not in the available list. New conversations will request this ID; Claude may reject it.")
+    : list?.state !== "ok" ? l10n.t("Loading models. This may take a few seconds after starting a conversation.") : "";
+  if (!missing && list?.state === "failed") initialModelNote.textContent = modelListStatusText(list, state.externalDetection.claude);
+  initialModelNote.hidden = !initialModelNote.textContent;
+}
+initialModelSelect.addEventListener("change", () => {
+  if (pendingInitialModel !== null) return;
+  pendingInitialModel = nextRequestId();
+  initialModelSelect.disabled = true;
+  vscode.postMessage({ type: "setInitialModel", requestId: pendingInitialModel, model: initialModelSelect.value });
+});
 
 const restoreSwitch = element("button", "settings-switch");
 restoreSwitch.id = "setting-restore-tabs";
@@ -411,7 +641,7 @@ const sourceChips = PROFILE_SOURCES.map(source => {
   chip.addEventListener("click", () => {
     if (!current || pendingSources !== null) return;
     const sources = normalizeProfileSources(current.profileSources);
-    if (sources.length === 1 && sources.includes(source)) return; // R-LRN-18: 最後の 1 つは警告を出さずに残す（verify-settings-page#SP-LRN-sources）。
+    if (sources.length === 1 && sources.includes(source)) return;
     const next = sources.includes(source) ? sources.filter(item => item !== source) : [...sources, source];
     pendingSources = nextRequestId();
     vscode.postMessage({ type: "setProfileSources", requestId: pendingSources, sources: next });
@@ -508,7 +738,7 @@ externalBlock.append(detectionHeader, element("p", "settings-row-description set
 rosterCategory.appendChild(externalBlock);
 externalTimeout.addEventListener("change", () => {
   const value = Number(externalTimeout.value);
-  if (isExternalTimeout(value)) writeOrchestration("externalTimeoutMinutes", value); // R-ORC-11
+  if (isExternalTimeout(value)) writeOrchestration("externalTimeoutMinutes", value);
   else externalTimeout.reportValidity();
 });
 
@@ -547,7 +777,7 @@ let settingsRosterFocusId: string | undefined;
 const settingsRosterDrafts = new Map<string, ExecutorRow>();
 
 function writeOrchestration(setting: "enabled" | "agents" | "conductorPolicy" | "externalTimeoutMinutes", value: unknown): void {
-  if (!current || pendingOrchestration !== null) return; // R-ORC-20
+  if (!current || pendingOrchestration !== null) return;
   const requestId = nextRequestId();
   pendingOrchestration = requestId;
   settingsRosterFocusId = rosterCategory.contains(document.activeElement) ? document.activeElement?.id : undefined;
@@ -558,7 +788,7 @@ function writeRoster(rows: readonly OrchestrationSettingRow[]): void {
   writeOrchestration("agents", rows.map((entry) => ({ ...entry, rows: entry.rows.map((rosterRow) => ({ ...rosterRow, efforts: canonicalExecutorEfforts(rosterRow.executor, rosterRow.efforts) })) })));
 }
 function lockOrchestration(): void {
-  if (pendingOrchestration !== null) { // R-ORC-20
+  if (pendingOrchestration !== null) {
     rosterCategory.querySelectorAll<HTMLButtonElement | HTMLInputElement | HTMLTextAreaElement | HTMLSelectElement>("button, input, textarea, select").forEach((control) => { control.disabled = true; });
   }
 }
@@ -590,7 +820,7 @@ function requestInstructionPreview(): void {
 function renderOrchestration(state: SettingsState): void {
   if (pendingOrchestration === state.replyTo) pendingOrchestration = null;
   for (const role of settingsRosterDrafts.keys()) {
-    if (!state.orchestrationEnabled || !state.orchestrationAgents.some((entry) => entry.role === role)) settingsRosterDrafts.delete(role); // R-ORC-20
+    if (!state.orchestrationEnabled || !state.orchestrationAgents.some((entry) => entry.role === role)) settingsRosterDrafts.delete(role);
   }
   orchestrationSwitch.disabled = false;
   orchestrationSwitch.setAttribute("aria-checked", String(state.orchestrationEnabled));
@@ -648,10 +878,10 @@ function renderOrchestration(state: SettingsState): void {
       const definition = EXECUTORS[executorRow.executor];
       const isDraft = rowIndex === entry.rows.length;
       const updateRow = (patch: Partial<ExecutorRow>) => {
-        if (controlsDisabled || pendingOrchestration !== null) return; // R-ORC-20
+        if (controlsDisabled || pendingOrchestration !== null) return;
         const nextRow = { ...executorRow, ...patch };
         if (isDraft) {
-          if (!nextRow.model) { // R-ORC-20
+          if (!nextRow.model) {
             settingsRosterDrafts.set(entry.role, nextRow);
             renderOrchestration(state);
             return;
@@ -672,19 +902,19 @@ function renderOrchestration(state: SettingsState): void {
       for (const candidate of Object.values(EXECUTORS)) {
         const detected = isExternalExecutorId(candidate.id) ? state.externalDetection[candidate.id] : undefined;
         const list = executorModelList(candidate.id, state.externalModels);
-        if (detected?.state === "notInstalled" && list?.state !== "ok") continue; // R-ORC-20
+        if (detected?.state === "notInstalled" && list?.state !== "ok") continue;
         const group = element("optgroup", "");
         group.label = candidate.displayName;
-        group.disabled = detected?.state === "notInstalled"; // R-ORC-39: CLI が無くても覚えている選択を見せる（verify-settings-page#SP-ORC-39missing）。
+        group.disabled = detected?.state === "notInstalled";
         const selection = modelSelectionState(candidate.id, list, state.externalDetection[candidate.id]);
         const choices = selection.choices;
         const option = (model: string, label: string) => {
           const item = element("option", "", label);
           item.value = `${candidate.id}/${model}`;
-          item.disabled = entry.rows.some((value, i) => i !== rowIndex && value.executor === candidate.id && value.model === model); // R-ORC-20
+          item.disabled = entry.rows.some((value, i) => i !== rowIndex && value.executor === candidate.id && value.model === model);
           group.appendChild(item);
         };
-        if (selection.checking) { // R-ORC-39: 覚えている一覧は更新中も選べる。src/orchestration-executors.ts#modelSelectionState の checking は一覧が無いときだけ立つ（verify-settings-page#SP-ORC-39states）。
+        if (selection.checking) {
           group.disabled = true;
           option("", l10n.t("checking…"));
           group.firstElementChild?.setAttribute("disabled", "");
@@ -692,7 +922,7 @@ function renderOrchestration(state: SettingsState): void {
           for (const choice of choices) option(choice.model, choice.label ?? choice.model);
         } else option("", l10n.t("model list unavailable — type a model ID"));
         if (!group.disabled && candidate.id === executorRow.executor && executorRow.model && !choices?.some((choice) => choice.model === executorRow.model)) {
-          option(executorRow.model, executorRow.model + l10n.t(" (not in list)")); // R-ORC-20
+          option(executorRow.model, executorRow.model + l10n.t(" (not in list)"));
         }
         if (selection.refreshFailed) {
           const unavailable = element("option", "", l10n.t("List not obtained (use Recheck to try again)"));
@@ -702,7 +932,7 @@ function renderOrchestration(state: SettingsState): void {
         }
         cascade.appendChild(group);
       }
-      if (executorRow.model && !Array.from(cascade.options).some((option) => option.value === `${executorRow.executor}/${executorRow.model}`)) { // R-ORC-20
+      if (executorRow.model && !Array.from(cascade.options).some((option) => option.value === `${executorRow.executor}/${executorRow.model}`)) {
         const saved = element("option", "", `${definition.displayName} — ${executorRow.model}${l10n.t(" (not in list)")}`);
         saved.value = `${executorRow.executor}/${executorRow.model}`;
         saved.disabled = true;
@@ -711,7 +941,7 @@ function renderOrchestration(state: SettingsState): void {
       cascade.value = executorRow.model ? `${executorRow.executor}/${executorRow.model}` : "";
       cascade.addEventListener("change", () => {
         const [executor, model] = cascade.value.split("/");
-        if (!isExecutorId(executor) || model === undefined) return; // R-ORC-20
+        if (!isExecutorId(executor) || model === undefined) return;
         updateRow({ executor, model, efforts: [] });
       });
       modelField.append(settingsHiddenLabel(cascade, `${entry.role} Model`), cascade);
@@ -724,7 +954,7 @@ function renderOrchestration(state: SettingsState): void {
         input.disabled = controlsDisabled;
         input.addEventListener("change", () => {
           input.setCustomValidity(isExternalModel(input.value) ? "" : l10n.t("Use a model ID starting with a letter or digit, followed by letters, digits, dots, underscores, colons or hyphens."));
-          if (entry.rows.some((value, i) => i !== rowIndex && value.executor === executorRow.executor && value.model === input.value)) input.setCustomValidity(l10n.t("This model already exists.")); // R-ORC-20
+          if (entry.rows.some((value, i) => i !== rowIndex && value.executor === executorRow.executor && value.model === input.value)) input.setCustomValidity(l10n.t("This model already exists."));
           if (input.reportValidity()) updateRow({ model: input.value, efforts: [] });
         });
         modelField.append(settingsHiddenLabel(input, `${definition.displayName} Model`), input,
@@ -738,7 +968,7 @@ function renderOrchestration(state: SettingsState): void {
         for (let column = 0; column < 6; column++) {
           const effort = definition.efforts[column];
           const pressed = executorRow.efforts.includes(effort);
-          if (!executorRow.model || !effort || (!supported.includes(effort) && !pressed)) { matrix.appendChild(element("span", "settings-effort-slot")); continue; } // R-ORC-20
+          if (!executorRow.model || !effort || (!supported.includes(effort) && !pressed)) { matrix.appendChild(element("span", "settings-effort-slot")); continue; }
           const button = element("button", "settings-segment settings-chip", `${pressed ? "✓ " : ""}${effort}`);
           button.id = `roster-${index}-row-${rowIndex}-${effort}`;
           button.type = "button";
@@ -746,7 +976,7 @@ function renderOrchestration(state: SettingsState): void {
           button.dataset.column = String(column + 2);
           button.setAttribute("aria-pressed", String(pressed));
           button.setAttribute("aria-label", `${entry.role} ${definition.displayName} ${cascade.selectedOptions[0]?.textContent ?? executorRow.model} ${effort}`);
-          button.disabled = controlsDisabled || !supported.includes(effort); // R-ORC-12
+          button.disabled = controlsDisabled || !supported.includes(effort);
           if (!supported.includes(effort)) {
             button.classList.add("settings-unsupported");
             button.title = l10n.t(" (not supported by this model)");
@@ -768,15 +998,15 @@ function renderOrchestration(state: SettingsState): void {
         } else update({ rows: entry.rows.filter((_, i) => i !== rowIndex) });
       });
       matrix.appendChild(removeRow);
-      if (!rowComplete(executorRow, state.externalModels)) matrix.appendChild(element("div", "settings-matrix-caption settings-muted settings-incomplete-note", l10n.t("Select a Model and an Effort to enable this row"))); // R-ORC-20
-      if (entry.role === "worker" && !definition.writable) matrix.appendChild(element("div", "settings-matrix-caption settings-muted settings-worker-note", l10n.t("This executor cannot edit files; use it for explorer or reviewer"))); // R-ORC-26
+      if (!rowComplete(executorRow, state.externalModels)) matrix.appendChild(element("div", "settings-matrix-caption settings-muted settings-incomplete-note", l10n.t("Select a Model and an Effort to enable this row")));
+      if (entry.role === "worker" && !definition.writable) matrix.appendChild(element("div", "settings-matrix-caption settings-muted settings-worker-note", l10n.t("This executor cannot edit files; use it for explorer or reviewer")));
       const unsupported = executorRow.efforts.filter((effort) => !supported.includes(effort));
-      if (unsupported.length) matrix.appendChild(element("div", "settings-matrix-caption settings-muted settings-effort-warning", l10n.t("⚠ Unsupported Effort kept in settings and excluded from targets: {0}", unsupported.join(", ")))); // R-ORC-12
+      if (unsupported.length) matrix.appendChild(element("div", "settings-matrix-caption settings-muted settings-effort-warning", l10n.t("⚠ Unsupported Effort kept in settings and excluded from targets: {0}", unsupported.join(", "))));
     });
     const addRow = element("button", "settings-link settings-add-row", l10n.t("+ Add row"));
     addRow.id = `roster-${index}-add-row`;
     addRow.type = "button";
-    addRow.disabled = controlsDisabled || !!draft || visibleRows.length >= 12; // R-ORC-20
+    addRow.disabled = controlsDisabled || !!draft || visibleRows.length >= 12;
     addRow.addEventListener("click", () => {
       settingsRosterDrafts.set(entry.role, { executor: DEFAULT_EXECUTOR, model: "", efforts: [] });
       renderOrchestration(state);
@@ -787,7 +1017,7 @@ function renderOrchestration(state: SettingsState): void {
     const agentKeys = orchestrationVariants(selectedRole).map((variant) => variant.agentKey);
     const externalKeys = orchestrationExternalTargets(selectedRole, state.externalModels).map((target) => target.target);
     card.appendChild(wrapper);
-    if (!controlsDisabled && !agentKeys.length && !externalKeys.length) { // R-ORC-20
+    if (!controlsDisabled && !agentKeys.length && !externalKeys.length) {
       card.appendChild(element("p", "settings-role-warning settings-muted", l10n.t("No combination selected — this role is not injected")));
     }
     rosterRows.appendChild(card);
@@ -805,13 +1035,13 @@ function renderOrchestration(state: SettingsState): void {
 }
 orchestrationSwitch.addEventListener("click", () => writeOrchestration("enabled", !current?.orchestrationEnabled));
 function addRole(): void {
-  if (!current?.orchestrationEnabled || pendingOrchestration !== null) return; // R-ORC-20
+  if (!current?.orchestrationEnabled || pendingOrchestration !== null) return;
   const role = roleInput.value;
-  if (!/^[a-z][a-z0-9-]*$/.test(role)) { // R-ORC-20
+  if (!/^[a-z][a-z0-9-]*$/.test(role)) {
     roleError.textContent = l10n.t("Use a lowercase letter first, then lowercase letters, digits or hyphens.");
     return;
   }
-  if (current.orchestrationAgents.some((entry) => entry.role === role)) { // R-ORC-20
+  if (current.orchestrationAgents.some((entry) => entry.role === role)) {
     roleError.textContent = l10n.t("This role already exists.");
     return;
   }
@@ -836,8 +1066,6 @@ generalCategory.appendChild(footer);
 let current: SettingsState | null = null;
 let requestSerial = 0;
 const nextRequestId = (): number => ++requestSerial;
-// replyTo が自分の requestId と一致する返送（失敗を含む）まで、同じ操作の再押下を捨てる。current は返送でしか変わらないので、
-// 捨てないと 2 回目も 1 回目と同じ値を送る。構成変更の通知や別の要求への返送では解かない（R-DSP-01）。
 const pending: { autoContinue: number | null; restore: number | null; apiKey: number | null; learning: number | null } = { autoContinue: null, restore: null, apiKey: null, learning: null };
 const pendingFileLink: Record<FileLinkBooleanSetting, number | null> = {
   fileLinkInstruction: null,
@@ -850,6 +1078,8 @@ const pendingFileLink: Record<FileLinkBooleanSetting, number | null> = {
 
 function render(state: SettingsState): void {
   current = state;
+  renderInitialModel(state);
+  renderDisplayName(state);
   renderAccent(state.appearance, state.replyTo);
   if (pending.autoContinue === state.replyTo) pending.autoContinue = null;
   autoContinueSwitch.setAttribute("aria-checked", String(state.autoContinueAtUsageLimit));
@@ -869,7 +1099,6 @@ function render(state: SettingsState): void {
   fileLinkSwitches.planInstruction.disabled = false;
   fileLinkSwitches.revealInExplorer.disabled = false;
   fileLinkSwitches.allowOutsideWorkspace.disabled = false;
-  // 子の値は親がオフの間も Host の値のまま見せる（押せないだけ）。有効化は親の実効値の返送でだけ行う
   for (const child of outsideChildren) {
     child.control.disabled = !state.allowOutsideWorkspace;
     child.hint.hidden = state.allowOutsideWorkspace;
@@ -896,7 +1125,6 @@ sendKeySelect.addEventListener("change", () => {
   vscode.postMessage({ type: "setComposerSendKey", requestId: nextRequestId(), sendKey: sendKeySelect.value as ComposerSendKey });
 });
 
-// aria-checked は Host が返した値でだけ変える
 function requestApiKeyPolicy(policy: ApiKeyPolicy): void {
   if (current === null || pending.apiKey !== null || policy === current.apiKeyPolicy) return;
   const requestId = nextRequestId();
@@ -953,9 +1181,10 @@ moreLink.addEventListener("click", () => vscode.postMessage({ type: "openVsCodeS
 window.addEventListener("message", (event: MessageEvent<unknown>) => {
   if (!isHostToSettingsPage(event.data)) return;
   if (event.data.type === "conductorPreview") {
-    if (event.data.requestId !== previewRequest) return; // R-ORC-37: 古いプレビューで今の下書きを置き換えない（verify-settings-page#SP-LRN-preview）。
+    if (event.data.requestId !== previewRequest) return;
     instructionPreview.textContent = event.data.text;
     instructionTokens.textContent = l10n.t("≈ {0} tokens", event.data.tokens);
   } else render(event.data);
 });
+renderSettingsToc();
 vscode.postMessage({ type: "settingsPageReady" });

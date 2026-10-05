@@ -1,5 +1,6 @@
 import * as l10n from "@vscode/l10n";
 import type { AskBlock, AskOption } from "./ask-parser";
+import { bindUserLabel } from "./user-label";
 
 function part<K extends keyof HTMLElementTagNameMap>(tag: K, cls: string, text?: string): HTMLElementTagNameMap[K] {
   const el = document.createElement(tag);
@@ -12,7 +13,9 @@ export function askHeading(kind: "decide" | "check", title: string, counter: str
   const rail = part("span", "ask-rail");
   rail.setAttribute("aria-hidden", "true");
   const row = part("div", "ask-heading");
-  row.append(part("span", "ask-label", kind === "decide" ? l10n.t("YOU · Decision") : l10n.t("YOU · Machine check")));
+  const label = part("span", "ask-label");
+  label.append(bindUserLabel(part("span", "ask-label-name")), part("span", "ask-label-kind", ` · ${kind === "decide" ? l10n.t("Decision") : l10n.t("Machine check")}`));
+  row.append(label);
   if (header) row.append(part("span", "ask-topic", header));
   row.append(part("span", "ask-counter", counter));
   return [rail, row, part("div", "ask-title", title)];

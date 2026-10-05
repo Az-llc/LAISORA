@@ -53,8 +53,6 @@ export class PendingAttachmentStore {
     return true;
   }
 
-  // 送信の確定点でだけ呼ぶ。取り出しと解放を 1 操作にしてあるのは、読み出しと解放が
-  // 別呼び出しだと拒否された送信で解放だけが走り、添付が黙って消えるため
   take(tabId: string): ImageAttachment[] | undefined {
     const slots = this.byTab.get(tabId);
     if (!slots || slots.length === 0) return undefined;
@@ -66,7 +64,6 @@ export class PendingAttachmentStore {
     this.byTab.delete(tabId);
   }
 
-  // R-OPS-10: 稼働中のタブが持つ添付を巻き込まない。live に無い tabId のスロットだけを落とす
   sweep(liveTabIds: ReadonlySet<string>): string[] {
     const dropped: string[] = [];
     for (const tabId of [...this.byTab.keys()]) {

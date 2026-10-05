@@ -1,24 +1,7 @@
-// セッション表示名の解決規則と、その入力を作る差分インデックスの純関数群。
-// I/O はこのモジュールに入れない（呼び出し側が read/stat を行い、結果を渡す）。
-//
-// Claude Code のセッション JSONL の実測事実（2026-08-18, CLI 2.1.233 / corpus 2149ファイル）:
-//  - `custom-title` は /rename でのみ書かれる。`ai-title` は自動命名で、**rename 後も
-//    旧い自動命名の値で再出力され続ける**。よって「最後に現れたタイトル系レコード」を
-//    採用すると誤る。型ごとの優先順位が必須。
-//  - これらのメタレコードは timestamp を持たず、メッセージ列と時系列順に並ばない
-//    （/rename コマンドの user レコードより前に custom-title が現れる実例がある）。
-//    順序の判定に使えるのはバイトオフセットだけ。
-//  - `agent-name` は直前の ai-title / custom-title と常に同値の写し（47/47）で、
-//    出現率も低い。表示名の解決には使わない。混入を構造的に防ぐため
-//    SessionTitleCandidateSource に含めず、parseTitleRecord で捨てる。
-
 import * as l10n from "@vscode/l10n";
 
 export const SESSION_TITLE_INDEX_VERSION = 1;
 
-// 前回読了位置の直前この長さのバイト列で追記ファイルの同一性を検証する。
-// 値を変えると既存キャッシュの fingerprint と比較できなくなるため、
-// index エントリ側にも記録して不一致なら full rescan する。
 export const FINGERPRINT_WINDOW_BYTES = 512;
 
 export type SessionTitleSource =
@@ -36,7 +19,6 @@ export interface TitleCandidate {
 
 export type SessionTitleCandidates = Partial<Record<SessionTitleCandidateSource, TitleCandidate>>;
 
-// 解決順。`claude-ai-title` は型にあるがこの配列に無いので採用されない。
 export const DEFAULT_TITLE_PRIORITY: readonly SessionTitleCandidateSource[] = [
   "claude-custom-title",
   "first-human-utterance",
@@ -52,10 +34,6 @@ export interface ResolvedSessionTitle {
   byteOffset?: number;
 }
 
-// ---------------------------------------------------------------- 値の正規化
-
-// 空文字・空白のみ（U+3000 / U+FEFF を含む。JS の \s はどちらも含むので trim で落ちる）は
-// 候補として成立しない。制御文字はタブ表示とアクセシビリティラベルを壊すので空白へ潰す。
 export function normalizeTitleValue(raw: unknown): string | null {
   if (typeof raw !== "string") return null;
   const firstLine = raw.split("\n")[0] ?? "";
@@ -63,8 +41,6 @@ export function normalizeTitleValue(raw: unknown): string | null {
   return cleaned.length === 0 ? null : cleaned;
 }
 
-// 表示幅の切り詰めは解決規則から分離する（履歴一覧とタブで上限が異なるため）。
-// コードポイント単位で切るので、既存の UTF-16 slice と違いサロゲートペアを割らない。
 export function formatSessionTitleForDisplay(title: string, maxLength: number): string {
   if (maxLength <= 0) return "";
   const points = Array.from(title);
@@ -72,14 +48,9 @@ export function formatSessionTitleForDisplay(title: string, maxLength: number): 
   return `${points.slice(0, maxLength).join("")}…`;
 }
 
-// /rename で Host が書く custom-title レコード。CLI（2.1.233 実測）が書く形そのもの:
-// 1 行の JSON・キー順 type, customTitle, sessionId・timestamp 無し。形が違うと SDK の解決器
-// （末尾 64KB の customTitle）と parseTitleRecord の両方から見えなくなる（R-SES-05）
 export function formatCustomTitleRecord(sessionId: string, customTitle: string): string {
   return `${JSON.stringify({ type: "custom-title", customTitle, sessionId })}\n`;
 }
-
-// ---------------------------------------------------------------- 解決規則
 
 export function resolveSessionDisplayTitle(
   candidates: SessionTitleCandidates,
@@ -99,8 +70,6 @@ export function resolveSessionDisplayTitle(
   return { title: options?.untitledLabel ?? untitledLabel(), source: "untitled" };
 }
 
-// ---------------------------------------------------------------- レコード解釈
-
 export type ParsedTitleRecord =
   | { kind: "candidate"; source: SessionTitleCandidateSource; value: string; byteOffset: number }
   | { kind: "meta"; sessionId?: string; cwd?: string };
@@ -108,15 +77,6 @@ export type ParsedTitleRecord =
 const INJECTED_TAG_RE =
   /^<\/?(?:laisora-handoff|laisora-steer|command-message|command-name|command-args|local-command-[a-z-]+|system-reminder|task-notification)[\s>]/i;
 
-// 既定の人間発話判定。正本は session-transcript.extractHumanUserText であり、配線時は
-// そちらを extractHumanText で注入して本関数を使わないのが望ましい。正本と意図的に
-// 異なるのは3点で、いずれも「表示名の入力としては厳しめに落とす」方向:
-//  1. `<command-name>` 系の引数を返さない。正本は args を人間発話として返すため
-//     `/rename stage4,5` が初回発言になる（表示名以外の派生値へ rename が波及する）
-//  2. 先頭が `/コマンド` の生テキストを一律に落とす。正本は引数なしの既知コマンドだけを
-//     落とすので `/model opus` は人間発話になる。副作用として `/tmp を見て` のような
-//     実在しうる人間発話も落ちる（表示名の候補としては許容する）
-//  3. INJECTED_TAG_RE に `command-args` を足してある
 export function defaultExtractHumanText(record: unknown): string | null {
   if (!isRecord(record)) return null;
   if (record.type !== "user" || record.isSidechain === true) return null;
@@ -151,11 +111,6 @@ function isRecord(v: unknown): v is Record<string, unknown> {
 }
 
 export interface ParseOptions {
-  // 省略推奨。省略すると foldTitleRecords がファイル内で最初に見つけた sessionId を基準にする。
-  // ファイル名由来の id を渡すと、全レコードが別 id を持つファイル（corpus に実在。
-  // 4ec6ec9d-….jsonl の中身は fa8fc424-… だった）で全レコードが弾かれ untitled に落ちる。
-  // 推論に任せれば、その種のファイルでも表示名が出たうえで、一貫したファイルへ紛れ込んだ
-  // 異物レコードだけを落とせる。
   sessionId?: string;
   extractHumanText?: (record: unknown) => string | null;
 }
@@ -167,7 +122,6 @@ export function parseTitleRecord(
 ): ParsedTitleRecord | null {
   if (!isRecord(record)) return null;
   const recordSessionId = typeof record.sessionId === "string" ? record.sessionId : undefined;
-  // fork や別セッションの断片が混じったファイルが実在する（corpus 1757件中1件）。
   if (options?.sessionId && recordSessionId && recordSessionId !== options.sessionId) return null;
 
   switch (record.type) {
@@ -202,8 +156,6 @@ export function parseTitleRecord(
   }
 }
 
-// ---------------------------------------------------------------- 差分インデックス
-
 export interface SessionTitleIndexEntry {
   version: number;
   size: number;
@@ -234,8 +186,6 @@ export interface FileStatLike {
   mtimeMs: number;
 }
 
-// mtime と size だけでは同サイズの書き換えを検出できないので、必ず fingerprint 検証を挟む。
-// 変化が無く見えるときも verify を返す（512バイト読むだけで、40ファイルでも 1ms 程度）。
 export function planSessionTitleScan(
   entry: SessionTitleIndexEntry | undefined | null,
   stat: FileStatLike
@@ -278,7 +228,6 @@ export function confirmSessionTitleScan(
   return { mode: "incremental", fromByte: entry.consumedBytes, hasNewBytes: stat.size > entry.consumedBytes };
 }
 
-// FNV-1a 64bit。改竄検知ではなく「同じ追記ファイルか」の判定なので暗号学的強度は不要。
 export function fingerprintBytes(bytes: Uint8Array): string {
   let hash = 0xcbf29ce484222325n;
   const prime = 0x100000001b3n;
@@ -299,9 +248,6 @@ export interface SplitResult {
   consumedBytes: number;
 }
 
-// 末尾の未完成行は消費しない。次回の増分読みで先頭から読み直させる。
-// 改行探索をバイト列で行うのは、UTF-8 の継続バイトが 0x0a を取り得ないため安全であり、
-// かつ byteOffset を文字数ではなくバイト数で正確に出すため（日本語ログで両者はずれる）。
 export function splitCompleteLines(chunk: Uint8Array, baseOffset: number): SplitResult {
   const decoder = new TextDecoder("utf-8");
   const lines: ScannedLine[] = [];
@@ -358,7 +304,6 @@ export function foldTitleRecords(prior: FoldResult, lines: readonly ScannedLine[
 
     const next: TitleCandidate = { value: parsed.value, byteOffset: parsed.byteOffset };
     if (parsed.source === "first-human-utterance") {
-      // 初回発言は単調: 一度決まったら後続で上書きしない
       if (!candidates["first-human-utterance"]) candidates["first-human-utterance"] = next;
       continue;
     }
@@ -369,9 +314,6 @@ export function foldTitleRecords(prior: FoldResult, lines: readonly ScannedLine[
   return { candidates, sessionId, cwd };
 }
 
-// tailBytes は fingerprintWindowFor(split.consumedBytes) の区間を**別途読み直した**バイト列。
-// 今読んだ増分チャンクを流用してはいけない: 追記が 512 バイト未満のとき窓は fromByte より
-// 手前から始まるので、チャンク先頭を窓の先頭とみなすと fingerprint が静かに壊れる。
 export function applyScanResult(
   prior: SessionTitleIndexEntry | undefined | null,
   mode: "full" | "incremental",
@@ -398,7 +340,6 @@ export function applyScanResult(
   };
 }
 
-// 呼び出し側が読むべき fingerprint 窓。applyScanResult へ渡す tailBytes と対で使う。
 export function fingerprintWindowFor(consumedBytes: number): { start: number; end: number } {
   return { start: Math.max(0, consumedBytes - FINGERPRINT_WINDOW_BYTES), end: consumedBytes };
 }

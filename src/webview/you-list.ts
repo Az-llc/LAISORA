@@ -1,5 +1,6 @@
 import * as l10n from "@vscode/l10n";
 import type { YouItem, YouItemsReader } from "./you-items";
+import { bindUserLabel } from "./user-label";
 
 function node<K extends keyof HTMLElementTagNameMap>(tag: K, className: string, text?: string): HTMLElementTagNameMap[K] {
   const element = document.createElement(tag);
@@ -18,7 +19,7 @@ export class YouList {
   constructor(reader: YouItemsReader, navigate: (item: YouItem) => void, onCount?: (count: number, total: number) => void,
     dismiss?: (item: YouItem) => void, restoreModel?: (model: string) => void) {
     this.element.lang = document.documentElement.lang;
-    this.element.setAttribute("aria-label", "YOU");
+    bindUserLabel(this.element, "aria");
     let signature = "";
     const render = (force = false): void => {
       const items = reader.get();
@@ -26,13 +27,12 @@ export class YouList {
       if (!force && signature === next) return;
       signature = next;
       const open = items.filter(item => item.resolvedAt === undefined);
-      // R-DSP-33: a dismissed ask leaves the list; it is not a resolved item.
       const resolved = items.filter(item => item.resolvedAt !== undefined && item.resolution !== "dismissed");
       const folded = this.element.dataset.resolvedOpen !== "true";
       onCount?.(open.length, items.length);
       const head = node("header", "plan-section-head");
       const label = node("div", "plan-top");
-      label.append(node("span", "you-label", "YOU"));
+      label.append(bindUserLabel(node("span", "you-label")));
       head.append(label, node("h3", "you-heading", l10n.t("Your decisions, approvals and checks")),
         node("p", "you-lede", open.length ? l10n.t("{0} waiting", open.length) : ""));
       const list = node("div", "you-section-body");
@@ -44,14 +44,14 @@ export class YouList {
         square.setAttribute("aria-hidden", "true");
         const body = node("div", "you-body");
         const kind = item.kind === "approve" ? l10n.t("Approval") : item.kind === "decide" ? l10n.t("Decision") : item.kind === "confirm" ? l10n.t("Confirmation") : l10n.t("Machine check");
-        body.append(node("div", "you-kind", item.resolvedAt === undefined ? kind : l10n.t("{0} · Resolved", kind)));
+        body.append(node("div", "you-kind", item.resolvedAt === undefined ? kind
+          : item.resolution === "historical" ? l10n.t("{0} · Recorded", kind) : l10n.t("{0} · Resolved", kind)));
         const title = node("div", "you-title");
         const link = node("button", "you-link", item.anchor.approvalRef ? l10n.t("↗ Card") : l10n.t("↗ Message"));
         link.type = "button";
         link.setAttribute("aria-label", l10n.t("Go to: {0}", item.title));
         link.onclick = () => navigate(item);
         title.append(node("strong", "you-title-text", item.title), link);
-        // R-CNV-39 / R-CNV-43: dismiss applies to asks; confirmation follows the applied model.
         if (dismiss && item.kind !== "confirm" && !item.anchor.approvalRef && item.resolvedAt === undefined) {
           const remove = node("button", "you-dismiss", "×");
           remove.type = "button";
@@ -81,7 +81,6 @@ export class YouList {
         list.append(row);
       } };
       if (resolved.length) {
-        // R-DSP-33: resolved items fold into one counted line heading the list, like PLAN's completed steps.
         const toggle = node("button", "plan-done-toggle you-resolved-toggle", `✓ ${l10n.t("{0} resolved", String(resolved.length))} ${folded ? "▸" : "▾"}`);
         toggle.type = "button";
         toggle.setAttribute("aria-expanded", String(!folded));

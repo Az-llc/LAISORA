@@ -1,13 +1,13 @@
 import { ClaudeConversation, sdkClaudeCodeVersion, type ClaudeHostOptions } from "./claudeHost";
 import { resolveClaudeCodeStartup } from "./claudeCliResolver";
 import { runFailureReason } from "./orchestration-external";
+import { resolveModelDisplayName } from "./model-display-name";
 import { claudeModelIdLabel, type ExternalModel, type ExternalModelsState, type ExternalDetection } from "./orchestration-executors";
 
 const CLAUDE_ALIASES = ["haiku", "sonnet", "opus"] as const;
 
-export function claudeAliasModels(rows: readonly { id: string; resolvedModel?: string }[]): ExternalModelsState {
+export function claudeAliasModels(rows: readonly { id: string; label?: string; resolvedModel?: string }[]): ExternalModelsState {
   const rank = (row: (typeof rows)[number]) => (row.resolvedModel ? 2 : 0) + (row.id === row.id.replace(/\[1m\]$/, "") ? 1 : 0);
-  // R-ORC-25: keep the CLI's order; a stripped ID keeps its first position and takes the best-ranked row.
   const uniqueRows = new Map<string, (typeof rows)[number]>();
   for (const row of rows) {
     const id = row.id.replace(/\[1m\]$/, "");
@@ -16,16 +16,23 @@ export function claudeAliasModels(rows: readonly { id: string; resolvedModel?: s
   }
   const listed = [...uniqueRows.entries()].map(([id, row]): ExternalModel => {
     const resolvedModel = row.resolvedModel?.replace(/\[1m\]$/, "");
-    if (!resolvedModel && CLAUDE_ALIASES.some((alias) => alias === id)) return { id, label: id }; // R-ORC-25: alias without version stays selectable
-    return { id, label: claudeModelIdLabel(resolvedModel ?? id), resolvedModel };
+    if (!resolvedModel && CLAUDE_ALIASES.some((alias) => alias === id)) return { id, label: id };
+    return { id, label: resolveModelDisplayName(rows, resolvedModel ?? id) ?? id, resolvedModel };
   });
   const models = listed.filter((model) => model.id !== "default"
     || !listed.some((other) => other.id !== "default" && other.resolvedModel === model.resolvedModel));
   for (const alias of CLAUDE_ALIASES) {
-    if (!models.some((model) => model.id === alias)) models.push({ id: alias, label: alias }); // R-ORC-25
+    if (!models.some((model) => model.id === alias)) models.push({ id: alias, label: alias });
   }
   return models.some((model) => model.resolvedModel) || listed.some((model) => !CLAUDE_ALIASES.some((alias) => alias === model.id))
     ? { state: "ok", models } : { state: "failed", reason: "empty-model-list" };
+}
+
+export function relabelRememberedClaudeModels(models: readonly ExternalModel[]): ExternalModel[] {
+  return models.map((model) => {
+    const value = model.resolvedModel ?? model.id;
+    return model.label === claudeModelIdLabel(value) ? { ...model, label: resolveModelDisplayName([], value) ?? model.label } : model;
+  });
 }
 
 type ClaudeListOptions = Pick<ClaudeHostOptions, "apiKeyPolicy" | "claudeCodeExecutablePath">;
@@ -39,12 +46,10 @@ export async function listClaudeModels(cwd: string, log: (message: string) => vo
     log(`R-ORC-25: Claude ${reason}`);
     return { state: "failed", reason };
   };
-  // R-ORC-39: only use structured SDK error codes, never infer auth from arbitrary text or exit 1.
   let stopForFailure: (result: ExternalModelsState) => void;
   const terminalFailure = new Promise<ExternalModelsState>(resolve => { stopForFailure = resolve; });
   let conv: ReturnType<typeof create>;
   try {
-    // R-ORC-25: a concrete startup model can remove opus[1m] from supportedModels; probe with the alias.
     conv = create({ ...options, cwd, model: "opus[1m]", settingSources: [], permissionMode: "default", interruptForceKillTimeoutMs: 5000,
       onApprovalRequest: async () => ({ behavior: "deny" }), onEvent: event => {
         if (event.kind !== "api_retry") return;
@@ -61,7 +66,7 @@ export async function listClaudeModels(cwd: string, log: (message: string) => vo
       }, log: () => {} });
   } catch (error) { return failed(error); }
   let disposing: Promise<void> | undefined;
-  const dispose = (): Promise<void> => { // R-ORC-25: timeout and completion both dispose; run it once
+  const dispose = (): Promise<void> => {
     disposing ??= conv.dispose().catch((error: unknown) => { log(`R-ORC-25: Claude dispose ${runFailureReason("dispose-failed", error)}`); });
     return disposing;
   };

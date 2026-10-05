@@ -16,11 +16,19 @@ import {
   type FoldEffect,
   type FoldEventResult,
 } from "./event-fold";
-import { handoffDecisionLineCount } from "./handoff-envelope";
-import { output } from "./host-context";
+import {
+  handoffDecisionCounts,
+  handoffDecisionLineCount,
+  handoffContextUsageKey,
+  handoffUnreadableLinesKey,
+  restoredHandoffUnreadableLineCount,
+} from "./handoff-envelope";
+import { extensionContext, output } from "./host-context";
 import {
   EventProvenance,
+  HandoffContextUsage,
   HostToWebview,
+  isHandoffContextMeasurement,
   NormalizedEventBody,
   ResumeHydrationPhase,
   ResumePreviewMessage,
@@ -64,12 +72,8 @@ import {
 const HYDRATION_SWITCHOVER_MAX = 64;
 const HYDRATION_DRAIN_BATCH = 512;
 
-// RESUME_CWD_SCAN_BYTES は SDK の getSessionInfo が読む先頭・末尾の窓に合わせる。
-// 全文読みへ広げない: readRecordedSessionCwd は最初の描画より前に await される。
-// 採る値は所在ディレクトリとの突合で決まり、履歴一覧の行の cwd と一致するとは限らない。
 const RESUME_CWD_SCAN_BYTES = 64 * 1024;
 
-// lastRelocatedCwd で移動先の記録を候補に含める。
 function lastRelocatedCwd(
   lines: readonly { text: string }[]
 ): { cwd: string | undefined; malformedLines: number } {
@@ -94,23 +98,17 @@ function lastRelocatedCwd(
   return { cwd, malformedLines };
 }
 
-// encodedProjectDirName は SDK の projects ディレクトリ名の符号化を写す。PROJECT_DIR_ENCODE_MAX を超える名前は
-// SDK が別規則で符号化するので、一致と判定しない。
-// 所在ディレクトリと食い違う cwd でも resume は記録を見つける。
-// 食い違いは resume の成否ではなく、CLI が読む設定とツールの作業ディレクトリを変える。
 const PROJECT_DIR_ENCODE_MAX = 200;
 function encodedProjectDirName(cwd: string): string | undefined {
   const encoded = cwd.replace(/[^a-zA-Z0-9]/g, "-");
   return encoded.length > PROJECT_DIR_ENCODE_MAX ? undefined : encoded;
 }
 
-// knownCwdMatchingStore で保存済みの推定を突合し、過去の誤推定を固定しない。
 function knownCwdMatchingStore(knownCwd: string | undefined, filePath: string): string | undefined {
   if (knownCwd === undefined || knownCwd.length === 0) return undefined;
   return encodedProjectDirName(knownCwd) === basename(dirname(filePath)) ? knownCwd : undefined;
 }
 
-// ancestorMatchingStore は、記録の候補が起動後の移動先でも起動フォルダを探すために使う。
 function ancestorMatchingStore(dirName: string, candidate: string | undefined): string | undefined {
   if (candidate === undefined) return undefined;
   let current = candidate;
@@ -123,7 +121,6 @@ function ancestorMatchingStore(dirName: string, candidate: string | undefined): 
 
 type RecordedCwdSource = "record-matched" | "ancestor-matched" | "unconfirmed";
 
-// encodedProjectDirName は非可逆なので、保存先の名前から起動フォルダを逆算しない。
 async function readRecordedSessionCwd(
   filePath: string
 ): Promise<{ cwd: string | undefined; source: RecordedCwdSource; malformedRelocationLines: number }> {
@@ -144,7 +141,6 @@ async function readRecordedSessionCwd(
     ];
     const relocation = lastRelocatedCwd(lines);
     const firstCwd = foldTitleRecords({ candidates: {} }, lines).cwd;
-    // 移動先を祖先で上書きしないよう、ancestorMatchingStore の適用を絞る。
     const dirName = basename(dirname(filePath));
     const matching = [relocation.cwd, firstCwd].filter(
       (candidate): candidate is string =>
@@ -169,13 +165,11 @@ export interface HydrationJournalEntry {
   partial: NormalizedEventBody & { provenance?: EventProvenance };
   conversationId?: string;
   meta?: EventMeta;
-  // replayJournalInto は到着時の verdict を使う。破棄した記録も境界の引き継ぎに必要。
   verdict: HydrationVerdict;
   displayed: boolean;
   clientToken?: string;
 }
 
-// hydrationCommitted を関数に分け、呼び出し側の代入による型の絞り込みが副作用後にも残るのを避ける。
 function hydrationCommitted(h: ResumeHydration): boolean {
   return h.phase === "complete";
 }
@@ -193,10 +187,8 @@ export interface ResumeHydration {
   journal: HydrationJournalEntry[];
   journalSeq: number;
   arrivalTimestamp: number | undefined;
-  // liveSeqBase は失敗時の再配送と表示の仮採番を揃えるために保持する（src/session.ts#finalizeHydrationFailure）。
   liveSeqBase: number;
   acceptedSinceBuffering: number;
-  // liveCommitCursor は src/session.ts#finalizeHydrationFailure の再実行でも未反映分だけを反映するために保持する。
   liveCommitCursor: number;
   liveTitleCandidate?: string;
   workPostDirty: boolean;
@@ -204,10 +196,16 @@ export interface ResumeHydration {
   persistencePosts: Map<string, Extract<HostToWebview, { type: "analysisPersistenceState" }>>;
 }
 
-// ResumeOpenOutcome.tabPosted は新規タブ通知の有無。再利用では立たないので、成功判定に単独で使わない。
 interface ResumeOpenOutcome {
   tabPosted: boolean;
   session: Session | undefined;
+}
+
+function restoredHandoffContextUsage(value: unknown): HandoffContextUsage | undefined {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return undefined;
+  const { before, after } = value as Record<string, unknown>;
+  if (before !== null && !isHandoffContextMeasurement(before)) return undefined;
+  return after === null || isHandoffContextMeasurement(after) ? { before, after } : { before };
 }
 
 export async function openResumedSession(
@@ -227,7 +225,6 @@ export async function openResumedSession(
     void vscode.window.showWarningMessage(l10n.t("LAISORA: Logs outside the session store cannot be restored."));
     return { tabPosted, session: undefined };
   }
-  // 同じ記録の連打でタブ枠を消費しないための inFlight 判定（verify-resume-hydration#Wmut-40、R-SES-03 / R-TAB-08）。
   const inFlight = [...st.sessions.values()].find(
     (t) => t.resuming && t.resumeSessionId === req.sessionId
   );
@@ -245,6 +242,8 @@ export async function openResumedSession(
   const resumeT0 = Date.now();
   s.resuming = true;
   let hydration: ResumeHydration | null = null;
+  let preparation: ReturnType<Session["beginResumePreparation"]> | undefined;
+  let resumeGeneration = s.logicalGeneration;
   let readSetT0 = resumeT0;
   let captureDoneT = resumeT0;
   let detached: ClaudeConversation | null = null;
@@ -260,6 +259,8 @@ export async function openResumedSession(
         s.clearing = false;
       }
     }
+    preparation = s.beginResumePreparation();
+    resumeGeneration = s.logicalGeneration;
     s.resumeSessionId = req.sessionId;
     if (req.inherit !== undefined) {
       s.modelOverride = req.inherit.model;
@@ -274,14 +275,13 @@ export async function openResumedSession(
     };
     s.analysisStore.loadPersistedArtifactsFromStore();
     s.analysisStore.flushPendingPersistence();
-    // 旧 CLI の破棄を await すると最初の描画が破棄の完了を待つ（verify-resume-hydration#Wmut-39）。
     if (canReuse) {
       void s
         .disposeDetachedConversation(detached)
         .catch((e) => output.appendLine(`[${s.title}] 旧 CLI の破棄に失敗: ${String(e)}`));
     }
     let readSet: ResumeReadSet | undefined;
-    // 起動フォルダの固定は src/conversation-lifecycle.ts#warmup より前に済ませる。
+    let recordedModel: string | undefined;
     let recordedCwd = knownCwdMatchingStore(req.knownCwd, req.filePath);
     if (recordedCwd !== undefined) {
       output.appendLine(`[${s.title}] resume cwd=${recordedCwd} source=known`);
@@ -289,7 +289,7 @@ export async function openResumedSession(
     try {
       readSetT0 = Date.now();
       readSet = await captureResumeReadSet(req.filePath);
-      s.recordedModel = readSet.recordedModel;
+      recordedModel = readSet.recordedModel;
       if (recordedCwd === undefined) {
         const recorded = await readRecordedSessionCwd(req.filePath);
         recordedCwd = recorded.cwd;
@@ -301,13 +301,13 @@ export async function openResumedSession(
     } catch (error) {
       output.appendLine(`[${s.title}] resume read-set / cwd 捕捉に失敗: ${String(error)}`);
     }
-    if (recordedCwd !== undefined && recordedCwd.length > 0) s.cwd = recordedCwd;
     captureDoneT = Date.now();
-    if (s.closed || st.sessions.get(s.tabId) !== s) {
+    if (s.closed || st.sessions.get(s.tabId) !== s || s.logicalGeneration !== resumeGeneration || s.resumePreparation !== preparation) {
       s.resuming = false;
       return { tabPosted, session: undefined };
     }
-    // preview の読み取りは初期表示を待たせない位置に保つ（verify-resume-hydration#FP-C10、R-TAB-08）。
+    s.recordedModel = recordedModel;
+    if (recordedCwd !== undefined && recordedCwd.length > 0) s.cwd = recordedCwd;
     hydration = {
       attemptId: randomUUID(),
       logicalGeneration: s.logicalGeneration,
@@ -329,7 +329,6 @@ export async function openResumedSession(
     };
     s.hydration = hydration;
     s.hydrationCoverageUnconfirmed = false;
-    // src/session.ts#resumePreviewSnapshot を使い、表示専用の仮状態を履歴窓へ登録しない。
     st.post(
       canReuse
         ? { type: "tabCleared", tab: s.resumePreviewSnapshot(hydration) }
@@ -348,7 +347,7 @@ export async function openResumedSession(
       output.appendLine(`[${s.title}] resume preview 取得に失敗: ${String(error)}`);
     }
     const previewDoneT = Date.now();
-    if (s.closed || st.sessions.get(s.tabId) !== s) {
+    if (s.closed || st.sessions.get(s.tabId) !== s || s.logicalGeneration !== resumeGeneration || s.resumePreparation !== preparation) {
       if (s.hydration === hydration) s.hydration = null;
       s.resuming = false;
       return { tabPosted, session: undefined };
@@ -360,7 +359,6 @@ export async function openResumedSession(
       if (s.closed || st.sessions.get(s.tabId) !== s || s.hydration !== hydration || s.logicalGeneration !== hydration.logicalGeneration) {
         output.appendLine(`[${s.title}] resume aborted: the session changed while reading the recorded model`);
         if (s.hydration === hydration) s.finalizeHydrationFailure(hydration, "cancelled", false);
-        // src/session.ts#resetLogicalSession で所有ごと消えた場合も、復元中の印を残さない。
         else if (s.hydration === null) s.resuming = false;
         return { tabPosted, session: undefined };
       }
@@ -381,11 +379,11 @@ export async function openResumedSession(
         ` / preview ${previewDoneT - previewT0}ms / loop lag 最大 ${lagProbe.maxLagMs()}ms）`
     );
     lagProbe.stop();
+    if (hydration.arrivalTimestamp !== undefined) s.finishResumePreparation(preparation);
     warmup(s);
     await runResumeHydration(st, s, hydration, transcript);
   } catch (e) {
     output.appendLine(`[${s.title}] resume 失敗: ${String(e)}`);
-    // hydrationCommitted の成立後は失敗扱いへ戻さず、確定済みの表示を未確定にしない。
     if (hydration === null || s.hydration === null) {
       s.resuming = false;
     } else if (s.hydration === hydration && !hydrationCommitted(hydration)) {
@@ -396,6 +394,7 @@ export async function openResumedSession(
       );
     }
   } finally {
+    if (preparation !== undefined) s.finishResumePreparation(preparation);
     lagProbe.stop();
   }
   rememberSession(s);
@@ -409,7 +408,6 @@ export async function handleResumeMessage(
 ): Promise<void> {
   switch (msg.type) {
     case "resumeSession": {
-      // openResumedSession の inherit はホスト内部専用。受信したオブジェクトを展開して引き継がない。
       await openResumedSession(st, {
         sessionId: msg.sessionId,
         filePath: msg.filePath,
@@ -418,7 +416,6 @@ export async function handleResumeMessage(
       });
       break;
     }
-    // runResumeHydration の再試行では、捕捉済みの読取境界を保つ（verify-resume-hydration#FP-C6）。
     case "resumeHydrationRetry": {
       const s = target!;
       const h = s.hydration;
@@ -428,7 +425,6 @@ export async function handleResumeMessage(
       h.failureReason = undefined;
       h.buffering = true;
       h.logicalGeneration = s.logicalGeneration;
-      // liveSeqBase を再試行時の採番へ合わせる。既に反映した範囲は liveCommitCursor で保持する。
       h.liveSeqBase = s.seq;
       h.acceptedSinceBuffering = 0;
       s.resuming = true;
@@ -437,7 +433,6 @@ export async function handleResumeMessage(
         await runResumeHydration(st, s, h);
       } catch (e) {
         output.appendLine(`[${s.title}] resume retry 失敗: ${String(e)}`);
-        // hydrationCommitted の成立後は再試行でも失敗扱いへ戻さない。
         if (s.hydration === h && !hydrationCommitted(h)) {
           s.finalizeHydrationFailure(h, String(e), !s.closed && st.sessions.get(s.tabId) === s);
         }
@@ -455,7 +450,6 @@ interface DraftEffectSink {
   liveTurnCompleted: boolean;
 }
 
-// applyDraftEffects から集計結果を画面へ送らず、未確定の値を確定値として見せない。
 function applyDraftEffects(effects: readonly FoldEffect[], sink: DraftEffectSink): void {
   for (const effect of effects) {
     switch (effect.type) {
@@ -486,7 +480,6 @@ function applyDraftEffects(effects: readonly FoldEffect[], sink: DraftEffectSink
         output.appendLine(`[hydration] draft fold が抑止対象の effect を出した: ${effect.type}`);
         break;
       default: {
-        // unhandled の網羅性検査を残し、src/event-fold.ts#FoldEffect の追加を黙って捨てない。
         const unhandled: never = effect;
         output.appendLine(`[hydration] 未知の FoldEffect を破棄: ${JSON.stringify(unhandled)}`);
         break;
@@ -495,7 +488,6 @@ function applyDraftEffects(effects: readonly FoldEffect[], sink: DraftEffectSink
   }
 }
 
-// createHydrationDraft では src/event-fold.ts#foldEventState が破壊的に更新する容器を共有せず、中止時の変更を隔離する。
 export function createHydrationDraft(s: Session): EventFoldDraft {
   return {
     tabId: s.tabId,
@@ -525,7 +517,6 @@ export function createHydrationDraft(s: Session): EventFoldDraft {
     events: [],
     titleRefreshed: s.titleRefreshed,
     titleRefreshing: s.titleRefreshing,
-    // resuming による予約抑止を仮集計にも適用し、確定前の読み直しを避ける（src/event-fold.ts#foldEventState）。
     resuming: true,
     closed: false,
   };
@@ -547,7 +538,6 @@ function commitHydrationDraft(s: Session, draft: EventFoldDraft, commandsTouched
     s.effectiveModel = draft.modelFallback.appliedModel;
   }
   s.lastContextTotalTokens = draft.lastContextTotalTokens;
-  // src/session.ts#applyCommandList も候補を書き込むため、commandsTouched で記録の再生による更新と区別する。
   if (commandsTouched) s.commands = draft.commands;
   s.liveDelegationAgentIds = draft.liveDelegationAgentIds;
   s.liveDelegationRev = draft.liveDelegationRev;
@@ -557,7 +547,6 @@ function commitHydrationDraft(s: Session, draft: EventFoldDraft, commandsTouched
   s.events = draft.events;
 }
 
-// createHydrationYielder は重い記録と時計の分解能の両方に備えて中断機会を設ける。
 const HYDRATION_YIELD_RECORDS = 500;
 const HYDRATION_YIELD_MS = 8;
 
@@ -579,7 +568,6 @@ function createHydrationYielder(): () => Promise<void> | undefined {
   };
 }
 
-// foldHistoryEvents に履歴の集約を集め、消費者の追加は visit で分岐する（verify-guardrail#GR-37、verify-guardrail#GR-37a）。
 export async function foldHistoryEvents(
   draft: EventFoldDraft,
   history: { events: readonly HistoryEvent[] },
@@ -604,7 +592,6 @@ export async function foldHistoryEvents(
   return "complete";
 }
 
-// replayJournalInto の到着順を時刻順へ並べ替えず、発言とターン境界の順序を保つ（R-TAB-09）。
 function replayJournalInto(
   draft: EventFoldDraft,
   journal: readonly HydrationJournalEntry[],
@@ -619,7 +606,6 @@ function replayJournalInto(
       sink.liveTurnCompleted = true;
     }
     if (entry.verdict !== "accepted") {
-      // replayJournalInto では、記録の採否と境界の引き継ぎを混同しない。
       if (entry.meta?.gapBoundaries !== undefined && entry.meta.gapBoundaries.length > 0) {
         draft.carriedGapBoundaries.push(...entry.meta.gapBoundaries);
       }
@@ -645,13 +631,11 @@ async function runResumeHydration(st: SessionStore, s: Session, h: ResumeHydrati
   const abort = (why: string): void => {
     output.appendLine(`[${s.title}] resume 中止: ${why}`);
     if (s.hydration !== h) {
-      // src/session.ts#resetLogicalSession で所有が消えた場合に限り、後続の復元が持つ実行中の印に触れず片付ける。
       if (s.hydration === null) s.resuming = false;
       return;
     }
     s.finalizeHydrationFailure(h, "cancelled", !s.closed && st.sessions.get(s.tabId) === s);
   };
-  // src/session-transcript.ts#readSessionHistory の世代指定を、集計する履歴の切り捨てに使わない（R-HND-13）。
   const historyOpts = {
     ...(h.readSet === undefined ? {} : { resumeReadSet: h.readSet }),
     generationSessionId: h.sessionId,
@@ -673,10 +657,8 @@ async function runResumeHydration(st: SessionStore, s: Session, h: ResumeHydrati
         `omittedTools=${transcript.coverage.omittedToolCount ?? 0}`
     );
   }
-  // src/session-list-wiring.ts#sessionSummaryOf を通し、保存された改名を発言由来の名前で置き換えない。
   const resolvedTitle = (await sessionSummaryOf(h.sessionId)) ?? title;
   if (invalidated()) return abort("タイトル解決中にセッションが変化しました");
-  // invalidated では利用者の改名を検出できないため、titleAtResolve と autoTitledAtResolve を別に控える（R-SES-05）。
   const titleAtResolve = s.title;
   const autoTitledAtResolve = s.autoTitled;
 
@@ -708,7 +690,6 @@ async function runResumeHydration(st: SessionStore, s: Session, h: ResumeHydrati
     invalidated
   );
   if (folded === "invalidated") return abort("履歴集計中にセッションが変化しました");
-  // src/work-model.ts#WorkCoverage の圧縮履歴は集約済みの値を保ち、読取器の初期値で上書きしない。
   draft.workModel = {
     ...draft.workModel,
     coverage: {
@@ -724,7 +705,6 @@ async function runResumeHydration(st: SessionStore, s: Session, h: ResumeHydrati
       ...(history.coverage.omittedToolCount
         ? { omittedToolCount: history.coverage.omittedToolCount }
         : {}),
-      // 原因を src/work-model.ts#WorkCoverage に残し、読み取り失敗を先頭の集計省略と混同させない（R-DSP-01）。
       ...(history.coverage.hierarchyIncomplete ? { hierarchyIncomplete: true as const } : {}),
       ...(history.coverage.historyReadError !== undefined
         ? { historyReadError: history.coverage.historyReadError }
@@ -744,7 +724,6 @@ async function runResumeHydration(st: SessionStore, s: Session, h: ResumeHydrati
       restored.malformedMetaCount + restored.transcriptReadFailureCount + restored.omittedTranscriptCount,
     hierarchyIncomplete: restored.readError !== undefined || restored.malformedMetaCount > 0,
   });
-  // src/work-model.ts#markBackgroundUnconfirmed で、記録だけでは証明できない実行継続を未確認にする。
   draft.workModel = markBackgroundUnconfirmed(draft.workModel, draft.lastEventTimestamp ?? Date.now());
   output.appendLine(
     `[${s.title}] resume subagents: meta=${restored.metaCount} malformed=${restored.malformedMetaCount} ` +
@@ -801,6 +780,7 @@ async function runResumeHydration(st: SessionStore, s: Session, h: ResumeHydrati
       role: m.role,
       text: m.text,
       uuid: m.uuid,
+      ...(m.restoredApproval ? { restoredApproval: m.restoredApproval } : {}),
       ...(m.imageRefs && m.imageRefs.length > 0 ? { imageRefs: m.imageRefs } : {}),
       ...(m.model ? { model: m.model } : {}),
       ...(m.timestamp > 0 ? { recordedAt: m.timestamp } : {}),
@@ -815,27 +795,30 @@ async function runResumeHydration(st: SessionStore, s: Session, h: ResumeHydrati
   const conversation = await readConversationMessages(h.filePath, isInSessionStore, h.readSet, h.sessionId);
   if (invalidated()) return abort("会話履歴読み取り中にセッションが変化しました");
 
-  // src/session-transcript.ts#isHandoffGenerationBoundary との条件の一致を保ち、前世代への導線を残す（R-HND-09）。
   if (conversation.handoffEnvelope?.snapshot.forkSessionId === h.sessionId) {
     const sourceId = conversation.handoffEnvelope.snapshot.sourceSessionId;
     const existingSource = [...st.sessions.values()].find(
       (other) => !other.closed && (other.resumeSessionId === sourceId || other.auth?.sessionId === sourceId)
     );
+    const restoredContextUsage = restoredHandoffContextUsage(extensionContext?.globalState.get(handoffContextUsageKey(h.sessionId)));
+    const unreadableLineCount = restoredHandoffUnreadableLineCount(extensionContext?.globalState.get(handoffUnreadableLinesKey(h.sessionId)));
+    const decisions = conversation.handoffEnvelope.decisions;
     s.handoffSource = {
       sessionId: sourceId,
       ...(existingSource?.title ? { title: existingSource.title } : {}),
       ...(conversation.handoffEnvelope.snapshot.compact !== undefined
         ? { compact: conversation.handoffEnvelope.snapshot.compact }
         : {}),
+      ...(restoredContextUsage !== undefined ? { contextUsage: restoredContextUsage } : {}),
       utteranceCount: conversation.handoffEnvelope.userUtterances.length,
-      ...(conversation.handoffEnvelope.decisions !== undefined
-        ? { decisionCount: handoffDecisionLineCount(conversation.handoffEnvelope.decisions) }
+      ...(unreadableLineCount !== undefined ? { unreadableLineCount } : {}),
+      ...(decisions !== undefined
+        ? { decisionCount: handoffDecisionLineCount(decisions), decisions: handoffDecisionCounts(decisions) }
         : {}),
       detailRunId: restoredHandoffRunId(h.sessionId),
     };
   }
 
-  // createHydrationDraft の作成後に再起動していても、再生する記録の採番には現在の世代を使う。
   draft.generation = s.generation;
 
   let cursor = 0;
@@ -848,7 +831,6 @@ async function runResumeHydration(st: SessionStore, s: Session, h: ResumeHydrati
     if (invalidated()) return abort("journal 整理中にセッションが変化しました");
   }
 
-  // commitHydrationDraft まで待機を挟まず、到着する境界イベントとの順序を保つ（R-TAB-09）。
   dropped += replayJournalInto(draft, h.journal, cursor, h.journal.length, sink);
   draft.timestampContractViolations += dropped;
   h.buffering = false;
@@ -859,7 +841,6 @@ async function runResumeHydration(st: SessionStore, s: Session, h: ResumeHydrati
   s.restoredAgents = restored.agents;
   s.hydrationCoverageUnconfirmed = false;
   s.conversationAnchorUuids = anchors;
-  // ResumeHydration は再試行判定のために残すが、成功後の記録本文をタブの寿命まで保持しない。
   h.journal.length = 0;
   h.liveCommitCursor = 0;
   try {
@@ -872,7 +853,6 @@ async function runResumeHydration(st: SessionStore, s: Session, h: ResumeHydrati
     releaseConversationHistory(historyScopeKey(s));
     output.appendLine(`[${s.title}] 会話履歴の登録に失敗: ${String(error)}`);
   }
-  // titleAtResolve と autoTitledAtResolve の比較で、解決後の改名を上書きしない（R-SES-05）。
   if (s.title === titleAtResolve && s.autoTitled === autoTitledAtResolve) {
     if (resolvedTitle) {
       s.title = displayTitleFromSummary(resolvedTitle, h.sessionId);
@@ -891,7 +871,6 @@ async function runResumeHydration(st: SessionStore, s: Session, h: ResumeHydrati
   if (sink.resolveOwner !== null) {
     s.analysisStore.resolveOwnerFromAuthStatus(sink.resolveOwner.sessionId, sink.resolveOwner.logicalGeneration);
   }
-  // 読み直しを live 境界の有無で制限すると復元後のモデル別内訳が欠ける（verify-resume-hydration#Wmut-42、R-DSP-39 / R-TAB-07）。
   s.semantic.scheduleTranscriptTimeBuckets();
   if (sink.liveTurnCompleted && !s.titleRefreshed && !s.titleRefreshing && !s.closed) {
     s.titleRefreshing = true;

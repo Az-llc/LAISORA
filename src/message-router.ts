@@ -67,8 +67,11 @@ export async function handleWebviewMessage(
         await handleComposerMessage(st, msg, target, sender);
         break;
       case "renameTab":
+      case "renameSession":
+      case "setSessionHidden":
       case "listSessions":
-      case "requestCachedUsage":
+      case "requestAccountUsage":
+      case "accountUsagePanelClosed":
       case "sessionImageRequest":
       case "openSessionImage":
         await handleSessionFileMessage(st, msg, sender, target);

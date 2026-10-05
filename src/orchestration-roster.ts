@@ -1,3 +1,4 @@
+import { PLACEMENT_LINE } from "./placement-line";
 import { EXECUTORS, EXTERNAL_EXECUTORS, DEFAULT_EXECUTOR, CLAUDE_EFFORTS, CODEX_EFFORTS, canonicalExecutorEfforts,
   executorModelList, isExecutorId, isExternalExecutorId, isExternalModel, rowComplete,
   type ExecutorId, type ExecutorRow, type ExternalExecutorId, type ExternalModels, type ExternalDetection, type OrchestrationEffort } from "./orchestration-executors";
@@ -34,30 +35,30 @@ function roleHeader(value: unknown): value is Record<string, unknown> & { role: 
 }
 function validExecutorRow(value: unknown): value is ExecutorRow {
   return rosterObject(value, ["executor", "model", "efforts"]) && isExecutorId(value.executor) && isExternalModel(value.model)
-    && rosterEfforts(value.efforts, EXECUTORS[value.executor].efforts); // R-ORC-20
+    && rosterEfforts(value.efforts, EXECUTORS[value.executor].efforts);
 }
 export function isOrchestrationSettingRoster(raw: unknown): raw is OrchestrationSettingRow[] {
   return Array.isArray(raw) && raw.every((entry) => rosterObject(entry, ["role", "enabled", "description", "rows"])
     && roleHeader(entry) && Array.isArray(entry.rows) && entry.rows.length <= 12 && entry.rows.every(validExecutorRow)
     && new Set(entry.rows.map((row) => `${row.executor}/${row.model}`)).size === entry.rows.length)
-    && new Set(raw.map((entry) => entry.role)).size === raw.length; // R-ORC-20
+    && new Set(raw.map((entry) => entry.role)).size === raw.length;
 }
 export function orchestrationSettingRows(raw: unknown, log?: (message: string) => void): OrchestrationSettingRow[] {
-  if (!Array.isArray(raw)) return []; // R-ORC-03
+  if (!Array.isArray(raw)) return [];
   let normalized = false;
   const roles = new Set<string>();
   const result: OrchestrationSettingRow[] = [];
   for (const entry of raw) {
-    if (!roleHeader(entry) || roles.has(entry.role)) { normalized = true; continue; } // R-ORC-02
+    if (!roleHeader(entry) || roles.has(entry.role)) { normalized = true; continue; }
     roles.add(entry.role);
     const legacy = !Array.isArray(entry.rows);
     normalized ||= legacy;
     const input = legacy ? Object.values(EXECUTORS).flatMap((definition) => definition.legacy(entry)) : entry.rows as unknown[];
     const rows: ExecutorRow[] = [], used = new Set<string>();
     for (const value of input) {
-      if (!value || typeof value !== "object") { normalized = true; continue; } // R-ORC-03
+      if (!value || typeof value !== "object") { normalized = true; continue; }
       const candidate = value as ExecutorRow;
-      if (!isExecutorId(candidate.executor) || !isExternalModel(candidate.model) || !Array.isArray(candidate.efforts)) { normalized = true; continue; } // R-ORC-03
+      if (!isExecutorId(candidate.executor) || !isExternalModel(candidate.model) || !Array.isArray(candidate.efforts)) { normalized = true; continue; }
       const canonical = { executor: candidate.executor, model: candidate.model, efforts: canonicalExecutorEfforts(candidate.executor, candidate.efforts) };
       const row = EXECUTORS[candidate.executor].normalize(canonical, legacy);
       normalized ||= row.model !== candidate.model || row.efforts.length !== candidate.efforts.length
@@ -65,7 +66,7 @@ export function orchestrationSettingRows(raw: unknown, log?: (message: string) =
         || Object.keys(candidate).some((key) => !["executor", "model", "efforts"].includes(key));
       if (row.model === "") { normalized = true; continue; }
       const key = `${row.executor}/${row.model}`;
-      if (used.has(key) || rows.length >= 12) { normalized = true; continue; } // R-ORC-20
+      if (used.has(key) || rows.length >= 12) { normalized = true; continue; }
       used.add(key);
       rows.push(row);
     }
@@ -87,7 +88,7 @@ export function resolveOrchestrationRoster(raw: unknown): { roster: readonly Orc
     else roles.add(value.role);
   }
   for (const value of orchestrationSettingRows(raw, (message) => droppedRows.push(message))) {
-    if (value.enabled !== true) continue; // R-ORC-02
+    if (value.enabled !== true) continue;
     const entry = freezeOrchestrationRole(value);
     roster.push(entry);
     if (!orchestrationVariants([entry]).length && !orchestrationExternalTargets([entry]).length) droppedRows.push(`R-ORC-02: role ${entry.role} has no combination selected; nothing injected`);
@@ -95,15 +96,15 @@ export function resolveOrchestrationRoster(raw: unknown): { roster: readonly Orc
   return { roster: Object.freeze(roster), droppedRows: Object.freeze(droppedRows) };
 }
 function selectedEfforts(row: ExecutorRow, models?: ExternalModels): readonly (string | undefined)[] {
-  if (!rowComplete(row, models)) return []; // R-ORC-10, R-ORC-12
+  if (!rowComplete(row, models)) return [];
   return row.efforts.length ? canonicalExecutorEfforts(row.executor, row.efforts) : [undefined];
 }
 export function orchestrationVariants(roster: readonly OrchestrationRow[]) {
   return roster.filter((entry) => entry.enabled).flatMap((entry) => entry.rows.flatMap((row) => {
     const definition = EXECUTORS[row.executor];
     const choice = definition.models()?.find((choice) => choice.model === row.model);
-    if (definition.kind !== "agent" || !choice) return []; // R-ORC-02
-    const efforts = choice.efforts.length ? selectedEfforts(row) : [undefined]; // R-ORC-04
+    if (definition.kind !== "agent" || !choice) return [];
+    const efforts = choice.efforts.length ? selectedEfforts(row) : [undefined];
     return efforts.map((effort) => ({ role: entry.role, agentKey: definition.targetKey(entry.role, row.model, effort),
       model: row.model as "haiku" | "sonnet" | "opus", ...(effort ? { effort: effort as OrchestrationEffort } : {}), description: entry.description }));
   }));
@@ -127,13 +128,13 @@ export function externalExecutorName(executor: ExecutorId): string { return EXEC
 export function orchestrationExternalTargets(roster: readonly OrchestrationRow[], models?: ExternalModels, log?: (message: string) => void): readonly ExternalRow[] {
   const excluded: string[] = [], nonWritable: string[] = [];
   const targets = roster.filter((entry) => entry.enabled).flatMap((entry) => entry.rows.flatMap((row) => {
-    if (!isExternalExecutorId(row.executor)) return []; // R-ORC-12
+    if (!isExternalExecutorId(row.executor)) return [];
     const executor = row.executor, definition = EXECUTORS[executor];
-    if (entry.role === "worker" && !definition.writable) { nonWritable.push(`${entry.role}/${executor}@${row.model}`); return []; } // R-ORC-26
+    if (entry.role === "worker" && !definition.writable) { nonWritable.push(`${entry.role}/${executor}@${row.model}`); return []; }
     const supported = definition.models(executorModelList(executor, models))?.find((choice) => choice.model === row.model)?.efforts;
     return selectedEfforts(row, models).flatMap((effort) => {
       const target = definition.targetKey(entry.role, row.model, effort);
-      if (effort && supported && !supported.includes(effort)) { excluded.push(target); return []; } // R-ORC-12
+      if (effort && supported && !supported.includes(effort)) { excluded.push(target); return []; }
       return [Object.freeze({ target, role: entry.role, enabled: true, executor, model: row.model, description: entry.description, ...(effort ? { effort } : {}) })];
     });
   }));
@@ -150,7 +151,7 @@ export function isExternalRows(raw: unknown): raw is ExternalRow[] {
     && typeof entry.role === "string" && /^[a-z][a-z0-9-]*$/.test(entry.role) && typeof entry.enabled === "boolean"
     && isExternalExecutorId(entry.executor) && isExternalModel(entry.model) && entry.model !== "" && typeof entry.description === "string"
     && (entry.effort === undefined ? EXECUTORS[entry.executor as ExternalExecutorId].fallbackEfforts(entry.model).length === 0 : EXECUTORS[entry.executor as ExternalExecutorId].efforts.includes(entry.effort))
-    && entry.target === externalTargetKey(entry.role, entry.executor, entry.model, entry.effort)); // R-ORC-12
+    && entry.target === externalTargetKey(entry.role, entry.executor, entry.model, entry.effort));
 }
 export function estimateTokens(text: string): number {
   let asciiChars = 0, nonAsciiChars = 0;
@@ -161,24 +162,23 @@ export function estimateTokens(text: string): number {
   return Math.ceil(asciiChars / 4 + nonAsciiChars / 1.5);
 }
 export const EXTERNAL_CAPABILITIES = "Explorer and reviewer external targets are read-only and return only text. Worker Codex targets may edit files under the chosen working directory, never commit, and cannot run the build; the conductor runs checks and commits.";
-export function conductorInstruction(roster: readonly OrchestrationRow[], policy: string, external = orchestrationExternalTargets(roster), deliverySection = "", modelProfileSection = ""): string {
+export function conductorInstruction(roster: readonly OrchestrationRow[], policy: string, external = orchestrationExternalTargets(roster), deliverySection = ""): string {
   const variants = orchestrationVariants(roster);
   const generated = [
     "Act as the conductor. Delegate using the exact agent key or external target. Model and Effort below are requested settings, not observations of applied values.",
     ...roster.map((entry) => JSON.stringify({ role: entry.role, description: entry.description,
       agents: variants.filter((variant) => variant.role === entry.role).map(({ agentKey, model, effort }) => ({ agentKey, model, ...(effort ? { effort } : {}) })),
       external: external.filter((target) => target.role === entry.role).map(({ target, executor, model, effort }) => ({ target, executor: externalExecutorName(executor), model, ...(effort ? { effort } : {}) })) })),
-    ...(modelProfileSection ? [modelProfileSection] : []),
-    ...(external.length ? [`External targets (${EXTERNAL_EXECUTORS.map((definition) => definition.displayName).join(" and ")}) cost no Claude usage. ${EXTERNAL_CAPABILITIES} Call the run tool of laisora_external with the exact target key.`] : []),
+    ...(external.length ? [`External targets (${EXTERNAL_EXECUTORS.map((definition) => definition.displayName).join(" and ")}) cost no Claude usage. ${EXTERNAL_CAPABILITIES} Call the run tool of laisora_external with the exact target key. A background launch acknowledgement means the work is still running; you can respond to new user input, but wait for its completion notification before dependent review or work.`] : []),
   ].join("\n");
-  const instruction = [generated, deliverySection].filter(Boolean).join("\n\n");
+  const instruction = [generated, PLACEMENT_LINE, deliverySection].filter(Boolean).join("\n\n");
   return policy.trim() ? `${instruction}\n\nUser conductor policy:\n${policy}` : instruction;
 }
 export function isExternalTimeout(value: unknown): value is number {
   return typeof value === "number" && Number.isFinite(value) && value >= 1 && value <= 120;
 }
 export function isExternalModels(value: unknown): value is ExternalModels {
-  if (!rosterObject(value, Object.keys(EXECUTORS))) return false; // R-ORC-20
+  if (!rosterObject(value, Object.keys(EXECUTORS))) return false;
   return Object.values(value).every((entry) => {
     if (rosterObject(entry, ["state"])) return entry.state === "checking";
     if (rosterObject(entry, ["state", "reason"])) return entry.state === "failed" && typeof entry.reason === "string";
@@ -194,14 +194,14 @@ export function isExternalModels(value: unknown): value is ExternalModels {
   });
 }
 export function isExternalDetection(value: unknown): value is Record<ExecutorId, ExternalDetection> {
-  if (!rosterObject(value, Object.keys(EXECUTORS))) return false; // R-ORC-20
+  if (!rosterObject(value, Object.keys(EXECUTORS))) return false;
   return Object.values(value).every((entry) => {
     if (rosterObject(entry, ["state"])) return entry.state === "checking" || entry.state === "notInstalled";
     const found = entry as Record<string, unknown> | null;
     if (found && typeof found === "object" && found.state === "found") {
       return typeof found.path === "string" && (found.version === undefined || typeof found.version === "string")
         && (found.versionNote === undefined || typeof found.versionNote === "string" && /^(timeout|exit:-?\d+|empty-output)$/.test(found.versionNote))
-        && Object.keys(found).every((key) => ["state", "path", "version", "versionNote"].includes(key)); // R-ORC-20
+        && Object.keys(found).every((key) => ["state", "path", "version", "versionNote"].includes(key));
     }
     return rosterObject(entry, ["state", "path", "reason"]) && entry.state === "failed" && typeof entry.path === "string"
       && typeof entry.reason === "string" && /^spawn-error:[A-Z0-9_]+$/.test(entry.reason);

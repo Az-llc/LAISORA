@@ -13,20 +13,16 @@ export const MAX_REPORT_SIGNALS_PER_ENVELOPE = 20;
 export const MAX_PENDING_REPORT_SIGNALS = 200;
 export const FAILURE_LOOP_CONSECUTIVE_THRESHOLD = 3;
 export const FAILURE_LOOP_SIGNATURE_THRESHOLD = 5;
-// 長時間ステップでは失敗の件数より失った時間が効く（5 分 × 5 回を待ってから知らせても遅い）
 export const FAILURE_LOOP_LOST_MS_THRESHOLD = 5 * 60_000;
 export const FAILURE_LOOP_LOST_MIN_COUNT = 2;
-// evidence-index IDLE_GAP_MS と同値だが import しない（閾値は本ファイルにのみ置く）
 export const STAGNATION_IDLE_MS = 5 * 60_000;
-// 初期値。実測根拠は無く level 1 でしか使わない（token 量だけで停止しない）
 export const OUTPUT_OVERRUN_MESSAGE_TOKENS = 16_000;
 export const OUTPUT_OVERRUN_TURN_TOKENS = 100_000;
-// Claude Code が人間の拒否・中断で tool_result に入れる定型文（corpus と E2E 実測。SDK/CLI 更新時に再確認）
 export const HUMAN_REJECTED_TOOL_RESULT_RE =
   /^(?:The user doesn't want to proceed with this tool use\b|\[Request interrupted by user(?: for tool use)?\])/;
 const USAGE_LIMIT_TOOL_RESULT_RE = /^(?:You've (?:hit|reached) your\b|You're out of (?:usage credits|extra usage)\b|Your org is out of usage \u00b7 (?:add funds to continue|contact your admin)\b|Your seat type doesn't include (?:extra usage|usage(?: credits)?)\b|Your usage allocation has been disabled by your admin\b|Your group's usage limit is set to \$0\b|Fable 5 requires usage credits\b|You have hit your limit\b|Usage limit reached\b|Rate limit reached\b)/;
 
-function isUsageLimitResult(text: string): boolean {
+export function isUsageLimitResult(text: string): boolean {
   if (USAGE_LIMIT_TOOL_RESULT_RE.test(text)) return true;
   try {
     const value = JSON.parse(text);
@@ -87,6 +83,7 @@ export interface GuardrailSubjectState {
     isError: boolean;
     fingerprintHash?: string;
     at: number;
+    lostMs: number;
   }[];
   signatureCounts: Record<string, number>;
   signatureLostMs?: Record<string, number>;
@@ -95,7 +92,6 @@ export interface GuardrailSubjectState {
     tools: Record<string, Record<string, number>>;
     lostMs?: Record<string, Record<string, number>>;
   };
-  // root のみ。turn_started でリセット（R-TK2）
   turnOutput?: { turnId: string; outputTokens: number };
 }
 
@@ -113,7 +109,6 @@ export interface GuardrailState {
   droppedSignalCount: number;
   appliedDivergenceIds: string[];
   assignments: GuardrailAssignment[];
-  // turn_started で開き、turn_completed / turn_interrupted / turn_failed / conversation_closed または clearProcessEphemeral で閉じる（root）。tick は open turn の間だけ stagnation を出す
   openTurn?: { turnId: string; startedAt: number };
 }
 
@@ -138,13 +133,10 @@ export interface GuardrailActionOutcome {
   ok: boolean;
   message: string;
   reason?: string;
-  // true = 会話状態が変われば通る失敗（not_running 等）。台帳へ記録しない
   transient?: boolean;
 }
 
 export type GuardrailTrigger = "auto" | "manual";
-
-// 自動実行は steer / escalate まで（MAX_AUTO_LEVEL）。完全自律の interrupt はしない
 
 export interface GuardrailExecutor {
   warn(decision: GuardrailDecision, signals: GuardrailSignal[]): void;
@@ -176,14 +168,10 @@ export function actionForLevel(level: GuardrailLevel): GuardrailActionKind | und
   }
 }
 
-// envelope の decision.key。composite 成立で鍵が変わるため、自動実行の冪等性はこの鍵ではなく
-// signal 単位の台帳（selectAutoActions）で判定する
 export function decisionKey(decision: Pick<GuardrailDecision, "signalIds">): string {
   return [...decision.signalIds].sort().join(",");
 }
 
-// signalId → その signal を含む decision に対して実行済み（queued または terminal 失敗）の最大 level。
-// 鍵の揺れ（composite 成立・帰属変化）で同じループへ同 level を繰り返し送らないための台帳
 export type GuardrailActionLedger = Record<string, GuardrailLevel>;
 
 export interface PlannedGuardrailAction {
@@ -193,10 +181,6 @@ export interface PlannedGuardrailAction {
   signals: GuardrailSignal[];
 }
 
-// 自動実行の選定（純粋）。条件: autoLevel >= 2 / decision に live 観測の signal がある（isLive は Host が
-// live fold で実際に作成・更新した signal の集合。時刻比較にすると resume 直後の同時刻で history signal が live に化ける）/
-// 会話が running / 構成 signal のいずれも台帳で level 以上の実行が無い。
-// Level 4 は autoLevel によらず返さない（MAX_AUTO_LEVEL でクランプ）
 export function selectAutoActions(
   decisions: readonly GuardrailDecision[],
   signals: readonly GuardrailSignal[],
@@ -207,7 +191,6 @@ export function selectAutoActions(
   if (!conversationRunning) return [];
   const byId = new Map(signals.map((s) => [s.signalId, s] as const));
   const out: PlannedGuardrailAction[] = [];
-  // 同一 pass 内で同じ signal を含む decision が複数あっても多重選定しない（局所台帳）
   let current = ledger;
   for (const decision of decisions) {
     if (decision.autoLevel < 2) continue;
@@ -217,15 +200,12 @@ export function selectAutoActions(
     const members = decision.signalIds.map((id) => byId.get(id)).filter((s): s is GuardrailSignal => s !== undefined);
     if (!members.some((s) => isLive(s))) continue;
     if (members.some((s) => (current[s.signalId] ?? 0) >= level)) continue;
-    // instruction には decision を構成する全 signal を載せる（live 判定は選定条件にだけ使う）
     out.push({ decision, level: level as 2 | 3, action, signals: members });
     current = recordLedger(current, decision.signalIds, level);
   }
   return out;
 }
 
-// fold 前後で実際に作成・更新された signal（live 観測の登録に使う）。参照比較は tool_call_* の
-// 無変更 clone を拾い、時刻一致は resume 直後の同時刻 history signal を拾うため、内容比較にする
 export function touchedSignalIds(before: GuardrailState, after: GuardrailState): string[] {
   if (before === after) return [];
   const prevById = new Map(before.signals.map((s) => [s.signalId, s] as const));
@@ -265,8 +245,6 @@ export const DEFAULT_GUARDRAIL_POLICY: GuardrailPolicy = {
 
 export type GuardrailInput =
   | { type: "event"; event: NormalizedEvent }
-  // Host-runtime-only。history で再構成しない。idleSince は Host 受信時計
-  // （イベント timestamp は stream_event で進まないため使えない）
   | { type: "tick"; now: number; idleSince: number | undefined }
   | {
       type: "divergence";
@@ -299,7 +277,6 @@ export function clearProcessEphemeral(state: GuardrailState): GuardrailState {
   return next;
 }
 
-// 正規化規則を analysis.ts errorFingerprint と一致させる（入力は redact 済みのため値は一致しない。乖離すると live と事後分析の failure-loop が別物になる）
 export function computeErrorFingerprintHash(toolName: string, rawResultText?: string): string | undefined {
   const text = (rawResultText ?? "")
     .toLowerCase()
@@ -365,8 +342,6 @@ function foldEvent(state: GuardrailState, ev: NormalizedEvent): GuardrailState {
     if (targetSubjectId === undefined) {
       return state;
     }
-    // 人間の拒否・中断による is_error はモデルの失敗ではない（E2E 実測 2026-08-25: 中断で拒否された
-    // tool_result が 3 連続失敗の窓に入り別 fingerprint の 2 件目の failure_loop を作った）。窓にも署名にも入れない
     const usageLimit = ev.isError && isUsageLimitResult(ev.resultPreview ?? "");
     if (usageLimit && state.subjects[`agent:${ev.toolUseId}`]) {
       discardRecoveredFailures(state, `agent:${ev.toolUseId}`, ev.turnId);
@@ -380,13 +355,11 @@ function foldEvent(state: GuardrailState, ev: NormalizedEvent): GuardrailState {
       discardRecoveredFailures(state, targetSubjectId, ev.turnId, toolName);
     }
     let fingerprintHash: string | undefined;
+    const lostMs = ev.isError && isObservedTime(startedAt) && isObservedTime(ev.timestamp) && ev.timestamp > startedAt ? ev.timestamp - startedAt : 0;
     if (ev.isError) {
       fingerprintHash = computeErrorFingerprintHash(toolName, ev.resultPreview);
       if (fingerprintHash !== undefined) {
         sub.signatureCounts[fingerprintHash] = (sub.signatureCounts[fingerprintHash] ?? 0) + 1;
-        // 両端とも SDK message の任意項目 timestamp（CLI 側の同じ時計）。欠けた message は直前の message の時刻を継ぎ、
-        // 時刻を一度も観測していなければ 0 で届く。0 を時刻として引くと 1970 年からの経過が失った時間になる
-        const lostMs = isObservedTime(startedAt) && isObservedTime(ev.timestamp) && ev.timestamp > startedAt ? ev.timestamp - startedAt : 0;
         const signatureLostMs = (sub.signatureLostMs ??= {});
         signatureLostMs[fingerprintHash] = (signatureLostMs[fingerprintHash] ?? 0) + lostMs;
         if (sub.recoveryCounts?.turnId !== ev.turnId) sub.recoveryCounts = { turnId: ev.turnId, tools: {}, lostMs: {} };
@@ -404,6 +377,7 @@ function foldEvent(state: GuardrailState, ev: NormalizedEvent): GuardrailState {
       isError: ev.isError,
       ...(fingerprintHash ? { fingerprintHash } : {}),
       at: ev.timestamp,
+      lostMs,
     });
     if (sub.recentFinished.length > MAX_RECENT_FINISHED) {
       sub.recentFinished = sub.recentFinished.slice(-MAX_RECENT_FINISHED);
@@ -420,8 +394,9 @@ function foldEvent(state: GuardrailState, ev: NormalizedEvent): GuardrailState {
     let rFl1FirstAt = ev.timestamp;
     let rFl1RecentToolUseIds: string[] = [];
 
-    if (sub.recentFinished.length >= FAILURE_LOOP_CONSECUTIVE_THRESHOLD) {
-      const window = sub.recentFinished.slice(-FAILURE_LOOP_CONSECUTIVE_THRESHOLD);
+    for (const threshold of [FAILURE_LOOP_CONSECUTIVE_THRESHOLD, FAILURE_LOOP_SIGNATURE_THRESHOLD]) {
+      if (sub.recentFinished.length < threshold) continue;
+      const window = sub.recentFinished.slice(-threshold);
       if (window.every((entry) => entry.isError)) {
         const firstEntry = window[0];
         const lastEntry = window[window.length - 1];
@@ -429,20 +404,21 @@ function foldEvent(state: GuardrailState, ev: NormalizedEvent): GuardrailState {
         const firstFp = firstEntry.fingerprintHash;
         const sameSignature =
           firstFp !== undefined && window.every((entry) => entry.fingerprintHash === firstFp);
-        if (sameTurn || sameSignature) {
+        if ((sameTurn || sameSignature) && (threshold === FAILURE_LOOP_SIGNATURE_THRESHOLD || window.reduce((sum, entry) => sum + entry.lostMs, 0) >= FAILURE_LOOP_LOST_MS_THRESHOLD)) {
           rFl1Hit = true;
           rFl1Confidence = sameSignature ? "signature" : "turn";
           rFl1ToolName = lastEntry.toolName;
           rFl1FingerprintHash = lastEntry.fingerprintHash;
           rFl1FirstAt = firstEntry.at;
           rFl1RecentToolUseIds = window.map((entry) => entry.toolUseId);
+          break;
         }
       }
     }
 
     const signatureCount = fingerprintHash !== undefined ? sub.signatureCounts[fingerprintHash] ?? 0 : 0;
     const signatureLostMs = fingerprintHash !== undefined ? sub.signatureLostMs?.[fingerprintHash] ?? 0 : 0;
-    const timeLossHit = signatureCount >= FAILURE_LOOP_LOST_MIN_COUNT && signatureLostMs >= FAILURE_LOOP_LOST_MS_THRESHOLD; // R-OPS-12
+    const timeLossHit = signatureCount >= FAILURE_LOOP_LOST_MIN_COUNT && signatureLostMs >= FAILURE_LOOP_LOST_MS_THRESHOLD;
     const rFl2Hit =
       fingerprintHash !== undefined &&
       (signatureCount >= FAILURE_LOOP_SIGNATURE_THRESHOLD || timeLossHit);
@@ -617,7 +593,6 @@ function discardRecoveredFailures(state: GuardrailState, subjectId: string, turn
 
 }
 
-// observed-only signal（stagnation / output_overrun）の作成・更新。count を渡さないと既存は +1
 function upsertObservedSignal(
   state: GuardrailState,
   rootKey: string,
@@ -652,25 +627,10 @@ function upsertObservedSignal(
   });
 }
 
-// root がツールを開いている間は、無音でも停滞ではない（R-OPS-08）。ツール実行中はレコードが
-// 来ず idleSince が進まないので、これを見ないと正常な長時間実行と人間の回答待ちが停滞に化ける。
-// openTurn と同じく root だけを見る:
-// subagent の openTools で抑止すると root の本物の停滞を落とす。委任中は Agent 呼び出し自体が
-// root の openTools にある。
-//
-// **ツール名で例外を作らないこと（R-OPS-09）。** Read/Write/Edit/Glob/Grep を「5 分かかるのは異常」として検知側へ回さない:
-// これらの実作業時間は閾値より十分短く、逆に **Bash のツール timeout と停滞閾値がどちらも 300 秒で一致している**ため、
-// Bash が timeout するたびに、その裏で待たされた Read/Edit が 5 分判定を踏む。検知の利益が無く誤発火だけが増える。
-//
-// **経過時間で判定しないこと。** openTools.startedAt は provider イベント時刻、tick の now は
-// Host 壁時計で領域が違う（kind をまたぐ時刻比較をしない）。
-// SDK の tool_progress は heartbeat: true と elapsed_time_seconds だけで出力の進捗を運ばず
-// （2026-09-08 実測）、NormalizedEvent にもなっていないのでここからは見えない
 function isSuppressedByOpenTool(state: GuardrailState): boolean {
   return Object.keys(state.subjects["root"]?.openTools ?? {}).length > 0;
 }
 
-// R-ST1。変更が無いときは同一参照を返す（呼び出し側は参照比較で refresh を省ける）
 function foldTick(state: GuardrailState, now: number, idleSince: number | undefined): GuardrailState {
   if (state.openTurn === undefined || idleSince === undefined) return state;
   const idleMs = now - idleSince;
@@ -797,11 +757,6 @@ export function foldGuardrail(state: GuardrailState, input: GuardrailInput): Gua
   if (input.type === "tick") {
     return foldTick(state, input.now, input.idleSince);
   }
-  // recentFinished / signatureCounts には時間窓も resume 境界のリセットも無いので、history を fold すると
-  // 数日前の同一署名 2 件＋今の live 1 件が failure_loop 閾値を満たし live 観測として report される
-  // （GR-W4・GR-32/33。束縛は verify-guardrail GR-31/31b/31c/31d）。
-  // `!== "live"` にしないこと: provenance 無しで直接 push される conversation_closed（/clear・store-surfaces.ts）が
-  // 落ちて openTurn が閉じなくなる
   if (input.type === "event" && input.event.provenance?.path === "history") {
     return state;
   }
@@ -1003,8 +958,6 @@ export interface SettleReportSendOutput {
   logLine?: string;
 }
 
-// 送信結果 -> 配信簿の outcome 写像。extension.ts 側に置くと、not_running（debounce 中に
-// ターンが閉じた場合）を permanent へ倒す変異を検査が殺せず、当該 signal が恒久的に沈黙する
 export const REPORT_SEND_OUTCOME_KINDS: ReadonlySet<string> = new Set(["sent", "transient", "permanent", "conversation_lost"]);
 
 export function classifyReportSendOutcome(result: { ok: boolean; transient?: boolean; reason?: string }): { kind: ReportSendOutcomeKind; reason?: string } {

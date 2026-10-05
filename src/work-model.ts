@@ -8,18 +8,12 @@ import { findCommitBoundary, recordSeparator } from "./webview/commit-boundary";
 
 export const MAX_PHASES = 256;
 
-// WorkTotals; startRequest; reconcileRequestCommands; src/protocol.ts#projectWorkModel
 const MAX_SEGMENTS = 512;
 const MAX_PHASE_REFS = 64;
 const MAX_PHASE_AGENTS = 64;
 const MAX_TASKS = 256;
-// 未終了ツールの配置は遅延完了の帰属先そのもので、捨てると集計を戻せない。上限は実運用で
-// 届かない値にし、複製コストはバケット分割で抑える（単一 record を毎イベント丸ごと複製しない）
 const MAX_TRACKED_TOOL_USES = 8192;
 const PLACEMENT_BUCKETS = 64;
-// 未解決の承認は CLI が応答を待つため実運用では同時に数件。上限は保険で、超えたときは
-// 最古の requestId の記録と件数を同時に外す。件数だけ残すと、その要求が解決しても
-// どの phase から引くか決められず永久に承認待ちのまま畳めなくなる
 const MAX_TRACKED_APPROVALS = 256;
 
 export type OperationKind = "observe" | "mutate" | "verify" | "delegated" | "neutral" | "unknown";
@@ -35,39 +29,18 @@ export interface WorkCoverage {
   droppedEventCount?: number;
   omittedMessageCount?: number;
   omittedToolCount?: number;
-  // 上限で追跡をやめた承認要求。件数側からも外しているので、ここに出ない限り
-  // pendingApprovalCount は追跡中の未解決要求と一致する
   untrackedApprovalCount?: number;
-  // 通知を待っていた背景タスクを placement の上限退避で追跡できなくなった件数。退避後の通知は
-  // 完了と断言しない（集計に入らない。完了済みの退避は数えない）
   untrackedBackgroundCount?: number;
-  // resume で meta / transcript を読めなかったサブエージェント
   unreadableAgentCount?: number;
-  // history 全量パースで欠落した子 transcript 相当の論理単位（上限超過・読取失敗した
-  // ファイル1件につき+1。inline sidechain を捨てて子ファイルも読めなかった場合は+1）
   omittedTranscriptCount?: number;
-  // 木の深さ上限で親子の辺を捨て「階層未確認」へ回した件数
   depthLimitedAgentCount?: number;
-  // summary を "prefix-truncated" へ倒した原因。どれも無いとき webview は reducer 自身の
-  // 上限退避（最古の task / placement を捨てた）と読み「先頭の作業は集計外」と書く。
-  // 新しい原因で summary だけ倒すと画面がその断定へ戻る（R-DSP-01。G-COV-7）
-  // subagents/ の一覧または meta が読めず agent 木が欠けた
   hierarchyIncomplete?: true;
-  // reduceWorkModel が例外を投げて捨てたイベント件数
   reducerErrorCount?: number;
-  // resume の全量走査が終わっていない（loading）／失敗した（failed）。live 分だけの集計
   hydrationUnconfirmed?: "loading" | "failed";
-  // 親 transcript の読み取りが途中で失敗した（それ以降のイベントは無い）
   historyReadError?: string;
-  // 親 transcript で JSON として読めなかった行数
   historyMalformedLineCount?: number;
-  // Task ツールの入力を解釈できず配置しなかった件数
   unparsedTaskInputCount?: number;
-  // 証拠索引（foldEvidence）が例外で捨てたイベント件数。summary の件数は減らない（reducer は通っている）が、
-  // 状況・L3・LLM 入力・Inspector の根拠からは欠ける。Host の Session がイベント fold 時に立てる
   evidenceFoldErrorCount?: number;
-  // 状況（semantic）の導出が例外で失敗した。stale = 状況タブは最後に成功した時点のまま、
-  // unavailable = 一度も出せていない。Host の Session が射影時に立て、導出が成功した payload には付かない
   semanticDerivationFailed?: "stale" | "unavailable";
   phaseHistory: "complete" | "prefix-compacted";
   compactedPhaseCount: number;
@@ -75,10 +48,6 @@ export interface WorkCoverage {
 
 export type WorkPhaseState = "approval" | "failed" | "running" | "stale" | "done";
 
-// phase の実行状態はここだけで決める。renderer や projection で件数から
-// 組み立て直すと、ターンが終わっている phase を「実行中」と表示する分岐が復活する。
-// currentPhaseId はターン終端で解除しない（次ターンの作業を同じ phase へ戻すため）ので、
-// 現在フェーズかどうかだけでは実行中を判定できない
 export function phaseStateOf(totals: WorkTotals, isCurrent: boolean, turnActive: boolean): WorkPhaseState {
   if (totals.pendingApprovalCount > 0) return "approval";
   if (totals.failCount > 0 || totals.childFailCount > 0) return "failed";
@@ -88,7 +57,6 @@ export function phaseStateOf(totals: WorkTotals, isCurrent: boolean, turnActive:
   return "done";
 }
 
-// phase と rollup が共通で持つ集計面。詳細を退避しても、この面だけは常に維持する
 export interface WorkTotals {
   elapsedMs: number;
   toolCount: number;
@@ -97,17 +65,11 @@ export interface WorkTotals {
   taskCount: number;
   agentCount: number;
   agentTokens: number;
-  // agent 配下のツール。phase 直下の toolCount へは入れないが、agent 記録を捨てても失わない
   childToolCount: number;
   childFailCount: number;
-  // agent の状態数。ツールの実行中数ではない
   staleCount: number;
   runningCount: number;
-  // 背景 Bash（run_in_background）の実行中数。委任ではないので runningCount（agent の状態数）とは別に持つ。
-  // phase の実行状態はこれも見る。無いと背景 Bash だけが動く phase が「done」と出る（R-DSP-01）
   backgroundRunningCount?: number;
-  // 追跡中の未解決な承認要求。上限で追跡をやめた分はここからも外し、
-  // coverage.untrackedApprovalCount へ出す（外さないと解決しても減らせず永久に承認待ちになる）
   pendingApprovalCount: number;
   revision: number;
 }
@@ -115,11 +77,9 @@ export interface WorkTotals {
 export interface WorkTask {
   taskKey: string;
   description: string;
-  // 進行中に出す表現（TodoWrite/TaskCreate の activeForm）。description とは別に持つ
   activeForm?: string;
   status: TaskStatus;
   occurrence: number;
-  // 担当phaseがrollupへ併合済み。次に in_progress へ戻ったとき新occurrenceを起こす
   compacted?: boolean;
   revision: number;
 }
@@ -155,12 +115,8 @@ export interface WorkSegment {
   turnIds: string[];
   startedAt: number;
   endedAt?: number;
-  // 詳細カード1枚分の集計。phase 集計では代用できない（1つの phase が複数の segment を束ねるため、
-  // phase の値をカードへ出すと同じ数値が複数カードへ重複して出る）。
-  // 数えるのは counted のツールだけ＝agent の子ツールは agent 1件へ含める（二重計上防止）
   toolCount: number;
   failCount: number;
-  // agent 配下で失敗した子ツール。phase 側と同じく直下の失敗とは分けて持つ
   childFailCount: number;
   elapsedMs: number;
   runningCount: number;
@@ -194,7 +150,6 @@ export interface WorkRollup extends WorkTotals {
 
 export type PhaseRef = { kind: "phase"; phaseId: string } | { kind: "rollup" };
 
-// 記帳系ツールの意図。状態へ反映するのは成功終了時（失敗した更新は成立していないため）
 export type TaskIntent =
   | { kind: "todo"; items: { taskKey: string; description: string; activeForm?: string; status: TaskStatus }[] }
   | { kind: "create"; toolUseId: string; subject: string; activeForm?: string; status: TaskStatus }
@@ -207,9 +162,6 @@ export type TaskIntent =
       deleted?: boolean;
     };
 
-// 実行中ツールの記録。tool_call_started 時点で配置先を固定し、終了時に現在phase/segmentを
-// 一切参照しない。agent の running/stale はこの記録が正本で、
-// phase 側の agent 記録が退避されていても集計を戻せる
 export interface WorkTool {
   requestIndex?: number;
   intentInput?: ToolIntentInput;
@@ -227,32 +179,19 @@ export interface WorkTool {
   spawnDepth?: number;
   taskIntent?: TaskIntent;
   stale?: boolean;
-  // 起動 ACK が task id を運んだ背景タスク（Agent の async 起動・Bash の run_in_background）。
-  // ACK では閉じず、task_notification で閉じる（裁定A2）
   background?: { taskId: string };
-  // 起動時に run_in_background が宣言された Agent。ACK 本文が認識できず id が取れなくても
-  // 完了として閉じない（L2 の非受理 ACK 縮退と同じ: completed へ漏らさず stale へ落ちる）
   declaredBackground?: true;
-  // Agent の reopen（SendMessage 成功）時刻。経過は直近の開始から数える
   resumedAt?: number;
-  // 直近の通知が運んだ tokens。再通知は置き換えなので、合計へは前回との差だけを入れる（合算すると二重計上）
   notifiedTokens?: number;
 }
 
-// 背景タスクの相関索引。task id → 元の placement。通知は合成 toolUseId で届くので、これ無しでは
-// 元の placement を閉じられない。terminal 確定後もエントリを残す（重複通知の無視・Agent の reopen）。
-// placement の退避と同時に消す
 export interface BackgroundTaskEntry {
   toolUseId: string;
   kind: "agent" | "tool";
   terminal?: "completed" | "failed" | "stale";
-  // background_tasks（REPLACE）の集合から消えたが通知は未着。次の turn_started で stale に確定する。
-  // 即 stale にしないのは、CLI が background_tasks_changed:[] を通知の 1ms 前に送るため
   pendingStale?: true;
 }
 
-// 未終了ツールの索引。毎イベント複製するため、キー空間をバケットへ分けて
-// 変更のあった1バケットだけを複製する。参照は findToolPlacement を使う
 export interface ToolPlacementIndex {
   buckets: Record<string, WorkTool>[];
   size: number;
@@ -270,33 +209,26 @@ export interface WorkModelState {
   planHistoryTruncated?: boolean;
   planHistoryLostThrough?: number;
   revision: number;
+  displayOnlySignalCount?: number;
   phases: WorkPhase[];
   rollup?: WorkRollup;
   segments: WorkSegment[];
   tasks: WorkTask[];
   toolPlacements: ToolPlacementIndex;
-  // requestId → 承認要求を計上した配置先。approval_resolved は requestId しか持たないので、
-  // これが無いとどの phase の件数を戻すか決められない（tool の placement と同じ考え方）
   approvalPlacements: Record<string, PhaseRef>;
   phaseByTaskKey: Record<string, string>;
   runningAgentToolUseIds: string[];
-  // 未終了の非agentツール。ターン境界で「実行中」表示を畳むために持つ。agent と分けるのは、
-  // 完了済みまで走査すると完了済みの経過時間・tokens が毎ターン消えるため
   runningToolUseIds: string[];
   backgroundTasks: Record<string, BackgroundTaskEntry>;
   activeTaskKey?: string;
   ambiguity?: "multiple-active-tasks";
-  // 上限で捨てた in_progress task の数。帰属判定を「1件だけ」と誤らせないために数える
   omittedActiveTaskCount: number;
   fallbackOperation: FallbackOperation;
-  // ターンが進行中か。currentPhaseId はターン終端で解除しない（次ターンの作業を同じ phase へ
-  // 戻すため）ので、これが無いと終了済みターンの phase を「実行中」と判定してしまう
   turnActive: boolean;
   currentPhaseId?: string;
   currentSegmentId?: string;
   nextPhaseOrdinal: number;
   nextSegmentOrdinal: number;
-  // inputPreview が壊れて解釈できなかった記帳/Bash入力の件数。黙って捨てないための観測点
   unparsedInputCount: number;
   coverage: WorkCoverage;
 }
@@ -324,7 +256,6 @@ function draftRequest(d: Draft, index: number | undefined): WorkRequestTotals | 
 }
 
 function startRequest(d: Draft, signal: Extract<WorkSignal, { kind: "turn_started" }>): void {
-  // R-TAB-07: createWorkModelState; startRequest
   if (d.next.requests === undefined) return;
   if (d.next.requestByTurn?.[signal.turnId] !== undefined) return;
   const headline = d.next.requestHeadline;
@@ -339,7 +270,6 @@ function startRequest(d: Draft, signal: Extract<WorkSignal, { kind: "turn_starte
     const request = draftRequest(d, index)!;
     request.turnIds = [...request.turnIds, signal.turnId];
     if (request.turnIds.length > MAX_PHASE_REFS) {
-      // R-TAB-07: incomplete requests are excluded by src/protocol.ts#projectWorkModel.
       request.incomplete = true;
       dropped = [request.turnIds.shift()!];
     }
@@ -373,7 +303,6 @@ function reconcileRequestCommands(d: Draft, turnId: string, text: string): void 
       previous.incomplete ||= current.incomplete;
       previous.revision = d.next.revision;
       if (previous.turnIds.length > MAX_PHASE_REFS) {
-        // R-TAB-07: src/protocol.ts#projectWorkModel
         previous.incomplete = true;
         previous.turnIds = previous.turnIds.slice(-MAX_PHASE_REFS);
       }
@@ -393,7 +322,6 @@ function reconcileRequestCommands(d: Draft, turnId: string, text: string): void 
 export type PlanHistoryEntry = { at: number; kind: "user" } | {
   at: number; kind: "todos"; source?: "tasks"; created?: boolean; removed?: boolean; items: Extract<TaskIntent, { kind: "todo" }>["items"];
 } | {
-  // status / endedAt are the agent's state just before this resume; reopen overwrites them on the agent
   at: number; kind: "resume"; agentId: string; description: string; status: WorkStatus; endedAt?: number;
 };
 export type WorkSignal = Readonly<NormalizedEvent>;
@@ -439,19 +367,14 @@ export function isBookkeepingTool(toolName: string): boolean {
 
 function buildVerifyCommandRegex(commands: readonly string[]): RegExp | null {
   if (commands.length === 0) return null;
-  // allowlist 側で \s を使うと改行に一致してしまうため [ \t] と [^\n\r] に限定する
   return new RegExp(`^(?:${commands.join("|")})(?:[ \\t][^\\n\\r]*)?$`);
 }
 
 const CLAUDE_VERIFY_COMMAND_RE = buildVerifyCommandRegex(CLAUDE_VOCABULARY.verifyCommands);
 
-// 実測: TaskCreate の結果は 'Task #7 created successfully: <件名>' のプレーンテキスト。
-// 入力側に taskId は無い（SDK実測知見.md）。JSON形式にも保険で一致させる
 const TASK_CREATE_ID_RE = /Task #(\d+)\b/;
 const TASK_CREATE_JSON_ID_RE = /"id"\s*:\s*"?([^",}\s]+)"?/;
-// 実測: Agent/Task の結果テキストに含まれるサブエージェント消費量（tab.ts と同一の形）
 const SUBAGENT_TOKENS_RE = /subagent_tokens[":\s]*(\d+)/;
-// TodoWrite のキー分離子（content に現れない制御文字）
 const TODO_KEY_SEPARATOR = "\u001f";
 
 function createOperationCounts(): Record<OperationKind, number> {
@@ -538,10 +461,6 @@ function readTaskStatus(value: unknown): TaskStatus | undefined {
   return undefined;
 }
 
-// シェルの引用符を解釈したうえで、コマンド結合が引用符の外にあるかだけを見る。
-// 引用符を無視すると --testNamePattern="foo|bar" のような単一コマンドまで弾く。
-// 二重引用符の中でもコマンド置換は実行されるので $( とバッククォートは中でも結合として扱う。
-// 引用符が閉じていない（inputPreview の切り詰め）ときは単一コマンドと断定できないため結合扱い
 function hasCommandSeparator(command: string): boolean {
   let quote: '"' | "'" | null = null;
   for (let i = 0; i < command.length; i++) {
@@ -645,8 +564,6 @@ interface Draft {
   coverageCopied: boolean;
 }
 
-// 入力stateは共有したまま、書き換える枝だけを複製する。深いコピーへ戻すと 5000件時点で
-// 1イベント13.65ms（実測）に戻り Extension Host が止まる
 function beginDraft(previousState: WorkModelState): Draft {
   return {
     next: { ...previousState, revision: previousState.revision + 1 },
@@ -669,8 +586,6 @@ function beginDraft(previousState: WorkModelState): Draft {
   };
 }
 
-// delete 演算子は対象オブジェクトを V8 の dictionary mode へ落とし、以後のコピーが目に見えて
-// 遅くなる。この record は毎イベント複製するため、キー削除は必ず再構築で行う
 function withoutKey<T>(source: Record<string, T>, omitted: string): Record<string, T> {
   const target: Record<string, T> = {};
   for (const key in source) {
@@ -680,8 +595,6 @@ function withoutKey<T>(source: Record<string, T>, omitted: string): Record<strin
   return target;
 }
 
-// キーが一意に増え続ける record へスプレッド構文でキーを足すと for-in の再構築より遅く、
-// 大きな記録の復元が verify-webview-wiring#sol-3 の待ち時間を超える。
 function withKey<T>(source: Record<string, T> | undefined, key: string, value: T, omitted: ReadonlySet<string>): Record<string, T> {
   const target: Record<string, T> = {};
   for (const existing in source) {
@@ -878,14 +791,12 @@ function draftCoverage(d: Draft): WorkCoverage {
   return d.next.coverage;
 }
 
-// 詳細を捨てたら必ずここを通す。捨てたのに complete のままにしない
 function markDetailsTruncated(d: Draft, omittedTools = 0): void {
   const coverage = draftCoverage(d);
   coverage.details = "prefix-truncated";
   if (omittedTools > 0) coverage.omittedToolCount = (coverage.omittedToolCount ?? 0) + omittedTools;
 }
 
-// 帰属（タスク状態・agent配置）に影響する欠落を出す
 function markSummaryTruncated(d: Draft): void {
   draftCoverage(d).summary = "prefix-truncated";
 }
@@ -897,7 +808,6 @@ function pushBounded(d: Draft, values: string[], value: string, limit: number): 
   markDetailsTruncated(d);
 }
 
-/** 配置先の集計面（phase か rollup）を取り出す。詳細記録の有無に依存しない */
 interface TotalsTarget {
   totals: WorkTotals;
   phase?: WorkPhase;
@@ -942,8 +852,6 @@ function removeTask(d: Draft, taskKey: string): void {
   tasks.splice(index, 1);
 }
 
-// 上限は必ず成立させる。in_progress しか無い場合も退避し、帰属判定が「1件だけ」へ
-// 誤って倒れないよう omittedActiveTaskCount で数える
 function boundTasks(d: Draft): void {
   const tasks = draftTasks(d);
   while (tasks.length > MAX_TASKS) {
@@ -1015,7 +923,6 @@ export function parseTaskIntentFromRawInput(
   if (toolName === "TaskUpdate") {
     const taskId = readTaskId(input);
     if (taskId === undefined) return undefined;
-    // 実測: TaskUpdate の status には "deleted" もある（SDK実測知見.md）
     return {
       kind: "update",
       taskKey: `task:${taskId}`,
@@ -1034,8 +941,6 @@ function parseTaskIntent(e: ToolStartedSignal): TaskIntent | undefined {
   return parseTaskIntentFromRawInput(e.toolName, input, e.toolUseId);
 }
 
-// TodoWrite は現在のtodo配列そのものが状態（レベル信号）。配列から消えた todo を失効させないと
-// 完了済みタスクが in_progress のまま残り、後続作業が誤帰属する
 function applyTodoIntent(
   d: Draft,
   items: { taskKey: string; description: string; activeForm?: string; status: TaskStatus }[]
@@ -1045,7 +950,6 @@ function applyTodoIntent(
   const retained = tasks.filter((task) => !task.taskKey.startsWith("todo:"));
   const todoTasks = items.map((item) => {
     const old = previous.get(item.taskKey);
-    // 退避済みの todo が配列へ戻ってきたら、記録側で数え直せるので omitted 分を返す
     if (!old && item.status === "in_progress") releaseOmittedActiveTask(d);
     if (
       old &&
@@ -1086,9 +990,6 @@ function applyCreateIntent(d: Draft, intent: Extract<TaskIntent, { kind: "create
   upsertTask(d, taskKey, intent.subject, intent.status, intent.activeForm);
 }
 
-// 記録が退避された in_progress task が in_progress を抜けた合図。これを取り込まないと
-// omittedActiveTaskCount が減らず、以後ずっと「複数タスクが進行中」に固着して
-// 明示タスクのphaseが二度と作られなくなる（記録が無い側の同定はできないので下限0で丸める）
 function releaseOmittedActiveTask(d: Draft): void {
   if (d.next.omittedActiveTaskCount === 0) return;
   d.next.omittedActiveTaskCount--;
@@ -1116,7 +1017,6 @@ function applyUpdateIntent(d: Draft, intent: Extract<TaskIntent, { kind: "update
   }
   if (intent.subject !== undefined) existing.description = intent.subject;
   if (intent.activeForm !== undefined) existing.activeForm = intent.activeForm;
-  // status 未指定は「変更なし」。unknown で上書きすると進行中タスクから作業が外れる
   if (intent.status !== undefined) existing.status = intent.status;
 }
 
@@ -1202,7 +1102,6 @@ function compactPhases(d: Draft, removed: WorkPhase[]): void {
       task.compacted = true;
       continue;
     }
-    // task記録が上限で退避済みでも occurrence 連鎖は切らさない（phase が taskKey と occurrence を持つ）
     draftTasks(d).push({
       taskKey: phase.taskKey,
       description: phase.title,
@@ -1226,8 +1125,6 @@ function compactPhases(d: Draft, removed: WorkPhase[]): void {
       if (drafted) drafted.phaseRef = { kind: "rollup" };
     }
   }
-  // 未解決の承認が rollup へ移った phase を指したままだと、後から来る approval_resolved が
-  // 消えた phase の件数を戻そうとして総計が合わなくなる
   for (const requestId in state.approvalPlacements) {
     const placement = state.approvalPlacements[requestId];
     if (placement.kind !== "phase" || !removedIds.has(placement.phaseId)) continue;
@@ -1317,9 +1214,6 @@ function advanceFallback(d: Draft, operation: OperationKind): void {
   d.next.fallbackOperation = operation;
 }
 
-// unknown / delegated は「まだ分類する根拠が無い」状態。最初の observe/mutate/verify は
-// 現在phaseをその場で昇格させる（新phaseを作ると Bash 起点の会話で「その他の作業」が残り、
-// Todo無しfallbackが4個になる）
 function isUnclassified(phase: WorkPhase): boolean {
   return phase.operation === "unknown" || phase.operation === "delegated";
 }
@@ -1341,8 +1235,6 @@ function destination(d: Draft, operation: OperationKind, timestamp: number): Wor
   });
 }
 
-// Agent/Task は「単独の場合のみサブエージェント作業」。他の作業が同じphaseに
-// 入った時点で通常の分類へ戻す
 function relabelFallbackPhase(d: Draft, phase: WorkPhase): void {
   if (phase.taskKey !== undefined) return;
   const fallback = d.next.fallbackOperation;
@@ -1370,8 +1262,6 @@ function place(d: Draft, phase: WorkPhase, timestamp: number, turnId: string): W
   trackTurn(d, phase, turnId);
   const current = findSegment(d.next, d.next.currentSegmentId);
   if (current && current.phaseId === phase.phaseId && current.endedAt === undefined) {
-    // 呼び出し側が集計を書き換えるので、再利用でも必ず複製を返す（前state共有のまま
-    // 加算すると過去の state まで書き換わる）
     const drafted = draftSegment(d, current.segmentId)!;
     if (!drafted.turnIds.includes(turnId)) drafted.turnIds.push(turnId);
     return drafted;
@@ -1402,8 +1292,6 @@ function place(d: Draft, phase: WorkPhase, timestamp: number, turnId: string): W
   return segment;
 }
 
-// agent記録は詳細。件数・tokens・running/stale は WorkTotals 側が持つので、
-// 上限超過ではここを捨ててよい（捨てたことは coverage へ出す）
 function addAgent(d: Draft, phase: WorkPhase, agent: WorkAgent): void {
   phase.agents.push(agent);
   d.copiedAgentIds.add(agent.agentId);
@@ -1425,7 +1313,6 @@ function removeRunningTool(d: Draft, toolUseId: string): void {
   d.next.runningToolUseIds = draftRunningTools(d).filter((id) => id !== toolUseId);
 }
 
-// 1件を stale へ畳む。segment 側は counted のツールだけを数えているので、そちらに合わせて増減する
 function markToolStale(d: Draft, toolUseId: string, timestamp: number, isAgent: boolean): void {
   const current = findToolPlacement(d.next, toolUseId);
   if (!current || current.stale === true) return;
@@ -1449,15 +1336,10 @@ function markToolStale(d: Draft, toolUseId: string, timestamp: number, isAgent: 
   agent.elapsedMs = Math.max(0, timestamp - agent.startedAt);
 }
 
-// 別の上限は設けない。ここへ入るのは未終了ツールだけで、終了・退避のどちらでも
-// 同時にリストから外れるため、長さは placement 索引の上限（MAX_TRACKED_TOOL_USES）を超えない
 function trackRunningTool(d: Draft, toolUseId: string): void {
   draftRunningTools(d).push(toolUseId);
 }
 
-// 退避しても集計が壊れないよう、実行中agentの配置は先に stale へ畳んでから捨てる。
-// 非agentを優先して捨てるのは、agent配置を失うと子ツールが親を見つけられず
-// トップレベルとして二重計上されるため
 function evictOldestPlacement(d: Draft): void {
   const index = draftPlacementIndex(d);
   let victim: WorkTool | undefined;
@@ -1479,11 +1361,7 @@ function evictOldestPlacement(d: Draft): void {
     }
   }
   if (victim === undefined) return;
-  // 退避した配置の終了イベントは帰属先を持たないため、経過時間・失敗数（子ツールなら
-  // childFailCount）が集計へ入らない。総計が実態からずれるので summary 側も欠落扱いにする
-  // （詳細を捨てても総計は保つ。保てないなら coverage へ出す）
   markSummaryTruncated(d);
-  // 追跡をやめる分は segment の実行中数からも外す。外さないとそのカードが永久に「実行中」になる
   if (victim.counted && victim.stale !== true) {
     const segment = draftSegment(d, victim.segmentId);
     if (segment) {
@@ -1505,7 +1383,6 @@ function evictOldestPlacement(d: Draft): void {
   if (victim.background !== undefined) {
     const taskId = victim.background.taskId;
     const entry = d.next.backgroundTasks[taskId];
-    // 通知待ちのまま退避したものだけを欠落として数える。完了済みの退避は集計に影響しない
     if (entry !== undefined && entry.terminal === undefined) {
       const coverage = draftCoverage(d);
       coverage.untrackedBackgroundCount = (coverage.untrackedBackgroundCount ?? 0) + 1;
@@ -1544,7 +1421,6 @@ function handleToolStart(d: Draft, e: ToolStartedSignal): void {
   if (isBookkeepingTool(e.toolName)) {
     const intent = e.taskIntentStructured ?? parseTaskIntent(e);
     if (intent) {
-      // 記帳系は作業件数へ混ぜない。状態へ反映するのは成功終了時（失敗した更新は成立していない）
       setPlacement(d, {
         toolUseId: e.toolUseId,
         parentToolUseId: e.parentToolUseId,
@@ -1661,7 +1537,6 @@ function parseSubagentTokens(resultPreview: string): number | undefined {
   return match ? Number(match[1]) : undefined;
 }
 
-// 背景タスクの起動 ACK。閉じずに索引へ登録し、通知を待つ（裁定A2: ACK は完了ではない）
 function markBackgroundStarted(d: Draft, toolUseId: string, taskId: string): void {
   const placement = draftPlacement(d, toolUseId);
   if (!placement) return;
@@ -1674,7 +1549,6 @@ function markBackgroundStarted(d: Draft, toolUseId: string, taskId: string): voi
   }
 }
 
-// 背景を stale に確定する（終端イベント・pendingStale の確定・hydration 末尾）。以後の通知は無視される
 function settleBackgroundStale(d: Draft, placement: WorkTool): void {
   const taskId = placement.background?.taskId;
   if (taskId === undefined) return;
@@ -1688,7 +1562,6 @@ function settleBackgroundStale(d: Draft, placement: WorkTool): void {
   }
 }
 
-// 背景 1 件を終端へ畳む。ACK で入れなかった集計（経過・実行中数・失敗）をここで入れる
 function finishBackground(
   d: Draft,
   placement: WorkTool,
@@ -1740,7 +1613,6 @@ function finishBackground(
   }
   removeRunningAgent(d, placement.toolUseId);
   removeRunningTool(d, placement.toolUseId);
-  // Bash は reopen しないので placement を消す。Agent は SendMessage で再開しうるので残す（退避で消える）
   if (placement.agentId === undefined) {
     deletePlacement(d, placement.toolUseId);
   } else {
@@ -1749,7 +1621,6 @@ function finishBackground(
   }
 }
 
-// background 委任の tokens は ACK の結果本文に無く、通知だけが運ぶ
 function recordNotifiedTokens(d: Draft, toolUseId: string, tokens: number): void {
   const placement = draftPlacement(d, toolUseId);
   if (!placement || placement.agentId === undefined) return;
@@ -1762,9 +1633,6 @@ function recordNotifiedTokens(d: Draft, toolUseId: string, tokens: number): void
   placement.notifiedTokens = tokens;
 }
 
-// task_notification（合成 toolUseId）。task id で元の placement を引いて閉じる。
-// 観測外・重複・退避後・終端済みは無視する（completed と断言しない）。tokens だけは終端済みでも
-// 最新の通知で置き換える: 実行中に届いた SendMessage は reopen を経ずに再通知を起こす
 function closeBackgroundByNotification(
   d: Draft,
   taskId: string,
@@ -1784,8 +1652,6 @@ function closeBackgroundByNotification(
   if (entry.kind === "agent" && tokens !== undefined) recordNotifiedTokens(d, entry.toolUseId, tokens);
 }
 
-// SendMessage 成功（resumedAgentId）: 終端済みの Agent を running へ戻す。running なら何もしない。
-// 通知より先に届いた場合も running のまま（順序逆転で completed に倒さない）
 function reopenBackground(d: Draft, taskId: string, timestamp: number): void {
   const entry = d.next.backgroundTasks[taskId];
   if (entry === undefined || entry.kind !== "agent" || entry.terminal === undefined) return;
@@ -1820,8 +1686,6 @@ function reopenBackground(d: Draft, taskId: string, timestamp: number): void {
   if (!d.next.runningAgentToolUseIds.includes(placement.toolUseId)) draftRunningAgents(d).push(placement.toolUseId);
 }
 
-// background_tasks（REPLACE のレベル信号）: 追跡中の task id が集合に無ければ pendingStale。
-// 集合に戻ればフラグを外す。確定は次の turn_started（settlePendingStale）
 function notePendingStale(d: Draft, tasks: ReadonlyArray<{ id: string; ambient?: true }>): void {
   const alive = new Set(tasks.filter((t) => t.ambient !== true).map((t) => t.id));
   for (const [taskId, entry] of Object.entries(d.next.backgroundTasks)) {
@@ -1846,8 +1710,6 @@ function settlePendingStale(d: Draft, timestamp: number): void {
   }
 }
 
-// ストリームが閉じている（history の hydration 末尾・CLI 死亡で終端イベントが来ない）ときに host が当てる。
-// 通知未観測の背景を全て stale にする。revision は進めない（markSubagentGaps と同じ扱い）
 export function markBackgroundUnconfirmed(state: WorkModelState, timestamp: number): WorkModelState {
   const open = Object.entries(state.backgroundTasks).filter(([, e]) => e.terminal === undefined);
   if (open.length === 0) return state;
@@ -1867,15 +1729,12 @@ export function markBackgroundUnconfirmed(state: WorkModelState, timestamp: numb
 }
 
 function handleToolFinish(d: Draft, e: ToolFinishedSignal): void {
-  // 通知（合成 toolUseId）は placement を持たない。placement 検索より先に task id で解決する
   if (e.taskNotification !== undefined) {
     closeBackgroundByNotification(d, e.taskNotification.agentId, e.taskNotification.status, e.timestamp, e.taskNotification.tokens);
     return;
   }
-  // SendMessage の成功結果は「同じ Agent が再び動き出した」観測。SendMessage 自身の終端処理は続ける
   if (e.resumedAgentId !== undefined && !e.isError) reopenBackground(d, e.resumedAgentId, e.timestamp);
   const placement = findToolPlacement(d.next, e.toolUseId);
-  // 配置が無いのは上限退避（退避時に coverage へ記録済み）か、観測範囲外で始まったツール
   if (!placement) return;
   const backgroundTaskId =
     !e.isError && placement.taskIntent === undefined ? (e.asyncLaunchedAgentId ?? e.backgroundTaskId) : undefined;
@@ -1885,13 +1744,10 @@ function handleToolFinish(d: Draft, e: ToolFinishedSignal): void {
       const agent = phase && draftAgent(d, phase, placement.agentId);
       if (agent) agent.transcriptAgentId = e.asyncLaunchedAgentId;
     }
-    // 起動 ACK は完了ではない（裁定A2）。閉じずに索引へ登録し、通知を待つ
     markBackgroundStarted(d, e.toolUseId, backgroundTaskId);
     return;
   }
   if (placement.declaredBackground === true && placement.agentId !== undefined && !e.isError) {
-    // 宣言は background なのに ACK から id が取れない（本文が想定外）。completed へ倒さず、
-    // 通知では決して閉じられない索引エントリ（鍵は toolUseId）にして終端イベントで stale にする
     markBackgroundStarted(d, e.toolUseId, e.toolUseId);
     return;
   }
@@ -1922,9 +1778,6 @@ function handleToolFinish(d: Draft, e: ToolFinishedSignal): void {
     if (request) request.failCount++;
   }
   const elapsedMs = Math.max(0, e.timestamp - placement.startedAt);
-  // 配置は開始時に固定されている。カード切替後に終了しても、集計は開始時の segment へ入る
-  // ターン終端で stale へ畳んだ後に遅れて終わる経路があるので、
-  // どちらの計数から引くかは placement.stale で決める（両方 running から引くと負になる）
   const segment = draftSegment(d, placement.segmentId);
   if (segment && placement.counted) {
     if (placement.stale) segment.staleCount--;
@@ -1939,7 +1792,6 @@ function handleToolFinish(d: Draft, e: ToolFinishedSignal): void {
   if (target.phase) target.phase.endedAt = e.timestamp;
   if (target.rollup) target.rollup.endedAt = Math.max(target.rollup.endedAt, e.timestamp);
 
-  // 子ツールの経過時間は agent 自身の経過時間に含まれるため、counted のときだけ加算する
   if (placement.counted) {
     target.totals.elapsedMs += elapsedMs;
     if (e.isError) target.totals.failCount++;
@@ -1966,14 +1818,6 @@ function handleToolFinish(d: Draft, e: ToolFinishedSignal): void {
   if (tokens !== undefined) agent.tokens = tokens;
 }
 
-// ターン境界で、実行中として残っているものだけを stale にする。走査するのは実行中リストだけで、
-// 完了済みは触らない（完了済みまで走査すると経過時間・tokens が毎ターン消える）。
-// ターン開始側でも呼ぶ: 終端イベントを取りこぼした場合、ここが唯一の回収点になる
-// （取りこぼすと前ターンの作業が「実行中」のまま永久に回り続ける）
-// includeBackground=false（turn_completed / turn_started）は背景を残す。ストリーム継続中の区切りで
-// 背景は生きている。true（turn_interrupted / turn_failed / conversation_closed）は query の終端で、
-// CLI が背景を kill する。リストを無条件に空にしない——残した背景が追跡から落ち、
-// 後の終端イベントで二度と回収できなくなる
 function markRunningWorkStale(d: Draft, timestamp: number, includeBackground: boolean): void {
   const isBackground = (toolUseId: string): boolean => findToolPlacement(d.next, toolUseId)?.background !== undefined;
   const keptAgents: string[] = [];
@@ -2002,8 +1846,6 @@ function markRunningWorkStale(d: Draft, timestamp: number, includeBackground: bo
   }
 }
 
-// 追跡をやめる承認は件数からも外す。外さないと approval_resolved が未知IDとして無視され、
-// 全件解決してもその phase が承認待ちのまま残る
 function untrackApproval(d: Draft, requestId: string): void {
   const phaseRef = d.next.approvalPlacements[requestId];
   d.next.approvalPlacements = withoutKey(draftApprovals(d), requestId);
@@ -2014,9 +1856,7 @@ function untrackApproval(d: Draft, requestId: string): void {
   coverage.untrackedApprovalCount = (coverage.untrackedApprovalCount ?? 0) + 1;
 }
 
-// 承認要求は現在phaseの出来事として数える。phase 境界にはしない（agent 起動と同じ扱い）
 function handleApprovalRequest(d: Draft, e: Extract<NormalizedEvent, { kind: "approval_request" }>): void {
-  // 同じ requestId の再送で二重に数えない。記録は1件しか持てないので、増やすと解決時に戻せない
   if (d.next.approvalPlacements[e.requestId] !== undefined) return;
   const phase = destination(d, "unknown", e.timestamp);
   const target = draftTotals(d, { kind: "phase", phaseId: phase.phaseId });
@@ -2029,7 +1869,6 @@ function handleApprovalRequest(d: Draft, e: Extract<NormalizedEvent, { kind: "ap
 
 function handleApprovalResolved(d: Draft, e: Extract<NormalizedEvent, { kind: "approval_resolved" }>): void {
   const phaseRef = d.next.approvalPlacements[e.requestId];
-  // 記録が無いのは上限退避（退避時に coverage へ記録済み）か、観測範囲外で始まった承認
   if (phaseRef === undefined) return;
   d.next.approvalPlacements = withoutKey(draftApprovals(d), e.requestId);
   const target = draftTotals(d, phaseRef);
@@ -2050,13 +1889,32 @@ function handleSubagentInfo(d: Draft, e: Extract<NormalizedEvent, { kind: "subag
 function recordPlanHistory(d: Draft, entry: PlanHistoryEntry): void {
   const history = [...(d.next.planHistory ?? []), entry];
   while (history.length > MAX_TASKS) {
-    // R-DSP-29: spend the bound on visible steps and requests before hidden generations.
     const earlier = history.findIndex(row => row.kind !== "user" && row.at < (d.next.planBoundaryAt ?? Number.NEGATIVE_INFINITY));
     const [lost] = history.splice(earlier < 0 ? 0 : earlier, 1);
     d.next.planHistoryTruncated = true;
     d.next.planHistoryLostThrough = Math.max(d.next.planHistoryLostThrough ?? Number.NEGATIVE_INFINITY, lost.at);
   }
   d.next.planHistory = history;
+}
+
+export function foldPlanDeclarationText(previous: WorkModelState["planText"], turnId: string, delta: string, at: number): {
+  text: NonNullable<WorkModelState["planText"]>; declarations: { goal: string; at: number }[];
+} {
+  const prior = previous?.turnId === turnId ? previous : undefined;
+  const head = prior === undefined ? "" : prior.text + (prior.recordEnded ? recordSeparator(prior.text) : "");
+  const text = head + delta;
+  let declaredThrough = prior?.declaredThrough ?? -1;
+  const declarations: { goal: string; at: number }[] = [];
+  if (text.includes("laisora-plan")) {
+    for (const node of parseMarkdown(text)) {
+      if (node.type !== "plan" || node.offset <= declaredThrough) continue;
+      declarations.push({ goal: node.goal, at });
+      declaredThrough = node.offset;
+    }
+  }
+  const boundary = findCommitBoundary(text, 0);
+  return { text: { turnId, text: boundary < 0 ? text : text.slice(boundary),
+    declaredThrough: boundary < 0 ? declaredThrough : declaredThrough - boundary }, declarations };
 }
 
 function applySignal(d: Draft, signal: WorkSignal): void {
@@ -2080,21 +1938,9 @@ function applySignal(d: Draft, signal: WorkSignal): void {
       if (d.next.planText?.turnId === signal.turnId) d.next.planText = { ...d.next.planText, recordEnded: true };
       return;
     case "assistant_text_delta": {
-      const previous = d.next.planText?.turnId === signal.turnId ? d.next.planText : undefined;
-      const head = previous === undefined ? "" : previous.text + (previous.recordEnded ? recordSeparator(previous.text) : "");
-      const text = head + signal.text;
-      let declaredThrough = previous?.declaredThrough ?? -1;
-      if (text.includes("laisora-plan")) {
-        for (const node of parseMarkdown(text)) {
-          if (node.type !== "plan" || node.offset <= declaredThrough) continue;
-          d.next.planDeclaration = { goal: node.goal, at: signal.timestamp };
-          declaredThrough = node.offset;
-        }
-      }
-      const boundary = findCommitBoundary(text, 0);
-      d.next.planText = { turnId: signal.turnId, text: boundary < 0 ? text : text.slice(boundary),
-        declaredThrough: boundary < 0 ? declaredThrough : declaredThrough - boundary };
-      // ツールを1件も使わないターンでも概要を空にしない
+      const folded = foldPlanDeclarationText(d.next.planText, signal.turnId, signal.text, signal.timestamp);
+      d.next.planText = folded.text;
+      for (const declaration of folded.declarations) d.next.planDeclaration = declaration;
       const phase = destination(d, "unknown", signal.timestamp);
       place(d, phase, signal.timestamp, signal.turnId);
       relabelFallbackPhase(d, phase);
@@ -2136,8 +1982,6 @@ function applySignal(d: Draft, signal: WorkSignal): void {
       closeSegment(d, signal.timestamp);
       return;
     case "compact_boundary":
-      // R-DSP-43: the handoff cuts PLAN; history is not reset because EARLIER REQUESTS counts every generation (R-HND-13).
-      // priorGeneration is the only handoff signal: a plain /compact or auto compact must keep the plan (R-DSP-36).
       if (signal.priorGeneration !== true) return;
       d.next.planDeclaration = undefined;
       d.next.planBoundaryAt = signal.timestamp;
@@ -2147,10 +1991,6 @@ function applySignal(d: Draft, signal: WorkSignal): void {
   }
 }
 
-// bounded EventLog から詳細イベントを落としたことを集計側へ出す。reducer は落とす前の
-// イベントを既に畳んでいるので summary は欠けないが、details は欠ける。
-// revision は進めない。WorkSignal 列から再計算した WorkModel と revision まで一致する
-// ことが前提で、切り詰め回数だけ live 側が先へ進むと崩れる
 export function markEventLogTrimmed(state: WorkModelState, droppedCount: number): WorkModelState {
   if (droppedCount <= 0) return state;
   return {
@@ -2163,9 +2003,6 @@ export function markEventLogTrimmed(state: WorkModelState, droppedCount: number)
   };
 }
 
-// resume でサブエージェントの meta / transcript を読めなかったぶんを出す。
-// meta が読めないと agent tree ごと欠けるので、その場合は概要も欠落扱いにする
-// （読めていないのに「概要: セッション全体」と表示しないため）
 export function markSubagentGaps(
   state: WorkModelState,
   gaps: { unreadableAgentCount: number; hierarchyIncomplete: boolean }
@@ -2182,10 +2019,17 @@ export function markSubagentGaps(
   return { ...state, coverage };
 }
 
+export const DISPLAY_ONLY_SIGNAL_KINDS: ReadonlySet<WorkSignal["kind"]> = new Set<WorkSignal["kind"]>(["local_command_output"]);
+
 export function reduceWorkModel(previousState: WorkModelState, workSignal: WorkSignal): WorkModelState {
   const d = beginDraft(previousState);
   applySignal(d, workSignal);
+  if (DISPLAY_ONLY_SIGNAL_KINDS.has(workSignal.kind)) d.next.displayOnlySignalCount = (previousState.displayOnlySignalCount ?? 0) + 1;
   return d.next;
+}
+
+export function semanticRevision(state: WorkModelState): number {
+  return state.revision - (state.displayOnlySignalCount ?? 0);
 }
 
 export function deriveWorkModel(

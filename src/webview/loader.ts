@@ -1,4 +1,3 @@
-// dom.ts から値 import される。import を足さず、トップレベルで DOM に触れない（dom.ts の評価順の保証が崩れる）。
 const SVG_NS = "http://www.w3.org/2000/svg";
 
 export function createLoader(size: 12 | 16 = 16): SVGSVGElement {

@@ -4,6 +4,8 @@ import { redactAbsolutePaths, redactOptional } from "./path-redaction";
 import type { DelegationInfo, ProgressEmission, ProgressState, TaskNotificationInfo } from "./protocol";
 import { parseTaskIntentFromRawInput } from "./work-model";
 import type { TaskIntent } from "./work-model";
+import { taskNotificationDisplayFields } from "./transcript-display";
+import { isExternalRunTool } from "./orchestration-executors";
 
 export interface Stage0ToolFields {
   delegation?: DelegationInfo;
@@ -123,16 +125,15 @@ export function extractStage0ToolFields(
 export interface ResumeSignals {
   asyncLaunchedAgentId?: string;
   resumedAgentId?: string;
-  // 背景 Bash の起動 ACK が運ぶ task id。task_notification の task_id と一致する（SDK 0.3.260 実測）。
-  // Agent の asyncLaunchedAgentId と同じ「通知を受理する id」だが、Bash は委任ではないので欄を分ける
   backgroundTaskId?: string;
 }
 
-// この集合に無いツールは ACK 本文を抽出器へ渡さない。Bash を外すと backgroundTaskId は絶対に取れない
 export const RESUME_SIGNAL_TOOL_NAMES: ReadonlySet<string> = new Set(["Task", "Agent", "SendMessage", "Bash"]);
+export const isResumeSignalToolName = (name: string): boolean =>
+  RESUME_SIGNAL_TOOL_NAMES.has(name) || /^mcp__[A-Za-z0-9_-]+__[A-Za-z0-9_-]+$/.test(name) || isExternalRunTool(name);
 
-// 実測形。前置きが一致しない Bash 結果は通常の同期実行
 const BASH_BACKGROUND_ACK_RE = /^Command running in background with ID: ([A-Za-z0-9][A-Za-z0-9._-]*)\. Output is being written to:/;
+const MCP_BACKGROUND_ACK_RE = /^MCP tool "([A-Za-z0-9_-]+)\/([A-Za-z0-9_-]+)" is still running after \d+s\. It was moved to the background as task ([A-Za-z0-9][A-Za-z0-9._-]*) and keeps running;/;
 
 export function extractResumeSignals(
   toolName: string | undefined,
@@ -149,6 +150,14 @@ export function extractResumeSignals(
   if (toolName === "Bash") {
     const m = BASH_BACKGROUND_ACK_RE.exec(text);
     return m ? { backgroundTaskId: m[1] } : undefined;
+  }
+  if (toolName !== undefined && isExternalRunTool(toolName)) {
+    const m = MCP_BACKGROUND_ACK_RE.exec(text);
+    return m && (toolName === `${m[1]}__${m[2]}` || toolName.endsWith(`__${m[1]}__${m[2]}`)) ? { backgroundTaskId: m[3] } : undefined;
+  }
+  if (toolName?.startsWith("mcp__")) {
+    const m = MCP_BACKGROUND_ACK_RE.exec(text);
+    return m && toolName === `mcp__${m[1]}__${m[2]}` ? { backgroundTaskId: m[3] } : undefined;
   }
   if (toolName === "SendMessage") {
     if (text.startsWith("{") && text.includes('"resumedAgentId"')) {
@@ -172,16 +181,27 @@ export function extractResumeSignals(
   return undefined;
 }
 
-export function parseTaskNotification(text: string): TaskNotificationInfo | undefined {
-  const t = text.trimStart();
-  if (!t.startsWith("<task-notification>")) return undefined;
+const TASK_NOTIFICATION_OPEN = "<task-notification>";
+const TASK_NOTIFICATION_PREAMBLE_MARKER = "[SYSTEM NOTIFICATION - NOT USER INPUT]";
+
+export function parseTaskNotification(
+  text: string,
+  opts?: { trustedOrigin?: boolean }
+): TaskNotificationInfo | undefined {
+  let t = text.trimStart();
+  if (opts?.trustedOrigin === true && t.startsWith(TASK_NOTIFICATION_PREAMBLE_MARKER)) {
+    const open = t.indexOf(TASK_NOTIFICATION_OPEN);
+    if (open >= 0) t = t.slice(open);
+  }
+  if (!t.startsWith(TASK_NOTIFICATION_OPEN)) return undefined;
   const agentId = /<task-id>([^<]+)<\/task-id>/.exec(t)?.[1]?.trim();
   if (!agentId) return undefined;
   const toolUseId = /<tool-use-id>([^<]+)<\/tool-use-id>/.exec(t)?.[1]?.trim();
   const status = /<status>([^<]+)<\/status>/.exec(t)?.[1]?.trim();
-  // <result> は委任先の自由文で <usage> も </result> も含みうる。usage は最後の </result> より後ろ
-  // （閉じていない <result> があれば読まない）からだけ取る。外側に usage が無い通知は未計測のまま
   const resultEnd = t.lastIndexOf("</result>");
+  const resultStart = t.indexOf("<result>");
+  const result = resultStart >= 0 && resultEnd >= resultStart ? t.slice(resultStart + "<result>".length, resultEnd) : undefined;
+  const summary = /<summary>([\s\S]*?)<\/summary>/.exec(resultStart >= 0 ? t.slice(0, resultStart) : t)?.[1];
   const outside = resultEnd >= 0 ? t.slice(resultEnd + "</result>".length) : t.includes("<result>") ? "" : t;
   const tokensText = /<usage>[^]*?<subagent_tokens>(\d+)<\/subagent_tokens>/.exec(outside)?.[1];
   const tokens = tokensText === undefined ? undefined : Number(tokensText);
@@ -190,5 +210,6 @@ export function parseTaskNotification(text: string): TaskNotificationInfo | unde
     ...(toolUseId ? { toolUseId } : {}),
     ...(status ? { status } : {}),
     ...(tokens !== undefined && Number.isSafeInteger(tokens) ? { tokens } : {}),
+    ...taskNotificationDisplayFields(summary, result),
   };
 }

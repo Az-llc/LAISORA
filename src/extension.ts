@@ -24,6 +24,7 @@ import {
   store,
 } from "./host-context";
 import { initHostL10n } from "./l10n";
+import { deleteOldLearningStore } from "./learning-startup";
 import {
   llmAnalysisEnabled,
   llmDiagnosticsAudience,
@@ -36,8 +37,10 @@ import { PROTOCOL_VERSION } from "./protocol";
 import { openResumedSession as resumePersistedTab } from "./resume-hydration";
 import { lookupSessionFile } from "./session-files";
 import {
+  disposeAccountUsage,
   persistOpenTabs,
   readPersistedOpenTabs,
+  releaseAccountUsageWaiter,
   restoreTabsOnStartupEnabled,
   type PersistedOpenTab,
 } from "./session-list-wiring";
@@ -46,7 +49,6 @@ export { settingsStateMessage, setExternalDetectorForTest } from "./gateway-host
 import { openSettingsPanel, postSettingsState } from "./settings-panel";
 import { postOrchestrationView } from "./conversation-lifecycle";
 import { registerReadOnlyFileProvider } from "./composer-io";
-// 公開面と検証ハーネスの互換性を保つ再 export。Host 内部は各所有モジュールを直接参照する。
 export { Session, historyScopeKey, historyTranscriptScopeKey, isUnusedSession } from "./session";
 export {
   createHydrationDraft,
@@ -61,8 +63,6 @@ function affectsProductConfiguration(e: vscode.ConfigurationChangeEvent, key: st
   return e.affectsConfiguration(`laisora.${key}`);
 }
 
-// 最初のタブを用意する。activity bar の view と panel コマンドは同じ activation で両方通るので、
-// 既にタブがあれば何もしない（復元の二重実行でタブが重複する。R-SES-01）
 function ensureInitialTabs(st: SessionStore): void {
   if (st.sessions.size > 0) return;
   const entries = restoreTabsOnStartupEnabled() ? readPersistedOpenTabs() : [];
@@ -73,16 +73,12 @@ function ensureInitialTabs(st: SessionStore): void {
   void restorePersistedTabs(st, entries);
 }
 
-// 前回開いていたタブを履歴からの再開と同じ経路（openResumedSession）で開き直す。
-// 記録の位置は lookupSessionFile だけで解き、「無い」と「確かめられなかった」を別の文で出す（R-DSP-01）。
-// 復元できなかった分は黙って落とさず、先頭のタブへ 1 行ずつ残す
 async function restorePersistedTabs(st: SessionStore, entries: PersistedOpenTab[]): Promise<void> {
   const notices: string[] = [];
   const started: Array<{ label: string; sessionId: string; outcome: ReturnType<typeof resumePersistedTab> }> = [];
   let skippedByLimit = 0;
   for (const entry of entries) {
     const label = entry.title ?? entry.sessionId;
-    // タブ上限は履歴からの再開と同じ値（R-SES-03）。scope 上限はタブ数から導出される（R-SES-04）
     if (st.sessions.size >= tabLimit()) {
       skippedByLimit++;
       continue;
@@ -101,7 +97,6 @@ async function restorePersistedTabs(st: SessionStore, entries: PersistedOpenTab[
       }
       continue;
     }
-    // openResumedSession は最初の await より前にタブを作るので、保存順がそのままタブ順になる
     started.push({
       label,
       sessionId: entry.sessionId,
@@ -150,7 +145,9 @@ function activateReady(context: vscode.ExtensionContext): void {
   setOutput(vscode.window.createOutputChannel("LAISORA"));
   context.subscriptions.push(output);
   output.appendLine(`[startup] ${sinceActivation()} activate`);
-  // 前回の異常終了で残った引き継ぎ用 fork を回収する（完成品は残す）
+  if (context.globalStorageUri?.fsPath) {
+    void deleteOldLearningStore(context.globalStorageUri.fsPath, (line) => output.appendLine(line));
+  }
   void HandoffRunner.sweepOrphans(
     { fs: handoffFs, persist: handoffPersist(), readRecords: readHandoffRecords, log: (line) => output.appendLine(line) },
     claudeProjectsDir()
@@ -167,19 +164,17 @@ function activateReady(context: vscode.ExtensionContext): void {
     vscode.commands.registerCommand("laisora.open", () => openPanel(context)),
     vscode.commands.registerCommand("laisora.openSettings", () => openSettingsPanel(context))
   );
-  // semanticView / llmAnalysisDiagnostics の「明示off」は snapshot でしか運べない。
-  // ?. は検証ハーネスの偽 vscode が onDidChangeConfiguration を持たないため
   const displayConfigSub = vscode.workspace.onDidChangeConfiguration?.((e) => {
     if (["enabled", "agents", "externalTimeoutMinutes", "conductorPolicy"]
       .some((key) => affectsProductConfiguration(e, `orchestration.${key}`))) {
       for (const session of store?.sessions.values() ?? []) postOrchestrationView(session);
     }
-    // settings.json を直接編集した変更も設定画面と入力欄へ届ける（R-DSP-01）
     if (affectsProductConfiguration(e, "composer.sendKey") || affectsProductConfiguration(e, "appearance")) store?.post(userSettingsMessage());
     if (
       affectsProductConfiguration(e, "appearance") ||
       affectsProductConfiguration(e, "composer.sendKey") ||
       affectsProductConfiguration(e, "claude.apiKeyPolicy") ||
+      affectsProductConfiguration(e, "claude.initialModel") ||
       affectsProductConfiguration(e, "restoreTabsOnStartup") ||
       affectsProductConfiguration(e, "learning.profileSources") ||
       affectsProductConfiguration(e, "claude.fileLinkInstruction") ||
@@ -202,9 +197,6 @@ function activateReady(context: vscode.ExtensionContext): void {
     const affects = llmAnalysis || semanticView || llmDiagnostics;
     if (!affects) return;
     if (!store) return;
-    // off にした時点で進行中の生成を止める。attach 済みの結果は落とさない（裁定: 支払い済みの
-    // 結果は on へ戻したときに再利用できる）。診断表示のキーをこの条件へ混ぜると、表示を
-    // 切り替えただけで飛行中の分析が中断される
     if (llmAnalysis && !llmAnalysisEnabled()) {
       for (const s of store.sessions.values()) s.abortLlmAnalysisRun();
     }
@@ -221,7 +213,6 @@ function activateReady(context: vscode.ExtensionContext): void {
     store.post({ type: "init", protocolVersion: PROTOCOL_VERSION, tabs: store.snapshotAll(), hostWindows: process.platform === "win32", systemAppExtensions: configuredSystemAppExtensions() });
   });
   if (displayConfigSub) context.subscriptions.push(displayConfigSub);
-  // エディタの選択をWebviewへ通知（Claude拡張のファイル/行コンテキスト相当。300msデバウンス）
   let selTimer: ReturnType<typeof setTimeout> | undefined;
   context.subscriptions.push(
     vscode.window.onDidChangeTextEditorSelection((e) => {
@@ -240,8 +231,6 @@ function activateReady(context: vscode.ExtensionContext): void {
     })
   );
 
-  // アクティビティバーのアイコン → サイドバーに直接チャットUIを出す（WebviewView。
-  // ランチャーのワンクッションは置かない）
   context.subscriptions.push(
     vscode.window.registerWebviewViewProvider(
       "laisora.home",
@@ -263,19 +252,13 @@ function activateReady(context: vscode.ExtensionContext): void {
               vscode.Uri.joinPath(context.extensionUri, "media"),
             ],
           };
-          // HTML 設定直後に Webview が ready を送れるため、受信口を必ず先に開く。
-          // 逆順だと高速な初期化時に最初の ready を取りこぼす。
           st.attach(view.webview);
           view.webview.html = buildHtml(context, view.webview);
           view.onDidChangeVisibility(() => st.setVisible(view.webview, view.visible));
-          // タブ切替では resolveWebviewView は再実行されず iframe だけが作り直される（VS Code 1.133.0 実測）。
-          // 復帰の init は上の onDidChangeVisibility が即時に送り、作り直された document 発の
-          // ready 由来は短い窓の間だけ抑止される（sol-12。契約は SessionStore.restoreVisible /
-          // initForReady 側）。onDidDispose はビュー自体が破棄されるときの契約なので、
-          // ここでの登録は1ビュー1回で足りる。
           if (!disposeHooked.has(view)) {
             disposeHooked.add(view);
             view.onDidDispose(() => {
+              releaseAccountUsageWaiter(view.webview);
               store?.detach(view.webview);
             });
           }
@@ -286,16 +269,13 @@ function activateReady(context: vscode.ExtensionContext): void {
   );
 }
 
-// host-context.ts が store の型として使う。値として export すると束ね後の export 面が増える
 export type { SessionStore } from "./store-surfaces";
 
-// ハーネスが mod.sessionsForTest() で観測する口。移動先ではなく extension.ts の export 面に
-// 居ることが前提なので、束ねの入口が変わっても再 export を外さない
 export { sessionsForTest } from "./store-surfaces";
+export { appendSessionRecordOnFreshLine as appendSessionRecordForTest } from "./session-files";
+export { persistInitialTabTitle as persistInitialTabTitleForTest, setInitialTabTitle as setInitialTabTitleForTest } from "./session-list-wiring";
 
-// Remote / workspace trust ゲート。問題があれば理由文字列を返す（R-CNV-35）。
 function guardMessage(): string | null {
-  // 拒否理由だけでなく、利用者が次に取るべき操作まで文面に含める。
   if (vscode.env.remoteName) {
     return l10n.t(
       "LAISORA is for local desktop use only (current: {0}). Remote / WSL / Dev Container are not supported. Reopen it in a local window.",
@@ -328,24 +308,20 @@ function openPanel(context: vscode.ExtensionContext): void {
 
   const panel = vscode.window.createWebviewPanel("laisora", "LAISORA", vscode.ViewColumn.One, {
     enableScripts: true,
-    // U-32: Ctrl+F を VS Code 標準の検索ウィジェットに任せる（WebviewPanel でのみ使える）
     enableFindWidget: true,
-    // retainContextWhenHidden は使わない。復元は snapshot 再送で行う。
     localResourceRoots: [
       vscode.Uri.joinPath(context.extensionUri, "dist"),
       vscode.Uri.joinPath(context.extensionUri, "media"),
     ],
   });
   st.panel = panel;
-  // Sidebar と同じく、HTML を評価可能にする前に ready の受信口を開く。
   st.attach(panel.webview);
   panel.webview.html = buildHtml(context, panel.webview);
-  // パネルは onDidChangeVisibility を持たない（可視性は onDidChangeViewState 側）
   panel.onDidChangeViewState(() => st.setVisible(panel.webview, panel.visible));
 
   panel.onDidDispose(() => {
+    releaseAccountUsageWaiter(panel.webview);
     if (store) {
-      // パネルを閉じたら、パネルを開く前に繋がっていたサイドバーへ配信を戻す
       store.detach(panel.webview);
       store.panel = null;
     }
@@ -437,10 +413,7 @@ function buildHtml(context: vscode.ExtensionContext, webview: vscode.Webview): s
     fail("Webview bootstrap timeout: bundle did not reach ready");
   }, 4000);
 })();`;
-  // webview の表示言語の正本は documentElement.lang。判定は src/webview/l10n-boot.ts
-  // #selectWebviewL10nBundle と同一（ja 前方一致だけが ja、他は既定の英語）
   const htmlLang = String(vscode.env.language ?? "").toLowerCase().startsWith("ja") ? "ja" : "en";
-  // CSP: nonce 必須・外部接続なし
   return `<!DOCTYPE html>
 <html lang="${htmlLang}">
 <head>
@@ -459,6 +432,7 @@ function buildHtml(context: vscode.ExtensionContext, webview: vscode.Webview): s
 }
 
 export async function deactivate(): Promise<void> {
+  disposeAccountUsage();
   if (store) {
     for (const s of store.sessions.values()) {
       s.semantic.clearSemanticModelPostTimer();

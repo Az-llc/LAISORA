@@ -1,6 +1,3 @@
-// Live Guardrail の steering envelope。述語B（信頼済み steering の判定）。
-// 述語A（human-input-vocabulary.STEER_TAG_RE / INJECTED_TAG_RE = 非人間）とは別物で、
-// B で落ちても A は通る（handoff-envelope.ts と同じ非対称）。
 import type { GuardrailLevel, GuardrailSignalKind } from "./guardrail";
 import { containsAbsolutePath, redactAbsolutePaths } from "./path-redaction";
 import * as l10n from "@vscode/l10n";
@@ -96,7 +93,6 @@ function describeSignals(signals: readonly SteeringSignalSummary[]): string {
     .join("; ");
 }
 
-// モデルが読む固定テンプレート。モデル出力・resultPreview・path を入れない
 export function steeringInstruction(mode: SteeringMode, signals: readonly SteeringSignalSummary[]): string {
   if (mode === "report") {
     const observed = signals
@@ -124,7 +120,6 @@ export function steeringInstruction(mode: SteeringMode, signals: readonly Steeri
   );
 }
 
-// 送信側。instruction は将来自由文を含みうるので redaction を通す
 export function buildSteeringEnvelope(body: SteeringEnvelopeBody, version = "1"): string {
   const safe = JSON.parse(JSON.stringify(body)) as SteeringEnvelopeBody;
   safe.instruction = redactAbsolutePaths(safe.instruction);
@@ -137,7 +132,6 @@ export function parseSteeringEnvelope(text: string): SteeringParseResult {
   if (!open) return { ok: false, reason: "no_envelope" };
   const closeAt = trimmed.indexOf(CLOSE_TAG, open[0].length);
   if (closeAt < 0) return { ok: false, reason: "unterminated" };
-  // 終了タグの後ろは空白のみ（末尾に自由文を足して読ませる経路を作らない）
   if (trimmed.slice(closeAt + CLOSE_TAG.length).trim() !== "") return { ok: false, reason: "trailing_content" };
 
   const version = VERSION_RE.exec(open[1] ?? "")?.[1];
@@ -230,7 +224,6 @@ export function parseSteeringEnvelope(text: string): SteeringParseResult {
     }
   }
   const body = parsed as unknown as SteeringEnvelopeBody;
-  // instruction は固定テンプレート以外を許さない（自由文経路を作らない）
   if (body.instruction !== steeringInstruction(mode, body.signals)) return { ok: false, reason: "instruction_mismatch" };
   return { ok: true, version, raw: trimmed.slice(0, closeAt + CLOSE_TAG.length), body };
 }
@@ -246,8 +239,6 @@ export type SteeringAdmission =
   | { ok: true }
   | { ok: false; reason: SteeringSendRejectReason; message: string; transient: boolean };
 
-// 送信前の受理検証（fail-closed・純粋）。順序: closed → interrupting → not_running →
-// 完全パース（述語B）→ redaction。transient = 会話状態が変われば通る失敗（台帳へ記録しない）
 export function admitSteeringSend(
   state: { closed: boolean; turnState: "idle" | "running" | "interrupting" },
   envelopeText: string,
@@ -283,11 +274,6 @@ export function admitSteeringSend(
   return { ok: true };
 }
 
-// report は idle でも投入してよい（steer / escalate との唯一の差）。根拠は実 SDK 実測:
-// idle 投入で新ターンが起き、transcript には非人間の user レコードとして残り gap 境界にならない
-// （SDK 実測 2026-08-26）。コードからもハーネスからも観測できない
-// 外部事実なので、not_running 分岐を「一貫性のため」足し戻さないこと。
-// mode 検査は parse の後に置く（mode は parse しないと判らない）。ここを外すと steer が idle へ漏れる
 export function admitReportSend(
   state: { closed: boolean; turnState: "idle" | "running" | "interrupting" },
   envelopeText: string,

@@ -29,7 +29,7 @@ function status(value: string): string {
     case "completed": return "✓";
     case "pending": return l10n.t("Pending");
     case "failed": return `✗ ${l10n.t("Failed")}`;
-    case "stale": return l10n.t("Stopped");
+    case "stale": case "stopped": return l10n.t("Stopped");
     default: return "—";
   }
 }
@@ -53,7 +53,7 @@ export class PlanPanel {
   private usage?: PlanUsage;
   private nowMs = 0;
   private signature = "";
-  private youCount = 0;
+  private nowStatus = "";
   private readonly resize: ResizeObserver;
   private readonly theme: MutationObserver;
   private returnFocus: HTMLElement | null = null;
@@ -96,12 +96,11 @@ export class PlanPanel {
     this.theme.observe(document.documentElement, { attributes: true, attributeFilter: ["class", "style"] });
   }
 
-  setWaiting(count: number, total = count): void {
-    this.youCount = total;
-    this.waiting.textContent = count ? l10n.t("Waiting on you {0}", count) : "";
-    this.signature = "";
-    this.render();
+  setWaiting(count: number): void {
+    this.waiting.textContent = count ? l10n.t("Waiting for your decision: {0}", count) : "";
   }
+
+  setStatus(text: string): void { this.nowStatus = text; this.render(); }
 
   close(restoreFocus = true): void { if (!restoreFocus) this.returnFocus = null; if (this.dialog.open) this.dialog.close(); }
   destroy(): void { this.close(); this.resize.disconnect(); this.theme.disconnect(); this.dialog.remove(); }
@@ -112,20 +111,19 @@ export class PlanPanel {
 
   private render(): void {
     const view = derivePlanView(this.model, this.orchestration, this.usage, this.nowMs);
-    const signature = JSON.stringify(view);
+    const planRunning = this.model?.planContext?.running === true;
+    const signature = JSON.stringify([view, planRunning, this.nowStatus]);
     if (signature === this.signature) return;
     this.signature = signature;
-    this.aside.classList.toggle("plan-empty", !view.goal && !view.steps.length && !view.now.length && this.youCount === 0);
-    this.bar.classList.toggle("plan-empty", !view.goal && !view.steps.length && !view.now.length && this.youCount === 0);
     const current = view.steps.find(step => step.number === view.current);
     this.barCount.textContent = view.steps.length ? `${view.current ?? view.completed}/${view.steps.length}` : "";
     this.barNumber.textContent = current ? String(current.number).padStart(2, "0") : "";
     this.barTitle.textContent = current?.title ?? "";
     const running = [...view.now, ...view.steps.flatMap(step => step.lanes)].filter(lane => lane.status === "running").length;
     this.barRunning.textContent = running ? l10n.t("Working {0}", running) : "";
-    this.barLoader.hidden = !(running || current?.status === "in_progress") || !view.steps.length;
+    this.barLoader.hidden = !planRunning || !(running || current?.status === "in_progress") || !view.steps.length;
     this.barStats.textContent = view.steps.length ? `${planDuration(view.elapsed)} · ${view.claude ? "≈" : ""}${planTokens(view.claude?.tokens ?? null)}` : "";
-    renderPlanSection(this.section, view);
+    renderPlanSection(this.section, view, this.nowStatus || l10n.t("Waiting for input"));
   }
 
 }
@@ -143,9 +141,10 @@ function renderLane(lane: PlanLane): HTMLElement {
   return row;
 }
 
-export function renderPlanSection(section: HTMLElement, view: PlanView): void {
+export function renderPlanSection(section: HTMLElement, view: PlanView, nowStatus?: string): void {
   section.lang = document.documentElement.lang;
-  section.hidden = !view.goal && !view.steps.length && !view.now.length;
+  const noPlan = !view.goal && !view.steps.length;
+  section.hidden = nowStatus === undefined && noPlan && !view.now.length;
   const top = node("div", "plan-top");
   const stats = node("span", "plan-stats", `${planDuration(view.elapsed)} · ${view.claude ? "≈" : ""}${planTokens(view.claude?.tokens ?? null)} Claude · ${planTokens(view.external?.tokens ?? null)} ${l10n.t("External")}`);
   stats.title = l10n.t("Cache read: Claude {0} · External {1}", planTokens(view.claude?.cacheRead ?? null), planTokens(view.external?.cacheRead ?? null));
@@ -158,6 +157,10 @@ export function renderPlanSection(section: HTMLElement, view: PlanView): void {
   head.append(top, goal, lede);
   const children: HTMLElement[] = [];
   if (view.partial) lede.append(document.createElement("br"), node("span", "plan-partial", l10n.t("Some earlier plan details are unavailable.")));
+  if (nowStatus !== undefined && noPlan) {
+    children.push(node("p", "plan-none", l10n.t("No planned work")));
+    lede.hidden = !view.partial;
+  }
   const done = view.steps.filter(step => !step.removed && step.status === "completed");
   const collapsed = done.length > 1 && section.dataset.doneOpen !== "true";
   if (done.length > 1) {
@@ -166,7 +169,7 @@ export function renderPlanSection(section: HTMLElement, view: PlanView): void {
     toggle.setAttribute("aria-expanded", String(!collapsed));
     toggle.onclick = () => {
       section.dataset.doneOpen = String(collapsed);
-      renderPlanSection(section, view);
+      renderPlanSection(section, view, nowStatus);
       section.querySelector<HTMLElement>(".plan-done-toggle")?.focus();
     };
     children.push(toggle);
@@ -194,10 +197,11 @@ export function renderPlanSection(section: HTMLElement, view: PlanView): void {
     item.append(node("span", "plan-number", String(step.number).padStart(2, "0")), body);
     children.push(item);
   }
-  if (view.now.length) {
+  if (view.now.length || nowStatus !== undefined) {
     const now = node("div", "plan-now");
     now.append(node("div", "plan-label", "NOW"));
     for (const lane of view.now) now.append(renderLane(lane));
+    if (!view.now.length && nowStatus !== undefined) now.append(node("div", "plan-now-state", nowStatus));
     children.push(now);
   }
   const body = node("div", "plan-section-body");

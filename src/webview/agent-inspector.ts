@@ -1,20 +1,20 @@
 import * as l10n from "@vscode/l10n";
 import type {
+  AgentInspectorCoverage,
   AgentInspectorErrorReason,
+  AgentInspectorMessageItem,
   AgentInspectorPage,
   AgentInspectorSection,
   AgentInspectorTruncatedReason,
   HostToWebview,
 } from "../protocol";
-import { formatDateTime, formatDuration, uiLocale } from "./format";
+import { formatDuration } from "./format";
+import { formatDateTime, uiLocale } from "./l10n";
 import { vscode } from "./dom";
+import { failureCount } from "./failure-count";
+import { createLoader } from "./loader";
 import { termSpan, type TermKey } from "./term";
 
-// インスペクターは独立タブではなくグラフの行から開くポップアップ。
-// UI のタブ 5 枚は protocol の 4 section（overview / tools / messages / report）を描き分けたもの。
-// 「思考」タブを作らない。thinking ブロックは実在するが 209 件すべて 0 字で、生の思考は API から返らない（R-DSP-10）。
-// 使えるツール（権限）を出さない。availableTools / allowedTools / systemPrompt は記録に 0 件で、
-// 権限は agent 定義ファイル側にある（R-DSP-11）
 type UiTabId = "basic" | "instruction" | "report" | "messages" | "tools" | "request";
 
 interface UiTab {
@@ -39,15 +39,11 @@ const AGENT_TABS: readonly UiTab[] = [
   { id: "messages", label: l10n.t("Intermediate replies"), section: "messages" },
   { id: "tools", label: l10n.t("Tool execution"), section: "tools" },
 ];
-// 依頼ブロックの 応答内容 / ツール実行 は親 transcript を読む Host API が無い（NEEDED-WIRING）。
-// 中身の無いタブは置かない: 押しても何も起きない印は意味を持たない（R-DSP-10）
 const BLOCK_TABS: readonly UiTab[] = [
   { id: "basic", label: l10n.t("Basic info") },
   { id: "request", label: l10n.t("Request") },
 ];
 
-// 指示は所要時間より下。長文を先頭に置くと種別・モデル・所要時間が画面外へ出る（R-DSP-22）
-// term を持つ項目は termSpan(term.ts のキー) で注記付きに描く。label だけの項目は翻訳済み文字列をそのまま出す
 type BasicFieldId = "type" | "model" | "effort" | "started" | "ended" | "elapsed" | "tools" | "failures" | "isolated";
 const BASIC_FIELDS: readonly ({ id: BasicFieldId } & ({ label: string } | { term: TermKey }))[] = [
   { id: "type", label: l10n.t("Type") },
@@ -95,12 +91,13 @@ export type InspectorTarget =
       meta?: string;
       axis?: InspectorAxis;
       text: string;
-      rows: [TermKey | Node, string][];
+      rows: [TermKey | Node, string | Node][];
     };
 
-function element<K extends keyof HTMLElementTagNameMap>(tag: K, className: string): HTMLElementTagNameMap[K] {
+function element<K extends keyof HTMLElementTagNameMap>(tag: K, className: string, text?: string): HTMLElementTagNameMap[K] {
   const node = document.createElement(tag);
   node.className = className;
+  if (text !== undefined) node.textContent = text;
   return node;
 }
 
@@ -120,13 +117,14 @@ export class AgentInspector {
   private readonly axisEl: HTMLElement;
   private readonly statusEl: HTMLElement;
   private readonly navEl: HTMLElement;
+  private readonly bodyEl: HTMLElement;
   private readonly contentEl: HTMLElement;
   private readonly coverageEl: HTMLElement;
   private readonly retryEl: HTMLButtonElement;
   private tabButtons = new Map<UiTabId, HTMLButtonElement>();
   private readonly pages = new Map<AgentInspectorSection, AgentInspectorPage>();
+  private readonly toolOpen = new Map<string, boolean>();
   private target: InspectorTarget | undefined;
-  // 開いた行は再描画で要素が入れ替わるので、要素ではなく引き当て関数を持つ
   private opener: (() => HTMLElement | undefined) | undefined;
   private activeTab: UiTabId = "basic";
   private visible = false;
@@ -153,45 +151,55 @@ export class AgentInspector {
       }
     });
 
-    const head = element("div", "wi-head");
-    this.kindEl = element("span", "wi-kind");
-    this.titleEl = element("h3", "wi-title");
-    this.titleEl.id = `wi-title-${tabId}`;
-    this.metaEl = element("span", "wi-meta");
-    this.maxEl = element("button", "wi-max") as HTMLButtonElement;
+    const head = element("header", "wi-head");
+    const line = element("div", "wi-head-line");
+    this.kindEl = element("span", "wi-code");
+    const actions = element("div", "wi-actions");
+    this.maxEl = element("button", "wi-act wi-max");
     this.maxEl.type = "button";
-    this.maxEl.textContent = "⤢";
     this.maxEl.title = l10n.t("Maximize / restore");
     this.maxEl.setAttribute("aria-label", l10n.t("Maximize / restore"));
-    this.maxEl.onclick = () => this.popEl.classList.toggle("max");
-    this.closeEl = element("button", "wi-close") as HTMLButtonElement;
+    this.maxEl.append(element("span", "wi-max-icon"));
+    this.maxEl.onclick = () => this.setMaximized(!this.popEl.classList.contains("max"));
+    this.closeEl = element("button", "wi-act wi-close");
     this.closeEl.type = "button";
-    this.closeEl.textContent = l10n.t("Close");
+    this.closeEl.setAttribute("aria-keyshortcuts", "Escape");
+    this.closeEl.append(l10n.t("Close"), element("kbd", "", "Esc"));
     this.closeEl.onclick = () => this.close();
-    head.append(this.kindEl, this.titleEl, this.metaEl, this.maxEl, this.closeEl);
-
+    actions.append(this.maxEl, this.closeEl);
+    line.append(this.kindEl, actions);
+    this.titleEl = element("h3", "wi-title");
+    this.titleEl.id = `wi-title-${tabId}`;
+    this.metaEl = element("p", "wi-meta");
     this.axisEl = element("div", "wi-axis");
+    head.append(line, this.titleEl, this.metaEl, this.axisEl);
+
+    this.navEl = element("nav", "wi-sections");
+    this.navEl.setAttribute("role", "tablist");
+    this.navEl.setAttribute("aria-label", l10n.t("Inspector sections"));
+
+    this.bodyEl = element("div", "wi-body");
+    this.bodyEl.id = `wi-body-${tabId}`;
+    this.bodyEl.setAttribute("role", "tabpanel");
+    const state = element("div", "wi-state");
     this.statusEl = element("div", "wi-status");
     this.statusEl.setAttribute("role", "status");
     this.statusEl.setAttribute("aria-live", "polite");
     this.statusEl.setAttribute("aria-atomic", "true");
-    this.navEl = element("nav", "wi-sections");
-    this.navEl.setAttribute("role", "tablist");
-    this.navEl.setAttribute("aria-label", l10n.t("Inspector sections"));
-    const body = element("div", "wi-body");
-    this.contentEl = element("div", "wi-content");
-    this.coverageEl = element("div", "wi-coverage");
-    this.retryEl = element("button", "wi-retry") as HTMLButtonElement;
+    this.retryEl = element("button", "wi-retry", l10n.t("Retry"));
     this.retryEl.type = "button";
-    this.retryEl.textContent = l10n.t("Retry");
     this.retryEl.hidden = true;
     this.retryEl.onclick = () => {
       if (this.pending) return;
       this.request(this.retryCursor);
     };
-    body.append(this.contentEl, this.coverageEl, this.retryEl);
-    this.popEl.append(head, this.axisEl, this.statusEl, this.navEl, body);
+    state.append(this.statusEl, this.retryEl);
+    this.contentEl = element("div", "wi-content");
+    this.bodyEl.append(state, this.contentEl);
+    this.coverageEl = element("footer", "wi-coverage");
+    this.popEl.append(head, this.navEl, this.bodyEl, this.coverageEl);
     this.rootEl.append(scrim, this.popEl);
+    this.setMaximized(false);
   }
 
   isOpen(): boolean {
@@ -205,6 +213,7 @@ export class AgentInspector {
     this.opener = opener;
     if (!sameAgent) {
       this.pages.clear();
+      this.toolOpen.clear();
       this.pending = undefined;
       this.lastError = undefined;
       this.retryCursor = undefined;
@@ -212,7 +221,8 @@ export class AgentInspector {
     }
     this.visible = true;
     this.rootEl.hidden = false;
-    this.popEl.classList.remove("max");
+    this.setMaximized(false);
+    this.renderHead(target);
     this.buildTabs();
     this.render();
     this.closeEl.focus();
@@ -239,7 +249,6 @@ export class AgentInspector {
     this.lastError = undefined;
     this.retryCursor = undefined;
     this.render();
-    // 各タブの中身は全文。「続きを読み込む」を押させず、続きがある限り自動で取り寄せる
     if (merged.nextCursor !== undefined && this.visible && this.activeSection() === merged.section) {
       this.request(merged.nextCursor);
     }
@@ -265,28 +274,47 @@ export class AgentInspector {
     return this.tabs().find((t) => t.id === this.activeTab)?.section;
   }
 
+  private setMaximized(maximized: boolean): void {
+    this.popEl.classList.toggle("max", maximized);
+    this.maxEl.setAttribute("aria-pressed", String(maximized));
+  }
+
   private buildTabs(): void {
     this.navEl.textContent = "";
     this.tabButtons = new Map();
     for (const tab of this.tabs()) {
-      const button = element("button", "wi-section-button") as HTMLButtonElement;
+      const button = element("button", "wi-tab");
       button.type = "button";
+      button.id = `wi-tab-${tab.id}-${this.tabId}`;
       button.setAttribute("role", "tab");
+      button.setAttribute("aria-controls", this.bodyEl.id);
       button.dataset.tab = tab.id;
-      const name = element("span", "wi-section-name");
-      name.textContent = tab.label;
-      const count = element("span", "wi-cnt");
-      button.append(name, count);
+      button.append(element("span", "wi-section-name", tab.label), element("span", "wi-cnt"));
       button.onclick = () => this.setTab(tab.id);
+      button.addEventListener("keydown", (e) => this.onTabKey(e, tab.id));
       this.tabButtons.set(tab.id, button);
       this.navEl.appendChild(button);
     }
   }
 
-  private setTab(tab: UiTabId): void {
+  private onTabKey(e: KeyboardEvent, from: UiTabId): void {
+    const tabs = this.tabs();
+    const at = tabs.findIndex((t) => t.id === from);
+    const next = e.key === "ArrowRight" ? (at + 1) % tabs.length
+      : e.key === "ArrowLeft" ? (at + tabs.length - 1) % tabs.length
+      : e.key === "Home" ? 0
+      : e.key === "End" ? tabs.length - 1
+      : -1;
+    if (next < 0) return;
+    e.preventDefault();
+    this.setTab(tabs[next].id, true);
+  }
+
+  private setTab(tab: UiTabId, moveFocus = false): void {
     this.activeTab = tab;
     this.lastError = undefined;
     this.render();
+    if (moveFocus) this.tabButtons.get(tab)?.focus();
     this.requestIfNeeded();
   }
 
@@ -318,29 +346,31 @@ export class AgentInspector {
   private render(): void {
     const target = this.target;
     if (target === undefined) return;
-    this.kindEl.textContent = target.kind === "agent" ? l10n.t("Subagent") : l10n.t("Request block");
-    this.kindEl.dataset.kind = target.kind;
-    this.titleEl.textContent = target.label;
-    this.metaEl.textContent = target.meta ?? "";
-    this.renderAxis(target.axis);
     for (const tab of this.tabs()) {
       const button = this.tabButtons.get(tab.id);
       if (button === undefined) continue;
       const active = tab.id === this.activeTab;
-      button.classList.toggle("active", active);
       button.setAttribute("aria-selected", String(active));
       button.tabIndex = active ? 0 : -1;
+      if (active) this.bodyEl.setAttribute("aria-labelledby", button.id);
       const cnt = button.querySelector<HTMLElement>(".wi-cnt");
       if (cnt) cnt.textContent = this.countLabel(tab);
     }
     const busy = this.pending !== undefined;
     this.popEl.setAttribute("aria-busy", String(busy));
-    this.retryEl.setAttribute("aria-disabled", String(busy));
-    this.statusEl.textContent = busy ? l10n.t("Loading history…") :
-      this.lastError ? ERROR_LABELS[this.lastError] : "";
-    this.retryEl.hidden = this.lastError === undefined;
+    this.renderStatus(busy);
+    const focused = document.activeElement;
+    const focusKey = focused instanceof HTMLElement && this.contentEl.contains(focused) ? focused.dataset.focusKey ?? "" : undefined;
     this.contentEl.textContent = "";
     this.coverageEl.textContent = "";
+    delete this.coverageEl.dataset.state;
+    this.renderContent(target, busy);
+    if (focusKey === undefined) return;
+    const restored = Array.from(this.contentEl.querySelectorAll<HTMLElement>("[data-focus-key]")).find((el) => el.dataset.focusKey === focusKey);
+    (restored ?? this.closeEl).focus({ preventScroll: true });
+  }
+
+  private renderContent(target: InspectorTarget, busy: boolean): void {
     if (target.kind === "block") {
       this.renderBlock(target);
       return;
@@ -348,16 +378,48 @@ export class AgentInspector {
     const section = this.activeSection();
     const page = section !== undefined ? this.pages.get(section) : undefined;
     if (!page) {
-      if (!busy && !this.lastError) this.contentEl.appendChild(textBlock("wi-empty", l10n.t("No history to show.")));
+      if (!busy && !this.lastError) this.contentEl.appendChild(element("p", "wi-empty", l10n.t("No history to show.")));
       return;
     }
     this.renderPage(page, target);
-    const coverage = page.coverage;
+    this.renderCoverage(page.coverage);
+  }
+
+  private renderHead(target: InspectorTarget): void {
+    this.kindEl.replaceChildren(
+      element("b", "", target.kind === "agent" ? "SUBAGENT" : "REQUEST"),
+      termSpan(target.kind === "agent" ? "Subagent" : "Request block")
+    );
+    this.titleEl.textContent = target.label;
+    this.metaEl.textContent = target.meta ?? "";
+    this.metaEl.hidden = !target.meta;
+    this.renderAxis(target.axis);
+  }
+
+  private renderStatus(busy: boolean): void {
+    this.statusEl.textContent = "";
+    this.statusEl.classList.toggle("error", !busy && this.lastError !== undefined);
+    if (busy) {
+      this.statusEl.append(createLoader(12), element("span", "wi-status-text", l10n.t("Loading history…")));
+    } else if (this.lastError !== undefined) {
+      this.statusEl.append(element("span", "wi-x", "✗"), " ", element("span", "wi-status-text", ERROR_LABELS[this.lastError]));
+    }
+    this.retryEl.hidden = this.lastError === undefined;
+    this.retryEl.setAttribute("aria-disabled", String(busy));
+  }
+
+  private renderCoverage(coverage: AgentInspectorCoverage): void {
     this.coverageEl.dataset.state = coverage.state;
-    this.coverageEl.textContent = coverage.state === "complete"
-      ? l10n.t("Fetched {0} records", coverage.returnedRecords)
-      : l10n.t("Partial · {0} records", coverage.returnedRecords) +
-        (coverage.truncatedReasons.length > 0 ? ` · ${coverage.truncatedReasons.map((r) => TRUNCATED_REASON_TEXT[r]).join(" · ")}` : "");
+    const code = element("span", "wi-code");
+    code.append(element("b", "", "COV"));
+    const complete = coverage.state === "complete";
+    const count = l10n.t("{0} items", coverage.returnedRecords);
+    const reasons = coverage.truncatedReasons.map((r) => ` · ${TRUNCATED_REASON_TEXT[r]}`).join("");
+    this.coverageEl.append(
+      code,
+      element("span", "wi-cov-state", complete ? l10n.t("Fetched") : l10n.t("Partial")),
+      complete ? ` ${count}` : ` · ${count}${reasons}`
+    );
   }
 
   private countLabel(tab: UiTab): string {
@@ -375,26 +437,27 @@ export class AgentInspector {
 
   private renderAxis(axis: InspectorAxis | undefined): void {
     this.axisEl.textContent = "";
+    this.axisEl.hidden = axis === undefined || axis.windowEnd <= axis.windowStart;
     if (axis === undefined || axis.windowEnd <= axis.windowStart) return;
     const span = axis.windowEnd - axis.windowStart;
     const x = (t: number) => (Math.max(axis.windowStart, Math.min(axis.windowEnd, t)) - axis.windowStart) / span * 100;
-    const startEl = element("span", "wi-axis-c");
-    startEl.textContent = clock(axis.windowStart);
+    const line = element("div", "wi-axis-line");
+    const code = element("span", "wi-code");
+    code.append(element("b", "", "SPAN"), element("span", "", l10n.t("Position within the graph's visible range")));
+    line.append(code, element("span", "wi-axis-w", `${clock(axis.start)} – ${clock(axis.end)}`));
+    const row = element("div", "wi-axis-row");
     const track = element("div", "wi-axis-t");
     const me = element("div", "wi-axis-me");
     me.style.left = `${x(axis.start)}%`;
     me.style.width = `${Math.max(1, x(axis.end) - x(axis.start))}%`;
     track.appendChild(me);
-    const endEl = element("span", "wi-axis-c");
-    endEl.textContent = clock(axis.windowEnd);
-    const range = element("span", "wi-axis-w");
-    range.textContent = `${clock(axis.start)} – ${clock(axis.end)}`;
-    this.axisEl.append(startEl, track, endEl, range);
+    row.append(element("span", "wi-axis-c", clock(axis.windowStart)), track, element("span", "wi-axis-c", clock(axis.windowEnd)));
+    this.axisEl.append(line, row);
   }
 
   private renderBlock(target: Extract<InspectorTarget, { kind: "block" }>): void {
     if (this.activeTab === "request") {
-      this.contentEl.appendChild(pre("wi-report", target.text));
+      this.contentEl.appendChild(pre("wi-text", target.text));
       return;
     }
     const list = element("dl", "wi-overview");
@@ -402,15 +465,27 @@ export class AgentInspector {
     this.contentEl.appendChild(list);
   }
 
+  private failuresValue(count: number): Node {
+    const value = failureCount(count);
+    if (count > 0) {
+      const go = element("button", "wi-link wi-go", l10n.t("View in Tool execution ›"));
+      go.type = "button";
+      go.dataset.focusKey = "go-tools";
+      go.onclick = () => this.setTab("tools", true);
+      value.append(go);
+    }
+    return value;
+  }
+
   private renderPage(page: AgentInspectorPage, target: Extract<InspectorTarget, { kind: "agent" }>): void {
     if (page.section === "overview") {
       if (this.activeTab === "instruction") {
-        this.contentEl.appendChild(page.overview.instruction ? pre("wi-report", page.overview.instruction) : textBlock("wi-empty", l10n.t("No instruction was recorded.")));
+        this.contentEl.appendChild(page.overview.instruction ? pre("wi-text", page.overview.instruction) : element("p", "wi-empty", l10n.t("No instruction was recorded.")));
         return;
       }
       const list = element("dl", "wi-overview");
       const tools = this.pages.get("tools");
-      const values: Record<BasicFieldId, string | undefined> = {
+      const values: Record<BasicFieldId, string | Node | undefined> = {
         type: page.overview.agentType,
         model: page.overview.modelMeasured,
         effort: page.overview.effortMeasured,
@@ -419,7 +494,7 @@ export class AgentInspector {
         elapsed: formatDuration(page.overview.elapsedMs ?? 0),
         tools: target.stats !== undefined ? l10n.t("{0} times", target.stats.toolCount) :
           tools?.section === "tools" && tools.nextCursor === undefined ? l10n.t("{0} times", tools.tools.length) : undefined,
-        failures: target.stats !== undefined ? l10n.t("{0} items", target.stats.failCount) : undefined,
+        failures: target.stats !== undefined ? this.failuresValue(target.stats.failCount) : undefined,
         isolated: page.overview.spawnedWithWorktree === undefined ? undefined : page.overview.spawnedWithWorktree ? l10n.t("Yes") : l10n.t("No"),
       };
       for (const field of BASIC_FIELDS) {
@@ -432,35 +507,89 @@ export class AgentInspector {
       return;
     }
     if (page.section === "tools") {
-      if (page.tools.length === 0) this.contentEl.appendChild(textBlock("wi-empty", l10n.t("No tool executions were recorded.")));
-      for (const tool of page.tools) {
-        const card = element("article", "wi-tool");
-        const title = element("h4", "wi-tool-title");
-        title.textContent = tool.isError ? l10n.t("{0} (failed)", tool.toolName) : tool.toolName;
-        card.appendChild(title);
-        if (tool.inputSummary) card.appendChild(textBlock("wi-tool-summary", tool.inputSummary));
-        card.appendChild(pre("wi-preview", tool.inputPreview));
-        if (tool.resultPreview) card.appendChild(pre("wi-result", tool.resultPreview));
-        this.contentEl.appendChild(card);
-      }
+      this.renderTools(page);
       return;
     }
     if (page.section === "messages") {
       const replies = intermediateReplies(page);
-      if (replies.length === 0) this.contentEl.appendChild(textBlock("wi-empty", l10n.t("No intermediate replies were recorded.")));
-      for (const message of replies) {
-        const card = element("article", "wi-message wi-message-assistant");
-        card.appendChild(pre("wi-message-text", message.text));
-        this.contentEl.appendChild(card);
+      if (replies.length === 0) {
+        this.contentEl.appendChild(element("p", "wi-empty", l10n.t("No intermediate replies were recorded.")));
+        return;
       }
+      const list = element("div", "wi-messages");
+      replies.forEach((message, index) => {
+        const item = element("article", "wi-message");
+        const body = element("div", "wi-message-body");
+        if (message.timestamp !== undefined) body.append(element("span", "wi-message-at", clock(message.timestamp)));
+        body.append(pre("wi-message-text", message.text));
+        item.append(element("span", "wi-message-no", String(index + 1).padStart(2, "0")), body);
+        list.append(item);
+      });
+      this.contentEl.appendChild(list);
       return;
     }
-    this.contentEl.appendChild(page.text ? pre("wi-report", page.text) : textBlock("wi-empty", l10n.t("No report was recorded.")));
+    this.contentEl.appendChild(page.text ? pre("wi-text", page.text) : element("p", "wi-empty", l10n.t("No report was recorded.")));
+  }
+
+  private renderTools(page: Extract<AgentInspectorPage, { section: "tools" }>): void {
+    if (page.tools.length === 0) {
+      this.contentEl.appendChild(element("p", "wi-empty", l10n.t("No tool executions were recorded.")));
+      return;
+    }
+    const failed = page.tools.filter((tool) => tool.isError === true).length;
+    const head = element("div", "wi-tools-head");
+    const total = element("span", "");
+    total.append(l10n.t("{0} items", page.tools.length));
+    if (failed > 0) total.append(" · ", element("span", "wi-x", "✗"), " ", l10n.t("{0} failed", failed));
+    const toggle = element("button", "wi-link");
+    toggle.type = "button";
+    toggle.dataset.focusKey = "expand-all";
+    head.append(total, toggle);
+    const list = element("div", "wi-tools");
+    const rows: HTMLDetailsElement[] = [];
+    const sync = () => {
+      toggle.textContent = rows.every((row) => row.open) ? l10n.t("Collapse all") : l10n.t("Expand all");
+    };
+    page.tools.forEach((tool, index) => {
+      const key = tool.toolUseId || `#${index}`;
+      const row = element("details", tool.isError === true ? "wi-tool failed" : "wi-tool");
+      row.open = this.toolOpen.get(key) ?? tool.isError === true;
+      const summary = element("summary", "");
+      summary.dataset.focusKey = `tool:${key}`;
+      const completed = tool.isError === false && tool.backgroundLaunch !== true;
+      const mark = element("span", "wi-tool-mark", tool.isError === true ? "✗" : completed ? "✓" : "");
+      if (tool.isError === true || completed) mark.setAttribute("aria-label", tool.isError ? l10n.t("Failed") : l10n.t("Completed"));
+      const name = element("span", "wi-tool-name", tool.toolName);
+      name.title = tool.toolName;
+      const preview = element("span", "wi-tool-summary", tool.inputSummary ?? "");
+      const tail = element("span", "wi-tool-tail");
+      tail.append(preview);
+      if (tool.isError === true) tail.append(element("span", "wi-tool-failtag", l10n.t("Failed")));
+      else if (tool.backgroundLaunch === true) tail.append(element("span", "wi-tool-bgtag", l10n.t("Background")));
+      summary.append(element("span", "wi-tool-at", tool.timestamp !== undefined ? clock(tool.timestamp) : ""), mark, name, tail);
+      row.append(summary, labelledPre("wi-preview", tool.inputPreview, l10n.t("INPUT")));
+      if (tool.resultPreview) {
+        row.append(tool.isError === true
+          ? labelledPre("wi-result wi-result-error", tool.resultPreview, l10n.t("ERROR"))
+          : labelledPre("wi-result", tool.resultPreview, l10n.t("RESULT")));
+      }
+      row.addEventListener("toggle", () => {
+        this.toolOpen.set(key, row.open);
+        sync();
+      });
+      rows.push(row);
+      list.append(row);
+    });
+    toggle.onclick = () => {
+      const open = !rows.every((row) => row.open);
+      for (const row of rows) row.open = open;
+    };
+    sync();
+    this.contentEl.append(head, list);
   }
 }
 
-// 途中の応答 = assistant の本文のうち最後以外（最後は報告内容として別タブ）
-function intermediateReplies(page: Extract<AgentInspectorPage, { section: "messages" }>): { text: string }[] {
+function intermediateReplies(page: Extract<AgentInspectorPage, { section: "messages" }>): AgentInspectorMessageItem[] {
   const assistant = page.messages.filter((m) => m.role === "assistant");
   return page.nextCursor === undefined ? assistant.slice(0, -1) : assistant;
 }
@@ -504,23 +633,20 @@ function mergeCoverage(previous: AgentInspectorPage, next: AgentInspectorPage): 
   };
 }
 
-function textBlock(className: string, text: string): HTMLElement {
-  const node = element("div", className);
-  node.textContent = text;
-  return node;
-}
-
 function pre(className: string, text: string): HTMLElement {
-  const node = element("pre", className);
-  node.textContent = text;
+  return element("pre", className, text);
+}
+
+function labelledPre(className: string, text: string, label: string): HTMLElement {
+  const node = pre(className, text);
+  node.dataset.label = label;
   return node;
 }
 
-// 文字列は term.ts のキーとして termSpan へ通す（注記が付く）。翻訳済みの見出しは Node で渡す
-function addDefinition(list: HTMLElement, term: TermKey | Node, value: string): void {
+function addDefinition(list: HTMLElement, term: TermKey | Node, value: string | Node): void {
   const dt = document.createElement("dt");
   dt.appendChild(typeof term === "string" ? termSpan(term) : term);
   const dd = document.createElement("dd");
-  dd.textContent = value;
+  dd.append(value);
   list.append(dt, dd);
 }

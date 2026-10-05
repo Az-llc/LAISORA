@@ -9,9 +9,6 @@ function parseLine(line: string | undefined): unknown {
   try { return JSON.parse(line); } catch { return undefined; }
 }
 
-// R-LRN-12: a multi-record append is framed by a leading {"batch":[opIds]} line. Any line with a batch key starts a batch;
-// unless the header has exactly that key and its members follow completely and in order, none of the contiguous member
-// lines are returned and incompleteBatch is reported, also for a reader started after a crash.
 function batchHeader(value: unknown): { ids: string[]; valid: boolean } | undefined {
   if (!value || typeof value !== "object" || Array.isArray(value) || !("batch" in value)) return undefined;
   const batch = (value as { batch: unknown }).batch;

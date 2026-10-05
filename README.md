@@ -8,7 +8,7 @@ I wanted the everyday view to focus on the conversation: what I want to achieve 
 
 Commands and file operations appear in LOG, making your instructions and the agent's replies easier to follow in CHAT. The two screenshots below are the same conversation: first CHAT with PLAN and YOU beside the conversation, then LOG, where each of your requests is a numbered group of the tool calls it led to.
 
-<img src="media/screenshots/conversation.png" alt="CHAT with a decision the agent is asking for, YOU with the waiting decision and resolved items folded into one line, and PLAN with its goal and completed steps folded into one line" width="734">
+<img src="media/screenshots/conversation.png" alt="CHAT with a decision card the agent asked for (options, pros and cons, and a recommendation), YOU with resolved items folded into one line, and PLAN with its goal and completed steps folded into one line" width="734">
 
 <img src="media/screenshots/execution-log.png" alt="LOG for the same conversation, with each request as a numbered group: the latest is open, and earlier ones are folded to their last tool call" width="734">
 
@@ -22,13 +22,13 @@ LAISORA uses an LLM to analyze work logs and suggest improvements to the workflo
 
 Analysis uses the model selected for the conversation, so the capabilities of newer models can also support reviewing the work and suggesting improvements.
 
-<img src="media/screenshots/llm-analysis.png" alt="ANALYSIS with TIME, ROLES and ERR at the top and the start of the LLM findings below" width="734">
+<img src="media/screenshots/llm-analysis.png" alt="ANALYSIS on the LLM Analysis tab, with a saved analysis and its first finding, the improvement area, and links to the records behind it" width="734">
 
 ## What you can do
 
 ### Run several conversations side by side
 
-Each conversation is a tab (20 by default; `laisora.tabLimit`). Tabs keep their own draft, view selection, and scroll position, and a tab stays lit while its subagents or background commands are still running, even after the main reply has finished. Open past sessions from the history list and resume them in the folder where the conversation was started, even if commands changed directory along the way. By default, LAISORA reopens the tabs that were open when the window was last closed or reloaded; turn off `laisora.restoreTabsOnStartup` to start with a single new tab (also available on the LAISORA settings page, which you open from **Settings** in the ☰ menu of a conversation or with **LAISORA: Open Settings**).
+Each conversation is a tab (20 by default; `laisora.tabLimit`). Tabs keep their own draft, view selection, and scroll position, and a tab stays lit while its subagents or background commands are still running, even after the main reply has finished. Open past sessions from the history list and resume them in the folder where the conversation was started, even if commands changed directory along the way. The history list can be used from the keyboard (arrow keys, Enter, F2 to rename, Esc), and each row can be renamed or removed from the list; removing only hides the session in LAISORA and keeps its record, and **Show hidden** brings it back. By default, LAISORA reopens the tabs that were open when the window was last closed or reloaded; turn off `laisora.restoreTabsOnStartup` to start with a single new tab (also available on the LAISORA settings page, which you open from **Settings** in the ☰ menu of a conversation or with **LAISORA: Open Settings**).
 
 ### Read the reply without the noise
 
@@ -42,18 +42,18 @@ CHAT shows what the model says to you, along with approval requests, failures, a
 
 The other views let you look more closely:
 
-- **SUMMARY** — at the top, the key figures from GRAPH (elapsed and processing time, parallelism, time per request) and ANALYSIS (improvement candidates by area). Below, PLAN on the left and YOU on the right, and earlier requests with their step count, time, and tokens. With the agent roster enabled, it also lists the observed agents with their applied model and effort. In a narrow window, YOU comes first in a single column.
-- **GRAPH** — a timeline of the main agent, its subagents, and background tasks on an elapsed-time axis, with each request as a block and a zoomable time window. Long waits can be hidden from the axis. Open a subagent to read the full instruction it was given.
-- **ANALYSIS** — at the top, TIME (the main agent's time by model and in tools), ROLES (time and tokens by delegated role; open a row for its runs) and ERR (failures out of all tool calls, by kind). Below, script analysis lists failure classifications and convention violations linked to LOG, and optional LLM analysis shows findings as numbered articles that link back to their evidence. Analyzing a past session opened from the history list also compares it with your own past sessions.
+- **SUMMARY** — at the top, the key figures from GRAPH (elapsed and processing time, parallelism, time in generation, tools and subagents, and time per work block) and ANALYSIS (improvement candidates, by area when the LLM analysis is current). Below, PLAN on the left and YOU on the right, and earlier requests with their step count, time, and tokens. With the agent roster enabled, it also lists the observed agents with their applied model and effort. In a narrow window, YOU comes first in a single column.
+- **GRAPH** — a timeline of the main agent, its subagents, and background tasks on an elapsed-time axis. Each request is a block, split by the steps of the plan, with the subagents started in each step beneath it. A map of the whole session sits above it, and you can narrow the time window; waiting for subagents is shown separately from tool execution. Long waits can be hidden from the axis. Open a subagent to read the full instruction it was given.
+- **ANALYSIS** — at the top, TIME (the main agent's time by model and in tools), ROLES (time and tokens by delegated role; open a row for its runs) and ERR (failures out of all tool calls, by kind). Under them, STEPS lists each plan step with its duration, generation and tool time, waits, subagent time, and tokens. Below, script analysis lists failure classifications and convention violations linked to LOG, and optional LLM analysis shows findings as numbered articles that link back to their evidence. Analyzing a past session opened from the history list also compares it with your own past sessions.
 - **LOG** — tool calls grouped by request, with the available input and output previews, duration, and marks for failures and convention violations. Only the latest request is open; a folded request still shows its last tool call.
 
 Some information may be unavailable when session records are incomplete; the views say so instead of showing partial numbers as complete.
 
 The screenshots below show SUMMARY, GRAPH, and the instruction given to a subagent opened from GRAPH.
 
-<img src="media/screenshots/summary.png" alt="SUMMARY with the GRAPH figures (elapsed and processing time, parallelism, time per request) and the ANALYSIS figures (improvement candidates by area) at the top, and PLAN and YOU below" width="734">
+<img src="media/screenshots/summary.png" alt="SUMMARY with the GRAPH figures (elapsed and processing time, parallelism, time in generation, tools and subagents, time per work block) and the ANALYSIS figures at the top, and PLAN and YOU below" width="734">
 
-<img src="media/screenshots/graph.png" alt="GRAPH with each request as a block on an elapsed-time axis and its subagents below it" width="734">
+<img src="media/screenshots/graph.png" alt="GRAPH with a map of the whole session and the legend at the top, and each request as a block on an elapsed-time axis with its plan steps below it" width="734">
 
 <img src="media/screenshots/subagent-instruction.png" alt="A subagent opened from GRAPH, with its Instruction tab showing the full instruction the main agent gave it" width="734">
 

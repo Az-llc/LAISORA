@@ -1,7 +1,7 @@
 import * as l10n from "@vscode/l10n";
 import type { ExternalDetection, ExternalModelsState } from "./orchestration-executors";
+import type { ModelInfo } from "./protocol";
 
-/** R-ORC-39: pure card text; rendering never starts or retries a probe. */
 export function modelListStatusText(list: ExternalModelsState, detection: ExternalDetection): string {
   const reason = detection.state === "notInstalled" ? "not-installed"
     : list.state === "failed" ? list.reason : list.state === "ok" && list.refresh === "failed" ? list.refreshReason ?? "model-list-failed" : undefined;
@@ -21,8 +21,6 @@ export function modelListStatusText(list: ExternalModelsState, detection: Extern
   return text === l10n.t("Could not fetch the latest model list") ? remembered : `${text} ${remembered}`;
 }
 
-// SDK 0.3.257 実測: claude-fable-5[1m] と claude-fable-5-1[1m] の両方が displayName "Fable" を返す。
-// 版は resolvedModel / id から補う。R-CMD-02: [1m] は文脈長で版ではない。最新版の表を持たない。
 function claudeModelParts(id: string): { family: string; version: string } | undefined {
   const match = /^claude-(opus|sonnet|haiku|fable)-(\d+(?:-\d+)*?)(?:-\d{8})?(?:\[1m\])?$/i.exec(id);
   if (!match) return undefined;
@@ -33,6 +31,21 @@ function claudeModelParts(id: string): { family: string; version: string } | und
 export function shortModelDisplayName(id: string): string {
   const parts = claudeModelParts(id);
   return parts ? `${parts.family} ${parts.version}${/\[1m\]$/i.test(id) ? " (1M)" : ""}` : id;
+}
+
+type ModelNameRow = Pick<ModelInfo, "id" | "resolvedModel"> & { label?: string };
+
+export function findModelRow<T extends ModelNameRow>(rows: readonly T[], value: string): T | undefined {
+  const contextRow = (id: string): boolean => /\[1m\]$/i.test(id);
+  return rows.find((m) => m.id === value)
+    ?? rows.find((m) => m.id !== "default" && m.resolvedModel === value && (contextRow(value) || !contextRow(m.id)));
+}
+
+export function resolveModelDisplayName(rows: readonly ModelNameRow[], model: string | undefined): string | undefined {
+  const value = model?.trim();
+  if (!value) return undefined;
+  const label = findModelRow(rows, value)?.label;
+  return label && label !== value ? label : shortModelDisplayName(value);
 }
 
 export function modelLabelWithVersion(displayName: string | undefined, id: string, resolvedModel?: string): string {

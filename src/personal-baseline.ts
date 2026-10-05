@@ -8,11 +8,7 @@ import { extensionContext, output } from "./host-context";
 
 interface BaselineCache {
   version: 1;
-  // Short hash -> packed scalar metrics. No paths and no full reports are persisted.
   entries: Record<string, string>;
-  // 先頭レコードのtimestamp。JSONLは追記専用なのでこれはファイル不変値であり、90日判定の
-  // ためだけに毎回全ファイルを開き直す必要がない（実測: 1697件の open+read+close で852ms、
-  // キャッシュ後は statSync のみの十数ms）。
   firstTimestamps: Record<string, number>;
 }
 
@@ -30,19 +26,14 @@ function unpackMetrics(packed: string): { mtime: number; size: number; metrics: 
 
 interface BaselineSourceFiles {
   files: Array<{ path: string; mtime: number; size: number }>;
-  // First-record timestamps are immutable for append-only JSONL files, so retain them to avoid reopening every file.
   firstTimestamps: Record<string, number>;
-  // 解析例外は列挙より後（personalBaselineSerialized）で起きるので、ここでは数えられない
   scan: Omit<BaselineScanDegradation, "unparsedSessions">;
 }
 
-// 実測1696件で同時64が最速、128は悪化
 const BASELINE_SCAN_CONCURRENCY = 64;
 const FIRST_RECORD_SCAN_LIMIT = 1024 * 1024;
 
-// 列挙の await で再入しうる。直列化しないと globalState の read-modify-write が後勝ちで消える
 let personalBaselineTail: Promise<void> = Promise.resolve();
-// SessionFacts の baseline 比は同期導出なので、直近に解決した値だけを使う（未解決なら null）
 export let cachedPersonalBaseline: PersonalBaseline | null = null;
 
 async function mapWithConcurrency<T, R>(values: readonly T[], concurrency: number, worker: (value: T, index: number) => Promise<R>): Promise<R[]> {
@@ -59,9 +50,6 @@ async function mapWithConcurrency<T, R>(values: readonly T[], concurrency: numbe
   return results;
 }
 
-// The 90-day window is based on the JSONL's first-record timestamp, not its mtime.
-// readFailed は timestamp===null の 3 通り（読取失敗・走査上限・時刻が無い）を分けるためにある。
-// 全部を「読めなかった」に数えると、読めているのに欠落件数が水増しされる（R-DSP-01）
 async function firstSessionTimestamp(path: string): Promise<{ timestamp: number | null; readFailed: boolean }> {
   let file: FileHandle | undefined;
   let readFailed = false;
@@ -77,7 +65,6 @@ async function firstSessionTimestamp(path: string): Promise<{ timestamp: number 
       chunks.push(Buffer.from(buffer.subarray(0, newline === -1 ? bytesRead : newline)));
       if (newline !== -1) break;
       position += bytesRead;
-      // 改行が来ないファイルを最後まで読むと、64並列ぶんが常駐して拡張ホストが落ちる
       if (position >= FIRST_RECORD_SCAN_LIMIT) return { timestamp: null, readFailed };
     }
     const firstLine = Buffer.concat(chunks).toString("utf8").replace(/\r$/, "");
@@ -117,7 +104,6 @@ async function baselineSourceFiles(previousFirstTimestamps: Record<string, numbe
     const scans = await mapWithConcurrency(candidates, BASELINE_SCAN_CONCURRENCY, async (candidate) => {
       try {
         const info = await stat(candidate.path);
-        // ディレクトリ等は正常な読み飛ばし。読めなかった件数へ混ぜない
         if (!info.isFile()) return { kind: "skip" as const };
         const cached = firstTimestamps[candidate.key];
         const first = Number.isFinite(cached)
@@ -133,7 +119,6 @@ async function baselineSourceFiles(previousFirstTimestamps: Record<string, numbe
     const files: BaselineSourceFiles["files"] = [];
     for (const scan of scans) {
       if (scan.kind !== "file") continue;
-      // null をキャッシュすると、後で中身が入っても永久に90日フィルタから漏れる
       if (scan.timestamp === null) { delete firstTimestamps[scan.key]; continue; }
       firstTimestamps[scan.key] = scan.timestamp;
       if (scan.timestamp >= cutoff) files.push({ path: scan.path, mtime: scan.mtime, size: scan.size });
@@ -141,8 +126,6 @@ async function baselineSourceFiles(previousFirstTimestamps: Record<string, numbe
     for (const key of Object.keys(firstTimestamps)) if (!seen.has(key)) delete firstTimestamps[key];
     return { files, firstTimestamps, scan: { rootFailed, unreadableProjects, unreadableSessions, readSessions: files.length } };
   } catch {
-    // 保存先を読めなかったことを 0 件へ畳まない。畳むと「比較できるベースラインがない」と
-    // 断言することになる（R-DSP-01）
     rootFailed = true;
     return { files: [], firstTimestamps, scan: { rootFailed, unreadableProjects, unreadableSessions, readSessions: 0 } };
   }
@@ -168,10 +151,7 @@ const NO_BASELINE_SCAN: BaselineScanDegradation = {
   readSessions: 0,
 };
 
-// baseline===null は「比較できるものが無い」ではなく「揃わなかった」。理由の内訳を
-// scan で一緒に返し、断言の前に注記へ写せるようにする（R-DSP-03）
 let onPersonalBaselineChanged: (() => void) | undefined;
-// 走査は activate 後も続くので、完了時に開いている画面へ描き直しを依頼する口
 export function setPersonalBaselineListener(listener: () => void): void {
   onPersonalBaselineChanged = listener;
 }
@@ -180,10 +160,7 @@ export function personalBaseline(excludePath?: string): Promise<{ baseline: Pers
   const result = personalBaselineTail.then(() => personalBaselineSerialized(excludePath));
   personalBaselineTail = result.then(
     (outcome) => {
-      // 除外付きの走査は分析対象セッションの報告用。共有の cachedPersonalBaseline へ入れると、開いている全タブの比較対象から
-      // そのセッションが抜け、全タブの base が失効する
       if (excludePath !== undefined || outcome.baseline === null) return;
-      // 同じ内容で参照だけ替えると semantic memo が失効し、描き直しが無駄に走る。calculatedAt は毎回変わるので比較から外す
       if (cachedPersonalBaseline !== null && JSON.stringify({ ...cachedPersonalBaseline, calculatedAt: 0 }) === JSON.stringify({ ...outcome.baseline, calculatedAt: 0 })) return;
       cachedPersonalBaseline = outcome.baseline;
       try {
@@ -208,20 +185,14 @@ async function personalBaselineSerialized(excludePath?: string): Promise<{ basel
     await writePersonalBaselineCache({ version: 1, entries, firstTimestamps });
     return { baseline: null, scan: { ...scan, unparsedSessions } };
   }
-  // 列挙側キーは join() 済み。excludePath は webview 由来なので揃えないと除外が外れる
   const excluded = excludePath ? sessionCacheKey(resolve(excludePath)) : "";
-  // 呼び出し元が同じファイルを解析するので、ここで解析すると13MB級を2回読む。metrics は
-  // 古いまま残るが、他セッションの分析時に mtime/size 差分で更新される
   for (const file of files) {
     const key = sessionCacheKey(file.path);
     if (key === excluded) continue;
     const cached = entries[key] ? unpackMetrics(entries[key]) : null;
     if (cached && cached.mtime === file.mtime && cached.size === file.size) continue;
     try { entries[key] = packMetrics(file.mtime, file.size, baselineSessionMetrics(await analyzeSessionFileAsync(file.path))); }
-    // 母集団から黙って外さない。外した件数を数えないと「20 件未満」「比較できるものが無い」の
-    // 断言が、実際は読めなかっただけの状態を覆い隠す（R-DSP-01 E-04）
     catch { unparsedSessions++; delete entries[key]; }
-    // 1 記録ごとにイベントループへ戻す。activate から撃たれるので、続けて回すと拡張ホストが止まる
     await new Promise<void>((resolve) => setImmediate(resolve));
   }
   const active = new Set(files.map((file) => sessionCacheKey(file.path)));
