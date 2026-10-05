@@ -158,6 +158,10 @@
   "LAISORA: Could not determine whether the session log exists (check sync and permissions): {0}": "LAISORA: セッションログの有無を確かめられませんでした（同期や権限の状態を確認してください）: {0}",
   "LAISORA: The session log has not been written yet (wait briefly and try again).": "LAISORA: セッションログがまだ書き出されていません（少し待って再実行してください）",
   "LAISORA: Could not save the setting.": "LAISORA: 設定の保存に失敗しました",
+  "Reload window": "ウィンドウを再読み込み",
+  "Open settings.json": "settings.json を開く",
+  "Could not save. Reload the window and try again.": "保存できませんでした。ウィンドウを再読み込みしてから、もう一度設定してください。",
+  "Could not save: {0}": "保存できませんでした: {0}",
   "LAISORA: The analysis result has changed. Run the analysis again.": "LAISORA: 分析結果が更新されています。再実行してください",
   "LAISORA: The analysis result was not found.": "LAISORA: 分析結果が見つかりません",
   "LAISORA: The finding was not found.": "LAISORA: 所見が見つかりません",
@@ -1210,9 +1214,9 @@
   "Show summary": "要約を表示",
   "Could not retrieve": "取得できず",
   "Initial model": "初期モデル",
-  "Choose a model for new conversations. Off uses Claude's normal settings. Running conversations and Resume are unchanged.": "新しい会話のモデルを選びます。オフでは Claude の通常の設定を使います。実行中の会話と再開には影響しません。",
+  "Choose a model for new and resumed conversations. A model chosen in a tab still wins. Off uses Claude's normal settings. Running conversations are unchanged.": "新しい会話と再開した会話のモデルを選びます。タブで選んだモデルが優先です。オフでは Claude の通常の設定を使います。実行中の会話には影響しません。",
   "Off": "オフ",
-  "The configured model is not in the available list. New conversations will request this ID; Claude may reject it.": "設定されたモデルは利用可能な一覧にありません。新しい会話ではこの ID を要求しますが、Claude が拒否する場合があります。",
+  "The configured model is not in the available list. New and resumed conversations will request this ID; Claude may reject it.": "設定されたモデルは利用可能な一覧にありません。新しい会話と再開した会話ではこの ID を要求しますが、Claude が拒否する場合があります。",
   "Automatic restore is off; restore {0} from {1}.": "自動で戻す設定はオフです。{1} から {0} に戻せます。",
   "Could not restore the original model {0} automatically; restore it from {1}.": "元のモデル {0} へ自動で戻せませんでした。{1} から戻してください。",
   "Colour used for {0}, the current step and heading lines. The send button and keyboard focus rings keep the theme colours.": "{0}・今の手順・見出しの線に使う色です。送信ボタンとキーボードのフォーカス枠はテーマの色のままです。",
@@ -1260,5 +1264,6 @@
   "Show hidden": "非表示を表示",
   "Clear search": "検索を消す",
   "Sessions": "セッション",
-  "Select": "選ぶ"
+  "Select": "選ぶ",
+  "The Claude CLI is using {0} instead of {1}, which LAISORA passed for this conversation. A managed policy or an ANTHROPIC_* model setting may be overriding it.": "Claude CLI は、LAISORA がこの会話に渡した {1} ではなく {0} を使っています。管理ポリシーか ANTHROPIC_* のモデル設定が優先されている可能性があります。"
 }

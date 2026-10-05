@@ -1,5 +1,5 @@
 {
-  "config.laisora.claude.initialModel.description": "新しい会話の初期モデル。空欄はオフ（Claude の通常の設定）。実行中の会話と再開には影響しません。",
+  "config.laisora.claude.initialModel.description": "新しい会話と再開した会話のモデル（タブで選んだモデルが優先）。空欄はオフ（Claude の通常の設定）。実行中の会話には影響しません。",
   "config.laisora.learning.enabled.description": "laisora-learning の現役対策を配信し、学習記録ツールを提供し、配信とモデル変更を記録します。編成の有効・無効に依りません。次の会話プロセス起動から適用します。既定は無効で、無効時は学習記録の読み書きを行いません。",
   "extension.description": "VS CodeでAIエージェントとの会話に集中し、作業状況の確認とログ分析による改善を進められます。",
   "capabilities.untrustedWorkspaces": "Claude Codeを実行するには、このワークスペースを信頼する必要があります。",

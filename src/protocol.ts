@@ -638,7 +638,19 @@ export type SettingsPageToHost =
   | { type: "setOrchestrationSetting"; requestId: number; setting: "enabled" | "agents" | "conductorPolicy" | "externalTimeoutMinutes"; value: unknown }
   | { type: "setFileLinkSetting"; requestId: number; setting: FileLinkBooleanSetting; enabled: boolean }
   | { type: "setFileLinkSetting"; requestId: number; setting: "openWithSystemApp"; value: string[] }
-  | { type: "openVsCodeSettings" };
+  | { type: "openVsCodeSettings" }
+  | { type: "settingWriteFailureAction"; action: SettingWriteFailureAction };
+
+export const SETTING_WRITE_FAILURE_KINDS = ["unregistered", "other"] as const;
+export type SettingWriteFailure = { kind: typeof SETTING_WRITE_FAILURE_KINDS[number]; reason: string };
+export const SETTING_WRITE_FAILURE_ACTIONS = ["reloadWindow", "openSettingsJson"] as const;
+export type SettingWriteFailureAction = typeof SETTING_WRITE_FAILURE_ACTIONS[number];
+
+function isSettingWriteFailure(v: unknown): v is SettingWriteFailure {
+  if (typeof v !== "object" || v === null) return false;
+  const m = v as Record<string, unknown>;
+  return hasOnlyKeys(m, ["kind", "reason"]) && (SETTING_WRITE_FAILURE_KINDS as readonly string[]).includes(m.kind as string) && typeof m.reason === "string";
+}
 
 export interface SettingsProfileProjection {
   profileSources?: ProfileSource[];
@@ -650,7 +662,7 @@ export interface SettingsProfileProjection {
 }
 export type HostToSettingsPage =
   | { type: "conductorPreview"; requestId: number; text: string; tokens: number }
-  | ({ type: "settingsState"; appearance?: AccentSettings; displayName?: string; composerSendKey: ComposerSendKey; apiKeyPolicy: ApiKeyPolicy; restoreTabsOnStartup: boolean; initialModel?: string; autoContinueAtUsageLimit: boolean; learningEnabled: boolean; replyTo?: number }
+  | ({ type: "settingsState"; appearance?: AccentSettings; displayName?: string; composerSendKey: ComposerSendKey; apiKeyPolicy: ApiKeyPolicy; restoreTabsOnStartup: boolean; initialModel?: string; autoContinueAtUsageLimit: boolean; learningEnabled: boolean; replyTo?: number; writeFailure?: SettingWriteFailure }
     & SettingsProfileProjection & Record<FileLinkBooleanSetting, boolean> & { openWithSystemApp: string[] } & { orchestrationEnabled: boolean; orchestrationAgents: OrchestrationSettingRow[]; orchestrationDefaults: OrchestrationSettingRow[]; conductorPolicy: string; conductorPolicyDefault: string; externalTimeoutMinutes: number; externalDetection: Record<ExecutorId, ExternalDetection>; externalModels: ExternalModels });
 
 function isSettingsRequestId(v: unknown): v is number {
@@ -662,6 +674,9 @@ export function isSettingsPageToHost(v: unknown): v is SettingsPageToHost {
   const m = v as Record<string, unknown>;
   const t = m.type as SettingsPageToHost["type"];
   if (t === "settingsPageReady" || t === "recheckExternalExecutors" || t === "openVsCodeSettings") return hasOnlyKeys(m, ["type"]);
+  if (t === "settingWriteFailureAction") {
+    return hasOnlyKeys(m, ["type", "action"]) && (SETTING_WRITE_FAILURE_ACTIONS as readonly string[]).includes(m.action as string);
+  }
   if (t === "researchModelProfiles") return hasOnlyKeys(m, ["type", "targets", "purpose"]) && isProfileTargetIds(m.targets) && m.targets.length > 0
     && (m.purpose === undefined || m.purpose === "effort");
   if (t === "setProfileSources") return hasOnlyKeys(m, ["type", "requestId", "sources"]) && isSettingsRequestId(m.requestId) && isProfileSources(m.sources);
@@ -739,7 +754,8 @@ export function isHostToSettingsPage(v: unknown): v is HostToSettingsPage {
       && FILE_LINK_BOOLEAN_SETTINGS.every((key) => typeof m[key] === "boolean")
       && Array.isArray(m.openWithSystemApp) && m.openWithSystemApp.every((item) => typeof item === "string")
       && (m.replyTo === undefined || isSettingsRequestId(m.replyTo))
-      && hasOnlyKeys(m, ["type", "initialModel", "appearance", "displayName", "composerSendKey", "apiKeyPolicy", "restoreTabsOnStartup", "autoContinueAtUsageLimit", "learningEnabled", ...FILE_LINK_SETTINGS, "orchestrationEnabled", "orchestrationAgents", "orchestrationDefaults", "conductorPolicy", "conductorPolicyDefault", "externalTimeoutMinutes", "externalDetection", "externalModels", "replyTo", "profileSources", "researchTargets", "researchUnavailable", "effortUnavailable", "researchText", "conductorPreview"]);
+      && (m.writeFailure === undefined || m.replyTo !== undefined && isSettingWriteFailure(m.writeFailure))
+      && hasOnlyKeys(m, ["type", "initialModel", "appearance", "displayName", "composerSendKey", "apiKeyPolicy", "restoreTabsOnStartup", "autoContinueAtUsageLimit", "learningEnabled", ...FILE_LINK_SETTINGS, "orchestrationEnabled", "orchestrationAgents", "orchestrationDefaults", "conductorPolicy", "conductorPolicyDefault", "externalTimeoutMinutes", "externalDetection", "externalModels", "replyTo", "writeFailure", "profileSources", "researchTargets", "researchUnavailable", "effortUnavailable", "researchText", "conductorPreview"]);
   }
   t satisfies never;
   return false;

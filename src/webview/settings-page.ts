@@ -18,6 +18,7 @@ import {
   type FileLinkBooleanSetting,
   type HostToSettingsPage,
   type SettingsPageToHost,
+  type SettingWriteFailure,
 } from "../protocol";
 
 declare function acquireVsCodeApi(): { postMessage(message: SettingsPageToHost): void; getState(): { category?: string } | undefined; setState(state: { category: string }): void };
@@ -315,7 +316,7 @@ function writeDisplayName(value: string): void {
   }
   if (value === (current.displayName ?? "")) return;
   pendingDisplayName = nextRequestId();
-  vscode.postMessage({ type: "setDisplayName", requestId: pendingDisplayName, value });
+  post({ type: "setDisplayName", requestId: pendingDisplayName, value });
 }
 displayNameInput.addEventListener("change", () => {
   displayNameInput.value = displayNameInputValue();
@@ -347,24 +348,24 @@ function renderDisplayName(state: SettingsState): void {
 }
 const renderAccent = createAccentSettings(accentCard, (setting, value) => {
   const requestId = nextRequestId();
-  vscode.postMessage({ type: "setAccentSetting", requestId, setting, value });
+  post({ type: "setAccentSetting", requestId, setting, value });
   return requestId;
 }, { row, rowNote });
 const chatCard = section(generalCategory, l10n.t("Chat"));
 const learningCard = section(generalCategory, l10n.t("Learning"));
 const learningSwitch = switchButton("setting-learning-enabled");
-row(learningCard, l10n.t("Enable learning"), l10n.t("Turning learning off stops delivery in running conversations. Turning it on applies from the next conversation. Recording and research remain available."), learningSwitch);
+const learningText = row(learningCard, l10n.t("Enable learning"), l10n.t("Turning learning off stops delivery in running conversations. Turning it on applies from the next conversation. Recording and research remain available."), learningSwitch);
 
 const sendKeySelect = select<ComposerSendKey>([
   ["enter", "Enter"],
   ["shiftEnter", "Shift+Enter"],
 ]);
 sendKeySelect.id = "setting-composer-send-key";
-row(chatCard, l10n.t("Send shortcut"), l10n.t("Key that sends the message box contents. The other combination inserts a new line."), sendKeySelect);
+const sendKeyText = row(chatCard, l10n.t("Send shortcut"), l10n.t("Key that sends the message box contents. The other combination inserts a new line."), sendKeySelect);
 
 const initialModelSelect = select<string>([]);
 initialModelSelect.id = "setting-initial-model";
-const initialModelText = row(chatCard, l10n.t("Initial model"), l10n.t("Choose a model for new conversations. Off uses Claude's normal settings. Running conversations and Resume are unchanged."), initialModelSelect);
+const initialModelText = row(chatCard, l10n.t("Initial model"), l10n.t("Choose a model for new and resumed conversations. A model chosen in a tab still wins. Off uses Claude's normal settings. Running conversations are unchanged."), initialModelSelect);
 const initialModelNote = rowNote(initialModelText, "settings-row-note", "");
 let pendingInitialModel: number | null = null;
 function renderInitialModel(state: SettingsState): void {
@@ -388,7 +389,7 @@ function renderInitialModel(state: SettingsState): void {
   initialModelSelect.value = selected;
   initialModelSelect.disabled = false;
   initialModelNote.textContent = missing
-    ? l10n.t("The configured model is not in the available list. New conversations will request this ID; Claude may reject it.")
+    ? l10n.t("The configured model is not in the available list. New and resumed conversations will request this ID; Claude may reject it.")
     : list?.state !== "ok" ? l10n.t("Loading models. This may take a few seconds after starting a conversation.") : "";
   if (!missing && list?.state === "failed") initialModelNote.textContent = modelListStatusText(list, state.externalDetection.claude);
   initialModelNote.hidden = !initialModelNote.textContent;
@@ -397,7 +398,7 @@ initialModelSelect.addEventListener("change", () => {
   if (pendingInitialModel !== null) return;
   pendingInitialModel = nextRequestId();
   initialModelSelect.disabled = true;
-  vscode.postMessage({ type: "setInitialModel", requestId: pendingInitialModel, model: initialModelSelect.value });
+  post({ type: "setInitialModel", requestId: pendingInitialModel, model: initialModelSelect.value });
 });
 
 const restoreSwitch = element("button", "settings-switch");
@@ -406,7 +407,7 @@ restoreSwitch.type = "button";
 restoreSwitch.setAttribute("role", "switch");
 restoreSwitch.disabled = true;
 restoreSwitch.appendChild(element("span", "settings-switch-thumb"));
-row(
+const restoreText = row(
   chatCard,
   l10n.t("Restore tabs on startup"),
   l10n.t("Reopen the conversation tabs that were open when the window was last closed or reloaded. Tabs that never sent a message are not restored."),
@@ -433,7 +434,7 @@ const apiKeyRadios = apiKeyOptions.map(([value, text]) => {
   return radio;
 });
 const checkedApiKeyRadio = (): HTMLButtonElement | undefined => apiKeyRadios.find((r) => r.getAttribute("aria-checked") === "true");
-row(
+const apiKeyText = row(
   section(generalCategory, l10n.t("Authentication")),
   l10n.t("API key"),
   l10n.t("Inherit uses ANTHROPIC_API_KEY if it is set (billed to the API); Subscription only uses your signed-in subscription. Applies to conversations started afterwards."),
@@ -511,12 +512,12 @@ extensionError.id = "setting-system-app-error";
 extensionError.setAttribute("role", "alert");
 extensionInput.setAttribute("aria-describedby", extensionError.id);
 extensionControl.append(extensionChips, extensionInput, extensionAdd, extensionError);
-row(fileLinkCard, l10n.t("Open with the default app"), l10n.t("Open these file extensions with the default app only inside the workspace and conversation folder."), extensionControl, () => extensionInput);
+const extensionText = row(fileLinkCard, l10n.t("Open with the default app"), l10n.t("Open these file extensions with the default app only inside the workspace and conversation folder."), extensionControl, () => extensionInput);
 let pendingExtensions: number | null = null;
 function writeSystemAppExtensions(value: string[]): void {
   if (current === null || pendingExtensions !== null) return;
   pendingExtensions = nextRequestId();
-  vscode.postMessage({ type: "setFileLinkSetting", requestId: pendingExtensions, setting: "openWithSystemApp", value });
+  post({ type: "setFileLinkSetting", requestId: pendingExtensions, setting: "openWithSystemApp", value });
 }
 function addSystemAppExtension(): void {
   if (current === null || pendingExtensions !== null) return;
@@ -552,8 +553,8 @@ function renderSystemAppExtensions(state: SettingsState): void {
 const orchestrationCard = element("div", "settings-card");
 rosterCategory.appendChild(orchestrationCard);
 const orchestrationSwitch = switchButton("setting-orchestration-enabled");
-const orchestrationNote = row(orchestrationCard, l10n.t("Enable the agent roster"), l10n.t("Changes apply from the next session. The roster of running conversations will not change."), orchestrationSwitch)
-  .querySelector<HTMLElement>(".settings-row-description")!;
+const orchestrationText = row(orchestrationCard, l10n.t("Enable the agent roster"), l10n.t("Changes apply from the next session. The roster of running conversations will not change."), orchestrationSwitch);
+const orchestrationNote = orchestrationText.querySelector<HTMLElement>(".settings-row-description")!;
 orchestrationNote.id = "orchestration-note";
 const rosterRows = element("div", "settings-roster-rows");
 rosterCategory.appendChild(rosterRows);
@@ -644,7 +645,7 @@ const sourceChips = PROFILE_SOURCES.map(source => {
     if (sources.length === 1 && sources.includes(source)) return;
     const next = sources.includes(source) ? sources.filter(item => item !== source) : [...sources, source];
     pendingSources = nextRequestId();
-    vscode.postMessage({ type: "setProfileSources", requestId: pendingSources, sources: next });
+    post({ type: "setProfileSources", requestId: pendingSources, sources: next });
     renderProfileResearch(current);
   });
   return chip;
@@ -671,10 +672,10 @@ const externalRecheck = element("button", "settings-segment", l10n.t("Re-check")
 externalRecheck.id = "setting-recheck-external";
 externalRecheck.type = "button";
 externalRecheck.disabled = true;
-externalRecheck.addEventListener("click", () => vscode.postMessage({ type: "recheckExternalExecutors" }));
+externalRecheck.addEventListener("click", () => post({ type: "recheckExternalExecutors" }));
 detectionHeader.append(externalHeading, externalRecheck);
 function requestResearch(targets: string[], purpose?: "effort"): void {
-  if (targets.length) vscode.postMessage({ type: "researchModelProfiles", targets, ...(purpose ? { purpose } : {}) });
+  if (targets.length) post({ type: "researchModelProfiles", targets, ...(purpose ? { purpose } : {}) });
 }
 function renderProfileResearch(state: SettingsState): void {
   if (pendingSources === state.replyTo) pendingSources = null;
@@ -782,7 +783,7 @@ function writeOrchestration(setting: "enabled" | "agents" | "conductorPolicy" | 
   pendingOrchestration = requestId;
   settingsRosterFocusId = rosterCategory.contains(document.activeElement) ? document.activeElement?.id : undefined;
   lockOrchestration();
-  vscode.postMessage({ type: "setOrchestrationSetting", requestId, setting, value });
+  post({ type: "setOrchestrationSetting", requestId, setting, value });
 }
 function writeRoster(rows: readonly OrchestrationSettingRow[]): void {
   writeOrchestration("agents", rows.map((entry) => ({ ...entry, rows: entry.rows.map((rosterRow) => ({ ...rosterRow, efforts: canonicalExecutorEfforts(rosterRow.executor, rosterRow.efforts) })) })));
@@ -814,7 +815,7 @@ function renderInstructionPreview(state: SettingsState): void {
 }
 function requestInstructionPreview(): void {
   previewRequest = nextRequestId();
-  vscode.postMessage({ type: "previewConductorInstruction", requestId: previewRequest, policy: policyInput.value });
+  post({ type: "previewConductorInstruction", requestId: previewRequest, policy: policyInput.value });
 }
 
 function renderOrchestration(state: SettingsState): void {
@@ -1076,8 +1077,67 @@ const pendingFileLink: Record<FileLinkBooleanSetting, number | null> = {
   openOutsideReadOnly: null,
 };
 
+const requestAnchors = new Map<number, HTMLElement>();
+const rowErrors = new Map<HTMLElement, HTMLElement>();
+
+function rowTextOf(control: Element | null | undefined): HTMLElement | undefined {
+  return control?.closest(".settings-row")?.querySelector<HTMLElement>(":scope > .settings-row-text") ?? undefined;
+}
+
+function writeAnchor(message: SettingsPageToHost): HTMLElement | undefined {
+  switch (message.type) {
+    case "setAccentSetting":
+      return (accentCard.contains(document.activeElement) ? rowTextOf(document.activeElement) : undefined)
+        ?? accentCard.querySelector<HTMLElement>(".settings-row-text") ?? undefined;
+    case "setDisplayName": return displayNameText;
+    case "setComposerSendKey": return sendKeyText;
+    case "setInitialModel": return initialModelText;
+    case "setRestoreTabsOnStartup": return restoreText;
+    case "setLearningEnabled": return learningText;
+    case "setApiKeyPolicy": return apiKeyText;
+    case "setFileLinkSetting": return message.setting === "openWithSystemApp" ? extensionText : rowTextOf(fileLinkSwitches[message.setting]);
+    case "setOrchestrationSetting":
+      return message.setting === "externalTimeoutMinutes" ? timeoutText : message.setting === "conductorPolicy" ? policyCard : orchestrationText;
+    case "setProfileSources": return policyCard;
+    default: return undefined;
+  }
+}
+
+function post(message: SettingsPageToHost): void {
+  if ("requestId" in message) {
+    const anchor = writeAnchor(message);
+    if (anchor) requestAnchors.set(message.requestId, anchor);
+  }
+  vscode.postMessage(message);
+}
+
+function renderRowError(anchor: HTMLElement, failure: SettingWriteFailure | undefined): void {
+  rowErrors.get(anchor)?.remove();
+  rowErrors.delete(anchor);
+  if (!failure) return;
+  const note = element("div", "settings-row-note settings-row-error");
+  note.setAttribute("role", "alert");
+  const mark = element("span", "settings-row-error-mark", "✗");
+  mark.setAttribute("aria-hidden", "true");
+  const unregistered = failure.kind === "unregistered";
+  const action = element("button", "settings-link settings-row-error-action",
+    unregistered ? l10n.t("Reload window") : l10n.t("Open settings.json"));
+  action.type = "button";
+  action.addEventListener("click", () => post({ type: "settingWriteFailureAction", action: unregistered ? "reloadWindow" : "openSettingsJson" }));
+  note.append(mark, " ", unregistered
+    ? l10n.t("Could not save. Reload the window and try again.")
+    : l10n.t("Could not save: {0}", failure.reason), " ", action);
+  anchor.appendChild(note);
+  rowErrors.set(anchor, note);
+}
+
 function render(state: SettingsState): void {
   current = state;
+  const anchor = state.replyTo === undefined ? undefined : requestAnchors.get(state.replyTo);
+  if (anchor) {
+    requestAnchors.delete(state.replyTo!);
+    renderRowError(anchor, state.writeFailure);
+  }
   renderInitialModel(state);
   renderDisplayName(state);
   renderAccent(state.appearance, state.replyTo);
@@ -1122,14 +1182,14 @@ function render(state: SettingsState): void {
 }
 
 sendKeySelect.addEventListener("change", () => {
-  vscode.postMessage({ type: "setComposerSendKey", requestId: nextRequestId(), sendKey: sendKeySelect.value as ComposerSendKey });
+  post({ type: "setComposerSendKey", requestId: nextRequestId(), sendKey: sendKeySelect.value as ComposerSendKey });
 });
 
 function requestApiKeyPolicy(policy: ApiKeyPolicy): void {
   if (current === null || pending.apiKey !== null || policy === current.apiKeyPolicy) return;
   const requestId = nextRequestId();
   pending.apiKey = requestId;
-  vscode.postMessage({ type: "setApiKeyPolicy", requestId, policy });
+  post({ type: "setApiKeyPolicy", requestId, policy });
 }
 for (const radio of apiKeyRadios) {
   radio.addEventListener("click", () => requestApiKeyPolicy(radio.dataset.value as ApiKeyPolicy));
@@ -1151,21 +1211,21 @@ autoContinueSwitch.addEventListener("click", () => {
   const requestId = nextRequestId();
   pending.autoContinue = requestId;
   autoContinueSwitch.disabled = true;
-  vscode.postMessage({ type: "setAutoContinueAtUsageLimit", requestId, enabled: !current.autoContinueAtUsageLimit });
+  post({ type: "setAutoContinueAtUsageLimit", requestId, enabled: !current.autoContinueAtUsageLimit });
 });
 
 restoreSwitch.addEventListener("click", () => {
   if (current === null || pending.restore !== null) return;
   const requestId = nextRequestId();
   pending.restore = requestId;
-  vscode.postMessage({ type: "setRestoreTabsOnStartup", requestId, enabled: !current.restoreTabsOnStartup });
+  post({ type: "setRestoreTabsOnStartup", requestId, enabled: !current.restoreTabsOnStartup });
 });
 learningSwitch.addEventListener("click", () => {
   if (current === null || pending.learning !== null) return;
   const requestId = nextRequestId();
   pending.learning = requestId;
   learningSwitch.disabled = true;
-  vscode.postMessage({ type: "setLearningEnabled", requestId, enabled: !current.learningEnabled });
+  post({ type: "setLearningEnabled", requestId, enabled: !current.learningEnabled });
 });
 for (const key of FILE_LINK_BOOLEAN_SETTINGS) {
   const control = fileLinkSwitches[key];
@@ -1173,10 +1233,10 @@ for (const key of FILE_LINK_BOOLEAN_SETTINGS) {
     if (current === null || pendingFileLink[key] !== null || control.disabled) return;
     const requestId = nextRequestId();
     pendingFileLink[key] = requestId;
-    vscode.postMessage({ type: "setFileLinkSetting", requestId, setting: key, enabled: !current[key] });
+    post({ type: "setFileLinkSetting", requestId, setting: key, enabled: !current[key] });
   });
 }
-moreLink.addEventListener("click", () => vscode.postMessage({ type: "openVsCodeSettings" }));
+moreLink.addEventListener("click", () => post({ type: "openVsCodeSettings" }));
 
 window.addEventListener("message", (event: MessageEvent<unknown>) => {
   if (!isHostToSettingsPage(event.data)) return;
@@ -1187,4 +1247,4 @@ window.addEventListener("message", (event: MessageEvent<unknown>) => {
   } else render(event.data);
 });
 renderSettingsToc();
-vscode.postMessage({ type: "settingsPageReady" });
+post({ type: "settingsPageReady" });

@@ -177,6 +177,7 @@ export class Session {
   modelFallback?: import("./protocol").ModelFallbackState;
   fallbackRevert: { conversation: ClaudeConversation; turnId: string | null; originalModel: string; priorOverride: string | null | undefined } | undefined;
   recordedModel: string | undefined;
+  launchModelCheck: { conversation: ClaudeConversation; requested: string; observed?: string; listSettled: boolean } | undefined;
   defaultEffort: ConfiguredEffort | undefined;
   resumeSessionId: string | undefined;
   handoffSource?: HandoffSourceSnapshot;
@@ -234,6 +235,7 @@ export class Session {
     this.modelFallback = undefined;
     this.fallbackRevert = undefined;
     this.recordedModel = undefined;
+    this.launchModelCheck = undefined;
     this.defaultEffort = undefined;
     this.configuredEffortGeneration += 1;
     this.store.post({ type: "configuredEffortChanged", tabId: this.tabId, effort: null });

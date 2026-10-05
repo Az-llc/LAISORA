@@ -1,6 +1,6 @@
 import { DEFAULT_ACCENT_SETTINGS, isAccentColor, isAccentSettingValue, type AccentSetting, type AccentSettings } from "./accent";
 import { isAbsolute, join, relative, sep } from "node:path";
-import { containsAbsolutePath } from "./path-redaction";
+import { containsAbsolutePath, redactAbsolutePaths } from "./path-redaction";
 import { LearningLedger } from "./learning-ledger";
 import { sectionFromLedger, readMeasuredRuns, learningRoster } from "./learning-delivery";
 import type { MeasuredRun } from "./learning-section";
@@ -28,6 +28,7 @@ import {
   type FileLinkSetting,
   type HostToSettingsPage,
   type HostToWebview,
+  type SettingWriteFailure,
   type WebviewToHost,
 } from "./protocol";
 import * as l10n from "@vscode/l10n";
@@ -49,12 +50,12 @@ export function accentSettings(): AccentSettings {
   };
 }
 
-export async function writeAccentSetting(setting: AccentSetting, value: string): Promise<void> {
-  if (isAccentSettingValue(setting, value)) await updateUserSetting(`appearance.${setting}`, value);
+export async function writeAccentSetting(setting: AccentSetting, value: string): Promise<SettingWriteFailure | undefined> {
+  return isAccentSettingValue(setting, value) ? updateUserSetting(`appearance.${setting}`, value) : undefined;
 }
 
-export async function writeDisplayName(value: string): Promise<void> {
-  if (isDisplayName(value)) await updateUserSetting("appearance.displayName", value);
+export async function writeDisplayName(value: string): Promise<SettingWriteFailure | undefined> {
+  return isDisplayName(value) ? updateUserSetting("appearance.displayName", value) : undefined;
 }
 
 export function userSettingsMessage(): Extract<HostToWebview, { type: "userSettings" }> {
@@ -356,37 +357,53 @@ export function settingsStateMessage(): Extract<HostToSettingsPage, { type: "set
   };
 }
 
-function reportSettingWriteFailure(key: string, error: unknown): void {
-  output.appendLine(`[error] update ${key} failed: ${String(error)}`);
-  void vscode.window.showWarningMessage(l10n.t("LAISORA: Could not save the setting."));
-}
+const UNREGISTERED_SETTING_ERROR_CODE = "ERROR_UNKNOWN_KEY";
+const UNREGISTERED_SETTING_MESSAGE = /is not a registered configuration/i;
 
-async function updateUserSetting(key: string, value: unknown): Promise<void> {
+function isUnregisteredSetting(key: string, error: unknown): boolean {
+  if ((error as { code?: unknown } | undefined)?.code === UNREGISTERED_SETTING_ERROR_CODE) return true;
+  if (UNREGISTERED_SETTING_MESSAGE.test(error instanceof Error ? error.message : String(error))) return true;
   try {
-    await getLaisoraConfiguration().update(key, value, vscode.ConfigurationTarget?.Global ?? 1);
-  } catch (error) {
-    reportSettingWriteFailure(key, error);
+    const cfg = getLaisoraConfiguration();
+    return typeof cfg.inspect === "function" && cfg.inspect(key)?.defaultValue === undefined;
+  } catch {
+    return false;
   }
 }
 
-export async function writeInitialModel(model: string): Promise<void> {
-  await updateUserSetting("claude.initialModel", model);
+function reportSettingWriteFailure(key: string, error: unknown): SettingWriteFailure {
+  output.appendLine(`[error] update ${key} failed: ${String(error)}`);
+  const text = error instanceof Error ? error.message || String(error) : String(error);
+  return { kind: isUnregisteredSetting(key, error) ? "unregistered" : "other", reason: redactAbsolutePaths(text.split(/\r?\n/, 1)[0].trim()) };
 }
 
-export async function writeComposerSendKey(sendKey: ComposerSendKey): Promise<void> {
-  await updateUserSetting("composer.sendKey", sendKey);
+async function updateUserSetting(key: string, value: unknown): Promise<SettingWriteFailure | undefined> {
+  try {
+    await getLaisoraConfiguration().update(key, value, vscode.ConfigurationTarget?.Global ?? 1);
+    return undefined;
+  } catch (error) {
+    return reportSettingWriteFailure(key, error);
+  }
 }
 
-export async function writeApiKeyPolicy(policy: ApiKeyPolicy): Promise<void> {
-  await updateUserSetting("claude.apiKeyPolicy", policy);
+export async function writeInitialModel(model: string): Promise<SettingWriteFailure | undefined> {
+  return updateUserSetting("claude.initialModel", model);
 }
 
-export async function writeLearningEnabled(enabled: boolean): Promise<void> {
-  await updateUserSetting("learning.enabled", enabled);
+export async function writeComposerSendKey(sendKey: ComposerSendKey): Promise<SettingWriteFailure | undefined> {
+  return updateUserSetting("composer.sendKey", sendKey);
 }
 
-export async function writeProfileSources(value: unknown): Promise<void> {
-  await updateUserSetting("learning.profileSources", normalizeProfileSources(value));
+export async function writeApiKeyPolicy(policy: ApiKeyPolicy): Promise<SettingWriteFailure | undefined> {
+  return updateUserSetting("claude.apiKeyPolicy", policy);
+}
+
+export async function writeLearningEnabled(enabled: boolean): Promise<SettingWriteFailure | undefined> {
+  return updateUserSetting("learning.enabled", enabled);
+}
+
+export async function writeProfileSources(value: unknown): Promise<SettingWriteFailure | undefined> {
+  return updateUserSetting("learning.profileSources", normalizeProfileSources(value));
 }
 
 let normalizedRosterLogged = false;
@@ -397,29 +414,30 @@ function readRoster(value: unknown) {
   });
 }
 
-export async function writeOrchestrationSetting(setting: "enabled" | "agents" | "conductorPolicy" | "externalTimeoutMinutes", value: unknown): Promise<void> {
+export async function writeOrchestrationSetting(setting: "enabled" | "agents" | "conductorPolicy" | "externalTimeoutMinutes", value: unknown): Promise<SettingWriteFailure | undefined> {
   if (setting === "externalTimeoutMinutes" ? !isExternalTimeout(value)
     : setting === "agents" ? !isOrchestrationSettingRoster(value)
     : setting === "enabled" ? typeof value !== "boolean" : typeof value !== "string") {
     output.appendLine("[drop] R-ORC-20: invalid orchestration setting");
-    return;
+    return undefined;
   }
-  await updateUserSetting(`orchestration.${setting}`, setting === "agents" ? orchestrationSettingRows(value as OrchestrationSettingRow[]) : value);
+  return updateUserSetting(`orchestration.${setting}`, setting === "agents" ? orchestrationSettingRows(value as OrchestrationSettingRow[]) : value);
 }
 
-export async function writeFileLinkSetting(setting: FileLinkSetting, enabled: boolean | string[]): Promise<void> {
-  await updateUserSetting(FILE_LINK_SETTING_KEYS[setting], enabled);
+export async function writeFileLinkSetting(setting: FileLinkSetting, enabled: boolean | string[]): Promise<SettingWriteFailure | undefined> {
+  return updateUserSetting(FILE_LINK_SETTING_KEYS[setting], enabled);
 }
 
-export async function writeRestoreTabsOnStartup(enabled: boolean): Promise<void> {
+export async function writeRestoreTabsOnStartup(enabled: boolean): Promise<SettingWriteFailure | undefined> {
   try {
     const cfg = getLaisoraConfiguration();
     const target = cfg.inspect?.<boolean>("restoreTabsOnStartup")?.workspaceValue !== undefined
       ? vscode.ConfigurationTarget?.Workspace ?? 2
       : vscode.ConfigurationTarget?.Global ?? 1;
     await cfg.update("restoreTabsOnStartup", enabled, target);
+    return undefined;
   } catch (error) {
-    reportSettingWriteFailure("restoreTabsOnStartup", error);
+    return reportSettingWriteFailure("restoreTabsOnStartup", error);
   }
 }
 

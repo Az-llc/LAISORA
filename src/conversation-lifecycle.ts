@@ -28,12 +28,13 @@ import { pendingAttachments } from "./pending-attachments";
 import * as l10n from "@vscode/l10n";
 import { isUnusedSession, type Session } from "./session";
 import { modelsMessage, recomputeModelRows } from "./gateway-models";
+import { resolveModelDisplayName } from "./model-display-name";
 import { clearProcessEphemeral } from "./guardrail";
 import { extensionContext, output, sinceActivation, store } from "./host-context";
 import { INJECTED_TAG_RE as HUMAN_INPUT_INJECTED_TAG_RE, isNonHumanCommandInput } from "./human-input-vocabulary";
 import { observedTimestampSeed } from "./observed-timestamp-seed";
 import { normalizeProgressTracking } from "./progress-protocol";
-import { normalizeApiKeyPolicy, type WebviewToHost } from "./protocol";
+import { normalizeApiKeyPolicy, type ModelInfo, type WebviewToHost } from "./protocol";
 import { displayTitleFromSummary } from "./session-list";
 import type { SessionStore } from "./store-surfaces";
 
@@ -118,6 +119,42 @@ function refreshConfiguredEffort(
     if (s.initialModel && s.modelOverride === undefined && !s.auth?.model) s.effectiveModel = applied.model;
     s.modelFallback = applyFallbackModel(s.modelFallback, applied.model, Date.now(), s.models);
     publishConfiguredEffort(st, s);
+    observeLaunchModel(st, s, conv, applied.model);
+  });
+}
+
+function launchModelResolved(id: string, rows: readonly ModelInfo[]): string | undefined {
+  const trimmed = id.trim();
+  const exact = rows.find((m) => m.id === trimmed && m.id !== "default");
+  if (exact !== undefined) return exact.resolvedModel ?? (trimmed.startsWith("claude-") ? trimmed : undefined);
+  const extended = /\[1m\]$/i.test(trimmed);
+  const base = trimmed.replace(/\[1m\]$/i, "");
+  const row = rows.find((m) => m.id === base && m.id !== "default");
+  const resolved = row?.resolvedModel ?? (base.startsWith("claude-") ? base : undefined);
+  if (resolved === undefined) return undefined;
+  return extended && !/\[1m\]$/i.test(resolved) ? `${resolved}[1m]` : resolved;
+}
+
+function observeLaunchModel(st: SessionStore | null | undefined, s: Session, conv: ClaudeConversation, model: string | undefined, listSettled = false): void {
+  const check = s.launchModelCheck;
+  if (check === undefined || check.conversation !== conv || s.closed) return;
+  if (model !== undefined && check.observed === undefined) check.observed = model;
+  if (listSettled) check.listSettled = true;
+  if (check.observed === undefined || !check.listSettled || s.conversation !== conv) return;
+  s.launchModelCheck = undefined;
+  if (s.modelFallback !== undefined && s.modelFallback.resolvedAt === undefined) return;
+  const requested = launchModelResolved(check.requested, s.models);
+  const observed = launchModelResolved(check.observed, s.models);
+  if (requested === undefined || observed === undefined || requested === observed) return;
+  output.appendLine(`[${s.title}] launch model: requested=${check.requested} applied=${check.observed}`);
+  st?.post({
+    type: "tabNotice",
+    tabId: s.tabId,
+    text: l10n.t(
+      "The Claude CLI is using {0} instead of {1}, which LAISORA passed for this conversation. A managed policy or an ANTHROPIC_* model setting may be overriding it.",
+      resolveModelDisplayName(s.models, check.observed) ?? check.observed,
+      resolveModelDisplayName(s.models, check.requested) ?? check.requested
+    ),
   });
 }
 
@@ -311,6 +348,7 @@ async function applyModelChange(
     }
 
     s.modelOverride = restore === undefined ? requested : restore.override;
+    s.launchModelCheck = undefined;
     clearObservedEffort(s);
     const knownRow = requested === null || s.models.some((m) => m.id === requested);
     const saved: SettingsWriteResult | null = knownRow && !sessionOnly ? updateClaudeCodeSettings({ model: requested }) : null;
@@ -331,6 +369,9 @@ async function applyModelChange(
           : l10n.t("LAISORA: Changed model to {0} (saved to settings.json).", label);
     const openFallback = s.modelFallback?.resolvedAt === undefined ? s.modelFallback : undefined;
     s.modelFallback = resolveFallbackByChoice(s.modelFallback, requested, Date.now(), s.models);
+    if (restore === undefined && (s.modelFallback?.autoRevert === "applied" || s.modelFallback?.autoRevert === "deferred")) {
+      s.modelFallback = { ...s.modelFallback, autoRevert: "chosen" };
+    }
     if (restore === undefined) st.post({ type: "modelChanged", tabId: s.tabId, model: requested, notice, applied: true });
     if (restore === undefined && openFallback !== undefined) {
       s.pushEvent({ kind: "model_fallback_revert", turnId: openFallback.notice.turnId,
@@ -405,9 +446,9 @@ function settleFallbackRevert(st: SessionStore | null | undefined, s: Session, c
 function launchModel(s: Session): string | null | undefined {
   const fallback = s.modelFallback;
   if (fallback !== undefined && fallback.resolvedAt === undefined) return fallback.appliedModel;
-  if (s.modelOverride !== undefined) return s.modelOverride;
-  if (fallback === undefined) return s.initialModel ?? undefined;
-  return fallback.autoRevert === "applied" || fallback.autoRevert === "deferred" ? fallback.appliedModel : undefined;
+  if (typeof s.modelOverride === "string") return s.modelOverride;
+  if (fallback !== undefined && (fallback.autoRevert === "applied" || fallback.autoRevert === "deferred")) return fallback.appliedModel;
+  return s.initialModel ?? undefined;
 }
 
 export async function handleConversationMessage(
@@ -574,7 +615,7 @@ async function ensureConversationInner(s: Session): Promise<void> {
   s.cwd = cwd;
 
   invalidateClaudeCodeSettingsCache();
-  if (s.initialModel === undefined && !s.resumeSessionId && !crashResumeSessionId) {
+  if (s.initialModel === undefined) {
     s.initialModel = cfg.get<string>("claude.initialModel", "").trim() || null;
   }
   s.effectiveModel = launchModel(s);
@@ -634,6 +675,7 @@ async function ensureConversationInner(s: Session): Promise<void> {
       ) {
         if (typeof ev.auth?.model === "string" && ev.auth.model.length > 0) {
           s.effectiveModel = ev.auth.model;
+          observeLaunchModel(store, s, conv, ev.auth.model);
         }
         s.effectiveEffort = ev.auth?.effort ?? undefined;
         rederiveConfiguredEffort(store, s);
@@ -666,6 +708,9 @@ async function ensureConversationInner(s: Session): Promise<void> {
   });
   try {
     s.expectedConversationId = conv.conversationId;
+    s.launchModelCheck = typeof s.effectiveModel === "string" && s.effectiveModel !== "default"
+      ? { conversation: conv, requested: s.effectiveModel, listSettled: false }
+      : undefined;
     await conv.start();
     if (s.closed || s.logicalGeneration !== logicalGenerationAtStart) {
       void conv.dispose();
@@ -685,6 +730,7 @@ async function ensureConversationInner(s: Session): Promise<void> {
       recomputeModelRows(s);
       rederiveConfiguredEffort(store, s);
       if (s.models.length > 0) store?.post(modelsMessage(s));
+      observeLaunchModel(store, s, conv, undefined, true);
     });
   } catch (e) {
     void conv.dispose();

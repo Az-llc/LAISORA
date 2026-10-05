@@ -1,6 +1,15 @@
 # Changelog
 
-## 1.4.0
+## 1.4.1
+
+- **Initial model now also applies to resumed conversations.** Tabs restored at startup, sessions
+  reopened from history, crash restarts and handoff targets start on the initial model (a model
+  chosen in the tab still comes first). Previously they started on whatever model Claude Code's
+  settings named, which could silently switch an Opus conversation to Sonnet. If Claude runs a
+  different model than the one LAISORA asked for, the tab now says so.
+- **Settings page shows why a save failed,** directly under the setting, with a button to reload
+  the window (when the window still uses the previous version's settings after an update) or to
+  open settings.json. The control returns to the value that is actually saved.
 
 - **Learning ledger v2.** The ledger now holds model-specific usage knowledge: each line names the
   model, role and effort it applies to, and is labelled as a recurring failure, public source,

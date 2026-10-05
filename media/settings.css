@@ -151,6 +151,7 @@ html, body {
   line-height: 1.5;
   color: var(--vscode-foreground);
 }
+.settings-row-error-mark { color: var(--vscode-errorForeground); }
 .settings-row-hint {
   margin-top: var(--settings-gap-1);
   font-size: var(--l-note);

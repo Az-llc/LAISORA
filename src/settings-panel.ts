@@ -3,7 +3,7 @@ import * as l10n from "@vscode/l10n";
 import { randomBytes } from "node:crypto";
 import { updateClaudeCodeSettings } from "./claude-settings";
 import { output } from "./host-context";
-import { isSettingsPageToHost } from "./protocol";
+import { isSettingsPageToHost, type SettingWriteFailure } from "./protocol";
 import {
   settingsStateMessage,
   loadSettingsProfiles,
@@ -64,6 +64,7 @@ export async function handleSettingsPageMessage(webview: vscode.Webview, raw: un
     output.appendLine(`[drop] invalid settings page message: ${JSON.stringify(raw).slice(0, 200)}`);
     return;
   }
+  let writeFailure: SettingWriteFailure | undefined;
   switch (raw.type) {
     case "previewConductorInstruction":
       await loadSettingsProfiles();
@@ -76,20 +77,23 @@ export async function handleSettingsPageMessage(webview: vscode.Webview, raw: un
     case "openVsCodeSettings":
       await vscode.commands.executeCommand("workbench.action.openSettings", "laisora");
       return;
+    case "settingWriteFailureAction":
+      await vscode.commands.executeCommand(raw.action === "reloadWindow" ? "workbench.action.reloadWindow" : "workbench.action.openSettingsJson");
+      return;
     case "settingsPageReady":
     case "recheckExternalExecutors":
       break;
     case "setAccentSetting":
-      await writeAccentSetting(raw.setting, raw.value);
+      writeFailure = await writeAccentSetting(raw.setting, raw.value);
       break;
     case "setDisplayName":
-      await writeDisplayName(raw.value);
+      writeFailure = await writeDisplayName(raw.value);
       break;
     case "setComposerSendKey":
-      await writeComposerSendKey(raw.sendKey);
+      writeFailure = await writeComposerSendKey(raw.sendKey);
       break;
     case "setApiKeyPolicy":
-      await writeApiKeyPolicy(raw.policy);
+      writeFailure = await writeApiKeyPolicy(raw.policy);
       break;
     case "setAutoContinueAtUsageLimit":
       if (!updateClaudeCodeSettings({ autoContinueAtUsageLimit: raw.enabled }).ok) {
@@ -97,22 +101,22 @@ export async function handleSettingsPageMessage(webview: vscode.Webview, raw: un
       }
       break;
     case "setInitialModel":
-      await writeInitialModel(raw.model);
+      writeFailure = await writeInitialModel(raw.model);
       break;
     case "setRestoreTabsOnStartup":
-      await writeRestoreTabsOnStartup(raw.enabled);
+      writeFailure = await writeRestoreTabsOnStartup(raw.enabled);
       break;
     case "setLearningEnabled":
-      await writeLearningEnabled(raw.enabled);
+      writeFailure = await writeLearningEnabled(raw.enabled);
       break;
     case "setProfileSources":
-      await writeProfileSources(raw.sources);
+      writeFailure = await writeProfileSources(raw.sources);
       break;
     case "setOrchestrationSetting":
-      await writeOrchestrationSetting(raw.setting, raw.value);
+      writeFailure = await writeOrchestrationSetting(raw.setting, raw.value);
       break;
     case "setFileLinkSetting":
-      await writeFileLinkSetting(raw.setting, raw.setting === "openWithSystemApp" ? raw.value : raw.enabled);
+      writeFailure = await writeFileLinkSetting(raw.setting, raw.setting === "openWithSystemApp" ? raw.value : raw.enabled);
       break;
   }
   if (raw.type === "settingsPageReady" && settingsPanel?.webview === webview) {
@@ -133,7 +137,10 @@ export async function handleSettingsPageMessage(webview: vscode.Webview, raw: un
   await loadSettingsProfiles();
   const reply = settingsStateMessage();
   if (settingsPanel?.webview !== webview) return;
-  if ("requestId" in raw) reply.replyTo = raw.requestId;
+  if ("requestId" in raw) {
+    reply.replyTo = raw.requestId;
+    if (writeFailure) reply.writeFailure = writeFailure;
+  }
   void webview.postMessage(reply);
 }
 
