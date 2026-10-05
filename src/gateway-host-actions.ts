@@ -193,7 +193,7 @@ export async function loadSettingsProfiles(): Promise<void> {
   if (!directory) { settingsLedger = undefined; settingsMeasuredRuns = []; return; }
   try {
     if (settingsLedger?.directory !== join(directory, "laisora-learning")) settingsLedger = new LearningLedger(join(directory, "laisora-learning"));
-    await settingsLedger.reload(true);
+    await settingsLedger.refresh();
     settingsMeasuredRuns = await readMeasuredRuns(join(directory, "orchestration"), line => output.appendLine(line));
   } catch { settingsLedger = undefined; settingsMeasuredRuns = []; output.appendLine("R-LRN-07: settings ledger unavailable"); }
 }

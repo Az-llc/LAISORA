@@ -59,7 +59,7 @@ export function sectionFromLedger(records: Iterable<LedgerV2Record>, rules: Iter
   const roles = new Set(roster.filter(row => row.enabled).map(row => row.role));
   const usage = exposureUsage(all);
   const assignment = all.find(record => record.kind === "experiment-assignment" && record.conversation === conversation);
-  const noticesSeen = new Set(validExposures(all).filter(exposure => exposure.conversation === conversation).flatMap(exposure => exposure.items.filter(item => item.type === "notice").map(item => item.id)));
+  const noticesSeen = new Set(validExposures(all.filter(record => record.kind === "exposure" && record.conversation === conversation)).flatMap(exposure => exposure.items.filter(item => item.type === "notice").map(item => item.id)));
   return buildSection({ conductorModel, targets, roles, rules: switches.enabled && switches.automaticAdoption
     ? deliverableRules(rules, conductorModel, learningRoster(roster, models)).map(rule => ({ ...rule, ineffective: usage.ineffective.get(rule.ruleId) ?? 0 })) : [],
     claims: switches.enabled ? qualifyClaims(all.filter(record => record.kind !== "claim" || !privateTextR06(record.text)), now, (executor, model) => targets.some(target => target.executor === executor && target.model === model), roles)
@@ -93,11 +93,11 @@ export async function readMeasuredRuns(directory: string | undefined, log: (mess
           || raw.outcome !== undefined && !["normal", "stopped", "timeout", "unknown"].includes(raw.outcome)
           || raw.confirmedAt !== undefined && !Number.isFinite(Date.parse(raw.confirmedAt))
           || raw.outcomeEvidence !== undefined && (!Array.isArray(raw.outcomeEvidence) || !raw.outcomeEvidence.every((value: unknown) => typeof value === "string"))) { skipped++; continue; }
-        const key = `${raw.conversation ?? raw.sessionId ?? "unknown"}:${raw.agent_id}`;
+        const owner = raw.conversation ?? raw.sessionId ?? "unknown", key = JSON.stringify([owner, raw.agent_id]);
         const previous = agents.get(key);
         const segment = raw.segment ?? 0;
         if (previous && (previous.segment > segment || previous.segment === segment && previous.run.endAt > raw.lastActivityAt)) continue;
-        agents.set(key, { segment, run: { runId: raw.runId ?? textHash(key), executor: "claude", model: claudeModelIdLabel(raw.requestedModel ?? "unknown"),
+        agents.set(key, { segment, run: { runId: raw.runId ?? textHash(`${owner}:${raw.agent_id}`), executor: "claude", model: claudeModelIdLabel(raw.requestedModel ?? "unknown"),
           actualModel: raw.confirmedAt && raw.outcomeEvidence?.length ? raw.model ?? "unknown" : "unknown", actualEffort: raw.confirmedAt ? raw.effort ?? "unknown" : "unknown",
           effort: raw.requestedEffort ?? "unknown", role: raw.role ?? "unknown", outcome: raw.outcome ?? "unknown", endAt: raw.lastActivityAt,
           durationMs: Date.parse(raw.lastActivityAt) - Date.parse(raw.firstSeenAt), session: raw.conversation ?? "unknown" } });
@@ -150,7 +150,7 @@ export class LearningDelivery {
     if (budget.commandLineLimit !== undefined && baseUsage.commandLineUnits > budget.commandLineLimit) throw new Error(DISPATCH_BUDGET_EXCEEDED);
     const record = this.receipt(subject, prompt, subject.model ?? "unknown", subject.effort ?? "unknown", "target", []);
     const reason = !this.ingestion.ready || !this.ingestion.ledger.consistent ? "state-unavailable" : !settings.enabled || !settings.targetInjection || !settings.automaticAdoption ? "disabled"
-      : this.mismatched.has(`${subject.executor}:${subject.model}:${subject.effort}`) ? "model-mismatch" : settings.experiment && arm === "holdout" ? "holdout"
+      : this.mismatched.has(JSON.stringify([subject.executor, subject.model, subject.effort])) ? "model-mismatch" : settings.experiment && arm === "holdout" ? "holdout"
       : budget.taskCodePointLimit !== undefined && baseUsage.taskCodePoints > budget.taskCodePointLimit ? "task-size-withheld" : undefined;
     const kept = reason ? [] : [...rules];
     const withheld = reason ? rules.map(rule => ({ item: { type: "rule" as const, id: rule.ruleId }, reason })) : [];
@@ -191,7 +191,7 @@ export class LearningDelivery {
     if (unresolvedConductor && model !== "unknown") pending.boundModel ??= model;
     const requestedModel = unresolvedConductor ? pending.boundModel ?? "unknown" : record.requestedModel;
     const mismatch = metadataMismatch || model !== "unknown" && model !== requestedModel || record.route === "target" && effort !== "unknown" && effort !== record.requestedEffort;
-    if (mismatch) this.mismatched.add(`${record.executor}:${record.requestedModel}:${record.requestedEffort}`);
+    if (mismatch) this.mismatched.add(JSON.stringify([record.executor, record.requestedModel, record.requestedEffort]));
     await this.ingestion.ledger.append({ ...record, session: this.ingestion.sessionRef, opId: randomUUID(), at: new Date().toISOString(), observedModel: model, observedEffort: effort,
       attestation: evidence.map(value => this.ingestion.ref("attestation", value)), outcome: failed ? "dispatch-failed" : mismatch ? "model-mismatch" : "sent" });
   }

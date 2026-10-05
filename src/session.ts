@@ -165,6 +165,7 @@ export class Session {
   commands: SlashCommandInfo[] = [];
   models: ModelInfo[] = [];
   discoveredModels: Pick<ModelInfo, "id" | "label" | "description" | "resolvedModel">[] = [];
+  modelsFromLastRun = false;
   modelOverride: string | null | undefined;
   initialModel: string | null | undefined;
   effectiveModel: string | null | undefined;

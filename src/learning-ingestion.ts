@@ -1,6 +1,7 @@
 import type { AgentInput } from "@anthropic-ai/claude-agent-sdk/sdk-tools" with { "resolution-mode": "import" };
 import { homedir } from "node:os";
 import { randomUUID } from "node:crypto";
+import { isDeepStrictEqual } from "node:util";
 import { EpisodeTracker, episodeOpId, ruleIdOf, type EpisodeRecord, type RuleKey } from "./learning-episodes";
 import { callKey, toolHead, failureSig, SIG_VERSION } from "./learning-signature";
 import { gitCommonDirState, projectIdOf, projectLiteralJudgment } from "./learning-project";
@@ -219,10 +220,12 @@ export class LearningIngestion {
   }
   private async restoreState(): Promise<void> {
     if (this.resume) await this.identity?.restore();
-    await this.ledger.reload(true);
+    await this.ledger.refresh();
     const records = [...this.ledger.state.records.values()].filter(record => record.conversation === (this.conversation ?? "unknown"));
     const states = records.filter(record => record.kind === "episode-state");
-    for (const state of states) if (state.episode) await this.ledger.append(state.episode);
+    for (const state of states) if (state.episode && !(this.ledger.consistent && isDeepStrictEqual(this.ledger.state.records.get(state.episode.opId), state.episode))) {
+      await this.ledger.append(state.episode);
+    }
     const ready = !!this.conversation && !this.ledger.skipped && !this.ledger.incompleteTail
       && !this.ledger.state.conflicts.size && records.every(record => record.kind !== "episode" || record.status === "state-unavailable"
         || states.some(state => state.status !== "state-unavailable" && state.toolUse === record.toolUse

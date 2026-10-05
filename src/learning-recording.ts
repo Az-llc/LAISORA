@@ -213,7 +213,7 @@ export class LearningRecorder {
       const submitted = kind === "observe" ? [input] : input.claims;
       if (!Array.isArray(submitted) || !submitted.length) return refuse("invalid-value", "R-LRN-24", "claims");
       for (const claim of submitted) { const invalid = claimInput(claim, kind, context); if (invalid) return invalid; }
-      await this.ledger.reload(true);
+      await this.ledger.refresh();
       const state = this.ledger.state;
       if (!this.ledger.consistent || this.ledger.skipped || state.unavailableConversations.has(context.conversation)) return refuse("state-unavailable", "R-LRN-45");
       const all = [...state.records.values()];

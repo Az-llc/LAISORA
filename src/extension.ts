@@ -34,7 +34,7 @@ import { SessionStore, tabLimit } from "./store-surfaces";
 import { handoffFs, handoffPersist, readHandoffRecords } from "./handoff-wiring";
 import { personalBaseline, setPersonalBaselineListener } from "./personal-baseline";
 import { PROTOCOL_VERSION } from "./protocol";
-import { openResumedSession as resumePersistedTab } from "./resume-hydration";
+import { openResumedSession as resumePersistedTab, startLoopLagProbe } from "./resume-hydration";
 import { lookupSessionFile } from "./session-files";
 import {
   disposeAccountUsage,
@@ -74,6 +74,7 @@ function ensureInitialTabs(st: SessionStore): void {
 }
 
 async function restorePersistedTabs(st: SessionStore, entries: PersistedOpenTab[]): Promise<void> {
+  const lagProbe = startLoopLagProbe();
   const notices: string[] = [];
   const started: Array<{ label: string; sessionId: string; outcome: ReturnType<typeof resumePersistedTab> }> = [];
   let skippedByLimit = 0;
@@ -125,7 +126,11 @@ async function restorePersistedTabs(st: SessionStore, entries: PersistedOpenTab[
   if (first) {
     for (const message of notices) first.pushEvent({ kind: "error", message, fatal: false });
   }
-  output.appendLine(`[restore] ${sinceActivation()} restored ${restored}/${entries.length} tab(s)`);
+  lagProbe.stop();
+  output.appendLine(
+    `[restore] ${sinceActivation()} restored ${restored}/${entries.length} tab(s)` +
+      ` (loop lag max ${lagProbe.maxLagMs()}ms total ${lagProbe.blockedMs()}ms)`
+  );
   void persistOpenTabs();
 }
 
@@ -254,6 +259,7 @@ function activateReady(context: vscode.ExtensionContext): void {
           };
           st.attach(view.webview);
           view.webview.html = buildHtml(context, view.webview);
+          output.appendLine(`[webview] ${sinceActivation()} html set (view)`);
           view.onDidChangeVisibility(() => st.setVisible(view.webview, view.visible));
           if (!disposeHooked.has(view)) {
             disposeHooked.add(view);
@@ -317,6 +323,7 @@ function openPanel(context: vscode.ExtensionContext): void {
   st.panel = panel;
   st.attach(panel.webview);
   panel.webview.html = buildHtml(context, panel.webview);
+  output.appendLine(`[webview] ${sinceActivation()} html set (panel)`);
   panel.onDidChangeViewState(() => st.setVisible(panel.webview, panel.visible));
 
   panel.onDidDispose(() => {

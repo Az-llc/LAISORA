@@ -3,15 +3,17 @@ import type { ExposureRecord, LedgerV2Record } from "./learning-episodes";
 export function validExposures(records: Iterable<LedgerV2Record>): ExposureRecord[] {
   const groups = new Map<string, ExposureRecord[]>();
   for (const record of records) if (record.kind === "exposure") {
-    const key = `${record.conversation}:${record.recipient}:${record.run}:${record.dispatchId}:${record.exposureId}`;
-    groups.set(key, [...(groups.get(key) ?? []), record]);
+    const key = JSON.stringify([record.conversation, record.recipient, record.run, record.dispatchId, record.exposureId]);
+    const group = groups.get(key);
+    if (group) group.push(record); else groups.set(key, [record]);
   }
   return [...groups.values()].flatMap(group => {
     const sent = group.find(record => record.outcome === "sent");
     if (!sent || group.some(record => ["model-mismatch", "dispatch-failed"].includes(record.outcome))) return [];
     const identity = (record: ExposureRecord) => JSON.stringify([record.promptHash, record.requestedModel, record.requestedEffort, record.route,
       record.executor, record.role, record.items.map(item => `${item.type}:${item.id}`).sort()]);
-    if (group.some(record => identity(record) !== identity(sent))) return [];
+    const sentIdentity = identity(sent);
+    if (group.some(record => record !== sent && identity(record) !== sentIdentity)) return [];
     const observed = [...group].reverse().find(record => record.observedModel !== "unknown" && record.attestation?.length
       && (record.route === "conductor" || record.observedEffort !== "unknown"));
     const unresolvedConductor = sent.route === "conductor" && sent.requestedModel === "unknown";
@@ -27,11 +29,31 @@ export function validExposures(records: Iterable<LedgerV2Record>): ExposureRecor
 export function exposureUsage(records: Iterable<LedgerV2Record>) {
   const all = [...records], valid = validExposures(all);
   const delivered = new Map<string, Set<string>>(), used = new Map<string, Set<string>>(), ineffective = new Map<string, Set<string>>();
-  const add = (map: Map<string, Set<string>>, id: string, value: string) => map.set(id, new Set([...(map.get(id) ?? []), value]));
+  const add = (map: Map<string, Set<string>>, id: string, value: string) => {
+    const values = map.get(id);
+    if (values) values.add(value); else map.set(id, new Set([value]));
+  };
   for (const exposure of valid) for (const item of exposure.items) add(delivered, item.id, exposure.conversation);
-  const matching = (record: { conversation: string; recipient: string; run: string; dispatchId: string; at: string }, id: string) => valid.filter(exposure =>
-    exposure.conversation === record.conversation && exposure.recipient === record.recipient && exposure.run === record.run
-    && exposure.dispatchId === record.dispatchId && exposure.at <= record.at && exposure.items.some(item => item.id === id));
+  const subjectKey = (record: { conversation: string; recipient: string; run: string }) => JSON.stringify([record.conversation, record.recipient, record.run]);
+  const bySubject = new Map<string, ExposureRecord[]>();
+  for (const exposure of valid) {
+    const key = subjectKey(exposure), group = bySubject.get(key);
+    if (group) group.push(exposure); else bySubject.set(key, [exposure]);
+  }
+  const matching = (record: { conversation: string; recipient: string; run: string; dispatchId: string; at: string }, id: string) => (bySubject.get(subjectKey(record)) ?? []).filter(exposure =>
+    exposure.dispatchId === record.dispatchId && exposure.at <= record.at && exposure.items.some(item => item.id === id));
+  const firstEpisode = new Map<string, Extract<LedgerV2Record, { kind: "episode" }>>();
+  const countedEpisodes = new Set<string>();
+  const successes = new Map<string, Extract<LedgerV2Record, { kind: "episode-state" }>[]>();
+  for (const record of all) {
+    if (record.kind === "episode") {
+      if (!firstEpisode.has(record.ruleId)) firstEpisode.set(record.ruleId, record);
+      if (record.status === "counted") countedEpisodes.add(JSON.stringify([record.ruleId, record.conversation, record.recipient, record.run]));
+    } else if (record.kind === "episode-state" && record.action === "success" && record.status === undefined) {
+      const key = subjectKey(record), group = successes.get(key);
+      if (group) group.push(record); else successes.set(key, [record]);
+    }
+  }
   for (const episode of all) if (episode.kind === "episode" && episode.status === "counted") {
     if (matching(episode, episode.ruleId).some(exposure => exposure.route === (episode.key.bind === "target" ? "target" : "conductor"))) add(ineffective, episode.ruleId, episode.opId);
   }
@@ -41,13 +63,11 @@ export function exposureUsage(records: Iterable<LedgerV2Record>) {
     if (!received.length) continue;
     if (use.item.type === "claim" && !use.runs?.length) continue;
     if (use.item.type === "rule") {
-      const rule = all.find(record => record.kind === "episode" && record.ruleId === id);
-      if (!rule || rule.kind !== "episode" || !received.some(exposure => exposure.route === (rule.key.bind === "target" ? "target" : "conductor"))) continue;
-      if (all.some(record => record.kind === "episode" && record.status === "counted" && record.ruleId === id
-        && record.conversation === use.conversation && record.recipient === use.recipient && record.run === use.run)) continue;
-      if (!all.some(record => record.kind === "episode-state" && record.action === "success" && record.status === undefined
-        && record.conversation === use.conversation && record.recipient === use.recipient && record.run === use.run
-        && record.tool === rule.tool && record.head === rule.head && record.at <= use.at && received.some(exposure => exposure.at <= record.at))) continue;
+      const rule = firstEpisode.get(id);
+      if (!rule || !received.some(exposure => exposure.route === (rule.key.bind === "target" ? "target" : "conductor"))) continue;
+      if (countedEpisodes.has(JSON.stringify([id, use.conversation, use.recipient, use.run]))) continue;
+      if (!(successes.get(subjectKey(use)) ?? []).some(record => record.tool === rule.tool && record.head === rule.head && record.at <= use.at
+        && received.some(exposure => exposure.at <= record.at))) continue;
     }
     add(used, id, use.conversation);
   }

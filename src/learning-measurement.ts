@@ -84,7 +84,7 @@ export function conversationMeasurement(records: readonly LedgerV2Record[], assi
   const start = Date.parse(assignment.at), stop = Math.min(now, start + EXPERIMENT_WINDOW_MS);
   const current = records.filter(record => record.conversation === assignment.conversation && Date.parse(record.at) >= start && Date.parse(record.at) <= stop);
   const measurements = current.filter(record => record.kind === "measurement");
-  const actual = validExposures(records).filter(exposure => exposure.conversation === assignment.conversation && Date.parse(exposure.at) >= start && Date.parse(exposure.at) <= stop);
+  const actual = validExposures(records.filter(record => record.kind === "exposure" && record.conversation === assignment.conversation)).filter(exposure => Date.parse(exposure.at) >= start && Date.parse(exposure.at) <= stop);
   const usage = exposureUsage(records.filter(record => Date.parse(record.at) <= stop));
   const claimSources = new Map(records.filter(record => record.kind === "claim").map(record => [record.itemId, record.source]));
   const sourceOf = (item: { type: string; id: string }) => item.type === "claim" ? claimSources.get(item.id) ?? "unknown" : item.type;
@@ -114,7 +114,7 @@ export function conversationMeasurement(records: readonly LedgerV2Record[], assi
   let repairTurns = 0, unknownRepairs = 0;
   for (const state of states) {
     if (state.action === "failure" && !current.some(record => record.kind === "episode" && record.status === "counted" && record.sig === state.sig && record.recipient === state.recipient)) continue;
-    const key = `${state.recipient}:${state.operation}`, at = Date.parse(state.at);
+    const key = JSON.stringify([state.recipient, state.operation]), at = Date.parse(state.at);
     if (state.action === "failure" && !open.has(key)) open.set(key, { at, turns: turns.filter(turn => turn <= at).length, unknown: state.head === "other" || state.status === "state-unavailable" });
     if (state.action === "success" && open.has(key)) {
       const failure = open.get(key)!;

@@ -14,6 +14,7 @@ import { orchestrationRunsDirectoryOf } from "./orchestration-external";
 import { releaseHistoryWindow } from "./history-window";
 import { extensionContext, output, sinceActivation, store } from "./host-context";
 import { handleWebviewMessage } from "./message-router";
+import { seedLastDiscoveredModels } from "./gateway-models";
 import { pendingAttachments } from "./pending-attachments";
 import { PROTOCOL_VERSION, type HostToWebview, type TabSnapshot, type WebviewToHost } from "./protocol";
 import { historyScopeKey, historyTranscriptScopeKey, Session } from "./session";
@@ -303,6 +304,7 @@ export class SessionStore {
   }
   createSession(): Session {
     const s = new Session(this, ++this.tabCounter);
+    seedLastDiscoveredModels(s);
     this.sessions.set(s.tabId, s);
     postSettingsState();
     return s;

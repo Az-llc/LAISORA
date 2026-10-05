@@ -1,5 +1,19 @@
 # Changelog
 
+## 1.5.0
+
+- **Faster startup.** Restored tabs, the conversation view and the CLI start no longer wait while
+  the learning ledger is re-read in full for every lookup; with a large ledger this used to hold
+  the window for tens of seconds.
+- **Learning history starts over.** The learning ledger moves to a new, more compact file
+  (`ledger-v3.jsonl`) with a verified checkpoint, so it opens without re-reading every record.
+  Earlier learning records (`ledger.jsonl`) are not carried over and are deleted at startup;
+  conversation links, proposals and the machine key are kept.
+- **Model list appears at once.** A new tab shows the model list Claude Code returned last time and
+  replaces it when the current list arrives. A model chosen while only the remembered list is
+  shown applies to the tab but is not written to settings.json.
+- **History list opens faster.** It reads session details only for the entries a page shows.
+
 ## 1.4.1
 
 - **Initial model now also applies to resumed conversations.** Tabs restored at startup, sessions

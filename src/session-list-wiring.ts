@@ -30,7 +30,7 @@ import {
 } from "./session-files";
 import { formatCustomTitleRecord, normalizeTitleValue } from "./session-display-title";
 import type { SessionCandidate } from "./session-list";
-import { candidatePathIndex, displayTitleFromSummary, rankSessionCandidates, streamSessionRows } from "./session-list";
+import { SESSION_RESOLVE_BATCH, candidatePathIndex, displayTitleFromSummary, rankSessionCandidates, streamSessionRows } from "./session-list";
 import type { SessionStore } from "./store-surfaces";
 
 const USED_SESSIONS_KEY = "history.laisoraSessions";
@@ -154,18 +154,26 @@ function updateHiddenSessions(sessionId: string, hidden: boolean): Promise<void>
 }
 
 type HistorySource = "laisora" | "claude";
-const historyPages = new Map<string, { token: number; candidates: SessionCandidate[] }>();
+interface HistoryListing {
+  token: number;
+  candidates: SessionCandidate[];
+  knownIds: ReadonlySet<string>;
+  origins: Map<string, "claude" | "unknown" | "failed">;
+  degradation: SessionScanDegradation;
+}
+const historyPages = new Map<string, HistoryListing>();
 
 const originCache = new Map<string, "claude" | "unknown">();
-async function historicalOrigin(file: string): Promise<"claude" | "unknown"> {
+async function historicalOrigin(file: string, probes?: { count: number; bytes: number }): Promise<"claude" | "unknown" | "failed"> {
   const cached = originCache.get(file);
   if (cached) return cached;
   const handle = await open(file, "r").catch(() => undefined);
-  if (!handle) return "unknown";
+  if (!handle) return "failed";
   let origin: "claude" | "unknown" = "unknown";
   try {
     const buffer = Buffer.alloc(65536);
     const { bytesRead } = await handle.read(buffer, 0, buffer.length, 0);
+    if (probes) { probes.count++; probes.bytes += bytesRead; }
     for (const line of buffer.subarray(0, bytesRead).toString("utf8").split("\n")) {
       try {
         const record = JSON.parse(line);
@@ -176,7 +184,7 @@ async function historicalOrigin(file: string): Promise<"claude" | "unknown"> {
       } catch { }
     }
     originCache.set(file, origin);
-  } catch { return "unknown"; } finally { await handle.close(); }
+  } catch { return "failed"; } finally { await handle.close(); }
   return origin;
 }
 
@@ -287,7 +295,7 @@ async function listPastSessions(
   const continuation = cursorParts && savedPage?.token === cursorParts[0] ? savedPage : undefined;
   const offset = continuation ? cursorParts![1] : 0;
 
-  const degradation: SessionScanDegradation = {
+  const degradation: SessionScanDegradation = continuation?.degradation ?? {
     rootFailed: false,
     unreadableProjects: 0,
     statFailed: 0,
@@ -332,55 +340,71 @@ async function listPastSessions(
     emit([], true, degraded());
     return;
   }
-  if (degradation.statFailed > 0) {
+  if (!continuation && degradation.statFailed > 0) {
     output.appendLine(`[history] stat できないファイル ${degradation.statFailed} 件（候補から除外・req ${requestId}）`);
   }
-  if (!continuation && options.source) {
-    for (let i = 0; i < entries.length; i += 4) {
-      await Promise.all(entries.slice(i, i + 4).map(async c => {
-        if (!known[c.sessionId]) await historicalOrigin(c.filePath);
-      }));
-    }
-  }
-  const candidates = continuation ? entries : rankSessionCandidates(entries).filter(c =>
-    (options.showHidden === true || !hidden.has(c.sessionId)) &&
-    (!options.source || (source === "laisora"
-      ? !!known[c.sessionId] || originCache.get(c.filePath) !== "claude"
-      : !known[c.sessionId] && originCache.get(c.filePath) === "claude")));
-  const token = continuation?.token ?? requestId;
-  if (!continuation) historyPages.set(pageKey, {token, candidates});
-  const pathBySessionId = candidatePathIndex(candidates);
   const scanDoneT = Date.now();
+  const candidates = continuation ? entries : rankSessionCandidates(entries).filter(c =>
+    options.showHidden === true || !hidden.has(c.sessionId));
+  const token = continuation?.token ?? requestId;
+  const knownIds = continuation?.knownIds ?? new Set(Object.keys(known));
+  const origins = continuation?.origins ?? new Map<string, "claude" | "unknown" | "failed">();
+  if (!continuation) historyPages.set(pageKey, {token, candidates, knownIds, origins, degradation});
+  const pathBySessionId = candidatePathIndex(candidates);
+  const sortDoneT = Date.now();
   output.appendLine(
     `[history] ${sinceActivation()} 候補 ${candidates.length} 件（走査 ${scanDoneT - listStartT}ms・req ${requestId}）`
   );
 
+  const originProbes = { count: 0, bytes: 0 };
+  let originMs = 0;
+  const matchesSource = async (c: SessionCandidate): Promise<boolean> => {
+    if (!options.source) return true;
+    if (knownIds.has(c.sessionId)) return source === "laisora";
+    let origin = origins.get(c.sessionId);
+    if (origin === undefined) {
+      const t = Date.now();
+      origin = await historicalOrigin(c.filePath, originProbes);
+      originMs += Date.now() - t;
+      origins.set(c.sessionId, origin);
+      if (origin === "failed" && source === "claude") {
+        degradation.statFailed++;
+        output.appendLine(`[history] 由来を読めません（一覧から除外）: ${c.sessionId}・req ${requestId}`);
+      }
+    }
+    return source === "laisora" ? origin !== "claude" : origin === "claude";
+  };
   let firstRowT = 0;
   let resolveStarts = 0;
   let firstResolveMs = -1;
+  let resolveMs = 0;
   let rowsSent = 0;
+  let emits = 0;
+  let emitMs = 0;
   const { sent, scanned, nextIndex } = await streamSessionRows(
     candidates.slice(offset),
     pathBySessionId,
     async (c) => {
       if (options.showHidden !== true && hidden.has(c.sessionId)) return undefined;
+      if (!await matchesSource(c)) return undefined;
       const first = ++resolveStarts === 1;
-      const t = first ? Date.now() : 0;
+      const t = Date.now();
       const info = await sessionInfoOf(c.sessionId, (err) => {
         degradation.resolveFailed++;
         if (degradation.resolveFailed === 1) {
           output.appendLine(`[history] 要約を解決できません: ${c.sessionId} — ${errText(err)}`);
         }
       });
+      resolveMs += Date.now() - t;
       if (first) firstResolveMs = Date.now() - t;
       return info && typeof info.summary === "string" ? info : undefined;
     },
     (sessions: SessionListItem[], complete: boolean) => {
       rowsSent += sessions.length;
       if (complete && rowsSent === 0 && resolveStarts > 0) {
-        degradation.unresolvedCandidates = candidates.length;
+        degradation.unresolvedCandidates = degradation.unresolvedCandidates + resolveStarts;
         output.appendLine(
-          `[history] 候補 ${candidates.length} 件から 1 行も解決できません（req ${requestId}）`
+          `[history] 候補 ${resolveStarts} 件から 1 行も解決できません（req ${requestId}）`
         );
       }
       if (firstRowT === 0 && sessions.length > 0) {
@@ -394,12 +418,27 @@ async function listPastSessions(
         if (source === "laisora" && !known[row.sessionId]) row.originUnverified = true;
         if (hidden.has(row.sessionId)) row.hidden = true;
       }
+      const t = Date.now();
       emit(sessions, false, degraded());
+      emitMs += Date.now() - t;
+      emits++;
     }
   );
-  emit([], true, degraded(), nextIndex === undefined ? undefined : `${token}:${offset + nextIndex}`);
+  let more = false;
+  for (let i = nextIndex === undefined ? candidates.length : offset + nextIndex; i < candidates.length && !more; i += SESSION_RESOLVE_BATCH) {
+    const found = await Promise.all(candidates.slice(i, i + SESSION_RESOLVE_BATCH).map(c =>
+      options.showHidden !== true && hidden.has(c.sessionId) ? false : matchesSource(c)));
+    more = found.includes(true);
+  }
+  const lastEmitT = Date.now();
+  emit([], true, degraded(), more && nextIndex !== undefined ? `${token}:${offset + nextIndex}` : undefined);
+  emitMs += Date.now() - lastEmitT;
+  emits++;
   output.appendLine(
-    `[history] ${sinceActivation()} 一覧完了 ${Date.now() - listStartT}ms（${sent}行 / 候補 ${scanned}件解決 / 走査 ${scanDoneT - listStartT}ms・req ${requestId}）`
+    `[history] ${sinceActivation()} 一覧完了 ${Date.now() - listStartT}ms（走査 ${scanDoneT - listStartT}ms / 並べ替え ${sortDoneT - scanDoneT}ms` +
+      ` / 由来 ${originProbes.count}件 ${Math.round(originProbes.bytes / 1024)}KB 計 ${originMs}ms / 要約 ${resolveStarts}件 計 ${resolveMs}ms` +
+      ` / 送信 ${emits}回 ${emitMs}ms / 初行 ${firstRowT === 0 ? "-" : `${firstRowT - listStartT}ms`}` +
+      ` / ${sent}行・候補 ${candidates.length}件中 ${scanned}件を確認・req ${requestId}）`
   );
 }
 

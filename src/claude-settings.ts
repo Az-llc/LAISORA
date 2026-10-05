@@ -98,7 +98,7 @@ export function canonicalEffortModel(s: Session): string | undefined {
   const snapshot = s.configuredEffortSnapshot;
   const selected = s.modelOverride ?? s.effectiveModel ?? s.appliedModel ?? (snapshot ? snapshot.resolvedModel ?? "default" : undefined);
   if (!selected) return undefined;
-  const keys = settingsKeysForModel(selected, s.models);
+  const keys = settingsKeysForModel(selected, s.modelsFromLastRun ? [] : s.models);
   const key = keys.size === 1 ? [...keys][0] : undefined;
   return key && BUILTIN_CANONICAL_MODEL.test(key) ? key : undefined;
 }

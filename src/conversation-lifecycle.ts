@@ -27,7 +27,7 @@ import { postAttachments } from "./composer-io";
 import { pendingAttachments } from "./pending-attachments";
 import * as l10n from "@vscode/l10n";
 import { isUnusedSession, type Session } from "./session";
-import { modelsMessage, recomputeModelRows } from "./gateway-models";
+import { applyLiveDiscoveredModels, modelsMessage } from "./gateway-models";
 import { resolveModelDisplayName } from "./model-display-name";
 import { clearProcessEphemeral } from "./guardrail";
 import { extensionContext, output, sinceActivation, store } from "./host-context";
@@ -65,7 +65,7 @@ function publishConfiguredEffort(st: SessionStore | null | undefined, s: Session
   const shown = effortDisplayFromSnapshot(
     s.configuredEffortSnapshot,
     s.effectiveModel ?? s.modelOverride,
-    s.discoveredModels,
+    s.modelsFromLastRun ? [] : s.discoveredModels,
     s.effortOverride === undefined ? s.appliedEffort : undefined
   );
   s.configuredEffort = shown.configured;
@@ -219,10 +219,11 @@ async function applyEffortChange(
   requested: NonNullable<Session["effortOverride"]> | null
 ): Promise<void> {
   const logicalGeneration = s.logicalGeneration;
+  const persistable = !s.modelsFromLastRun;
   const run = async (): Promise<void> => {
     if (s.closed || s.logicalGeneration !== logicalGeneration) return;
     const processGeneration = s.generation;
-    const canonicalModel = canonicalEffortModel(s);
+    const canonicalModel = persistable ? canonicalEffortModel(s) : undefined;
     const conv = s.conversation;
     if (conv !== null && !conv.isClosed) {
       try {
@@ -306,6 +307,7 @@ async function applyModelChange(
   sessionOnly = false,
   restore?: FallbackRestore
 ): Promise<FallbackRevertOutcome | "discarded" | "unwanted"> {
+  const persistable = !s.modelsFromLastRun;
   const requested =
     requestedRaw === "default" && !sessionOnly && s.models.some((m) => m.id === "default") ? null : requestedRaw;
   const logicalGeneration = s.logicalGeneration;
@@ -350,15 +352,15 @@ async function applyModelChange(
     s.modelOverride = restore === undefined ? requested : restore.override;
     s.launchModelCheck = undefined;
     clearObservedEffort(s);
-    const knownRow = requested === null || s.models.some((m) => m.id === requested);
+    const knownRow = persistable && (requested === null || s.models.some((m) => m.id === requested));
     const saved: SettingsWriteResult | null = knownRow && !sessionOnly ? updateClaudeCodeSettings({ model: requested }) : null;
     if (conv !== null && s.conversation === conv) s.effectiveModel = requested;
     const label = requested === null ? null : s.models.find((m) => m.id === requested)?.label ?? requested;
     const notice = sessionOnly
       ? l10n.t("Changed model to {0} for this conversation.", label ?? "")
       : saved === null
-      ? s.models.length === 0
-        ? l10n.t("LAISORA: Changed model to {0} for this session; it was not saved to settings.json because the model list has not loaded yet.", label ?? "")
+      ? s.models.length === 0 || !persistable
+        ? l10n.t("LAISORA: Changed model to {0} for this session; it was not saved to settings.json because the model list has not loaded yet.", label ?? s.models.find((m) => m.id === "default")?.label ?? "default")
         : l10n.t("LAISORA: Changed model to {0} for this session; it was not saved to settings.json because the model is not in the model list.", label ?? "")
       : !saved.ok
         ? label === null
@@ -572,13 +574,14 @@ function sessionObservedTimestampSeed(s: Session): number | undefined {
 
 async function ensureConversation(s: Session): Promise<void> {
   const logicalGeneration = s.logicalGeneration;
+  const requestedAt = Date.now();
   if (s.resumePreparation !== null) await s.resumePreparation.ready;
   while (s.starting) await s.starting;
   if (s.closed || s.logicalGeneration !== logicalGeneration) {
     throw new Error(l10n.t("The logical session of this tab changed while the conversation was starting (restore or clear)."));
   }
   const generation = s.logicalGeneration;
-  const p = ensureConversationInner(s);
+  const p = ensureConversationInner(s, requestedAt);
   s.starting = p.catch(() => {
     cancelPendingModelProfileResearch(s, generation);
   }).then(() => {
@@ -587,7 +590,8 @@ async function ensureConversation(s: Session): Promise<void> {
   return p;
 }
 
-async function ensureConversationInner(s: Session): Promise<void> {
+async function ensureConversationInner(s: Session, requestedAt: number): Promise<void> {
+  const innerT0 = Date.now();
   const logicalGenerationAtStart = s.logicalGeneration;
   let crashResumeSessionId: string | undefined;
   if (s.conversation?.isClosed) {
@@ -711,7 +715,13 @@ async function ensureConversationInner(s: Session): Promise<void> {
     s.launchModelCheck = typeof s.effectiveModel === "string" && s.effectiveModel !== "default"
       ? { conversation: conv, requested: s.effectiveModel, listSettled: false }
       : undefined;
+    const convStartT0 = Date.now();
     await conv.start();
+    const startedAt = Date.now();
+    output.appendLine(
+      `[${s.title}] ${sinceActivation()} CLI 起動: ${startedAt - requestedAt}ms` +
+        `（待ち ${innerT0 - requestedAt}ms / 設定 ${convStartT0 - innerT0}ms / start ${startedAt - convStartT0}ms）`
+    );
     if (s.closed || s.logicalGeneration !== logicalGenerationAtStart) {
       void conv.dispose();
       throw new Error(l10n.t("The logical session of this tab changed while the conversation was starting (restore or clear)."));
@@ -726,11 +736,13 @@ async function ensureConversationInner(s: Session): Promise<void> {
     });
     void conv.supportedModels().then((models) => {
       if (s.closed || s.conversation !== conv) return;
-      s.discoveredModels = models;
-      recomputeModelRows(s);
+      applyLiveDiscoveredModels(s, models);
       rederiveConfiguredEffort(store, s);
       if (s.models.length > 0) store?.post(modelsMessage(s));
-      observeLaunchModel(store, s, conv, undefined, true);
+      output.appendLine(
+        `[${s.title}] ${sinceActivation()} モデル一覧: ${s.models.length}件（起動要求から ${Date.now() - requestedAt}ms / start 後 ${Date.now() - startedAt}ms）`
+      );
+      observeLaunchModel(store, s, conv, undefined, models.length > 0);
     });
   } catch (e) {
     void conv.dispose();

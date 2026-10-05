@@ -69,7 +69,7 @@ The agent roster on the LAISORA settings page lets you configure worker, explore
 
 ### Keep lessons for later work
 
-The learning ledger is off by default (`laisora.learning.enabled`). When enabled, the main agent can record model-specific or general lessons, and active rules are passed to later sessions. Records stay on your machine; text containing absolute paths or credentials is refused. Learning works with or without the agent roster, and setting changes apply from the next session.
+The learning ledger is off by default (`laisora.learning.enabled`). When enabled, the main agent can record model-specific lessons, and active rules are passed to later sessions. Records stay on your machine; text containing absolute paths or credentials is refused. Learning works with or without the agent roster, and setting changes apply from the next session.
 
 ### Carry long work forward
 

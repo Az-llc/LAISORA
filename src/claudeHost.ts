@@ -843,8 +843,13 @@ ${ctxJson}`
       options.allowedTools = [...(options.allowedTools ?? []), "TaskCreate", "TaskGet", "TaskUpdate", "TaskList"];
     }
     options.systemPrompt = conversationSystemPrompt(this.opts.fileLinkInstruction === true, this.opts.planInstruction !== false, this.opts.cwd);
+    const learningT0 = Date.now();
     await this.ingestion?.start();
+    const deliveryT0 = Date.now();
     const deliverySection = await this.prepareLearningDeliveryR31();
+    if (this.ingestion) {
+      this.opts.log(`learning 準備: ${Date.now() - learningT0}ms（restore ${deliveryT0 - learningT0}ms / delivery ${Date.now() - deliveryT0}ms）`);
+    }
     this.rosterInjections.push(injectionOf(this.orchestrationEnabled ? orchestrationVariants(this.roster) : [], Date.now()));
     if (this.orchestrationEnabled) {
       options.agents = orchestrationAgents(this.roster);

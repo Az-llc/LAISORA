@@ -354,8 +354,11 @@ export async function openResumedSession(
     }
     hydration.previewMessages = previewMessages;
     let transcript: SessionTranscript | undefined;
+    let transcriptMs: number | undefined;
     if (s.recordedModel === undefined) {
+      const transcriptT0 = Date.now();
       transcript = await readSessionTranscript(req.filePath, isInSessionStore, readSet, req.sessionId);
+      transcriptMs = Date.now() - transcriptT0;
       if (s.closed || st.sessions.get(s.tabId) !== s || s.hydration !== hydration || s.logicalGeneration !== hydration.logicalGeneration) {
         output.appendLine(`[${s.title}] resume aborted: the session changed while reading the recorded model`);
         if (s.hydration === hydration) s.finalizeHydrationFailure(hydration, "cancelled", false);
@@ -376,12 +379,14 @@ export async function openResumedSession(
     output.appendLine(
       `[${s.title}] resume phase1: ${previewDoneT - resumeT0}ms` +
         `（準備 ${readSetT0 - resumeT0}ms / read-set ${captureDoneT - readSetT0}ms` +
-        ` / preview ${previewDoneT - previewT0}ms / loop lag 最大 ${lagProbe.maxLagMs()}ms）`
+        ` / preview ${previewDoneT - previewT0}ms` +
+        (transcriptMs === undefined ? "" : ` / transcript ${transcriptMs}ms`) +
+        ` / loop lag 最大 ${lagProbe.maxLagMs()}ms）`
     );
     lagProbe.stop();
     if (hydration.arrivalTimestamp !== undefined) s.finishResumePreparation(preparation);
     warmup(s);
-    await runResumeHydration(st, s, hydration, transcript);
+    await runResumeHydration(st, s, hydration, transcript, resumeT0);
   } catch (e) {
     output.appendLine(`[${s.title}] resume 失敗: ${String(e)}`);
     if (hydration === null || s.hydration === null) {
@@ -622,7 +627,36 @@ function replayJournalInto(
   return dropped;
 }
 
-async function runResumeHydration(st: SessionStore, s: Session, h: ResumeHydration, capturedTranscript?: SessionTranscript): Promise<void> {
+async function runResumeHydration(
+  st: SessionStore,
+  s: Session,
+  h: ResumeHydration,
+  capturedTranscript?: SessionTranscript,
+  startedAt = Date.now()
+): Promise<void> {
+  const lagProbe = startLoopLagProbe();
+  try {
+    await runResumeHydrationStages(st, s, h, capturedTranscript, startedAt, lagProbe);
+  } finally {
+    lagProbe.stop();
+  }
+}
+
+async function runResumeHydrationStages(
+  st: SessionStore,
+  s: Session,
+  h: ResumeHydration,
+  capturedTranscript: SessionTranscript | undefined,
+  startedAt: number,
+  lagProbe: LoopLagProbe
+): Promise<void> {
+  const stages: string[] = [];
+  let stageT0 = Date.now();
+  const stage = (name: string): void => {
+    const now = Date.now();
+    stages.push(`${name} ${now - stageT0}ms`);
+    stageT0 = now;
+  };
   const invalidated = (): boolean =>
     s.closed ||
     st.sessions.get(s.tabId) !== s ||
@@ -642,6 +676,7 @@ async function runResumeHydration(st: SessionStore, s: Session, h: ResumeHydrati
   };
 
   const transcript = capturedTranscript ?? await readSessionTranscript(h.filePath, isInSessionStore, h.readSet, h.sessionId);
+  if (capturedTranscript === undefined) stage("transcript");
   if (invalidated()) return abort("読み取り中にセッションが変化しました");
   const { title, messages } = transcript;
   s.recordedModel = transcript.recordedModel ?? s.recordedModel;
@@ -658,11 +693,13 @@ async function runResumeHydration(st: SessionStore, s: Session, h: ResumeHydrati
     );
   }
   const resolvedTitle = (await sessionSummaryOf(h.sessionId)) ?? title;
+  stage("title");
   if (invalidated()) return abort("タイトル解決中にセッションが変化しました");
   const titleAtResolve = s.title;
   const autoTitledAtResolve = s.autoTitled;
 
   const history = await readSessionHistory(h.filePath, isInSessionStore, historyOpts);
+  stage("history");
   if (invalidated()) return abort("履歴読み取り中にセッションが変化しました");
   if (history.readError) {
     output.appendLine(`[${s.title}] resume history read failed: ${history.readError}`);
@@ -689,6 +726,7 @@ async function runResumeHydration(st: SessionStore, s: Session, h: ResumeHydrati
     },
     invalidated
   );
+  stage("fold");
   if (folded === "invalidated") return abort("履歴集計中にセッションが変化しました");
   draft.workModel = {
     ...draft.workModel,
@@ -716,8 +754,10 @@ async function runResumeHydration(st: SessionStore, s: Session, h: ResumeHydrati
     },
   };
   draft.evidenceIndex = { ...draft.evidenceIndex, hash: evidenceIndexHash(draft.evidenceIndex) };
+  stage("evidence");
 
   const restored = await readSubagentAgents(h.filePath, isInSessionStore);
+  stage("subagents");
   if (invalidated()) return abort("階層読み取り中にセッションが変化しました");
   draft.workModel = markSubagentGaps(draft.workModel, {
     unreadableAgentCount:
@@ -791,8 +831,10 @@ async function runResumeHydration(st: SessionStore, s: Session, h: ResumeHydrati
       if (invalidated()) return abort("表示メッセージ整形中にセッションが変化しました");
     }
   }
+  stage("replay");
 
   const conversation = await readConversationMessages(h.filePath, isInSessionStore, h.readSet, h.sessionId);
+  stage("conversation");
   if (invalidated()) return abort("会話履歴読み取り中にセッションが変化しました");
 
   if (conversation.handoffEnvelope?.snapshot.forkSessionId === h.sessionId) {
@@ -832,6 +874,7 @@ async function runResumeHydration(st: SessionStore, s: Session, h: ResumeHydrati
   }
 
   dropped += replayJournalInto(draft, h.journal, cursor, h.journal.length, sink);
+  stage(`journal(${h.journal.length})`);
   draft.timestampContractViolations += dropped;
   h.buffering = false;
   h.phase = "complete";
@@ -862,7 +905,15 @@ async function runResumeHydration(st: SessionStore, s: Session, h: ResumeHydrati
       s.autoTitled = true;
     }
   }
-  st.post({ type: "tabCleared", tab: s.snapshot() });
+  stage("commit");
+  const snapshot = s.snapshot();
+  stage("snapshot");
+  st.post({ type: "tabCleared", tab: snapshot });
+  stage("post");
+  output.appendLine(
+    `[${s.title}] resume 全文表示: ${Date.now() - startedAt}ms（${stages.join(" / ")}` +
+      ` / loop lag 最大 ${lagProbe.maxLagMs()}ms 計 ${lagProbe.blockedMs()}ms）`
+  );
   s.resuming = false;
 
   s.flushHydrationPosts(h);
@@ -879,15 +930,22 @@ async function runResumeHydration(st: SessionStore, s: Session, h: ResumeHydrati
 }
 
 const RESUME_LOOP_LAG_TICK_MS = 20;
-function startLoopLagProbe(): { maxLagMs: () => number; stop: () => void } {
+export interface LoopLagProbe {
+  maxLagMs: () => number;
+  blockedMs: () => number;
+  stop: () => void;
+}
+export function startLoopLagProbe(): LoopLagProbe {
   let maxLag = 0;
+  let blocked = 0;
   let last = Date.now();
   const timer = setInterval(() => {
     const now = Date.now();
     const lag = now - last - RESUME_LOOP_LAG_TICK_MS;
     if (lag > maxLag) maxLag = lag;
+    if (lag > RESUME_LOOP_LAG_TICK_MS) blocked += lag;
     last = now;
   }, RESUME_LOOP_LAG_TICK_MS);
   timer.unref?.();
-  return { maxLagMs: () => maxLag, stop: () => clearInterval(timer) };
+  return { maxLagMs: () => maxLag, blockedMs: () => blocked, stop: () => clearInterval(timer) };
 }
