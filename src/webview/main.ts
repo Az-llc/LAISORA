@@ -61,7 +61,7 @@ import {
   syncMenuCursor,
 } from "./menu";
 import { closeSuggest, handleFilesResponse, initSuggest, insertFilePaths } from "./suggest";
-import { setFileLinkHostPlatform, setFileLinkSystemAppExtensions } from "./markdown-ast";
+import { setFileLinkHostPlatform, setFileLinkSystemAppExtensions } from "../markdown-ast";
 import type { ScrollCarry, ViewMode } from "./tab";
 import {
   Tab,
@@ -394,7 +394,7 @@ export function renderAuth(t: Tab | null): void {
         : t?.defaultEffort ? l10n.t("{0} (default)", t.defaultEffort)
           : t?.appliedEffort === null ? l10n.t("Not used") : t?.appliedEffort ?? l10n.t("Unconfirmed"));
   const modelName = displayModelName(t);
-  const fallback = t !== null && fallbackChipWarning(t.modelFallback, t.modelOverride, t.models);
+  const fallback = t !== null && fallbackChipWarning(t.modelFallback);
 
   if (!auth) {
     const model = modelName || l10n.t("Model unconfirmed");
@@ -683,6 +683,11 @@ function withoutScrollAnchoring<T>(fn: () => T): T {
 }
 
 export function swapPreservingConvView(tabId: string, target: Element, replacement: Node): void {
+  swapKeepingConvView(tabId, target, replacement);
+  tabs.get(tabId)?.noteConvContentShift();
+}
+
+function swapKeepingConvView(tabId: string, target: Element, replacement: Node): void {
   if (!convPaneVisible(tabId)) {
     target.replaceWith(replacement);
     return;
@@ -1004,6 +1009,7 @@ function onConvEventChunkResult(
   let result;
   try {
     result = prependPreservingView(logsEl, t.convEl, () => t.prependPastConvEvents(page.items));
+    t.noteConvContentShift();
   } catch (error) {
     pager.status = "error";
     stopConvChase(pager);
@@ -1107,6 +1113,7 @@ function onConversationHistoryResult(
   let result;
   try {
     result = prependPreservingView(logsEl, t.convEl, () => t.prependPastMessages(page.items));
+    t.noteConvContentShift();
   } catch (error) {
     pager.status = "error";
     stopConvChase(pager);
@@ -1983,7 +1990,7 @@ function addTab(snap: TabSnapshot, scrollCarry?: ScrollCarry): Tab {
     navigate: (turnId) => t.navigateToConversationTurn(turnId),
   }, t.graphScrollPort(), () => {
     if (!restoringWorkView) t.persistViewState();
-  }, (moveFocus) => t.syncViewTabs(moveFocus), (action) => t.withViewChange(action));
+  }, (moveFocus) => t.syncViewTabs(moveFocus), (action) => t.withViewChange(action), (model) => t.modelDisplayName(model));
   t.setWorkViewMode = (mode) => overview.setMode(mode);
   t.syncWorkVisibility = () => overview.syncVisibility();
   t.setWorkViewVisible = (visible) => overview.setVisible(visible);
@@ -2369,6 +2376,7 @@ function initMessageBus(): void {
         const t = tabs.get(msg.tabId);
         if (t) {
           t.setModels(msg.models);
+          refreshLocalDropViews(msg.tabId);
           if (activeTabId === msg.tabId) {
             renderAuth(t);
             if (!authPickerEl.classList.contains("hidden")) {

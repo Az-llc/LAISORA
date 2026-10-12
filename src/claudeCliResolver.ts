@@ -1,8 +1,10 @@
 import { spawn } from "node:child_process";
 import { constants } from "node:fs";
-import { access, readFile } from "node:fs/promises";
-import { delimiter, dirname, extname, isAbsolute, join, resolve } from "node:path";
+import { access, readFile, realpath } from "node:fs/promises";
+import { homedir } from "node:os";
+import { delimiter, dirname, extname, isAbsolute, join, posix, resolve, win32 } from "node:path";
 import * as l10n from "@vscode/l10n";
+import { envValueOf } from "./claude-env";
 
 export interface ResolvedClaudeCodeExecutable {
   path: string;
@@ -106,9 +108,9 @@ async function resolveCandidate(
   return { path: candidate, source };
 }
 
-function createCacheThatForgetsFailures<T>(): (key: string, create: () => Promise<T>) => Promise<T> {
+function createCacheThatForgetsFailures<T>(): ((key: string, create: () => Promise<T>) => Promise<T>) & { forget(): void } {
   let cached: { key: string; promise: Promise<T> } | undefined;
-  return (key, create) => {
+  const get = (key: string, create: () => Promise<T>): Promise<T> => {
     if (cached?.key === key) return cached.promise;
     const promise = create();
     cached = { key, promise };
@@ -117,6 +119,7 @@ function createCacheThatForgetsFailures<T>(): (key: string, create: () => Promis
     });
     return promise;
   };
+  return Object.assign(get, { forget: () => { cached = undefined; } });
 }
 
 export function createClaudeCodeExecutableResolver(environment?: Partial<ResolverEnvironment>) {
@@ -220,4 +223,96 @@ export function resolveClaudeCodeStartup(
     const version = await checkClaudeCodeVersion(executable.path, sdkVersion);
     return { executable, version };
   });
+}
+
+export function forgetClaudeCodeStartup(): void {
+  startupCache.forget();
+}
+
+const TRUTHY_ENV_VALUES = ["1", "true", "yes", "on"];
+
+export type ClaudeCliUpdateDecision =
+  | { run: true }
+  | { run: false; reason: "notNative" | "disabled" };
+
+export interface ClaudeCliUpdateInputs {
+  platform: NodeJS.Platform;
+  nativeInstall: boolean;
+  envSources: ReadonlyArray<Readonly<Record<string, unknown>> | undefined>;
+  globalConfig: unknown;
+}
+
+function envDisablesUpdates(env: Readonly<Record<string, unknown>> | undefined, platform: NodeJS.Platform): boolean {
+  if (!env || typeof env !== "object") return false;
+  return envTruthy(envValueOf(env, "DISABLE_UPDATES", platform))
+    || envTruthy(envValueOf(env, "DISABLE_AUTOUPDATER", platform))
+    || !!envValueOf(env, "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", platform);
+}
+
+function envTruthy(value: unknown): boolean {
+  if (typeof value === "boolean") return value;
+  return !!value && TRUTHY_ENV_VALUES.includes(String(value).toLowerCase().trim());
+}
+
+function globalConfigDisablesUpdates(config: unknown): boolean {
+  if (!config || typeof config !== "object") return false;
+  const record = config as Record<string, unknown>;
+  return record.autoUpdates === false && (record.installMethod !== "native" || record.autoUpdatesProtectedForNative !== true);
+}
+
+export function decideClaudeCliUpdate(inputs: ClaudeCliUpdateInputs): ClaudeCliUpdateDecision {
+  if (!inputs.nativeInstall) return { run: false, reason: "notNative" };
+  if (inputs.envSources.some((env) => envDisablesUpdates(env, inputs.platform)) || globalConfigDisablesUpdates(inputs.globalConfig)) {
+    return { run: false, reason: "disabled" };
+  }
+  return { run: true };
+}
+
+function isInside(parent: string, child: string, platform: NodeJS.Platform): boolean {
+  const paths = platform === "win32" ? win32 : posix;
+  const fold = (value: string) => (platform === "win32" ? value.toLowerCase() : value);
+  const rel = paths.relative(fold(parent), fold(child));
+  return rel !== "" && !rel.startsWith("..") && !paths.isAbsolute(rel);
+}
+
+export function isNativeClaudeInstall(
+  executablePath: string,
+  realExecutablePath: string,
+  home: string,
+  platform: NodeJS.Platform
+): boolean {
+  const paths = platform === "win32" ? win32 : posix;
+  const fold = (value: string) => (platform === "win32" ? value.toLowerCase() : value);
+  const launcher = paths.join(home, ".local", "bin", platform === "win32" ? "claude.exe" : "claude");
+  if (fold(paths.resolve(executablePath)) !== fold(launcher)) return false;
+  if (platform === "win32") return true;
+  return isInside(paths.join(home, ".local", "share", "claude", "versions"), paths.resolve(realExecutablePath), platform);
+}
+
+async function findUnixClaude(pathValue: string | undefined): Promise<string | undefined> {
+  for (const directory of (pathValue ?? "").split(delimiter)) {
+    if (!directory) continue;
+    const file = join(directory, "claude");
+    if (await exists(file)) return file;
+  }
+  return undefined;
+}
+
+export async function nativeClaudeUpdateTarget(
+  executablePath: string,
+  environment?: Partial<ResolverEnvironment> & { home?: string }
+): Promise<string | undefined> {
+  const platform = environment?.platform ?? process.platform;
+  const home = environment?.home ?? homedir();
+  const located = isAbsolute(executablePath)
+    ? (platform === "win32" ? win32 : posix).resolve(executablePath)
+    : await findUnixClaude(environment?.pathValue ?? process.env.PATH);
+  if (!located) return undefined;
+  let real: string;
+  try {
+    real = await realpath(located);
+  } catch {
+    return undefined;
+  }
+  return isNativeClaudeInstall(located, real, home, platform) ? located : undefined;
 }

@@ -1,6 +1,6 @@
 import { redactAbsolutePaths } from "./path-redaction";
 import { subagentResultForDisplay } from "./subagent-result";
-import type { TaskNotificationInfo } from "./protocol";
+import type { NormalizedEventBody, TaskNotificationInfo } from "./protocol";
 
 export const RESULT_PREVIEW_MAX = 2000;
 
@@ -55,3 +55,16 @@ export function localCommandOutput(record: Record<string, unknown>): string | un
   return output ? boundedDisplayText(output) : undefined;
 }
 
+export function apiRetryEvent(record: Record<string, unknown>, turnId: string | null): Extract<NormalizedEventBody, { kind: "api_retry" }> | undefined {
+  if (record.type !== "system" || record.subtype !== "api_error" || typeof record.retryAttempt !== "number") return undefined;
+  const error = typeof record.error === "object" && record.error !== null ? record.error as Record<string, unknown> : undefined;
+  const errorType = error?.type ?? error?.message;
+  return {
+    kind: "api_retry", turnId,
+    attempt: record.retryAttempt,
+    maxRetries: typeof record.maxRetries === "number" ? record.maxRetries : 0,
+    retryDelayMs: typeof record.retryInMs === "number" ? record.retryInMs : 0,
+    errorStatus: typeof error?.status === "number" ? error.status : undefined,
+    errorType: typeof errorType === "string" ? boundedDisplayText(errorType) : undefined,
+  };
+}

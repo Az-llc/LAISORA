@@ -16,7 +16,7 @@ export const EXPERIMENT_BOOTSTRAP_SAMPLES = 2000;
 const queues = new Map<string, Promise<unknown>>();
 
 export function assignLearningExperiment(ledger: LearningLedger, conversation: string, switches: LearningSwitches, candidates: readonly string[],
-  detectorVersion: number, dedicated = false, holdout = EXPERIMENT_HOLDOUT_PERCENT, draw = () => randomInt(1000000) / 1000000): Promise<ExperimentAssignmentRecord | undefined> {
+  detectorVersion: number, holdout = EXPERIMENT_HOLDOUT_PERCENT, draw = () => randomInt(1000000) / 1000000): Promise<ExperimentAssignmentRecord | undefined> {
   const key = resolve(ledger.directory).toLowerCase();
   const action = (queues.get(key) ?? Promise.resolve()).then(async () => {
     if (!Number.isFinite(holdout) || holdout < 0 || holdout >= 100) throw new Error("invalid learning holdout percentage");
@@ -25,7 +25,7 @@ export function assignLearningExperiment(ledger: LearningLedger, conversation: s
     if (!ledger.consistent || ledger.skipped || state.unavailableConversations.has(conversation)) return undefined;
     const prior = state.assignments.get(conversation);
     if (prior) return prior;
-    const reason = dedicated ? "dedicated" : !switches.enabled ? "learning-off" : !switches.experiment || holdout === 0 ? "experiment-off"
+    const reason = !switches.enabled ? "learning-off" : !switches.experiment || holdout === 0 ? "experiment-off"
       : !switches.automaticAdoption && !switches.observationDelivery ? "paths-off" : "eligible";
     const eligible = reason === "eligible", probability = eligible ? holdout / 100 : 0;
     const record: ExperimentAssignmentRecord = { kind: "experiment-assignment", v: 2, at: new Date().toISOString(),

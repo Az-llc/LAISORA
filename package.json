@@ -2,7 +2,7 @@
   "name": "laisora",
   "displayName": "LAISORA",
   "description": "%extension.description%",
-  "version": "1.5.0",
+  "version": "1.6.0",
   "publisher": "az-llc",
   "categories": [
     "AI",
@@ -138,6 +138,13 @@
           "default": 20,
           "description": "%config.laisora.tabLimit.description%"
         },
+        "laisora.history.eventLimit": {
+          "type": "integer",
+          "minimum": 1000,
+          "maximum": 100000,
+          "default": 5000,
+          "description": "%config.laisora.history.eventLimit.description%"
+        },
         "laisora.restoreTabsOnStartup": {
           "type": "boolean",
           "default": true,
@@ -154,12 +161,6 @@
           "default": true,
           "scope": "application",
           "description": "%config.laisora.claude.fileLinkInstruction.description%"
-        },
-        "laisora.claude.restoreModelAfterRefusalFallback": {
-          "type": "boolean",
-          "default": true,
-          "scope": "application",
-          "description": "%config.laisora.claude.restoreModelAfterRefusalFallback.description%"
         },
         "laisora.fileLinks.openWithSystemApp": {
           "type": "array",
@@ -240,6 +241,21 @@
           "default": "observe",
           "description": "%config.laisora.progressTracking.description%"
         },
+        "laisora.claude.autoUpdate": {
+          "type": "boolean",
+          "default": true,
+          "description": "%config.laisora.claude.autoUpdate.description%"
+        },
+        "laisora.codex.autoUpdate": {
+          "type": "boolean",
+          "default": true,
+          "description": "%config.laisora.codex.autoUpdate.description%"
+        },
+        "laisora.antigravity.autoUpdate": {
+          "type": "boolean",
+          "default": true,
+          "description": "%config.laisora.antigravity.autoUpdate.description%"
+        },
         "laisora.claude.remoteControlAtStartup": {
           "type": "boolean",
           "default": false,
@@ -251,15 +267,6 @@
           "default": false,
           "scope": "application",
           "description": "%config.laisora.orchestration.enabled.description%"
-        },
-        "laisora.learning.profileSources": {
-          "type": "array",
-          "scope": "application",
-          "items": { "type": "string", "enum": ["official", "artificialAnalysis"] },
-          "uniqueItems": true,
-          "minItems": 1,
-          "default": ["official", "artificialAnalysis"],
-          "description": "%config.laisora.learning.profileSources.description%"
         },
         "laisora.learning.enabled": {
           "type": "boolean",
@@ -277,25 +284,15 @@
               "rows": [
                 {
                   "executor": "claude",
-                  "model": "haiku",
-                  "efforts": []
-                },
-                {
-                  "executor": "claude",
-                  "model": "sonnet",
-                  "efforts": [
-                    "low",
-                    "high"
-                  ]
-                },
-                {
-                  "executor": "claude",
                   "model": "opus",
                   "efforts": [
+                    "low",
+                    "medium",
                     "high"
                   ]
                 }
-              ]
+              ],
+              "cacheTtl": "1h"
             },
             {
               "role": "explorer",
@@ -304,17 +301,13 @@
               "rows": [
                 {
                   "executor": "claude",
-                  "model": "haiku",
-                  "efforts": []
-                },
-                {
-                  "executor": "claude",
                   "model": "sonnet",
                   "efforts": [
-                    "low"
+                    "medium"
                   ]
                 }
-              ]
+              ],
+              "cacheTtl": "5m"
             },
             {
               "role": "reviewer",
@@ -325,10 +318,12 @@
                   "executor": "claude",
                   "model": "opus",
                   "efforts": [
+                    "medium",
                     "high"
                   ]
                 }
-              ]
+              ],
+              "cacheTtl": "5m"
             }
           ],
           "items": {
@@ -393,6 +388,13 @@
                     }
                   }
                 }
+              },
+              "cacheTtl": {
+                "type": "string",
+                "enum": [
+                  "5m",
+                  "1h"
+                ]
               }
             }
           },
@@ -401,7 +403,7 @@
         },
         "laisora.orchestration.conductorPolicy": {
           "type": "string",
-          "default": "If nothing requires orchestration, complete the work yourself.\nDelegate to the roles needed when separating work, isolating context, or obtaining independent judgment helps.\nChoose the model and effort using the required quality, difficulty, and available model characteristics.\nFor generation, exploration, and selection, judge content quality as well as compliance with the format.\nChoose the need and scope of review according to impact, and keep independent reviewers separate from implementers.\nGive delegated work a clear objective, scope, and conditions for verifying completion.\nAccept results through the artifacts and suitable external checks; resolve material findings through verification or explicit user acceptance of the risk before release.",
+          "default": "<scope>\nDeliver the requested scope; ask the user only when different readings would lead to materially different work.\n</scope>\n<delegation>\nDo work yourself when it takes a handful of tool calls; delegate only when separating work, isolating context, or independent judgment outweighs the handoff cost. Use the fewest agents and run independent ones in parallel.\nBriefs state objective, scope, sources, expected output, and how completion is checked. Ask for brief conclusions with pointers; long reports are reread every later turn.\nIf a delegate fails or stalls, read its output, rebrief once naming the gap, then take over or report the blocker.\n</delegation>\n<effort>\nEffort sets how deeply an agent reasons: raise it for work that needs more thought, not for a misread brief or for fixes the findings already specify.\nThe efforts below are explicit instructions; for an external target, choose the target with that effort.\n</effort>\n<workers>\nWorkers run at {d}; use {up} only when a mistake would not be caught by later checks or review (design decisions, conclusions from records, removal judgments, behavior kept identical across many places) or when an action cannot be undone.\nSend review fixes back to the worker that made the change: continue a Claude agent with SendMessage; for an external target, run the same target again with the findings and the current diff. If the work misread the request, correct the brief and send it back the same way.\nStart a new {up} worker only when the work shows shallow reasoning, such as cases left unconsidered or the same kind of defect returning after fixes; a continued agent keeps its effort.\n</workers>\n<reviewers>\nReviewers run at {up}. Tell them to report every finding with its evidence; you triage. Use {d} only for a review that confirms earlier findings were fixed, after a review that found no new defect.\nCount each completed review as a round, the first included. Review again after each fix, and stop when nothing actionable remains. After three rounds, continue only if the latest found a user-visible problem or data loss; otherwise stop and report the open findings to the user.\n</reviewers>\n<acceptance>\nAccept results through artifacts and checks that can fail, judging generated or selected content against the request, not just format. Rerun passed checks only when inputs changed. Before handoff or release, fix and verify material findings, dismiss them with evidence, or get the user's explicit acceptance of the risk.\n</acceptance>",
           "editPresentation": "multilineText",
           "scope": "application",
           "description": "%config.laisora.orchestration.conductorPolicy.description%"
@@ -467,7 +469,7 @@
     "typecheck": "tsc --noEmit"
   },
   "devDependencies": {
-    "@anthropic-ai/claude-agent-sdk": "^0.3.289",
+    "@anthropic-ai/claude-agent-sdk": "^0.3.296",
     "@types/node": "^24.0.0",
     "@types/vscode": "^1.90.0",
     "@vscode/l10n": "0.0.18",

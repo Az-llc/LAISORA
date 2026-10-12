@@ -1,5 +1,6 @@
+import { MEMORY_DESTINATION } from "./placement-line";
 import { privateTextR06, textHash } from "./learning";
-import { deliverySetHash, type ClaimItem, type DeliveryItem, type ProjectNotice, type RuleState } from "./learning-episodes";
+import { shortItemId, deliverySetHash, type ClaimItem, type DeliveryItem, type ProjectNotice, type RuleState } from "./learning-episodes";
 import { failureLabelText } from "./learning-signature";
 
 export const SECTION_HEADING = "Model usage knowledge (from LAISORA's learning ledger; valid only for the named model):";
@@ -90,23 +91,27 @@ export function measuredLines(runs: readonly MeasuredRun[], targets: readonly Se
   return lines;
 }
 
-export function ruleLine(rule: RuleState): string {
+export function ruleNeedsReview(rule: RuleState, deliveredConversations: number): boolean {
+  return deliveredConversations >= NEW_ITEM_GRACE_DELIVERIES && rule.ineffective === 0;
+}
+
+export function ruleLine(rule: RuleState, deliveredConversations = 0): string {
   const scope = rule.key.bind === "target" ? `${rule.key.role} ${rule.key.effort}: ` : "";
   const head = rule.head ? ` \`${rule.head}\`` : "";
   const label = failureLabelText(rule.cls, rule.label) ?? (rule.labelFacts?.code
     ? `${rule.labelFacts.code}${rule.labelFacts.fields?.length ? `; schema fields: ${rule.labelFacts.fields.join(", ")}` : ""}` : undefined);
   const shown = rule.ineffective ? `, ${rule.ineffective} after being shown` : "";
-  return `- [rule] ${scope}${rule.tool}${head} → ${rule.cls}${label ? `: ${label}` : ""} (${rule.count} times${shown})`;
+  return `- [rule${ruleNeedsReview(rule, deliveredConversations) ? ", review" : ""}] ${shortItemId(rule.ruleId)} ${scope}${rule.tool}${head} → ${rule.cls}${label ? `: ${label}` : ""} (${rule.count} times${shown})`;
 }
 
 export function claimLine(claim: ClaimItem): string {
   const tag = claim.source === "public" ? "[public]" : claim.corroborated ? "[provisional]" : "[provisional, uncorroborated]";
-  return `- ${tag} ${claim.role} ${claim.effort}: ${claim.text}`;
+  return `- ${tag} ${shortItemId(claim.itemId)} ${claim.role} ${claim.effort}: ${claim.text}`;
 }
 
 export function noticeLine(notice: ProjectNotice): string {
   const head = notice.head ? ` \`${notice.head}\`` : "";
-  return `- ${notice.tool}${head} → ${notice.cls} recurred ${notice.count} times with a working-folder path in the call arguments and was excluded from general learning; write a control to this project's .claude/rules or a fact to auto memory.`;
+  return `- ${notice.tool}${head} → ${notice.cls} recurred ${notice.count} times with a working-folder path in the call arguments and was excluded from general learning; permanent project controls → the project's .claude/rules; ${MEMORY_DESTINATION}.`;
 }
 
 export interface SectionInput {
@@ -161,7 +166,7 @@ export function buildSection(input: SectionInput): SectionResult {
   for (const rule of input.rules) {
     const group = rule.key.bind === "conductor" ? "conductor" : targetId(rule.key);
     if (!groupOrder.has(group) || !rule.active || rule.key.bind === "conductor" && rule.key.model !== input.conductorModel) continue;
-    knowledge.push({ id: rule.ruleId, type: "rule", group, order: 1, line: ruleLine(rule), current: input.currentProject !== "unknown" && rule.projects.has(input.currentProject),
+    knowledge.push({ id: rule.ruleId, type: "rule", group, order: 1, line: ruleLine(rule, input.deliveredConversations.get(rule.ruleId) ?? 0), current: input.currentProject !== "unknown" && rule.projects.has(input.currentProject),
       grace: (input.deliveredConversations.get(rule.ruleId) ?? 0) < NEW_ITEM_GRACE_DELIVERIES, used: input.usedConversations.get(rule.ruleId) ?? 0, at: rule.lastAt });
   }
   for (const claim of input.claims) {

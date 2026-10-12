@@ -1,17 +1,25 @@
 export const CLAUDE_EFFORTS = ["low", "medium", "high", "xhigh", "max"] as const;
 export type OrchestrationEffort = typeof CLAUDE_EFFORTS[number];
+export function isOrchestrationEffort(value: unknown): value is OrchestrationEffort { return (CLAUDE_EFFORTS as readonly unknown[]).includes(value); }
 export const CODEX_EFFORTS = ["low", "medium", "high", "xhigh", "max", "ultra"] as const;
 export type CodexEffort = typeof CODEX_EFFORTS[number];
 export interface ExternalModel {
   readonly id: string;
   readonly label: string;
   readonly resolvedModel?: string;
+  readonly defaultEffort?: OrchestrationEffort;
+  readonly supportedEffortLevels?: readonly OrchestrationEffort[];
   readonly efforts?: readonly string[];
 }
 export type ExternalModelList = { state: "ok"; models: readonly ExternalModel[] } | { state: "failed"; reason: string };
 export type ExternalModelsState = (Extract<ExternalModelList, { state: "ok" }> & { fetchedAt?: number; refresh?: "checking" | "failed"; refreshReason?: string })
   | Extract<ExternalModelList, { state: "failed" }> | { state: "checking" };
 export type ExternalModels = Record<ExecutorId, ExternalModelsState>;
+
+export const ORCHESTRATION_PLUGIN_NAME = "laisora";
+export function claudeAgentName(role: string, model: string): string {
+  return `${role}-${model}`;
+}
 
 export function claudeModelIdLabel(model: string): string {
   return model.replace(/\[1m\]$/, "").replace(/-\d{8}$/, "");
@@ -156,7 +164,7 @@ export const EXECUTORS: Record<ExecutorId, ExecutorDefinition> = {
       ...(typeof entry.model === "string" && ["haiku", "sonnet", "opus"].includes(entry.model)
         ? [{ executor: "claude" as const, model: entry.model, efforts: entry.model === "haiku" ? [] : typeof entry.effort === "string" ? [entry.effort] : [] }] : []),
     ],
-    targetKey: (role, model, effort) => `laisora-${role}-${model}${effort ? `-${effort}` : ""}`,
+    targetKey: (role, model, effort) => `${ORCHESTRATION_PLUGIN_NAME}:${claudeAgentName(role, model)}${effort ? `-${effort}` : ""}`,
   },
   agy: {
     id: "agy", writable: false, displayName: "Antigravity", kind: "external", efforts: AGY_EFFORTS,

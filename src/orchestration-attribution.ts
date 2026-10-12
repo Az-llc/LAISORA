@@ -1,12 +1,12 @@
 import { readFile } from "node:fs/promises";
 import { randomUUID } from "node:crypto";
-import { attributeSubagent, type RosterEvidence } from "./roster-evidence";
-import { claudeModelIdLabel } from "./orchestration-executors";
-import { HUMAN_REJECTED_TOOL_RESULT_RE } from "./guardrail";
+import { attributeSubagent, type InjectedAgentDefinition, type RosterEvidence } from "./roster-evidence";
+import { CLAUDE_EFFORTS, claudeModelIdLabel } from "./orchestration-executors";
+import { HUMAN_REJECTED_TOOL_RESULT_RE } from "./tool-result-signals";
 import type { AgentRunRecord } from "./orchestration-external";
 import type { LearningSubject } from "./learning-ingestion";
 
-interface Dispatch { run: string; dispatchId: string; parent: string; key?: string; model?: string; outcome?: "normal" | "stopped"; evidence?: string; background?: boolean; runtime: boolean; segment: number; terminalSegment?: number; taskId?: string }
+interface Dispatch { run: string; dispatchId: string; parent: string; key?: string; effort?: string; model?: string; outcome?: "normal" | "stopped"; evidence?: string; background?: boolean; runtime: boolean; segment: number; terminalSegment?: number; taskId?: string }
 interface Pending { record: AgentRunRecord; parent?: string; stopped: boolean }
 
 export class AgentAttribution {
@@ -19,7 +19,8 @@ export class AgentAttribution {
   private readonly unrecorded: { record: AgentRunRecord; parent?: string; subject?: LearningSubject }[] = [];
   private queue: Promise<unknown> = Promise.resolve();
   constructor(private readonly roster: () => RosterEvidence, private readonly append: (record: AgentRunRecord) => Promise<unknown>,
-    private readonly settled: (parent: string, agentId: string, record: AgentRunRecord, subject: LearningSubject) => Promise<void>, private readonly log: (message: string) => void) {}
+    private readonly settled: (parent: string, agentId: string, record: AgentRunRecord, subject: LearningSubject) => Promise<void>, private readonly log: (message: string) => void,
+    private readonly recorded: (agentKey: string | undefined) => InjectedAgentDefinition | undefined = () => undefined) {}
   private serial(action: () => Promise<void>): Promise<void> {
     const next = this.queue.then(action).catch(() => this.log("[learning-v2] agent attribution unavailable"));
     this.queue = next;
@@ -28,7 +29,8 @@ export class AgentAttribution {
   dispatch(parent: string, input: Record<string, unknown>): void {
     if (this.dispatches.has(parent)) return;
     this.dispatches.set(parent, { parent, run: randomUUID(), dispatchId: randomUUID(),
-      key: typeof input.subagent_type === "string" ? input.subagent_type : undefined, runtime: false, segment: 1 });
+      key: typeof input.subagent_type === "string" ? input.subagent_type : undefined,
+      effort: (CLAUDE_EFFORTS as readonly unknown[]).includes(input.effort) ? input.effort as string : undefined, runtime: false, segment: 1 });
   }
   model(parent: string, value: string): void {
     const dispatch = this.dispatches.get(parent);
@@ -118,11 +120,12 @@ export class AgentAttribution {
       if (dispatch) dispatch.runtime = true;
       const agentKey = typeof input.agent_type === "string" ? input.agent_type : dispatch?.key;
       const attributed = attributeSubagent(this.roster(), { agentType: agentKey, transcriptAgentId: record.agent_id, startedAt: Date.parse(record.firstSeenAt) });
+      const definition = attributed?.definition ?? this.recorded(agentKey);
       const effort = (input.effort as { level?: unknown } | undefined)?.level;
       const segment = (this.segments.get(record.agent_id) ?? 0) + 1;
       this.segments.set(record.agent_id, segment);
-      const enriched: AgentRunRecord = { ...record, agentKey, role: attributed?.definition.role ?? "unknown",
-        requestedModel: attributed?.definition.model ?? "unknown", requestedEffort: attributed?.definition.effort ?? "unknown",
+      const enriched: AgentRunRecord = { ...record, agentKey, role: definition?.role ?? "unknown",
+        requestedModel: definition?.model ?? "unknown", requestedEffort: (attributed?.perCallEffort && attributed.definition.effort ? dispatch?.effort : undefined) ?? definition?.effort ?? "unknown",
         model: model ?? dispatch?.model ?? (typeof input.model === "string" ? claudeModelIdLabel(input.model) : record.model ?? "unknown"),
         effort: typeof effort === "string" ? effort : record.effort ?? "unknown", segment,
         runId: segment === 1 ? dispatch?.run ?? randomUUID() : randomUUID(), dispatchId: dispatch?.dispatchId ?? randomUUID(), recipient: parent ? `agent:${parent}` : `agent:${record.agent_id}` };

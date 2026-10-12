@@ -1,5 +1,31 @@
 # Changelog
 
+## 1.6.0
+
+- **Work follows the PLAN.** GRAPH, ANALYSIS and SUMMARY now split a conversation by the steps of
+  its PLAN: each step gets its own row with the conductor's work, delegations, time, tokens and
+  cache hits, and work outside any step goes to one "Unplanned work" row. Resumed delegations show
+  inside the step they continue, finished PLANs fold together, and stopped agents show as stopped.
+- **CLI updates in the background.** A new CLI tab in settings shows the Claude Code, Codex and
+  Antigravity CLIs. LAISORA updates them while nothing is running, at startup and every 30 minutes;
+  each can be turned off (`laisora.claude.autoUpdate`, `laisora.codex.autoUpdate`,
+  `laisora.antigravity.autoUpdate`), and Claude Code's own update settings still apply.
+- **Roster and prompt cache.** Each role can use a 5-minute or 1-hour prompt cache, the settings
+  show the official prices for the Claude models in use, and a roster suggestion can be applied
+  with one button. Delegation effort follows the CLI's default effort.
+- **Delegates cannot change instructions.** Subagents and external runs can no longer change
+  instruction, settings, hook or memory files; external runs report such changes instead.
+- **Learning ledger.** Rules are generated only for explained failure classes, observations cite the
+  runs they are about, and the conductor can correct a delivered line. Model research and its
+  setting (`laisora.learning.profileSources`) are removed. Old learning stores are no longer
+  deleted at startup (they are still not read).
+- **Safety refusals.** When a refusal switches to a fallback model, the original model is always
+  restored and the safety category is shown; the
+  `laisora.claude.restoreModelAfterRefusalFallback` setting is removed.
+- **Longer chat history.** `laisora.history.eventLimit` sets how many events a conversation keeps.
+  The chat keeps its reading position when the panel width changes.
+- Claude Agent SDK 0.3.296 (Claude Code CLI 2.1.296).
+
 ## 1.5.0
 
 - **Faster startup.** Restored tabs, the conversation view and the CLI start no longer wait while

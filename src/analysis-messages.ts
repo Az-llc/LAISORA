@@ -127,7 +127,7 @@ export async function handleAnalysisMessage(
       const filePath = s.resumeFilePath ?? (sessionId ? findSessionFile(sessionId) : undefined);
       const sessionRef = [sessionId, filePath].filter(Boolean).join(" / ") || l10n.t("Tab {0} (session not identified)", s.tabId);
       const prompt = buildFindingSessionPrompt({
-        learningEnabled: getLaisoraConfiguration().get<boolean>("learning.enabled", false) === true,
+        learningEnabled: getLaisoraConfiguration().get<boolean>("learning.enabled")! === true,
         analysisSdk: art?.analysisSdk,
         sessionRef,
         models: models ?? null,
@@ -182,7 +182,7 @@ export async function handleAnalysisMessage(
         "",
         l10n.t("When improving, check how it relates to the current target and use only the material that still applies."),
         buildFindingSessionPrompt({
-          learningEnabled: getLaisoraConfiguration().get<boolean>("learning.enabled", false) === true,
+          learningEnabled: getLaisoraConfiguration().get<boolean>("learning.enabled")! === true,
           analysisSdk: art.analysisSdk,
           sessionRef,
           models: art.executedModels,

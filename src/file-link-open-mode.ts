@@ -1,4 +1,6 @@
-export const DEFAULT_SYSTEM_APP_EXTENSIONS = [".xlsx", ".xls", ".docx", ".doc", ".pptx", ".ppt", ".pdf"];
+import { configurationDefault } from "./configuration-defaults";
+
+export const DEFAULT_SYSTEM_APP_EXTENSIONS = configurationDefault<string[]>("fileLinks.openWithSystemApp");
 
 export const R_CNV_20_BLOCKED_EXTENSIONS = new Set([
   ".exe", ".bat", ".cmd", ".com", ".ps1", ".psm1", ".vbs", ".vbe", ".js", ".jse", ".wsf", ".wsh",

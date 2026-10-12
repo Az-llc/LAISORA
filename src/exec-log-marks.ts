@@ -1,4 +1,4 @@
-import { HUMAN_REJECTED_TOOL_RESULT_RE } from "./guardrail";
+import { HARNESS_DENIED_TOOL_RESULT_RE, HUMAN_REJECTED_TOOL_RESULT_RE, isHookDenial } from "./tool-result-signals";
 import type { NormalizedEvent } from "./protocol";
 import * as l10n from "@vscode/l10n";
 
@@ -14,6 +14,7 @@ export interface ExecLogMark {
 }
 
 export interface ExecLogFindingView {
+  toolUseIds?: string[];
   anchor: string;
   family: ExecLogMarkFamily;
   label: string;
@@ -36,7 +37,7 @@ interface FailureRule {
   label: string;
   category?: string;
   fixCandidate?: string;
-  pattern: RegExp;
+  pattern: Pick<RegExp, "test">;
 }
 
 interface ConventionRule {
@@ -51,11 +52,12 @@ interface ConventionRule {
 const FAILURE_RULES: readonly FailureRule[] = [
   { anchor: "fail:rejected", get label() { return l10n.t("A human stopped the execution"); }, pattern: HUMAN_REJECTED_TOOL_RESULT_RE },
   { anchor: "fail:guard", get label() { return l10n.t("A guard stopped the execution"); }, pattern: /This agent is isolated in the worktree|Refusing to use|Blocked: / },
+  { anchor: "fail:hook", get label() { return l10n.t("A hook denied the execution"); }, pattern: { test: isHookDenial } },
   { anchor: "fail:read-first", get label() { return l10n.t("Tried to modify a file that had not been read"); }, get category() { return l10n.t("Rule"); }, get fixCandidate() { return l10n.t("Read before Edit or Write"); }, pattern: /File has not been read yet/ },
   { anchor: "fail:edit", get label() { return l10n.t("The Edit target did not match the actual file"); }, pattern: /String to replace not found|old_string and new_string are exactly the same/ },
   { anchor: "fail:script", get label() { return l10n.t("A script failed with a runtime error"); }, pattern: /Traceback \(most recent call last\)/ },
   { anchor: "fail:syntax", get label() { return l10n.t("The executed code had a syntax error"); }, get category() { return l10n.t("Rule"); }, get fixCandidate() { return l10n.t("How shell arguments are written (quoting, heredocs)"); }, pattern: /unexpected EOF while looking for matching|unterminated|SyntaxError/ },
-  { anchor: "fail:permission", get label() { return l10n.t("The harness denied the execution"); }, get category() { return l10n.t("Settings"); }, get fixCandidate() { return l10n.t("permissions.allow in settings.json"); }, pattern: /Permission for this action was denied by/ },
+  { anchor: "fail:permission", get label() { return l10n.t("The harness denied the execution"); }, get category() { return l10n.t("Settings"); }, get fixCandidate() { return l10n.t("permissions.allow in settings.json"); }, pattern: HARNESS_DENIED_TOOL_RESULT_RE },
   { anchor: "fail:limit", get label() { return l10n.t("Could not read because the tool limit was exceeded"); }, pattern: /File content \([^)]*\) exceeds maximum/ },
   { anchor: "fail:input", get label() { return l10n.t("The tool input did not match the expected format"); }, pattern: /InputValidationError/ },
   { anchor: "fail:path", get label() { return l10n.t("The specified path was not found"); }, get category() { return l10n.t("Project"); }, get fixCandidate() { return l10n.t("The working directory description in CLAUDE.md"); }, pattern: /File does not exist|current working directory is/ },
@@ -122,6 +124,7 @@ export function deriveExecLogFindings(marks: readonly ExecLogMark[]): ExecLogFin
   }
   const out: ExecLogFindingView[] = [];
   const view = (rule: FailureRule | ConventionRule, family: ExecLogMarkFamily, count: number, index: number): ExecLogFindingView => ({
+    toolUseIds: marks.filter(mark => mark.findingAnchor === rule.anchor).map(mark => mark.toolUseId),
     anchor: rule.anchor,
     family,
     label: rule.label,

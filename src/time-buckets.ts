@@ -1,10 +1,11 @@
 import type { NormalizedEvent } from "./protocol";
 import { redactAbsolutePaths } from "./path-redaction";
 import { isPureCommandWrapper, INJECTED_TAG_RE, STEER_TAG_RE } from "./human-input-vocabulary";
-import { isBookkeepingTool, foldPlanDeclarationText, parseTaskIntentFromRawInput, taskCreateKeyFromResult, type TaskIntent, type WorkModelState } from "./work-model";
-import { planStepKey, planStepAt, transitionPlanStep, type PlanStepTiming, type PlanStepTransition } from "./plan-steps";
+import { isBookkeepingTool, foldPlanDeclarationText, parseTaskIntentFromRawInput, taskCreateKeyFromResult, type TaskIntent, type PlanTextState } from "./work-model";
+import { planItemNumber, planItemNumberOf, planNumberedStep, planStepActiveSpans, planStepKey, transitionPlanStep, type PlanSpan, type PlanStepTiming, type PlanStepTransition } from "./plan-steps";
 import type { PlanUsage, PlanTokenTotal } from "./plan-usage";
 import { isExternalRunTool } from "./orchestration-executors";
+import { isRejectedBeforeRun } from "./tool-result-signals";
 import * as l10n from "@vscode/l10n";
 
 export type TimeBucket = "generate" | "tool" | "delegation" | "confirm" | "reply";
@@ -28,7 +29,11 @@ export function isRequestMessageText(text: string): boolean {
   return human.length > 0 && !isPureCommandWrapper(human) && (!INJECTED_TAG_RE.test(human) || STEER_TAG_RE.test(human)) && !human.includes(TASK_NOTIFICATION_MARKER);
 }
 
-export interface TurnSpan {
+interface TurnOrigin {
+  effort?: string;
+}
+
+export interface TurnSpan extends TurnOrigin {
   turnId: string;
   start: number;
   end: number;
@@ -72,7 +77,7 @@ export function keyedGet<V>(log: KeyedLog<V>, key: string): V | undefined {
   return undefined;
 }
 
-function keyedSet<V>(log: KeyedLog<V>, key: string, value: V): KeyedLog<V> {
+export function keyedSet<V>(log: KeyedLog<V>, key: string, value: V): KeyedLog<V> {
   let { entries, positions, keys } = log;
   if (entries.length !== log.size) {
     entries = entries.slice(0, log.size);
@@ -122,6 +127,7 @@ export interface ToolInterval {
   isError: boolean;
   turnId: string;
   agentId?: string;
+  rejectedBeforeRun?: true;
 }
 
 export interface DelegationSpan {
@@ -131,12 +137,12 @@ export interface DelegationSpan {
   ackEndedAt?: number;
   notifiedEndedAt?: number;
   isBackground: boolean;
-  firstChildAt?: number;
   lastChildAt?: number;
   transcriptAgentId?: string;
   description: string;
   subagentType?: string;
   model?: string;
+  rejectedBeforeRun?: true;
 }
 
 export interface BackgroundTaskSpan {
@@ -169,6 +175,7 @@ export interface BackgroundTaskSpanView {
 export type RequestBlockKind = "say" | "command" | "interrupt" | "plan";
 
 export interface PlanBlockStepRecord extends PlanStepTiming {
+  number: number;
   taskKey: string;
   transitions: PlanStepTransition[];
 }
@@ -178,7 +185,10 @@ export interface PlanBlockMetrics {
   decisionWaitMs: number | null; replyWaitMs: number | null; tokens: PlanTokenTotal | null;
 }
 export interface PlanBlockStepView extends PlanStepTiming, PlanBlockMetrics {
-  end: number | null; durationMs: number | null; longest: boolean; parallel: boolean;
+  conductorIntervals?: TimeBucketInterval[];
+  conductorTail?: number | null;
+  number: number; end: number | null; durationMs: number | null; longest: boolean; parallel: boolean;
+  activeSpans?: PlanSpan[];
 }
 
 export interface RequestBlockRecord {
@@ -191,19 +201,26 @@ export interface RequestBlockRecord {
   goal?: string;
   closedAt?: number;
   steps?: PlanBlockStepRecord[];
-  userMessages?: { at: number; text: string }[];
+  seenSteps?: string[];
+  // requestId: the request's message uuid, so a request absorbed into a later block names that block.
+  userMessages?: { at: number; text: string; requestId?: string }[];
 }
 
 export interface TimeBucketState {
+  modelMarks?: ModelMark[];
+  generationBoundaryAt?: number;
+  // Blocks of earlier generations; only keeps block IDs unique across a handoff.
+  earlierBlockCount?: number;
   fidelity: TimeFidelity;
   inheritedBoundaryCount: number;
   firstAt?: number;
   lastAt?: number;
   turnSpans: AppendList<TurnSpan>;
-  openTurn?: { turnId: string; startedAt: number };
-  openTools: Record<string, { at: number; toolName: string; lane: TimeLane; parentToolUseId: string | null; turnId: string; description?: string; taskIntent?: TaskIntent }>;
-  planText?: WorkModelState["planText"];
-  planDeclarationBlockId?: string;
+  openTurn?: TurnOrigin & { turnId: string; startedAt: number };
+  openTools: Record<string, { at: number; toolName: string; lane: TimeLane; parentToolUseId: string | null; turnId: string; messageId?: string; description?: string; taskIntent?: TaskIntent }>;
+  // The assistant message of the latest main-lane call (src/time-buckets.ts#numberedLaunchVerdict).
+  mainMessageId?: string;
+  planText?: PlanTextState;
   mainTools: ToolInterval[];
   subTools: ToolInterval[];
   delegations: KeyedLog<DelegationSpan>;
@@ -216,42 +233,71 @@ export interface TimeBucketState {
   requestNumbers: KeyedLog<RequestNumberEntry>;
   droppedIntervalCount: number;
   droppedBlockCount: number;
+  // The latest request's message uuid and how many blocks its goal declarations have opened (src/time-buckets.ts#openPlanBlock).
+  request?: { id: string; openings: number };
 }
 
-type NumberedRequests = readonly { turnIds: readonly string[]; number: string }[];
+type NumberedRequests = readonly { requestId: string; mergedRequestIds?: readonly string[]; turnIds: readonly string[]; number: string }[];
 interface RequestNumberEntry {
   number: string;
   next: string;
 }
 
-function requestNumberOf(log: KeyedLog<RequestNumberEntry>, turnId: string): string | undefined {
-  let entry = keyedGet(log, turnId);
-  let id = turnId;
+function requestNumberRoot(log: KeyedLog<RequestNumberEntry>, id: string): { id: string; entry: RequestNumberEntry } | undefined {
+  let entry = keyedGet(log, id);
   for (let hops = 0; entry !== undefined && entry.next !== id && hops < log.keyCount; hops++) {
     const following = keyedGet(log, entry.next);
     if (following === undefined) break;
     id = entry.next;
     entry = following;
   }
-  return entry?.number;
+  return entry === undefined ? undefined : { id, entry };
+}
+
+function requestNumberOf(log: KeyedLog<RequestNumberEntry>, turnId: string): string | undefined {
+  return requestNumberRoot(log, `turn:${turnId}`)?.entry.number;
+}
+
+function compactRequestNumbers(log: KeyedLog<RequestNumberEntry>, state: TimeBucketState, requests: NumberedRequests): KeyedLog<RequestNumberEntry> {
+  const keys = new Set<string>();
+  for (const request of requests) {
+    keys.add(`request:${request.requestId}`);
+    for (const id of request.mergedRequestIds ?? []) keys.add(`request:${id}`);
+    for (const id of request.turnIds) keys.add(`turn:${id}`);
+  }
+  for (const block of state.blocks) if (block.turnId !== null) keys.add(`turn:${block.turnId}`);
+  if (state.openTurn !== undefined) keys.add(`turn:${state.openTurn.turnId}`);
+  if (state.planText !== undefined) keys.add(`turn:${state.planText.turnId}`);
+  for (const tool of Object.values(state.openTools)) keys.add(`turn:${tool.turnId}`);
+  let compacted = emptyKeyedLog<RequestNumberEntry>();
+  for (const key of keys) {
+    const root = requestNumberRoot(log, key);
+    if (root === undefined) continue;
+    if (keyedGet(compacted, root.id) === undefined) compacted = keyedSet(compacted, root.id, root.entry);
+    if (key !== root.id) compacted = keyedSet(compacted, key, { number: root.entry.number, next: root.id });
+  }
+  return compacted;
 }
 
 export function attachTimeBucketRequestNumbers(state: TimeBucketState, requests: NumberedRequests): TimeBucketState {
+  if (state.numberedRequests === requests) return state;
   const numbers = new Map(requests.flatMap(request => request.turnIds.map(id => [id, request.number] as const)));
   const seen = new Set(state.numberedRequests ?? []);
   let requestNumbers = state.requestNumbers;
   let renumbered = false;
   for (const request of requests) {
     if (seen.has(request)) continue;
-    request.turnIds.forEach((id, i) => {
-      const cached = keyedGet(requestNumbers, id);
-      const next = i + 1 < request.turnIds.length ? request.turnIds[i + 1] : id;
-      if (cached === undefined) requestNumbers = keyedSet(requestNumbers, id, { number: request.number, next });
-      else if (cached.number !== request.number || cached.next === id && next !== id) {
-        if (cached.number !== request.number) renumbered = true;
-        requestNumbers = keyedSet(requestNumbers, id, { number: request.number, next: cached.next === id ? next : cached.next });
-      }
-    });
+    const target = `request:${request.requestId}`;
+    const keys = [target, ...(request.mergedRequestIds ?? []).map(id => `request:${id}`), ...request.turnIds.map(id => `turn:${id}`)];
+    for (const key of keys) {
+      const cached = keyedGet(requestNumbers, key);
+      if (cached?.number === request.number && cached.next === target) continue;
+      if (cached !== undefined) renumbered = true;
+      requestNumbers = keyedSet(requestNumbers, key, { number: request.number, next: target });
+    }
+  }
+  if (requestNumbers.size > Math.max(512, (numbers.size + requests.length + state.blocks.length) * 4)) {
+    requestNumbers = compactRequestNumbers(requestNumbers, state, requests);
   }
   let changed = state.numberedRequests !== requests || requestNumbers !== state.requestNumbers;
   const blocks = state.blocks.map(block => {
@@ -288,14 +334,58 @@ function isWindowKind(kind: string): boolean {
   return kind.startsWith("tool_call_") || kind === "user_message" || kind.startsWith("turn_");
 }
 
-function appendWorkBlock(state: TimeBucketState, block: Omit<RequestBlockRecord, "blockId">): TimeBucketState {
+function isLiveEvent(event: NormalizedEvent): boolean {
+  return event.provenance?.path !== "history";
+}
+
+// A block's id names what opened it: the request's message uuid (the same in the transcript and the live fold, since the
+// Host sends that uuid with the message), the plan tool call, or the n-th goal declaration of a request. Only an opening
+// without an identity falls back to its position, and a live opening's position is kept apart from the transcript's, so
+// the two views never share an id for different blocks (src/time-buckets.ts#isPositionalLiveBlockId).
+const POSITIONAL_LIVE_BLOCK_PREFIX = "block:live:";
+
+function positionalBlockId(state: TimeBucketState, live: boolean): string {
+  return `${live ? POSITIONAL_LIVE_BLOCK_PREFIX : "block:"}${(state.earlierBlockCount ?? 0) + state.blocks.length + state.droppedBlockCount + 1}`;
+}
+
+function isPositionalLiveBlockId(blockId: string): boolean {
+  return blockId.startsWith(POSITIONAL_LIVE_BLOCK_PREFIX);
+}
+
+function appendWorkBlock(state: TimeBucketState, block: Omit<RequestBlockRecord, "blockId">, blockId: string): TimeBucketState {
   const blocks = [...state.blocks, { ...block, requestNumber: block.requestNumber ?? (block.turnId === null ? undefined : requestNumberOf(state.requestNumbers, block.turnId)),
-    blockId: `block:${state.blocks.length + state.droppedBlockCount + 1}` }];
+    blockId }];
   const dropped = Math.max(0, blocks.length - MAX_TIME_BLOCKS);
   return { ...state, blocks: dropped ? blocks.slice(dropped) : blocks, droppedBlockCount: state.droppedBlockCount + dropped };
 }
 
-function applyPlanTask(state: TimeBucketState, intent: TaskIntent, at: number, turnId: string, result: string): TimeBucketState {
+function firstLine(text: string): string {
+  return text.split(/\r?\n/, 1)[0];
+}
+
+function openPlanBlock(state: TimeBucketState, opening: { goal?: string; text: string; start: number; turnId: string }, live: boolean, openedBy?: string): TimeBucketState {
+  const plan = { kind: "plan" as const, ...opening, steps: [], userMessages: [] };
+  const last = state.blocks.at(-1);
+  if (last?.kind === "say") {
+    const turnId = last.turnId ?? opening.turnId;
+    return { ...state, blocks: [...state.blocks.slice(0, -1), { ...plan, blockId: last.blockId, start: last.start, turnId,
+      requestNumber: last.requestNumber ?? requestNumberOf(state.requestNumbers, turnId),
+      userMessages: [{ at: last.start, text: firstLine(last.text), ...(state.request === undefined ? {} : { requestId: state.request.id }) }] }] };
+  }
+  const request = last?.kind === "plan" && last.closedAt === undefined ? last.userMessages?.at(-1) : undefined;
+  if (last !== undefined && request !== undefined && request.at > last.start
+    && !last.steps?.some(step => step.transitions.some(change => change.at >= request.at))) {
+    state = { ...state, blocks: [...state.blocks.slice(0, -1), { ...last, userMessages: last.userMessages!.slice(0, -1) }] };
+    return appendWorkBlock(state, { ...plan, start: request.at, userMessages: [request] },
+      request.requestId === undefined ? positionalBlockId(state, live) : `block:${request.requestId}`);
+  }
+  if (openedBy !== undefined) return appendWorkBlock(state, plan, `block:${openedBy}`);
+  if (state.request === undefined) return appendWorkBlock(state, plan, positionalBlockId(state, live));
+  const request2 = { ...state.request, openings: state.request.openings + 1 };
+  return appendWorkBlock({ ...state, request: request2 }, plan, `block:${request2.id}:${request2.openings}`);
+}
+
+function applyPlanTask(state: TimeBucketState, intent: TaskIntent, at: number, turnId: string, result: string, opener: { live: boolean; toolUseId: string }): TimeBucketState {
   let index = state.blocks.length - 1;
   if (intent.kind === "update") {
     while (index >= 0 && !state.blocks[index].steps?.some(step => step.taskKey === intent.taskKey)) index--;
@@ -303,11 +393,8 @@ function applyPlanTask(state: TimeBucketState, intent: TaskIntent, at: number, t
   } else if (state.blocks[index]?.kind !== "plan" || state.blocks[index].closedAt !== undefined) {
     const title = intent.kind === "todo" ? intent.items.find(item => item.status !== "completed")?.description : intent.subject;
     if (!title?.trim()) return state;
-    const declared = state.blocks.find(block => block.blockId === state.planDeclarationBlockId);
-    const goal = declared?.closedAt === undefined && declared?.steps?.length === 0 ? declared.goal : undefined;
-    state = appendWorkBlock(state, { kind: "plan", goal, text: goal ?? redactAbsolutePaths(title), start: at, turnId, steps: [], userMessages: [] });
+    state = openPlanBlock(state, { text: redactAbsolutePaths(title), start: at, turnId }, opener.live, opener.toolUseId);
     index = state.blocks.length - 1;
-    if (goal) state = { ...state, planDeclarationBlockId: state.blocks[index].blockId };
   }
   const block = state.blocks[index];
   const steps = (block.steps ?? []).map(step => ({ ...step, transitions: [...step.transitions] }));
@@ -321,18 +408,26 @@ function applyPlanTask(state: TimeBucketState, intent: TaskIntent, at: number, t
   }
   let order = steps.reduce((latest, step) => step.transitions.reduce((maximum, change) => Math.max(maximum, change.order), latest), 0);
   const present = new Set<string>();
+  const seen = [...block.seenSteps ?? steps.map(step => step.key)];
   for (const item of items) {
     const key = planStepKey(source, item);
     if (present.has(key)) continue;
     present.add(key);
+    const number = planItemNumber(seen, key);
     let step = steps.find(value => value.key === key);
     if (!step) {
       if (intent.kind === "todo" && item.status === "completed") continue;
-      step = { key, taskKey: item.taskKey, title: redactAbsolutePaths(item.description), status: "unknown", removed: false, startedAt: null, endedAt: null, transitions: [] };
+      step = { key, number, taskKey: item.taskKey,
+        title: redactAbsolutePaths(item.description), status: "unknown", removed: false, startedAt: null, endedAt: null, transitions: [] };
       steps.push(step);
     }
     const removed = intent.kind === "update" && intent.deleted === true;
     if (transitionPlanStep(step, at, item.status, removed)) step.transitions.push({ at, active: !removed && item.status === "in_progress", order: ++order });
+    // Sending in_progress again (a TaskUpdate carrying the status, a TodoWrite listing it) selects the item for the current
+    // response; a TaskUpdate without a status does not.
+    else if (!removed && item.status === "in_progress" && (intent.kind !== "update" || intent.status === "in_progress")) {
+      step.transitions.push({ at, active: true, order: ++order });
+    }
     step.title = redactAbsolutePaths(item.description);
   }
   if (intent.kind === "todo") for (const step of steps) {
@@ -341,8 +436,17 @@ function applyPlanTask(state: TimeBucketState, intent: TaskIntent, at: number, t
     step.transitions.push({ at, active: false, order: ++order });
   }
   const blocks = [...state.blocks];
-  blocks[index] = { ...block, steps, text: block.goal ?? steps.find(step => !step.removed && step.status !== "completed")?.title ?? block.text };
+  blocks[index] = { ...block, steps, seenSteps: seen, text: block.goal ?? steps.find(step => !step.removed && step.status !== "completed")?.title ?? block.text };
   return { ...state, blocks };
+}
+
+function launchDescription(event: Extract<NormalizedEvent, { kind: "tool_call_started" }>): string | undefined {
+  return isExternalRunTool(event.toolName) ? event.intentInput?.description ?? event.inputSummary : event.inputSummary;
+}
+
+// The item number a delegation or external run names in its description; the launch guard and ANALYSIS placement share it.
+export function launchItemNumber(event: Extract<NormalizedEvent, { kind: "tool_call_started" }>): number | undefined {
+  return isSubagentWaitTool(event.toolName) ? planItemNumberOf(event.delegation?.description ?? launchDescription(event)) : undefined;
 }
 
 function pushBounded(list: ToolInterval[], item: ToolInterval, state: { droppedIntervalCount: number }): ToolInterval[] {
@@ -408,7 +512,7 @@ function unsettledBackgroundOfTask(state: TimeBucketState, taskId: string): Back
   return undefined;
 }
 
-export function foldTimeBuckets(state: TimeBucketState, event: NormalizedEvent): TimeBucketState {
+export function foldTimeBuckets(state: TimeBucketState, event: NormalizedEvent, options?: Parameters<typeof deriveTimeBuckets>[1]): TimeBucketState {
   const ts = typeof event.timestamp === "number" && event.timestamp > 0 ? event.timestamp : undefined;
   let next: TimeBucketState = state;
   const touch = (): TimeBucketState => (next === state ? (next = { ...state }) : next);
@@ -418,8 +522,12 @@ export function foldTimeBuckets(state: TimeBucketState, event: NormalizedEvent):
   }
 
   switch (event.kind) {
+    case "model_observed":
+      if (ts !== undefined) touch().modelMarks = pushModelMark([...(state.modelMarks ?? [])], ts, event.model);
+      return next;
     case "assistant_message_uuid":
-      if (state.planText?.turnId === event.turnId) touch().planText = { ...state.planText, recordEnded: true };
+      if (state.planText?.turnId === event.turnId) touch().planText = foldPlanDeclarationText(
+        state.planText, event.turnId, { text: "", uuid: event.uuid }, event.timestamp).text;
       return next;
     case "assistant_text_delta": {
       if (ts === undefined) return next;
@@ -433,21 +541,18 @@ export function foldTimeBuckets(state: TimeBucketState, event: NormalizedEvent):
         const goal = redactAbsolutePaths(declaration.goal).trim();
         if (!goal) continue;
         const current = next.blocks.at(-1);
-        if (current?.kind === "plan" && !current.goal && current.closedAt === undefined && !current.userMessages?.length) {
+        if (current?.kind === "plan" && !current.goal && current.closedAt === undefined && !current.userMessages?.some(message => message.at > current.start)) {
           next = { ...next, blocks: [...next.blocks.slice(0, -1), { ...current, goal, text: goal }] };
-        } else next = appendWorkBlock(next, { kind: "plan", goal, text: goal, start: ts, turnId: event.turnId, steps: [], userMessages: [] });
-        next = { ...next, planDeclarationBlockId: next.blocks.at(-1)!.blockId };
+        } else next = openPlanBlock(next, { goal, text: goal, start: ts, turnId: event.turnId }, isLiveEvent(event));
       }
       return next;
     }
     case "compact_boundary": {
       if (event.priorGeneration !== true || ts === undefined) return next;
-      const current = state.blocks.at(-1);
-      if (current?.kind === "plan" && current.closedAt === undefined) touch().blocks = [...state.blocks.slice(0, -1), { ...current, closedAt: ts }];
-      touch().planText = undefined;
-      touch().planDeclarationBlockId = undefined;
-      touch().lastAt = Math.max(next.lastAt ?? ts, ts);
-      return next;
+      return { ...createTimeBucketState(), generationBoundaryAt: ts, fidelity: state.fidelity, inheritedBoundaryCount: state.inheritedBoundaryCount,
+        droppedBlockCount: state.droppedBlockCount, earlierBlockCount: (state.earlierBlockCount ?? 0) + next.blocks.length,
+        ...(state.request === undefined ? {} : { request: state.request }),
+        requestNumbers: state.requestNumbers, ...(state.numberedRequests === undefined ? {} : { numberedRequests: state.numberedRequests }) };
     }
     case "background_tasks": {
       const alive = new Set(event.tasks.filter((t) => t.ambient !== true).map((t) => t.id));
@@ -467,17 +572,17 @@ export function foldTimeBuckets(state: TimeBucketState, event: NormalizedEvent):
         state = staleOpenBackground(state, touch(), ts, (span) => span.pendingStale === true);
       }
       const n = touch();
-      if (event.provenance?.path !== "history") {
+      if (isLiveEvent(event)) {
         n.inheritedBoundaryCount = state.inheritedBoundaryCount + 1;
         n.fidelity = "inherited";
       }
       if (ts === undefined) return n;
       if (state.openTurn !== undefined) {
-        n.turnSpans = appendItem(state.turnSpans, { turnId: state.openTurn.turnId, start: state.openTurn.startedAt, end: Math.max(state.openTurn.startedAt, ts) });
+        n.turnSpans = appendItem(state.turnSpans, { ...state.openTurn, start: state.openTurn.startedAt, end: Math.max(state.openTurn.startedAt, ts) });
       }
       const pending = n.blocks.at(-1);
       if (pending?.turnId === null) n.blocks = [...n.blocks.slice(0, -1), { ...pending, turnId: event.turnId }];
-      n.openTurn = { turnId: event.turnId, startedAt: ts };
+      n.openTurn = { turnId: event.turnId, startedAt: ts, ...(options?.appliedEffort ? { effort: options.appliedEffort } : {}) };
       return n;
     }
     case "conversation_closed": {
@@ -492,7 +597,7 @@ export function foldTimeBuckets(state: TimeBucketState, event: NormalizedEvent):
       }
       if (state.openTurn === undefined || ts === undefined) return next;
       const n = touch();
-      n.turnSpans = appendItem(state.turnSpans, { turnId: state.openTurn.turnId, start: state.openTurn.startedAt, end: Math.max(state.openTurn.startedAt, ts) });
+      n.turnSpans = appendItem(state.turnSpans, { ...state.openTurn, start: state.openTurn.startedAt, end: Math.max(state.openTurn.startedAt, ts) });
       n.openTurn = undefined;
       return n;
     }
@@ -500,15 +605,17 @@ export function foldTimeBuckets(state: TimeBucketState, event: NormalizedEvent):
       if (ts === undefined) return next;
       if (!isRequestMessageText(event.text)) return next;
       const current = state.blocks.at(-1);
-      if (current?.kind === "plan" && current.closedAt === undefined && (current.steps ?? []).some(step => !step.removed && step.status !== "completed")) {
-        touch().blocks = [...state.blocks.slice(0, -1), { ...current, userMessages: [...current.userMessages ?? [],
-          { at: ts, text: redactAbsolutePaths(event.text.trim().split(/\r?\n/, 1)[0]).slice(0, MAX_BLOCK_TEXT) }] }];
+      const requestId = event.uuid;
+      touch().request = requestId === undefined ? undefined : { id: requestId, openings: 0 };
+      if (current?.kind === "plan" && current.closedAt === undefined) {
+        next.blocks = [...state.blocks.slice(0, -1), { ...current, userMessages: [...current.userMessages ?? [],
+          { at: ts, text: redactAbsolutePaths(event.text.trim().split(/\r?\n/, 1)[0]).slice(0, MAX_BLOCK_TEXT), ...(requestId === undefined ? {} : { requestId }) }] }];
         return next;
       }
       const n = touch();
       const text = redactAbsolutePaths(event.text.trim()).slice(0, MAX_BLOCK_TEXT);
       const block: RequestBlockRecord = {
-        blockId: `block:${state.blocks.length + state.droppedBlockCount + 1}`,
+        blockId: requestId === undefined ? positionalBlockId(state, isLiveEvent(event)) : `block:${requestId}`,
         kind: "say",
         text,
         start: ts,
@@ -526,6 +633,7 @@ export function foldTimeBuckets(state: TimeBucketState, event: NormalizedEvent):
       if (ts === undefined) return next;
       const n = touch();
       const lane: TimeLane = event.parentToolUseId === null ? "main" : "sub";
+      const summary = launchDescription(event);
       let taskIntent = event.taskIntentStructured;
       if (!taskIntent && lane === "main" && ["TodoWrite", "TaskCreate", "TaskUpdate"].includes(event.toolName)) {
         try { taskIntent = parseTaskIntentFromRawInput(event.toolName, JSON.parse(event.inputPreview), event.toolUseId); }
@@ -539,10 +647,12 @@ export function foldTimeBuckets(state: TimeBucketState, event: NormalizedEvent):
           lane,
           parentToolUseId: event.parentToolUseId,
           turnId: event.turnId,
+          ...(event.messageId === undefined ? {} : { messageId: event.messageId }),
           ...(taskIntent ? { taskIntent } : {}),
-          ...(event.inputSummary !== undefined ? { description: redactAbsolutePaths(event.inputSummary).slice(0, 200) } : {}),
+          ...(summary !== undefined ? { description: redactAbsolutePaths(summary).slice(0, 200) } : {}),
         },
       };
+      if (lane === "main" && event.messageId !== undefined) n.mainMessageId = event.messageId;
       if (lane === "main" && DELEGATION_TOOL_NAMES.has(event.toolName) && keyedGet(state.delegations, event.toolUseId) === undefined) {
         putDelegation(n, state.delegations, {
           toolUseId: event.toolUseId,
@@ -558,7 +668,6 @@ export function foldTimeBuckets(state: TimeBucketState, event: NormalizedEvent):
         if (d !== undefined) {
           putDelegation(n, state.delegations, {
             ...d,
-            firstChildAt: d.firstChildAt === undefined ? ts : Math.min(d.firstChildAt, ts),
             lastChildAt: d.lastChildAt === undefined ? ts : Math.max(d.lastChildAt, ts),
           });
         }
@@ -612,6 +721,7 @@ export function foldTimeBuckets(state: TimeBucketState, event: NormalizedEvent):
         isError: event.isError === true,
         turnId: open.turnId,
         ...(open.parentToolUseId !== null ? { agentId: open.parentToolUseId } : {}),
+        ...(open.lane === "main" && isRejectedBeforeRun(event) ? { rejectedBeforeRun: true as const } : {}),
       };
       if (open.lane === "main") n.mainTools = pushBounded(state.mainTools, interval, n);
       else n.subTools = pushBounded(state.subTools, interval, n);
@@ -621,6 +731,7 @@ export function foldTimeBuckets(state: TimeBucketState, event: NormalizedEvent):
         const updated: DelegationSpan = { ...d };
         if (open.lane === "main") {
           updated.ackEndedAt = interval.end;
+          if (interval.rejectedBeforeRun) updated.rejectedBeforeRun = true;
           if (event.asyncLaunchedAgentId !== undefined) {
             updated.transcriptAgentId = event.asyncLaunchedAgentId;
             updated.isBackground = true;
@@ -631,7 +742,7 @@ export function foldTimeBuckets(state: TimeBucketState, event: NormalizedEvent):
         putDelegation(n, n.delegations, updated);
       }
       return open.lane === "main" && open.taskIntent && !event.isError
-        ? applyPlanTask(n, open.taskIntent, ts, open.turnId, event.resultPreview) : n;
+        ? applyPlanTask(n, open.taskIntent, ts, open.turnId, event.resultPreview, { live: isLiveEvent(event), toolUseId: event.toolUseId }) : n;
     }
     case "subagent_info": {
       const d = keyedGet(state.delegations, event.toolUseId);
@@ -752,6 +863,10 @@ export interface RequestBlockView {
   anchorAt: number;
   durationMs: number | null;
   turnIds: string[];
+  conductorAttribution?: { start: number; end: number; turnId?: string; keys: string[] }[];
+  conductorIntervals?: TimeBucketInterval[];
+  conductorTail?: number | null;
+  usageSlices?: PlanUsage["blocks"][number]["slices"];
   toolCount: number;
   failCount: number;
   agentCount: number;
@@ -787,7 +902,13 @@ export interface MainTimeByModelView {
   toolPercent: number | null;
 }
 
+export interface ConductorModel { model: string; effort?: string }
+export interface MainModelSpan extends ConductorModel { start: number; end: number }
+
 export interface TimeBucketView {
+  subagentOnlySpans?: Span[];
+  mainModelSpans?: MainModelSpan[];
+  generationBoundaryAt?: number;
   fidelity: TimeFidelity;
   inheritedBoundaryCount: number;
   firstAt: number | null;
@@ -910,7 +1031,7 @@ export function deriveMainByModel(
   }
   if (totalMs <= 0) return { totalMs, generateMs, models, toolMs, toolShare: null, toolPercent: null };
   const parts = [...models.map((m) => m.generateMs), toolMs];
-  const percents = largestRemainderPercents(parts, totalMs);
+  const percents = largestRemainder(parts, totalMs, 100);
   models.forEach((m, i) => {
     m.share = m.generateMs / totalMs;
     m.percent = percents[i];
@@ -918,10 +1039,10 @@ export function deriveMainByModel(
   return { totalMs, generateMs, models, toolMs, toolShare: toolMs / totalMs, toolPercent: percents[parts.length - 1] };
 }
 
-function largestRemainderPercents(parts: readonly number[], total: number): number[] {
-  const raw = parts.map((p) => (p / total) * 100);
+export function largestRemainder(parts: readonly number[], total: number, amount: number): number[] {
+  const raw = parts.map((p) => (p / total) * amount);
   const floors = raw.map((r) => Math.floor(r));
-  let rest = 100 - floors.reduce((acc, v) => acc + v, 0);
+  let rest = amount - floors.reduce((acc, v) => acc + v, 0);
   const order = raw.map((r, i) => ({ i, frac: r - floors[i] })).sort((a, b) => b.frac - a.frac || a.i - b.i);
   for (const { i } of order) {
     if (rest <= 0) break;
@@ -931,6 +1052,152 @@ function largestRemainderPercents(parts: readonly number[], total: number): numb
   return floors;
 }
 
+function deriveMainModelSpans(turns: readonly TurnSpan[], marks: readonly ModelMark[]): MainModelSpan[] {
+  const sorted = [...marks].sort((a, b) => a.at - b.at);
+  const spans: MainModelSpan[] = [];
+  let index = 0;
+  let model: string | undefined;
+  for (const turn of [...turns].sort((a, b) => a.start - b.start)) {
+    while (index < sorted.length && sorted[index].at <= turn.start) model = sorted[index++].model;
+    let start = turn.start;
+    const add = (end: number) => {
+      if (model && end > start) spans.push({ start, end, model, ...(turn.effort ? { effort: turn.effort } : {}) });
+      start = end;
+    };
+    while (index < sorted.length && sorted[index].at <= turn.end) {
+      const mark = sorted[index++];
+      model = mark.model;
+      add(mark.at);
+    }
+    add(turn.end);
+  }
+  return spans;
+}
+
+interface SelectedItem { blockIndex: number; key: string }
+
+// The latest turn started at or before `at` in turns sorted by start; callers bound it by its end.
+function turnStartedBy(sortedTurns: readonly TurnSpan[], at: number): TurnSpan | undefined {
+  let low = 0, high = sortedTurns.length;
+  while (low < high) {
+    const mid = (low + high) >>> 1;
+    if (sortedTurns[mid].start <= at) low = mid + 1;
+    else high = mid;
+  }
+  return sortedTurns[low - 1];
+}
+
+// The one decision of which PLAN items the conductor is working on: an item is selected when it is put in progress inside a
+// response (turn) and stays selected until it leaves in progress or the next response starts, so the reply wait after a
+// response belongs to what that response selected. Selected items are in selection order, latest last. Conductor time,
+// unnumbered members and the PLAN panel's per-step tokens all read it.
+function responseSelections(records: readonly Pick<RequestBlockRecord, "steps">[], turns: readonly TurnSpan[]): { at: number; selected: SelectedItem[] }[] {
+  const sortedTurns = [...turns].sort((a, b) => a.start - b.start);
+  // A change at the instant its response ends still belongs to that response.
+  const inResponse = (at: number): boolean => {
+    const turn = turnStartedBy(sortedTurns, at);
+    return turn !== undefined && at <= turn.end;
+  };
+  const changes = records.flatMap((block, blockIndex) => (block.steps ?? []).flatMap(step =>
+    step.transitions.map(change => ({ ...change, blockIndex, key: step.key }))))
+    .sort((a, b) => a.at - b.at || a.blockIndex - b.blockIndex || a.order - b.order);
+  const starts = new Set(sortedTurns.map(turn => turn.start));
+  const times = [...new Set([...starts, ...changes.map(change => change.at)])].sort((a, b) => a - b);
+  const selected = new Map<string, SelectedItem>();
+  const timeline: { at: number; selected: SelectedItem[] }[] = [];
+  let changeIndex = 0;
+  for (const at of times) {
+    if (starts.has(at)) selected.clear();
+    while (changeIndex < changes.length && changes[changeIndex].at <= at) {
+      const change = changes[changeIndex++];
+      const id = `${change.blockIndex}\n${change.key}`;
+      selected.delete(id);
+      if (change.active && inResponse(change.at)) selected.set(id, { blockIndex: change.blockIndex, key: change.key });
+    }
+    timeline.push({ at, selected: [...selected.values()] });
+  }
+  return timeline;
+}
+
+function selectionAt(timeline: readonly { at: number; selected: SelectedItem[] }[], at: number): SelectedItem[] {
+  let low = 0, high = timeline.length;
+  while (low < high) {
+    const mid = (low + high) >>> 1;
+    if (timeline[mid].at <= at) low = mid + 1;
+    else high = mid;
+  }
+  return timeline[low - 1]?.selected ?? [];
+}
+
+// Each moment goes whole to every item the conductor put in progress earlier in the same response (or, in the reply wait
+// after it, in that response), in any block (also after its block's window); with none it goes to the block whose window holds it. Launch descriptions, notifications and
+// human turns do not route.
+export function attributeConductorIntervals(state: TimeBucketState, view: TimeBucketView, turns: readonly TurnSpan[],
+  timeline = responseSelections(state.blocks, turns)): void {
+  const blocks = view.blocks;
+  for (const block of blocks) {
+    block.conductorAttribution = [];
+    block.conductorIntervals = [];
+    block.conductorTail = null;
+    for (const step of block.steps ?? []) { step.conductorIntervals = []; step.conductorTail = null; }
+  }
+  if (blocks.length === 0) return;
+  const sortedTurns = [...turns].sort((a, b) => a.start - b.start);
+  const turnsById = new Map(turns.map(turn => [turn.turnId, turn]));
+  const turnAt = (at: number): TurnSpan | undefined => {
+    const turn = turnStartedBy(sortedTurns, at);
+    return turn && at < turn.end ? turn : undefined;
+  };
+  const first = blocks[0].start, last = blocks.at(-1)!.end;
+  const points = [...new Set([...blocks.flatMap(block => [block.start, block.end]),
+    ...sortedTurns.flatMap(turn => [turn.start, turn.end]), ...timeline.map(entry => entry.at)])]
+    .filter(at => at >= first && at <= last).sort((a, b) => a - b);
+  const segments: { start: number; end: number; turnId?: string; owners: Map<number, string[]> }[] = [];
+  let windowIndex = 0;
+  for (let i = 0; i < points.length; i++) {
+    const start = points[i], end = points[i + 1] ?? start;
+    // The final zero-width segment owns the moments at and after the last observation (a live tail, a call at lastAt).
+    const turn = start === end && state.openTurn !== undefined ? turnsById.get(state.openTurn.turnId) : turnAt(start);
+    while (windowIndex + 1 < blocks.length && blocks[windowIndex + 1].start <= start) windowIndex++;
+    const owners = new Map<number, string[]>();
+    for (const { blockIndex, key } of selectionAt(timeline, start)) owners.set(blockIndex, [...owners.get(blockIndex) ?? [], key]);
+    if (owners.size === 0) owners.set(windowIndex, []);
+    const segment = { start, end, ...(turn ? { turnId: turn.turnId } : {}) };
+    for (const [blockIndex, keys] of owners) blocks[blockIndex].conductorAttribution!.push({ ...segment, keys });
+    segments.push({ ...segment, owners });
+  }
+  const stepsOf = blocks.map(block => new Map((block.steps ?? []).map(step => [step.key, step])));
+  let segmentIndex = 0;
+  for (const interval of view.intervals) {
+    if (interval.lane !== "main" || interval.bucket === "reply") continue;
+    while (segmentIndex < segments.length && segments[segmentIndex].end <= interval.start) segmentIndex++;
+    for (let i = segmentIndex; i < segments.length && segments[i].start < interval.end; i++) {
+      const segment = segments[i];
+      const from = Math.max(interval.start, segment.start), to = Math.min(interval.end, segment.end);
+      if (to <= from) continue;
+      for (const [blockIndex, keys] of segment.owners) {
+        for (const key of keys.length ? keys : [undefined]) {
+          const list = key === undefined ? blocks[blockIndex].conductorIntervals! : stepsOf[blockIndex].get(key)?.conductorIntervals;
+          if (list === undefined) continue;
+          const previous = list.at(-1);
+          if (previous?.bucket === interval.bucket && previous.turnId === segment.turnId && previous.end === from) previous.end = to;
+          else list.push({ bucket: interval.bucket, lane: "main", start: from, end: to, ...(segment.turnId ? { turnId: segment.turnId } : {}) });
+        }
+      }
+    }
+  }
+  const tail = segments.at(-1);
+  if (blocks.at(-1)!.running && view.tail.main !== null && view.lastAt !== null && tail !== undefined) {
+    for (const [blockIndex, keys] of tail.owners) {
+      if (keys.length === 0) blocks[blockIndex].conductorTail = view.lastAt;
+      for (const key of keys) {
+        const step = stepsOf[blockIndex].get(key);
+        if (step) step.conductorTail = view.lastAt;
+      }
+    }
+  }
+}
+
 export function deriveTimeBuckets(
   state: TimeBucketState,
   options?: {
@@ -938,6 +1205,7 @@ export function deriveTimeBuckets(
     streamOpen?: boolean;
     liveDelegationAgentIds?: ReadonlySet<string>;
     modelMarks?: readonly ModelMark[];
+    appliedEffort?: string | null;
   }
 ): TimeBucketView {
   const firstAt = state.firstAt ?? null;
@@ -946,10 +1214,7 @@ export function deriveTimeBuckets(
   const end = lastAt ?? 0;
   const inherited = state.inheritedBoundaryCount > 0;
 
-  const turnSpansAll: TurnSpan[] = appendListItems(state.turnSpans);
-  if (state.openTurn !== undefined && lastAt !== null) {
-    turnSpansAll.push({ turnId: state.openTurn.turnId, start: state.openTurn.startedAt, end: Math.max(state.openTurn.startedAt, end) });
-  }
+  const turnSpansAll = turnSpansUntil(state, lastAt === null ? null : end);
   const turnUnion = unionSpans(turnSpansAll.map((t) => [t.start, t.end] as Span));
 
   const confirmSpans = state.mainTools.filter((t) => HUMAN_INPUT_WAIT_TOOLS.has(t.toolName)).map((t) => [t.start, t.end] as Span);
@@ -963,7 +1228,7 @@ export function deriveTimeBuckets(
   const confirmUnion = unionSpans(confirmSpans);
   const callUnion = subtractSpans(unionSpans(allMainToolSpans), confirmUnion);
   const nonDelegationToolSpans = state.mainTools
-    .filter((t) => !isSubagentWaitTool(t.toolName))
+    .filter((t) => t.rejectedBeforeRun || !isSubagentWaitTool(t.toolName))
     .map((t) => [t.start, t.end] as Span);
   for (const open of Object.values(state.openTools)) {
     if (open.lane !== "main" || lastAt === null || isSubagentWaitTool(open.toolName)) continue;
@@ -983,6 +1248,7 @@ export function deriveTimeBuckets(
   }
   const agents: AgentSpanView[] = [];
   for (const d of keyedValues(state.delegations)) {
+    if (d.rejectedBeforeRun) continue;
     const toolUseId = d.toolUseId;
     const child = childByToolUseId.get(toolUseId);
     let start = d.startedAt;
@@ -1066,7 +1332,8 @@ export function deriveTimeBuckets(
   }
   const agentSpans = agents.map((a) => [a.start, a.end] as Span);
   const bgSpans = backgroundTasks.map((t) => [t.start, t.end] as Span);
-  const subActiveUnion = unionSpans([...agentSpans, ...subagentBackgroundSpans]);
+  const subagentSpans: Span[] = [...agentSpans, ...subagentBackgroundSpans];
+  const subActiveUnion = unionSpans(subagentSpans);
 
   const whole: Span[] = firstAt !== null && lastAt !== null ? [[firstAt, lastAt]] : [];
   const generateSpans = subtractSpans(turnUnion, unionSpans([...callUnion, ...confirmUnion]));
@@ -1097,7 +1364,7 @@ export function deriveTimeBuckets(
   const subGenerate = agents.reduce((acc, a) => acc + a.generateMs, 0);
   const subTool = agents.reduce((acc, a) => acc + a.toolMs, 0);
   const subSpan = agents.reduce((acc, a) => acc + Math.max(0, a.end - a.start), 0);
-  const subBarMs = subagentBackgroundSpans.reduce((acc, [s0, s1]) => acc + (s1 - s0), subSpan);
+  const subBarMs = subagentSpans.reduce((acc, [s0, s1]) => acc + (s1 - s0), 0);
 
   const intervals: TimeBucketInterval[] = [];
   if (!inherited) {
@@ -1117,12 +1384,13 @@ export function deriveTimeBuckets(
   }
   intervals.sort((a, b) => a.start - b.start || a.end - b.end);
 
-  const allSteps = state.blocks.flatMap(block => (block.steps ?? []).map(step => ({ ...step, closedAt: block.closedAt, blockId: block.blockId, key: `${block.blockId}\n${step.key}`, stepKey: step.key })));
-  const allTransitions = new Map(allSteps.map(step => [step.key, step.transitions]));
+  const selections = responseSelections(state.blocks, turnSpansAll);
+  // A numbered member goes to its item; an unnumbered one to the item selected last at its launch.
   const attribute = (agent: AgentSpanView | BackgroundTaskSpanView, launchedAt: number, blockId: string) => {
-    const step = planStepAt(allSteps.filter(value => value.closedAt === undefined || launchedAt < value.closedAt), allTransitions, launchedAt);
-    agent.blockId = step?.blockId ?? blockId;
-    agent.stepKey = step?.stepKey;
+    const number = "subagent" in agent && !agent.subagent ? undefined : planItemNumberOf(agent.description);
+    const item = launchStep(state.blocks, selections, number, launchedAt);
+    agent.blockId = item === undefined ? blockId : state.blocks[item.blockIndex].blockId;
+    agent.stepKey = item?.key;
   };
   const blocks: RequestBlockView[] = [];
   for (let i = 0; i < state.blocks.length; i++) {
@@ -1153,14 +1421,12 @@ export function deriveTimeBuckets(
     const elapsed = bEnd - b.start;
     const steps: PlanBlockStepView[] = (b.steps ?? []).map(step => {
       const stop = step.startedAt === null ? null : Math.min(step.endedAt ?? end, b.closedAt ?? end);
-      return { key: step.key, title: redactAbsolutePaths(step.title), status: step.status, removed: step.removed,
-        startedAt: step.startedAt, endedAt: step.endedAt, end: stop,
+      return { key: step.key, number: step.number, title: redactAbsolutePaths(step.title), status: step.status, removed: step.removed,
+        startedAt: step.startedAt, endedAt: step.endedAt, end: stop, activeSpans: planStepActiveSpans(step.transitions, Math.min(end, b.closedAt ?? end)),
         durationMs: inherited || stop === null ? null : Math.max(0, stop - step.startedAt!), longest: false, parallel: false,
         ...metrics(step.startedAt, stop ?? bEnd), provisional: running };
     });
-    const activeSpans = (step: PlanBlockStepRecord): Span[] => step.transitions.flatMap((change, index) => change.active
-      ? [[change.at, Math.min(step.transitions[index + 1]?.at ?? end, b.closedAt ?? end)] as Span] : []);
-    const stepSpans = (b.steps ?? []).map(activeSpans);
+    const stepSpans = steps.map(step => step.activeSpans!.map(span => [span.start, span.end] as Span));
     for (let j = 0; j < steps.length; j++) steps[j].parallel = stepSpans.some((spans, k) => k !== j && measureSpans(intersectSpans(stepSpans[j], spans)) > 0);
     const longest = steps.reduce<PlanBlockStepView | undefined>((winner, step) => step.durationMs !== null && (winner?.durationMs == null || step.durationMs > winner.durationMs) ? step : winner, undefined);
     if (longest) longest.longest = true;
@@ -1192,7 +1458,9 @@ export function deriveTimeBuckets(
       confirmMs: measureSpans(intersectSpans(confirmUnion, bspan)),
       replyMs: inherited ? null : measureSpans(intersectSpans(replySpans, bspan)),
       running,
-      ...(b.kind === "plan" ? { goal: b.goal, ...(b.closedAt === undefined ? {} : { closedAt: b.closedAt }), steps, userMessages: b.userMessages ?? [], metrics: { ...metrics(b.start, bEnd), provisional: running } } : {}),
+      metrics: { ...metrics(b.start, bEnd), provisional: running },
+      ...(b.kind === "plan" ? { goal: b.goal, ...(b.closedAt === undefined ? {} : { closedAt: b.closedAt }), steps,
+        userMessages: (b.userMessages ?? []).map(({ at, text }) => ({ at, text })) } : {}),
     });
   }
 
@@ -1217,6 +1485,8 @@ export function deriveTimeBuckets(
   const tail = { main: tailMain, anyOpen: tailAnyOpen };
 
   const view: TimeBucketView = {
+    ...(inherited ? {} : { subagentOnlySpans: subOnlySpans }),
+    ...(state.generationBoundaryAt === undefined ? {} : { generationBoundaryAt: state.generationBoundaryAt }),
     fidelity: state.fidelity,
     inheritedBoundaryCount: state.inheritedBoundaryCount,
     firstAt,
@@ -1252,6 +1522,8 @@ export function deriveTimeBuckets(
     droppedIntervalCount: state.droppedIntervalCount,
     droppedBlockCount: state.droppedBlockCount,
   };
+  attributeConductorIntervals(state, view, turnSpansAll, selections);
+  view.mainModelSpans = deriveMainModelSpans(turnSpansAll, options?.modelMarks ?? state.modelMarks ?? []);
   return view;
 }
 
@@ -1266,46 +1538,148 @@ export function projectWorkBlockTokens(view: TimeBucketView, usage: PlanUsage): 
       const ratio = overlap / Math.max(1, slice.end - slice.start);
       result.tokens += slice.tokens * ratio;
       result.cacheRead += slice.cacheRead * ratio;
+      if (slice.outputTokens !== undefined) result.outputTokens = (result.outputTokens ?? 0) + slice.outputTokens * ratio;
     }
     return result;
   };
-  const byId = new Map(usage.blocks.map(block => [block.blockId, block]));
   const allSlices = usage.blocks.flatMap(block => block.slices);
-  return { ...view, blocks: view.blocks.map(block => {
-    if (block.kind !== "plan") return block;
-    const observed = byId.get(block.blockId);
-    const slices = observed?.slices ?? [];
-    return { ...block, metrics: { ...block.metrics!, tokens: slices.length && observed
-      ? { tokens: observed.tokens, cacheRead: observed.cacheRead } : null },
-      steps: block.steps?.map(step => ({ ...step, tokens: total(allSlices, step.startedAt, step.end ?? block.end) })) };
-  }) };
+  const project = (block: RequestBlockView): RequestBlockView => {
+    const slices = usage.blocks.filter(value => value.blockId === block.blockId).flatMap(value => value.slices)
+      .filter(slice => slice.start >= block.start && (block.closedAt === undefined || slice.start < block.closedAt));
+    const { usageSlices: _previousSlices, ...withoutUsageSlices } = block;
+    const tokens = slices.length
+      ? { tokens: slices.reduce((sum, slice) => sum + slice.tokens, 0), cacheRead: slices.reduce((sum, slice) => sum + slice.cacheRead, 0),
+        ...(slices.some(slice => slice.outputTokens !== undefined) ? { outputTokens: slices.reduce((sum, slice) => sum + (slice.outputTokens ?? 0), 0) } : {}) } : null;
+    return { ...withoutUsageSlices, ...(slices.length ? { usageSlices: slices } : {}), ...(block.metrics ? { metrics: { ...block.metrics, tokens } } : {}),
+      ...(block.kind === "plan" ? { steps: block.steps?.map(step => ({ ...step, tokens: total(allSlices, step.startedAt, step.end ?? block.end) })) } : {}) };
+  };
+  return { ...view, blocks: view.blocks.map(project) };
 }
 
-export function currentWorkBlock(state: TimeBucketState): RequestBlockRecord | undefined { const block = state.blocks.at(-1); return block?.closedAt === undefined ? block : undefined; }
+export function currentWorkBlock<B extends { closedAt?: number }>(source: { blocks: readonly B[] }): B | undefined { const block = source.blocks.at(-1); return block?.closedAt === undefined ? block : undefined; }
+
+export function planItemKeys(block: RequestBlockRecord): string[] {
+  return block.seenSteps ?? (block.steps ?? []).map(step => step.key);
+}
+
+export type NumberedLaunchVerdict = { kind: "allow" } | { kind: "unnumbered"; numbers: number[] } | { kind: "not-in-progress"; number: number };
+
+// While a PLAN has items, a delegation or external run may run only for an item the conductor itself marked in progress;
+// the Host never changes item state for a launch. Plan-tool calls issued earlier in the same assistant message count with
+// the status they send, folded by the same rule as their results.
+export function numberedLaunchVerdict(state: TimeBucketState, description: string | undefined): NumberedLaunchVerdict {
+  // The current assistant message is the one that issued the latest main-lane call; a plan call left open by a cut stream
+  // or an earlier message is not folded.
+  const current = state.mainMessageId;
+  const planned = Object.entries(state.openTools).reduce((next, [toolUseId, tool]) => tool.lane === "main" && tool.taskIntent !== undefined
+    && tool.taskIntent.kind !== "create" && current !== undefined && tool.messageId === current && tool.turnId === state.openTurn?.turnId
+    ? applyPlanTask(next, tool.taskIntent, tool.at, tool.turnId, "", { live: true, toolUseId }) : next, state);
+  const block = currentWorkBlock(planned);
+  if (block?.kind !== "plan") return { kind: "allow" };
+  const listed = (block.steps ?? []).filter(step => !step.removed).map(step => step.number);
+  if (listed.length === 0) return { kind: "allow" };
+  const number = planItemNumberOf(description);
+  if (number === undefined) return { kind: "unnumbered", numbers: listed };
+  const found = planNumberedStep(planned.blocks, number, planned.lastAt ?? Number.POSITIVE_INFINITY);
+  if (found !== undefined && !found.step.removed && found.step.status === "in_progress") return { kind: "allow" };
+  const keys = planItemKeys(block);
+  return found !== undefined || keys.some(key => planItemNumber(keys, key) === number) ? { kind: "not-in-progress", number } : { kind: "unnumbered", numbers: listed };
+}
+
+function launchStep(blocks: readonly RequestBlockRecord[], selections: readonly { at: number; selected: SelectedItem[] }[],
+  number: number | undefined, at: number): SelectedItem | undefined {
+  const numbered = number === undefined ? undefined : planNumberedStep(blocks, number, at);
+  return numbered !== undefined ? { blockIndex: numbered.blockIndex, key: numbered.step.key } : selectionAt(selections, at).at(-1);
+}
+
+function turnSpansUntil(state: TimeBucketState, openEnd: number | null): TurnSpan[] {
+  const turns: TurnSpan[] = appendListItems(state.turnSpans);
+  if (state.openTurn !== undefined && openEnd !== null) {
+    turns.push({ ...state.openTurn, start: state.openTurn.startedAt, end: Math.max(state.openTurn.startedAt, openEnd) });
+  }
+  return turns;
+}
+
+export function inProgressStepOfDelegation(state: TimeBucketState, dispatch: { description: string; launchedAt: number; resumedAt?: number }): number | undefined {
+  const selections = responseSelections(state.blocks, turnSpansUntil(state, Number.POSITIVE_INFINITY));
+  const item = (dispatch.resumedAt === undefined ? undefined : selectionAt(selections, dispatch.resumedAt).at(-1))
+    ?? launchStep(state.blocks, selections, planItemNumberOf(dispatch.description), dispatch.launchedAt);
+  const step = item === undefined ? undefined : state.blocks[item.blockIndex].steps?.find(value => value.key === item.key);
+  return step !== undefined && !step.removed && step.status === "in_progress" ? step.number : undefined;
+}
 
 function retainObserved<T extends object>(measured: T, live: T): T {
   return { ...measured, ...Object.fromEntries(Object.entries(live).filter(([, value]) => value !== null && value !== undefined)) };
 }
 
-function refreshCurrentPlan(measured: RequestBlockView, live: RequestBlockView, provisional: boolean): RequestBlockView {
+// Measured routing up to the cutoff stays: item state changes only at the moment it is observed, so live events after
+// the cutoff cannot reroute earlier time. The live fold supplies what came after the cutoff.
+function measuredBefore<T extends { start: number; end: number }>(list: readonly T[], cutoff: number): T[] {
+  return list.filter(value => value.start < cutoff).map(value => value.end > cutoff ? { ...value, end: cutoff } : value);
+}
+
+// A zero-width entry at or after the cutoff is the live tail decision and is kept.
+function liveAfter<T extends { start: number; end: number }>(list: readonly T[], cutoff: number): T[] {
+  return list.filter(value => value.end > cutoff || value.start === value.end && value.start >= cutoff)
+    .map(value => value.start < cutoff ? { ...value, start: cutoff } : value);
+}
+
+function refreshPlan(measured: RequestBlockView, live: RequestBlockView, provisional: boolean, cutoff = measured.end): RequestBlockView {
   const steps = new Map(measured.steps?.map(step => [step.key, step]));
+  const before = <T extends { start: number; end: number }>(list: readonly T[]): T[] => measuredBefore(list, cutoff);
+  const after = <T extends { start: number; end: number }>(list: readonly T[]): T[] => liveAfter(list, cutoff);
+  const conductorAttribution = measured.conductorAttribution === undefined || live.conductorAttribution === undefined
+    ? live.conductorAttribution ?? measured.conductorAttribution
+    : [...before(measured.conductorAttribution), ...after(live.conductorAttribution)];
+  const mergeIntervals = (previous: readonly TimeBucketInterval[] | undefined, current: readonly TimeBucketInterval[] | undefined): TimeBucketInterval[] => {
+    const conductorIntervals = previous === undefined ? current : [...before(previous), ...after(current ?? [])];
+    const merged: TimeBucketInterval[] = [];
+    for (const interval of [...conductorIntervals ?? []].sort((a, b) => a.start - b.start || a.end - b.end)) {
+      const last = merged.at(-1);
+      if (last?.bucket === interval.bucket && last.turnId === interval.turnId && last.end >= interval.start) last.end = Math.max(last.end, interval.end);
+      else merged.push({ ...interval });
+    }
+    return merged;
+  };
   for (const step of live.steps ?? []) {
     const previous = steps.get(step.key);
-    steps.set(step.key, { ...(previous ? { ...retainObserved(previous, step), longest: step.durationMs === null ? previous.longest : step.longest } : step), provisional });
+    steps.set(step.key, { ...(previous ? { ...retainObserved(previous, step), longest: step.durationMs === null ? previous.longest : step.longest, conductorTail: step.conductorTail } : step),
+      conductorIntervals: mergeIntervals(previous?.conductorIntervals, step.conductorIntervals), provisional });
   }
-  const messages = new Map([...measured.userMessages ?? [], ...live.userMessages ?? []].map(message => [`${message.at}:${message.text}`, message]));
+  const metrics = measured.metrics && live.metrics ? retainObserved(measured.metrics, live.metrics) : live.metrics ?? measured.metrics;
   return { ...retainObserved(measured, live),
-    metrics: { ...(measured.metrics && live.metrics ? retainObserved(measured.metrics, live.metrics) : live.metrics ?? measured.metrics!), provisional },
-    steps: [...steps.values()].map(step => ({ ...step, provisional })), userMessages: [...messages.values()].sort((a, b) => a.at - b.at) };
+    ...(conductorAttribution === undefined ? {} : { conductorAttribution }),
+    conductorIntervals: mergeIntervals(measured.conductorIntervals, live.conductorIntervals),
+    conductorTail: live.conductorTail,
+    ...(metrics === undefined ? {} : { metrics: { ...metrics, provisional } }),
+    ...(measured.kind === "plan" ? { steps: [...steps.values()].map(step => ({ ...step, provisional })),
+      userMessages: live.userMessages?.length ? live.userMessages : measured.userMessages ?? [] } : {}) };
+}
+
+function provisionalBlock(block: RequestBlockView): RequestBlockView {
+  return block.kind === "plan" ? refreshPlan(block, block, true)
+    : { ...block, durationMs: null, generateMs: null, replyMs: null, processingMs: null, strip: null };
 }
 
 export function overlayLiveTimeBucketState(measured: TimeBucketView, live: TimeBucketView): TimeBucketView {
+  const view = overlayLiveTimeBucketStateCore(measured, live);
+  if ((live.generationBoundaryAt ?? 0) > (measured.generationBoundaryAt ?? 0)) return view;
+  const liveSpans = live.mainModelSpans ?? [];
+  const covered = unionSpans(liveSpans.map(span => [span.start, span.end]));
+  const mainModelSpans = [...(measured.mainModelSpans ?? []).flatMap(span =>
+    subtractSpans([[span.start, span.end]], covered).map(([start, end]) => ({ ...span, start, end }))), ...liveSpans];
+  return { ...view, mainModelSpans };
+}
+
+function overlayLiveTimeBucketStateCore(measured: TimeBucketView, live: TimeBucketView): TimeBucketView {
+  if ((live.generationBoundaryAt ?? 0) > (measured.generationBoundaryAt ?? 0)) return live;
+  if ((measured.generationBoundaryAt ?? 0) > (live.generationBoundaryAt ?? 0)) return measured;
   const liveAgents = new Map(live.agents.map((a) => [a.toolUseId, a]));
   const agents: AgentSpanView[] = measured.agents.map((a) => {
     const l = liveAgents.get(a.toolUseId);
     if (l === undefined) return a;
     const attributed = { ...a, blockId: l.blockId, stepKey: l.stepKey };
-    if (l.open === a.open) return attributed;
+    if (l.open === a.open) return l.open ? { ...attributed, end: Math.max(a.end, l.end) } : attributed;
     if (l.open) return { ...attributed, open: true, end: Math.max(a.end, l.end), endSource: "open" };
     return { ...attributed, open: false, end: l.end, endSource: l.endSource };
   });
@@ -1318,7 +1692,7 @@ export function overlayLiveTimeBucketState(measured: TimeBucketView, live: TimeB
     const l = liveBg.get(t.toolUseId);
     if (l === undefined) return t;
     const attributed = { ...t, blockId: l.blockId, stepKey: l.stepKey };
-    if (l.open === t.open) return attributed;
+    if (l.open === t.open) return l.open ? { ...attributed, end: Math.max(t.end, l.end) } : attributed;
     if (l.open) return { ...attributed, open: true, end: Math.max(t.end, l.end), endSource: "open" };
     return { ...attributed, open: false, end: l.end, endSource: l.endSource };
   });
@@ -1332,32 +1706,68 @@ export function overlayLiveTimeBucketState(measured: TimeBucketView, live: TimeB
   ];
   const turnParallel = live.turnOpen && live.tail.main !== "confirm" ? 1 : 0;
   const mergedParallel = turnParallel + agents.filter((a) => a.open).length + backgroundTasks.filter((t) => t.open).length;
-  const blocks: RequestBlockView[] = measured.blocks.map(block => ({ ...block, running: false }));
-  const liveLast = live.blocks[live.blocks.length - 1];
+  let blocks: RequestBlockView[] = measured.blocks.map(block => ({ ...block, running: false }));
+  // Rows route the view's intervals (src/plan-steps.ts#planFrame), so the live part after the measured data reaches them
+  // from the same source as the refreshed block metrics.
+  const horizon = measured.blocks.at(-1)?.end;
+  let intervals = measured.intervals;
+  const liveLast = live.blocks.at(-1);
   if (liveLast !== undefined && (liveLast.running || (live.lastAt ?? 0) > (measured.lastAt ?? 0))) {
-    const currentLast = blocks.at(-1);
-    const sameOpening = currentLast !== undefined && currentLast.kind === liveLast.kind
-      && (currentLast.goal !== undefined ? currentLast.goal === liveLast.goal
-        : liveLast.goal === undefined && (currentLast.text === liveLast.text
-          || currentLast.kind === "plan" && currentLast.steps?.some(step => liveLast.steps?.some(value => value.key === step.key))))
-      && liveLast.start <= (measured.lastAt ?? currentLast.end) && liveLast.end >= currentLast.start;
-    const at = currentLast?.blockId === liveLast.blockId && (currentLast.start === liveLast.start || sameOpening) ? blocks.length - 1 : -1;
-    if (at >= 0 && at === blocks.length - 1 && blocks[at].closedAt === undefined) {
-      const current = blocks[at];
-      const refresh = liveLast.kind === "plan" && current.kind === "plan"
-        && (live.lastAt ?? 0) >= (measured.lastAt ?? 0);
-      const provisional = liveLast.running || (live.lastAt ?? 0) > (measured.lastAt ?? 0);
-      blocks[at] = { ...(refresh ? refreshCurrentPlan(current, liveLast, provisional) : current), start: current.start, anchorAt: current.anchorAt,
-        requestNumber: current.requestNumber ?? liveLast.requestNumber, running: liveLast.running, end: Math.max(current.end, liveLast.end) };
-    } else if (blocks.length === 0 || liveLast.start > blocks[blocks.length - 1].start) {
-      blocks.push(liveLast.kind === "plan" ? refreshCurrentPlan(liveLast, liveLast, true) : { ...liveLast, durationMs: null, generateMs: null, replyMs: null, processingMs: null, strip: null, running: liveLast.running });
-    }
+    const caughtUp = (live.lastAt ?? 0) >= (measured.lastAt ?? 0);
+    const provisional = liveLast.running || (live.lastAt ?? 0) > (measured.lastAt ?? 0);
+    // Block ids name the opening request or call (src/time-buckets.ts#positionalBlockId), so a measured block and its live
+    // fold match by id alone.
+    const liveById = new Map(live.blocks.map(block => [block.blockId, block]));
+    const lastIndex = blocks.length - 1;
+    blocks = blocks.map((block, index) => {
+      const liveBlock = liveById.get(block.blockId);
+      if (liveBlock === undefined) return block;
+      if (liveBlock.kind !== block.kind) return provisionalBlock(liveBlock);
+      if (index === lastIndex) {
+        if (block.closedAt !== undefined) return block;
+        return { ...(caughtUp ? refreshPlan(block, liveBlock, provisional) : block), start: block.start, anchorAt: block.anchorAt,
+          requestNumber: block.requestNumber ?? liveBlock.requestNumber, running: liveBlock.running, end: Math.max(block.end, liveBlock.end) };
+      }
+      // Items of earlier blocks still in progress keep receiving live work after their block's window.
+      if (!caughtUp || horizon === undefined || block.kind !== "plan" || !block.steps?.length) return block;
+      const selected = (liveBlock.conductorAttribution ?? []).some(segment => segment.end > horizon && segment.keys.length > 0);
+      return { ...refreshPlan(block, liveBlock, selected, horizon), start: block.start, anchorAt: block.anchorAt,
+        requestNumber: block.requestNumber ?? liveBlock.requestNumber, running: false, end: block.end };
+    });
+    // A live block the measured view lacks is new. One without an identity cannot be matched, so it is new only once it
+    // starts after everything measured; before that the transcript holds it under its own id.
+    const known = new Set(blocks.map(block => block.blockId));
+    const added = live.blocks.filter(block => !known.has(block.blockId)
+      && (!isPositionalLiveBlockId(block.blockId) || block.start > (measured.lastAt ?? Number.NEGATIVE_INFINITY))).map(provisionalBlock);
+    const ordered = [...blocks, ...added].sort((a, b) => a.start - b.start);
+    // A block lasts until the next one starts; only the last can still run. A block whose end moves takes the live fold's
+    // numbers, which were derived with that end, or none.
+    blocks = ordered.map((block, index) => {
+      const next = ordered[index + 1];
+      if (next === undefined) return block;
+      if (block.end <= next.start) return { ...block, running: false };
+      const liveBlock = liveById.get(block.blockId);
+      const moved = liveBlock !== undefined && liveBlock.end <= next.start ? provisionalBlock(liveBlock) : { ...provisionalBlock(block), durationMs: null };
+      return { ...moved, end: Math.min(moved.end, next.start), running: false };
+    });
+    if (caughtUp && horizon !== undefined) intervals = [...measuredBefore(measured.intervals, horizon), ...liveAfter(live.intervals, horizon)];
   }
+  // A span the live fold placed in a block the view does not show keeps its measured placement, or is placed by time.
+  const shown = new Set(blocks.map(block => block.blockId));
+  const measuredSpans = new Map<string, { blockId?: string; stepKey?: string }>([...measured.agents, ...measured.backgroundTasks].map(span => [span.toolUseId, span]));
+  const placed = <T extends { toolUseId: string; blockId?: string; stepKey?: string }>(span: T): T => {
+    if (span.blockId === undefined || shown.has(span.blockId)) return span;
+    const { blockId: _blockId, stepKey: _stepKey, ...unplaced } = span;
+    const kept = measuredSpans.get(span.toolUseId);
+    return { ...unplaced, ...(kept?.blockId === undefined ? {} : { blockId: kept.blockId }), ...(kept?.stepKey === undefined ? {} : { stepKey: kept.stepKey }) } as T;
+  };
   return {
     ...measured,
-    agents,
-    backgroundTasks,
+    intervals,
+    agents: agents.map(placed),
+    backgroundTasks: backgroundTasks.map(placed),
     blocks,
+    subagentOnlySpans: live.subagentOnlySpans ?? measured.subagentOnlySpans,
     agentCount: agents.length,
     currentParallel: mergedParallel,
     maxConcurrency: Math.max(measured.maxConcurrency, sweepMax(mergedSpans), mergedParallel),

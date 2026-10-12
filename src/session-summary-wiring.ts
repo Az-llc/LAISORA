@@ -156,7 +156,7 @@ export class SessionSummaryWiring {
       output.appendLine(`[${this.host.title}] 要約を開始します（トークンを消費します・モデル: ${modelId}）`);
       const result = await generateSessionSummaryViaSdk({
         modelId,
-        apiKeyPolicy: normalizeApiKeyPolicy(getLaisoraConfiguration().get("claude.apiKeyPolicy", "inherit")),
+        apiKeyPolicy: normalizeApiKeyPolicy(getLaisoraConfiguration().get<string>("claude.apiKeyPolicy")!),
         cwd: resolveSessionCwd(this.host) ?? process.cwd(),
         prompt: (naming ? buildSessionNamePrompt : buildSummaryPrompt)(buildSessionDigest(userTexts, toolCalls, agentCount)),
         signal: abort.signal,

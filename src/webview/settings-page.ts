@@ -2,16 +2,16 @@ import { createAccentSettings } from "./accent-settings";
 import { bindUserLabel, setDisplayName } from "./user-label";
 import { DISPLAY_NAME_MAX, displayNameLength, normalizeDisplayName } from "../display-name";
 import { normalizeSystemAppExtension } from "../file-link-open-mode";
-import { EXECUTORS, DEFAULT_EXECUTOR, canonicalExecutorEfforts, executorModelList, modelSelectionState, isExecutorId, isExternalExecutorId, rowEfforts, rowComplete, type ExecutorRow } from "../orchestration-executors";
-import { modelListStatusText } from "../model-display-name";
-import { emptyOrchestrationRole, externalExecutorName, isExternalModel, isExternalTimeout, orchestrationVariants, orchestrationExternalTargets } from "../orchestration-roster";
-import { type OrchestrationSettingRow } from "../orchestration-roster";
+import { EVENT_LIMIT_DEFAULT, EVENT_LIMIT_MIN, EVENT_LIMIT_MAX, isEventLimit } from "../event-limits";
+import { EXECUTORS, EXTERNAL_EXECUTORS, DEFAULT_EXECUTOR, canonicalExecutorEfforts, claudeModelIdLabel, executorModelList, modelSelectionState, isExecutorId, isExternalExecutorId, rowEfforts, rowComplete, type ExecutorId, type ExecutorRow, type ExternalModels } from "../orchestration-executors";
+import { findModelRow, modelListStatusText, shortModelDisplayName } from "../model-display-name";
+import { resolveOrchestrationCacheTtl, emptyOrchestrationRole, externalExecutorName, isExternalModel, isExternalTimeout, orchestrationVariants, orchestrationExternalTargets } from "../orchestration-roster";
+import { type OrchestrationSettingRow, type RecommendedRosterChange } from "../orchestration-roster";
 import * as l10n from "@vscode/l10n";
+import { uiLocale } from "./l10n";
+import { CLAUDE_MODEL_PRICES, PROMPT_CACHE_PRICES_CHECKED_ON, PROMPT_CACHE_WRITE_MULTIPLIER, type TokenPrices } from "../claude-prices";
 import {
   FILE_LINK_BOOLEAN_SETTINGS,
-  normalizeProfileSources,
-  PROFILE_SOURCES,
-  type ProfileSource,
   isHostToSettingsPage,
   type ApiKeyPolicy,
   type ComposerSendKey,
@@ -24,6 +24,27 @@ import {
 declare function acquireVsCodeApi(): { postMessage(message: SettingsPageToHost): void; getState(): { category?: string } | undefined; setState(state: { category: string }): void };
 
 const vscode = acquireVsCodeApi();
+
+function usesClaudeUsage(row: ExecutorRow): boolean {
+  return EXECUTORS[row.executor].kind === "agent";
+}
+
+export type RosterPriceRow = { readonly name: string; readonly aboveTokens?: number; readonly prices: readonly number[] };
+
+export function deriveRosterPriceRows(enabled: boolean, agents: readonly OrchestrationSettingRow[], externalModels: ExternalModels): RosterPriceRow[] {
+  if (!enabled) return [];
+  const used = new Set(agents.filter((entry) => entry.enabled).flatMap((entry) => entry.rows)
+    .filter((row) => usesClaudeUsage(row) && rowComplete(row, externalModels))
+    .map((row) => {
+      const list = externalModels[row.executor];
+      const resolved = findModelRow(list.state === "ok" ? list.models : [], row.model)?.resolvedModel ?? row.model;
+      return shortModelDisplayName(claudeModelIdLabel(resolved));
+    }));
+  const line = (name: string, price: TokenPrices, aboveTokens?: number): RosterPriceRow => ({ name, aboveTokens,
+    prices: [price.input, price.input * PROMPT_CACHE_WRITE_MULTIPLIER["5m"], price.input * PROMPT_CACHE_WRITE_MULTIPLIER["1h"], price.read, price.output] });
+  return Object.entries(CLAUDE_MODEL_PRICES).filter(([name]) => used.has(name))
+    .flatMap(([name, price]) => [line(name, price), ...(price.overLongPrompt ? [line(name, price.overLongPrompt, price.overLongPrompt.aboveTokens)] : [])]);
+}
 
 type SettingsState = Extract<HostToSettingsPage, { type: "settingsState" }>;
 
@@ -85,6 +106,18 @@ function switchButton(id: string): HTMLButtonElement {
   return button;
 }
 
+function handleSegmentedArrow(event: KeyboardEvent, radios: HTMLButtonElement[], activate: (radio: HTMLButtonElement) => void, canNavigate: () => boolean = () => true): void {
+  if (event.ctrlKey || event.metaKey || event.altKey) return;
+  const step = event.key === "ArrowRight" || event.key === "ArrowDown" ? 1 : event.key === "ArrowLeft" || event.key === "ArrowUp" ? -1 : 0;
+  if (step === 0) return;
+  event.preventDefault();
+  const from = radios.findIndex((radio) => radio === document.activeElement);
+  if (from < 0 || !canNavigate()) return;
+  const target = radios[(from + step + radios.length) % radios.length];
+  target.focus();
+  activate(target);
+}
+
 function select<V extends string>(options: Array<[V, string]>): HTMLSelectElement {
   const el = element("select", "settings-select");
   const unknown = element("option", "settings-option-unknown", "");
@@ -124,6 +157,7 @@ const settingsCategories = [
   { key: "general", title: l10n.t("General") },
   { key: "files", title: l10n.t("File links") },
   { key: "roster", title: l10n.t("Agent roster") },
+  { key: "cli", title: l10n.t("CLI") },
 ].map((category, index) => {
   const button = element("button", "settings-tab");
   button.type = "button";
@@ -200,7 +234,7 @@ settingsBody.append(settingsContent, settingsToc);
 settingsMain.append(settingsPageHead, settingsBody);
 settingsShell.append(settingsNav, settingsMain);
 root.appendChild(settingsShell);
-const [generalCategory, fileCategory, rosterCategory] = settingsCategories.map((category) => category.panel);
+const [generalCategory, fileCategory, rosterCategory, cliCategory] = settingsCategories.map((category) => category.panel);
 const accentCard = section(generalCategory, l10n.t("Appearance"));
 const displayNameField = element("div", "settings-name-field");
 const displayNameInput = element("input", "settings-input settings-name-input");
@@ -354,7 +388,7 @@ const renderAccent = createAccentSettings(accentCard, (setting, value) => {
 const chatCard = section(generalCategory, l10n.t("Chat"));
 const learningCard = section(generalCategory, l10n.t("Learning"));
 const learningSwitch = switchButton("setting-learning-enabled");
-const learningText = row(learningCard, l10n.t("Enable learning"), l10n.t("Turning learning off stops delivery in running conversations. Turning it on applies from the next conversation. Recording and research remain available."), learningSwitch);
+const learningText = row(learningCard, l10n.t("Enable learning"), l10n.t("Turning learning off stops delivery in running conversations. Turning it on applies from the next conversation. Recording remains available."), learningSwitch);
 
 const sendKeySelect = select<ComposerSendKey>([
   ["enter", "Enter"],
@@ -413,6 +447,28 @@ const restoreText = row(
   l10n.t("Reopen the conversation tabs that were open when the window was last closed or reloaded. Tabs that never sent a message are not restored."),
   restoreSwitch
 );
+const eventLimitInput = element("input", "settings-input");
+eventLimitInput.id = "setting-event-limit";
+eventLimitInput.type = "number";
+eventLimitInput.min = String(EVENT_LIMIT_MIN);
+eventLimitInput.max = String(EVENT_LIMIT_MAX);
+eventLimitInput.step = "1";
+eventLimitInput.required = true;
+eventLimitInput.disabled = true;
+const eventLimitText = row(chatCard, l10n.t("Events kept per conversation"), l10n.t("The official Claude Code VS Code extension keeps about 600 chat rows. LAISORA keeps more because SUMMARY, ANALYSIS and LLM analysis read the log. Higher values use more memory and make long conversations slower. Events older than the limit drop out of the live log."), eventLimitInput);
+let pendingEventLimit: number | null = null;
+eventLimitInput.addEventListener("change", () => {
+  const value = eventLimitInput.valueAsNumber;
+  if (pendingEventLimit !== null) return;
+  if (!isEventLimit(value)) {
+    eventLimitInput.reportValidity();
+    return;
+  }
+  pendingEventLimit = nextRequestId();
+  eventLimitInput.disabled = true;
+  post({ type: "setEventLimit", requestId: pendingEventLimit, value });
+});
+
 const autoContinueSwitch = switchButton("setting-auto-continue-usage-limit");
 row(chatCard, l10n.t("Resume automatically when the usage limit resets"), l10n.t("When the claude.ai usage limit stops a conversation, continue it automatically after the limit resets. The same setting is used by Claude Code in the terminal."), autoContinueSwitch);
 
@@ -556,8 +612,169 @@ const orchestrationSwitch = switchButton("setting-orchestration-enabled");
 const orchestrationText = row(orchestrationCard, l10n.t("Enable the agent roster"), l10n.t("Changes apply from the next session. The roster of running conversations will not change."), orchestrationSwitch);
 const orchestrationNote = orchestrationText.querySelector<HTMLElement>(".settings-row-description")!;
 orchestrationNote.id = "orchestration-note";
+const recommendButton = element("button", "settings-segment", l10n.t("Run"));
+recommendButton.id = "setting-recommended-roster";
+recommendButton.type = "button";
+recommendButton.disabled = true;
+recommendButton.setAttribute("aria-expanded", "false");
+const recommendText = row(orchestrationCard, l10n.t("Roster suggestion"), "", recommendButton);
+const recommendSame = element("span", "settings-row-description", l10n.t("The roster already matches the suggestion."));
+recommendSame.id = "setting-recommended-same";
+recommendSame.hidden = true;
+recommendButton.before(recommendSame);
+const recommendPanel = element("div", "settings-recommend");
+recommendPanel.id = "setting-recommended-panel";
+recommendPanel.hidden = true;
+recommendPanel.setAttribute("role", "region");
+const recommendHeading = element("div", "l-label", l10n.t("Review the changes"));
+recommendHeading.id = "setting-recommended-heading";
+recommendPanel.setAttribute("aria-labelledby", recommendHeading.id);
+recommendButton.setAttribute("aria-controls", recommendPanel.id);
+const recommendBody = element("div", "settings-recommend-scroll");
+const recommendNote = element("p", "settings-row-description", l10n.t("Rows other than Claude are not changed."));
+const recommendApply = element("button", "settings-segment settings-primary", l10n.t("Confirm"));
+recommendApply.id = "setting-recommended-apply";
+recommendApply.type = "button";
+const recommendCancel = element("button", "settings-segment", l10n.t("Not now"));
+recommendCancel.id = "setting-recommended-cancel";
+recommendCancel.type = "button";
+const recommendActions = element("div", "settings-recommend-actions");
+recommendActions.append(recommendApply, recommendCancel);
+recommendPanel.append(recommendHeading, recommendBody, recommendNote, recommendActions);
+orchestrationCard.appendChild(recommendPanel);
+let recommendSource: string | null = null;
+let recommendRevision: string | null = null;
+let pendingRecommend: number | null = null;
+function requestRecommendation(): void {
+  if (!current) return;
+  recommendSource = JSON.stringify(current.orchestrationAgents);
+  post({ type: "proposeRecommendedRoster" });
+}
+function closeRecommendation(): void {
+  recommendSource = null;
+  recommendRevision = null;
+  recommendPanel.hidden = true;
+  recommendButton.setAttribute("aria-expanded", "false");
+}
+recommendButton.addEventListener("click", () => {
+  if (recommendButton.disabled) return;
+  recommendButton.setAttribute("aria-expanded", "true");
+  requestRecommendation();
+});
+recommendCancel.addEventListener("click", () => { closeRecommendation(); recommendButton.focus(); });
+recommendApply.addEventListener("click", () => {
+  if (!current || pendingOrchestration !== null || recommendApply.disabled || recommendRevision === null) return;
+  const revision = recommendRevision;
+  recommendRevision = null;
+  const requestId = nextRequestId();
+  pendingOrchestration = requestId;
+  pendingRecommend = requestId;
+  settingsRosterFocusId = recommendButton.id;
+  lockOrchestration();
+  post({ type: "applyRecommendedRoster", requestId, revision });
+});
+const RECOMMEND_CHANGE_TEXT: Record<RecommendedRosterChange["change"], string> = {
+  same: l10n.t("No change"), add: l10n.t("Add"), remove: l10n.t("Drop"), change: l10n.t("Change it"),
+};
+function renderRecommendation(revision: string, changes: readonly RecommendedRosterChange[]): void {
+  if (recommendSource === null || !current) return;
+  recommendRevision = revision;
+  if (changes.every((change) => change.change === "same")) {
+    closeRecommendation();
+    return;
+  }
+  const claudeChoices = EXECUTORS.claude.models(current.externalModels.claude);
+  const modelLabel = (model: string) => claudeChoices?.find((choice) => choice.model === model)?.label ?? model;
+  const efforts = (list: readonly string[]) => list.length ? list.join(" · ") : "―";
+  const table = element("table", "settings-recommend-table");
+  const head = element("tr", "");
+  for (const title of ["Role", "Model", l10n.t("Now"), "", l10n.t("Suggested"), l10n.t("Difference")]) {
+    const cell = element("th", "", title);
+    cell.scope = "col";
+    head.appendChild(cell);
+  }
+  const body = element("tbody", "");
+  for (const change of changes) {
+    const line = element("tr", change.change === "remove" ? "settings-recommend-removed" : "");
+    const struck = (text: string) => {
+      const cell = element("td", "");
+      cell.appendChild(change.change === "remove" ? element("s", "", text) : document.createTextNode(text));
+      return cell;
+    };
+    line.append(element("td", "settings-mono", change.role), struck(modelLabel(change.model)), struck(efforts(change.current)),
+      element("td", "settings-recommend-muted", "→"), element("td", "", efforts(change.recommended)),
+      element("td", change.change === "same" ? "settings-recommend-muted" : "", RECOMMEND_CHANGE_TEXT[change.change]));
+    body.appendChild(line);
+  }
+  const thead = element("thead", "");
+  thead.appendChild(head);
+  table.append(thead, body);
+  recommendBody.replaceChildren(table);
+  recommendPanel.hidden = false;
+}
+function renderRecommendedState(state: SettingsState): void {
+  if (pendingRecommend !== null && pendingRecommend === state.replyTo) {
+    pendingRecommend = null;
+    if (!state.writeFailure && recommendRevision === null) closeRecommendation();
+  }
+  const busy = pendingOrchestration !== null && pendingOrchestration !== state.replyTo;
+  const same = state.recommendedRosterSame === true;
+  recommendSame.hidden = !same || !state.orchestrationEnabled;
+  recommendButton.setAttribute("aria-describedby", same ? recommendSame.id : recommendText.querySelector(".settings-row-description")!.id);
+  if (same) closeRecommendation();
+  recommendButton.disabled = !state.orchestrationEnabled || busy || same;
+  recommendApply.disabled = !state.orchestrationEnabled || busy;
+  recommendCancel.disabled = false;
+  if (!state.orchestrationEnabled) closeRecommendation();
+  else if (recommendSource !== null && recommendSource !== JSON.stringify(state.orchestrationAgents)) requestRecommendation();
+}
 const rosterRows = element("div", "settings-roster-rows");
-rosterCategory.appendChild(rosterRows);
+const rosterCacheNote = element("p", "settings-row-description");
+rosterCacheNote.hidden = true;
+const rosterPricePanel = element("div", "settings-recommend settings-price-table");
+rosterPricePanel.id = "setting-roster-prices";
+rosterPricePanel.hidden = true;
+rosterCategory.append(rosterCacheNote, rosterPricePanel, rosterRows);
+const tokenCount = (value: number) => new Intl.NumberFormat(uiLocale(), { notation: "compact" }).format(value);
+const priceNumber = (value: number) => value.toLocaleString("en-US", { minimumFractionDigits: Number.isInteger(value) ? 0 : 2, maximumFractionDigits: 4 });
+function renderRosterPrices(state: SettingsState): void {
+  const prices = deriveRosterPriceRows(state.orchestrationEnabled, state.orchestrationAgents, state.externalModels);
+  rosterCacheNote.textContent = l10n.t("Prompt cache applies to Claude agents only. 1 hour bills cache writes at {0}x the input price (5 min: {1}x); reads cost the same for both. {2}", PROMPT_CACHE_WRITE_MULTIPLIER["1h"], PROMPT_CACHE_WRITE_MULTIPLIER["5m"],
+    prices.length ? l10n.t("The table below shows official prices as of {0}.", PROMPT_CACHE_PRICES_CHECKED_ON) : l10n.t("Official prices as of {0}.", PROMPT_CACHE_PRICES_CHECKED_ON));
+  rosterPricePanel.hidden = prices.length === 0;
+  if (!prices.length) { rosterPricePanel.replaceChildren(); return; }
+  const heading = element("div", "l-label", l10n.t("Prices of the models in the roster (USD per 1M tokens)"));
+  heading.id = "setting-roster-prices-heading";
+  const table = element("table", "settings-recommend-table");
+  table.setAttribute("aria-labelledby", heading.id);
+  const head = element("tr", "");
+  const headers: Array<[string, string?]> = [["Model"], [l10n.t("Input")], [l10n.t("Write"), l10n.t("5 min")], [l10n.t("Write"), l10n.t("1 hour")], [l10n.t("Read")], [l10n.t("Output")]];
+  headers.forEach(([title, sub], column) => {
+    const cell = element("th", column ? "settings-price-number" : "", title);
+    cell.scope = "col";
+    if (sub) cell.append(" ", element("span", "settings-price-sub", sub));
+    head.appendChild(cell);
+  });
+  const thead = element("thead", "");
+  thead.appendChild(head);
+  const body = element("tbody", "");
+  for (const price of prices) {
+    const line = element("tr", "");
+    const name = element("th", price.aboveTokens ? "settings-price-tier" : "", price.aboveTokens ? l10n.t("Over {0} tokens", tokenCount(price.aboveTokens)) : price.name);
+    name.scope = "row";
+    line.appendChild(name);
+    for (const value of price.prices) line.appendChild(element("td", "settings-price-number", priceNumber(value)));
+    body.appendChild(line);
+  }
+  table.append(thead, body);
+  const scroll = element("div", "settings-recommend-scroll");
+  scroll.appendChild(table);
+  const externalNote = l10n.t("{0} rows do not use Claude usage, so they are not in the table.",
+    new Intl.ListFormat(uiLocale(), { type: "conjunction" }).format(EXTERNAL_EXECUTORS.map((definition) => definition.displayName)));
+  const footnote = element("p", "settings-row-description", prices.reduceRight((rest, price) => price.aboveTokens
+    ? l10n.t("{0} uses the lower row's prices when the prompt exceeds {1} tokens. {2}", price.name, tokenCount(price.aboveTokens), rest) : rest, externalNote));
+  rosterPricePanel.replaceChildren(heading, scroll, footnote);
+}
 const addGroup = element("div", "settings-roster-actions");
 const roleField = element("div", "settings-role-field");
 const roleInput = element("input", "settings-input");
@@ -568,11 +785,11 @@ const roleLabel = element("label", "settings-row-label", "Role");
 roleLabel.htmlFor = roleInput.id;
 roleLabel.id = "setting-new-role-label";
 roleInput.setAttribute("aria-labelledby", roleLabel.id);
-const addButton = element("button", "settings-segment", l10n.t("Add role"));
+const addButton = element("button", "settings-segment", l10n.t("Add"));
 addButton.id = "setting-add-role";
 addButton.type = "button";
 addButton.disabled = true;
-const defaultsButton = element("button", "settings-segment", l10n.t("Restore defaults"));
+const defaultsButton = element("button", "settings-segment", l10n.t("Delete added roles"));
 defaultsButton.id = "setting-restore-roster";
 defaultsButton.type = "button";
 defaultsButton.disabled = true;
@@ -580,9 +797,9 @@ const roleError = element("p", "settings-row-note");
 roleError.id = "setting-role-error";
 roleError.setAttribute("role", "alert");
 roleInput.setAttribute("aria-describedby", roleError.id);
-roleField.append(roleLabel, roleInput, roleError);
+roleField.append(roleLabel, roleInput);
 addGroup.append(roleField, addButton, defaultsButton);
-rosterCategory.appendChild(addGroup);
+rosterCategory.append(addGroup, roleError);
 const policyCard = element("div", "settings-card settings-policy-card");
 const policyInput = element("textarea", "settings-input settings-policy");
 policyInput.id = "setting-conductor-policy";
@@ -604,55 +821,8 @@ const policyCounter = element("p", "settings-muted");
 policyCounter.id = "setting-conductor-policy-counter";
 policyCounter.setAttribute("aria-live", "polite");
 policyInput.setAttribute("aria-describedby", `${policyHelp.id} ${policyProposal.id} ${policyCounter.id}`);
-const researchBlock = element("div", "settings-research");
-researchBlock.setAttribute("role", "group");
-researchBlock.setAttribute("aria-labelledby", "setting-research-text");
-const researchText = element("p", "settings-research-text");
-researchText.id = "setting-research-text";
-const researchMissing = element("button", "settings-segment", l10n.t("Research"));
-researchMissing.id = "setting-research-missing";
-researchMissing.type = "button";
-researchMissing.addEventListener("click", () => requestResearch(current?.researchTargets ?? []));
-const effortProposal = element("button", "settings-segment", l10n.t("Suggest efforts"));
-effortProposal.id = "setting-suggest-efforts";
-effortProposal.type = "button";
-effortProposal.addEventListener("click", () => requestResearch(current?.researchTargets ?? [], "effort"));
-const researchActions = element("div", "settings-detection-header");
-researchActions.append(researchText, researchMissing, effortProposal);
-const researchReason = element("p", "settings-muted");
-researchReason.id = "setting-research-reason";
-const effortReason = element("p", "settings-muted");
-effortReason.id = "setting-effort-reason";
-const researchUsage = element("p", "settings-muted", l10n.t("Research opens a new conversation tab and uses model usage there."));
-researchUsage.id = "setting-research-usage";
-const researchSources = element("div", "settings-research-sources");
-researchSources.setAttribute("role", "group");
-const researchSourcesLabel = element("span", "settings-muted", l10n.t("Research sources"));
-researchSourcesLabel.id = "setting-research-sources-label";
-researchSources.setAttribute("aria-labelledby", researchSourcesLabel.id);
-const researchSourcesNote = element("p", "settings-muted", l10n.t("At least one source is required, so the last source cannot be turned off."));
-researchSourcesNote.id = "setting-research-sources-note";
-let pendingSources: number | null = null;
-const sourceLabels: Record<ProfileSource, string> = { official: l10n.t("Official material"), artificialAnalysis: "Artificial Analysis" };
-const sourceChips = PROFILE_SOURCES.map(source => {
-  const chip = element("button", "settings-segment settings-chip");
-  chip.id = `setting-research-source-${source}`;
-  chip.type = "button";
-  chip.dataset.source = source;
-  chip.addEventListener("click", () => {
-    if (!current || pendingSources !== null) return;
-    const sources = normalizeProfileSources(current.profileSources);
-    if (sources.length === 1 && sources.includes(source)) return;
-    const next = sources.includes(source) ? sources.filter(item => item !== source) : [...sources, source];
-    pendingSources = nextRequestId();
-    post({ type: "setProfileSources", requestId: pendingSources, sources: next });
-    renderProfileResearch(current);
-  });
-  return chip;
-});
-researchSources.append(researchSourcesLabel, ...sourceChips);
 policyCard.append(policyHeader, policyHelp, policyInput, policyProposal, policyCounter);
-renderPolicyCounter();
+renderPolicyCounter("", "");
 const instructionDetails = element("details", "settings-instruction-details");
 const instructionPreview = element("pre", "settings-instruction-preview");
 instructionPreview.id = "setting-conductor-preview";
@@ -674,52 +844,22 @@ externalRecheck.type = "button";
 externalRecheck.disabled = true;
 externalRecheck.addEventListener("click", () => post({ type: "recheckExternalExecutors" }));
 detectionHeader.append(externalHeading, externalRecheck);
-function requestResearch(targets: string[], purpose?: "effort"): void {
-  if (targets.length) post({ type: "researchModelProfiles", targets, ...(purpose ? { purpose } : {}) });
-}
-function renderProfileResearch(state: SettingsState): void {
-  if (pendingSources === state.replyTo) pendingSources = null;
-  const sources = normalizeProfileSources(state.profileSources);
-  sourceChips.forEach((chip, index) => {
-    const source = PROFILE_SOURCES[index], pressed = sources.includes(source);
-    chip.textContent = (pressed ? "✓ " : "") + sourceLabels[source];
-    chip.setAttribute("aria-pressed", String(pressed));
-    chip.disabled = pendingSources !== null;
-    if (pressed && sources.length === 1) {
-      chip.setAttribute("aria-disabled", "true");
-      chip.setAttribute("aria-describedby", researchSourcesNote.id);
-    } else {
-      chip.removeAttribute("aria-disabled");
-      chip.removeAttribute("aria-describedby");
-    }
-  });
-  researchBlock.setAttribute("aria-labelledby", state.researchText ? researchText.id : researchSourcesLabel.id);
-  researchText.textContent = state.researchText ?? "";
-  researchMissing.disabled = !!state.researchUnavailable || !(state.researchTargets?.length);
-  if (state.researchUnavailable) researchMissing.title = state.researchUnavailable;
-  else researchMissing.removeAttribute("title");
-  researchMissing.setAttribute("aria-describedby", [researchText.id,
-    state.researchUnavailable ? researchReason.id : !researchMissing.disabled ? researchUsage.id : ""].filter(Boolean).join(" "));
-  const effortUnavailable = state.researchUnavailable || state.effortUnavailable;
-  effortProposal.disabled = researchMissing.disabled || !!effortUnavailable;
-  if (effortUnavailable) effortProposal.title = effortUnavailable;
-  else effortProposal.removeAttribute("title");
-  effortProposal.setAttribute("aria-describedby", [researchMissing.getAttribute("aria-describedby"), state.effortUnavailable ? effortReason.id : ""].filter(Boolean).join(" "));
-  effortReason.textContent = state.effortUnavailable ?? "";
-  researchReason.textContent = state.researchUnavailable ?? "";
-  researchBlock.replaceChildren(...(state.researchText
-    ? [researchActions, ...(state.effortUnavailable ? [effortReason] : []), ...(state.researchUnavailable ? [researchReason] : !researchMissing.disabled ? [researchUsage] : [])] : []),
-    researchSources, ...(sources.length === 1 ? [researchSourcesNote] : []));
-  policyCard.appendChild(researchBlock);
-}
 const detectionControls = Object.values(EXECUTORS).map(({ id: executor }) => {
   const badge = element("span", "settings-detection-badge");
   badge.id = `external-status-${executor}`;
-  const text = row(detectionCard, externalExecutorName(executor), "", badge);
+  const autoUpdate = switchButton(`setting-${executor}-auto-update`);
+  const switchName = l10n.t("Update {0} automatically", externalExecutorName(executor));
+  autoUpdate.title = switchName;
+  const text = row(detectionCard, externalExecutorName(executor), "", autoUpdate);
   text.parentElement!.id = `external-detection-${executor}`;
+  const nameLine = element("div", "settings-cli-name");
+  text.querySelector("label")!.replaceWith(nameLine);
+  nameLine.append(element("span", "settings-row-label", externalExecutorName(executor)), badge);
+  autoUpdate.removeAttribute("aria-labelledby");
+  autoUpdate.setAttribute("aria-label", switchName);
   const modelNote = element("div", "settings-row-description settings-model-list-note");
   text.appendChild(modelNote);
-  return { executor, badge, description: text.querySelector<HTMLElement>(".settings-row-description")!, modelNote };
+  return { executor, badge, autoUpdate, text, description: text.querySelector<HTMLElement>(".settings-row-description")!, modelNote };
 });
 const timeoutGroup = element("div", "settings-timeout-control");
 timeoutGroup.id = "setting-timeout-group";
@@ -735,8 +875,8 @@ const timeoutText = row(detectionCard, l10n.t("Wait limit per run"), l10n.t("Ext
 timeoutText.querySelector("label")!.htmlFor = externalTimeout.id;
 externalTimeout.setAttribute("aria-labelledby", timeoutText.querySelector("label")!.id);
 externalTimeout.setAttribute("aria-describedby", timeoutText.querySelector(".settings-row-description")!.id);
-externalBlock.append(detectionHeader, element("p", "settings-row-description settings-environment-help", l10n.t("CLIs installed on this PC. Used by the Claude / Antigravity / Codex rows in the agent roster.")), detectionCard);
-rosterCategory.appendChild(externalBlock);
+externalBlock.append(detectionHeader, element("p", "settings-row-description settings-environment-help", l10n.t("CLIs installed on this PC. Conversations use Claude; agent roster rows can also use Antigravity and Codex. With a row's switch on, LAISORA updates that CLI in the background once a conversation is ready and no turn is running (Antigravity and Codex also wait for external runs to finish). Claude Code: native install only, following its own update settings. Codex and Antigravity: only the copy from their own installer.")), detectionCard);
+cliCategory.appendChild(externalBlock);
 externalTimeout.addEventListener("change", () => {
   const value = Number(externalTimeout.value);
   if (isExternalTimeout(value)) writeOrchestration("externalTimeoutMinutes", value);
@@ -769,19 +909,21 @@ function renderExternal(state: SettingsState): void {
   }
   externalRecheck.disabled = Object.values(EXECUTORS).some(({ id }) => state.externalDetection[id].state === "checking"
     || state.externalModels[id].state === "checking" || state.externalModels[id].state === "ok" && state.externalModels[id].refresh === "checking");
-  renderProfileResearch(state);
   externalTimeout.disabled = false;
   externalTimeout.value = String(state.externalTimeoutMinutes);
 }
 let pendingOrchestration: number | null = null;
 let settingsRosterFocusId: string | undefined;
+function orchestrationFocusId(): string | undefined {
+  return [rosterCategory, cliCategory].some((category) => category.contains(document.activeElement)) ? document.activeElement?.id : undefined;
+}
 const settingsRosterDrafts = new Map<string, ExecutorRow>();
 
 function writeOrchestration(setting: "enabled" | "agents" | "conductorPolicy" | "externalTimeoutMinutes", value: unknown): void {
   if (!current || pendingOrchestration !== null) return;
   const requestId = nextRequestId();
   pendingOrchestration = requestId;
-  settingsRosterFocusId = rosterCategory.contains(document.activeElement) ? document.activeElement?.id : undefined;
+  settingsRosterFocusId = orchestrationFocusId();
   lockOrchestration();
   post({ type: "setOrchestrationSetting", requestId, setting, value });
 }
@@ -790,6 +932,7 @@ function writeRoster(rows: readonly OrchestrationSettingRow[]): void {
 }
 function lockOrchestration(): void {
   if (pendingOrchestration !== null) {
+    externalTimeout.disabled = true;
     rosterCategory.querySelectorAll<HTMLButtonElement | HTMLInputElement | HTMLTextAreaElement | HTMLSelectElement>("button, input, textarea, select").forEach((control) => { control.disabled = true; });
   }
 }
@@ -798,9 +941,9 @@ function settingsHiddenLabel(control: HTMLElement, title: string): HTMLLabelElem
   label.htmlFor = control.id;
   return label;
 }
-function renderPolicyCounter(text = policyInput.value): void {
+function renderPolicyCounter(text = policyInput.value, defaultPolicy = current?.conductorPolicyDefault ?? ""): void {
   const count = Array.from(text).length;
-  const warning = count > 1500;
+  const warning = count > 1500 && count > Array.from(defaultPolicy).length;
   policyCounter.classList.toggle("settings-policy-warning", warning);
   policyCounter.textContent = l10n.t("{0} characters", count)
     + (warning ? " " + l10n.t("Long policies are sent with every conversation start; keep it short.") : "");
@@ -819,14 +962,17 @@ function requestInstructionPreview(): void {
 }
 
 function renderOrchestration(state: SettingsState): void {
+  renderRecommendedState(state);
   if (pendingOrchestration === state.replyTo) pendingOrchestration = null;
   for (const role of settingsRosterDrafts.keys()) {
     if (!state.orchestrationEnabled || !state.orchestrationAgents.some((entry) => entry.role === role)) settingsRosterDrafts.delete(role);
   }
   orchestrationSwitch.disabled = false;
   orchestrationSwitch.setAttribute("aria-checked", String(state.orchestrationEnabled));
-  const focusedId = settingsRosterFocusId ?? (rosterCategory.contains(document.activeElement) ? document.activeElement?.id : undefined);
+  const focusedId = settingsRosterFocusId ?? orchestrationFocusId();
   rosterRows.replaceChildren();
+  rosterCacheNote.hidden = state.orchestrationAgents.length === 0;
+  renderRosterPrices(state);
   state.orchestrationAgents.forEach((entry, index) => {
     const card = element("div", "settings-card settings-role-card");
     const controlsDisabled = !state.orchestrationEnabled || !entry.enabled;
@@ -868,6 +1014,39 @@ function renderOrchestration(state: SettingsState): void {
     description.disabled = controlsDisabled;
     description.addEventListener("change", () => update({ description: description.value }));
     card.append(header, settingsHiddenLabel(description, l10n.t("Description")), description);
+    const cacheGroup = element("div", "settings-segmented");
+    cacheGroup.id = `roster-${index}-cache-ttl`;
+    cacheGroup.setAttribute("role", "radiogroup");
+    const cacheTtl = resolveOrchestrationCacheTtl(entry);
+    const cacheDisabled = controlsDisabled || !entry.rows.some(usesClaudeUsage);
+    const cacheOptions: Array<[NonNullable<OrchestrationSettingRow["cacheTtl"]>, string]> = [
+      ["5m", l10n.t("5 min")],
+      ["1h", l10n.t("1 hour")],
+    ];
+    const cacheRadios = cacheOptions.map(([value, text]) => {
+      const radio = element("button", "settings-segment", text);
+      radio.id = `roster-${index}-cache-ttl-${value}`;
+      radio.type = "button";
+      radio.setAttribute("role", "radio");
+      radio.setAttribute("aria-checked", String(value === cacheTtl));
+      radio.tabIndex = value === cacheTtl ? 0 : -1;
+      radio.disabled = cacheDisabled;
+      radio.addEventListener("click", () => {
+        if (!cacheDisabled && pendingOrchestration === null && value !== cacheTtl) update({ cacheTtl: value });
+      });
+      cacheGroup.appendChild(radio);
+      return radio;
+    });
+    cacheGroup.addEventListener("keydown", (event) => {
+      if (cacheDisabled || pendingOrchestration !== null) return;
+      handleSegmentedArrow(event, cacheRadios, (radio) => radio.click());
+    });
+    const cacheText = row(card, l10n.t("Prompt cache"), "", cacheGroup, () => cacheRadios.find((radio) => radio.getAttribute("aria-checked") === "true"));
+    cacheText.parentElement!.classList.add("settings-cache-row");
+    const cacheLabel = settingsHiddenLabel(cacheGroup, l10n.t("Prompt cache for {0}", entry.role));
+    cacheLabel.id = `roster-${index}-cache-label`;
+    cacheGroup.setAttribute("aria-labelledby", cacheLabel.id);
+    cacheText.appendChild(cacheLabel);
     const wrapper = element("div", "settings-matrix-wrapper");
     wrapper.tabIndex = 0;
     wrapper.setAttribute("role", "group");
@@ -1025,7 +1204,7 @@ function renderOrchestration(state: SettingsState): void {
   });
   for (const control of [roleInput, addButton, defaultsButton, policyInput]) control.disabled = !state.orchestrationEnabled;
   policyInput.value = state.conductorPolicy;
-  renderPolicyCounter(state.conductorPolicy);
+  renderPolicyCounter(state.conductorPolicy, state.conductorPolicyDefault);
   renderPolicyDefaults(state);
   previewRequest = 0;
   renderInstructionPreview(state);
@@ -1053,7 +1232,7 @@ addButton.addEventListener("click", addRole);
 roleInput.addEventListener("keydown", (event) => {
   if (event.key === "Enter") { event.preventDefault(); addRole(); }
 });
-defaultsButton.addEventListener("click", () => { if (current) writeRoster(current.orchestrationDefaults); });
+defaultsButton.addEventListener("click", () => { if (current) { const defaults = current.orchestrationDefaults; writeRoster(current.orchestrationAgents.filter((entry) => defaults.some((role) => role.role === entry.role))); } });
 policyDefaultsButton.addEventListener("click", () => { if (current) writeOrchestration("conductorPolicy", current.conductorPolicyDefault); });
 policyInput.addEventListener("change", () => writeOrchestration("conductorPolicy", policyInput.value));
 policyInput.addEventListener("input", () => { renderPolicyCounter(); if (current) { renderPolicyDefaults(current); requestInstructionPreview(); } });
@@ -1068,6 +1247,7 @@ let current: SettingsState | null = null;
 let requestSerial = 0;
 const nextRequestId = (): number => ++requestSerial;
 const pending: { autoContinue: number | null; restore: number | null; apiKey: number | null; learning: number | null } = { autoContinue: null, restore: null, apiKey: null, learning: null };
+const pendingAutoUpdate = new Map<ExecutorId, number>();
 const pendingFileLink: Record<FileLinkBooleanSetting, number | null> = {
   fileLinkInstruction: null,
   planInstruction: null,
@@ -1093,12 +1273,14 @@ function writeAnchor(message: SettingsPageToHost): HTMLElement | undefined {
     case "setComposerSendKey": return sendKeyText;
     case "setInitialModel": return initialModelText;
     case "setRestoreTabsOnStartup": return restoreText;
+    case "setCliAutoUpdate": return detectionControls.find(({ executor }) => executor === message.executor)?.text;
+    case "setEventLimit": return eventLimitText;
     case "setLearningEnabled": return learningText;
     case "setApiKeyPolicy": return apiKeyText;
     case "setFileLinkSetting": return message.setting === "openWithSystemApp" ? extensionText : rowTextOf(fileLinkSwitches[message.setting]);
     case "setOrchestrationSetting":
       return message.setting === "externalTimeoutMinutes" ? timeoutText : message.setting === "conductorPolicy" ? policyCard : orchestrationText;
-    case "setProfileSources": return policyCard;
+    case "applyRecommendedRoster": return recommendText;
     default: return undefined;
   }
 }
@@ -1140,6 +1322,9 @@ function render(state: SettingsState): void {
   }
   renderInitialModel(state);
   renderDisplayName(state);
+  if (pendingEventLimit === state.replyTo) pendingEventLimit = null;
+  eventLimitInput.disabled = pendingEventLimit !== null;
+  if (pendingEventLimit === null) eventLimitInput.value = String(state.eventLimit ?? EVENT_LIMIT_DEFAULT);
   renderAccent(state.appearance, state.replyTo);
   if (pending.autoContinue === state.replyTo) pending.autoContinue = null;
   autoContinueSwitch.setAttribute("aria-checked", String(state.autoContinueAtUsageLimit));
@@ -1179,6 +1364,11 @@ function render(state: SettingsState): void {
   if (focusInGroup) checkedApiKeyRadio()?.focus();
   restoreSwitch.setAttribute("aria-checked", String(state.restoreTabsOnStartup));
   restoreSwitch.disabled = false;
+  for (const { executor, autoUpdate } of detectionControls) {
+    if (pendingAutoUpdate.get(executor) === state.replyTo) pendingAutoUpdate.delete(executor);
+    autoUpdate.setAttribute("aria-checked", String(state.cliAutoUpdate[executor]));
+    autoUpdate.disabled = pendingAutoUpdate.has(executor);
+  }
 }
 
 sendKeySelect.addEventListener("change", () => {
@@ -1194,16 +1384,8 @@ function requestApiKeyPolicy(policy: ApiKeyPolicy): void {
 for (const radio of apiKeyRadios) {
   radio.addEventListener("click", () => requestApiKeyPolicy(radio.dataset.value as ApiKeyPolicy));
 }
-apiKeyGroup.addEventListener("keydown", (e) => {
-  if (e.ctrlKey || e.metaKey || e.altKey) return;
-  const step = e.key === "ArrowRight" || e.key === "ArrowDown" ? 1 : e.key === "ArrowLeft" || e.key === "ArrowUp" ? -1 : 0;
-  if (step === 0) return;
-  e.preventDefault();
-  const from = apiKeyRadios.findIndex((r) => r === document.activeElement);
-  if (from < 0 || current === null || pending.apiKey !== null) return;
-  const target = apiKeyRadios[(from + step + apiKeyRadios.length) % apiKeyRadios.length];
-  target.focus();
-  requestApiKeyPolicy(target.dataset.value as ApiKeyPolicy);
+apiKeyGroup.addEventListener("keydown", (event) => {
+  handleSegmentedArrow(event, apiKeyRadios, (radio) => requestApiKeyPolicy(radio.dataset.value as ApiKeyPolicy), () => current !== null && pending.apiKey === null);
 });
 
 autoContinueSwitch.addEventListener("click", () => {
@@ -1220,6 +1402,15 @@ restoreSwitch.addEventListener("click", () => {
   pending.restore = requestId;
   post({ type: "setRestoreTabsOnStartup", requestId, enabled: !current.restoreTabsOnStartup });
 });
+for (const { executor, autoUpdate } of detectionControls) {
+  autoUpdate.addEventListener("click", () => {
+    if (current === null || pendingAutoUpdate.has(executor)) return;
+    const requestId = nextRequestId();
+    pendingAutoUpdate.set(executor, requestId);
+    autoUpdate.disabled = true;
+    post({ type: "setCliAutoUpdate", requestId, executor, enabled: !current.cliAutoUpdate[executor] });
+  });
+}
 learningSwitch.addEventListener("click", () => {
   if (current === null || pending.learning !== null) return;
   const requestId = nextRequestId();
@@ -1244,7 +1435,8 @@ window.addEventListener("message", (event: MessageEvent<unknown>) => {
     if (event.data.requestId !== previewRequest) return;
     instructionPreview.textContent = event.data.text;
     instructionTokens.textContent = l10n.t("≈ {0} tokens", event.data.tokens);
-  } else render(event.data);
+  } else if (event.data.type === "recommendedRoster") renderRecommendation(event.data.revision, event.data.changes);
+  else render(event.data);
 });
 renderSettingsToc();
 post({ type: "settingsPageReady" });

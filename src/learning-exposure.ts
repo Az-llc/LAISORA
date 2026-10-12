@@ -1,8 +1,9 @@
-import type { ExposureRecord, LedgerV2Record } from "./learning-episodes";
+import { correctionTimes, itemSurvivesCorrection, type ExposureRecord, type LedgerV2Record } from "./learning-episodes";
 
 export function validExposures(records: Iterable<LedgerV2Record>): ExposureRecord[] {
+  const all = [...records], corrections = correctionTimes(all);
   const groups = new Map<string, ExposureRecord[]>();
-  for (const record of records) if (record.kind === "exposure") {
+  for (const record of all) if (record.kind === "exposure") {
     const key = JSON.stringify([record.conversation, record.recipient, record.run, record.dispatchId, record.exposureId]);
     const group = groups.get(key);
     if (group) group.push(record); else groups.set(key, [record]);
@@ -22,7 +23,7 @@ export function validExposures(records: Iterable<LedgerV2Record>): ExposureRecor
     if (!observed || observed.promptHash !== sent.promptHash || observed.requestedModel !== sent.requestedModel
       || observed.observedModel !== requestedModel || observed.route !== sent.route
       || observed.route === "target" && observed.observedEffort !== sent.requestedEffort) return [];
-    return [{ ...sent, observedModel: observed.observedModel, observedEffort: observed.observedEffort, attestation: observed.attestation }];
+    return [{ ...sent, items: sent.items.filter(item => itemSurvivesCorrection(item, sent.at, corrections)), observedModel: observed.observedModel, observedEffort: observed.observedEffort, attestation: observed.attestation }];
   });
 }
 

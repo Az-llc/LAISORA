@@ -1,6 +1,8 @@
 import * as l10n from "@vscode/l10n";
+import { ROW_H } from "./row-frame";
+import { planConductorRunning, planFrame, planLive, planMemberEnd, planNow, planRowIndexAt, planRowPeriod, planRowProvisional, planSpansMs, UNMEASURED_LABEL, type PlanFrameMembers, type PlanRowPeriod, type PlanSpan } from "../plan-steps";
 import type { SemanticModelPayload, TimeBucketsCoverage, WorkAgentNode, WorkModelPayload } from "../protocol";
-import type { AgentSpanView, BackgroundTaskSpanView, PlanBlockStepView, RequestBlockView, TimeBucket, TimeBucketView } from "../time-buckets";
+import type { AgentSpanView, BackgroundTaskSpanView, ConductorModel, PlanBlockStepView, RequestBlockView, TimeBucket, TimeBucketInterval, TimeBucketView } from "../time-buckets";
 import type { AgentInspector, InspectorAxis } from "./agent-inspector";
 import { failureCount } from "./failure-count";
 import { formatDuration, clock, dayClock } from "./format";
@@ -181,7 +183,8 @@ const LABEL_W = 288;
 const PAD_L = 8;
 const PAD_R = 8;
 const AXIS_H = 22;
-const ROW_H = 36;
+const TOGGLE_PAD_PX = 5;
+const NARROW_TOGGLE_H = 30;
 const FOLD_PX = 30;
 const FOLD_MIN_MS = 5 * 60_000;
 const MINI_ARIA_LABEL = l10n.t("Activity distribution across the whole session. Click to zoom in on the rows at that time");
@@ -196,8 +199,6 @@ export function elapsedLabel(ms: number): string {
   return `${Math.floor(minutes / 60)}:${String(minutes % 60).padStart(2, "0")}`;
 }
 const ZOOM_ARIA_LABEL = l10n.t("Press anywhere on the minimap to move the visible range to that time. Drag to move; double-click the frame for the whole session");
-const MINI_HINT = l10n.t("Drag to move · Double-click for whole");
-const HINT_MIN_PX = 200;
 const MIN_WINDOW_ROWS = 3;
 const MINI_DBL_MS = 400;
 const MINI_DBL_PX = 6;
@@ -244,13 +245,27 @@ type RowKey = string;
 
 interface GraphRow {
   key: RowKey;
-  kind: "block" | "step" | "agent" | "bg";
-  step?: PlanBlockStepView;
+  kind: "block" | "item" | "conductor" | "agent" | "bg";
+  item?: PlanBlockStepView;
+  conductorSpans?: PlanSpan[];
+  conductorOpenFrom?: number;
+  conductorIntervals?: TimeBucketInterval[];
+  conductorTail?: number;
+  conductorModels?: ConductorModel[];
   block?: RequestBlockView;
   agent?: AgentSpanView;
   bgTask?: BackgroundTaskSpanView;
   parentBlock?: RequestBlockView;
-  parentStep?: PlanBlockStepView;
+  parentItem?: RowKey;
+  members?: { agents: AgentSpanView[]; bgTasks: BackgroundTaskSpanView[] };
+  // Head rows only: the number and title src/plan-steps.ts#planFrame gives both GRAPH and ANALYSIS.
+  number?: string;
+  title?: string;
+  // Head and member rows: src/plan-steps.ts#planRowPeriod / #planMemberEnd at this render's now; undefined is "nothing started".
+  period?: PlanRowPeriod;
+  provisional?: boolean;
+  // What the row occupies on the time axis (period, conductor work, live tail), for layout only.
+  extent: [number, number];
 }
 
 type FoldKind = "reply" | "confirm" | "unobserved";
@@ -295,6 +310,19 @@ function svgEl<K extends keyof SVGElementTagNameMap>(name: K, attrs: Record<stri
   const el = document.createElementNS(SVG_NS, name);
   for (const [k, v] of Object.entries(attrs)) if (v !== undefined) el.setAttribute(k, String(v));
   return el;
+}
+
+function iconButton(icon: string, label: string, onClick: () => void): HTMLButtonElement {
+  const button = document.createElement("button");
+  button.type = "button";
+  button.title = label;
+  button.setAttribute("aria-label", label);
+  const glyph = document.createElement("span");
+  glyph.className = `l-icon ${icon}`;
+  glyph.setAttribute("aria-hidden", "true");
+  button.append(glyph);
+  button.addEventListener("click", onClick);
+  return button;
 }
 
 function span(className: string, text: string): HTMLElement {
@@ -457,6 +485,11 @@ export class WorkGraph {
   private rowEls = new Map<RowKey, SVGGElement>();
   private selectedKey: RowKey | undefined;
   private openKey: RowKey | undefined;
+  private readonly expandedItems = new Set<RowKey>();
+  private pendingToggleFocus: RowKey | undefined;
+  private readonly toggleLayerEl: HTMLElement;
+  private readonly expandAllEl: HTMLButtonElement;
+  private readonly collapseAllEl: HTMLButtonElement;
   private hiddenCategories = defaultGraphHidden();
   private rowHeight = ROW_H;
   private labelWidth = LABEL_W;
@@ -473,7 +506,8 @@ export class WorkGraph {
   constructor(
     private readonly tabId: string,
     private readonly inspector: AgentInspector,
-    private readonly scrollPort?: GraphScrollPort
+    private readonly scrollPort?: GraphScrollPort,
+    private readonly modelDisplayName: (model: string) => string | undefined = model => model
   ) {
     this.rootEl = document.createElement("div");
     this.rootEl.className = "work-graph";
@@ -526,7 +560,13 @@ export class WorkGraph {
     this.timelineEl = document.createElement("div");
     this.timelineEl.className = "wg-timeline-head";
     const heading = document.createElement("div");
-    heading.append(span("wg-code", "TIMELINE"), span("wg-caption", l10n.t("Request blocks and subagents")), this.totalEl);
+    this.expandAllEl = iconButton("l-icon-expand-all", l10n.t("Expand all items"), () => this.setExpanded(this.togglableKeys(), true));
+    this.collapseAllEl = iconButton("l-icon-collapse-all", l10n.t("Collapse all items"), () => this.setExpanded([...this.expandedItems], false));
+    const foldAll = document.createElement("span");
+    foldAll.className = "wg-fold-all";
+    foldAll.setAttribute("role", "group");
+    foldAll.append(this.expandAllEl, this.collapseAllEl);
+    heading.append(span("wg-code", "TIMELINE"), span("wg-caption", l10n.t("Request blocks and subagents")), foldAll, this.totalEl);
     this.timelineEl.append(heading, this.axisEl);
     this.zoomBarEl.prepend(span("wg-code", "MAP"), span("wg-caption wg-map-caption", l10n.t("Whole session")));
     this.headEl.append(this.zoomBarEl, this.miniEl, this.legendEl, this.timelineEl);
@@ -536,7 +576,9 @@ export class WorkGraph {
     this.chartPaneEl.className = "wg-chart-pane";
     this.chartEl = svgEl("svg", { class: "wg-chart", role: "group", "aria-label": l10n.t("Timeline of request blocks and subagents") });
     this.chartEl.addEventListener("keydown", (e) => this.onKeyDown(e));
-    this.chartPaneEl.appendChild(this.chartEl);
+    this.toggleLayerEl = document.createElement("div");
+    this.toggleLayerEl.className = "wg-toggle-layer";
+    this.chartPaneEl.append(this.chartEl, this.toggleLayerEl);
     this.bodyEl.appendChild(this.chartPaneEl);
     this.emptyEl = span("wg-empty", NO_WORK_SUMMARY_TEXT);
     this.stageEl.append(this.headEl, this.bodyEl, this.emptyEl, this.inspector.rootEl);
@@ -632,6 +674,15 @@ export class WorkGraph {
 
   openAgentByWorkAgentId(agentId: string): boolean {
     const agent = this.findWorkAgent(agentId);
+    const itemKey = agent === undefined ? undefined
+      : this.rows.find((r) => r.kind === "item" && r.members?.agents.some((a) => a.toolUseId === agent.toolUseId))?.key;
+    if (itemKey !== undefined && !this.expandedItems.has(itemKey)) {
+      this.expandedItems.add(itemKey);
+      const view = this.activeView();
+      if (view !== undefined) this.rows = this.buildRows(view);
+      this.dirty = true;
+      if (this.visible) this.render();
+    }
     const row = this.rows.find((r) => r.kind === "agent" && r.agent !== undefined && agent !== undefined && r.agent.toolUseId === agent.toolUseId);
     if (row !== undefined) {
       this.openRow(row);
@@ -692,9 +743,13 @@ export class WorkGraph {
       delete this.rootEl.dataset.windowBandSource;
       this.chartEl.textContent = "";
       this.axisEl.textContent = "";
+      this.renderToggles([], 0);
       return;
     }
     const focusedKey = this.focusedRowKey();
+    const active = document.activeElement;
+    const toggleFocus = this.pendingToggleFocus ?? (active instanceof HTMLElement && this.toggleLayerEl.contains(active) ? active.dataset.rowKey : undefined);
+    this.pendingToggleFocus = undefined;
     const legendFocus = document.activeElement instanceof HTMLElement && this.legendEl.contains(document.activeElement)
       ? document.activeElement.dataset.bucket : undefined;
     this.renderLegend(view);
@@ -738,6 +793,9 @@ export class WorkGraph {
     this.renderAxisLabels(scale);
     this.renderChart(view, scale, end, range, tail);
     if (this.selectedKey !== undefined && !this.rowEls.has(this.selectedKey)) this.selectedKey = undefined;
+    if (toggleFocus !== undefined) {
+      Array.from(this.toggleLayerEl.querySelectorAll<HTMLButtonElement>(".wg-item-toggle")).find((button) => button.dataset.rowKey === toggleFocus)?.focus(FOCUS_NO_SCROLL);
+    }
     if (focusedKey !== undefined) {
       const el = this.rowEls.get(focusedKey);
       if (el !== undefined) {
@@ -756,54 +814,65 @@ export class WorkGraph {
   }
 
   private windowEnd(view: TimeBucketView): number {
-    const lastAt = view.lastAt as number;
-    if (this.running && this.lastTickMs !== undefined && this.lastTickMs > lastAt) return this.lastTickMs;
-    return lastAt;
+    return planNow(view, this.lastTickMs, this.running);
   }
 
-  private buildRows(view: TimeBucketView): GraphRow[] {
+  private buildRows(view: TimeBucketView, now = this.windowEnd(view)): GraphRow[] {
     const rows: GraphRow[] = [];
-    const placed = new Set<string>();
-    for (const block of view.blocks) {
-      rows.push({ key: `block:${block.blockId}`, kind: "block", block });
-      for (const step of block.steps ?? []) {
-        rows.push({ key: `step:${block.blockId}:${step.key}`, kind: "step", step, parentBlock: block });
-        for (const agent of view.agents) {
-          if (agent.blockId !== block.blockId || agent.stepKey !== step.key) continue;
-          placed.add(`agent:${agent.toolUseId}`);
-          rows.push({ key: `agent:${agent.toolUseId}`, kind: "agent", agent, parentBlock: block, parentStep: step });
-        }
-        for (const bg of view.backgroundTasks ?? []) {
-          if (bg.blockId !== block.blockId || bg.stepKey !== step.key) continue;
-          placed.add(`bg:${bg.toolUseId}`);
-          rows.push({ key: `bg:${bg.toolUseId}`, kind: "bg", bgTask: bg, parentBlock: block, parentStep: step });
-        }
-      }
-      for (const agent of view.agents) {
-        if (agent.blockId !== block.blockId || placed.has(`agent:${agent.toolUseId}`)) continue;
-        placed.add(`agent:${agent.toolUseId}`);
-        rows.push({ key: `agent:${agent.toolUseId}`, kind: "agent", agent, parentBlock: block });
-      }
-      for (const bg of view.backgroundTasks ?? []) {
-        if (bg.blockId !== block.blockId || placed.has(`bg:${bg.toolUseId}`)) continue;
-        placed.add(`bg:${bg.toolUseId}`);
-        rows.push({ key: `bg:${bg.toolUseId}`, kind: "bg", bgTask: bg, parentBlock: block });
+    const live = planLive(view);
+    const frame = planFrame(view);
+    for (const row of frame.rows) {
+      const parentBlock = row.block;
+      const period = planRowPeriod(row, now, live);
+      const provisional = planRowProvisional(row, period);
+      const conductor = row.item === undefined ? { conductorSpans: row.conductorSpans, conductorOpenFrom: row.conductorOpenFrom,
+        conductorIntervals: row.conductorWork.filter(interval => interval.bucket !== "reply"), conductorTail: row.conductorTail } : {};
+      const intervals = row.item?.conductorIntervals ?? conductor.conductorIntervals ?? [];
+      const blockEnd = planRowPeriod({ kind: "block", block: parentBlock, members: { agents: [], bgTasks: [] } }, now, live)!.end;
+      const starts = [...(period ? [period.start] : []), ...intervals.map(interval => interval.start)];
+      const ends = [...(period ? [period.end] : []), ...intervals.map(interval => interval.end)];
+      const extent: [number, number] = starts.length === 0 ? [blockEnd, blockEnd] : [Math.min(...starts), Math.max(...ends)];
+      const head = { item: row.item, parentBlock, period, provisional, extent, conductorModels: row.conductorModels, ...conductor };
+      rows.push({ key: row.key, kind: "item", members: row.members, number: row.number, title: row.title, ...head });
+      if (this.expandedItems.has(row.key)) {
+        rows.push({ key: row.key.replace(/^item:/, "conductor:"), kind: "conductor", parentItem: row.key, ...head });
+        this.memberRows(rows, row.members, now, live, parentBlock, row.key);
       }
     }
-    for (const agent of view.agents) {
-      if (placed.has(`agent:${agent.toolUseId}`)) continue;
-      rows.push({ key: `agent:${agent.toolUseId}`, kind: "agent", agent });
-    }
-    for (const bg of view.backgroundTasks ?? []) {
-      if (placed.has(`bg:${bg.toolUseId}`)) continue;
-      rows.push({ key: `bg:${bg.toolUseId}`, kind: "bg", bgTask: bg });
-    }
+    this.memberRows(rows, frame.unplaced, now, live);
     return rows;
   }
 
-  private drawPlanMarkers(g: SVGElement, block: RequestBlockView, scale: Scale, range: ResolvedRange, cy: number): void {
+  private memberRows(rows: GraphRow[], members: PlanFrameMembers, now: number, live: boolean, parentBlock?: RequestBlockView, parentItem?: RowKey): void {
+    const period = (member: AgentSpanView | BackgroundTaskSpanView): Pick<GraphRow, "period" | "extent"> => {
+      const end = planMemberEnd(member, now, live);
+      return { period: { start: member.start, end, running: live && member.open, spans: [{ start: member.start, end }] }, extent: [member.start, end] };
+    };
+    for (const agent of members.agents) rows.push({ key: `agent:${agent.toolUseId}`, kind: "agent", agent, parentBlock, parentItem, ...period(agent) });
+    for (const bg of members.bgTasks) rows.push({ key: `bg:${bg.toolUseId}`, kind: "bg", bgTask: bg, parentBlock, parentItem, ...period(bg) });
+  }
+
+  private subagentCount(row: GraphRow): number {
+    return (row.members?.agents.length ?? 0) + (row.members?.bgTasks.filter((bg) => bg.subagent).length ?? 0);
+  }
+
+  private togglableKeys(): RowKey[] {
+    return this.rows.filter((row) => row.kind === "item").map((row) => row.key);
+  }
+
+  private setExpanded(keys: readonly RowKey[], expanded: boolean, focusKey?: RowKey): void {
+    for (const key of keys) {
+      if (expanded) this.expandedItems.add(key); else this.expandedItems.delete(key);
+    }
+    this.pendingToggleFocus = focusKey;
+    this.dirty = true;
+    if (this.visible) this.render();
+  }
+
+  private drawPlanMarkers(g: SVGElement, block: RequestBlockView, scale: Scale, range: ResolvedRange, cy: number, span?: [number, number]): void {
     for (const marker of block.userMessages ?? []) {
       if (marker.at < range.start || marker.at > range.end) continue;
+      if (span !== undefined && (marker.at < span[0] || marker.at > span[1])) continue;
       const mark = svgEl("path", { d: `M ${scale.x(marker.at)} ${cy - 9} v 18`, class: "wg-user-marker wg-group-line" });
       titled(mark, marker.text);
       g.appendChild(mark);
@@ -816,10 +885,10 @@ export class WorkGraph {
     const items: [GraphCategory, TermKey][] = [
       ["g", "LLM generation"],
       ["t", "Tool execution"],
+      ["sub", "Subagent"],
       ["d", "Waiting for subagent"],
       ["a", "Waiting for your answer"],
       ["wait", "Waiting for reply"],
-      ["sub", "Subagent"],
     ];
     const totals = { g: view.main.generateMs, t: view.main.toolMs, d: view.main.subagentWaitMs, a: view.main.confirmMs, wait: view.main.replyMs, sub: view.bars.subMs };
     for (const [cls, label] of items) {
@@ -931,11 +1000,11 @@ export class WorkGraph {
       }
     }
     for (const a of this.hiddenCategories.has("sub") ? [] : view.agents) {
-      const aEnd = this.agentEnd(a, end);
+      const aEnd = planMemberEnd(a, end, planLive(view));
       mini.appendChild(svgEl("rect", { x: px(a.start), y: 23, width: Math.max(0.8, px(aEnd) - px(a.start)), height: 4, class: `wg-seg wg-seg-sub${a.open ? " open" : ""}`, rx: 1 }));
     }
     for (const bg of this.hiddenCategories.has("sub") ? [] : view.backgroundTasks ?? []) {
-      const bgEnd = this.bgEnd(bg, end);
+      const bgEnd = planMemberEnd(bg, end, planLive(view));
       mini.appendChild(svgEl("rect", { x: px(bg.start), y: 23, width: Math.max(0.8, px(bgEnd) - px(bg.start)), height: 4, class: `wg-seg wg-seg-sub${bg.open ? " open" : ""}`, rx: 1 }));
     }
     if (range.framed) {
@@ -950,22 +1019,9 @@ export class WorkGraph {
         class: "wg-mini-win",
         "data-part": "window",
       });
-      titled(winRect, l10n.t("Visible range {0} – {1}", dayClock(range.start), dayClock(range.end)));
+      titled(winRect, `${l10n.t("Visible range {0} – {1}", dayClock(range.start), dayClock(range.end))}\n${ZOOM_ARIA_LABEL}`);
       mini.appendChild(winRect);
 
-      const miniRect = this.miniEl.getBoundingClientRect();
-      const miniWidth = miniRect.width || W;
-      const sx = W / miniWidth;
-      const cssWidth = (px(range.end) - px(range.start)) / sx;
-      if (cssWidth >= HINT_MIN_PX) {
-        const hint = svgEl("text", {
-          class: "wg-tick wg-mini-hint",
-          "aria-hidden": "true",
-          transform: `translate(${px(range.start) + 6 * sx} 16) scale(${sx} 1)`,
-        });
-        hint.textContent = MINI_HINT;
-        mini.appendChild(hint);
-      }
       mini.classList.add("can-drag");
       mini.setAttribute("aria-label", ZOOM_ARIA_LABEL);
     } else {
@@ -1037,13 +1093,65 @@ export class WorkGraph {
       }
       return "…";
     };
-    let blockNumber = 0;
+    const drawMain = (g: SVGElement, cy: number, wait: [number, number], host: [number, number], provisional: boolean, running: boolean, source: readonly TimeBucketInterval[] = intervals, drawWait = true, tailFrom = view.lastAt as number): void => {
+      const [waitFrom, waitTo] = wait;
+      const [from, to] = host;
+      if (drawWait && waitTo > range.start && view.fidelity === "record" && !this.hiddenCategories.has("wait")) {
+        const x0 = scale.x(Math.max(waitFrom, range.start));
+        const x1 = scale.x(Math.min(waitTo, range.end));
+        const rect = svgEl("rect", { x: x0, y: cy - (this.narrow ? 5 : 6), width: Math.max(1, x1 - x0), height: this.narrow ? 10 : 12, class: "wg-seg-wait" });
+        rect.dataset.bucket = "reply";
+        const clipWait = this.clipped(waitFrom, waitTo, range);
+        if (clipWait !== undefined) rect.dataset.clipped = clipWait;
+        g.appendChild(rect);
+      }
+      for (const i of source) {
+        if (this.hiddenCategories.has(bucketClass(i.bucket))) continue;
+        const hostS = Math.max(i.start, from);
+        const hostE = Math.min(i.end, to);
+        const s = Math.max(hostS, range.start);
+        const e = Math.min(hostE, range.end);
+        if (e <= s) continue;
+        const half = this.segHalf(i.bucket);
+        const seg = svgEl("rect", { x: scale.x(s), y: cy - half, width: Math.max(1.2, scale.x(e) - scale.x(s)), height: half * 2, class: `wg-seg wg-seg-${bucketClass(i.bucket)}` });
+        seg.dataset.bucket = i.bucket;
+        const word = bucketWord(i.bucket);
+        const clipSeg = this.clipped(hostS, hostE, range);
+        if (clipSeg !== undefined) seg.dataset.clipped = clipSeg;
+        titled(seg, `${provisional ? "≈" : ""}${segTitle(word, s, e, clipSeg !== undefined ? l10n.t("Continues outside the window") : undefined)}`);
+        g.appendChild(seg);
+      }
+      if (running && tail.main !== null && !this.hiddenCategories.has(bucketClass(tail.main)) && this.running && end > tailFrom && tailFrom < range.end) {
+        if (tail.main !== "generate" || view.fidelity === "record") {
+          const lastAtVal = tailFrom;
+          const extX0 = scale.x(Math.max(lastAtVal, range.start));
+          const extX1 = scale.x(Math.min(end, range.end));
+          const half = this.segHalf(tail.main);
+          const ext = svgEl("rect", {
+            x: extX0,
+            y: cy - half,
+            width: Math.max(1.2, extX1 - extX0),
+            height: half * 2,
+            class: `wg-seg wg-seg-${bucketClass(tail.main)} open`,
+          });
+          ext.dataset.bucket = tail.main;
+          ext.dataset.tail = "main";
+          const clipExt = this.clipped(lastAtVal, end, range);
+          if (clipExt !== undefined) ext.dataset.clipped = clipExt;
+          const word = bucketWord(tail.main);
+          titled(ext, segTitle(word, lastAtVal, null, clipExt !== undefined ? l10n.t("Continues outside the window") : undefined));
+          g.appendChild(ext);
+        }
+      }
+    };
+    const toggles: { key: RowKey; y: number; label: string; expanded: boolean; g: SVGGElement }[] = [];
     this.rows.forEach((row, index) => {
       const y = index * this.rowHeight;
       const cy = y + (this.narrow ? 37 : 18);
       const labelY = y + 14;
       const labelEnd = (this.narrow ? scale.width : this.labelWidth) - 28;
-      const labelStart = row.kind === "block" ? (this.narrow ? 20 : 24) : row.parentStep ? (this.narrow ? 44 : 56) : (this.narrow ? 32 : 40);
+      const head = row.kind === "block" || row.kind === "item";
+      const labelStart = head ? (this.narrow ? 20 : 24) : (this.narrow ? 32 : 40);
       const addLabels = (name: string, meta: string, duration: string, full = name, model?: string, durationNote?: string): void => {
         const label = svgEl("text", { x: labelStart, y: labelY, class: "wg-lbl" });
         const value = svgEl("text", { x: labelEnd, y: labelY, "text-anchor": "end", class: "wg-row-value" });
@@ -1068,14 +1176,16 @@ export class WorkGraph {
       g.dataset.kind = row.kind;
       svg.appendChild(g);
       g.appendChild(svgEl("rect", { x: 0, y, width: scale.width, height: this.rowHeight, class: "wg-row-bg" }));
-      if (row.kind === "block") {
-        blockNumber++;
+      if (head) {
         if (index > 0) g.append(svgEl("line", { x1: 0, x2: scale.width, y1: y, y2: y, class: "wg-group-line" }));
-        const number = svgEl("text", { x: 0, y: labelY, class: "wg-block-number" });
-        number.textContent = String(blockNumber).padStart(2, "0");
-        g.append(number);
+        const label = row.number;
+        if (label) {
+          const number = svgEl("text", { x: 0, y: labelY, class: "wg-block-number" });
+          number.textContent = label;
+          g.append(number);
+        }
       }
-      const outside = this.outside(row, range, end);
+      const outside = this.outside(row, range);
       if (outside !== undefined) {
         g.dataset.outside = outside;
         const mark = outside === "before"
@@ -1088,77 +1198,58 @@ export class WorkGraph {
       const outsideSuffix = outside === undefined ? "" : outside === "before" ? ` · ${l10n.t("Before the visible range")}` : ` · ${l10n.t("After the visible range")}`;
       if (row.kind === "block" && row.block !== undefined) {
         const b = row.block;
-        const bEnd = this.blockEnd(b, end);
+        const bEnd = row.extent[1];
         const meta = [clock(b.anchorAt), b.toolCount > 0 ? l10n.t("{0} main-agent tool calls", b.toolCount) : "", b.agentCount > 0 ? l10n.t("{0} subagents", b.agentCount) : ""].filter(Boolean).join(" · ");
         const untilNext = b.durationMs !== null && view.blocks[view.blocks.length - 1] !== b ? b.kind === "plan" ? l10n.t("Until the next work block") : l10n.t("Until the next request") : undefined;
         addLabels(b.text, meta, blockDuration(b, bEnd), b.text, undefined, untilNext);
-        if (drawBars && b.end > range.start) {
-          const x0 = scale.x(Math.max(b.anchorAt, range.start));
-          const x1 = scale.x(Math.min(b.end, range.end));
-          if (view.fidelity === "record" && !this.hiddenCategories.has("wait")) {
-            const wait = svgEl("rect", { x: x0, y: cy - (this.narrow ? 5 : 6), width: Math.max(1, x1 - x0), height: this.narrow ? 10 : 12, class: "wg-seg-wait" });
-            wait.dataset.bucket = "reply";
-            const clipWait = this.clipped(b.anchorAt, b.end, range);
-            if (clipWait !== undefined) wait.dataset.clipped = clipWait;
-            g.appendChild(wait);
-          }
-        }
-        for (const i of drawBars ? intervals : []) {
-          const hostS = Math.max(i.start, b.start);
-          const hostE = Math.min(i.end, bEnd);
-          const s = Math.max(hostS, range.start);
-          const e = Math.min(hostE, range.end);
-          if (e <= s) continue;
-          const half = this.segHalf(i.bucket);
-          const seg = svgEl("rect", { x: scale.x(s), y: cy - half, width: Math.max(1.2, scale.x(e) - scale.x(s)), height: half * 2, class: `wg-seg wg-seg-${bucketClass(i.bucket)}` });
-          seg.dataset.bucket = i.bucket;
-          const word = bucketWord(i.bucket);
-          const clipSeg = this.clipped(hostS, hostE, range);
-          if (clipSeg !== undefined) seg.dataset.clipped = clipSeg;
-          titled(seg, `${b.metrics?.provisional ? "≈" : ""}${segTitle(word, s, e, clipSeg !== undefined ? l10n.t("Continues outside the window") : undefined)}`);
-          g.appendChild(seg);
-        }
-        if (drawBars && b.running && tail.main !== null && !this.hiddenCategories.has(bucketClass(tail.main)) && this.running && end > (view.lastAt as number) && (view.lastAt as number) < range.end) {
-          if (tail.main !== "generate" || view.fidelity === "record") {
-            const lastAtVal = view.lastAt as number;
-            const extX0 = scale.x(Math.max(lastAtVal, range.start));
-            const extX1 = scale.x(Math.min(end, range.end));
-            const half = this.segHalf(tail.main);
-            const ext = svgEl("rect", {
-              x: extX0,
-              y: cy - half,
-              width: Math.max(1.2, extX1 - extX0),
-              height: half * 2,
-              class: `wg-seg wg-seg-${bucketClass(tail.main)} open`,
-            });
-            ext.dataset.bucket = tail.main;
-            ext.dataset.tail = "main";
-            const clipExt = this.clipped(lastAtVal, end, range);
-            if (clipExt !== undefined) ext.dataset.clipped = clipExt;
-            const word = bucketWord(tail.main);
-            titled(ext, segTitle(word, lastAtVal, null, clipExt !== undefined ? l10n.t("Continues outside the window") : undefined));
-            g.appendChild(ext);
-          }
-        }
-        if (b.running) g.classList.add("running");
+        if (drawBars) drawMain(g, cy, [b.anchorAt, b.end], [b.start, bEnd], row.provisional === true, row.period?.running === true);
+        if (row.period?.running) g.classList.add("running");
         if (drawBars && b.kind === "plan") this.drawPlanMarkers(g, b, scale, range, cy);
         g.setAttribute("aria-label", `${b.kind === "plan" ? l10n.t("Work block") : l10n.t("Request block")} ${clip(b.text, 40)} ${clock(b.anchorAt)} ${blockDuration(b, bEnd)}${untilNext === undefined ? "" : ` (${untilNext})`}${outsideSuffix}`);
-      } else if (row.kind === "step" && row.step !== undefined) {
-        const step = row.step;
-        const stop = step.endedAt === null && row.parentBlock?.running ? this.blockEnd(row.parentBlock, end) : step.end ?? row.parentBlock?.end ?? end;
-        addLabels(step.title, step.removed ? l10n.t("Removed") : step.status === "completed" ? l10n.t("Completed") : step.status === "in_progress" ? l10n.t("Running") : l10n.t("Pending"),
-          step.durationMs === null ? "—" : `${step.provisional ? "≈" : ""}${formatDuration(step.durationMs)}`);
-        if (drawBars && step.startedAt !== null && stop > step.startedAt) {
-          const start = Math.max(step.startedAt, range.start);
-          const finish = Math.min(stop, range.end);
-          if (finish > start) g.appendChild(titled(svgEl("rect", { x: scale.x(start), y: cy - 3,
-            width: Math.max(1.2, scale.x(finish) - scale.x(start)), height: 6, class: "wg-step-bar wg-row-bg", stroke: "currentColor" }),
-            `${step.provisional ? "≈" : ""}${segTitle(step.title, step.startedAt, stop)}`));
+      } else if (row.kind === "item" && row.parentBlock !== undefined) {
+        const item = row.item;
+        const span = row.period;
+        const running = span?.running === true;
+        const provisional = row.provisional === true;
+        const subagents = this.subagentCount(row);
+        const expanded = this.expandedItems.has(row.key);
+        const title = row.title ?? "";
+        const number = row.number ?? "";
+        const duration = span === undefined ? UNMEASURED_LABEL : `${provisional ? "≈" : ""}${formatDuration(planSpansMs(span.spans))}`;
+        const facts = [span !== undefined ? clock(span.start) : item?.removed ? "" : item?.status === "completed" ? l10n.t("Completed") : l10n.t("Not started"),
+          item?.removed ? l10n.t("Removed") : "",
+          subagents > 0 ? l10n.t("{0} subagents", subagents) : ""].filter(Boolean).join(" · ");
+        addLabels(title, `${facts} ${expanded ? "▾" : "▸"}`, duration, title);
+        if (drawBars) {
+          for (const part of span?.spans ?? []) {
+            if (part.end < range.start || part.start > range.end) continue;
+            const x0 = scale.x(Math.max(part.start, range.start));
+            const x1 = scale.x(Math.min(part.end, range.end));
+            const half = this.narrow ? 6 : 7;
+            const bar = svgEl("rect", { x: x0, y: cy - half, width: Math.max(2, x1 - x0), height: half * 2, rx: 2,
+              fill: "var(--l-chart-c4)", "fill-opacity": running ? .6 : 1 });
+            bar.dataset.bucket = "span";
+            titled(bar, segTitle(l10n.t("Step"), part.start, running && part.end === span!.end ? null : part.end));
+            g.appendChild(bar);
+          }
         }
-        g.setAttribute("aria-label", `${step.title} ${step.durationMs === null ? l10n.t("Not measured") : `${step.provisional ? "≈" : ""}${formatDuration(step.durationMs)}`}${outsideSuffix}`);
+        if (running) g.classList.add("running");
+        g.setAttribute("aria-label", `${l10n.t("Step")} ${[number, clip(title, 40), span === undefined ? "" : clock(span.start), duration].filter(Boolean).join(" ")}${outsideSuffix}`);
+        toggles.push({ key: row.key, y, label: [number, title, facts].filter(Boolean).join(" · "), expanded, g });
+      } else if (row.kind === "conductor" && row.parentBlock !== undefined) {
+        const item = row.item;
+        const b = row.parentBlock;
+        const conductorTail = item?.conductorTail ?? row.conductorTail;
+        const running = planConductorRunning(row, row.period);
+        addLabels(l10n.t("Conductor"), (row.conductorModels ?? []).map(entry =>
+          [this.modelDisplayName(entry.model), entry.effort].filter(Boolean).join(" · ")).join(", "), "");
+        if (drawBars) drawMain(g, cy, [0, 0], [Math.min(b.start, row.extent[0]), Math.max(row.extent[1], running ? end : -Infinity)], row.provisional === true,
+          running, item?.conductorIntervals ?? row.conductorIntervals ?? [], false, conductorTail ?? undefined);
+        if (running) g.classList.add("running");
+        g.setAttribute("aria-label", `${l10n.t("Conductor")}${outsideSuffix}`);
       } else if (row.agent !== undefined) {
         const a = row.agent;
-        const aEnd = this.agentEnd(a, end);
+        const aEnd = row.extent[1];
         addLabels(agentLabel(a), [a.subagentType, a.model].filter(Boolean).join(" · "), formatDuration(aEnd - a.start), agentLabel(a), a.model);
         if (drawBars && !this.hiddenCategories.has("sub")) {
           const x0 = scale.x(Math.max(a.start, range.start));
@@ -1168,15 +1259,15 @@ export class WorkGraph {
           bar.dataset.bucket = "sub";
           const clipA = this.clipped(a.start, aEnd, range);
           if (clipA !== undefined) bar.dataset.clipped = clipA;
-          titled(bar, segTitle(l10n.t("Subagent"), a.start, a.open && this.running ? null : aEnd, clipA !== undefined ? l10n.t("Continues outside the window") : undefined));
+          titled(bar, segTitle(l10n.t("Subagent"), a.start, row.period?.running ? null : aEnd, clipA !== undefined ? l10n.t("Continues outside the window") : undefined));
           g.appendChild(bar);
         }
-        if (a.open && this.running) g.classList.add("running");
+        if (row.period?.running) g.classList.add("running");
         const name = agentLabel(a);
         g.setAttribute("aria-label", `${a.description ? `${l10n.t("Subagent")} ` : ""}${clip(name, 40)} ${clock(a.start)} ${formatDuration(aEnd - a.start)}${outsideSuffix}`);
       } else if (row.kind === "bg" && row.bgTask !== undefined) {
         const bg = row.bgTask;
-        const bgEnd = this.bgEnd(bg, end);
+        const bgEnd = row.extent[1];
         const desc = bg.description || bg.taskId;
         const word = bg.subagent ? l10n.t("Subagent") : l10n.t("Background");
         addLabels(bg.subagent ? desc : `↻ ${desc}`, word, formatDuration(bgEnd - bg.start), desc);
@@ -1188,10 +1279,10 @@ export class WorkGraph {
           bar.dataset.bucket = "sub";
           const clipBg = this.clipped(bg.start, bgEnd, range);
           if (clipBg !== undefined) bar.dataset.clipped = clipBg;
-          titled(bar, segTitle(word, bg.start, bg.open && this.running ? null : bgEnd, clipBg !== undefined ? l10n.t("Continues outside the window") : undefined));
+          titled(bar, segTitle(word, bg.start, row.period?.running ? null : bgEnd, clipBg !== undefined ? l10n.t("Continues outside the window") : undefined));
           g.appendChild(bar);
         }
-        if (bg.open && this.running) g.classList.add("running");
+        if (row.period?.running) g.classList.add("running");
         g.setAttribute("aria-label", `${word} ${clip(desc, 40)} ${clock(bg.start)} ${formatDuration(bgEnd - bg.start)}${outsideSuffix}`);
       }
       if (this.canOpen(row)) {
@@ -1208,6 +1299,30 @@ export class WorkGraph {
       g.classList.toggle("open", row.key === this.openKey);
       this.rowEls.set(row.key, g);
     });
+    this.renderToggles(toggles, (this.narrow ? scale.width : this.labelWidth) - 28);
+  }
+
+  private renderToggles(toggles: readonly { key: RowKey; y: number; label: string; expanded: boolean; g: SVGGElement }[], labelEnd: number): void {
+    this.toggleLayerEl.textContent = "";
+    for (const toggle of toggles) {
+      const button = document.createElement("button");
+      button.type = "button";
+      button.className = "wg-item-toggle";
+      button.dataset.rowKey = toggle.key;
+      button.setAttribute("aria-expanded", String(toggle.expanded));
+      button.setAttribute("aria-label", toggle.label);
+      button.style.left = `${-TOGGLE_PAD_PX}px`;
+      button.style.top = `${toggle.y}px`;
+      button.style.width = `${labelEnd + TOGGLE_PAD_PX * 2}px`;
+      button.style.height = `${this.narrow ? NARROW_TOGGLE_H : this.rowHeight}px`;
+      button.addEventListener("click", () => this.setExpanded([toggle.key], !toggle.expanded, toggle.key));
+      button.addEventListener("mouseenter", () => toggle.g.classList.add("toggle-hover"));
+      button.addEventListener("mouseleave", () => toggle.g.classList.remove("toggle-hover"));
+      this.toggleLayerEl.appendChild(button);
+    }
+    const keys = this.togglableKeys();
+    this.expandAllEl.disabled = keys.every((key) => this.expandedItems.has(key));
+    this.collapseAllEl.disabled = !keys.some((key) => this.expandedItems.has(key));
   }
 
   private segHalf(bucket: TimeBucket): number {
@@ -1217,6 +1332,7 @@ export class WorkGraph {
 
   private canOpen(row: GraphRow): boolean {
     if (row.kind === "block") return row.block?.kind !== "command";
+    if (row.kind === "item") return true;
     return row.agent !== undefined && this.workAgentIdFor(row.agent) !== undefined;
   }
 
@@ -1262,6 +1378,20 @@ export class WorkGraph {
       }, opener);
       return;
     }
+    if (row.kind === "item" && row.parentBlock !== undefined) {
+      const period = row.period;
+      const span: [number, number] | undefined = period === undefined ? undefined : [period.start, period.end];
+      const title = row.title ?? "";
+      this.inspector.open({
+        kind: "block",
+        label: clip(title, 60),
+        meta: span === undefined ? undefined : `${clock(span[0])} · ${formatDuration(planSpansMs(period!.spans))}`,
+        axis: span === undefined ? undefined : this.axisFor(span[0], span[1]),
+        text: title,
+        rows: this.itemRows(row, span),
+      }, opener);
+      return;
+    }
     if (row.block !== undefined) {
       const b = row.block;
       this.inspector.open({
@@ -1291,6 +1421,27 @@ export class WorkGraph {
     rows.push([text(l10n.t("Tool operations")), l10n.t("{0} calls", b.toolCount)]);
     rows.push([text(l10n.t("Failures")), failureCount(b.failCount)]);
     if (b.agentCount > 0) rows.push(["Subagent", `${b.agentCount}`]);
+    return rows;
+  }
+
+  private itemRows(row: GraphRow, span: [number, number] | undefined): [TermKey | Node, string | Node][] {
+    const text = (s: string) => document.createTextNode(s);
+    const item = row.item;
+    const provisional = row.provisional === true;
+    const duration = (ms: number) => `${provisional ? "≈" : ""}${formatDuration(ms)}`;
+    const rows: [TermKey | Node, string | Node][] = [[text(l10n.t("Kind")), item === undefined ? l10n.t("Work block") : l10n.t("Step")]];
+    if (span !== undefined) {
+      rows.push([text(l10n.t("Start")), formatDateTime(span[0])], [text(l10n.t("Elapsed")), duration(span[1] - span[0])]);
+    }
+    if (item !== undefined && item.startedAt !== null) {
+      if (item.generateMs !== null) rows.push(["LLM generation", duration(item.generateMs)]);
+      if (item.toolMs !== null) rows.push(["Tool execution", duration(item.toolMs)]);
+      if (item.subagentWaitMs !== null && item.subagentWaitMs > 0) rows.push(["Waiting for subagent", duration(item.subagentWaitMs)]);
+      if (item.decisionWaitMs !== null) rows.push(["Waiting for your answer", duration(item.decisionWaitMs)]);
+      if (item.replyWaitMs !== null) rows.push(["Waiting for reply", duration(item.replyWaitMs)]);
+    }
+    const subagents = this.subagentCount(row);
+    if (subagents > 0) rows.push(["Subagent", `${subagents}`]);
     return rows;
   }
 
@@ -1382,31 +1533,33 @@ export class WorkGraph {
 
   private bandRange(band: Band, view: TimeBucketView, end: number): ResolvedRange {
     const firstAt = view.firstAt as number;
-    const B: RequestBlockView[] = [];
+    const heads: [number, number][] = [];
+    let running = false;
     for (let k = band.i; k < band.j; k++) {
-      const b = this.rows[k].block;
-      if (b !== undefined) B.push(b);
+      const row = this.rows[k];
+      if (row.kind !== "block" && row.kind !== "item") continue;
+      heads.push(row.extent);
+      running ||= row.period?.running === true;
     }
     let s: number;
     let e: number;
-    if (B.length === 0) {
+    if (heads.length === 0) {
       s = Number.POSITIVE_INFINITY;
       e = Number.NEGATIVE_INFINITY;
       for (let k = band.i; k < band.j; k++) {
-        const [rs, re] = this.rowSpan(this.rows[k], end);
+        const [rs, re] = this.rows[k].extent;
         s = Math.min(s, rs);
         e = Math.max(e, re);
       }
     } else {
-      s = Math.min(...B.map((b) => b.anchorAt));
+      s = Math.min(...heads.map((span) => span[0]));
       for (let k = band.i; k < band.j; k++) {
         const row = this.rows[k];
-        if (row.kind === "block") break;
-        s = Math.min(s, this.rowSpan(row, end)[0]);
+        if (row.kind === "block" || row.kind === "item") break;
+        s = Math.min(s, row.extent[0]);
       }
-      e = Math.max(...B.map((b) => this.blockEnd(b, end)));
+      e = Math.max(...heads.map((span) => span[1]));
     }
-    const running = B.some((b) => b.running);
     s = Math.max(s, firstAt);
     e = Math.min(e, end);
     if (e <= s) return { ...this.fullRange(view, end), band: { i: band.i, j: band.j, running } };
@@ -1444,23 +1597,13 @@ export class WorkGraph {
     return m === undefined ? undefined : this.bandOf(m);
   }
 
-  private blockRowIndexAt(t: number, end: number): number {
-    let first = -1;
-    let last = -1;
-    for (let k = 0; k < this.rows.length; k++) {
-      const b = this.rows[k].block;
-      if (b === undefined) continue;
-      if (first < 0) first = k;
-      if (b.anchorAt <= t && t < this.blockEnd(b, end)) return k;
-      if (b.anchorAt <= t) last = k;
-    }
-    if (last >= 0) return last;
-    return first >= 0 ? first : 0;
+  private blockRowIndexAt(t: number): number {
+    return planRowIndexAt(this.rows, t);
   }
 
-  private outside(row: GraphRow, range: ResolvedRange, end: number): "before" | "after" | undefined {
+  private outside(row: GraphRow, range: ResolvedRange): "before" | "after" | undefined {
     if (!range.framed) return undefined;
-    const [s, e] = this.rowSpan(row, end);
+    const [s, e] = row.extent;
     if (e <= range.start) return "before";
     if (s >= range.end) return "after";
     return undefined;
@@ -1538,35 +1681,6 @@ export class WorkGraph {
     this.zoomLiveEl.textContent = text;
   }
 
-  private blockEnd(b: RequestBlockView, end: number): number {
-    return b.running ? Math.max(b.end, end) : b.end;
-  }
-
-  private agentEnd(a: AgentSpanView, end: number): number {
-    return a.open && this.running ? Math.max(a.end, end) : a.end;
-  }
-
-  private bgEnd(bg: BackgroundTaskSpanView, end: number): number {
-    return bg.open && this.running ? Math.max(bg.end, end) : bg.end;
-  }
-
-  private rowSpan(row: GraphRow, end: number): [number, number] {
-    if (row.kind === "step" && row.step !== undefined) {
-      return [row.step.startedAt ?? row.parentBlock?.start ?? 0,
-        row.step.endedAt === null && row.parentBlock?.running ? this.blockEnd(row.parentBlock, end) : row.step.end ?? row.parentBlock?.end ?? 0];
-    }
-    if (row.kind === "block" && row.block !== undefined) {
-      return [row.block.anchorAt, this.blockEnd(row.block, end)];
-    }
-    if (row.kind === "agent" && row.agent !== undefined) {
-      return [row.agent.start, this.agentEnd(row.agent, end)];
-    }
-    if (row.kind === "bg" && row.bgTask !== undefined) {
-      return [row.bgTask.start, this.bgEnd(row.bgTask, end)];
-    }
-    return [0, 0];
-  }
-
   private clipped(hostStart: number, hostEnd: number, range: ResolvedRange): "start" | "end" | "both" | undefined {
     const s = hostStart < range.start;
     const e = hostEnd > range.end;
@@ -1620,7 +1734,7 @@ export class WorkGraph {
     const rect = this.miniEl.getBoundingClientRect();
     const t = this.miniTimeAt(e.clientX, rect.left, rect.width);
     if (t === undefined) return;
-    const k = this.blockRowIndexAt(t, this.windowEnd(view));
+    const k = this.blockRowIndexAt(t);
     this.enterWindow();
     this.centerRow(this.rows[k].key);
     const band = this.resolveBand();
@@ -1642,7 +1756,7 @@ export class WorkGraph {
     if (view === undefined) return;
     const t = this.miniTimeAt(e.clientX, d.miniLeft, d.miniWidth);
     if (t === undefined) return;
-    const k = this.blockRowIndexAt(t, this.windowEnd(view));
+    const k = this.blockRowIndexAt(t);
     const m = this.measurePort();
     if (m === undefined) return;
     const band = this.bandOf(m);

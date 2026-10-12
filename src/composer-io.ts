@@ -1,4 +1,4 @@
-import { decideOpenMode, DEFAULT_SYSTEM_APP_EXTENSIONS, systemAppExtensions } from "./file-link-open-mode";
+import { decideOpenMode, systemAppExtensions } from "./file-link-open-mode";
 import * as vscode from "vscode";
 import * as l10n from "@vscode/l10n";
 import { createHash } from "node:crypto";
@@ -36,18 +36,17 @@ import { createHydrationDraft, foldHistoryEvents } from "./resume-hydration";
 import { isInSessionStore, sessionTranscriptRef } from "./session-files";
 import { readSessionHistory } from "./session-transcript";
 import type { SessionStore } from "./store-surfaces";
-import { recordSeparator } from "./webview/commit-boundary";
+import { appendRecordPart, joinRecordTexts, type RecordTextPart } from "./commit-boundary";
 
 function createExportSink(lines: string[], userHeading: string): {
   push: (ev: NormalizedEventBody) => void;
   flush: () => void;
 } {
-  let assistantBuf = "";
-  let recordEnded = false;
+  const assistantParts: RecordTextPart[] = [];
   const flush = () => {
+    const assistantBuf = joinRecordTexts(assistantParts.map(part => part.text));
     if (assistantBuf.trim()) lines.push("## Assistant", "", assistantBuf.trim(), "");
-    assistantBuf = "";
-    recordEnded = false;
+    assistantParts.length = 0;
   };
   const push = (ev: NormalizedEventBody): void => {
     switch (ev.kind) {
@@ -60,11 +59,10 @@ function createExportSink(lines: string[], userHeading: string): {
         lines.push(ev.role === "user" ? userHeading : "## Assistant", "", ev.text, "");
         break;
       case "assistant_text_delta":
-        assistantBuf += (recordEnded ? recordSeparator(assistantBuf) : "") + ev.text;
-        recordEnded = false;
+        appendRecordPart(assistantParts, { text: ev.text, uuid: null });
         break;
       case "assistant_message_uuid":
-        recordEnded = true;
+        appendRecordPart(assistantParts, { text: "", uuid: ev.uuid });
         break;
       case "tool_call_started":
         flush();
@@ -111,7 +109,7 @@ function heldEventsForExport(events: readonly NormalizedEvent[], handoff: boolea
 
 async function buildExportMarkdown(s: Session): Promise<string> {
   const dateLocale = String(vscode.env.language ?? "").toLowerCase().startsWith("ja") ? "ja-JP" : "en-US";
-  const userHeading = `## ${configuredDisplayName() || "User"}`;
+  const userHeading = `## ${(configuredDisplayName() || "User").replace(/[!"#$%&'()*+,\-./:;<=>?@[\\\]^_`{|}~]/g, "\\$&")}`;
   const lines: string[] = [`# ${s.title}`, "", l10n.t("- Exported: {0}", new Date().toLocaleString(dateLocale)), `- cwd: ${s.cwd}`];
   if (s.handoffSource !== undefined) {
     const source = s.handoffSource.title !== undefined && s.handoffSource.title.length > 0
@@ -422,7 +420,7 @@ export async function openConversationFile(session: Session, rawTarget: string, 
     );
   if (preflightRoot === undefined) {
     const config = vscode.workspace.getConfiguration("laisora");
-    if (config.get<boolean>("fileLinks.allowOutsideWorkspace", false) !== true) {
+    if (config.get<boolean>("fileLinks.allowOutsideWorkspace")! !== true) {
       void vscode.window.showWarningMessage(
         l10n.t("LAISORA: The file is outside this workspace and conversation folder.")
       );
@@ -440,8 +438,8 @@ export async function openConversationFile(session: Session, rawTarget: string, 
     const outsideRoots = !roots.some((root) => pathIsInside(root.real, realOutside));
     await openResolvedFile(realOutside, parsed, outsideRoots
       ? {
-          confirm: config.get<boolean>("fileLinks.confirmOutsideWorkspace", true) !== false,
-          readOnly: config.get<boolean>("fileLinks.openOutsideReadOnly", true) !== false,
+          confirm: config.get<boolean>("fileLinks.confirmOutsideWorkspace")! !== false,
+          readOnly: config.get<boolean>("fileLinks.openOutsideReadOnly")! !== false,
         }
       : null, fromEditorPanel, !outsideRoots);
     return;
@@ -491,7 +489,7 @@ async function openResolvedFile(
     return;
   }
   const extensions = systemAppExtensions(
-    vscode.workspace.getConfiguration("laisora").get("fileLinks.openWithSystemApp", DEFAULT_SYSTEM_APP_EXTENSIONS),
+    vscode.workspace.getConfiguration("laisora").get<unknown>("fileLinks.openWithSystemApp"),
     () => output.appendLine(l10n.t("R-CNV-20: Invalid or blocked extensions in the default app setting were ignored."))
   );
   const mode = decideOpenMode(realCandidate, { isDirectory: info.isDirectory(), inside, systemAppExtensions: extensions });
@@ -547,7 +545,7 @@ async function openResolvedFile(
   }
   if (outside !== null) return;
   if (!fromEditorPanel) return;
-  if (vscode.workspace.getConfiguration("laisora").get<boolean>("fileLinks.revealInExplorer", true) === false) return;
+  if (vscode.workspace.getConfiguration("laisora").get<boolean>("fileLinks.revealInExplorer")! === false) return;
 
   try {
     await vscode.commands.executeCommand("revealInExplorer", uri);

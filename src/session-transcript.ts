@@ -1,5 +1,6 @@
-import { captureToolIntentInput } from "./webview/status-line";
-import { localCommandOutput, taskNotificationDisplayFields, taskNotificationPreview, toolResultPreview } from "./transcript-display";
+import { captureToolIntentInput } from "./tool-intent";
+import type { RosterSource } from "./roster-evidence";
+import { apiRetryEvent, localCommandOutput, taskNotificationDisplayFields, taskNotificationPreview, toolResultPreview } from "./transcript-display";
 import type { HostArtifactAccess } from "./artifact-access";
 import type { AssistantUsage, AskUserQuestionSpec, EventProvenance, ImageRefInfo, NormalizedEventBody, RestoredAgent, RestoredApprovalCard, ResumePreviewMessage, TaskNotificationInfo } from "./protocol";
 import type { ConversationMessage } from "./conversation-history";
@@ -68,6 +69,7 @@ const MAX_SUBAGENT_TRANSCRIPT_BYTES = 8 * 1024 * 1024;
 const RESUME_TAIL_MAX_BYTES = 1024 * 1024;
 const RESUME_TAIL_MAX_RECORDS = 1500;
 const RESUME_CAPTURE_CHUNK_BYTES = 64 * 1024;
+const AGENT_WAKE_ORIGIN_KINDS: ReadonlySet<string> = new Set(["task-notification", "peer"]);
 
 export interface ResumeReadSet {
   parentEndOffset: number;
@@ -358,9 +360,10 @@ function findTurnIdForTimestamp(
 export async function readSessionHistory(
   parentFilePath: string,
   isAllowedPath: (p: string) => boolean,
-  opts?: { subagentsDir?: string; resumeReadSet?: ResumeReadSet; generationSessionId?: string }
+  opts?: { subagentsDir?: string; resumeReadSet?: ResumeReadSet; generationSessionId?: string; usageAncestors?: readonly string[] }
 ): Promise<{
   events: HistoryEvent[];
+  rosterSources?: RosterSource[];
   coverage: WorkCoverage;
   claudeCodeVersion?: string;
   generationStartAt?: number;
@@ -403,6 +406,7 @@ export async function readSessionHistory(
   }
 
   const rawEvents: RawHistoryItem[] = [];
+  const usageSources = new Map<string, number>();
   const preBoundaryCompacts = new Set<RawHistoryItem>();
   const parentTurns: ParentTurnSpan[] = [];
   const seenToolUseIds = new Set<string>();
@@ -546,6 +550,11 @@ export async function readSessionHistory(
       const rawTs = typeof obj.timestamp === "string" ? Date.parse(obj.timestamp) : NaN;
       const recordTime = Number.isFinite(rawTs) ? rawTs : lastParentTimestamp;
       lastParentTimestamp = recordTime;
+      const sourceSession = asRecord(obj.forkedFrom)?.sessionId;
+      if (typeof sourceSession === "string" && /^[a-zA-Z0-9-]+$/.test(sourceSession)) {
+        usageSources.set(sourceSession, Math.max(usageSources.get(sourceSession) ?? 0, recordTime));
+      }
+
 
       if (generationSessionId !== undefined && isHandoffGenerationBoundary(obj, generationSessionId)) {
         generationStartAt = recordTime;
@@ -581,7 +590,8 @@ export async function readSessionHistory(
         const prompt = extractHumanUserPrompt(obj, queuedSources, seenQueuedPrompts);
         const humanText = prompt?.text ?? null;
         const cliInsertedText = obj.type === "user" && humanText === null ? extractCliInsertedUserText(obj) : null;
-        if (humanText === null && currentTurnId !== null && STEER_TAG_RE.test(joinedText)) {
+        const agentWake = obj.type === "user" && AGENT_WAKE_ORIGIN_KINDS.has(String(asRecord(obj.origin)?.kind));
+        if (humanText === null && currentTurnId !== null && (STEER_TAG_RE.test(joinedText) || agentWake)) {
           const completedTime = lastTurnActivityTimestamp || recordTime;
           rawEvents.push({
             body: { kind: "turn_completed", turnId: currentTurnId, provenance: { path: "history" } },
@@ -598,7 +608,7 @@ export async function readSessionHistory(
         const absorbedMidTurn = extractQueuedPromptRecord(obj) !== null && prompt !== null && currentTurnId !== null;
         if (absorbedMidTurn && prompt !== null) {
           rawEvents.push({
-            body: { kind: "user_message", turnId: currentTurnId, text: prompt.text,
+            body: { kind: "user_message", turnId: currentTurnId, text: prompt.text, ...(prompt.uuid ? { uuid: prompt.uuid } : {}),
               ...(prompt.imageRefs ? { imageRefs: prompt.imageRefs } : {}), provenance: { path: "history" } },
             timestamp: recordTime, sourcePriority: 0, fileOrder: parentOrderCounter++,
           });
@@ -651,6 +661,7 @@ export async function readSessionHistory(
                 kind: "user_message",
                 turnId: currentTurnId,
                 text: prompt.text,
+                ...(prompt.uuid ? { uuid: prompt.uuid } : {}),
                 ...(imageRefs ? { imageRefs } : {}),
                 provenance: { path: "history" },
               },
@@ -825,6 +836,7 @@ export async function readSessionHistory(
                 toolUseId,
                 parentToolUseId: null,
                 toolName: toolUse.name,
+                ...(messageId === null ? {} : { messageId }),
                 inputPreview,
                 inputSummary,
                 intentInput: captureToolIntentInput(toolUse.name, toolUse.input),
@@ -864,6 +876,13 @@ export async function readSessionHistory(
         }
         rawEvents.push(item);
       } else if (obj.type === "system") {
+        const retry = apiRetryEvent(obj, currentTurnId);
+        if (retry) {
+          openPendingSilentTurn(recordTime);
+          lastTurnActivityTimestamp = recordTime;
+          rawEvents.push({ body: { ...retry, turnId: currentTurnId, provenance: { path: "history" } },
+            timestamp: recordTime, sourcePriority: 0, fileOrder: parentOrderCounter++ });
+        }
         if (obj.subtype === "task_notification" && typeof obj.task_id === "string" && obj.task_id) {
           const tokens = asRecord(obj.usage)?.total_tokens;
           const fields = makeNotificationFields({ agentId: obj.task_id,
@@ -1061,6 +1080,12 @@ export async function readSessionHistory(
             const message = asRecord(obj.message);
             const content = message?.content;
 
+            if (parentToolUseId !== null && obj.type === "assistant" && typeof message?.id === "string" && typeof message.usage === "object" && message.usage !== null) {
+              rawEvents.push({ body: { kind: "assistant_usage", turnId, parentToolUseId,
+                messageId: message.id, usage: assistantUsageFromRaw(message.usage, true), provenance: { path: "history" } },
+                timestamp: recordTime, sourcePriority: childFileIndex, fileOrder: childOrderCounter++ });
+            }
+
             if (obj.type === "user") {
               if (Array.isArray(content)) {
                 for (const block of content) {
@@ -1189,6 +1214,23 @@ export async function readSessionHistory(
     readError = String(error);
   }
 
+  const rosterSources: RosterSource[] = [];
+  const usageAncestors = [...opts?.usageAncestors ?? [], parentFilePath];
+  for (const [sessionId, through] of usageSources) {
+    const sourcePath = parentFilePath.replace(/[^\\/]+$/, `${sessionId}.jsonl`);
+    if (usageAncestors.includes(sourcePath) || !isAllowedPath(sourcePath)) continue;
+    const source = await readSessionHistory(sourcePath, isAllowedPath, { usageAncestors });
+    rosterSources.push({ sessionId, through }, ...(source.rosterSources ?? []).map(s => ({ ...s, through: Math.min(through, s.through) })));
+    if (source.readError || source.subagentsReadError) {
+      subagentsReadError ??= source.readError ?? source.subagentsReadError;
+    }
+    for (const event of source.events) {
+      if (event.body.kind !== "assistant_usage" || event.body.parentToolUseId === null ||
+        !seenToolUseIds.has(event.body.parentToolUseId) || event.timestamp > through) continue;
+      rawEvents.push({ ...event, sourcePriority: 0, fileOrder: parentOrderCounter++ });
+    }
+  }
+
   if (malformedLineCount > 0 || readError || subagentsReadError) {
     coverage.summary = "prefix-truncated";
     coverage.details = "prefix-truncated";
@@ -1247,6 +1289,7 @@ export async function readSessionHistory(
 
   return {
     events,
+    rosterSources,
     coverage,
     claudeCodeVersion,
     ...(generationStartAt !== undefined ? { generationStartAt } : {}),

@@ -1,8 +1,6 @@
 import { validExposures, exposureUsage } from "./learning-exposure";
 export { validExposures, exposureUsage } from "./learning-exposure";
 import { randomUUID } from "node:crypto";
-import { readFile } from "node:fs/promises";
-import { join } from "node:path";
 import { buildSection, measuredLines, ruleLine, NEW_ITEM_GRACE_DELIVERIES, type SectionResult, type MeasuredRun } from "./learning-section";
 import { qualifyClaims, deliverableRules, projectNotices, type RosterTarget, type RuleState, type ExposureRecord, type LedgerV2Record } from "./learning-episodes";
 import { LearningIngestion, type LearningSubject } from "./learning-ingestion";
@@ -10,7 +8,7 @@ import { privateTextR06, textHash } from "./learning";
 import { listedProfileTargets, resolveClaudeProfileModel } from "./orchestration-profiles";
 import { orchestrationVariants, orchestrationExternalTargets, type OrchestrationRow, type ExternalModels } from "./orchestration-roster";
 import { claudeModelIdLabel } from "./orchestration-executors";
-import { decodeExternalRunRecord, DISPATCH_BUDGET_EXCEEDED, LEARNING_ADDITION_CODE_POINT_CAP, WINDOWS_COMMAND_LINE_UTF16_LIMIT, type OrchestrationRunRecord } from "./orchestration-external";
+import { attestedExternalRun, readRunRecords, DISPATCH_BUDGET_EXCEEDED, LEARNING_ADDITION_CODE_POINT_CAP, WINDOWS_COMMAND_LINE_UTF16_LIMIT, type OrchestrationRunRecord } from "./orchestration-external";
 export { LEARNING_ADDITION_CODE_POINT_CAP, WINDOWS_COMMAND_LINE_UTF16_LIMIT } from "./orchestration-external";
 export const CLAUDE_TARGET_INJECTION_MAX_TASK_CODEPOINTS = 200000;
 
@@ -47,15 +45,19 @@ export function promptUsage(prompt: string, packaging: string, budget: PromptBud
 export function learningRoster(roster: readonly OrchestrationRow[], models?: ExternalModels): RosterTarget[] {
   return [...orchestrationVariants(roster).flatMap(variant => {
     const model = resolveClaudeProfileModel(variant.model, models);
-    return model ? [{ executor: "claude", model: claudeModelIdLabel(model), effort: variant.effort ?? "none", role: variant.role }] : [];
+    return model ? (variant.efforts.length ? variant.efforts : ["none"]).map(effort => ({ executor: "claude", model: claudeModelIdLabel(model), effort, role: variant.role })) : [];
   }), ...orchestrationExternalTargets(roster, models).map(row => ({ executor: row.executor, model: row.model, effort: row.effort ?? "none", role: row.role }))];
+}
+
+export function learningClaimTargets(roster: readonly OrchestrationRow[], models?: ExternalModels) {
+  return (models ? listedProfileTargets(models, roster) : learningRoster(roster, models))
+    .map(target => ({ executor: target.executor, model: target.executor === "claude" ? claudeModelIdLabel(target.model) : target.model }))
+    .filter((target, index, list) => list.findIndex(other => other.executor === target.executor && other.model === target.model) === index);
 }
 
 export function sectionFromLedger(records: Iterable<LedgerV2Record>, rules: Iterable<RuleState>, roster: readonly OrchestrationRow[], models: ExternalModels | undefined,
   conductorModel: string, project: string, conversation: string, now: string, runs: readonly MeasuredRun[], switches: LearningSwitches = DEFAULT_LEARNING_SWITCHES): SectionResult {
-  const all = [...records], targets = (models ? listedProfileTargets(models, roster) : learningRoster(roster, models))
-    .map(target => ({ executor: target.executor, model: target.executor === "claude" ? claudeModelIdLabel(target.model) : target.model }))
-    .filter((target, index, list) => list.findIndex(other => other.executor === target.executor && other.model === target.model) === index);
+  const all = [...records], targets = learningClaimTargets(roster, models);
   const roles = new Set(roster.filter(row => row.enabled).map(row => row.role));
   const usage = exposureUsage(all);
   const assignment = all.find(record => record.kind === "experiment-assignment" && record.conversation === conversation);
@@ -71,40 +73,26 @@ export function sectionFromLedger(records: Iterable<LedgerV2Record>, rules: Iter
 
 export async function readMeasuredRuns(directory: string | undefined, log: (message: string) => void): Promise<MeasuredRun[]> {
   if (!directory) return [];
-  let text: string;
-  try { text = await readFile(join(directory, "runs.jsonl"), "utf8"); }
-  catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") log("R-LRN-26: runs unavailable"); return []; }
+  const { runs, unreadableLines, readError } = await readRunRecords(directory);
+  if (readError) log("R-LRN-26: runs unavailable");
   const external = new Map<string, MeasuredRun>(), agents = new Map<string, { run: MeasuredRun; segment: number }>();
-  let skipped = 0;
-  for (const line of text.split("\n").slice(0, -1)) {
-    try {
-      const raw = JSON.parse(line);
-      if (raw.kind === "external") {
-        const record = decodeExternalRunRecord(raw);
-        if (!record) { skipped++; continue; }
-        const runId = record.runId ?? textHash(line);
-        external.set(runId, { runId, executor: record.executor, model: record.requestedModel ?? "unknown", actualModel: record.observedModel,
-          actualEffort: record.observedEffort, effort: record.requestedEffort ?? "unknown", role: record.role, outcome: record.outcome === "ok" ? "normal" : record.outcome,
-          endAt: record.endedAt, durationMs: record.durationMs, session: record.conversation ?? "unknown" });
-      } else if (raw.kind === "agent" && typeof raw.agent_id === "string" && Number.isFinite(Date.parse(raw.lastActivityAt))) {
-        if (typeof raw.firstSeenAt !== "string" || !Number.isFinite(Date.parse(raw.firstSeenAt))
-          || Date.parse(raw.firstSeenAt) > Date.parse(raw.lastActivityAt)
-          || [raw.role, raw.effort, raw.requestedModel, raw.requestedEffort, raw.model].some(value => value !== undefined && (typeof value !== "string" || !/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(value)))
-          || raw.outcome !== undefined && !["normal", "stopped", "timeout", "unknown"].includes(raw.outcome)
-          || raw.confirmedAt !== undefined && !Number.isFinite(Date.parse(raw.confirmedAt))
-          || raw.outcomeEvidence !== undefined && (!Array.isArray(raw.outcomeEvidence) || !raw.outcomeEvidence.every((value: unknown) => typeof value === "string"))) { skipped++; continue; }
-        const owner = raw.conversation ?? raw.sessionId ?? "unknown", key = JSON.stringify([owner, raw.agent_id]);
-        const previous = agents.get(key);
-        const segment = raw.segment ?? 0;
-        if (previous && (previous.segment > segment || previous.segment === segment && previous.run.endAt > raw.lastActivityAt)) continue;
-        agents.set(key, { segment, run: { runId: raw.runId ?? textHash(`${owner}:${raw.agent_id}`), executor: "claude", model: claudeModelIdLabel(raw.requestedModel ?? "unknown"),
-          actualModel: raw.confirmedAt && raw.outcomeEvidence?.length ? raw.model ?? "unknown" : "unknown", actualEffort: raw.confirmedAt ? raw.effort ?? "unknown" : "unknown",
-          effort: raw.requestedEffort ?? "unknown", role: raw.role ?? "unknown", outcome: raw.outcome ?? "unknown", endAt: raw.lastActivityAt,
-          durationMs: Date.parse(raw.lastActivityAt) - Date.parse(raw.firstSeenAt), session: raw.conversation ?? "unknown" } });
-      } else skipped++;
-    } catch { skipped++; }
+  for (const record of runs) {
+    if (record.kind === "external") {
+      const runId = record.runId ?? textHash(JSON.stringify(record));
+      external.set(runId, { runId, executor: record.executor, model: record.requestedModel ?? "unknown", actualModel: record.observedModel,
+        actualEffort: record.observedEffort, effort: record.requestedEffort ?? "unknown", role: record.role, outcome: record.outcome === "ok" ? "normal" : record.outcome,
+        endAt: record.endedAt, durationMs: record.durationMs, session: record.conversation ?? "unknown" });
+    } else {
+      const owner = record.conversation ?? record.sessionId ?? "unknown", key = JSON.stringify([owner, record.agent_id]);
+      const previous = agents.get(key), segment = record.segment ?? 0;
+      if (previous && (previous.segment > segment || previous.segment === segment && previous.run.endAt > record.lastActivityAt)) continue;
+      agents.set(key, { segment, run: { runId: record.runId ?? textHash(owner + ":" + record.agent_id), executor: "claude", model: claudeModelIdLabel(record.requestedModel ?? "unknown"),
+        actualModel: record.confirmedAt && record.outcomeEvidence?.length ? record.model ?? "unknown" : "unknown", actualEffort: record.confirmedAt ? record.effort ?? "unknown" : "unknown",
+        effort: record.requestedEffort ?? "unknown", role: record.role ?? "unknown", outcome: record.outcome ?? "unknown", endAt: record.lastActivityAt,
+        durationMs: Date.parse(record.lastActivityAt) - Date.parse(record.firstSeenAt), session: record.conversation ?? "unknown" } });
+    }
   }
-  if (skipped) log(`R-LRN-26: skipped ${skipped} invalid run lines`);
+  if (unreadableLines) log(`R-LRN-26: skipped ${unreadableLines} invalid run lines`);
   return [...external.values(), ...[...agents.values()].map(entry => entry.run)];
 }
 
@@ -135,7 +123,10 @@ export class LearningDelivery {
     await this.ingestion.ledger.append({ kind: "delivery", v: 2, at: record.at, opId: randomUUID(), conversation: record.conversation, session: record.session,
       conductorModel: model, project: this.ingestion.projectRef, items: section.items, setHash: section.setHash, chars: section.chars, dropped: section.dropped, outcome: "sent", exposureId: record.exposureId });
   }
-  target(subject: LearningSubject, prompt: string, packaging = "", budget = executorPromptBudget(subject.executor ?? "claude", subject.model ?? "unknown")): string {
+  async target(subject: LearningSubject, prompt: string, packaging = "", budget = executorPromptBudget(subject.executor ?? "claude", subject.model ?? "unknown")): Promise<string> {
+    let refreshed = false;
+    try { await this.ingestion.ledger.refresh(); refreshed = true; }
+    catch { this.log("R-LRN-07: learning state unavailable for target delivery"); }
     const all = [...this.ingestion.ledger.state.records.values()], usage = exposureUsage(all), settings = this.effectiveSettings();
     const arm = this.ingestion.ledger.state.assignments.get(this.ingestion.conversation ?? "unknown")?.arm;
     const rules = [...this.ingestion.ledger.state.rules.values()].filter(rule => rule.active && rule.key.bind === "target"
@@ -149,12 +140,12 @@ export class LearningDelivery {
     const baseUsage = promptUsage(prompt, packaging, budget);
     if (budget.commandLineLimit !== undefined && baseUsage.commandLineUnits > budget.commandLineLimit) throw new Error(DISPATCH_BUDGET_EXCEEDED);
     const record = this.receipt(subject, prompt, subject.model ?? "unknown", subject.effort ?? "unknown", "target", []);
-    const reason = !this.ingestion.ready || !this.ingestion.ledger.consistent ? "state-unavailable" : !settings.enabled || !settings.targetInjection || !settings.automaticAdoption ? "disabled"
+    const reason = !refreshed || !this.ingestion.ready || !this.ingestion.ledger.consistent ? "state-unavailable" : !settings.enabled || !settings.targetInjection || !settings.automaticAdoption ? "disabled"
       : this.mismatched.has(JSON.stringify([subject.executor, subject.model, subject.effort])) ? "model-mismatch" : settings.experiment && arm === "holdout" ? "holdout"
       : budget.taskCodePointLimit !== undefined && baseUsage.taskCodePoints > budget.taskCodePointLimit ? "task-size-withheld" : undefined;
     const kept = reason ? [] : [...rules];
     const withheld = reason ? rules.map(rule => ({ item: { type: "rule" as const, id: rule.ruleId }, reason })) : [];
-    const render = () => kept.length ? `${prompt}\n\nModel usage knowledge for ${subject.executor}/${subject.model}:\n${kept.map(ruleLine).join("\n")}` : prompt;
+    const render = () => kept.length ? `${prompt}\n\nModel usage knowledge for ${subject.executor}/${subject.model}:\n${kept.map(rule => ruleLine({ ...rule, ineffective: usage.ineffective.get(rule.ruleId) ?? 0 }, usage.delivered.get(rule.ruleId) ?? 0)).join("\n")}` : prompt;
     while (kept.length) {
       const usageNow = promptUsage(render(), packaging, budget, prompt);
       if (usageNow.learningAdditionPoints <= budget.learningAdditionCap
@@ -204,10 +195,11 @@ export class LearningDelivery {
     const executor = record.kind === "agent" ? "claude" : record.executor;
     const matches = executor === pending.record.executor && record.role === pending.record.role;
     const mismatch = executor !== pending.record.executor || record.role !== undefined && record.role !== "unknown" && record.role !== pending.record.role;
+    const attestation = record.kind === "external" ? attestedExternalRun(record) : undefined;
     await this.observed(record.dispatchId, record.kind === "agent" ? record.model ?? "unknown" : record.observedModel ?? "unknown",
       record.kind === "agent" ? record.effort ?? "unknown" : record.observedEffort ?? "unknown",
       record.kind === "agent" && record.confirmedAt && record.outcomeEvidence?.length && matches ? [`${record.runId}:runtime:${record.confirmedAt}`]
-        : record.kind === "external" && record.attestation && matches ? [`${record.runId}:${record.attestation.source}:${record.attestation.sessionId}`] : [], false, mismatch);
+        : attestation && matches ? [`${record.runId}:${attestation.source}:${attestation.sessionId}`] : [], false, mismatch);
   }
   async end(): Promise<void> {
     const all = [...this.ingestion.ledger.state.records.values()];
@@ -222,7 +214,7 @@ export class LearningDelivery {
           const started = run.kind === "agent" ? run.firstSeenAt : run.startedAt;
           const ended = run.kind === "agent" ? run.lastActivityAt : run.endedAt;
           const attested = run.kind === "agent" ? run.confirmedAt && run.outcomeEvidence?.length && run.confirmedAt >= ended
-            : run.attestation && run.attestation.model === model && run.attestation.effort === effort;
+            : attestedExternalRun(run);
           return run.runId && attested && Number.isFinite(Date.parse(started)) && Number.isFinite(Date.parse(ended))
             && started >= exposure.at && ended >= started && executor === claim.executor && model === claim.model
             && effort !== undefined && effort !== "unknown" && (claim.effort === "any" || effort === claim.effort)

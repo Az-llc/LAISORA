@@ -75,7 +75,7 @@ export class SessionGuardrail {
   guardrailPolicy(): GuardrailPolicy {
     let raw: unknown = 1;
     try {
-      raw = getLaisoraConfiguration().get<unknown>("guardrail.autoMaxLevel", 1);
+      raw = getLaisoraConfiguration().get<unknown>("guardrail.autoMaxLevel");
     } catch {
       raw = 1;
     }

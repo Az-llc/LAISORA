@@ -64,7 +64,7 @@ export interface PersistedOpenTab {
 
 export function restoreTabsOnStartupEnabled(): boolean {
   try {
-    return getLaisoraConfiguration().get<boolean>("restoreTabsOnStartup", true) !== false;
+    return getLaisoraConfiguration().get<boolean>("restoreTabsOnStartup")! !== false;
   } catch {
     return true;
   }
@@ -214,47 +214,12 @@ export async function sessionSummaryOf(sessionId: string): Promise<string | unde
   return typeof info?.summary === "string" ? info.summary : undefined;
 }
 
-const initialTabTitles = new WeakMap<Session, { generation: number; title: string }>();
-
-export function setInitialTabTitle(session: Session, title: string): void {
-  session.title = title;
-  session.autoTitled = true;
-  initialTabTitles.set(session, { generation: session.logicalGeneration, title });
-}
-
-export function persistInitialTabTitle(session: Session): void {
-  const initial = initialTabTitles.get(session);
-  if (initial?.generation !== session.logicalGeneration || session.closed || session.clearing || session.titleRefreshing) return;
-  session.titleRefreshing = true;
-  void refreshTabTitle(session);
-}
-
 export async function refreshTabTitle(session: Session): Promise<void> {
   const sessionId = session.auth?.sessionId;
   const generation = session.logicalGeneration;
   try {
     if (!sessionId) return;
     rememberSession(session);
-    const initial = initialTabTitles.get(session);
-    if (initial?.generation === generation) {
-      const ref = sessionTranscriptRef(session);
-      if (!ref) return;
-      let written: boolean;
-      try {
-        written = await queueRename(ref.sessionId, async () => {
-          if (initialTabTitles.get(session) !== initial || session.logicalGeneration !== generation || session.closed) return false;
-          await writeCustomTitle(ref.file, ref.sessionId, initial.title);
-          return true;
-        });
-      } catch (error) {
-        output.appendLine(`R-LRN-18: Could not save the research tab title: ${String(error)}`);
-        return;
-      }
-      if (!written || session.logicalGeneration !== generation || session.closed) return;
-      initialTabTitles.delete(session);
-      session.titleRefreshed = true;
-      return;
-    }
     const summary = await sessionSummaryOf(sessionId);
     if (summary === undefined) return;
     if (session.logicalGeneration !== generation || session.closed) return;
@@ -457,7 +422,6 @@ function queueRename<T>(sessionId: string, run: () => Promise<T>): Promise<T> {
 
 function applyCustomTitle(st: SessionStore, s: Session, sessionId: string, title: string): void {
   s.title = displayTitleFromSummary(title, sessionId);
-  initialTabTitles.delete(s);
   s.autoTitled = true;
   st.post({ type: "tabRenamed", tabId: s.tabId, title: s.title });
 }
@@ -587,7 +551,7 @@ export async function handleSessionFileMessage(
     case "requestAccountUsage": {
       const conversation = target?.conversation && !target.conversation.isClosed ? target.conversation : undefined;
       const cfg = getLaisoraConfiguration();
-      const apiKeyPolicy = normalizeApiKeyPolicy(cfg.get("claude.apiKeyPolicy", "inherit"));
+      const apiKeyPolicy = normalizeApiKeyPolicy(cfg.get<string>("claude.apiKeyPolicy")!);
       const snapshot = await accountUsageFetcher.request(sender, {
         identity: JSON.stringify([claudeConfigDir(), apiKeyPolicy, target?.auth?.credentialSource ?? null, target?.auth?.apiKeySource ?? null]),
         ...(conversation ? { viaConversation: (signal: AbortSignal) => conversation.planUsageRateLimits(ACCOUNT_USAGE_TIMEOUT_MS, signal) } : {}),

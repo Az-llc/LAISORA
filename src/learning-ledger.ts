@@ -4,7 +4,7 @@ import { appendFile, link, mkdir, open, readFile, stat, unlink } from "node:fs/p
 import { join, resolve } from "node:path";
 import { isDeepStrictEqual } from "node:util";
 import { deliverySetHash, episodeOpId, itemIdOf, qualifyRules, ruleIdOf, type EpisodeRecord, type LedgerV2Record, type ExperimentAssignmentRecord, type ClaimRecord, type RuleState } from "./learning-episodes";
-import { textHash } from "./learning";
+import { privateTextR06, singleLineR10, textHash } from "./learning";
 import { containsAbsolutePath } from "./path-redaction";
 import { encodeLedgerFrame, LedgerV3Decoder, type LedgerLine } from "./learning-ledger-codec";
 import { CHECKPOINT_MIN_GAIN_BYTES, LEARNING_MAX_LINE_BYTES, learningReadChunk, checkpointCandidates, hashPrefix, loadCheckpoint, publishCheckpoint, sameCheckpointContent } from "./learning-checkpoint";
@@ -48,6 +48,22 @@ function decodeFact(r: Record<string, unknown>): LedgerV2Record | undefined {
           || episode.at !== r.at || (r.status === "state-unavailable") !== (episode.status === "state-unavailable")) return undefined;
       }
       if (r.tool !== undefined && !ref(r.tool) || r.head !== undefined && (typeof r.head !== "string" || !/^(?:|other|[a-z]+(?: [a-z][a-z0-9-]*)?)$/.test(r.head))) return undefined;
+      break;
+    }
+    case "correction": {
+      if (!fields(r, ["conversation", "session", "requestId", "inputHash", "item", "action", "reason", "runs"], ["replacement", "replacementRecord"])
+        || ![r.session, r.requestId].every(ref) || !hash(r.inputHash) || !["retract", "replace"].includes(String(r.action))
+        || !safeText(r.reason, 300) || !singleLineR10(r.reason, 300) || privateTextR06(r.reason)) return undefined;
+      const item = r.item as Record<string, unknown>;
+      if (!item || Object.keys(item).length !== 2 || !(item.type === "rule" && hash(item.ruleId) || item.type === "claim" && hash(item.itemId))) return undefined;
+      if (!Array.isArray(r.runs) || r.runs.length > 8 || !r.runs.every(run => run && Object.keys(run).length === 2 && ref(run.runId) && time(run.endAt))) return undefined;
+      if (r.action === "replace" ? !hash(r.replacement) : r.replacement !== undefined || r.replacementRecord !== undefined) return undefined;
+      if (r.replacementRecord !== undefined) {
+        const replacement = decodeLedgerRecord(r.replacementRecord);
+        if (replacement?.kind !== "claim" || replacement.source !== "observation" || replacement.itemId !== r.replacement
+          || replacement.conversation !== r.conversation || replacement.session !== r.session || replacement.at !== r.at
+          || replacement.requestId !== r.requestId || replacement.inputHash !== r.inputHash || !isDeepStrictEqual(replacement.evidence.runs, r.runs)) return undefined;
+      }
       break;
     }
     case "claim": {
@@ -645,7 +661,6 @@ export class LearningLedger {
   reload(reset = false): Promise<void> { return this.synchronize(reset ? "reset" : "tail"); }
   async refresh(): Promise<void> {
     await this.synchronize("checked");
-    if (!this.consistent || this.skipped) await this.synchronize("reset");
   }
   append(record: LedgerV2Record): Promise<void> {
     return this.serial(async () => {

@@ -1,5 +1,5 @@
 import { privateTextR06, textHash } from "./learning";
-import { SIG_VERSION } from "./learning-signature";
+import { failureLabelText, SIG_VERSION } from "./learning-signature";
 
 export type EpisodeStatus = "counted" | "transient" | "human" | "hook" | "probe" | "unclassified" | "project" | "unknown-project" | "unknown-model" | "state-unavailable";
 
@@ -190,7 +190,46 @@ export interface EpisodeStateRecord {
   readonly head?: string;
 }
 
-export type LedgerV2Record = EpisodeStateRecord | EpisodeRecord | ClaimRecord | UseRecord | DeliveryRecord | ExposureRecord | ResearchCompleteRecord | ExperimentAssignmentRecord | MeasurementRecord | LearningControlRecord;
+export interface CorrectionRecord {
+  readonly kind: "correction";
+  readonly v: 2;
+  readonly at: string;
+  readonly opId: string;
+  readonly conversation: string;
+  readonly session: string;
+  readonly requestId: string;
+  readonly inputHash: string;
+  readonly item: ItemRef;
+  readonly action: "retract" | "replace";
+  readonly reason: string;
+  readonly runs: readonly ClaimRun[];
+  readonly replacement?: string;
+  readonly replacementRecord?: ClaimRecord;
+}
+
+export function shortItemId(id: string): string { return "#" + id.slice(0, 8); }
+
+export function correctionTimes(records: Iterable<LedgerV2Record>): Map<string, string> {
+  const times = new Map<string, string>();
+  for (const record of records) if (record.kind === "correction") {
+    const id = record.item.type === "claim" ? record.item.itemId : record.item.ruleId;
+    const key = record.item.type + ":" + id;
+    if (!times.has(key) || times.get(key)! < record.at) times.set(key, record.at);
+  }
+  return times;
+}
+
+export function itemSurvivesCorrection(item: DeliveryItem, at: string, corrections: ReadonlyMap<string, string>): boolean {
+  const corrected = corrections.get(item.type + ":" + item.id);
+  return corrected === undefined || item.type === "rule" && at > corrected;
+}
+
+export function deliveredLearningItems(records: Iterable<LedgerV2Record>, delivery: DeliveryRecord): DeliveryItem[] {
+  const corrections = correctionTimes(records);
+  return delivery.items.filter(item => itemSurvivesCorrection(item, delivery.at, corrections));
+}
+
+export type LedgerV2Record = CorrectionRecord | EpisodeStateRecord | EpisodeRecord | ClaimRecord | UseRecord | DeliveryRecord | ExposureRecord | ResearchCompleteRecord | ExperimentAssignmentRecord | MeasurementRecord | LearningControlRecord;
 
 function canonicalJson(value: Readonly<Record<string, unknown>>): string {
   return JSON.stringify(Object.fromEntries(Object.keys(value).sort().map((key) => [key, value[key]])));
@@ -261,10 +300,12 @@ export interface RuleState {
 export const RULE_ACTIVE_EPISODES = 2;
 
 export function qualifyRules(records: Iterable<LedgerV2Record>, sigVersion = SIG_VERSION): Map<string, RuleState> {
+  const all = [...records], corrections = correctionTimes(all);
   const byRule = new Map<string, EpisodeRecord[]>();
   const seen = new Set<string>();
-  for (const record of records) {
-    if (record.kind !== "episode" || record.cls === "hook_block" || record.status !== "counted" || record.sigV !== sigVersion) continue;
+  for (const record of all) {
+    if (record.kind !== "episode" || record.cls === "hook_block" || record.status !== "counted" || record.sigV !== sigVersion
+      || !failureLabelText(record.cls, record.label) || !itemSurvivesCorrection({ type: "rule", id: record.ruleId }, record.at, corrections)) continue;
     if (seen.has(record.opId)) continue;
     seen.add(record.opId);
     const list = byRule.get(record.ruleId);
@@ -326,7 +367,7 @@ function latest(values: readonly string[]): string | undefined {
 }
 
 export function qualifyClaims(records: Iterable<LedgerV2Record>, now: string, listed: (executor: string, model: string) => boolean, roles: ReadonlySet<string> = new Set(["worker", "explorer", "reviewer"])): ClaimItem[] {
-  const all = [...records], complete = completedPublicClaims(all);
+  const all = [...records], complete = completedPublicClaims(all), corrections = correctionTimes(all);
   const completeClaims = all.filter((record): record is ClaimRecord => record.kind === "claim" && (record.source !== "public" || complete.has(record.opId)))
     .sort((a, b) => a.at.localeCompare(b.at) || a.opId.localeCompare(b.opId));
   const latestResearch = new Map<string, string>();
@@ -342,7 +383,7 @@ export function qualifyClaims(records: Iterable<LedgerV2Record>, now: string, li
   const items: ClaimItem[] = [];
   for (const [itemId, list] of byItem) {
     const first = list[0];
-    if (!listed(first.executor, first.model)) continue;
+    if (!listed(first.executor, first.model) || corrections.has("claim:" + itemId)) continue;
     const corroborations = list.flatMap((claim) => {
       const credited = new Set(claim.evidence.creditedRunIds);
       const at = latest(claim.evidence.runs.filter((run) => credited.has(run.runId)).map((run) => run.endAt));

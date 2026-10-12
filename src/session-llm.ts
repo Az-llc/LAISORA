@@ -63,7 +63,7 @@ function createLlmClientForSession(
     cwd,
     claudeCodeExecutablePath: configuredClaudeExecutablePath(cfg),
     sdkClaudeCodeVersion: sdkClaudeCodeVersion(),
-    apiKeyPolicy: normalizeApiKeyPolicy(cfg.get("claude.apiKeyPolicy", "inherit")),
+    apiKeyPolicy: normalizeApiKeyPolicy(cfg.get<string>("claude.apiKeyPolicy")!),
   });
 }
 
@@ -92,7 +92,7 @@ export class SessionLlm {
             const settings = await Promise.race([
               sdk.resolveSettings({
                 cwd,
-                settingSources: cfg.get("claude.settingSources", ["user", "project", "local"]),
+                settingSources: cfg.get<Array<"user" | "project" | "local">>("claude.settingSources")!,
               }),
               timeoutPromise,
             ]);
@@ -299,7 +299,7 @@ export class SessionLlm {
       } else {
         outcome = await runLlmAnalysis({
           enabled: true,
-          learningEnabled: getLaisoraConfiguration().get<boolean>("learning.enabled", false) === true,
+          learningEnabled: getLaisoraConfiguration().get<boolean>("learning.enabled")! === true,
           client: createLlmClientForSession(this.host, profile),
           cache: this.host.llmCache,
           input,

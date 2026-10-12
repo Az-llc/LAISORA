@@ -18,6 +18,7 @@ export interface InjectedAgentDefinition {
 export interface RosterInjection {
   at: number;
   agents: InjectedAgentDefinition[];
+  perCallEffort?: true;
 }
 
 export interface AgentStartObservation {
@@ -31,6 +32,21 @@ export interface AgentStartObservation {
 export interface RosterEvidence {
   injections: RosterInjection[];
   starts: AgentStartObservation[];
+}
+
+export interface RosterSource {
+  sessionId: string;
+  through: number;
+}
+
+export function readSourceRosterEvidence(directory: string, sources: readonly RosterSource[]): RosterEvidence {
+  return sources.reduce((evidence, source) => {
+    const recorded = readRosterEvidence(directory, source.sessionId);
+    return mergeRosterEvidence(evidence, {
+      injections: recorded.injections.filter(i => i.at <= source.through),
+      starts: recorded.starts.filter(s => s.at <= source.through),
+    });
+  }, emptyRosterEvidence());
 }
 
 export function emptyRosterEvidence(): RosterEvidence {
@@ -73,7 +89,7 @@ export function decodeRosterEvidence(raw: unknown): RosterEvidence | undefined {
     if (!entry || typeof entry !== "object") continue;
     const e = entry as Record<string, unknown>;
     if (!time(e.at) || !Array.isArray(e.agents)) continue;
-    injections.push({ at: e.at, agents: e.agents.map(decodeAgent).filter((a): a is InjectedAgentDefinition => a !== undefined) });
+    injections.push({ at: e.at, agents: e.agents.map(decodeAgent).filter((a): a is InjectedAgentDefinition => a !== undefined), ...(e.perCallEffort === true ? { perCallEffort: true as const } : {}) });
   }
   const starts = r.starts.map(decodeStart).filter((s): s is AgentStartObservation => s !== undefined);
   return mergeRosterEvidence({ injections, starts }, emptyRosterEvidence());
@@ -81,10 +97,12 @@ export function decodeRosterEvidence(raw: unknown): RosterEvidence | undefined {
 
 export function injectionOf(
   variants: ReadonlyArray<{ agentKey: string; role: string; model: string; effort?: string }>,
-  at: number
+  at: number,
+  perCallEffort = false
 ): RosterInjection {
   return {
     at,
+    ...(perCallEffort ? { perCallEffort: true as const } : {}),
     agents: variants
       .map((v) => decodeAgent({ agentKey: v.agentKey, role: v.role, model: v.model, effort: v.effort ?? null }))
       .filter((a): a is InjectedAgentDefinition => a !== undefined)
@@ -92,7 +110,7 @@ export function injectionOf(
   };
 }
 
-const sameAgents = (a: RosterInjection, b: RosterInjection): boolean => JSON.stringify(a.agents) === JSON.stringify(b.agents);
+const sameAgents = (a: RosterInjection, b: RosterInjection): boolean => a.perCallEffort === b.perCallEffort && JSON.stringify(a.agents) === JSON.stringify(b.agents);
 
 export function mergeRosterEvidence(a: RosterEvidence, b: RosterEvidence): RosterEvidence {
   const all = [...a.injections, ...b.injections].sort((x, y) => x.at - y.at);
@@ -130,7 +148,7 @@ export function hasInjectedRoster(evidence: RosterEvidence): boolean {
 export function attributeSubagent(
   evidence: RosterEvidence,
   run: { agentType?: string; transcriptAgentId?: string; startedAt?: number }
-): { definition: InjectedAgentDefinition; start: AgentStartObservation | undefined } | undefined {
+): { definition: InjectedAgentDefinition; start: AgentStartObservation | undefined; perCallEffort: boolean } | undefined {
   const start = run.transcriptAgentId !== undefined ? evidence.starts.find((s) => s.agentId === run.transcriptAgentId) : undefined;
   if (start !== undefined && run.agentType !== undefined && run.agentType !== start.agentKey) return undefined;
   const key = start?.agentKey ?? run.agentType;
@@ -142,7 +160,7 @@ export function attributeSubagent(
     else break;
   }
   const definition = inForce?.agents.find((a) => a.agentKey === key);
-  return definition !== undefined ? { definition, start } : undefined;
+  return definition !== undefined ? { definition, start, perCallEffort: inForce?.perCallEffort === true } : undefined;
 }
 
 const digest = (value: string): string => createHash("sha256").update(value).digest("hex");

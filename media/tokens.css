@@ -14,6 +14,9 @@
   --l-note: 11.5px;
   --l-label: 10px;
   --l-step-number: 28px;
+  --l-row-number: var(--l-label);
+  --l-row-title: var(--l-note);
+  --l-row-meta: var(--l-label);
   --l-space-1: 4px;
   --l-space-2: 8px;
   --l-space-3: 12px;

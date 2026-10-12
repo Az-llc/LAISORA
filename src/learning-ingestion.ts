@@ -31,7 +31,7 @@ export interface LearningToolResult {
 export interface LearningSubject { recipient: string; run: string; dispatchId: string; executor?: "claude" | "codex" | "agy"; model?: string; effort?: string; role?: string }
 
 export const DELEGATION_SCHEMA_VERSION = 2;
-export const DELEGATION_SDK_VERSION = "0.3.289";
+export const DELEGATION_SDK_VERSION = "0.3.296";
 const agentString = (value: unknown) => typeof value === "string";
 const agentSchema = {
   description: agentString, prompt: agentString, subagent_type: agentString, name: agentString, team_name: agentString,
@@ -39,6 +39,7 @@ const agentSchema = {
   model: (value: unknown) => ["sonnet", "opus", "haiku", "fable"].includes(value as string),
   mode: (value: unknown) => ["acceptEdits", "auto", "bypassPermissions", "default", "dontAsk", "plan"].includes(value as string),
   isolation: (value: unknown) => ["worktree", "remote"].includes(value as string),
+  effort: (value: unknown) => ["low", "medium", "high", "xhigh", "max"].includes(value as string),
 } satisfies Record<keyof Required<AgentInput>, (value: unknown) => boolean>;
 const agentRequired = ["description", "prompt"] as const satisfies readonly { [K in keyof AgentInput]-?: undefined extends AgentInput[K] ? never : K }[keyof AgentInput][];
 export function delegationInvalidFields(tool: string, input: unknown): string[] {

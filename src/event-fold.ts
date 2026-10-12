@@ -3,7 +3,7 @@ import type { ModelFallbackState, ModelInfo } from "./protocol";
 import type { ClaudeConversation } from "./claudeHost";
 import type { HostArtifactAccess } from "./artifact-access";
 import { applyActivityEvent, type BackgroundActivityState } from "./background-activity";
-import { attachTimeBucketRequestNumbers } from "./time-buckets";
+import { attachTimeBucketRequestNumbers, inProgressStepOfDelegation } from "./time-buckets";
 import { foldEvidence, type SemanticEvidenceIndex } from "./evidence-index";
 import { windowEvents } from "./event-window";
 import { foldGuardrail, touchedSignalIds, type GuardrailState } from "./guardrail";
@@ -19,11 +19,10 @@ import {
   requiresTimestamp,
 } from "./protocol";
 import { foldSessionFacts, type SessionFactsAccumulator } from "./session-facts";
-import { markEventLogTrimmed, reduceWorkModel, type WorkModelState } from "./work-model";
+import { backgroundAgentDispatch, markEventLogTrimmed, reduceWorkModel, type WorkModelState } from "./work-model";
+import { configuredEventLimit } from "./claude-settings";
 
-const EVENT_LOG_MAX = 5000;
-
-export function trimEventLog(events: NormalizedEvent[], max = EVENT_LOG_MAX): NormalizedEvent[] {
+export function trimEventLog(events: NormalizedEvent[], max = configuredEventLimit()): NormalizedEvent[] {
   return windowEvents(events, max).events;
 }
 
@@ -82,6 +81,7 @@ export interface EventFoldDraft {
   modelFallback?: ModelFallbackState;
   models?: ModelInfo[];
   appliedModel?: string;
+  appliedEffort?: string | null;
   effectiveModel?: string | null;
   lastContextTotalTokens: number | null;
   liveDelegationAgentIds: Set<string>;
@@ -253,7 +253,8 @@ export function foldEventState(
       draft.evidenceIndex,
       ev,
       meta?.hostArtifacts,
-      boundaries.length > 0 ? boundaries : undefined
+      boundaries.length > 0 ? boundaries : undefined,
+      ev.provenance?.path === "history" ? undefined : { appliedEffort: draft.appliedEffort }
     );
     if (ev.kind === "turn_started" || ev.kind === "user_message") {
       const timeBuckets = attachTimeBucketRequestNumbers(draft.evidenceIndex.timeBuckets, draft.workModel.requests ?? []);
@@ -275,6 +276,15 @@ export function foldEventState(
   try {
     const before = draft.guardrail;
     draft.guardrail = foldGuardrail(draft.guardrail, { type: "event", event: ev });
+    if (ev.kind === "tool_call_started" || ev.kind === "tool_call_finished") {
+      const workModel = draft.workModel;
+      const timeBuckets = draft.evidenceIndex.timeBuckets;
+      draft.guardrail = foldGuardrail(draft.guardrail, { type: "delegation", event: ev, inProgressStep: () => {
+        const dispatch = ev.kind === "tool_call_finished" && ev.taskNotification !== undefined
+          ? backgroundAgentDispatch(workModel, ev.taskNotification.agentId) : undefined;
+        return dispatch === undefined ? undefined : inProgressStepOfDelegation(timeBuckets, dispatch);
+      } });
+    }
     if (ev.provenance?.path === "live") {
       for (const id of touchedSignalIds(before, draft.guardrail)) draft.liveGuardrailSignalIds.add(id);
     }

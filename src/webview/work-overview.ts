@@ -1,6 +1,8 @@
-import type { MainTokenTotal, PlanUsage } from "../plan-usage";
-import type { RoleRunView, RoleSummaryView } from "../role-summary";
-import { derivePlanView, planStepKey } from "./plan-view";
+import type { PlanUsage } from "../plan-usage";
+import type { AnalysisPlansView, AnalysisTimeView, TokenDisplay, RoleRunView, RoleSummaryView } from "../role-summary";
+import type { RoleCacheTtlView } from "../cache-ttl-cost";
+import { deriveEarlierPlanViews, derivePlanView, planStepKey } from "./plan-view";
+import { planContextOf, planNow, planPeriodEnd, UNMEASURED_LABEL } from "../plan-steps";
 import { renderPlanSection, planTokens } from "./plan-panel";
 import { createLoader } from "./loader";
 import { EXECUTORS } from "../orchestration-executors";
@@ -21,6 +23,7 @@ import { formatDuration, clock, dayClock } from "./format";
 import { formatDateTime } from "./l10n";
 import { termSpan, type TermKey } from "./term";
 import { WorkGraph, coverageRows, NO_WORK_SUMMARY_TEXT, type GraphScrollPort } from "./work-graph";
+import { ROW_H } from "./row-frame";
 import { AgentInspector } from "./agent-inspector";
 import * as l10n from "@vscode/l10n";
 
@@ -81,12 +84,21 @@ function sameMarks(a: readonly ExecLogMark[] | undefined, b: readonly ExecLogMar
   return a.every((m, i) => m.toolUseId === b[i].toolUseId && m.findingAnchor === b[i].findingAnchor && m.label === b[i].label);
 }
 
-type ChartTone = "c1" | "c2" | "c3" | "c4" | "tool" | "unobserved";
-const MODEL_TONES: readonly ChartTone[] = ["c1", "c2", "c3"];
+type ChartTone = "c1" | "c2" | "c3" | "c4" | "tool" | "wait" | "unobserved";
+const ANALYSIS_TIME_PARTS: readonly { tone: ChartTone; term: TermKey }[] = [
+  { tone: "c1", term: "LLM generation" }, { tone: "tool", term: "Tool execution" },
+  { tone: "wait", term: "Waiting for subagent" }, { tone: "c3", term: "Waiting for your answer" },
+  { tone: "c4", term: "Waiting for reply" }, { tone: "c2", term: "Subagent" },
+];
 const ROLE_TONES: readonly ChartTone[] = ["c1", "c2", "c3", "c4"];
 
 type AnalysisSubtab = "script" | "ai";
+type FoldArea = "roles" | "plans";
 const ANALYSIS_SUBTABS: readonly AnalysisSubtab[] = ["script", "ai"];
+
+function planPeriodText(start: number | null, end: number | null, running: boolean, now: number): string {
+  return start === null || end === null ? UNMEASURED_LABEL : `${dayClock(start)} → ${dayClock(planPeriodEnd({ end, running }, now))}`;
+}
 
 export class WorkOverview {
   private readonly rootEl: HTMLElement;
@@ -95,6 +107,8 @@ export class WorkOverview {
   private orchestrationEl: HTMLElement | undefined;
   private readonly analysisEl: HTMLElement;
   private readonly measuredEl: HTMLElement;
+  private readonly planOpenState = new Map<string, boolean>();
+  private readonly planHeadings = new Map<string, HTMLElement>();
   private readonly expandedRoles = new Set<string>();
   private errExpanded = false;
   private readonly expandedFindings = new Set<string>();
@@ -165,7 +179,8 @@ export class WorkOverview {
     private readonly graphScrollPort?: GraphScrollPort,
     private readonly onAnalysisSubChange?: () => void,
     private readonly onModeApplied?: (moveFocus: boolean) => void,
-    private readonly onViewChange: (action: () => void) => void = (action) => action()
+    private readonly onViewChange: (action: () => void) => void = (action) => action(),
+    modelDisplayName?: (model: string) => string | undefined
   ) {
     this.rootEl = document.createElement("div");
     this.rootEl.className = "work-overview";
@@ -221,7 +236,7 @@ export class WorkOverview {
     this.logHeadEl.hidden = true;
 
     this.inspector = new AgentInspector(this.tabId, () => this.graph.onInspectorClosed());
-    this.graph = new WorkGraph(this.tabId, this.inspector, this.graphScrollPort);
+    this.graph = new WorkGraph(this.tabId, this.inspector, this.graphScrollPort, modelDisplayName);
 
     (this.rootEl as HTMLElement & { laisoraSetExecLogMarks?: (marks: ExecLogMark[] | undefined) => void })
       .laisoraSetExecLogMarks = (marks) => this.setExecLogMarks(marks);
@@ -441,9 +456,7 @@ export class WorkOverview {
     this.planSection.className = "plan-section";
     const time = this.activeSemantic()?.timeBuckets;
     const block = time?.blocks.at(-1);
-    const context = this.payload?.planContext ?? (block ? {
-      blockId: block.blockId, text: block.text, start: block.start, end: block.end, running: this.turnRunning,
-    } : undefined);
+    const context = this.payload?.planContext ?? (block && block.closedAt === undefined ? planContextOf(block, block.end, this.turnRunning) : undefined);
     const view = derivePlanView(this.payload, this.planOrchestration, this.planUsage, this.lastTickMs ?? 0, context);
     for (const agent of time?.agents ?? []) {
       if (this.payload?.planTools !== undefined) continue;
@@ -459,7 +472,7 @@ export class WorkOverview {
       view.now.push({ id: `background:${task.taskId}`, agent: "Claude", title: task.description,
         start: task.start, elapsed: (this.nowMs(time) ?? task.end) - task.start, status: "running", tokens: null, cacheRead: 0, external: false });
     }
-    renderPlanSection(this.planSection, view);
+    renderPlanSection(this.planSection, view, undefined, deriveEarlierPlanViews(this.payload, this.planOrchestration, this.planUsage, this.lastTickMs ?? 0));
   }
 
   update(payload: WorkModelPayload | undefined): void {
@@ -475,6 +488,7 @@ export class WorkOverview {
     const active = semanticView === false ? undefined : model;
     const shallowAnalysisChanged =
       previous?.timeBuckets !== active?.timeBuckets ||
+      previous?.analysisPlans !== active?.analysisPlans ||
       previous?.roleSummary !== active?.roleSummary ||
       previous?.failureSummary !== active?.failureSummary ||
       previous?.mainTokens !== active?.mainTokens ||
@@ -551,6 +565,7 @@ export class WorkOverview {
   tick(nowMs: number): void {
     this.lastTickMs = nowMs;
     this.graph.tick(nowMs);
+    if (this.mode === "analysis") this.refreshPlanPeriods();
     if (this.mode === "summary") this.renderPlan();
     if (this.mode === "summary" && this.turnRunning) this.refreshLive(nowMs);
     if (this.mode === "analysis" && this.llmProgress !== undefined) this.renderLlmRunLine();
@@ -608,6 +623,7 @@ export class WorkOverview {
     const semantic = this.activeSemantic();
     return JSON.stringify([
       semantic?.timeBuckets,
+      semantic?.analysisPlans,
       semantic?.roleSummary,
       semantic?.failureSummary,
       semantic?.mainTokens,
@@ -688,22 +704,22 @@ export class WorkOverview {
 
   private renderMeasured(): void {
     const head = this.measuredEl;
+    const focused = [...this.planHeadings].find(([, heading]) => heading === document.activeElement)?.[0];
     head.textContent = "";
-    const semantic = this.activeSemantic();
-    const modules = [
-      this.renderTimeModule(semantic?.timeBuckets, semantic?.mainTokens ?? null),
-      this.renderRolesModule(semantic?.roleSummary),
-      this.renderErrModule(semantic?.failureSummary),
-      this.renderStepsModule(semantic?.timeBuckets),
-    ].filter((m): m is HTMLElement => m !== null);
-    head.hidden = modules.length === 0;
-    if (modules.length === 0) return;
+    this.planHeadings.clear();
+    const summary = this.activeSemantic()?.analysisPlans;
+    head.hidden = summary === undefined;
+    if (summary === undefined) return;
     const grid = div("wa-grid");
-    grid.append(...modules);
-    head.appendChild(grid);
+    const modules = [this.renderTimeModule(summary.time, summary.plans, summary.mainTokens),
+      this.renderRolesModule(summary.roles), this.renderErrModule(summary.failures)];
+    grid.append(...modules.filter((mod): mod is HTMLElement => mod !== null));
+    head.append(grid, this.renderPlansModule(summary));
+    this.syncAnalysisFolds();
+    if (focused !== undefined) this.planHeadings.get(focused)?.focus({ preventScroll: true });
   }
 
-  private metricsModule(kind: "time" | "steps" | "roles" | "err", code: string, subtitle: string): HTMLElement {
+  private metricsModule(kind: "time" | "roles" | "err", code: string, subtitle: string): HTMLElement {
     const mod = document.createElement("section");
     mod.className = `wa-mod wa-${kind}`;
     const head = div("wa-code");
@@ -716,61 +732,59 @@ export class WorkOverview {
     return mod;
   }
 
-  private renderTimeModule(view: TimeBucketView | undefined, tokens: MainTokenTotal | null): HTMLElement | null {
-    if (view === undefined || view.firstAt === null || view.lastAt === null) return null;
+  private renderTimeModule(time: AnalysisTimeView, plans: AnalysisPlansView["plans"] = [], tokens: number | null = null): HTMLElement {
     const mod = this.metricsModule("time", "TIME", l10n.t("Main processing time"));
-    const byModel = view.mainByModel ?? null;
-    const totalMs = byModel !== null ? byModel.totalMs : view.bars.mainMs;
-    const totalText = totalMs === null ? l10n.t("Not measured") : formatDuration(totalMs);
-    const segments: { tone: ChartTone; label: Node; ms: number; percent: number | null }[] = [];
-    if (byModel !== null) {
-      byModel.models.forEach((m, i) => {
-        const tone: ChartTone = m.kind === "model" ? MODEL_TONES[i] ?? "c4" : m.kind === "other" ? "c4" : "unobserved";
-        segments.push({ tone, label: document.createTextNode(m.label), ms: m.generateMs, percent: m.percent });
-      });
-      segments.push({ tone: "tool", label: termSpan("Tool execution"), ms: byModel.toolMs, percent: byModel.toolPercent });
-    }
+    const mainParts = time.parts.slice(0, 2);
+    const mainMs = mainParts.reduce<number | null>((total, part) => part.ms === null ? total : (total ?? 0) + part.ms, null);
+    const totalText = mainMs === null ? UNMEASURED_LABEL : formatDuration(mainMs);
     const ring = div("wa-ring");
     ring.setAttribute("role", "img");
     ring.setAttribute("aria-label", l10n.t("Main processing time {0}", totalText));
     let at = "";
     const stops: string[] = [];
-    for (const s of segments) {
-      if (s.percent === null) continue;
-      const from = at === "" ? "0%" : `calc(${at})`;
-      at = at === "" ? `${s.percent}%` : `${at} + ${s.percent}%`;
-      stops.push(`var(--l-chart-${s.tone}) ${from} calc(${at})`);
-    }
-    if (stops.length > 0) ring.style.background = `conic-gradient(${stops.join(", ")})`;
-    ring.appendChild(span("wa-ring-v", totalText));
     const legend = div("wa-tl");
-    for (const s of segments) {
+    time.parts.forEach((part, index) => {
+      const { tone, term } = ANALYSIS_TIME_PARTS[index];
+      const percent = index < 2 && part.ms !== null && mainMs !== null && mainMs > 0 ? part.ms / mainMs * 100 : null;
+      if (percent !== null) {
+        const from = at === "" ? "0%" : `calc(${at})`;
+        at = at === "" ? `${percent}%` : `${at} + ${percent}%`;
+        stops.push(`var(--l-chart-${tone}) ${from} calc(${at})`);
+      }
       const row = div("wa-lr");
-      row.dataset.tone = s.tone;
-      const dot = span(`wa-dot wa-tone-${s.tone}`, "");
+      row.dataset.tone = tone;
+      const dot = span(`wa-dot wa-tone-${tone}`, "");
       dot.setAttribute("aria-hidden", "true");
       const name = span("wa-ln", "");
-      name.appendChild(s.label);
+      name.appendChild(termSpan(term));
       name.title = name.textContent ?? "";
-      row.append(dot, name, span("wa-lv", formatDuration(s.ms)), span("wa-lp", s.percent === null ? "" : `${s.percent}%`));
+      row.append(dot, name, this.roleTotal("wa-lv", part.ms === null ? null : formatDuration(part.ms), part.partial ?? false, false, false));
       legend.appendChild(row);
-    }
+    });
+    if (stops.length > 0) ring.style.background = `conic-gradient(${stops.join(", ")})`;
+    ring.appendChild(this.roleTotal("wa-ring-v", totalText, mainParts.some(part => part.ms === null || part.partial), false, false));
     const facts = div("wa-fx");
-    if (tokens !== null) facts.appendChild(span("wa-fx-i", l10n.t("Main ≈{0} tok", planTokens(tokens.tokens))));
-    const start = dayClock(view.firstAt);
-    const end = dayClock(view.lastAt);
-    facts.appendChild(span("wa-fx-i", `${start} → ${start.slice(0, 5) === end.slice(0, 5) ? clock(view.lastAt) : end}`));
-    const wait = (term: TermKey, ms: number | null) => {
+    if (tokens !== null) facts.appendChild(span("wa-fx-i", l10n.t("Main ≈{0} tok", planTokens(tokens))));
+    const periods = plans.flatMap(plan => plan.start === null || plan.end === null ? [] : [[plan.start, plan.end]]);
+    if (periods.length > 0) {
+      const firstAt = Math.min(...periods.map(([start]) => start));
+      const lastAt = Math.max(...periods.map(([, end]) => end));
+      const start = dayClock(firstAt);
+      const end = dayClock(lastAt);
+      facts.appendChild(span("wa-fx-i", `${start} → ${start.slice(0, 5) === end.slice(0, 5) ? clock(lastAt) : end}`));
+    }
+    const wait = (term: TermKey, part: AnalysisTimeView["parts"][number]) => {
+      const { ms } = part;
       if (ms === null) return;
       const item = span("wa-fx-i", "");
       item.dataset.wait = term;
-      item.append(termSpan(term), document.createTextNode(` ${formatDuration(ms)}`));
+      item.append(termSpan(term), this.roleTotal("", ` ${formatDuration(ms)}`, part.partial ?? false, false, false));
       facts.appendChild(item);
     };
-    wait("Waiting for reply", view.main.replyMs);
-    wait("Waiting for your answer", view.main.confirmMs);
-    wait("Waiting for subagent", view.main.subagentWaitMs);
-    const subOnly = span("wa-fx-i", l10n.t("Subagent only {0}", view.main.subOnlyMs == null ? l10n.t("Not measured") : formatDuration(view.main.subOnlyMs)));
+    wait("Waiting for reply", time.parts[4]);
+    wait("Waiting for your answer", time.parts[3]);
+    wait("Waiting for subagent", time.parts[2]);
+    const subOnly = this.roleTotal("wa-fx-i", l10n.t("Subagent only {0}", time.parts[5].ms == null ? l10n.t("Not measured") : formatDuration(time.parts[5].ms)), time.parts[5].partial ?? false, false, false);
     subOnly.dataset.fact = "sub-only";
     facts.appendChild(subOnly);
     legend.appendChild(facts);
@@ -780,70 +794,161 @@ export class WorkOverview {
     return mod;
   }
 
-  private renderStepsModule(view: TimeBucketView | undefined): HTMLElement {
-    const mod = this.metricsModule("steps", "STEPS", l10n.t("Plan step analysis"));
-    const blocks = [...view?.blocks ?? []].filter(block => block.kind === "plan").reverse();
-    if (!blocks.length) { mod.appendChild(span("wa-fx-i", l10n.t("There are no plan steps."))); return mod; }
-    const duration = (ms: number | null | undefined) => ms == null ? "—" : formatDuration(ms);
-    for (const [index, block] of blocks.entries()) {
+  private analysisTimeBar(time: AnalysisTimeView, widthPercent: number | null, provisional = false): HTMLElement {
+    const track = span("wa-sb wa-sb-t", "");
+    const fill = span("wa-fill", "");
+    fill.style.width = `${widthPercent ?? 0}%`;
+    time.parts.forEach((part, index) => {
+      const { tone, term } = ANALYSIS_TIME_PARTS[index];
+      const segment = span(`wa-seg wa-tone-${tone}`, "");
+      segment.style.width = `${part.percent ?? 0}%`;
+      segment.title = `${termSpan(term).textContent}: ${part.ms === null ? UNMEASURED_LABEL : `${provisional ? "≈" : ""}${formatDuration(part.ms)}`}`;
+      fill.appendChild(segment);
+    });
+    track.appendChild(fill);
+    return track;
+  }
+
+  private analysisTokenBar(tokens: TokenDisplay, widthPercent: number | null): HTMLElement {
+    const track = span("wa-sb wa-sb-k", "");
+    const fill = span("wa-fill", "");
+    fill.style.width = `${widthPercent ?? 0}%`;
+    for (const [tone, percent] of [["c1", tokens.newPercent], ["c4", tokens.cacheBarPercent]] as const) {
+      const segment = span(`wa-seg wa-tone-${tone}`, "");
+      segment.style.width = `${percent ?? 0}%`;
+      fill.appendChild(segment);
+    }
+    track.setAttribute("aria-label", tokens.label);
+    track.appendChild(fill);
+    return track;
+  }
+
+  private syncAnalysisFolds(): void {
+    const rolesIn = (selector: string): HTMLButtonElement[] => Array.from(this.measuredEl.querySelector(selector)?.querySelectorAll<HTMLButtonElement>(".wa-rr") ?? []);
+    const sync = (area: FoldArea, plans: HTMLDetailsElement[], roles: HTMLButtonElement[]): void => {
+      const controls = this.measuredEl.querySelector(`.wa-fold-${area}`);
+      const expand = controls?.querySelector<HTMLButtonElement>(".wa-expand-all");
+      const collapse = controls?.querySelector<HTMLButtonElement>(".wa-collapse-all");
+      if (expand) expand.disabled = plans.every(plan => plan.open) && roles.every(role => role.getAttribute("aria-expanded") === "true");
+      if (collapse) collapse.disabled = plans.every(plan => !plan.open) && roles.every(role => role.getAttribute("aria-expanded") === "false");
+    };
+    sync("roles", [], rolesIn(".wa-grid"));
+    sync("plans", Array.from(this.measuredEl.querySelectorAll<HTMLDetailsElement>(".wa-plan-disclosure")), rolesIn(".wa-plans"));
+  }
+
+  private foldControls(area: FoldArea, apply: (open: boolean) => void): HTMLElement {
+    const controls = span(`wg-fold-all wa-fold-${area}`, "");
+    for (const open of [true, false]) {
+      const button = document.createElement("button");
+      button.type = "button";
+      button.className = open ? "wa-expand-all" : "wa-collapse-all";
+      button.title = open ? l10n.t("Expand all items") : l10n.t("Collapse all items");
+      button.setAttribute("aria-label", button.title);
+      const icon = span(`l-icon ${open ? "l-icon-expand-all" : "l-icon-collapse-all"}`, "");
+      icon.setAttribute("aria-hidden", "true");
+      button.appendChild(icon);
+      button.onclick = () => {
+        apply(open);
+        this.renderMeasured();
+        this.measuredEl.querySelector(`.wa-fold-${area}`)?.querySelector<HTMLButtonElement>(open ? ".wa-collapse-all" : ".wa-expand-all")?.focus({ preventScroll: true });
+      };
+      controls.appendChild(button);
+    }
+    return controls;
+  }
+
+  private setRolesOpen(scope: string, roles: RoleSummaryView, open: boolean): void {
+    for (const role of roles.roles) {
+      const key = JSON.stringify([scope, role.role]);
+      if (open) this.expandedRoles.add(key);
+      else this.expandedRoles.delete(key);
+    }
+  }
+
+  private renderPlansModule(summary: AnalysisPlansView): HTMLElement {
+    const time = this.activeSemantic()?.timeBuckets;
+    const now = time === undefined ? -Infinity : planNow(time, this.lastTickMs, this.turnRunning);
+    const mod = div("wa-plans");
+    mod.style.setProperty("--l-row-h", `${ROW_H}px`);
+    const toolbar = div("wa-rows-toolbar");
+    toolbar.appendChild(this.foldControls("plans", (open) => {
+      for (const plan of summary.plans) {
+        this.planOpenState.set(plan.key, open);
+        this.setRolesOpen(plan.key, plan.roles, open);
+      }
+    }));
+    mod.appendChild(toolbar);
+    const columns = div("wa-analysis-row wa-column-head");
+    for (const label of ["PLAN", "TIME", "TOKENS", "ERR"]) columns.appendChild(span("", label));
+    mod.appendChild(columns);
+    for (const plan of summary.plans) {
       const group = document.createElement("details");
-      group.className = "wa-step-block";
-      group.dataset.blockId = block.blockId;
-      group.open = index === 0;
+      group.className = "wa-plan-disclosure";
+      group.dataset.blockId = plan.blockId;
+      group.dataset.rowKey = plan.key;
+      group.open = this.planOpenState.get(plan.key) ?? false;
+      let lastOpen = group.open;
       const heading = document.createElement("summary");
-      heading.textContent = `${block.metrics?.provisional ? "≈ " : ""}${block.text}`;
+      heading.className = "wa-analysis-row wa-plan-row";
+      group.addEventListener("toggle", () => {
+        if (this.planHeadings.get(plan.key) !== heading || group.open === lastOpen) return;
+        lastOpen = group.open;
+        this.planOpenState.set(plan.key, group.open);
+        this.syncAnalysisFolds();
+      });
+      const title = span("wa-row-title", "");
+      const copy = span("wa-goal-copy", "");
+      const text = span("wa-goal-text", `${plan.provisional ? "≈ " : ""}${plan.title}`);
+      text.title = plan.title;
+      const period = span("wa-plan-period", planPeriodText(plan.start, plan.end, plan.running, now));
+      // A running row's end follows the clock between Host posts, as GRAPH's row does (src/webview/work-overview.ts#WorkOverview.refreshPlanPeriods).
+      if (plan.running && plan.start !== null && plan.end !== null) {
+        period.classList.add("wa-live-period");
+        Object.assign(period.dataset, { start: String(plan.start), end: String(plan.end) });
+      }
+      copy.append(text, period);
+      title.append(span("wa-chevron", ""), span("wa-plan-number", plan.number), copy);
+      const time = span("wa-metric wa-time-metric", "");
+      time.append(this.roleTotal("wa-tv", plan.time.totalMs === null ? UNMEASURED_LABEL : `${plan.provisional ? "≈" : ""}${formatDuration(plan.time.totalMs)}`, plan.time.partial, false, false),
+        this.analysisTimeBar(plan.time, plan.timeWidthPercent, plan.provisional));
+      const tokens = span("wa-metric wa-tokens-metric", "");
+      tokens.append(this.analysisTokenBar(plan.tokens, plan.tokenWidthPercent), this.roleTotal("wa-kv", `${plan.provisional && plan.tokens.total !== null ? "≈" : ""}${plan.tokens.label}`, plan.tokensPartial, false, false));
+      heading.append(title, time, tokens, span("wa-row-err", String(plan.failures.failCount)));
       group.appendChild(heading);
-      const table = document.createElement("table");
-      table.className = "wa-step-table";
-      const head = document.createElement("tr");
-      for (const label of [l10n.t("Step"), l10n.t("Duration"), l10n.t("Generate"), l10n.t("Tool"),
-        termSpan("Waiting for subagent"), l10n.t("Decision wait"), l10n.t("Reply wait"), termSpan("Subagent"), l10n.t("Tokens ≈")]) {
-        const cell = document.createElement("th"); cell.append(label); cell.scope = "col"; head.appendChild(cell);
-      }
-      const thead = document.createElement("thead"); thead.appendChild(head); table.appendChild(thead);
-      const body = document.createElement("tbody");
-      for (const step of block.steps ?? []) {
-        const row = document.createElement("tr");
-        row.dataset.stepKey = step.key;
-        if (step.longest) row.className = "wa-step-longest";
-        const name = document.createElement("th"); name.scope = "row";
-        name.textContent = `${step.title}${step.parallel ? ` · ${l10n.t("parallel")}` : ""}${step.longest ? ` · ${l10n.t("Longest step")}` : ""}`;
-        if (step.removed) name.style.textDecoration = "line-through";
-        row.appendChild(name);
-        for (const ms of [step.durationMs, step.generateMs, step.toolMs, step.subagentWaitMs, step.decisionWaitMs, step.replyWaitMs, step.subagentOnlyMs]) {
-          const cell = document.createElement("td"); cell.textContent = `${ms != null && step.provisional ? "≈" : ""}${duration(ms)}`; row.appendChild(cell);
-        }
-        const tokens = document.createElement("td"); tokens.textContent = step.tokens == null ? "—" : `≈${planTokens(step.tokens.tokens)}`;
-        if (step.tokens) tokens.title = l10n.t("Cache read {0} tokens",planTokens(step.tokens.cacheRead));
-        row.appendChild(tokens); body.appendChild(row);
-      }
-      table.appendChild(body); group.appendChild(table);
-      if (!block.steps?.length) group.appendChild(span("wa-fx-i", l10n.t("There are no plan steps.")));
+      this.planHeadings.set(plan.key, heading);
+      const roles = this.renderRolesModule(plan.roles, plan.key);
+      if (roles) { roles.classList.add("wa-plan-roles"); group.appendChild(roles); }
       mod.appendChild(group);
     }
+    if (summary.plans.length === 0) mod.appendChild(span("wa-note", l10n.t("There are no PLANs.")));
+    mod.appendChild(div("wa-plan-note")).textContent = l10n.t("Open a PLAN for roles, then a role for individual runs. View record contents in 05 LOG.");
     return mod;
   }
 
-  private renderRolesModule(summary: RoleSummaryView | undefined): HTMLElement | null {
+  private renderRolesModule(summary: RoleSummaryView | undefined, scope = "header"): HTMLElement | null {
     if (summary === undefined || (summary.roles.length === 0 && summary.omittedSubagentCount === 0 && summary.externalRunsCoverage === undefined)) return null;
-    const mod = this.metricsModule("roles", "ROLES", l10n.t("By delegated role (press a row for its runs)"));
+    const mod = scope === "header" ? this.metricsModule("roles", "ROLES", l10n.t("By delegated role (press a row for its runs)")) : div("wa-role-detail");
+    if (scope === "header" && summary.roles.length > 0) {
+      mod.querySelector(".wa-code")!.appendChild(this.foldControls("roles", (open) => this.setRolesOpen("header", summary, open)));
+    }
     if (summary.roles.length > 0) {
       const grid = div("wa-rg");
       const columns = div("wa-rh");
       columns.setAttribute("aria-hidden", "true");
-      columns.append(span("wa-rh-t", "TIME"), span("wa-rh-k", "TOKENS"));
-      grid.appendChild(columns);
+      columns.append(span("wa-rh-t", "TIME"), span("wa-rh-k", l10n.t("TOKENS (dark: new · light: cache read)")));
+      if (scope === "header") grid.appendChild(columns);
       summary.roles.forEach((role, i) => {
-        const key = role.role ?? "";
+        const key = JSON.stringify([scope, role.role]);
         const open = this.expandedRoles.has(key);
         const list = div("wa-rl");
-        list.id = `wa-rl-${this.tabId}-${i}`;
+        list.id = `wa-rl-${this.tabId}-${encodeURIComponent(scope)}-${i}`;
         list.hidden = !open;
         for (const run of role.runs) list.appendChild(this.renderRoleRun(run));
         const row = document.createElement("button");
         row.type = "button";
         row.className = "wa-rr";
-        row.dataset.role = key;
+        row.dataset.role = role.role ?? "";
+        this.planHeadings.set(key, row);
         row.setAttribute("aria-expanded", String(open));
         row.setAttribute("aria-controls", list.id);
         const name = span("wa-rname", "");
@@ -854,15 +959,17 @@ export class WorkOverview {
           this.roleTotal("wa-tv", role.totalMs === null ? null : formatDuration(role.totalMs), role.totalMsPartial, role.running, true),
           this.roleBar("wa-sb-t", role.timeWidthPercent, role.runs, (run) => run.timePercent),
           name,
-          this.roleBar("wa-sb-k", role.tokenWidthPercent, role.runs, (run) => run.tokenPercent),
-          this.roleTotal("wa-kv", role.totalTokens === null ? null : planTokens(role.totalTokens), role.totalTokensPartial, role.running, false)
+          this.analysisTokenBar(role.tokenDisplay, role.tokenWidthPercent),
+          this.roleTotal("wa-kv", role.tokenDisplay.label, role.totalTokensPartial, role.running, false)
         );
+        if (scope === "header" && role.cacheTtl !== undefined) row.append(...this.renderCacheTtl(role.cacheTtl));
         row.onclick = () => {
           const next = list.hidden;
           list.hidden = !next;
           row.setAttribute("aria-expanded", String(next));
           if (next) this.expandedRoles.add(key);
           else this.expandedRoles.delete(key);
+          this.syncAnalysisFolds();
         };
         grid.append(row, list);
       });
@@ -882,7 +989,7 @@ export class WorkOverview {
 
   private roleTotal(className: string, text: string | null, partial: boolean, running: boolean, withLoader: boolean): HTMLElement {
     const el = span(className, "");
-    if (text === null) return el;
+    if (text === null) { el.textContent = UNMEASURED_LABEL; return el; }
     if (running) {
       if (withLoader) {
         const loader = span("wa-running", "");
@@ -890,18 +997,36 @@ export class WorkOverview {
         loader.appendChild(createLoader(12));
         el.appendChild(loader);
       }
-      el.appendChild(document.createTextNode(text));
       el.title = l10n.t("Still running; the value will grow");
-      return el;
     }
     if (!partial) {
-      el.textContent = text;
+      el.appendChild(document.createTextNode(text));
       return el;
     }
     const note = span("term-note", text);
     note.title = l10n.t("Includes runs that were not measured; the value is the total of the measured runs");
     el.appendChild(note);
     return el;
+  }
+
+  private renderCacheTtl(view: RoleCacheTtlView): HTMLElement[] {
+    return view.options.flatMap((option, index) => {
+      const label = span("wa-ttlr-l", "");
+      const mark = span("wa-ttlr-set", option.setting ? "✓" : "");
+      if (option.setting) mark.title = l10n.t("Current setting");
+      label.append(mark, option.label);
+      const value = span("wa-ttlr-v", "");
+      value.title = l10n.t("Total of {0} Claude runs", view.claudeRunCount);
+      const amount = span(option.cheaper ? "wa-ttlr-cheap" : "", `≈${option.costLabel}`);
+      const figures = view.partial ? span("term-note", "") : value;
+      figures.append(amount, option.hitPercent === null ? "" : ` (${option.hitPercent}%)`);
+      if (view.partial) {
+        figures.title = l10n.t("Includes runs that were not measured; the value is the total of the measured runs");
+        value.appendChild(figures);
+      }
+      for (const cell of [label, value]) cell.style.gridRow = String(index + 2);
+      return [label, value];
+    });
   }
 
   private roleBar(className: string, widthPercent: number | null, runs: readonly RoleRunView[], percentOf: (run: RoleRunView) => number | null): HTMLElement {
@@ -928,29 +1053,36 @@ export class WorkOverview {
     dot.setAttribute("aria-hidden", "true");
     const variant = span("wa-mx", "");
     variant.title = run.variantLabel;
+    if (run.count !== undefined) variant.appendChild(span("wa-rcount wa-rcount-run", `×${run.count}`));
+    let first = true;
     const part = (text: string, requested: boolean) => {
-      if (variant.childNodes.length > 0) variant.appendChild(document.createTextNode(" · "));
+      if (!first) variant.appendChild(document.createTextNode(" · "));
+      first = false;
       variant.appendChild(document.createTextNode(text));
       if (!requested) return;
-      const mark = span("wa-req", l10n.t("requested"));
-      mark.title = l10n.t("Requested value; the applied value was not observed");
+      const mark = span("wa-req", l10n.t("unconfirmed"));
+      mark.title = l10n.t("The requested value; the value actually used could not be confirmed from the records");
       variant.appendChild(mark);
     };
     part(run.executor, false);
     if (run.model !== null) part(run.model, run.modelSource === "requested");
     if (run.effort !== null) part(run.effort, run.effortSource === "requested");
+    const name = span("wa-rn", run.name);
+    name.title = run.name;
+    const tokens = run.tokens === null ? this.unmeasuredCell() : this.roleTotal("wa-v", run.tokenDisplay.label, run.tokensPartial ?? false, false, false);
+    if (run.tokens !== null) tokens.appendChild(this.analysisTokenBar(run.tokenDisplay, run.tokenPercent));
     row.append(
       dot,
-      span("wa-rn", run.name),
+      name,
       variant,
-      run.durationMs === null ? this.unmeasuredCell() : span("wa-v", formatDuration(run.durationMs)),
-      run.tokens === null ? this.unmeasuredCell() : span("wa-v", planTokens(run.tokens))
+      run.durationMs === null ? this.unmeasuredCell() : this.roleTotal("wa-v", formatDuration(run.durationMs), run.durationPartial ?? false, false, false),
+      tokens
     );
     return row;
   }
 
   private unmeasuredCell(): HTMLElement {
-    const el = span("wa-v wa-unmeasured", "—");
+    const el = span("wa-v wa-unmeasured", UNMEASURED_LABEL);
     el.title = l10n.t("Not measured");
     return el;
   }
@@ -1058,7 +1190,8 @@ export class WorkOverview {
         body.appendChild(fix);
       }
       const nav = this.toolEvidence;
-      const marks = (this.execLogMarks ?? []).filter((m) => m.findingAnchor === f.anchor && nav?.has(m.toolUseId) === true);
+      const marks = (this.execLogMarks ?? []).filter((m) => m.findingAnchor === f.anchor &&
+        (f.toolUseIds === undefined || f.toolUseIds.includes(m.toolUseId)) && nav?.has(m.toolUseId) === true);
       if (marks.length > 0 && nav !== undefined) {
         const links = div("llm-finding-evidence wa-ev");
         links.id = `wa-ev-${this.tabId}-${f.anchor}`;
@@ -1202,7 +1335,7 @@ export class WorkOverview {
     const requested = list(l10n.t("Starting roster (requested settings)"), "roster");
     for (const member of state.roster.agents) {
       row(requested, `${member.role} → ${member.agentKey}`,
-        l10n.t("Requested {0} · {1}", member.model, member.effort ?? unknown), l10n.t("AGENT"));
+        l10n.t("Requested {0} · {1}", member.model, member.efforts.length ? member.efforts.join(" / ") : member.effort ?? unknown), l10n.t("AGENT"));
     }
     for (const member of state.roster.external) {
       row(requested, `${member.role} → ${EXECUTORS[member.executor].displayName}`,
@@ -1405,7 +1538,7 @@ export class WorkOverview {
   private hudDuration(ms: number | null | undefined): HTMLElement {
     const value = span("wo-hud-value wo-hud-duration", "");
     if (ms === null || ms === undefined) {
-      value.textContent = "—";
+      value.textContent = UNMEASURED_LABEL;
       value.title = l10n.t("Not measured");
       return value;
     }
@@ -1446,20 +1579,14 @@ export class WorkOverview {
       item.append(span(`wo-hud-swatch wo-hud-${tone}`, ""), label, ` ${duration(ms)}`);
       return item;
     };
-    const lane = (name: string, parts: readonly (readonly [string | null, number])[]) => {
-      const element = div(`wo-hud-lane wo-hud-lane-${name}`);
-      for (const [tone, ms] of parts) {
-        const part = span(tone === null ? "wo-hud-filler" : `wo-hud-${tone}`, "");
-        part.style.flex = `${ms} 1 0`;
-        element.appendChild(part);
-      }
-      return element;
-    };
     if (view) {
-      const split = div("wo-hud-split");
-      if (view.main.generateMs != null && view.bars.toolMs != null && view.bars.mainMs != null) {
-        split.append(lane("main", [["gen", view.main.generateMs], ["tool", view.bars.toolMs], [null, view.bars.subMs]]),
-          lane("sub", [[null, view.bars.mainMs], ["sub", view.bars.subMs]]));
+      const total = div("wo-hud-total");
+      if (view.bars.totalMs != null && view.main.generateMs != null && view.bars.toolMs != null) {
+        for (const [tone, ms] of [["gen", view.main.generateMs], ["tool", view.bars.toolMs], ["sub", view.bars.subMs]] as const) {
+          const part = span(`wo-hud-${tone}`, "");
+          part.style.flex = `${ms} 1 0`;
+          total.appendChild(part);
+        }
       }
       const legend = div("wo-hud-note wo-hud-key-line");
       legend.append(key("gen", "LLM generation", view.main.generateMs),
@@ -1492,7 +1619,7 @@ export class WorkOverview {
         key("subwait", "Waiting for subagent", view.main.subagentWaitMs),
         key("answer", "Waiting for your answer", view.main.confirmMs),
         key("wait", "Waiting for reply", view.main.replyMs));
-      graph.append(split, legend, strip, waits);
+      graph.append(total, legend, strip, waits);
     }
     hud.append(graph, this.renderSummaryAnalysis(semantic?.summaryAnalysis));
     return hud;
@@ -1602,6 +1729,15 @@ export class WorkOverview {
     left.append(earlier);
     layout.append(left, this.youSection);
     return layout;
+  }
+
+  private refreshPlanPeriods(): void {
+    const time = this.activeSemantic()?.timeBuckets;
+    if (time === undefined) return;
+    const now = planNow(time, this.lastTickMs, this.turnRunning);
+    for (const el of Array.from(this.measuredEl.querySelectorAll<HTMLElement>(".wa-live-period"))) {
+      el.textContent = planPeriodText(Number(el.dataset.start), Number(el.dataset.end), true, now);
+    }
   }
 
   private refreshLive(nowMs: number): void {

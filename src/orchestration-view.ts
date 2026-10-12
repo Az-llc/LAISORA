@@ -1,17 +1,17 @@
-import { isExternalExecutorId, type ExternalExecutorId } from "./orchestration-executors";
+import { EXECUTORS, isExternalExecutorId, type ExternalExecutorId } from "./orchestration-executors";
 import type { AgentRunRecord, ExternalRunRecord, TokenUsage } from "./orchestration-external";
 import { orchestrationVariants, type ExternalRow, type OrchestrationRow } from "./orchestration-roster";
 import type { ClaudeConversation, ClaudeHostOptions } from "./claudeHost";
 
 export interface OrchestrationView {
   roster: {
-    agents: Array<{ role: string; agentKey: string; model: string; effort: string | null }>;
+    agents: Array<{ role: string; agentKey: string; model: string; effort: string | null; efforts: string[] }>;
     external: Array<{ role: string; executor: ExternalExecutorId; model: string | null; effort: string | null }>;
   };
   settingsChanged: boolean;
   agents: Array<{ agentId: string; role: string | null; agentType: string | null; model: string | null; effort: string | null;
     firstSeenAt: string; lastActivityAt: string; usage: TokenUsage | null }>;
-  runs: Array<{ cwd?: string; role: string; executor: ExternalExecutorId; model?: string; effort?: string; outcome: ExternalRunRecord["outcome"];
+  runs: Array<{ toolUseId?: string; cwd?: string; role: string; executor: ExternalExecutorId; model?: string; effort?: string; outcome: ExternalRunRecord["outcome"];
     startedAt: string; endedAt: string; durationMs: number; usage: TokenUsage | null }>;
 }
 
@@ -19,7 +19,7 @@ export function orchestrationViewForConversation(conv: ClaudeConversation, curre
   if (!conv.orchestrationActive) return undefined;
   return projectOrchestrationView(conv.orchestrationRoster, conv.orchestrationExternalRoster,
     conv.orchestrationSettingsChanged(current), conv.observedAgentSettings, conv.observedAgentRuns,
-    conv.orchestrationRuns.filter((run) => run.kind === "external"));
+    conv.orchestrationRuns.filter((run) => run.kind === "external"), conv.orchestrationPerCallEffort, conv.recordedAgentRoles, conv.orchestrationAgentVariants);
 }
 
 const USAGE_KEYS = ["input_tokens", "cached_input_tokens", "output_tokens", "reasoning_output_tokens",
@@ -39,13 +39,14 @@ function usageView(usage: TokenUsage | undefined): TokenUsage | null {
 export function projectOrchestrationView(
   roster: readonly OrchestrationRow[], external: readonly ExternalRow[], settingsChanged: boolean,
   settings: ReadonlyMap<string, Readonly<{ agentType?: string; model?: string; effort?: string }>>,
-  agents: ReadonlyMap<string, AgentRunRecord>, runs: readonly ExternalRunRecord[]
+  agents: ReadonlyMap<string, AgentRunRecord>, runs: readonly ExternalRunRecord[], perCallEffort = false,
+  recordedRoles: ReadonlyMap<string, string> = new Map(), variants = orchestrationVariants(roster)
 ): OrchestrationView {
-  const variants = orchestrationVariants(roster);
-  const roleByAgentKey = new Map(variants.map((variant) => [variant.agentKey, variant.role]));
+  const roleByAgentKey = new Map([...recordedRoles, ...variants.map((variant) => [variant.agentKey, variant.role] as const)]);
   return {
     roster: {
-      agents: variants.map(({ role, agentKey, model, effort }) => ({ role, agentKey, model, effort: effort ?? null })),
+      agents: variants.map(({ role, agentKey, model, effort, efforts }) => ({ role, agentKey, model, effort: effort ?? null,
+        efforts: perCallEffort ? [...efforts] : effort ? [effort] : [] })),
       external: external.map(({ role, executor, model, effort }) => ({ role, executor, model: observed(model), effort: effort ?? null })),
     },
     settingsChanged,
@@ -57,8 +58,8 @@ export function projectOrchestrationView(
         model: observed(applied?.model), effort: observed(applied?.effort),
         firstSeenAt: agent.firstSeenAt, lastActivityAt: agent.lastActivityAt, usage: usageView(agent.usage) };
     }).sort((a, b) => b.lastActivityAt.localeCompare(a.lastActivityAt)).slice(0, 50),
-    runs: runs.map(({ cwd, role, executor, model, effort, outcome, startedAt, endedAt, durationMs, usage }) =>
-      ({ ...(typeof cwd === "string" ? { cwd } : {}), role, executor, ...(metadata(model) ? { model } : {}), ...(metadata(effort) ? { effort } : {}), outcome, startedAt, endedAt, durationMs, usage: usageView(usage) }))
+    runs: runs.map(({ toolUseId, cwd, role, executor, model, effort, outcome, startedAt, endedAt, durationMs, usage }) =>
+      ({ ...(metadata(toolUseId) ? { toolUseId } : {}), ...(typeof cwd === "string" ? { cwd } : {}), role, executor, ...(metadata(model) ? { model } : {}), ...(metadata(effort) ? { effort } : {}), outcome, startedAt, endedAt, durationMs, usage: usageView(usage) }))
       .sort((a, b) => b.startedAt.localeCompare(a.startedAt)).slice(0, 50),
   };
 }
@@ -79,25 +80,15 @@ function usageShape(value: unknown): boolean {
 function executor(value: unknown): boolean { return isExternalExecutorId(value); }
 
 export function isOrchestrationView(value: unknown): value is OrchestrationView {
-  if (!object(value, ["roster", "settingsChanged", "agents", "runs"]) || typeof value.settingsChanged !== "boolean"
-    || !object(value.roster, ["agents", "external"])) return false;
-  return Array.isArray(value.roster.agents) && value.roster.agents.every((row) =>
-    object(row, ["role", "agentKey", "model", "effort"]) && metadata(row.role) && row.agentKey === `laisora-${row.role}-${row.model}${row.effort === null ? "" : `-${row.effort}`}`
-    && metadata(row.model) && nullableMetadata(row.effort))
-    && Array.isArray(value.roster.external) && value.roster.external.every((row) =>
-      object(row, ["role", "executor", "model", "effort"]) && metadata(row.role) && executor(row.executor)
-      && nullableMetadata(row.model) && nullableMetadata(row.effort))
-    && Array.isArray(value.agents) && value.agents.every((row) =>
-      object(row, ["agentId", "role", "agentType", "model", "effort", "firstSeenAt", "lastActivityAt", "usage"])
-      && metadata(row.agentId) && nullableMetadata(row.role) && nullableMetadata(row.agentType)
-      && nullableMetadata(row.model) && nullableMetadata(row.effort) && isoTimestampShape(row.firstSeenAt)
-      && isoTimestampShape(row.lastActivityAt) && usageShape(row.usage))
-    && Array.isArray(value.runs) && value.runs.every((row) =>
-      object(row, ["role", "executor", "outcome", "startedAt", "endedAt", "durationMs", "usage", ...(row?.cwd === undefined ? [] : ["cwd"]), ...(row?.model === undefined ? [] : ["model"]), ...(row?.effort === undefined ? [] : ["effort"])])
-      && (row.cwd === undefined || typeof row.cwd === "string")
-      && (row.model === undefined || metadata(row.model)) && (row.effort === undefined || metadata(row.effort))
-      && metadata(row.role) && executor(row.executor) && ["ok", "failed", "timeout", "refused", "stopped"].includes(row.outcome as string)
-      && isoTimestampShape(row.startedAt) && isoTimestampShape(row.endedAt) && finite(row.durationMs) && usageShape(row.usage));
+  if (!object(value, ["roster", "settingsChanged", "agents", "runs"])) return false;
+  return (
+    typeof value.settingsChanged === "boolean" &&
+    isOrchestrationRosterView(value.roster) &&
+    Array.isArray(value.agents) &&
+    value.agents.every(isOrchestrationAgentView) &&
+    Array.isArray(value.runs) &&
+    value.runs.every(isOrchestrationRunView)
+  );
 }
 
 export class OrchestrationViewPublisher {
@@ -119,4 +110,71 @@ export class OrchestrationViewPublisher {
     this.lastPost = Date.now();
     this.post(view);
   }
+}
+
+function isOrchestrationRosterView(value: unknown): boolean {
+  if (!object(value, ["agents", "external"])) return false;
+  return (
+    Array.isArray(value.agents) &&
+    value.agents.every(isOrchestrationRosterAgent) &&
+    Array.isArray(value.external) &&
+    value.external.every(isOrchestrationRosterExternal)
+  );
+}
+
+function isOrchestrationRosterAgent(value: unknown): boolean {
+  if (!object(value, ["role", "agentKey", "model", "effort", "efforts"])) return false;
+  return (
+    metadata(value.role) &&
+    Array.isArray(value.efforts) &&
+    value.efforts.length <= 6 &&
+    value.efforts.every(metadata) &&
+    metadata(value.model) &&
+    nullableMetadata(value.effort) &&
+    [EXECUTORS.claude.targetKey(value.role as string, value.model as string), ...(typeof value.effort === "string" ? [EXECUTORS.claude.targetKey(value.role as string, value.model as string, value.effort)] : [])].includes(value.agentKey as string)
+  );
+}
+
+function isOrchestrationRosterExternal(value: unknown): boolean {
+  if (!object(value, ["role", "executor", "model", "effort"])) return false;
+  return (
+    metadata(value.role) &&
+    executor(value.executor) &&
+    nullableMetadata(value.model) &&
+    nullableMetadata(value.effort)
+  );
+}
+
+function isOrchestrationAgentView(value: unknown): boolean {
+  if (!object(value, ["agentId", "role", "agentType", "model", "effort", "firstSeenAt", "lastActivityAt", "usage"])) return false;
+  return (
+    metadata(value.agentId) &&
+    nullableMetadata(value.role) &&
+    nullableMetadata(value.agentType) &&
+    nullableMetadata(value.model) &&
+    nullableMetadata(value.effort) &&
+    isoTimestampShape(value.firstSeenAt) &&
+    isoTimestampShape(value.lastActivityAt) &&
+    usageShape(value.usage)
+  );
+}
+
+function isOrchestrationRunView(value: unknown): boolean {
+  if (typeof value !== "object" || value === null) return false;
+  const row = value as Record<string, unknown>;
+  if (!object(value, ["role", "executor", "outcome", "startedAt", "endedAt", "durationMs", "usage", ...(row.toolUseId === undefined ? [] : ["toolUseId"]), ...(row.cwd === undefined ? [] : ["cwd"]), ...(row.model === undefined ? [] : ["model"]), ...(row.effort === undefined ? [] : ["effort"])])) return false;
+  const checks: { [K in keyof OrchestrationView["runs"][number]]-?: () => boolean } = {
+    toolUseId: () => value.toolUseId === undefined || metadata(value.toolUseId),
+    cwd: () => value.cwd === undefined || typeof value.cwd === "string",
+    model: () => value.model === undefined || metadata(value.model),
+    effort: () => value.effort === undefined || metadata(value.effort),
+    role: () => metadata(value.role),
+    executor: () => executor(value.executor),
+    outcome: () => ["ok", "failed", "timeout", "refused", "stopped"].includes(value.outcome as string),
+    startedAt: () => isoTimestampShape(value.startedAt),
+    endedAt: () => isoTimestampShape(value.endedAt),
+    durationMs: () => finite(value.durationMs),
+    usage: () => usageShape(value.usage),
+  };
+  return Object.values(checks).every(check => check());
 }

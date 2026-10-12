@@ -1,10 +1,11 @@
-import type { ToolIntentInput } from "./webview/status-line";
-import type { NormalizedEvent } from "./protocol.js";
+import type { ToolIntentInput } from "./tool-intent";
+import type { NormalizedEvent, ResumeHydrationPhase } from "./protocol.js";
 import * as l10n from "@vscode/l10n";
 import { isRequestMessageText } from "./time-buckets";
+import { isRejectedBeforeRun } from "./tool-result-signals";
 import { isPureCommandWrapper } from "./human-input-vocabulary";
-import { parseMarkdown } from "./webview/markdown-ast";
-import { findCommitBoundary, recordSeparator } from "./webview/commit-boundary";
+import { parseMarkdown } from "./markdown-ast";
+import { appendRecordPart, findCommitBoundary, joinRecordTexts, type RecordTextPart } from "./commit-boundary";
 
 export const MAX_PHASES = 256;
 
@@ -202,9 +203,7 @@ export interface WorkModelState {
   requestOffset?: number;
   requestByTurn?: Record<string, number>;
   requestHeadline?: { turnId: string | null; text: string };
-  planDeclaration?: { goal: string; at: number };
   planBoundaryAt?: number;
-  planText?: { turnId: string; text: string; declaredThrough: number; recordEnded?: true };
   planHistory?: PlanHistoryEntry[];
   planHistoryTruncated?: boolean;
   planHistoryLostThrough?: number;
@@ -235,6 +234,8 @@ export interface WorkModelState {
 
 export type WorkModel = WorkModelState;
 export interface WorkRequestTotals {
+  requestId: string;
+  mergedRequestIds?: string[];
   incomplete?: true;
   turnIds: string[];
   number: string;
@@ -274,7 +275,7 @@ function startRequest(d: Draft, signal: Extract<WorkSignal, { kind: "turn_starte
       dropped = [request.turnIds.shift()!];
     }
   } else {
-    d.next.requests = [...requests, { turnIds: [signal.turnId], number: String(index + 1).padStart(2, "0"),
+    d.next.requests = [...requests, { requestId: signal.turnId, turnIds: [signal.turnId], number: String(index + 1).padStart(2, "0"),
       command, cliInserted: signal.cliInserted, toolCount: 0, agentCount: 0, failCount: 0, revision: d.next.revision }];
     if (d.next.requests.length > MAX_TASKS) {
       dropped = d.next.requests.shift()!.turnIds;
@@ -296,6 +297,7 @@ function reconcileRequestCommands(d: Draft, turnId: string, text: string): void 
   for (const [i, current] of d.next.requests!.entries()) {
     const previous = merged.at(-1);
     if (current.command !== undefined && previous?.command === current.command) {
+      previous.mergedRequestIds = [...(previous.mergedRequestIds ?? []), current.requestId].slice(-MAX_PHASE_REFS);
       previous.turnIds = [...previous.turnIds, ...current.turnIds];
       previous.toolCount += current.toolCount;
       previous.agentCount += current.agentCount;
@@ -1710,6 +1712,18 @@ function settlePendingStale(d: Draft, timestamp: number): void {
   }
 }
 
+export function knownBackgroundTask(state: WorkModelState, hydration: { phase: ResumeHydrationPhase } | null, taskId: string):
+  "agent" | "tool" | "unconfirmed" | undefined {
+  return hydration === null || hydration.phase === "complete" ? state.backgroundTasks[taskId]?.kind : "unconfirmed";
+}
+
+export function backgroundAgentDispatch(state: WorkModelState, taskId: string): { description: string; launchedAt: number; resumedAt?: number } | undefined {
+  const entry = state.backgroundTasks[taskId];
+  const placement = entry?.kind === "agent" ? findToolPlacement(state, entry.toolUseId) : undefined;
+  return placement === undefined ? undefined : { description: placement.description, launchedAt: placement.startedAt,
+    ...(placement.resumedAt === undefined ? {} : { resumedAt: placement.resumedAt }) };
+}
+
 export function markBackgroundUnconfirmed(state: WorkModelState, timestamp: number): WorkModelState {
   const open = Object.entries(state.backgroundTasks).filter(([, e]) => e.terminal === undefined);
   if (open.length === 0) return state;
@@ -1806,6 +1820,13 @@ function handleToolFinish(d: Draft, e: ToolFinishedSignal): void {
 
   if (placement.stale) target.totals.staleCount--;
   else target.totals.runningCount--;
+  if (isRejectedBeforeRun(e)) {
+    target.totals.agentCount--;
+    const request = draftRequest(d, placement.requestIndex);
+    if (request) request.agentCount--;
+    if (target.phase) target.phase.agents = target.phase.agents.filter(agent => agent.agentId !== placement.agentId);
+    return;
+  }
   const tokens = parseSubagentTokens(e.resultPreview);
   if (tokens !== undefined) target.totals.agentTokens += tokens;
 
@@ -1897,12 +1918,17 @@ function recordPlanHistory(d: Draft, entry: PlanHistoryEntry): void {
   d.next.planHistory = history;
 }
 
-export function foldPlanDeclarationText(previous: WorkModelState["planText"], turnId: string, delta: string, at: number): {
-  text: NonNullable<WorkModelState["planText"]>; declarations: { goal: string; at: number }[];
+export type PlanTextState = RecordTextPart & { turnId: string; declaredThrough: number };
+
+export function foldPlanDeclarationText(previous: PlanTextState | undefined, turnId: string, delta: string | RecordTextPart, at: number): {
+  text: PlanTextState; declarations: { goal: string; at: number }[];
 } {
   const prior = previous?.turnId === turnId ? previous : undefined;
-  const head = prior === undefined ? "" : prior.text + (prior.recordEnded ? recordSeparator(prior.text) : "");
-  const text = head + delta;
+  const parts: RecordTextPart[] = prior === undefined ? [] : [{ text: prior.text, uuid: prior.uuid }];
+  appendRecordPart(parts, typeof delta === "string" ? { text: delta, uuid: null } : delta);
+  if (typeof delta !== "string" && delta.text === "") return {
+    text: { turnId, text: prior?.text ?? "", uuid: parts.at(-1)!.uuid, declaredThrough: prior?.declaredThrough ?? -1 }, declarations: [] };
+  const text = joinRecordTexts(parts.map(part => part.text));
   let declaredThrough = prior?.declaredThrough ?? -1;
   const declarations: { goal: string; at: number }[] = [];
   if (text.includes("laisora-plan")) {
@@ -1913,7 +1939,7 @@ export function foldPlanDeclarationText(previous: WorkModelState["planText"], tu
     }
   }
   const boundary = findCommitBoundary(text, 0);
-  return { text: { turnId, text: boundary < 0 ? text : text.slice(boundary),
+  return { text: { turnId, text: boundary < 0 ? text : text.slice(boundary), uuid: parts.at(-1)!.uuid,
     declaredThrough: boundary < 0 ? declaredThrough : declaredThrough - boundary }, declarations };
 }
 
@@ -1934,13 +1960,7 @@ function applySignal(d: Draft, signal: WorkSignal): void {
     case "approval_resolved":
       handleApprovalResolved(d, signal);
       return;
-    case "assistant_message_uuid":
-      if (d.next.planText?.turnId === signal.turnId) d.next.planText = { ...d.next.planText, recordEnded: true };
-      return;
     case "assistant_text_delta": {
-      const folded = foldPlanDeclarationText(d.next.planText, signal.turnId, signal.text, signal.timestamp);
-      d.next.planText = folded.text;
-      for (const declaration of folded.declarations) d.next.planDeclaration = declaration;
       const phase = destination(d, "unknown", signal.timestamp);
       place(d, phase, signal.timestamp, signal.turnId);
       relabelFallbackPhase(d, phase);
@@ -1983,7 +2003,6 @@ function applySignal(d: Draft, signal: WorkSignal): void {
       return;
     case "compact_boundary":
       if (signal.priorGeneration !== true) return;
-      d.next.planDeclaration = undefined;
       d.next.planBoundaryAt = signal.timestamp;
       return;
     default:

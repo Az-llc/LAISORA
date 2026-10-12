@@ -7,6 +7,11 @@ export function claudeConfigDir(): string {
   return (configured ? configured : join(homedir(), ".claude")).normalize("NFC");
 }
 
+export function claudeGlobalConfigFile(): string {
+  const configured = process.env.CLAUDE_CONFIG_DIR;
+  return join(configured ? configured : homedir(), ".claude.json");
+}
+
 export function claudeProjectsDir(): string {
   return join(claudeConfigDir(), "projects");
 }
@@ -21,8 +26,17 @@ export interface SanitizedClaudeEnv {
   removed: string[];
 }
 
-export function envNameKey(key: string): string {
-  return process.platform === "win32" ? key.toUpperCase() : key;
+export function envNameKey(key: string, platform: NodeJS.Platform = process.platform): string {
+  return platform === "win32" ? key.toUpperCase() : key;
+}
+
+export function envKeysOf(env: Readonly<Record<string, unknown>>, name: string, platform: NodeJS.Platform = process.platform): string[] {
+  return Object.keys(env).filter((key) => envNameKey(key, platform) === name);
+}
+
+export function envValueOf<T>(env: Readonly<Record<string, T>>, name: string, platform: NodeJS.Platform = process.platform): T | undefined {
+  const key = envKeysOf(env, name, platform)[0];
+  return key === undefined ? undefined : env[key];
 }
 
 export function buildClaudeEnv(

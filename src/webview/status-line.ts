@@ -1,40 +1,10 @@
 import * as l10n from "@vscode/l10n";
 import type { WorkAgentNode, WorkModelPayload } from "../protocol";
-import { redactAbsolutePaths } from "../path-redaction";
+import { basename, firstLine, type ToolIntentInput } from "../tool-intent";
 import { monthDayClock } from "./format";
 import { CODEX_EFFORTS, AGY_EFFORTS, EXECUTORS, isExternalRunTool } from "../orchestration-executors";
 
 export const TOOL_INTENT_MAX_LENGTH = 80;
-const INTENT_FIELDS = ["description", "subagent_type", "agent_key", "target", "prompt", "file_path", "pattern", "url", "query"] as const;
-export type ToolIntentInput = Partial<Record<typeof INTENT_FIELDS[number], string>>;
-
-export function isToolIntentInput(value: unknown): value is ToolIntentInput {
-  return value !== null && typeof value === "object" && !Array.isArray(value) &&
-    Object.entries(value).every(([key, field]) => (INTENT_FIELDS as readonly string[]).includes(key) && typeof field === "string");
-}
-
-const basename = (value: string): string => value.split(/[\\/]/).filter(Boolean).at(-1) ?? value;
-const firstLine = (value: string): string => value.split(/\r?\n/).map(line => line.trim()).find(Boolean) ?? "";
-
-export function captureToolIntentInput(name: string, input: unknown): ToolIntentInput | undefined {
-  if (!input || typeof input !== "object" || Array.isArray(input)) return undefined;
-  const source = input as Record<string, unknown>;
-  const fields: readonly (typeof INTENT_FIELDS[number])[] = isExternalRunTool(name)
-    ? ["target", "description", "prompt"]
-    : name === "Agent" || name === "Task" ? ["description", "subagent_type", "agent_key"]
-    : name === "Bash" || name === "PowerShell" ? ["description"]
-    : name === "Read" || name === "Edit" || name === "Write" ? ["file_path"]
-    : name === "Grep" || name === "Glob" ? ["pattern"]
-    : name === "WebFetch" ? ["url"] : name === "WebSearch" ? ["query"] : [];
-  const result: ToolIntentInput = {};
-  for (const key of fields) {
-    const value = source[key];
-    if (typeof value !== "string" || !value.trim()) continue;
-    result[key] = redactAbsolutePaths(key === "prompt" ? firstLine(value)
-      : key === "file_path" || name === "Glob" && key === "pattern" ? basename(value) : value.trim());
-  }
-  return Object.keys(result).length ? result : undefined;
-}
 
 function externalTargetLabel(target: string): string {
   const match = /^([^/]+)\/([^@]+)@(.+)$/.exec(target);

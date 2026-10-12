@@ -3,6 +3,8 @@ import * as vscode from "vscode";
 import { randomBytes } from "node:crypto";
 import { HandoffRunner } from "./handoff-runner";
 import { claudeProjectsDir } from "./claude-env";
+import { scheduleCliUpdates } from "./claude-cli-update";
+import { CLI_AUTO_UPDATE_SETTINGS } from "./cli-update-policy";
 export { handleAnalysisMessage } from "./analysis-messages";
 export { handleConversationMessage } from "./conversation-lifecycle";
 export { handleHandoffMessage } from "./handoff-wiring";
@@ -24,7 +26,6 @@ import {
   store,
 } from "./host-context";
 import { initHostL10n } from "./l10n";
-import { deleteOldLearningStore } from "./learning-startup";
 import {
   llmAnalysisEnabled,
   llmDiagnosticsAudience,
@@ -150,13 +151,11 @@ function activateReady(context: vscode.ExtensionContext): void {
   setOutput(vscode.window.createOutputChannel("LAISORA"));
   context.subscriptions.push(output);
   output.appendLine(`[startup] ${sinceActivation()} activate`);
-  if (context.globalStorageUri?.fsPath) {
-    void deleteOldLearningStore(context.globalStorageUri.fsPath, (line) => output.appendLine(line));
-  }
   void HandoffRunner.sweepOrphans(
     { fs: handoffFs, persist: handoffPersist(), readRecords: readHandoffRecords, log: (line) => output.appendLine(line) },
     claudeProjectsDir()
   ).catch((e) => output.appendLine(`[startup] handoff の孤児回収に失敗: ${String(e)}`));
+  scheduleCliUpdates(context);
   context.subscriptions.push({
     dispose: () => {
       void artifactServer?.dispose();
@@ -172,7 +171,11 @@ function activateReady(context: vscode.ExtensionContext): void {
   const displayConfigSub = vscode.workspace.onDidChangeConfiguration?.((e) => {
     if (["enabled", "agents", "externalTimeoutMinutes", "conductorPolicy"]
       .some((key) => affectsProductConfiguration(e, `orchestration.${key}`))) {
-      for (const session of store?.sessions.values() ?? []) postOrchestrationView(session);
+      const cacheTtlSetting = ["enabled", "agents"].some((key) => affectsProductConfiguration(e, `orchestration.${key}`));
+      for (const session of store?.sessions.values() ?? []) {
+        postOrchestrationView(session);
+        if (cacheTtlSetting) session.semantic.scheduleSemanticModelPost();
+      }
     }
     if (affectsProductConfiguration(e, "composer.sendKey") || affectsProductConfiguration(e, "appearance")) store?.post(userSettingsMessage());
     if (
@@ -181,7 +184,8 @@ function activateReady(context: vscode.ExtensionContext): void {
       affectsProductConfiguration(e, "claude.apiKeyPolicy") ||
       affectsProductConfiguration(e, "claude.initialModel") ||
       affectsProductConfiguration(e, "restoreTabsOnStartup") ||
-      affectsProductConfiguration(e, "learning.profileSources") ||
+      Object.values(CLI_AUTO_UPDATE_SETTINGS).some((key) => affectsProductConfiguration(e, key)) ||
+      affectsProductConfiguration(e, "history.eventLimit") ||
       affectsProductConfiguration(e, "claude.fileLinkInstruction") ||
       affectsProductConfiguration(e, "claude.planInstruction") ||
       affectsProductConfiguration(e, "fileLinks.openWithSystemApp") ||
@@ -279,7 +283,6 @@ export type { SessionStore } from "./store-surfaces";
 
 export { sessionsForTest } from "./store-surfaces";
 export { appendSessionRecordOnFreshLine as appendSessionRecordForTest } from "./session-files";
-export { persistInitialTabTitle as persistInitialTabTitleForTest, setInitialTabTitle as setInitialTabTitleForTest } from "./session-list-wiring";
 
 function guardMessage(): string | null {
   if (vscode.env.remoteName) {

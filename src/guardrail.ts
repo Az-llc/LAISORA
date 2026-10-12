@@ -3,6 +3,8 @@ import type { DivergenceReport } from "./l3-divergence";
 import { progressSubjectKey } from "./progress-protocol";
 import type { NormalizedEvent } from "./protocol";
 import { redactAbsolutePaths } from "./path-redaction";
+import { planItemLabel } from "./plan-steps";
+import { HUMAN_REJECTED_TOOL_RESULT_RE } from "./tool-result-signals";
 import type { SteeringSignalSummary } from "./steering-envelope";
 
 export const MAX_RECENT_FINISHED = 200;
@@ -18,8 +20,7 @@ export const FAILURE_LOOP_LOST_MIN_COUNT = 2;
 export const STAGNATION_IDLE_MS = 5 * 60_000;
 export const OUTPUT_OVERRUN_MESSAGE_TOKENS = 16_000;
 export const OUTPUT_OVERRUN_TURN_TOKENS = 100_000;
-export const HUMAN_REJECTED_TOOL_RESULT_RE =
-  /^(?:The user doesn't want to proceed with this tool use\b|\[Request interrupted by user(?: for tool use)?\])/;
+export { HUMAN_REJECTED_TOOL_RESULT_RE };
 const USAGE_LIMIT_TOOL_RESULT_RE = /^(?:You've (?:hit|reached) your\b|You're out of (?:usage credits|extra usage)\b|Your org is out of usage \u00b7 (?:add funds to continue|contact your admin)\b|Your seat type doesn't include (?:extra usage|usage(?: credits)?)\b|Your usage allocation has been disabled by your admin\b|Your group's usage limit is set to \$0\b|Fable 5 requires usage credits\b|You have hit your limit\b|Usage limit reached\b|Rate limit reached\b)/;
 
 export function isUsageLimitResult(text: string): boolean {
@@ -39,7 +40,8 @@ export type GuardrailSignalKind =
   | "progress_stagnation"
   | "declared_state_conflict"
   | "stagnation"
-  | "output_overrun";
+  | "output_overrun"
+  | "delegation_stopped";
 
 export type Pp1DivergenceKind =
   | "unsupported_completion"
@@ -110,6 +112,7 @@ export interface GuardrailState {
   appliedDivergenceIds: string[];
   assignments: GuardrailAssignment[];
   openTurn?: { turnId: string; startedAt: number };
+  conductorStoppedTaskIds?: string[];
 }
 
 export type GuardrailLevel = 0 | 1 | 2 | 3 | 4;
@@ -234,6 +237,7 @@ export const DEFAULT_GUARDRAIL_POLICY: GuardrailPolicy = {
     declared_state_conflict: 1,
     stagnation: 1,
     output_overrun: 1,
+    delegation_stopped: 1,
   },
   composite: [
     {
@@ -246,6 +250,7 @@ export const DEFAULT_GUARDRAIL_POLICY: GuardrailPolicy = {
 export type GuardrailInput =
   | { type: "event"; event: NormalizedEvent }
   | { type: "tick"; now: number; idleSince: number | undefined }
+  | { type: "delegation"; event: NormalizedEvent; inProgressStep: () => number | undefined }
   | {
       type: "divergence";
       report: DivergenceReport;
@@ -757,6 +762,9 @@ export function foldGuardrail(state: GuardrailState, input: GuardrailInput): Gua
   if (input.type === "tick") {
     return foldTick(state, input.now, input.idleSince);
   }
+  if (input.type === "delegation") {
+    return foldDelegation(state, input.event, input.inProgressStep);
+  }
   if (input.type === "event" && input.event.provenance?.path === "history") {
     return state;
   }
@@ -770,6 +778,59 @@ export function foldGuardrail(state: GuardrailState, input: GuardrailInput): Gua
   if (input.type === "divergence") {
     return foldDivergence(next, input.report, input.assignments);
   }
+  return next;
+}
+
+const STOPPED_TASK_STATUSES: ReadonlySet<string> = new Set(["stopped", "killed"]);
+
+function conductorStopTarget(toolName: string, inputPreview: string): string | undefined {
+  if (toolName !== "TaskStop") return undefined;
+  try {
+    const taskId = (JSON.parse(inputPreview) as { task_id?: unknown }).task_id;
+    return typeof taskId === "string" && taskId !== "" ? taskId : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function foldDelegation(state: GuardrailState, event: NormalizedEvent, stepOf: () => number | undefined): GuardrailState {
+  if (event.kind === "tool_call_started") {
+    const taskId = event.parentToolUseId ? undefined : conductorStopTarget(event.toolName, event.inputPreview);
+    if (taskId === undefined || state.conductorStoppedTaskIds?.includes(taskId)) return state;
+    const next = structuredClone(state);
+    next.conductorStoppedTaskIds = [...(state.conductorStoppedTaskIds ?? []), taskId].slice(-MAX_SIGNALS);
+    return next;
+  }
+  if (event.kind !== "tool_call_finished") return state;
+  if (event.resumedAgentId !== undefined && event.isError !== true && state.conductorStoppedTaskIds?.includes(event.resumedAgentId)) {
+    const next = structuredClone(state);
+    next.conductorStoppedTaskIds = state.conductorStoppedTaskIds.filter((id) => id !== event.resumedAgentId);
+    return next;
+  }
+  const notification = event.taskNotification;
+  if (notification === undefined || !STOPPED_TASK_STATUSES.has(notification.status ?? "")) return state;
+  if (state.conductorStoppedTaskIds?.includes(notification.agentId)) return state;
+  const signalId = `delegation_stopped:${notification.agentId}`;
+  if (state.signals.some((s) => s.signalId === signalId)) return state;
+  const step = stepOf();
+  if (step === undefined) return state;
+  const next = structuredClone(state);
+  if (next.signals.length >= MAX_SIGNALS) {
+    next.droppedSignalCount += 1;
+    return next;
+  }
+  next.signals.push({
+    signalId,
+    kind: "delegation_stopped",
+    target: "delegation",
+    subjectId: notification.agentId,
+    taskId: planItemLabel(step),
+    firstAt: event.timestamp,
+    lastAt: event.timestamp,
+    count: 1,
+    confidence: "observed",
+    evidence: {},
+  });
   return next;
 }
 

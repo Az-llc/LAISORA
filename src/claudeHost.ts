@@ -2,12 +2,14 @@ import { UsageLimitResume, SDK_AUTO_CONTINUE_SETTINGS } from "./usage-limit-resu
 import { readClaudeCodeSettings, onAutoContinueSettingChange } from "./claude-code-settings";
 import { modelLabelWithVersion } from "./model-display-name";
 export { modelLabelWithVersion } from "./model-display-name";
-import { appendRunRecord, DISPATCH_BUDGET_EXCEEDED, DISPATCH_INTERNAL_ERROR, externalDescription, isExternalTimeout, observeAgentRun, runExternal, runFailureReason, type ExternalRow, type OrchestrationRunRecord, type AgentRunRecord } from "./orchestration-external";
+import { readConversationRuns, appendRunRecord, DISPATCH_BUDGET_EXCEEDED, DISPATCH_INTERNAL_ERROR, externalDescription, isExternalTimeout, observeAgentRun, runExternal, runFailureReason, type ExternalRow, type OrchestrationRunRecord, type AgentRunRecord } from "./orchestration-external";
 
 import { randomUUID } from "node:crypto";
 import { isDeepStrictEqual } from "node:util";
 import { readdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
+import { tmpdir } from "node:os";
+import { prepareOrchestrationPlugin } from "./orchestration-plugin";
 import * as l10n from "@vscode/l10n";
 
 declare const __LAISORA_SDK_CLAUDE_CODE_VERSION__: string | undefined;
@@ -47,21 +49,26 @@ import type { ProgressTrackingMode } from "./progress-protocol";
 import { PROGRESS_WIRE_TOOL_NAME } from "./artifact-access";
 import { z } from "zod";
 import { ClaudeLiveNormalizer, parseAliases } from "./claude-normalizer";
-import { conductorInstruction, orchestrationExternalTargets, orchestrationAgents, orchestrationVariants, resolveOrchestrationRoster, type OrchestrationRow, type ExternalModels } from "./orchestration-roster";
-import { injectionOf, MAX_AGENT_STARTS, type AgentStartObservation, type RosterEvidence, type RosterInjection } from "./roster-evidence";
+import { AGENT_EFFORT_ARGUMENT_CLI_VERSION, agentEffortArgumentSupported, conductorInstruction, delegationEffort, orchestrationExternalTargets, orchestrationAgents, orchestrationVariants, resolveOrchestrationRoster, type OrchestrationRow, type ExternalModels } from "./orchestration-roster";
+import { injectionOf, MAX_AGENT_STARTS, readRosterEvidence, type AgentStartObservation, type InjectedAgentDefinition, type RosterEvidence, type RosterInjection } from "./roster-evidence";
 import { type LearningFacts } from "./learning";
 import { PLACEMENT_LINE } from "./placement-line";
-import { compileVocabulary, PLACEMENT_EFFORT_WORDS, DEFAULT_ROLE_NAMES, placementPath, judgeFileWrite, judgeShellWrite, placementGuardReason, PLACEMENT_UNREADABLE_REFUSAL } from "./placement-guard";
+import { laisoraDenialMessage } from "./tool-result-signals";
+import { failClosedGuard } from "./guard-evaluation";
+import { isShellTool } from "./learning-signature";
+import { compileVocabulary, PLACEMENT_EFFORT_WORDS, DEFAULT_ROLE_NAMES, placementPath, protectedDestination, isControlFile, DELEGATE_CONTROL_REFUSAL, judgeFileWrite, judgeMemoryWrite, memoryGuardReason, type MemoryDecision, judgeShellWrite, placementGuardReason, PLACEMENT_UNREADABLE_REFUSAL } from "./placement-guard";
 import { assignLearningExperiment, EXPERIMENT_HOLDOUT_PERCENT } from "./learning-experiment";
 import { LearningMeasurement, learningCandidateMatches } from "./learning-measurement";
-import { qualifyClaims } from "./learning-episodes";
+import { deliveredLearningItems, qualifyClaims } from "./learning-episodes";
 import type { Detector } from "./learning-detector";
-import { LearningDelivery, sectionFromLedger, readMeasuredRuns, DEFAULT_LEARNING_SWITCHES, type LearningSwitches, type PromptBudget } from "./learning-delivery";
+import { LearningDelivery, learningRoster, sectionFromLedger, readMeasuredRuns, DEFAULT_LEARNING_SWITCHES, type LearningSwitches, type PromptBudget } from "./learning-delivery";
 import type { SectionResult } from "./learning-section";
-import { resolveClaudeProfileModel, type ProfileTarget } from "./orchestration-profiles";
+import { resolveClaudeProfileModel } from "./orchestration-profiles";
 import { LearningRecorder, type LearningRecordResult as LearningResult, type LearningToolKind } from "./learning-recording";
 import { createLearningMcpServer, LearningRootGate, LEARNING_INSTRUCTION, LEARNING_TOOL_NAMES } from "./learning-mcp";
-import { claudeModelIdLabel } from "./orchestration-executors";
+import { claudeModelIdLabel, isExternalRunTool } from "./orchestration-executors";
+import type { NumberedLaunchVerdict } from "./time-buckets";
+import { planItemLabel } from "./plan-steps";
 import { LearningIngestion, delegationInvalidFields, type LearningToolResult, type LearningSubject } from "./learning-ingestion";
 import { AgentAttribution } from "./orchestration-attribution";
 import type { NormalizedOutMeta } from "./claude-normalizer";
@@ -99,9 +106,11 @@ export const ASK_DECIDE_FORMAT = () => [
 ].join("\n");
 
 export const PLAN_INSTRUCTION = [
-  "When starting multi-step work, first write a laisora-plan block with the goal as you understand it, then the TaskCreate steps; do not restate the user's words.",
-  "For requests with more than one step, use TaskCreate before starting: one task per step, subject as the step title, and activeForm set.",
+  "Only for a clear work instruction (the user asks you to change, build, investigate or produce something), write a laisora-plan block with the goal as you understand it before your first tool call, then the TaskCreate steps; do not restate the user's words.",
+  "For such work, use TaskCreate before starting: one task per step, subject as the step title, and activeForm set. Mark the first task in_progress before the first other tool call. A question, a conversation, a confirmation or feedback on earlier work is not a work instruction: answer it without a laisora-plan block or new tasks.",
   "Use TaskUpdate to mark each step in_progress when starting and completed when done. Add new steps at the end with TaskCreate.",
+  "Put an action that waits for the user's approval (such as merging or publishing) in its own step, separate from work you can finish yourself, and do not mark it in_progress until the user answers.",
+  "While TaskCreate steps exist, start the description of every Agent call and external run with the number of the step it serves exactly as the PLAN panel shows it (the task id, zero-padded to at least two digits) followed by a space, as in \"03 Remove model research\". A delegation without a valid step number is rejected before it runs.",
   "When you need the user's decision or a real-machine check, do not bury it in prose. Write a ```laisora-ask block (format below) at the point you ask.",
   "In every decision, whether in a laisora-ask block or AskUserQuestion, state: what is being decided and why now; for each option, what happens after choosing it, with its merits and drawbacks in plain words rather than technical terms; your recommendation and why; and what you will do if there is no answer.",
   "Use AskUserQuestion only when you cannot continue without the answer; otherwise use a laisora-ask block and continue with the stated default.",
@@ -112,6 +121,18 @@ export const PLAN_INSTRUCTION = [
   "```laisora-ask\nkind: check\ntitle: Check the result on your machine\nwhy: What I cannot verify here.\nsteps:\n  - do: Open the changed screen.\n    look: Confirm the labels fit without clipping.\n  - do: Resize the window.\n    look: Confirm every action remains reachable.\ndefault: While awaiting the result, I will continue with the independent work.\n```",
   "</format>",
 ].join("\n");
+
+export function planItemDenial(numbers: readonly number[]): string {
+  return `Rejected before running: start the description with the number of the PLAN step this delegation serves as shown in the PLAN panel and a space (current steps: ${numbers.map(planItemLabel).join(", ")}), as in "03 Remove model research", then send the same call again.`;
+}
+
+export function planItemNotInProgressDenial(number: number): string {
+  return `Rejected before running: PLAN step ${planItemLabel(number)} is not in progress. Mark ${planItemLabel(number)} in progress first (TaskUpdate with status in_progress, or TodoWrite), then send the same call again.`;
+}
+
+export function planLaunchDenial(verdict: NumberedLaunchVerdict): string | undefined {
+  return verdict.kind === "allow" ? undefined : verdict.kind === "unnumbered" ? planItemDenial(verdict.numbers) : planItemNotInProgressDenial(verdict.number);
+}
 
 export function conversationSystemPrompt(fileLinkInstruction: boolean, planInstruction = true, cwd = ""): NonNullable<ClaudeCodeOptions["systemPrompt"]> {
   return { type: "custom", prompt: [fileLinkInstruction ? FILE_LINK_INSTRUCTION(cwd) : "", planInstruction ? PLAN_INSTRUCTION : "", PLACEMENT_LINE].filter(Boolean).join("\n\n"), snapshot: false };
@@ -139,6 +160,7 @@ interface QueryHandle extends AsyncIterable<any> {
 export interface ClaudeHostOptions {
   cwd: string;
   initialObservedTimestamp?: number;
+  knownBackgroundTask?: (taskId: string) => "agent" | "tool" | "unconfirmed" | undefined;
   model?: string;
   effort?: "low" | "medium" | "high" | "xhigh" | "max";
   resumeSessionId?: string;
@@ -149,19 +171,20 @@ export interface ClaudeHostOptions {
   apiKeyPolicy?: ApiKeyPolicy;
   fileLinkInstruction?: boolean;
   planInstruction?: boolean;
+  planLaunchVerdict?: (description: string | undefined) => NumberedLaunchVerdict;
   orchestrationEnabled?: boolean;
   orchestrationAgents?: unknown;
   externalModels?: ExternalModels;
   externalTimeoutMinutes?: number;
   orchestrationRunsDirectory?: string;
+  orchestrationPluginDirectory?: string;
+  rosterEvidenceDirectory?: string;
   learningEnabled?: boolean;
   learningSwitches?: () => Partial<LearningSwitches>;
   learningHoldoutPercent?: () => number;
-  learningDedicated?: boolean;
   learningDetectorCandidate?: { version: number; detect: Detector };
   learningPromptBudget?: (executor: string, model: string) => PromptBudget;
   learningDirectory?: string;
-  learningEvidenceSource?: string;
   configuredResolvedModel?: string;
   conductorPolicy?: string;
   onOrchestrationChanged?: () => void;
@@ -383,8 +406,7 @@ export class ClaudeConversation {
         const promptTokens = typeof input !== "number" ? null : external.executor === "codex" ? input
           : typeof usage?.cache_read_input_tokens === "number" && typeof usage?.cache_creation_input_tokens === "number"
             ? input + usage.cache_read_input_tokens + usage.cache_creation_input_tokens : null;
-        await this.measurement?.record({ externalRuns: 1, promptTokens, externalInputTokens: input ?? null,
-          ...(this.opts.learningDedicated ? { researchTokens: promptTokens, researchCost: null } : {}) },
+        await this.measurement?.record({ externalRuns: 1, promptTokens, externalInputTokens: input ?? null },
           { executor: external.executor, model: external.observedModel ?? "unknown", role: external.role }, `external-usage:${runId}`);
       });
     }
@@ -406,14 +428,7 @@ export class ClaudeConversation {
   private readonly initialOrchestrationSettings: { settings: unknown; deliveredSetHash?: string };
   private delivery?: LearningDelivery;
   private deliverySnapshot?: SectionResult;
-  private readonly researchModels: ProfileTarget[] = [];
-  get learningToolAvailable(): boolean { return !!this.learningGate && !this.closed; }
-  private researchId?: string;
   private recorder?: LearningRecorder;
-  allowResearchModels(targets: readonly ProfileTarget[]): string {
-    this.researchModels.push(...targets);
-    return this.researchId ??= randomUUID();
-  }
   private learningSessionRef?: string;
   private learningGate?: LearningRootGate;
   private measurement?: LearningMeasurement;
@@ -422,7 +437,11 @@ export class ClaudeConversation {
   private readonly observedAgents = new Map<string, Readonly<{ agentType?: string; model?: string; effort?: string }>>();
 
   get orchestrationRoster(): readonly OrchestrationRow[] { return this.roster; }
+  private perCallEffort = false;
+  get orchestrationPerCallEffort(): boolean { return this.perCallEffort; }
   get orchestrationActive(): boolean { return this.orchestrationEnabled; }
+  get orchestrationAgentVariants() { return orchestrationVariants(this.roster, this.opts.externalModels); }
+
   get orchestrationExternalRoster(): readonly ExternalRow[] { return this.externalRows; }
 
   get learningFacts(): LearningFacts | undefined {
@@ -438,7 +457,7 @@ export class ClaudeConversation {
     const delivery = current.find(record => record.kind === "delivery");
     const claims = current.filter(record => record.kind === "claim" && record.source === "observation");
     return { ledgerVersion: 2, coverage: !model ? "model-unknown" : !this.learningSessionRef ? "session-unknown" : "observed",
-      delivered: { count: delivery?.kind === "delivery" ? delivery.items.filter(item => item.type === "rule").length : 0,
+      delivered: { count: delivery?.kind === "delivery" ? deliveredLearningItems(records, delivery).filter(item => item.type === "rule").length : 0,
         setHash: delivery?.kind === "delivery" ? delivery.setHash : "", outcome: mismatch ? "model-mismatch" : delivery?.kind === "delivery" ? delivery.outcome : "none" },
       observations: claims.length, evidenced: claims.filter(record => record.kind === "claim" && record.evidence.creditedRunIds.length).length,
       recurrences: current.filter(record => record.kind === "episode" && record.status === "counted").length,
@@ -473,20 +492,13 @@ export class ClaudeConversation {
       if (candidate) ingestion.detector.adopt(candidate.version, candidate.detect);
       this.measurement = new LearningMeasurement(ingestion);
       await this.measurement.control(this.effectiveLearningSwitches());
-      if (this.opts.learningEvidenceSource) {
-        const state = ingestion.ledger.state;
-        if (this.opts.learningEvidenceSource === "unknown" || state.unavailableConversations.has(this.opts.learningEvidenceSource)) return "";
-        const source = state.assignments.get(this.opts.learningEvidenceSource);
-        if (source && !state.assignments.has(this.durableConversationKey)) await ingestion.ledger.append({ ...source,
-          conversation: this.durableConversationKey, eligible: false, reason: "effort-inherited", opId: ingestion.ref("effort-assignment", this.durableConversationKey), at: new Date().toISOString() });
-      }
       const model = resolveClaudeProfileModel(this.opts.model, this.opts.externalModels, this.opts.configuredResolvedModel);
       const runs = await readMeasuredRuns(this.opts.orchestrationRunsDirectory, this.opts.log);
       const state = ingestion.ledger.state;
       const candidates = sectionFromLedger(state.records.values(), state.rules.values(), this.roster, this.opts.externalModels,
         model ? claudeModelIdLabel(model) : "unknown", ingestion.projectRef, this.durableConversationKey, new Date().toISOString(), runs, this.effectiveLearningSwitches());
       const assignment = await assignLearningExperiment(ingestion.ledger, this.durableConversationKey, this.effectiveLearningSwitches(), candidates.items.map(item => item.id),
-        ingestion.detector.version, !!this.opts.learningDedicated || !!this.researchId || !!this.opts.learningEvidenceSource, this.opts.learningHoldoutPercent?.() ?? EXPERIMENT_HOLDOUT_PERCENT);
+        ingestion.detector.version, this.opts.learningHoldoutPercent?.() ?? EXPERIMENT_HOLDOUT_PERCENT);
       if (!assignment) return "";
       await this.measurement.record({ relevantOpportunities: 0, candidateOpportunities: 0, toolCalls: 0, toolResults: 0, turns: 0, turnStarts: 0, usageResults: 0,
         promptTokens: 0, researchTokens: 0, researchCost: 0 }, {}, `start:${ingestion.conductorSubject.run}`);
@@ -508,9 +520,9 @@ export class ClaudeConversation {
     this.recorder ??= new LearningRecorder(this.ingestion.ledger);
     return this.recorder.record(kind, input, { rootVerified, ready: this.ingestion.ready, conversation: this.ingestion.conversation,
       session: this.ingestion.sessionRef, project: this.ingestion.projectRef, conductorModel: this.recordingModel ?? "unknown", cwd: this.opts.cwd,
-      models: this.opts.externalModels, roles: new Set(this.roster.filter(row => row.enabled).map(row => row.role)), runs: this.orchestrationRuns,
-      research: this.researchId ? { id: this.researchId, targets: this.researchModels.map(target => ({ ...target,
-        model: target.executor === "claude" ? claudeModelIdLabel(target.model) : target.model })) } : undefined,
+      models: this.opts.externalModels, roster: this.roster, targets: learningRoster(this.roster, this.opts.externalModels),
+      roles: new Set(this.roster.filter(row => row.enabled).map(row => row.role)), runs: [],
+      loadRuns: () => readConversationRuns(this.opts.orchestrationRunsDirectory, this.ingestion!.conversation ?? "unknown", this.orchestrationRuns),
       ref: (domain, value) => this.ingestion!.ref(domain, value) });
   }
   private readonly learningGapScope = randomUUID();
@@ -543,6 +555,10 @@ export class ClaudeConversation {
     return new Map(this.observedAgents);
   }
 
+  private readonly recordedAgents = new Map<string, InjectedAgentDefinition>();
+  get recordedAgentRoles(): ReadonlyMap<string, string> {
+    return new Map([...this.recordedAgents].map(([key, definition]) => [key, definition.role]));
+  }
   private readonly rosterInjections: RosterInjection[] = [];
   private readonly agentStarts = new Map<string, AgentStartObservation>();
   get rosterEvidence(): RosterEvidence {
@@ -630,19 +646,24 @@ export class ClaudeConversation {
     this.externalTimeoutMinutes = isExternalTimeout(opts.externalTimeoutMinutes) ? opts.externalTimeoutMinutes : 10;
     this.conductorPolicy = opts.conductorPolicy ?? "";
     for (const dropped of resolved.droppedRows) opts.log(dropped);
+    if (opts.rosterEvidenceDirectory && opts.resumeSessionId) {
+      for (const injection of readRosterEvidence(opts.rosterEvidenceDirectory, opts.resumeSessionId, opts.log).injections)
+        for (const agent of injection.agents) this.recordedAgents.set(agent.agentKey, agent);
+    }
     this.attribution = new AgentAttribution(() => this.rosterEvidence, record => this.recordRun(record),
       async (parent, agentId, record, subject) => {
         await this.settleTargetResults(parent, agentId, subject);
         const tool = this.hookTools.get(parent);
         if (record.outcome === "normal" && tool) await this.ingestion?.result({ toolUseId: parent, tool: tool.tool, input: tool.input,
           text: "", isError: false, subject, at: record.confirmedAt });
-      }, opts.log);
+      }, opts.log, agentKey => agentKey === undefined ? undefined : this.recordedAgents.get(agentKey));
     if (opts.learningDirectory) this.ingestion = new LearningIngestion(opts.learningDirectory, opts.cwd, opts.log,
       () => this.recordingModel,
       parent => this.attribution.subject(parent), opts.resumeSessionId);
     this.normalizer = new ClaudeLiveNormalizer({
       cwd: this.opts.cwd,
       initialObservedTimestamp: this.opts.initialObservedTimestamp,
+      knownBackgroundTask: this.opts.knownBackgroundTask,
       log: this.opts.log,
       loadAgentDef: (subagentType: string) => this.loadAgentDef(subagentType),
       emit: (body, meta) => this.emit(body, meta),
@@ -693,6 +714,12 @@ export class ClaudeConversation {
     const version = startup.version;
     this.opts.log(`Claude Code CLI version: ${version.cliVersion ?? "unavailable"}; SDK expected: ${__LAISORA_SDK_CLAUDE_CODE_VERSION__ ?? "unknown"}`);
     if (version.warning) this.opts.log(`[warning] ${version.warning}`);
+    const perCallEffort = this.perCallEffort = agentEffortArgumentSupported(version.cliVersion);
+    if (this.orchestrationEnabled && !perCallEffort) {
+      this.opts.log(`[warning] ${version.cliVersion
+        ? l10n.t("Claude Code CLI {0} cannot set effort per delegation, so agents run at their default effort. Update Claude Code to {1} or later.", version.cliVersion, AGENT_EFFORT_ARGUMENT_CLI_VERSION)
+        : l10n.t("The Claude Code CLI version is unknown, so agents run at their default effort. Update Claude Code to {0} or later.", AGENT_EFFORT_ARGUMENT_CLI_VERSION)}`);
+    }
     this.normalizer.setUsageLimitPrefixes([...sdk.USAGE_LIMIT_ERROR_PREFIXES]);
 
     const { env, removed } = buildClaudeEnv(process.env, this.opts.apiKeyPolicy,
@@ -779,7 +806,7 @@ ${ctxJson}`
       else self.learningGate?.release(learningCall);
       self.emit({ kind: "approval_resolved", requestId, behavior: decision.behavior, resolvedBy: decision.resolvedBy ?? "user", answers: decision.answers });
       if (decision.behavior === "deny") {
-        return { behavior: "deny", message: l10n.t("Denied by the LAISORA user") };
+        return { behavior: "deny", message: laisoraDenialMessage() };
       }
       return decision.answers
         ? { behavior: "allow", updatedInput: { ...input, answers: decision.answers } }
@@ -850,12 +877,13 @@ ${ctxJson}`
     if (this.ingestion) {
       this.opts.log(`learning 準備: ${Date.now() - learningT0}ms（restore ${deliveryT0 - learningT0}ms / delivery ${Date.now() - deliveryT0}ms）`);
     }
-    this.rosterInjections.push(injectionOf(this.orchestrationEnabled ? orchestrationVariants(this.roster) : [], Date.now()));
+    this.rosterInjections.push(injectionOf(this.orchestrationEnabled ? orchestrationVariants(this.roster, this.opts.externalModels) : [], Date.now(), this.perCallEffort));
     if (this.orchestrationEnabled) {
-      options.agents = orchestrationAgents(this.roster);
+      options.plugins = [...(options.plugins ?? []), { type: "local",
+        path: await prepareOrchestrationPlugin(this.opts.orchestrationPluginDirectory ?? join(tmpdir(), "laisora-agent-plugin"), this.roster, this.opts.externalModels) }];
       const base = this.opts.fileLinkInstruction === true ? FILE_LINK_INSTRUCTION(this.opts.cwd) : "";
       options.systemPrompt = { type: "custom", snapshot: false,
-        prompt: [base, this.opts.planInstruction !== false ? PLAN_INSTRUCTION : "", conductorInstruction(this.roster, this.conductorPolicy, this.externalRows, deliverySection)].filter(Boolean).join("\n\n") };
+        prompt: [base, this.opts.planInstruction !== false ? PLAN_INSTRUCTION : "", conductorInstruction(this.roster, this.conductorPolicy, this.externalRows, deliverySection, perCallEffort, this.opts.externalModels)].filter(Boolean).join("\n\n") };
     }
     if (this.orchestrationEnabled || this.ingestion) {
       const observe: ClaudeCodeSdk.HookCallback = async (input) => {
@@ -901,21 +929,23 @@ ${ctxJson}`
             if (toolUse) this.handledExternalCalls.add(toolUse.id);
             const runId = randomUUID(), dispatchId = randomUUID(), recipient = `external:${runId}`;
             const subject = { recipient, run: runId, dispatchId, executor: row.executor, model: row.model, effort: row.effort ?? "none", role: row.role };
-            const run = await runExternal(row, input, { cwd: this.opts.cwd, timeoutMinutes: this.externalTimeoutMinutes, apiKeyPolicy: this.opts.apiKeyPolicy }, {
+            const run = await runExternal(row, input, { cwd: this.opts.cwd, configDir: claudeConfigDir(), timeoutMinutes: this.externalTimeoutMinutes, apiKeyPolicy: this.opts.apiKeyPolicy }, {
               signal: controller.signal,
               preparePrompt: (prompt, packaging, budget) => this.delivery?.target(subject, prompt, packaging, this.opts.learningPromptBudget?.(row.executor, row.model) ?? budget) ?? prompt,
-              onAccepted: () => this.delivery?.accept(dispatchId),
+              onAccepted: () => this.queueLearningR33(() => this.delivery?.accept(dispatchId) ?? Promise.resolve()),
             });
-            if (!("accepted" in run) || !run.accepted) await this.delivery?.observed(dispatchId, "unknown", "unknown", [], true);
+            if (!("accepted" in run) || !run.accepted) await this.queueLearningR33(() => this.delivery?.observed(dispatchId, "unknown", "unknown", [], true) ?? Promise.resolve());
             const boundaryCode = "boundaryCode" in run ? run.boundaryCode : undefined;
             await this.ingestion?.result({ toolUseId: toolUse?.id ?? dispatchId, dispatchId,
               tool: "mcp__laisora_external__run", input, text: run.record.reason ?? "", isError: false,
               executorFailure: run.record.outcome !== "ok", ...(run.record.outcome !== "ok" ? { executorOutcome: run.record.outcome } : {}),
               ...(boundaryCode ? { boundaryCode } : { subject: { recipient, run: runId, dispatchId, executor: row.executor,
                 model: run.record.observedModel, effort: run.record.observedEffort, role: row.role } }) });
-            const record = await this.recordRun({ ...run.record, runId, dispatchId, recipient });
-            if (record.reason !== run.record.reason) return { isError: true, content: [{ type: "text" as const, text: record.reason! }] };
-            return run.result;
+            const record = await this.recordRun({ ...run.record, runId, dispatchId, recipient,
+              ...(toolUse ? { toolUseId: toolUse.id } : typeof suppliedId === "string" ? { toolUseId: suppliedId } : {}) });
+            const result = record.outcome !== "ok" && record.reason !== run.record.reason
+              ? { isError: true, content: [{ type: "text" as const, text: record.reason! }] } : run.result;
+            return { ...result, content: [...result.content, { type: "text" as const, text: `Run: ${record.runId}` }] };
           })();
           this.activeExternalRuns.add(pending);
           try { return await pending; }
@@ -932,7 +962,7 @@ ${ctxJson}`
       options.systemPrompt = { ...prompt, prompt: [prompt.prompt, !this.orchestrationEnabled ? deliverySection : "", LEARNING_INSTRUCTION].filter(Boolean).join("\n\n") };
     }
     if (this.ingestion || this.opts.learningEnabled === true) {
-      const gate = this.learningGate = new LearningRootGate();
+      const gate = this.learningGate = new LearningRootGate(undefined, this.opts.log);
       options.mcpServers = { ...(options.mcpServers ?? {}), laisora_learning: createLearningMcpServer(sdk, gate, (input, root, kind) => this.recordLearningR12(input, root, kind)) };
       const gated = { matcher: LEARNING_TOOL_NAMES.join("|"), hooks: [gate.hook] };
       options.hooks = { ...(options.hooks ?? {}),
@@ -943,12 +973,15 @@ ${ctxJson}`
     {
       const guard: ClaudeCodeSdk.HookCallback = async input => {
         if (input.hook_event_name !== "PreToolUse") return {};
-        const settings = this.effectiveLearningSwitches();
+        let settings: LearningSwitches | undefined;
+        let settingsError: unknown;
+        try { settings = this.effectiveLearningSwitches(); } catch (error) { settingsError = error; }
         await this.queueLearningR33(async () => {
+          if (!settings) throw settingsError;
           await this.measurement?.control(settings);
-          const variants = orchestrationVariants(this.roster), value = input.tool_input as Record<string, unknown>;
+          const variants = orchestrationVariants(this.roster, this.opts.externalModels), value = input.tool_input as Record<string, unknown>;
           const agent = input.agent_id ? this.observedAgents.get(input.agent_id) : undefined;
-          const variant = variants.find(entry => entry.agentKey === agent?.agentType);
+          const variant = variants.find(entry => entry.agentKey === agent?.agentType) ?? this.recordedAgents.get(agent?.agentType ?? "");
           const model = input.agent_id ? agent?.model ?? variant?.model : this.recordingModel ?? this.opts.model;
           const resolved = resolveClaudeProfileModel(model, this.opts.externalModels, input.agent_id ? undefined : this.opts.configuredResolvedModel);
           const subject = { recipient: input.agent_id ?? "conductor", run: "unknown", dispatchId: input.tool_use_id, executor: "claude" as const,
@@ -957,7 +990,7 @@ ${ctxJson}`
           const external = input.tool_name === "mcp__laisora_external__run" ? this.externalRows.find(entry => entry.target === value.target) : undefined;
           const targetModel = targetVariant ? resolveClaudeProfileModel(targetVariant.model, this.opts.externalModels) : undefined;
           const target = external ? { ...subject, executor: external.executor, model: external.model, effort: external.effort ?? "none", role: external.role }
-            : targetVariant ? { ...subject, model: targetModel ? claudeModelIdLabel(targetModel) : "unknown", effort: targetVariant.effort ?? "none", role: targetVariant.role } : undefined;
+            : targetVariant ? { ...subject, model: targetModel ? claudeModelIdLabel(targetModel) : "unknown", effort: delegationEffort(targetVariant, value.effort, this.perCallEffort) ?? "none", role: targetVariant.role } : undefined;
           const state = this.ingestion?.ledger.state;
           const claims = state && target ? qualifyClaims([...state.records.values()], new Date().toISOString(), (executor, model) => executor === target.executor && model === target.model,
             new Set([target.role])) : [];
@@ -967,36 +1000,63 @@ ${ctxJson}`
               ...Object.fromEntries(matches.map((id, index) => [`candidate${index}`, id])) }, `tool:${input.tool_use_id}`);
           if (input.tool_name === "mcp__laisora_external__run") await this.measurement?.record({ externalDispatches: 1 }, { executor: "unknown", role: "target" }, `external-tokens:${input.tool_use_id}`);
         });
-        if (!settings.guard) return {};
-        const value = input.tool_input as Record<string, unknown>;
-        const guardRoster = resolveOrchestrationRoster(this.opts.orchestrationAgents).roster;
-        const names = ["claude", "Claude", "codex", "Codex", "agy", "Antigravity", ...orchestrationVariants(guardRoster).map(variant => variant.agentKey),
-          ...guardRoster.flatMap(row => row.rows.map(entry => entry.model)), ...this.orchestrationRuns.flatMap(run => [run.requestedModel, run.kind === "external" ? run.observedModel : run.model].filter((name): name is string => !!name)),
-          ...[...this.observedAgents.values()].flatMap(agent => [agent.agentType, agent.model].filter((name): name is string => !!name))];
-        const models = Object.values(this.opts.externalModels ?? {}).flatMap(list => list.state === "ok" ? list.models : []);
-        const listed = models.flatMap(model => [model.id, ...(model.resolvedModel ? [model.resolvedModel] : [])]);
-        const vocabulary = compileVocabulary({ names: [...names, ...listed, ...models.map(model => model.label), ...listed.map(model => claudeModelIdLabel(model))], effortWords: PLACEMENT_EFFORT_WORDS,
-          roleNames: [...DEFAULT_ROLE_NAMES, ...guardRoster.map(row => row.role)], listedModelIds: listed });
-        const cwd = input.cwd || this.opts.cwd;
-        let decision = judgeShellWrite(input.tool_name, value, claudeConfigDir(), process.platform, cwd);
-        let unreadable = false;
-        if (["Write", "Edit", "MultiEdit"].includes(input.tool_name) && typeof value.file_path === "string") {
-          const path = placementPath(value.file_path, cwd, false);
-          let current: string | undefined;
-          if (path) {
-            try { current = readFileSync(path, "utf8"); }
-            catch (error) { unreadable = (error as NodeJS.ErrnoException).code !== "ENOENT"; }
+        const delegate = typeof input.agent_id === "string" && input.agent_id.length > 0;
+        if (settings && !settings.guard && !delegate) return {};
+        if (!["Write", "Edit", "MultiEdit", ...(delegate ? ["NotebookEdit"] : [])].includes(input.tool_name) && !isShellTool(input.tool_name)) return {};
+        return failClosedGuard(async () => {
+          if (!settings) throw settingsError;
+          const value = input.tool_input as Record<string, unknown>;
+          const guardRoster = resolveOrchestrationRoster(this.opts.orchestrationAgents).roster;
+          const names = ["claude", "Claude", "codex", "Codex", "agy", "Antigravity", ...orchestrationVariants(guardRoster).map(variant => variant.agentKey),
+            ...guardRoster.flatMap(row => row.rows.map(entry => entry.model)), ...this.orchestrationRuns.flatMap(run => [run.requestedModel, run.kind === "external" ? run.observedModel : run.model].filter((name): name is string => !!name)),
+            ...[...this.observedAgents.values()].flatMap(agent => [agent.agentType, agent.model].filter((name): name is string => !!name))];
+          const models = Object.values(this.opts.externalModels ?? {}).flatMap(list => list.state === "ok" ? list.models : []);
+          const listed = models.flatMap(model => [model.id, ...(model.resolvedModel ? [model.resolvedModel] : [])]);
+          const vocabulary = compileVocabulary({ names: [...names, ...listed, ...models.map(model => model.label), ...listed.map(model => claudeModelIdLabel(model))], effortWords: PLACEMENT_EFFORT_WORDS,
+            roleNames: [...DEFAULT_ROLE_NAMES, ...guardRoster.map(row => row.role)], listedModelIds: listed });
+          const cwd = input.cwd || this.opts.cwd;
+          let decision = judgeShellWrite(input.tool_name, value, claudeConfigDir(), process.platform, cwd, delegate);
+          let unreadable = false;
+          let memoryDecision: MemoryDecision | undefined = delegate && decision.destination === "memory"
+            ? { destination: "memory", blocked: true, reasons: ["delegate"], blockedLines: [] } : undefined;
+          const filePath = input.tool_name === "NotebookEdit" ? value.notebook_path : value.file_path;
+          if (["Write", "Edit", "MultiEdit", "NotebookEdit"].includes(input.tool_name) && typeof filePath === "string") {
+            const path = placementPath(filePath, cwd, false);
+            let current: string | undefined;
+            if (path) {
+              try { current = readFileSync(path, "utf8"); }
+              catch (error) { unreadable = (error as NodeJS.ErrnoException).code !== "ENOENT"; }
+            }
+            const target = path ?? filePath;
+            decision = delegate && isControlFile(target, claudeConfigDir())
+              ? { destination: protectedDestination(target, claudeConfigDir()) ?? "control", blocked: true, reasons: [], examinedLines: 0, blockedLines: [] }
+              : judgeFileWrite(input.tool_name, { ...value, file_path: target }, current, vocabulary, claudeConfigDir());
+            memoryDecision = judgeMemoryWrite(input.tool_name, { ...value, file_path: target }, current,
+              delegate ? "delegate" : "conductor", claudeConfigDir());
           }
-          decision = judgeFileWrite(input.tool_name, { ...value, file_path: path ?? value.file_path }, current, vocabulary, claudeConfigDir());
-        }
-        const unchecked = unreadable && decision.skipped === "edit-does-not-apply";
-        if ((!decision.blocked && !unchecked) || !decision.destination) return {};
-        const destination = decision.destination;
-        await this.queueLearningR33(() => this.measurement?.record({ guardBlocks: 1 }, { tool: input.tool_name, destination: destination === "CLAUDE.md" ? "claude-md" : destination === "AGENTS.md" ? "agents-md" : destination }) ?? Promise.resolve());
-        return { hookSpecificOutput: { hookEventName: "PreToolUse", permissionDecision: "deny",
-          permissionDecisionReason: unchecked ? PLACEMENT_UNREADABLE_REFUSAL : placementGuardReason(destination, settings.enabled) } };
+          const unchecked = unreadable && decision.skipped === "edit-does-not-apply";
+          const destination = memoryDecision?.blocked ? "memory" : decision.destination;
+          if ((!memoryDecision?.blocked && !decision.blocked && !unchecked) || !destination) return {};
+          await this.queueLearningR33(() => this.measurement?.record({ guardBlocks: 1 }, { tool: input.tool_name, destination: destination === "CLAUDE.md" ? "claude-md" : destination === "AGENTS.md" ? "agents-md" : destination }) ?? Promise.resolve());
+          return { hookSpecificOutput: { hookEventName: "PreToolUse", permissionDecision: "deny",
+            permissionDecisionReason: memoryDecision?.blocked ? memoryGuardReason(memoryDecision) : delegate ? DELEGATE_CONTROL_REFUSAL : unchecked ? PLACEMENT_UNREADABLE_REFUSAL : placementGuardReason(destination, settings.enabled) } };
+        }, this.opts.log);
       };
       options.hooks = { ...(options.hooks ?? {}), PreToolUse: [{ hooks: [guard] }, ...(options.hooks?.PreToolUse ?? [])] };
+    }
+    const planLaunchVerdict = this.opts.planInstruction !== false ? this.opts.planLaunchVerdict : undefined;
+    if (planLaunchVerdict) {
+      const planItemGuard: ClaudeCodeSdk.HookCallback = async input => {
+        if (input.hook_event_name !== "PreToolUse" || input.agent_id || !(["Agent", "Task"].includes(input.tool_name) || isExternalRunTool(input.tool_name))) return {};
+        return failClosedGuard(() => {
+          const description = (input.tool_input as Record<string, unknown> | undefined)?.description;
+          const reason = planLaunchDenial(planLaunchVerdict(typeof description === "string" ? description : undefined));
+          if (reason === undefined) return {};
+          return { hookSpecificOutput: { hookEventName: "PreToolUse", permissionDecision: "deny", permissionDecisionReason: reason } };
+        }, this.opts.log);
+      };
+      const [first, ...rest] = options.hooks?.PreToolUse ?? [];
+      options.hooks = { ...(options.hooks ?? {}), PreToolUse: [...(first ? [first] : []), { hooks: [planItemGuard] }, ...rest] };
     }
     if (this.ingestion) {
       const observeFailure: ClaudeCodeSdk.HookCallback = async input => {
@@ -1031,20 +1091,21 @@ ${ctxJson}`
       });
     }
     if (this.delivery) {
+      const agentDefinitions = orchestrationAgents(this.roster, this.opts.externalModels);
       const inject: ClaudeCodeSdk.HookCallback = async input => {
         if (input.hook_event_name !== "PreToolUse" || !["Agent", "Task"].includes(input.tool_name)) return {};
         const value = input.tool_input as Record<string, unknown>;
         if (typeof value.prompt !== "string") return {};
         this.attribution.dispatch(input.tool_use_id, value);
         const identity = this.attribution.dispatchSubject(input.tool_use_id);
-        const variant = orchestrationVariants(this.roster).find(entry => entry.agentKey === value.subagent_type);
+        const variant = orchestrationVariants(this.roster, this.opts.externalModels).find(entry => entry.agentKey === value.subagent_type);
         if (!identity || !variant) return {};
         const model = resolveClaudeProfileModel(variant.model, this.opts.externalModels);
         if (!model) return {};
-        const subject = { ...identity, executor: "claude" as const, model: claudeModelIdLabel(model), effort: variant.effort ?? "none", role: variant.role };
-        const packaging = JSON.stringify({ ...value, prompt: "", system: options.systemPrompt, agent: options.agents?.[variant.agentKey] });
+        const subject = { ...identity, executor: "claude" as const, model: claudeModelIdLabel(model), effort: delegationEffort(variant, value.effort, this.perCallEffort) ?? "none", role: variant.role };
+        const packaging = JSON.stringify({ ...value, prompt: "", system: options.systemPrompt, agent: agentDefinitions[variant.agentKey] });
         try {
-          const prompt = this.delivery!.target(subject, value.prompt, packaging, this.opts.learningPromptBudget?.("claude", subject.model));
+          const prompt = await this.delivery!.target(subject, value.prompt, packaging, this.opts.learningPromptBudget?.("claude", subject.model));
           return { hookSpecificOutput: { hookEventName: "PreToolUse", updatedInput: { ...value, prompt } } };
         } catch (error) {
           const reason = error instanceof Error && error.message === DISPATCH_BUDGET_EXCEEDED ? DISPATCH_BUDGET_EXCEEDED : runFailureReason(DISPATCH_INTERNAL_ERROR, error);
@@ -1154,7 +1215,7 @@ ${ctxJson}`
     return [...this.pendingApprovals.values()].flatMap(p => p.toolUseId === undefined ? [] : [p.toolUseId]);
   }
 
-  send(text: string, images?: ImageAttachment[], observedTimestampSeed?: number, automatic = false): void {
+  send(text: string, images?: ImageAttachment[], observedTimestampSeed?: number, automatic = false, uuid?: `${string}-${string}-${string}-${string}-${string}`): void {
     if (!automatic) this.usageLimitResume.manualSend();
     if (this.closed) {
       this.emit({
@@ -1191,6 +1252,7 @@ ${ctxJson}`
       type: "user",
       message: { role: "user", content },
       ...(automatic ? { isMeta: true } : {}),
+      ...(uuid === undefined ? {} : { uuid }),
       parent_tool_use_id: null,
       session_id: "",
     });
@@ -1332,7 +1394,7 @@ ${ctxJson}`
       const session = msg.session_id ?? this.learningSessionRef ?? this.opts.resumeSessionId ?? this.conversationId;
       const identity = msg.uuid ?? this.normalizer.currentTurnId ?? randomUUID();
       const completesTurn = this.normalizer.currentTurnId !== null;
-      void this.queueLearningR33(() => this.measurement?.cumulativeUsage(msg, session, session === this.opts.resumeSessionId, !!this.opts.learningDedicated, identity, completesTurn) ?? Promise.resolve());
+      void this.queueLearningR33(() => this.measurement?.cumulativeUsage(msg, session, session === this.opts.resumeSessionId, identity, completesTurn) ?? Promise.resolve());
     }
     if (msg?.type === "system" && msg?.subtype === "task_started" && msg.task_type === "local_agent"
       && typeof msg.tool_use_id === "string" && typeof msg.task_id === "string"
@@ -1374,7 +1436,7 @@ ${ctxJson}`
       const missingUsage = !this.handlingResult;
       void this.queueLearningR33(async () => {
         await this.measurement?.control(this.effectiveLearningSwitches());
-        await this.measurement?.record({ turns: 1, ...(missingUsage ? { promptTokens: null, ...(this.opts.learningDedicated ? { researchTokens: null, researchCost: null } : {}) } : {}) },
+        await this.measurement?.record({ turns: 1, ...(missingUsage ? { promptTokens: null } : {}) },
           { model: this.recordingModel ? claudeModelIdLabel(this.recordingModel) : "unknown", role: "conductor", executor: "claude" }, `turn:${ev.turnId}`);
       });
     }

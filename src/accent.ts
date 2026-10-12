@@ -1,3 +1,5 @@
+import { configurationDefault } from "./configuration-defaults";
+
 export const ACCENT_COLORS = ["theme", "blue", "orange", "pink", "green", "custom"] as const;
 export type AccentColor = (typeof ACCENT_COLORS)[number];
 export type AccentTheme = "light" | "dark" | "high-contrast";
@@ -14,9 +16,9 @@ export interface AccentSettings {
 }
 export type AccentSetting = keyof AccentSettings;
 export const DEFAULT_ACCENT_SETTINGS: AccentSettings = {
-  accentColor: "theme",
-  accentCustomLight: ACCENT_PRESETS.orange.light,
-  accentCustomDark: ACCENT_PRESETS.orange.dark,
+  accentColor: configurationDefault<AccentColor>("appearance.accentColor"),
+  accentCustomLight: configurationDefault<string>("appearance.accentCustomLight"),
+  accentCustomDark: configurationDefault<string>("appearance.accentCustomDark"),
 };
 export const THEME_ACCENT = "var(--vscode-focusBorder, var(--vscode-textLink-foreground))";
 

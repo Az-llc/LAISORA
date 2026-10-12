@@ -1,7 +1,7 @@
 import * as l10n from "@vscode/l10n";
 import { vscode } from "./dom";
 import { renderAsk, renderGoal, type AskRenderContext } from "./ask-view";
-import { fileLinkDisplayKind, parseHostFileLinkTarget, parseMarkdown, type MdNode } from "./markdown-ast";
+import { fileLinkDisplayKind, parseHostFileLinkTarget, parseMarkdown, type MdNode } from "../markdown-ast";
 
 const artifactIds = new WeakMap<HTMLElement, string[]>();
 const SVG_NS = "http://www.w3.org/2000/svg";

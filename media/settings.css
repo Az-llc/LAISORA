@@ -501,11 +501,12 @@ textarea.settings-input { height: auto; }
 .settings-role-name { flex: 1; min-width: 0; overflow-wrap: anywhere; }
 .settings-mono { font-family: var(--vscode-editor-font-family); }
 .settings-role-description { width: 100%; }
+.settings-cache-row { padding: var(--settings-gap-4) 0 0; border-top: 0; flex-wrap: wrap; gap: var(--settings-gap-2) var(--settings-gap-4); }
 .settings-matrix-wrapper { overflow-x: auto; max-width: 100%; margin-top: var(--settings-gap-4); }
 .settings-matrix-wrapper:focus-visible { outline: 1px solid var(--vscode-focusBorder); outline-offset: -1px; }
 .settings-matrix {
   display: grid;
-  grid-template-columns: minmax(220px, 260px) repeat(6, 60px) 28px;
+  grid-template-columns: minmax(220px, 260px) repeat(6, 72px) 28px;
   gap: var(--settings-gap-2);
   align-items: center;
   min-width: 560px;
@@ -535,7 +536,6 @@ textarea.settings-input { height: auto; }
 .settings-policy-card p { margin: 0; }
 .settings-policy-warning { color: var(--vscode-editorWarning-foreground, #cca700); }
 .settings-policy { display: block; min-height: 160px; width: 100%; resize: vertical; }
-.settings-environment { margin-top: var(--settings-gap-6); }
 .settings-detection-header { display: flex; align-items: baseline; justify-content: space-between; gap: var(--settings-gap-4); }
 .settings-detection-header .settings-section-title { margin: 0; }
 .settings-environment-help { margin: var(--settings-gap-2) 0 var(--settings-gap-3); }
@@ -548,6 +548,7 @@ textarea.settings-input { height: auto; }
   padding: 2px 8px;
   white-space: nowrap;
 }
+.settings-cli-name { display: flex; align-items: center; flex-wrap: wrap; gap: var(--settings-gap-2); }
 .settings-timeout-control { display: flex; align-items: center; gap: var(--settings-gap-2); }
 #setting-external-timeout { width: 72px; }
 .settings-visually-hidden { position: absolute; width: 1px; height: 1px; padding: 0; overflow: hidden; clip-path: inset(50%); white-space: nowrap; }
@@ -580,8 +581,8 @@ textarea.settings-input { height: auto; }
 #setting-add-role,
 #setting-restore-roster,
 #setting-restore-policy,
-#setting-research-missing,
-#setting-suggest-efforts,
+#setting-recommended-roster,
+#setting-recommended-cancel,
 #setting-recheck-external {
   border-color: var(--vscode-contrastBorder, var(--vscode-dropdown-border, var(--vscode-widget-border)));
   background: var(--vscode-dropdown-background, var(--vscode-input-background));
@@ -590,7 +591,6 @@ textarea.settings-input { height: auto; }
 .settings-role-name { font-size: 14px; font-weight: 600; }
 .settings-roster-actions { align-items: flex-end; }
 .settings-matrix-wrapper { position: relative; }
-.settings-environment { margin-top: var(--settings-gap-6); padding-top: var(--settings-gap-4); border-top: 1px solid var(--vscode-widget-border, rgba(128, 128, 128, 0.35)); }
 .settings-environment-help { margin: var(--settings-gap-1) 0 var(--settings-gap-3); }
 
 .settings-extension-chips { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 8px; }
@@ -608,17 +608,45 @@ textarea.settings-input { height: auto; }
   .settings-row:has(.settings-accent-custom) { flex-wrap: wrap; }
 }
 
-.settings-research {
-  display: flex;
-  flex-direction: column;
-  gap: var(--settings-gap-1);
-  margin-top: var(--settings-gap-1);
-  padding-top: var(--settings-gap-3);
-  border-top: 1px solid var(--vscode-contrastBorder, var(--vscode-widget-border, var(--vscode-panel-border)));
-}
-.settings-research .settings-detection-header { align-items: baseline; flex-wrap: wrap; }
-.settings-research-text { min-width: 0; overflow-wrap: anywhere; }
-.settings-research-sources { display: flex; flex-wrap: wrap; align-items: baseline; gap: var(--settings-gap-1) var(--settings-gap-2); }
-.settings-research-sources .settings-chip { width: auto; max-width: 100%; padding: 2px var(--settings-gap-2); white-space: normal; text-align: start; }
-.settings-research-sources .settings-chip[aria-disabled="true"] { cursor: default; }
 .settings-environment .settings-detection-header { flex-wrap: wrap; }
+
+.settings-recommend { padding: 0 0 var(--settings-gap-3); }
+.settings-recommend > .l-label { margin-bottom: var(--settings-gap-2); }
+.settings-recommend-scroll { overflow-x: auto; }
+.settings-recommend-table { border-collapse: collapse; width: 100%; font-variant-numeric: tabular-nums; margin-bottom: var(--settings-gap-2); }
+.settings-recommend-table th {
+  text-align: start;
+  padding: 0 var(--settings-gap-3) var(--settings-gap-1) 0;
+  border-bottom: var(--settings-rule);
+  font-size: var(--l-label);
+  font-weight: 600;
+  letter-spacing: .08em;
+  font-feature-settings: "palt";
+  color: var(--vscode-descriptionForeground);
+  white-space: nowrap;
+}
+.settings-recommend-table td { padding: var(--settings-gap-1) var(--settings-gap-3) var(--settings-gap-1) 0; border-bottom: var(--settings-rule); white-space: nowrap; }
+.settings-recommend-muted { color: var(--vscode-descriptionForeground); }
+.settings-recommend-actions { display: flex; align-items: center; gap: var(--settings-gap-2); margin-top: var(--settings-gap-3); }
+.settings-price-table { margin-top: var(--settings-gap-3); padding-bottom: 0; container-type: inline-size; container-name: roster-prices; }
+.settings-price-table .settings-recommend-table { width: auto; margin-bottom: 0; }
+.settings-price-table tbody th { text-align: start; font: inherit; letter-spacing: normal; font-feature-settings: normal; color: inherit; padding: var(--settings-gap-1) 0; border-bottom: var(--settings-rule); white-space: nowrap; }
+.settings-price-table .settings-price-number { text-align: end; padding-left: var(--settings-gap-4); }
+.settings-price-table .settings-recommend-table :is(th, td) { padding-right: var(--settings-gap-3); }
+.settings-price-table .settings-recommend-table :is(th, td):last-child { padding-right: 0; }
+.settings-price-table tbody .settings-price-tier { padding-left: var(--settings-gap-3); color: var(--vscode-descriptionForeground); font-size: var(--l-note); }
+.settings-price-table > p { margin: var(--settings-gap-1) 0 0; }
+@container roster-prices (max-width: 420px) {
+  .settings-price-table thead th { vertical-align: bottom; }
+  .settings-price-table .settings-price-sub { display: block; }
+  .settings-price-table .settings-price-number { padding-left: var(--settings-gap-1); }
+  .settings-price-table .settings-recommend-table :is(th, td):not(:last-child) { padding-right: var(--settings-gap-2); }
+  .settings-price-table tbody th { white-space: normal; }
+}
+.settings-segment.settings-primary,
+.settings-segment.settings-primary:not(:disabled):not([aria-checked="true"]):not([aria-pressed="true"]):hover {
+  color: var(--vscode-button-foreground);
+  background: var(--vscode-button-hoverBackground, var(--vscode-button-background));
+  border-color: var(--vscode-contrastActiveBorder, var(--vscode-button-background));
+}
+.settings-segment.settings-primary { background: var(--vscode-button-background); }

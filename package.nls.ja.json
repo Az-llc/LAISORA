@@ -15,10 +15,10 @@
   "config.laisora.workLog.llmAnalysisDiagnostics.description": "受理されなかった分析所見の診断情報を表示します。",
   "config.laisora.defaultCwd.description": "新しい会話の作業ディレクトリ。空欄の場合は開いているワークスペースを使います。",
   "config.laisora.tabLimit.description": "同時に開ける会話タブの上限。履歴を調べる範囲の上限にも使います。",
+  "config.laisora.history.eventLimit.description": "公式の Claude Code VS Code 拡張は、チャットを約 600 行まで保持します。LAISORA は SUMMARY・ANALYSIS・LLM 分析でログを使うため、多めに保持しています。増やすとメモリの使用量が増え、長い会話で動作が重くなります。上限より古いイベントはライブのログから外れます。",
   "config.laisora.restoreTabsOnStartup.description": "ウィンドウを最後に閉じた・再読み込みしたときに開いていた会話タブを、起動時に開き直します。一度も送信していないタブは復元しません。",
   "config.laisora.claude.planInstruction.description": "Claudeに計画を更新させ、判断と実機確認を専用のブロックで表示させます。新しく始めた会話と、再開した会話から有効です。実行中の会話には反映しません。",
   "config.laisora.claude.fileLinkInstruction.description": "Claudeに、ローカルファイルをエディタで開けるMarkdownリンクの形式で書かせます（短いシステムプロンプトとして渡します）。新しく始めた会話と、再開した会話から有効です。実行中の会話には反映しません（会話の途中でシステムプロンプトを変えるとプロンプトキャッシュが使えなくなり、次の返答で会話全体を送り直すことになるため）。",
-  "config.laisora.claude.restoreModelAfterRefusalFallback.description": "拒否によって会話がフォールバック先のモデルへ切り替わったとき、そのターンの終了時に選んでいたモデルへ戻します。変更はその会話だけに適用し、settings.json には保存しません。オフのときは YOU の「元のモデルに戻す」を使います。",
   "config.laisora.fileLinks.revealInExplorer.description": "LAISORAのエディタータブでファイルリンクを押したとき、エクスプローラーでもそのファイルを選択します。サイドバーのLAISORAで押したリンクでは選択しません（サイドバーではエクスプローラーが会話と入れ替わるため）。ワークスペース外のファイルはエクスプローラーで選択しません。",
   "config.laisora.fileLinks.allowOutsideWorkspace.description": "会話中のMarkdownファイルリンクが、ワークスペースと会話フォルダーの外を指していても開きます。ネットワーク共有（UNCパス）とデバイスパスは常に拒否し、リンクにもしません。ユーザー設定でのみ指定できます。",
   "config.laisora.fileLinks.confirmOutsideWorkspace.description": "ワークスペース外のファイルを開く前に確認します。laisora.fileLinks.allowOutsideWorkspaceがオンのときだけ使います。ユーザー設定でのみ指定できます。",
@@ -29,6 +29,9 @@
   "config.laisora.interruptForceKillTimeoutMs.description": "停止要求から強制終了まで待つ時間（ミリ秒）。",
   "config.laisora.guardrail.autoMaxLevel.description": "自動介入の上限。0は介入なし、1は警告、2は追加指示、3は対応の引き上げです。実行中のモデルへの報告は、この上限とは別に行います。自動で中断しません。",
   "config.laisora.progressTracking.description": "instrumentを選ぶと、モデルに進捗報告用のツールを追加します。他の値では追加しません。記録済みの進捗は、設定にかかわらず読み取ります。",
+  "config.laisora.claude.autoUpdate.description": "ネイティブ導入の Claude Code CLI を、会話の準備ができてターンが動いていないときに背景で更新します。Claude Code 側の更新の設定も従来どおり効きます。",
+  "config.laisora.codex.autoUpdate.description": "単体インストール版の Codex CLI を、会話の準備ができてターンも外部の実行も動いていないときに背景で更新します。",
+  "config.laisora.antigravity.autoUpdate.description": "専用のインストーラーで入れた Antigravity CLI を、会話の準備ができてターンも外部の実行も動いていないときに背景で更新します。",
   "config.laisora.claude.remoteControlAtStartup.description": "LAISORAで開始する会話のRemote Controlを有効にします。Claude Code共通の設定ファイルは変更しません。",
   "config.laisora.orchestration.enabled.description": "エージェントのオーケストレーションを有効にします。次のセッションから有効。",
   "config.laisora.orchestration.agents.description": "コンダクターが使うエージェント構成。次のセッションから有効。",
@@ -45,6 +48,5 @@
   "config.laisora.appearance.accentColor.custom": "任意の色",
   "config.laisora.appearance.accentCustomLight.description": "ライト用の任意のアクセントカラー（#RRGGBB）。無効な値はテーマのアクセントに戻ります。",
   "config.laisora.appearance.accentCustomDark.description": "ダーク用の任意のアクセントカラー（#RRGGBB）。無効な値はテーマのアクセントに戻ります。",
-  "config.laisora.appearance.accentCustom.validation": "#RRGGBB 形式で入力してください。",
-  "config.laisora.learning.profileSources.description": "モデルの性質の調査に使う情報源です。少なくとも 1 つ必要です。不明な値は無視し、空の場合は両方を使います。"
+  "config.laisora.appearance.accentCustom.validation": "#RRGGBB 形式で入力してください。"
 }

@@ -1,14 +1,15 @@
-import { isToolIntentInput, type ToolIntentInput } from "./webview/status-line";
+import { isToolIntentInput, type ToolIntentInput } from "./tool-intent";
 import { isAccentSettings, isAccentSettingValue, type AccentSettings, type AccentSetting } from "./accent";
 import { isDisplayName } from "./display-name";
+import { isEventLimit } from "./event-limits";
 import { normalizeSystemAppExtension } from "./file-link-open-mode";
 import { isPlanUsage, type MainTokenTotal } from "./plan-usage";
 import type { FailureSummaryView } from "./exec-log-marks";
 import type { HandoffCompactStats } from "./handoff-envelope";
-import type { RoleSummaryView } from "./role-summary";
-import type { ExecutorId } from "./orchestration-executors";
+import type { AnalysisPlansView, RoleSummaryView } from "./role-summary";
+import { EXECUTORS, isExecutorId, type ExecutorId } from "./orchestration-executors";
 import { isExternalTimeout, isExternalDetection, isExternalModels, type ExternalModels, type ExternalDetection } from "./orchestration-roster";
-import { isOrchestrationSettingRoster, type OrchestrationSettingRow } from "./orchestration-roster";
+import { isOrchestrationSettingRoster, type OrchestrationSettingRow, type RecommendedRosterChange } from "./orchestration-roster";
 import { isOrchestrationView, type OrchestrationView } from "./orchestration-view";
 export type { OrchestrationView } from "./orchestration-view";
 import * as l10n from "@vscode/l10n";
@@ -146,7 +147,9 @@ export function fallbackOriginalModel(state: ModelFallbackState): string {
 
 export function fallbackNoticeOriginal(state: ModelFallbackState | undefined,
   notice: Extract<NormalizedEvent, { kind: "model_refusal_fallback" }>): string {
-  return state !== undefined && state.notice === notice ? fallbackOriginalModel(state) : notice.originalModel;
+  return state !== undefined && state.notice.conversationId === notice.conversationId &&
+    state.notice.generation === notice.generation && state.notice.seq === notice.seq
+    ? fallbackOriginalModel(state) : notice.originalModel;
 }
 
 export function foldModelFallback(state: ModelFallbackState | undefined, event: NormalizedEvent,
@@ -167,17 +170,8 @@ export function foldModelFallback(state: ModelFallbackState | undefined, event: 
   return state;
 }
 
-export function fallbackNeedsConfirmation(state: ModelFallbackState): boolean {
-  return state.autoRevert !== "pending" && state.autoRevert !== "applied" && state.autoRevert !== "deferred";
-}
-
-export function fallbackChipWarning(state: ModelFallbackState | undefined, modelOverride: string | null | undefined,
-  models: readonly ModelInfo[]): boolean {
-  if (state === undefined || state.resolvedAt !== undefined) return false;
-  const requested = modelOverride === null
-    ? models.find(row => row.id === "default")?.resolvedModel
-    : modelOverride ?? fallbackOriginalModel(state);
-  return !sameModel(state.appliedModel, requested, models);
+export function fallbackChipWarning(state: ModelFallbackState | undefined): boolean {
+  return state !== undefined && state.resolvedAt === undefined;
 }
 
 export interface ModelFallbackState {
@@ -238,6 +232,8 @@ export type NormalizedEventBody =
         kind: "user_message";
         turnId: string | null;
         text: string;
+        // The message uuid: sent with the message to the CLI, which keeps it as the transcript record uuid.
+        uuid?: string;
         images?: ImageAttachment[];
         imageRefs?: ImageRefInfo[];
         sentAt?: number;
@@ -259,6 +255,8 @@ export type NormalizedEventBody =
         toolUseId: string;
         parentToolUseId: string | null;
         toolName: string;
+        // The API id of the assistant message that issued the call; calls of one message share it.
+        messageId?: string;
         inputPreview: string;
         inputSummary?: string;
         intentInput?: ToolIntentInput;
@@ -310,7 +308,7 @@ export type NormalizedEventBody =
         kind: "assistant_usage";
         turnId: string;
         messageId: string;
-        parentToolUseId: null;
+        parentToolUseId: string | null;
         usage: AssistantUsage;
       }
     | {
@@ -377,12 +375,16 @@ export interface AssistantUsage {
   cacheCreationInputTokens?: number;
   cacheReadInputTokens?: number;
   outputTokens?: number;
+  cacheCreation5mInputTokens?: number;
+  cacheCreation1hInputTokens?: number;
 }
 
 export function assistantUsageFromRaw(raw: unknown, includeOutput: boolean): AssistantUsage {
   const r = typeof raw === "object" && raw !== null ? (raw as Record<string, unknown>) : {};
-  const pick = (key: string): number | undefined =>
-    typeof r[key] === "number" && Number.isFinite(r[key]) ? (r[key] as number) : undefined;
+  const pickFrom = (source: Record<string, unknown>, key: string): number | undefined =>
+    typeof source[key] === "number" && Number.isFinite(source[key]) ? (source[key] as number) : undefined;
+  const pick = (key: string): number | undefined => pickFrom(r, key);
+  const split = typeof r.cache_creation === "object" && r.cache_creation !== null ? r.cache_creation as Record<string, unknown> : {};
   const out: AssistantUsage = {};
   const input = pick("input_tokens");
   const creation = pick("cache_creation_input_tokens");
@@ -392,6 +394,10 @@ export function assistantUsageFromRaw(raw: unknown, includeOutput: boolean): Ass
   if (creation !== undefined) out.cacheCreationInputTokens = creation;
   if (read !== undefined) out.cacheReadInputTokens = read;
   if (output !== undefined) out.outputTokens = output;
+  const write5m = pickFrom(split, "ephemeral_5m_input_tokens");
+  const write1h = pickFrom(split, "ephemeral_1h_input_tokens");
+  if (write5m !== undefined) out.cacheCreation5mInputTokens = write5m;
+  if (write1h !== undefined) out.cacheCreation1hInputTokens = write1h;
   return out;
 }
 
@@ -588,12 +594,15 @@ function isAccountUsageRow(value: unknown): value is AccountUsageRow {
   if (typeof value !== "object" || value === null) return false;
   const row = value as Record<string, unknown>;
   return (
-    Object.keys(row).every((key) => key === "kind" || key === "percent" || key === "resetsAt" || key === "scope" || key === "severity") &&
-    typeof row.kind === "string" && row.kind.length > 0 && row.kind.length <= 100 &&
-    typeof row.percent === "number" && Number.isFinite(row.percent) &&
+    typeof row.kind === "string" &&
+    row.kind.length > 0 &&
+    row.kind.length <= 100 &&
+    typeof row.percent === "number" &&
+    Number.isFinite(row.percent) &&
     (row.resetsAt === null || (typeof row.resetsAt === "number" && Number.isFinite(row.resetsAt))) &&
     (row.scope === undefined || (typeof row.scope === "string" && row.scope.length <= 100)) &&
-    (row.severity === undefined || (typeof row.severity === "string" && row.severity.length <= 50))
+    (row.severity === undefined || (typeof row.severity === "string" && row.severity.length <= 50)) &&
+    Object.keys(row).every((key) => key === "kind" || key === "percent" || key === "resetsAt" || key === "scope" || key === "severity")
   );
 }
 
@@ -608,23 +617,11 @@ export const FILE_LINK_SETTINGS = [...FILE_LINK_BOOLEAN_SETTINGS, "openWithSyste
 export type FileLinkBooleanSetting = (typeof FILE_LINK_BOOLEAN_SETTINGS)[number];
 export type FileLinkSetting = (typeof FILE_LINK_SETTINGS)[number];
 
-export const PROFILE_SOURCES = ["official", "artificialAnalysis"] as const;
-export type ProfileSource = typeof PROFILE_SOURCES[number];
-
-export function normalizeProfileSources(value: unknown): ProfileSource[] {
-  const sources = PROFILE_SOURCES.filter(source => Array.isArray(value) && value.includes(source));
-  return sources.length ? sources : [...PROFILE_SOURCES];
-}
-
-export function isProfileSources(value: unknown): value is ProfileSource[] {
-  return Array.isArray(value) && value.length > 0 && value.length <= PROFILE_SOURCES.length
-    && new Set(value).size === value.length && value.every(source => PROFILE_SOURCES.includes(source));
-}
-
 export type SettingsPageToHost =
   | { type: "settingsPageReady" }
   | { type: "recheckExternalExecutors" }
-  | { type: "researchModelProfiles"; targets: string[]; purpose?: "effort" }
+  | { type: "proposeRecommendedRoster" }
+  | { type: "applyRecommendedRoster"; requestId: number; revision: string }
   | { type: "previewConductorInstruction"; requestId: number; policy: string }
   | { type: "setAccentSetting"; requestId: number; setting: AccentSetting; value: string }
   | { type: "setDisplayName"; requestId: number; value: string }
@@ -633,8 +630,9 @@ export type SettingsPageToHost =
   | { type: "setAutoContinueAtUsageLimit"; requestId: number; enabled: boolean }
   | { type: "setInitialModel"; requestId: number; model: string }
   | { type: "setRestoreTabsOnStartup"; requestId: number; enabled: boolean }
+  | { type: "setCliAutoUpdate"; requestId: number; executor: ExecutorId; enabled: boolean }
+  | { type: "setEventLimit"; requestId: number; value: number }
   | { type: "setLearningEnabled"; requestId: number; enabled: boolean }
-  | { type: "setProfileSources"; requestId: number; sources: ProfileSource[] }
   | { type: "setOrchestrationSetting"; requestId: number; setting: "enabled" | "agents" | "conductorPolicy" | "externalTimeoutMinutes"; value: unknown }
   | { type: "setFileLinkSetting"; requestId: number; setting: FileLinkBooleanSetting; enabled: boolean }
   | { type: "setFileLinkSetting"; requestId: number; setting: "openWithSystemApp"; value: string[] }
@@ -649,20 +647,21 @@ export type SettingWriteFailureAction = typeof SETTING_WRITE_FAILURE_ACTIONS[num
 function isSettingWriteFailure(v: unknown): v is SettingWriteFailure {
   if (typeof v !== "object" || v === null) return false;
   const m = v as Record<string, unknown>;
-  return hasOnlyKeys(m, ["kind", "reason"]) && (SETTING_WRITE_FAILURE_KINDS as readonly string[]).includes(m.kind as string) && typeof m.reason === "string";
+  return (
+    (SETTING_WRITE_FAILURE_KINDS as readonly string[]).includes(m.kind as string) &&
+    typeof m.reason === "string" &&
+    hasOnlyKeys(m, ["kind", "reason"])
+  );
 }
 
 export interface SettingsProfileProjection {
-  profileSources?: ProfileSource[];
-  researchTargets?: string[];
-  researchUnavailable?: string;
-  effortUnavailable?: string;
-  researchText?: string;
   conductorPreview?: { text: string; tokens: number };
+  recommendedRosterSame?: boolean;
 }
 export type HostToSettingsPage =
   | { type: "conductorPreview"; requestId: number; text: string; tokens: number }
-  | ({ type: "settingsState"; appearance?: AccentSettings; displayName?: string; composerSendKey: ComposerSendKey; apiKeyPolicy: ApiKeyPolicy; restoreTabsOnStartup: boolean; initialModel?: string; autoContinueAtUsageLimit: boolean; learningEnabled: boolean; replyTo?: number; writeFailure?: SettingWriteFailure }
+  | { type: "recommendedRoster"; revision: string; changes: RecommendedRosterChange[] }
+  | ({ type: "settingsState"; appearance?: AccentSettings; displayName?: string; eventLimit?: number; composerSendKey: ComposerSendKey; apiKeyPolicy: ApiKeyPolicy; restoreTabsOnStartup: boolean; cliAutoUpdate: Record<ExecutorId, boolean>; initialModel?: string; autoContinueAtUsageLimit: boolean; learningEnabled: boolean; replyTo?: number; writeFailure?: SettingWriteFailure }
     & SettingsProfileProjection & Record<FileLinkBooleanSetting, boolean> & { openWithSystemApp: string[] } & { orchestrationEnabled: boolean; orchestrationAgents: OrchestrationSettingRow[]; orchestrationDefaults: OrchestrationSettingRow[]; conductorPolicy: string; conductorPolicyDefault: string; externalTimeoutMinutes: number; externalDetection: Record<ExecutorId, ExternalDetection>; externalModels: ExternalModels });
 
 function isSettingsRequestId(v: unknown): v is number {
@@ -673,19 +672,20 @@ export function isSettingsPageToHost(v: unknown): v is SettingsPageToHost {
   if (typeof v !== "object" || v === null) return false;
   const m = v as Record<string, unknown>;
   const t = m.type as SettingsPageToHost["type"];
-  if (t === "settingsPageReady" || t === "recheckExternalExecutors" || t === "openVsCodeSettings") return hasOnlyKeys(m, ["type"]);
+  if (t === "settingsPageReady" || t === "recheckExternalExecutors" || t === "openVsCodeSettings" || t === "proposeRecommendedRoster") return hasOnlyKeys(m, ["type"]);
+  if (t === "applyRecommendedRoster") return hasOnlyKeys(m, ["type", "requestId", "revision"]) && isSettingsRequestId(m.requestId) && isRosterRevision(m.revision);
   if (t === "settingWriteFailureAction") {
     return hasOnlyKeys(m, ["type", "action"]) && (SETTING_WRITE_FAILURE_ACTIONS as readonly string[]).includes(m.action as string);
   }
-  if (t === "researchModelProfiles") return hasOnlyKeys(m, ["type", "targets", "purpose"]) && isProfileTargetIds(m.targets) && m.targets.length > 0
-    && (m.purpose === undefined || m.purpose === "effort");
-  if (t === "setProfileSources") return hasOnlyKeys(m, ["type", "requestId", "sources"]) && isSettingsRequestId(m.requestId) && isProfileSources(m.sources);
   if (t === "previewConductorInstruction") return hasOnlyKeys(m, ["type", "requestId", "policy"]) && isSettingsRequestId(m.requestId) && typeof m.policy === "string";
   if (t === "setAccentSetting") {
     return isSettingsRequestId(m.requestId) && isAccentSettingValue(m.setting, m.value) && hasOnlyKeys(m, ["type", "requestId", "setting", "value"]);
   }
   if (t === "setDisplayName") {
     return isSettingsRequestId(m.requestId) && isDisplayName(m.value) && hasOnlyKeys(m, ["type", "requestId", "value"]);
+  }
+  if (t === "setEventLimit") {
+    return isSettingsRequestId(m.requestId) && isEventLimit(m.value) && hasOnlyKeys(m, ["type", "requestId", "value"]);
   }
   if (t === "setComposerSendKey") {
     return isSettingsRequestId(m.requestId)
@@ -703,6 +703,9 @@ export function isSettingsPageToHost(v: unknown): v is SettingsPageToHost {
   if (t === "setAutoContinueAtUsageLimit" || t === "setRestoreTabsOnStartup" || t === "setLearningEnabled") {
     return isSettingsRequestId(m.requestId) && typeof m.enabled === "boolean" && hasOnlyKeys(m, ["type", "requestId", "enabled"]);
   }
+  if (t === "setCliAutoUpdate") {
+    return isSettingsRequestId(m.requestId) && isExecutorId(m.executor) && typeof m.enabled === "boolean" && hasOnlyKeys(m, ["type", "requestId", "executor", "enabled"]);
+  }
   if (t === "setOrchestrationSetting") {
     return isSettingsRequestId(m.requestId) && ["enabled", "agents", "conductorPolicy", "externalTimeoutMinutes"].includes(m.setting as string)
       && Object.hasOwn(m, "value") && hasOnlyKeys(m, ["type", "requestId", "setting", "value"]);
@@ -719,18 +722,37 @@ export function isSettingsPageToHost(v: unknown): v is SettingsPageToHost {
   return false;
 }
 
-function isProfileTargetIds(value: unknown): value is string[] {
-  return Array.isArray(value) && value.length <= 300 && value.every(id => typeof id === "string" && /^(claude|codex|agy)\/[A-Za-z0-9][A-Za-z0-9_.:@-]*$/.test(id));
+function isCliAutoUpdate(value: unknown): value is Record<ExecutorId, boolean> {
+  if (!isProfileObject(value)) return false;
+  const ids = Object.keys(EXECUTORS);
+  return hasOnlyKeys(value, ids) && ids.every((id) => typeof value[id] === "boolean");
 }
 function isProfileObject(value: unknown): value is Record<string, unknown> { return !!value && typeof value === "object" && !Array.isArray(value); }
 function isSettingsProfiles(m: Record<string, unknown>): boolean {
   const preview = m.conductorPreview as Record<string, unknown> | undefined;
-  return (m.researchTargets === undefined || isProfileTargetIds(m.researchTargets))
-    && (m.researchUnavailable === undefined || typeof m.researchUnavailable === "string")
-    && (m.effortUnavailable === undefined || typeof m.effortUnavailable === "string")
-    && (m.researchText === undefined || typeof m.researchText === "string")
-    && (m.profileSources === undefined || isProfileSources(m.profileSources))
-    && (preview === undefined || isProfileObject(preview) && hasOnlyKeys(preview, ["text", "tokens"]) && typeof preview.text === "string" && typeof preview.tokens === "number" && Number.isFinite(preview.tokens));
+  const checks: { [K in keyof SettingsProfileProjection]-?: () => boolean } = {
+    conductorPreview: () => preview === undefined || isConductorPreview(preview),
+    recommendedRosterSame: () => m.recommendedRosterSame === undefined || typeof m.recommendedRosterSame === "boolean",
+  };
+  return Object.values(checks).every(check => check());
+}
+
+function isRosterRevision(value: unknown): value is string {
+  return typeof value === "string" && /^[0-9a-f]{64}$/.test(value);
+}
+const RECOMMENDED_ROSTER_CHANGE_KINDS = ["same", "add", "remove", "change"] as const;
+const isStringList = (value: unknown): value is string[] => Array.isArray(value) && value.every((item) => typeof item === "string");
+function isRecommendedRosterChange(v: unknown): v is RecommendedRosterChange {
+  if (typeof v !== "object" || v === null) return false;
+  const m = v as Record<string, unknown>;
+  return (
+    typeof m.role === "string" &&
+    typeof m.model === "string" &&
+    isStringList(m.current) &&
+    isStringList(m.recommended) &&
+    (RECOMMENDED_ROSTER_CHANGE_KINDS as readonly string[]).includes(m.change as string) &&
+    hasOnlyKeys(m, ["role", "model", "current", "recommended", "change"])
+  );
 }
 
 export function isHostToSettingsPage(v: unknown): v is HostToSettingsPage {
@@ -739,12 +761,14 @@ export function isHostToSettingsPage(v: unknown): v is HostToSettingsPage {
   const t = m.type as HostToSettingsPage["type"];
   if (t === "conductorPreview") return hasOnlyKeys(m, ["type", "requestId", "text", "tokens"]) && isSettingsRequestId(m.requestId)
     && typeof m.text === "string" && typeof m.tokens === "number" && Number.isFinite(m.tokens);
+  if (t === "recommendedRoster") return hasOnlyKeys(m, ["type", "revision", "changes"]) && isRosterRevision(m.revision) && Array.isArray(m.changes) && m.changes.every(isRecommendedRosterChange);
   if (t === "settingsState") {
     return isSettingsProfiles(m) && (m.appearance === undefined || isAccentSettings(m.appearance))
       && (m.displayName === undefined || isDisplayName(m.displayName))
+      && (m.eventLimit === undefined || isEventLimit(m.eventLimit))
       && (COMPOSER_SEND_KEYS as readonly string[]).includes(m.composerSendKey as string)
       && (API_KEY_POLICIES as readonly string[]).includes(m.apiKeyPolicy as string)
-      && typeof m.restoreTabsOnStartup === "boolean"
+      && typeof m.restoreTabsOnStartup === "boolean" && isCliAutoUpdate(m.cliAutoUpdate)
       && (m.initialModel === undefined || typeof m.initialModel === "string")
       && typeof m.autoContinueAtUsageLimit === "boolean" && typeof m.learningEnabled === "boolean"
       && typeof m.orchestrationEnabled === "boolean" && typeof m.conductorPolicy === "string"
@@ -755,7 +779,7 @@ export function isHostToSettingsPage(v: unknown): v is HostToSettingsPage {
       && Array.isArray(m.openWithSystemApp) && m.openWithSystemApp.every((item) => typeof item === "string")
       && (m.replyTo === undefined || isSettingsRequestId(m.replyTo))
       && (m.writeFailure === undefined || m.replyTo !== undefined && isSettingWriteFailure(m.writeFailure))
-      && hasOnlyKeys(m, ["type", "initialModel", "appearance", "displayName", "composerSendKey", "apiKeyPolicy", "restoreTabsOnStartup", "autoContinueAtUsageLimit", "learningEnabled", ...FILE_LINK_SETTINGS, "orchestrationEnabled", "orchestrationAgents", "orchestrationDefaults", "conductorPolicy", "conductorPolicyDefault", "externalTimeoutMinutes", "externalDetection", "externalModels", "replyTo", "writeFailure", "profileSources", "researchTargets", "researchUnavailable", "effortUnavailable", "researchText", "conductorPreview"]);
+      && hasOnlyKeys(m, ["type", "initialModel", "appearance", "displayName", "eventLimit", "composerSendKey", "apiKeyPolicy", "restoreTabsOnStartup", "cliAutoUpdate", "autoContinueAtUsageLimit", "learningEnabled", ...FILE_LINK_SETTINGS, "orchestrationEnabled", "orchestrationAgents", "orchestrationDefaults", "conductorPolicy", "conductorPolicyDefault", "externalTimeoutMinutes", "externalDetection", "externalModels", "replyTo", "writeFailure", "conductorPreview", "recommendedRosterSame"]);
   }
   t satisfies never;
   return false;
@@ -783,7 +807,7 @@ export type WebviewToHost =
   | { type: "closeTab"; tabId: string }
   | { type: "clearTab"; tabId: string }
   | { type: "setMode"; tabId: string; mode: PermissionModeId }
-  | { type: "setModel"; tabId: string; model: string | null; sessionOnly?: boolean }
+  | { type: "setModel"; tabId: string; model: string | null }
   | { type: "setEffort"; tabId: string; effort: string | null }
   | { type: "queryFiles"; reqId: number; query: string }
   | { type: "pickFiles"; reqId: number; imageSlots: number }
@@ -1178,18 +1202,28 @@ export interface WorkEventInfo {
   turnToolCount?: number;
 }
 
+export interface PlanContextStep {
+  key: string; number: number; title: string; status: import("./work-model").TaskStatus; removed: boolean; startedAt: number | null; endedAt: number | null;
+  activeSpans?: import("./plan-steps").PlanSpan[];
+  // The step's routed Claude tokens (src/role-summary.ts#derivePlanPlacement); absent when the Host did not allocate them.
+  tokens?: import("./plan-usage").PlanTokenTotal | null;
+}
+
+// stepKey null: the lane is not on a step of this PLAN. agentId names a delegation's subagent for lanes known only by it.
+export interface PlanContextPlacement { toolUseId: string; agentId?: string; stepKey: string | null }
+
 export interface PlanContext {
-  blockId: string; start: number; end: number; text: string; running: boolean;
+  blockId: string; start: number; end: number; text: string; goal?: string; running: boolean; steps?: PlanContextStep[];
+  placements?: PlanContextPlacement[];
 }
 
 export interface WorkModelPayload {
   requests?: import("./work-model").WorkRequestTotals[];
-  planDeclaration?: { goal: string; at: number };
-  planBoundaryAt?: number;
   planHistory?: import("./work-model").PlanHistoryEntry[];
   planHistoryTruncated?: boolean;
   planHistoryLostThrough?: number;
   planContext?: PlanContext;
+  earlierPlans?: PlanContext[];
   planTools?: Array<{ id: string; name: string; description: string; startedAt: number; intentInput?: ToolIntentInput }>;
   runningMainTools?: Array<{ id: string; name: string; startedAt: number; intentInput?: ToolIntentInput }>;
   version: number;
@@ -1335,6 +1369,7 @@ export interface SemanticModelPayload extends Omit<SemanticModel, "nodes" | "pro
   l3?: L3ReportPayload;
   timeBucketsCoverage?: TimeBucketsCoverage;
   roleSummary?: RoleSummaryView;
+  analysisPlans?: AnalysisPlansView;
   failureSummary?: FailureSummaryView;
   summaryAnalysis?: SummaryAnalysisView;
   mainTokens?: MainTokenTotal | null;
@@ -1568,8 +1603,6 @@ export function projectWorkModel(
     version: WORK_MODEL_VERSION,
     requests: state.coverage.summary === "complete" && !state.coverage.hydrationUnconfirmed
       ? state.requests?.filter(request => !request.incomplete).map(({ command: _command, cliInserted: _cliInserted, incomplete: _incomplete, ...request }) => request) : undefined,
-    planDeclaration: state.planDeclaration,
-    planBoundaryAt: state.planBoundaryAt,
     planHistory: state.planHistory,
     planHistoryTruncated: state.planHistoryTruncated,
     planHistoryLostThrough: state.planHistoryLostThrough,
@@ -1804,39 +1837,47 @@ function isWorkCoverage(v: unknown): v is WorkCoverage {
 function isOperationCounts(v: unknown): boolean {
   if (typeof v !== "object" || v === null) return false;
   const counts = v as Record<string, unknown>;
-  return OPERATION_KIND_LIST.every((kind) => isNumber(counts[kind]));
+  return (
+    isNumber(counts.observe) &&
+    isNumber(counts.mutate) &&
+    isNumber(counts.verify) &&
+    isNumber(counts.delegated) &&
+    isNumber(counts.neutral) &&
+    isNumber(counts.unknown)
+  );
 }
 
 function isWorkAgentNode(v: unknown, depth = 0): v is WorkAgentNode {
   if (depth > AGENT_TREE_MAX_DEPTH) return false;
   if (typeof v !== "object" || v === null) return false;
   const a = v as Record<string, unknown>;
-  return (
-    (a.intentInput === undefined || isToolIntentInput(a.intentInput)) &&
-    typeof a.agentId === "string" &&
-    (a.parentAgentId === null || typeof a.parentAgentId === "string") &&
-    typeof a.toolUseId === "string" &&
-    (a.parentToolUseId === null || typeof a.parentToolUseId === "string") &&
-    isNumber(a.spawnDepth) &&
-    isOptionalString(a.agentType) &&
-    typeof a.description === "string" &&
-    isOptionalString(a.modelDeclared) &&
-    isOptionalString(a.modelMeasured) &&
-    isOptionalString(a.effortDeclared) &&
-    isOptionalString(a.effortMeasured) &&
-    WORK_STATUSES.includes(a.status as string) &&
-    (a.runStartedAt === undefined || isNumber(a.runStartedAt)) &&
-    (a.startedAt === undefined || isNumber(a.startedAt)) &&
-    (a.endedAt === undefined || isNumber(a.endedAt)) &&
-    isNumber(a.elapsedMs) &&
-    (a.tokens === undefined || isNumber(a.tokens)) &&
-    isNumber(a.childCount) &&
-    isNumber(a.failCount) &&
-    isNumber(a.revision) &&
-    (a.origin === "live" || a.origin === "restored") &&
-    Array.isArray(a.children) &&
-    (a.children as unknown[]).every((child) => isWorkAgentNode(child, depth + 1))
-  );
+  const checks: { [K in keyof WorkAgentNode]-?: () => boolean } = {
+    intentInput: () => a.intentInput === undefined || isToolIntentInput(a.intentInput),
+    agentId: () => typeof a.agentId === "string",
+    parentAgentId: () => a.parentAgentId === null || typeof a.parentAgentId === "string",
+    toolUseId: () => typeof a.toolUseId === "string",
+    parentToolUseId: () => a.parentToolUseId === null || typeof a.parentToolUseId === "string",
+    spawnDepth: () => isNumber(a.spawnDepth),
+    agentType: () => isOptionalString(a.agentType),
+    description: () => typeof a.description === "string",
+    modelDeclared: () => isOptionalString(a.modelDeclared),
+    modelMeasured: () => isOptionalString(a.modelMeasured),
+    effortDeclared: () => isOptionalString(a.effortDeclared),
+    effortMeasured: () => isOptionalString(a.effortMeasured),
+    status: () => WORK_STATUSES.includes(a.status as string),
+    runStartedAt: () => a.runStartedAt === undefined || isNumber(a.runStartedAt),
+    startedAt: () => a.startedAt === undefined || isNumber(a.startedAt),
+    endedAt: () => a.endedAt === undefined || isNumber(a.endedAt),
+    elapsedMs: () => isNumber(a.elapsedMs),
+    tokens: () => a.tokens === undefined || isNumber(a.tokens),
+    childCount: () => isNumber(a.childCount),
+    failCount: () => isNumber(a.failCount),
+    revision: () => isNumber(a.revision),
+    origin: () => a.origin === "live" || a.origin === "restored",
+    children: () => (Array.isArray(a.children)) && ((a.children as unknown[]).every((child) => isWorkAgentNode(child, depth + 1))),
+    transcriptAgentId: () => true,
+  };
+  return Object.values(checks).every(check => check());
 }
 
 function isWorkPhaseView(v: unknown): v is WorkPhaseView {
@@ -1881,60 +1922,71 @@ function isWorkPhaseView(v: unknown): v is WorkPhaseView {
 export function isWorkModelPayload(v: unknown): v is WorkModelPayload {
   if (typeof v !== "object" || v === null) return false;
   const m = v as Record<string, unknown>;
-  return (
-    (m.requests === undefined || isArrayOf(m.requests, value => {
-      if (!value || typeof value !== "object") return false;
-      const request = value as Record<string, unknown>;
-      return isStringArray(request.turnIds) && typeof request.number === "string" &&
-        isNumber(request.toolCount) && isNumber(request.agentCount) && isNumber(request.failCount) && isNumber(request.revision);
-    })) &&
-    (m.planHistory === undefined || isArrayOf(m.planHistory, entry => {
-      if (!entry || typeof entry !== "object") return false;
-      const row = entry as Record<string, unknown>;
-      return isNumber(row.at) && (row.kind === "user" || row.kind === "todos" &&
-        (row.source === undefined || row.source === "tasks") && (row.created === undefined || typeof row.created === "boolean") && (row.removed === undefined || typeof row.removed === "boolean") && isArrayOf(row.items, isWorkTaskItemView) ||
-        row.kind === "resume" && typeof row.agentId === "string" && typeof row.description === "string" &&
-        WORK_STATUSES.includes(row.status as string) && (row.endedAt === undefined || isNumber(row.endedAt)));
-    })) &&
-    (m.planDeclaration === undefined || isPlanDeclaration(m.planDeclaration)) &&
-    (m.planBoundaryAt === undefined || isNumber(m.planBoundaryAt)) &&
-    (m.planHistoryTruncated === undefined || typeof m.planHistoryTruncated === "boolean") &&
-    (m.planHistoryLostThrough === undefined || isNumber(m.planHistoryLostThrough)) &&
-    (m.planContext === undefined || isPlanContext(m.planContext)) &&
-    (m.runningMainTools === undefined || isArrayOf(m.runningMainTools, tool => {
-      if (!tool || typeof tool !== "object") return false;
-      const row = tool as Record<string, unknown>;
-      return (row.intentInput === undefined || isToolIntentInput(row.intentInput)) && typeof row.id === "string" && typeof row.name === "string" && isNumber(row.startedAt);
-    })) &&
-    (m.planTools === undefined || isArrayOf(m.planTools, tool => {
-      if (!tool || typeof tool !== "object") return false;
-      const row = tool as Record<string, unknown>;
-      return (row.intentInput === undefined || isToolIntentInput(row.intentInput)) && typeof row.id === "string" && typeof row.name === "string" && typeof row.description === "string" && isNumber(row.startedAt);
-    })) &&
-    isNumber(m.version) &&
-    isNumber(m.revision) &&
-    isWorkCoverage(m.coverage) &&
-    isOptionalString(m.currentPhaseId) &&
-    (m.ambiguity === undefined || m.ambiguity === "multiple-active-tasks") &&
-    Array.isArray(m.phases) &&
-    (m.phases as unknown[]).every(isWorkPhaseView) &&
-    Array.isArray(m.unlinkedAgents) &&
-    (m.unlinkedAgents as unknown[]).every((agent) => isWorkAgentNode(agent)) &&
-    isArrayOf(m.tasks, isWorkTaskItemView) &&
-    isArrayOf(m.taskTotals, isWorkTaskTotalsView)
-  );
+  const checks: { [K in keyof WorkModelPayload]-?: () => boolean } = {
+    requests: () => m.requests === undefined || isArrayOf(m.requests, isWorkRequestView),
+    planHistory: () => m.planHistory === undefined || isArrayOf(m.planHistory, isWorkPlanHistoryEntry),
+    planHistoryTruncated: () => m.planHistoryTruncated === undefined || typeof m.planHistoryTruncated === "boolean",
+    planHistoryLostThrough: () => m.planHistoryLostThrough === undefined || isNumber(m.planHistoryLostThrough),
+    planContext: () => m.planContext === undefined || isPlanContext(m.planContext),
+    earlierPlans: () => m.earlierPlans === undefined || isArrayOf(m.earlierPlans, isPlanContext),
+    runningMainTools: () => m.runningMainTools === undefined || isArrayOf(m.runningMainTools, isRunningMainToolView),
+    planTools: () => m.planTools === undefined || isArrayOf(m.planTools, isPlanToolView),
+    version: () => isNumber(m.version),
+    revision: () => isNumber(m.revision),
+    coverage: () => isWorkCoverage(m.coverage),
+    currentPhaseId: () => isOptionalString(m.currentPhaseId),
+    ambiguity: () => m.ambiguity === undefined || m.ambiguity === "multiple-active-tasks",
+    phases: () => (Array.isArray(m.phases)) && ((m.phases as unknown[]).every(isWorkPhaseView)),
+    unlinkedAgents: () => (Array.isArray(m.unlinkedAgents)) && ((m.unlinkedAgents as unknown[]).every((agent) => isWorkAgentNode(agent))),
+    tasks: () => isArrayOf(m.tasks, isWorkTaskItemView),
+    taskTotals: () => isArrayOf(m.taskTotals, isWorkTaskTotalsView),
+  };
+  return Object.values(checks).every(check => check());
+}
+
+function isPlanContextStep(value: unknown): boolean {
+  if (!value || typeof value !== "object") return false;
+  const row = value as Record<string, unknown>;
+  const checks: { [K in keyof PlanContextStep]-?: () => boolean } = {
+    key: () => typeof row.key === "string",
+    number: () => isNumber(row.number),
+    title: () => typeof row.title === "string",
+    status: () => TASK_STATUSES.includes(row.status as string),
+    removed: () => typeof row.removed === "boolean",
+    startedAt: () => row.startedAt === null || isNumber(row.startedAt),
+    endedAt: () => row.endedAt === null || isNumber(row.endedAt),
+    activeSpans: () => row.activeSpans === undefined || isArrayOf(row.activeSpans, isPlanSpan),
+    tokens: () => row.tokens === undefined || row.tokens === null || isPlanTokenTotal(row.tokens),
+  };
+  return Object.values(checks).every(check => check());
+}
+
+function isPlanSpan(value: unknown): boolean {
+  if (!value || typeof value !== "object") return false;
+  const span = value as Record<string, unknown>;
+  return isNumber(span.start) && isNumber(span.end) && (span.end as number) >= (span.start as number);
+}
+
+function isPlanContextPlacement(value: unknown): boolean {
+  if (!value || typeof value !== "object") return false;
+  const row = value as Record<string, unknown>;
+  return typeof row.toolUseId === "string" && (row.agentId === undefined || typeof row.agentId === "string")
+    && (row.stepKey === null || typeof row.stepKey === "string");
 }
 
 function isPlanContext(value: unknown): boolean {
   if (!value || typeof value !== "object") return false;
   const row = value as Record<string, unknown>;
-  return typeof row.blockId === "string" && typeof row.text === "string" && isNumber(row.start) && isNumber(row.end) && typeof row.running === "boolean";
-}
-
-function isPlanDeclaration(value: unknown): boolean {
-  if (!value || typeof value !== "object") return false;
-  const row = value as Record<string, unknown>;
-  return typeof row.goal === "string" && row.goal.trim().length > 0 && isNumber(row.at);
+  return (
+    typeof row.blockId === "string" &&
+    typeof row.text === "string" &&
+    (row.goal === undefined || typeof row.goal === "string") &&
+    isNumber(row.start) &&
+    isNumber(row.end) &&
+    typeof row.running === "boolean" &&
+    (row.steps === undefined || isArrayOf(row.steps, isPlanContextStep)) &&
+    (row.placements === undefined || isArrayOf(row.placements, isPlanContextPlacement))
+  );
 }
 
 const SEMANTIC_MODES = ["recorded", "fallback"];
@@ -2060,20 +2112,9 @@ function isSemanticNodeView(v: unknown): boolean {
       SEMANTIC_DEFINITION_STATES.includes(n.definitionState as string) &&
       SEMANTIC_DEFINITION_STATUSES.includes(n.definitionStatus as string) &&
       (summary === undefined ||
-        (typeof summary === "object" &&
-          summary !== null &&
-          isNumber(summary.attemptCount) &&
-          isNumber(summary.failCount) &&
-          (summary.tokens === undefined || isNumber(summary.tokens)) &&
-          typeof summary.approvalPending === "boolean" &&
-          (summary.footprint === undefined || isSemanticFootprint(summary.footprint)))) &&
+        isSemanticExecutionSummary(summary)) &&
       (window === undefined ||
-        (typeof window === "object" &&
-          window !== null &&
-          isNumber(window.startedAt) &&
-          (window.endedAt === undefined || isNumber(window.endedAt)) &&
-          isNumber(window.durationUnionMs) &&
-          SEMANTIC_COVERAGES.includes(window.coverage as string)))
+        isSemanticExecutionWindow(window))
     );
   }
   if (n.kind === "attempt") {
@@ -2084,34 +2125,18 @@ function isSemanticNodeView(v: unknown): boolean {
     return (
       (n.agentTypeRole === undefined || SEMANTIC_ATTEMPT_ROLES.includes(n.agentTypeRole as string)) &&
       (n.observedRole === undefined || SEMANTIC_ATTEMPT_ROLES.includes(n.observedRole as string)) &&
-      typeof reconciled === "object" &&
-      reconciled !== null &&
-      (reconciled.value === undefined || SEMANTIC_ATTEMPT_ROLES.includes(reconciled.value as string)) &&
-      SEMANTIC_RECONCILE_STATES.includes(reconciled.state as string) &&
+      isSemanticReconciledRole(reconciled) &&
       SEMANTIC_OWNER_STATES.includes(n.ownerState as string) &&
       (n.ordinalWithinTask === undefined || isNumber(n.ordinalWithinTask)) &&
       (actor === undefined ||
-        (typeof actor === "object" &&
-          actor !== null &&
-          isOptionalString(actor.agentId) &&
-          isOptionalString(actor.agentType) &&
-          isOptionalString(actor.model) &&
-          isOptionalString(actor.effort) &&
-          typeof actor.measured === "boolean")) &&
-      typeof anchors === "object" &&
-      anchors !== null &&
-      isStringArray(anchors.segmentIds) &&
-      isStringArray(anchors.agentIds) &&
+        isSemanticActor(actor)) &&
+      isSemanticAnchors(anchors) &&
       isNumber(n.startedAt) &&
       (n.endedAt === undefined || isNumber(n.endedAt)) &&
       isNumber(n.elapsedMs) &&
       isSemanticWorkStatusRef(n.status) &&
       (result === undefined ||
-        (typeof result === "object" &&
-          result !== null &&
-          isNumber(result.failCount) &&
-          isNumber(result.childFailCount) &&
-          (result.tokens === undefined || isNumber(result.tokens)))) &&
+        isSemanticResult(result)) &&
       isArrayOf(n.artifacts, isSemanticArtifactView) &&
       isSemanticFootprint(n.footprint)
     );
@@ -2217,30 +2242,13 @@ function isL3Metric(v: unknown): boolean {
   return false;
 }
 
-const L3_METRIC_KEYS: Record<keyof L3Report["metrics"], true> = {
-  longGapMs: true,
-  longGapCount: true,
-  failureCount: true,
-  actualConcurrency: true,
-  fileWriteConflictCount: true,
-  resourceDependencyCount: true,
-  unknownEffectRatio: true,
-  observedConstraintChainMs: true,
-};
-
-type L3TaskMetricKeys = Omit<L3Report["taskMetrics"][number], "taskId">;
-
-const L3_TASK_METRIC_KEYS: Record<keyof L3TaskMetricKeys, true> = {
-  taskDurationMs: true,
-  attemptCount: true,
-};
-
 function isL3TaskMetricSet(v: unknown): boolean {
   if (typeof v !== "object" || v === null) return false;
   const t = v as Record<string, unknown>;
   return (
     typeof t.taskId === "string" &&
-    Object.keys(L3_TASK_METRIC_KEYS).every((k) => isL3Metric(t[k]))
+    isL3Metric(t.taskDurationMs) &&
+    isL3Metric(t.attemptCount)
   );
 }
 
@@ -2307,15 +2315,9 @@ function isL3Report(v: unknown): boolean {
     isNumber(r.specVersion) &&
     typeof r.semanticHash === "string" &&
     isArrayOf(r.taskMetrics, isL3TaskMetricSet) &&
-    typeof metrics === "object" &&
-    metrics !== null &&
-    Object.keys(L3_METRIC_KEYS).every((k) => isL3Metric(metrics[k])) &&
+    isL3Metrics(metrics) &&
     isL3SerializationProfile(r.serializationProfile) &&
-    typeof r.estimates === "object" &&
-    r.estimates !== null &&
-    isL3ParallelizationEstimate(
-      (r.estimates as Record<string, unknown>).parallelizationUpperBound
-    )
+    isL3Estimates(r.estimates)
   );
 }
 
@@ -2363,9 +2365,7 @@ function isDivergenceReportView(v: unknown): boolean {
     isNumber(d.specVersion) &&
     typeof d.semanticHash === "string" &&
     isSemanticCoverage(d.coverage) &&
-    typeof kinds === "object" &&
-    kinds !== null &&
-    Object.keys(DIVERGENCE_KIND_KEYS).every((k) => isDivergenceKindReportView(kinds[k])) &&
+    isDivergenceKinds(kinds) &&
     isNumber(d.recordCount) &&
     isNumber(d.droppedRecordCount) &&
     (d.segmentAnchoredIdCount === undefined || isNumber(d.segmentAnchoredIdCount))
@@ -2388,19 +2388,17 @@ function isLlmAnalysisProvenance(v: unknown): boolean {
 function isHistoryOption(v: unknown): v is HistoryOption {
   if (typeof v !== "object" || v === null) return false;
   const h = v as Record<string, unknown>;
-  return (
-    typeof h.artifactId === "string" &&
-    h.artifactId.length > 0 &&
-    h.artifactId.length <= 200 &&
-    typeof h.label === "string" &&
-    h.label.length > 0 &&
-    isOptionalString(h.generatedAtLabel) &&
-    (h.findingsCount === undefined || isNumber(h.findingsCount)) &&
-    isOptionalString(h.requestedModel) &&
-    isOptionalString(h.requestedEffort) &&
-    isOptionalString(h.executedModels) &&
-    isOptionalString(h.freshnessLabel)
-  );
+  const checks: { [K in keyof HistoryOption]-?: () => boolean } = {
+    artifactId: () => (typeof h.artifactId === "string") && (h.artifactId.length > 0) && (h.artifactId.length <= 200),
+    label: () => (typeof h.label === "string") && (h.label.length > 0),
+    generatedAtLabel: () => isOptionalString(h.generatedAtLabel),
+    findingsCount: () => h.findingsCount === undefined || isNumber(h.findingsCount),
+    requestedModel: () => isOptionalString(h.requestedModel),
+    requestedEffort: () => isOptionalString(h.requestedEffort),
+    executedModels: () => isOptionalString(h.executedModels),
+    freshnessLabel: () => isOptionalString(h.freshnessLabel),
+  };
+  return Object.values(checks).every(check => check());
 }
 
 function isAttachedEvidenceChip(v: unknown): v is AttachedEvidenceChip {
@@ -2487,39 +2485,24 @@ function isAttachedAnalysisView(v: unknown): v is AttachedAnalysisView {
     (a.tokensLabel === null || isOptionalString(a.tokensLabel)) &&
     (a.slicesCount === undefined || isNumber(a.slicesCount)) &&
     (a.emptyStateLabel === undefined ||
-      (typeof a.emptyStateLabel === "string" && a.emptyStateLabel.length > 0)) &&
+    (typeof a.emptyStateLabel === "string" && a.emptyStateLabel.length > 0)) &&
     (a.inputCoverageLabel === undefined ||
-      (typeof a.inputCoverageLabel === "string" && a.inputCoverageLabel.length > 0)) &&
+    (typeof a.inputCoverageLabel === "string" && a.inputCoverageLabel.length > 0)) &&
     isArrayOf(a.historyOptions, isHistoryOption) &&
     typeof a.selectedArtifactId === "string" &&
-    (a.historyOptions as HistoryOption[]).some((opt) => opt.artifactId === a.selectedArtifactId) &&
-    isArrayOf(a.findings, isAttachedFindingView)
+    isArrayOf(a.findings, isAttachedFindingView) &&
+    (a.historyOptions as HistoryOption[]).some((opt) => opt.artifactId === a.selectedArtifactId)
   );
 }
 
 function isActionFinding(v: unknown): boolean {
   if (typeof v !== "object" || v === null) return false;
   const f = v as Record<string, unknown>;
-  const impact = f.impact as Record<string, unknown> | undefined;
-  const action = f.action as Record<string, unknown> | undefined;
-  const calc = impact?.calculation as Record<string, unknown> | undefined;
   return (
     typeof f.title === "string" &&
     typeof f.observed === "string" &&
-    typeof impact === "object" &&
-    impact !== null &&
-    (impact.unit === "ms" || impact.unit === "count") &&
-    isNumber(impact.value) &&
-    typeof calc === "object" &&
-    calc !== null &&
-    ["identity", "sum", "cardinality"].includes(calc.op as string) &&
-    isStringArray(calc.factIds) &&
-    typeof action === "object" &&
-    action !== null &&
-    typeof action.kind === "string" &&
-    typeof action.destination === "string" &&
-    isStringArray(action.steps) &&
-    isOptionalString(action.target) &&
+    isActionFindingImpact(f.impact) &&
+    isActionFindingAction(f.action) &&
     isStringArray(f.evidenceIds) &&
     (f.confidence === "high" || f.confidence === "medium" || f.confidence === "low")
   );
@@ -2601,43 +2584,35 @@ export function isLlmFindingDiagnosticsPayload(v: unknown): v is LlmFindingDiagn
     isLlmAnalysisProvenance(p.provenance) &&
     (p.cacheState === "hit" || p.cacheState === "miss") &&
     isArrayOf(p.rejected, isRejectedFindingView) &&
-    typeof counts === "object" &&
-    counts !== null &&
-    isNumber(counts.candidate) &&
-    isNumber(counts.schemaRejected) &&
-    isNumberRecord(counts.schemaByReason) &&
-    isNumber(counts.verified) &&
-    isNumber(counts.accepted) &&
-    isNumber(counts.rejected) &&
-    isNumberRecord(counts.byReason)
+    isLlmFindingDiagnosticsCounts(counts)
   );
 }
 
 function isAnalysisLearningRANL20(v: unknown): boolean {
   if (typeof v !== "object" || v === null || Array.isArray(v)) return false;
   const learning = v as Record<string, unknown>;
-  return hasOnlyKeys(learning, ["state", "note", "lines", "empty"])
-    && (learning.state === "unobserved" || learning.state === "observed")
-    && typeof learning.note === "string" && Array.isArray(learning.lines)
-    && learning.lines.every(line => typeof line === "string")
-    && (learning.state === "unobserved" ? learning.note.length > 0 && learning.lines.length === 0 : learning.lines.length > 0)
-    && (learning.empty === undefined || (learning.empty === true && learning.state === "observed" && learning.lines.length === 1));
+  return (
+    (learning.state === "unobserved" || learning.state === "observed") &&
+    typeof learning.note === "string" &&
+    Array.isArray(learning.lines) &&
+    learning.lines.every(line => typeof line === "string") &&
+    (learning.empty === undefined || learning.empty === true) &&
+    hasOnlyKeys(learning, ["state", "note", "lines", "empty"]) &&
+    (learning.state === "unobserved" ? (learning.note as string).length > 0 && (learning.lines as unknown[]).length === 0 : (learning.lines as unknown[]).length > 0) &&
+    (learning.empty === undefined || (learning.empty === true && learning.state === "observed" && (learning.lines as unknown[]).length === 1))
+  );
 }
 
 function isAnalysisFactsView(v: unknown): boolean {
   if (typeof v !== "object" || v === null || Array.isArray(v)) return false;
   const f = v as Record<string, unknown>;
-  return (
-    hasOnlyKeys(f, ["llmTargets", "coverageNote", "learning"]) &&
-    typeof f.llmTargets === "object" &&
-    f.llmTargets !== null &&
-    !Array.isArray(f.llmTargets) &&
-    hasOnlyKeys(f.llmTargets as Record<string, unknown>, ["toolCalls", "label"]) &&
-    isNumber((f.llmTargets as Record<string, unknown>).toolCalls) &&
-    typeof (f.llmTargets as Record<string, unknown>).label === "string" &&
-    isOptionalString(f.coverageNote) &&
-    (f.learning === undefined || isAnalysisLearningRANL20(f.learning))
-  );
+  const checks: { [K in keyof AnalysisFactsView]-?: () => boolean } = {
+    llmTargets: () => isAnalysisLlmTargets(f.llmTargets),
+    coverageNote: () => isOptionalString(f.coverageNote),
+    learning: () => f.learning === undefined || isAnalysisLearningRANL20(f.learning),
+  };
+  return Object.values(checks).every(check => check()) &&
+    (hasOnlyKeys(f, ["llmTargets", "coverageNote", "learning"]));
 }
 
 export function isL3ReportPayload(v: unknown): v is L3ReportPayload {
@@ -2654,29 +2629,36 @@ export function isL3ReportPayload(v: unknown): v is L3ReportPayload {
 export function isSemanticModelPayload(v: unknown): v is SemanticModelPayload {
   if (typeof v !== "object" || v === null) return false;
   const m = v as Record<string, unknown>;
-  return (
-    isNumber(m.version) &&
-    SEMANTIC_MODES.includes(m.mode as string) &&
-    isNumber(m.revision) &&
-    typeof m.evidenceHash === "string" &&
-    typeof m.semanticHash === "string" &&
-    isArrayOf(m.nodes, isSemanticNodeView) &&
-    isArrayOf(m.edges, isSemanticEdgeView) &&
-    isSemanticCoverage(m.coverage) &&
-    typeof m.degraded === "boolean" &&
-    isNumber(m.conflictCount) &&
-    isNumber(m.delegationMismatchCount) &&
-    isArrayOf(m.taskReopened, isSemanticTaskReopened) &&
-    isArrayOf(m.reworkCandidates, isSemanticReworkCandidate) &&
-    (m.assignments === undefined || isArrayOf(m.assignments, isSemanticAssignment)) &&
-    (m.l3 === undefined || isL3ReportPayload(m.l3)) &&
-    (m.timeBucketsCoverage === undefined || isTimeBucketsCoverage(m.timeBucketsCoverage)) &&
-    (m.timeBuckets === undefined || isTimeBucketsPayload(m.timeBuckets)) &&
-    (m.roleSummary === undefined || isRoleSummaryView(m.roleSummary)) &&
-    (m.failureSummary === undefined || isFailureSummaryView(m.failureSummary)) &&
-    (m.summaryAnalysis === undefined || isSummaryAnalysisView(m.summaryAnalysis)) &&
-    (m.mainTokens === undefined || m.mainTokens === null || isMainTokenTotal(m.mainTokens))
-  );
+  const checks: { [K in keyof SemanticModelPayload]-?: () => boolean } = {
+    version: () => isNumber(m.version),
+    mode: () => SEMANTIC_MODES.includes(m.mode as string),
+    revision: () => isNumber(m.revision),
+    evidenceHash: () => typeof m.evidenceHash === "string",
+    semanticHash: () => typeof m.semanticHash === "string",
+    nodes: () => isArrayOf(m.nodes, isSemanticNodeView),
+    edges: () => isArrayOf(m.edges, isSemanticEdgeView),
+    coverage: () => isSemanticCoverage(m.coverage),
+    degraded: () => typeof m.degraded === "boolean",
+    conflictCount: () => isNumber(m.conflictCount),
+    delegationMismatchCount: () => isNumber(m.delegationMismatchCount),
+    taskReopened: () => isArrayOf(m.taskReopened, isSemanticTaskReopened),
+    reworkCandidates: () => isArrayOf(m.reworkCandidates, isSemanticReworkCandidate),
+    assignments: () => m.assignments === undefined || isArrayOf(m.assignments, isSemanticAssignment),
+    l3: () => m.l3 === undefined || isL3ReportPayload(m.l3),
+    timeBucketsCoverage: () => m.timeBucketsCoverage === undefined || isTimeBucketsCoverage(m.timeBucketsCoverage),
+    timeBuckets: () => m.timeBuckets === undefined || isTimeBucketsPayload(m.timeBuckets),
+    roleSummary: () => m.roleSummary === undefined || isRoleSummaryView(m.roleSummary),
+    analysisPlans: () => m.analysisPlans === undefined || isAnalysisPlansView(m.analysisPlans),
+    failureSummary: () => m.failureSummary === undefined || isFailureSummaryView(m.failureSummary),
+    summaryAnalysis: () => m.summaryAnalysis === undefined || isSummaryAnalysisView(m.summaryAnalysis),
+    mainTokens: () => m.mainTokens === undefined || m.mainTokens === null || isMainTokenTotal(m.mainTokens),
+    attemptProgressStates: () => true,
+    firstPromptText: () => true,
+    execLogMarks: () => true,
+    execLogFindings: () => true,
+    execLogFindingsEmptyLabel: () => true,
+  };
+  return Object.values(checks).every(check => check());
 }
 
 const isNullableNumber = (v: unknown): boolean => v === null || isNumber(v);
@@ -2687,16 +2669,18 @@ function isSummaryAnalysisView(v: unknown): boolean {
   const s = v as Record<string, unknown>;
   const count = (n: unknown) => n === null || (Number.isSafeInteger(n) && (n as number) >= 0);
   const percent = (n: unknown) => isNumber(n) && (n as number) >= 0 && (n as number) <= 100;
-  return count(s.improvableCount) && count(s.scriptFindingCount) && count(s.scriptCandidateCount) &&
+  return (
+    count(s.improvableCount) &&
+    count(s.scriptFindingCount) &&
+    count(s.scriptCandidateCount) &&
     (s.scriptCandidatePercent === null || percent(s.scriptCandidatePercent)) &&
     (s.llmExecutionState === "idle" || s.llmExecutionState === "running" || s.llmExecutionState === "attemptFailed" || s.llmExecutionState === "disabled" || s.llmExecutionState === "attached") &&
     (s.llmState === "current" || s.llmState === "not-run" || s.llmState === "stale") &&
-    count(s.llmFindingCount) && count(s.rejectedCount) && isOptionalString(s.generatedAtLabel) &&
-    isArrayOf(s.llmAreas, value => {
-      if (typeof value !== "object" || value === null) return false;
-      const area = value as Record<string, unknown>;
-      return typeof area.label === "string" && area.count !== null && count(area.count) && percent(area.percent);
-    });
+    count(s.llmFindingCount) &&
+    count(s.rejectedCount) &&
+    isOptionalString(s.generatedAtLabel) &&
+    isArrayOf(s.llmAreas, isSummaryLlmAreaView)
+  );
 }
 
 const TIME_BUCKET_NAMES: Record<TimeBucket, true> = { generate: true, tool: true, delegation: true, confirm: true, reply: true };
@@ -2705,76 +2689,215 @@ const TAIL_MAIN_NAMES: Record<NonNullable<TimeBucketView["tail"]["main"]>, true>
 function isTimeBucketsPayload(v: unknown): boolean {
   if (typeof v !== "object" || v === null || Array.isArray(v)) return false;
   const { mainByModel: byModel, blocks, agents, backgroundTasks, bars, main, intervals, tail } = v as Record<string, unknown>;
-  const percent = (value: unknown) => isNumber(value) && (value as number) >= 0 && (value as number) <= 100;
+  const checks: { [K in keyof TimeBucketView]-?: () => boolean } = {
+    subagentOnlySpans: () => (v as TimeBucketView).subagentOnlySpans === undefined ||
+      isArrayOf((v as TimeBucketView).subagentOnlySpans, span => Array.isArray(span) && span.length === 2 &&
+        isNumber(span[0]) && isNumber(span[1]) && span[1] >= span[0]),
+    generationBoundaryAt: () => (v as TimeBucketView).generationBoundaryAt === undefined || isNumber((v as TimeBucketView).generationBoundaryAt),
+    bars: () => isTimeBarsView(bars),
+    main: () => main === undefined || isTimeMainView(main),
+    intervals: () => intervals === undefined || isArrayOf(intervals, isTimeIntervalView),
+    tail: () => tail === undefined || isTimeTailView(tail),
+    mainModelSpans: () => (v as TimeBucketView).mainModelSpans === undefined || isArrayOf((v as TimeBucketView).mainModelSpans, value =>
+      typeof value === "object" && value !== null && isNumber((value as Record<string, unknown>).start) && isNumber((value as Record<string, unknown>).end) &&
+      typeof (value as Record<string, unknown>).model === "string" && isOptionalString((value as Record<string, unknown>).effort)),
+    mainByModel: () => byModel === undefined || byModel === null || isMainTimeByModelView(byModel),
+    blocks: () => blocks === undefined || isArrayOf(blocks, isTimeRequestBlockView),
+    fidelity: () => true,
+    inheritedBoundaryCount: () => true,
+    firstAt: () => true,
+    lastAt: () => true,
+    spanMs: () => true,
+    sub: () => true,
+    agentCount: () => true,
+    maxParallelAgents: () => true,
+    currentParallel: () => true,
+    maxConcurrency: () => true,
+    turnOpen: () => true,
+    // Preserve the shared-array case: the original guard selected by array identity.
+    agents: () => agents === undefined || isArrayOf(agents, agents === backgroundTasks ? isTimeBackgroundTaskView : isTimeAgentView),
+    backgroundTasks: () => backgroundTasks === undefined || isArrayOf(backgroundTasks, isTimeBackgroundTaskView),
+    droppedIntervalCount: () => true,
+    droppedBlockCount: () => true,
+  };
+  return Object.values(checks).every(check => check());
+}
+
+function isTimeMainView(v: unknown): boolean {
+  if (typeof v !== "object" || v === null || Array.isArray(v)) return false;
+  const main = v as Record<string, unknown>;
   const duration = (value: unknown) => isNumber(value) && (value as number) >= 0;
-  const record = (value: unknown): value is Record<string, unknown> => typeof value === "object" && value !== null && !Array.isArray(value);
-  return isTimeBarsView(bars) &&
-    (main === undefined || record(main) && (main.subagentWaitMs === undefined || duration(main.subagentWaitMs))) &&
-    (intervals === undefined || isArrayOf(intervals, item => record(item) && typeof item.bucket === "string" && Object.hasOwn(TIME_BUCKET_NAMES, item.bucket))) &&
-    (tail === undefined || record(tail) && (tail.main === undefined || tail.main === null || typeof tail.main === "string" && Object.hasOwn(TAIL_MAIN_NAMES, tail.main))) &&
-    (byModel === undefined || byModel === null || isMainTimeByModelView(byModel)) &&
-    [agents, backgroundTasks].every(items => items === undefined || isArrayOf(items, item => {
-      if (typeof item !== "object" || item === null || Array.isArray(item)) return false;
-      const lane = item as Record<string, unknown>;
-      return (lane.stepKey === undefined || typeof lane.stepKey === "string") &&
-        (items !== backgroundTasks || lane.subagent === undefined || typeof lane.subagent === "boolean");
-    })) &&
-    (blocks === undefined || isArrayOf(blocks, value => {
+  const checks: { [K in keyof TimeBucketView["main"]]-?: () => boolean } = {
+    subagentWaitMs: () => main.subagentWaitMs === undefined || duration(main.subagentWaitMs),
+    generateMs: () => true,
+    toolMs: () => true,
+    confirmMs: () => true,
+    replyMs: () => true,
+    subOnlyMs: () => true,
+    spanMs: () => true,
+  };
+  return Object.values(checks).every(check => check());
+}
+
+function isTimeIntervalView(v: unknown): boolean {
+  if (typeof v !== "object" || v === null || Array.isArray(v)) return false;
+  const interval = v as Record<string, unknown>;
+  const checks: { [K in keyof TimeBucketView["intervals"][number]]-?: () => boolean } = {
+    bucket: () => typeof interval.bucket === "string" && Object.hasOwn(TIME_BUCKET_NAMES, interval.bucket),
+    lane: () => true,
+    start: () => true,
+    end: () => true,
+    turnId: () => true,
+    agentId: () => true,
+    backgroundOverlapMs: () => true,
+  };
+  return Object.values(checks).every(check => check());
+}
+
+function isTimeTailView(v: unknown): boolean {
+  if (typeof v !== "object" || v === null || Array.isArray(v)) return false;
+  const tail = v as Record<string, unknown>;
+  const checks: { [K in keyof TimeBucketView["tail"]]-?: () => boolean } = {
+    main: () => tail.main === undefined || tail.main === null || typeof tail.main === "string" && Object.hasOwn(TAIL_MAIN_NAMES, tail.main),
+    anyOpen: () => true,
+  };
+  return Object.values(checks).every(check => check());
+}
+
+function isTimeBackgroundTaskView(v: unknown): boolean {
+  if (typeof v !== "object" || v === null || Array.isArray(v)) return false;
+  const lane = v as Record<string, unknown>;
+  const checks: { [K in keyof TimeBucketView["backgroundTasks"][number]]-?: () => boolean } = {
+    stepKey: () => lane.stepKey === undefined || typeof lane.stepKey === "string",
+    subagent: () => lane.subagent === undefined || typeof lane.subagent === "boolean",
+    toolUseId: () => true,
+    taskId: () => true,
+    turnId: () => true,
+    blockId: () => true,
+    description: () => true,
+    start: () => true,
+    end: () => true,
+    open: () => true,
+    endSource: () => true,
+  };
+  return Object.values(checks).every(check => check());
+}
+
+function isTimeRequestBlockView(v: unknown): boolean {
+  if (typeof v !== "object" || v === null) return false;
+  const block = v as Record<string, unknown>;
+  const duration = (value: unknown) => isNumber(value) && (value as number) >= 0;
+  const checks: { [K in keyof TimeBucketView["blocks"][number]]-?: () => boolean } = {
+    usageSlices: () => block.usageSlices === undefined || isArrayOf(block.usageSlices, value => {
       if (typeof value !== "object" || value === null) return false;
-      const block = value as Record<string, unknown>;
+      const slice = value as Record<string, unknown>;
+      return duration(slice.start) && duration(slice.end) && (slice.end as number) >= (slice.start as number) &&
+        duration(slice.tokens) && duration(slice.cacheRead) && (slice.outputTokens === undefined || duration(slice.outputTokens));
+    }),
+    kind: () => {
       if (block.kind !== undefined && !["say", "command", "interrupt", "plan"].includes(block.kind as string)) return false;
-      if (block.kind === "plan" && (!isArrayOf(block.steps, isPlanBlockStep) || !isArrayOf(block.userMessages, isPlanBlockMarker) || !isPlanBlockMetrics(block.metrics))) return false;
-      if (block.goal !== undefined && typeof block.goal !== "string") return false;
-      if (block.closedAt !== undefined && !isNumber(block.closedAt)) return false;
-      if (block.steps !== undefined && !isArrayOf(block.steps, isPlanBlockStep)) return false;
-      if (block.userMessages !== undefined && !isArrayOf(block.userMessages, isPlanBlockMarker)) return false;
-      if (block.metrics !== undefined && !isPlanBlockMetrics(block.metrics)) return false;
-      if (block.requestNumber !== undefined && block.requestNumber !== null &&
-        !(typeof block.requestNumber === "string" && /^\d+$/.test(block.requestNumber))) return false;
-      if (block.processingMs !== undefined && block.processingMs !== null &&
-        !(isNumber(block.processingMs) && (block.processingMs as number) >= 0)) return false;
-      if (block.subagentWaitMs !== undefined && !duration(block.subagentWaitMs)) return false;
-      if (block.strip === undefined || block.strip === null) return true;
-      if (typeof block.strip !== "object" || Array.isArray(block.strip)) return false;
-      const strip = block.strip as Record<string, unknown>;
-      return [strip.generatePercent, strip.toolPercent, strip.subagentWaitPercent, strip.confirmPercent, strip.replyPercent, strip.remainderPercent].every(percent);
-    }));
+      return !(block.kind === "plan" && (!isArrayOf(block.steps, isPlanBlockStep) || !isArrayOf(block.userMessages, isPlanBlockMarker) || !isPlanBlockMetrics(block.metrics)));
+    },
+    goal: () => block.goal === undefined || typeof block.goal === "string",
+    closedAt: () => block.closedAt === undefined || isNumber(block.closedAt),
+    steps: () => block.steps === undefined || isArrayOf(block.steps, isPlanBlockStep),
+    conductorIntervals: () => block.conductorIntervals === undefined || isArrayOf(block.conductorIntervals, isTimeIntervalView),
+    conductorTail: () => block.conductorTail === undefined || isNullableNumber(block.conductorTail),
+    conductorAttribution: () => block.conductorAttribution === undefined || isArrayOf(block.conductorAttribution, value => {
+      if (typeof value !== "object" || value === null) return false;
+      const span = value as Record<string, unknown>;
+      return isNumber(span.start) && isNumber(span.end) && (span.turnId === undefined || typeof span.turnId === "string")
+        && Array.isArray(span.keys) && span.keys.every(key => typeof key === "string");
+    }),
+    userMessages: () => block.userMessages === undefined || isArrayOf(block.userMessages, isPlanBlockMarker),
+    metrics: () => block.metrics === undefined || isPlanBlockMetrics(block.metrics),
+    requestNumber: () => block.requestNumber === undefined || block.requestNumber === null ||
+      typeof block.requestNumber === "string" && /^\d+$/.test(block.requestNumber),
+    processingMs: () => block.processingMs === undefined || block.processingMs === null ||
+      isNumber(block.processingMs) && (block.processingMs as number) >= 0,
+    subagentWaitMs: () => block.subagentWaitMs === undefined || duration(block.subagentWaitMs),
+    strip: () => block.strip === undefined || block.strip === null || isTimeRequestStrip(block.strip),
+    blockId: () => true,
+    text: () => true,
+    start: () => true,
+    end: () => true,
+    anchorAt: () => true,
+    durationMs: () => true,
+    turnIds: () => true,
+    toolCount: () => true,
+    failCount: () => true,
+    agentCount: () => true,
+    generateMs: () => true,
+    toolMs: () => true,
+    confirmMs: () => true,
+    replyMs: () => true,
+    running: () => true,
+  };
+  return Object.values(checks).every(check => check());
 }
 
 function isTimeBarsView(v: unknown): boolean {
   if (typeof v !== "object" || v === null || Array.isArray(v)) return false;
   const b = v as Record<string, unknown>;
   const duration = (x: unknown) => isNumber(x) && (x as number) >= 0;
-  return [b.totalMs, b.mainMs, b.toolMs].every(x => x === null || duration(x)) && duration(b.subMs);
+  const { totalMs, mainMs, toolMs } = b;
+  const checks: { [K in keyof TimeBucketView["bars"]]-?: () => boolean } = {
+    totalMs: () => totalMs === null || duration(totalMs),
+    mainMs: () => mainMs === null || duration(mainMs),
+    toolMs: () => toolMs === null || duration(toolMs),
+    subMs: () => duration(b.subMs),
+  };
+  return Object.values(checks).every(check => check());
 }
 
 function isPlanBlockMarker(v: unknown): boolean {
   if (typeof v !== "object" || v === null || Array.isArray(v)) return false;
   const marker = v as Record<string, unknown>;
-  return isNumber(marker.at) && (marker.at as number) >= 0 && typeof marker.text === "string";
+  const checks: { [K in keyof NonNullable<TimeBucketView["blocks"][number]["userMessages"]>[number]]-?: () => boolean } = {
+    at: () => (isNumber(marker.at)) && ((marker.at as number) >= 0),
+    text: () => typeof marker.text === "string",
+  };
+  return Object.values(checks).every(check => check());
 }
 
 function isPlanBlockMetrics(v: unknown): boolean {
   if (typeof v !== "object" || v === null || Array.isArray(v)) return false;
   const m = v as Record<string, unknown>;
   const duration = (x: unknown) => x === null || isNumber(x) && (x as number) >= 0;
-  const tokens = m.tokens as Record<string, unknown> | null;
-  return (m.provisional === undefined || typeof m.provisional === "boolean") &&
-    [m.generateMs, m.toolMs, m.subagentWaitMs, m.subagentOnlyMs, m.decisionWaitMs, m.replyWaitMs].every(duration) &&
-    (tokens === null || typeof tokens === "object" && !Array.isArray(tokens) && tokens !== null &&
-      isNumber(tokens.tokens) && (tokens.tokens as number) >= 0 && isNumber(tokens.cacheRead) && (tokens.cacheRead as number) >= 0);
+  return (
+    (m.provisional === undefined || typeof m.provisional === "boolean") &&
+    duration(m.generateMs) &&
+    duration(m.toolMs) &&
+    duration(m.subagentWaitMs) &&
+    duration(m.subagentOnlyMs) &&
+    duration(m.decisionWaitMs) &&
+    duration(m.replyWaitMs) &&
+    (m.tokens === null || isPlanTokenTotal(m.tokens))
+  );
 }
 
 function isPlanBlockStep(v: unknown): boolean {
   if (!isPlanBlockMetrics(v)) return false;
   const step = v as Record<string, unknown>;
   const at = (x: unknown) => x === null || isNumber(x) && (x as number) >= 0;
-  return typeof step.key === "string" && typeof step.title === "string" &&
+  return (
+    typeof step.key === "string" &&
+    Number.isSafeInteger(step.number) &&
+    (step.number as number) >= 0 &&
+    typeof step.title === "string" &&
     ["unknown", "pending", "in_progress", "completed"].includes(step.status as string) &&
-    typeof step.removed === "boolean" && typeof step.longest === "boolean" &&
+    typeof step.removed === "boolean" &&
+    typeof step.longest === "boolean" &&
     (step.parallel === undefined || typeof step.parallel === "boolean") &&
-    [step.startedAt, step.endedAt, step.end, step.durationMs].every(at) &&
-    (step.startedAt === null || step.end === null || (step.end as number) >= (step.startedAt as number));
+    (step.conductorIntervals === undefined || isArrayOf(step.conductorIntervals, isTimeIntervalView)) &&
+    (step.conductorTail === undefined || at(step.conductorTail)) &&
+    at(step.startedAt) &&
+    at(step.endedAt) &&
+    at(step.end) &&
+    at(step.durationMs) &&
+    (step.activeSpans === undefined || isArrayOf(step.activeSpans, isPlanSpan)) &&
+    (step.startedAt === null || step.end === null || (step.end as number) >= (step.startedAt as number))
+  );
 }
 
 function isMainModelTimeEntry(v: unknown): boolean {
@@ -2784,11 +2907,13 @@ function isMainModelTimeEntry(v: unknown): boolean {
     (e.kind === "model" || e.kind === "other" || e.kind === "unknown") &&
     typeof e.label === "string" &&
     isNullableString(e.model) &&
-    (e.kind === "model") === (typeof e.model === "string") &&
     isNullableNumber(e.foldedModelCount) &&
-    (e.kind === "other") === (typeof e.foldedModelCount === "number") &&
-    isNumber(e.generateMs) && (e.generateMs as number) >= 0 &&
-    isNullableNumber(e.share) && isNullableNumber(e.percent)
+    isNumber(e.generateMs) &&
+    (e.generateMs as number) >= 0 &&
+    isNullableNumber(e.share) &&
+    isNullableNumber(e.percent) &&
+    (e.kind === "model") === (typeof e.model === "string") &&
+    (e.kind === "other") === (typeof e.foldedModelCount === "number")
   );
 }
 
@@ -2807,7 +2932,8 @@ function isRoleRunView(v: unknown): boolean {
   if (typeof v !== "object" || v === null) return false;
   const r = v as Record<string, unknown>;
   return (
-    (r.source === "subagent" || r.source === "external") &&
+    (r.source === "subagent" || r.source === "external" || r.source === "conductor") &&
+    isNullableString(r.blockId) && isOptionalString(r.toolUseId) && isNullableNumber(r.cacheRead) && isNullableNumber(r.outputTokens) && isTokenDisplay(r.tokenDisplay) &&
     typeof r.name === "string" &&
     typeof r.executor === "string" &&
     isNullableString(r.model) && isValueSource(r.modelSource) &&
@@ -2818,7 +2944,10 @@ function isRoleRunView(v: unknown): boolean {
     typeof r.running === "boolean" &&
     (r.outcome === null || ["ok", "failed", "timeout", "refused", "stopped"].includes(r.outcome as string)) &&
     isNullableNumber(r.durationMs) && isNullableNumber(r.tokens) &&
-    isNullableNumber(r.timePercent) && isNullableNumber(r.tokenPercent)
+    (r.durationPartial === undefined || typeof r.durationPartial === "boolean") &&
+    (r.tokensPartial === undefined || typeof r.tokensPartial === "boolean") &&
+    isNullableNumber(r.timePercent) && isNullableNumber(r.tokenPercent) &&
+    (r.count === undefined || Number.isSafeInteger(r.count) && (r.count as number) > 0)
   );
 }
 
@@ -2828,20 +2957,42 @@ function isRoleSummaryView(v: unknown): v is RoleSummaryView {
   const coverage = s.externalRunsCoverage as Record<string, unknown> | undefined;
   return (
     isNumber(s.omittedSubagentCount) &&
-    (coverage === undefined || (typeof coverage === "object" && coverage !== null &&
-      isNumber(coverage.unreadableLines) && (coverage.unreadableLines as number) >= 0 && typeof coverage.readError === "boolean")) &&
-    isArrayOf(s.roles, (role) => {
-      if (typeof role !== "object" || role === null) return false;
-      const r = role as Record<string, unknown>;
-      return (
-        isNullableString(r.role) && typeof r.label === "string" && isNumber(r.count) &&
-        isNullableNumber(r.totalMs) && typeof r.totalMsPartial === "boolean" &&
-        isNullableNumber(r.totalTokens) && typeof r.totalTokensPartial === "boolean" && typeof r.running === "boolean" &&
-        isNullableNumber(r.timeWidthPercent) && isNullableNumber(r.tokenWidthPercent) &&
-        isArrayOf(r.runs, isRoleRunView)
-      );
-    })
+    (coverage === undefined || isRoleExternalRunsCoverage(coverage)) &&
+    isArrayOf(s.roles, isRoleView)
   );
+}
+
+function isTokenDisplay(v: unknown): boolean {
+  if (typeof v !== "object" || v === null) return false;
+  const t = v as Record<string, unknown>;
+  return isNullableNumber(t.total) && isNullableNumber(t.cacheRead) && typeof t.label === "string" &&
+    isNullableNumber(t.newPercent) && isNullableNumber(t.cachePercent) && isNullableNumber(t.cacheBarPercent) && isNullableNumber(t.outputTokens);
+}
+
+function isAnalysisTimeView(v: unknown): boolean {
+  if (typeof v !== "object" || v === null) return false;
+  const t = v as Record<string, unknown>;
+  return isNullableNumber(t.totalMs) && typeof t.partial === "boolean" && Array.isArray(t.parts) && t.parts.length === 6 &&
+    t.parts.every(part => typeof part === "object" && part !== null && isNullableNumber(part.ms) && isNullableNumber(part.percent) &&
+      (part.partial === undefined || typeof part.partial === "boolean"));
+}
+
+function isAnalysisPlansView(v: unknown): v is AnalysisPlansView {
+  if (typeof v !== "object" || v === null) return false;
+  const a = v as Record<string, unknown>;
+  const keys = new Set<string>();
+  return isAnalysisTimeView(a.time) && isNullableNumber(a.mainTokens) && isTokenDisplay(a.tokens) && isRoleSummaryView(a.roles) && isFailureSummaryView(a.failures) &&
+    isArrayOf(a.plans, value => {
+      if (typeof value !== "object" || value === null) return false;
+      const p = value as Record<string, unknown>;
+      if (typeof p.key !== "string" || keys.has(p.key)) return false;
+      keys.add(p.key);
+      return typeof p.key === "string" && typeof p.blockId === "string" && isOptionalString(p.stepKey) &&
+        typeof p.title === "string" && typeof p.number === "string" && /^\d{2,}$/.test(p.number) &&
+        isNullableNumber(p.start) && isNullableNumber(p.end) && typeof p.running === "boolean" && typeof p.provisional === "boolean" && isAnalysisTimeView(p.time) &&
+        isNullableNumber(p.timeWidthPercent) && isNullableNumber(p.tokenWidthPercent) && isTokenDisplay(p.tokens) &&
+        typeof p.tokensPartial === "boolean" && isRoleSummaryView(p.roles) && isFailureSummaryView(p.failures);
+    });
 }
 
 function isFailureKindView(v: unknown): boolean {
@@ -3183,11 +3334,7 @@ export function isWebviewToHost(v: unknown): v is WebviewToHost {
   if (t === "ready") {
     const c = (v as { cursor?: unknown }).cursor;
     if (c === null || c === undefined) return true;
-    return (
-      typeof c === "object" &&
-      typeof (c as { generation?: unknown }).generation === "number" &&
-      typeof (c as { seq?: unknown }).seq === "number"
-    );
+    return isReadyCursor(c);
   }
   if (t === "webviewDiagnostic") {
     const diagnostic = v as { kind?: unknown; message?: unknown };
@@ -3205,9 +3352,8 @@ export function isWebviewToHost(v: unknown): v is WebviewToHost {
   }
   if (t === "setModel") {
     const model = (v as { model?: unknown }).model;
-    const sessionOnly = (v as { sessionOnly?: unknown }).sessionOnly;
     return (
-      (sessionOnly === undefined || typeof sessionOnly === "boolean") &&
+      hasOnlyKeys(v as Record<string, unknown>, ["type", "tabId", "model"]) &&
       typeof tabId === "string" &&
       (model === null || (typeof model === "string" && model.trim() !== "" && model.length <= 100))
     );
@@ -3305,13 +3451,7 @@ export function isWebviewToHost(v: unknown): v is WebviewToHost {
         typeof message.cursor === "string" && message.cursor.length > 0 && message.cursor.length <= 512
       );
     }
-    if (typeof message.anchor !== "object" || message.anchor === null) return false;
-    const anchor = message.anchor as Record<string, unknown>;
-    return (
-      Object.keys(anchor).length === 2 &&
-      Number.isInteger(anchor.generation) &&
-      Number.isInteger(anchor.seq)
-    );
+    return isHistoryRequestAnchor(message.anchor);
   }
   if (t === "worklogTranscriptRequest") {
     const message = v as Record<string, unknown>;
@@ -3334,13 +3474,7 @@ export function isWebviewToHost(v: unknown): v is WebviewToHost {
       );
     }
     if (message.anchor !== undefined) {
-      if (typeof message.anchor !== "object" || message.anchor === null) return false;
-      const anchor = message.anchor as Record<string, unknown>;
-      return (
-        Object.keys(anchor).length === 2 &&
-        Number.isInteger(anchor.generation) &&
-        Number.isInteger(anchor.seq)
-      );
+      return isHistoryRequestAnchor(message.anchor);
     }
     return true;
   }
@@ -3421,16 +3555,7 @@ export function isWebviewToHost(v: unknown): v is WebviewToHost {
     if (hasRef) {
       return isSessionImageRef(message.ref);
     }
-    if (typeof message.inline !== "object" || message.inline === null) return false;
-    const inl = message.inline as Record<string, unknown>;
-    const inlineAllowed = new Set(["mediaType", "data"]);
-    return (
-      Object.keys(inl).every((key) => inlineAllowed.has(key)) &&
-      ALLOWED_IMAGE_MEDIA_TYPES.includes(inl.mediaType as ImageAttachment["mediaType"]) &&
-      typeof inl.data === "string" &&
-      inl.data.length > 0 &&
-      inl.data.length <= IMAGE_MAX_BASE64_LEN
-    );
+    return isInlineSessionImage(message.inline);
   }
   if (t === "artifact/preview") {
     const message = v as { lang?: unknown; content?: unknown; artifactId?: unknown };
@@ -3634,27 +3759,31 @@ function isAgentInspectorPage(value: unknown): value is AgentInspectorPage {
   if (!isAgentInspectorCoverage(page.coverage)) return false;
   if (page.nextCursor !== undefined && typeof page.nextCursor !== "string") return false;
   if (page.section === "overview") {
-    if (typeof page.overview !== "object" || page.overview === null) return false;
-    const overview = page.overview as Record<string, unknown>;
-    return typeof overview.description === "string" && typeof overview.instruction === "string";
+    return isAgentInspectorOverview(page.overview);
   }
   if (page.section === "tools") {
-    return isArrayOf(page.tools, (item) => {
-      if (typeof item !== "object" || item === null) return false;
-      const tool = item as Record<string, unknown>;
-      return typeof tool.toolUseId === "string" && typeof tool.toolName === "string" &&
-        typeof tool.inputPreview === "string" && isOptionalString(tool.resultPreview) &&
-        (tool.backgroundLaunch === undefined || tool.backgroundLaunch === true);
-    });
+    return isArrayOf(page.tools, isAgentInspectorToolItem);
   }
   if (page.section === "messages") {
-    return isArrayOf(page.messages, (item) => {
-      if (typeof item !== "object" || item === null) return false;
-      const message = item as Record<string, unknown>;
-      return (message.role === "user" || message.role === "assistant") && typeof message.text === "string";
-    });
+    return isArrayOf(page.messages, isAgentInspectorMessageItem);
   }
   return page.section === "report" && typeof page.text === "string";
+}
+
+function isAgentInspectorToolItem(value: unknown): boolean {
+  if (typeof value !== "object" || value === null) return false;
+  const tool = value as Record<string, unknown>;
+  const checks: { [K in keyof AgentInspectorToolItem]-?: () => boolean } = {
+    toolUseId: () => typeof tool.toolUseId === "string",
+    toolName: () => typeof tool.toolName === "string",
+    inputPreview: () => typeof tool.inputPreview === "string",
+    resultPreview: () => isOptionalString(tool.resultPreview),
+    backgroundLaunch: () => tool.backgroundLaunch === undefined || tool.backgroundLaunch === true,
+    timestamp: () => true,
+    inputSummary: () => true,
+    isError: () => true,
+  };
+  return Object.values(checks).every(check => check());
 }
 
 function isHistoryChunkCoverage(value: unknown): value is HistoryChunkCoveragePayload {
@@ -3669,10 +3798,12 @@ function isHistoryChunkCoverage(value: unknown): value is HistoryChunkCoveragePa
 function isHistoryChunkPage(value: unknown): value is HistoryChunkPagePayload {
   if (typeof value !== "object" || value === null) return false;
   const page = value as Record<string, unknown>;
-  if (!isHistoryChunkCoverage(page.coverage)) return false;
-  if (page.nextCursor !== undefined && typeof page.nextCursor !== "string") return false;
-  if (typeof page.hasMore !== "boolean") return false;
-  return isArrayOf(page.items, isPlausibleNormalizedEvent);
+  return (
+    isHistoryChunkCoverage(page.coverage) &&
+    isOptionalString(page.nextCursor) &&
+    typeof page.hasMore === "boolean" &&
+    isArrayOf(page.items, isPlausibleNormalizedEvent)
+  );
 }
 
 export const ALLOWED_IMAGE_MEDIA_TYPES: readonly ImageAttachment["mediaType"][] = [
@@ -3727,19 +3858,15 @@ const CONVERSATION_ITEMS_MAX = 500;
 function isRestoredApprovalCard(value: unknown): boolean {
   if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
   const card = value as Record<string, unknown>;
-  if (typeof card.requestId !== "string" || !card.requestId || typeof card.toolName !== "string" ||
-    typeof card.inputJson !== "string" || !["answered", "allowed", "denied", "withdrawn", "failed", "unknown"].includes(String(card.resolution))) return false;
-  if (card.answers !== undefined && (typeof card.answers !== "object" || card.answers === null || Array.isArray(card.answers) ||
-    !Object.values(card.answers).every((answer) => typeof answer === "string"))) return false;
-  if (card.questions !== undefined) {
-    const spec = card.questions as AskUserQuestionSpec;
-    if (typeof spec !== "object" || spec === null || !Array.isArray(spec.questions) || !spec.questions.every((q) =>
-      typeof q === "object" && q !== null && typeof q.question === "string" && typeof q.multiSelect === "boolean" &&
-      (q.header === undefined || typeof q.header === "string") && Array.isArray(q.options) && q.options.every((option) =>
-        typeof option === "object" && option !== null && typeof option.label === "string" &&
-        (option.description === undefined || typeof option.description === "string")))) return false;
-  }
-  return true;
+  return (
+    typeof card.requestId === "string" &&
+    !!card.requestId &&
+    typeof card.toolName === "string" &&
+    typeof card.inputJson === "string" &&
+    ["answered", "allowed", "denied", "withdrawn", "failed", "unknown"].includes(String(card.resolution)) &&
+    (card.answers === undefined || typeof card.answers === "object" && card.answers !== null && !Array.isArray(card.answers) && Object.values(card.answers).every(answer => typeof answer === "string")) &&
+    (card.questions === undefined || isRestoredQuestionSpec(card.questions))
+  );
 }
 
 function isConversationHistoryMessage(value: unknown): boolean {
@@ -3759,21 +3886,14 @@ function isConversationHistoryMessage(value: unknown): boolean {
 function isConversationHistoryPage(value: unknown): boolean {
   if (typeof value !== "object" || value === null) return false;
   const page = value as Record<string, unknown>;
-  const coverage = page.coverage as Record<string, unknown> | undefined;
-  if (typeof coverage !== "object" || coverage === null) return false;
-  if (
-    typeof coverage.returnedCount !== "number" ||
-    typeof coverage.remainingOlderCount !== "number" ||
-    typeof coverage.oldestReached !== "boolean"
-  ) {
-    return false;
-  }
-  if (coverage.malformedLineCount !== undefined && !isNumber(coverage.malformedLineCount)) return false;
-  if (coverage.droppedWithoutUuidCount !== undefined && !isNumber(coverage.droppedWithoutUuidCount)) return false;
-  if (page.nextCursor !== undefined && typeof page.nextCursor !== "string") return false;
-  if (typeof page.hasMore !== "boolean") return false;
-  if (!Array.isArray(page.items) || page.items.length > CONVERSATION_ITEMS_MAX) return false;
-  return (page.items as unknown[]).every(isConversationHistoryMessage);
+  return (
+    isConversationHistoryCoverage(page.coverage) &&
+    isOptionalString(page.nextCursor) &&
+    typeof page.hasMore === "boolean" &&
+    Array.isArray(page.items) &&
+    page.items.length <= CONVERSATION_ITEMS_MAX &&
+    page.items.every(isConversationHistoryMessage)
+  );
 }
 
 function isWorkTaskItemView(item: unknown): boolean {
@@ -3803,49 +3923,12 @@ function isWorkTaskTotalsView(item: unknown): boolean {
 export function isWorkEventInfo(v: unknown): v is WorkEventInfo {
   if (typeof v !== "object" || v === null) return false;
   const info = v as Record<string, unknown>;
-  if (!isNumber(info.revision)) return false;
-  if (info.currentSegmentId !== undefined && info.currentSegmentId !== null) {
-    if (typeof info.currentSegmentId !== "string") return false;
-  }
-  if (info.placement !== undefined) {
-    if (typeof info.placement !== "object" || info.placement === null) return false;
-    const placement = info.placement as Record<string, unknown>;
-    if (typeof placement.phaseId !== "string" || typeof placement.counted !== "boolean") return false;
-    if (!isOptionalString(placement.segmentId) || !isOptionalString(placement.taskKey)) return false;
-    if (!isOptionalString(placement.ownerToolUseId)) return false;
-  }
   return (
-    isOptionalArrayOf(info.segments, (item) => {
-      if (typeof item !== "object" || item === null) return false;
-      const segment = item as Record<string, unknown>;
-      return (
-        typeof segment.segmentId === "string" &&
-        typeof segment.phaseId === "string" &&
-        isOptionalString(segment.taskKey) &&
-        isNumber(segment.toolCount) &&
-        isNumber(segment.failCount) &&
-        isNumber(segment.childFailCount) &&
-        isNumber(segment.elapsedMs) &&
-        isNumber(segment.runningCount) &&
-        isNumber(segment.staleCount) &&
-        isNumber(segment.revision)
-      );
-    }) &&
-    isOptionalArrayOf(info.agents, (item) => {
-      if (typeof item !== "object" || item === null) return false;
-      const agent = item as Record<string, unknown>;
-      return (
-        typeof agent.toolUseId === "string" &&
-        (agent.runStartedAt === undefined || isNumber(agent.runStartedAt)) &&
-        (WORK_STATUSES as string[]).includes(agent.status as string) &&
-        isNumber(agent.childCount) &&
-        isNumber(agent.failCount) &&
-        isNumber(agent.elapsedMs) &&
-        (agent.tokens === undefined || isNumber(agent.tokens)) &&
-        isOptionalString(agent.modelMeasured) &&
-        isNumber(agent.revision)
-      );
-    }) &&
+    isNumber(info.revision) &&
+    (info.currentSegmentId === undefined || info.currentSegmentId === null || typeof info.currentSegmentId === "string") &&
+    (info.placement === undefined || isWorkPlacementView(info.placement)) &&
+    isOptionalArrayOf(info.segments, isWorkSegmentView) &&
+    isOptionalArrayOf(info.agents, isWorkAgentStateView) &&
     isOptionalArrayOf(info.taskTotals, isWorkTaskTotalsView) &&
     isOptionalArrayOf(info.tasks, isWorkTaskItemView) &&
     isOptionalArrayOf(info.staled, (item) => typeof item === "string") &&
@@ -3919,32 +4002,24 @@ function isResumePreviewMessage(value: unknown): value is ResumePreviewMessage {
   if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
   const message = value as Record<string, unknown>;
   return (
-    hasOnlyKeys(message, ["uuid", "role", "text", "imageRefs", "model"]) &&
     typeof message.uuid === "string" &&
     (message.role === "user" || message.role === "assistant") &&
     typeof message.text === "string" &&
     (message.imageRefs === undefined || isImageRefInfoArray(message.imageRefs)) &&
-    (message.model === undefined || (typeof message.model === "string" && message.model.length > 0))
+    (message.model === undefined || (typeof message.model === "string" && message.model.length > 0)) &&
+    hasOnlyKeys(message, ["uuid", "role", "text", "imageRefs", "model"])
   );
 }
 
 function isResumeHydrationSnapshotState(value: unknown): value is ResumeHydrationSnapshotState {
   if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
   const state = value as Record<string, unknown>;
-  if (!hasOnlyKeys(state, ["phase", "previewMessages", "failureReason"])) return false;
-  if (state.phase !== "loading" && state.phase !== "complete" && state.phase !== "failed") return false;
-  if (
-    state.previewMessages !== undefined &&
-    (!Array.isArray(state.previewMessages) ||
-      state.previewMessages.length > RESUME_PREVIEW_MESSAGE_MAX ||
-      !state.previewMessages.every(isResumePreviewMessage))
-  ) {
-    return false;
-  }
-  if (state.failureReason !== undefined) {
-    return state.phase === "failed" && typeof state.failureReason === "string";
-  }
-  return true;
+  return (
+    (state.phase === "loading" || state.phase === "complete" || state.phase === "failed") &&
+    (state.previewMessages === undefined || Array.isArray(state.previewMessages) && state.previewMessages.length <= RESUME_PREVIEW_MESSAGE_MAX && state.previewMessages.every(isResumePreviewMessage)) &&
+    (state.failureReason === undefined || state.phase === "failed" && typeof state.failureReason === "string") &&
+    hasOnlyKeys(state, ["phase", "previewMessages", "failureReason"])
+  );
 }
 
 function isResumeHydrationStateMessage(value: Record<string, unknown>): boolean {
@@ -3987,38 +4062,8 @@ function isResumeHydrationStateMessage(value: Record<string, unknown>): boolean 
       return false;
     }
   }
-  if (hasDisplayEvent) {
-    if (typeof value.displayEvent !== "object" || value.displayEvent === null || Array.isArray(value.displayEvent)) {
-      return false;
-    }
-    const displayEvent = value.displayEvent as Record<string, unknown>;
-    if (
-      !hasOnlyKeys(displayEvent, ["journalEventId", "event"]) ||
-      typeof displayEvent.journalEventId !== "string" ||
-      !isPlausibleNormalizedEvent(displayEvent.event)
-    ) {
-      return false;
-    }
-  }
-  if (hasSendDisposition) {
-    if (
-      typeof value.sendDisposition !== "object" ||
-      value.sendDisposition === null ||
-      Array.isArray(value.sendDisposition)
-    ) {
-      return false;
-    }
-    const disposition = value.sendDisposition as Record<string, unknown>;
-    if (
-      !hasOnlyKeys(disposition, ["clientToken", "disposition"]) ||
-      typeof disposition.clientToken !== "string" ||
-      (disposition.disposition !== "accepted-human" &&
-        disposition.disposition !== "accepted-nonhuman" &&
-        disposition.disposition !== "rejected")
-    ) {
-      return false;
-    }
-  }
+  if (hasDisplayEvent && !isResumeDisplayEvent(value.displayEvent)) return false;
+  if (hasSendDisposition && !isResumeSendDisposition(value.sendDisposition)) return false;
   return true;
 }
 
@@ -4037,82 +4082,23 @@ function isHeadOmitted(v: unknown): boolean {
 function isBackgroundActivitySnapshot(v: unknown): boolean {
   if (typeof v !== "object" || v === null || Array.isArray(v)) return false;
   const a = v as Record<string, unknown>;
-  const listOf = (x: unknown, item: (y: unknown) => boolean): boolean =>
-    Array.isArray(x) && x.length <= BACKGROUND_ACTIVITY_LIST_MAX && x.every(item);
-  const record = (y: unknown): y is Record<string, unknown> =>
-    typeof y === "object" && y !== null && !Array.isArray(y);
   return (
-    hasOnlyKeys(a, ["tasks", "finishedTaskIds", "lifecycleSeenIds", "delegations"]) &&
-    listOf(a.tasks, (t) =>
-      record(t) &&
-      hasOnlyKeys(t, ["id", "type", "description", "ambient"]) &&
-      typeof t.id === "string" &&
-      typeof t.type === "string" &&
-      typeof t.description === "string" &&
-      (t.ambient === undefined || t.ambient === true)
-    ) &&
-    listOf(a.finishedTaskIds, (id) => typeof id === "string") &&
-    listOf(a.lifecycleSeenIds, (id) => typeof id === "string") &&
-    listOf(a.delegations, (d) =>
-      record(d) &&
-      hasOnlyKeys(d, ["toolUseId", "label", "agentId", "running", "background"]) &&
-      typeof d.toolUseId === "string" &&
-      typeof d.label === "string" &&
-      (d.agentId === undefined || typeof d.agentId === "string") &&
-      typeof d.running === "boolean" &&
-      typeof d.background === "boolean"
-    )
+    isBackgroundActivityList(a.tasks, isBackgroundTaskSnapshot) &&
+    isBackgroundActivityList(a.finishedTaskIds, id => typeof id === "string") &&
+    isBackgroundActivityList(a.lifecycleSeenIds, id => typeof id === "string") &&
+    isBackgroundActivityList(a.delegations, isBackgroundDelegationSnapshot) &&
+    hasOnlyKeys(a, ["tasks", "finishedTaskIds", "lifecycleSeenIds", "delegations"])
   );
 }
 
 function isTabSnapshotShape(x: unknown): x is TabSnapshot {
   if (typeof x !== "object" || x === null) return false;
-  const t = x as { tabId?: unknown; title?: unknown; state?: unknown; deferred?: unknown };
-  if (typeof t.tabId !== "string" || typeof t.title !== "string") return false;
-  if (t.deferred !== undefined && t.deferred !== true) return false;
-  if (typeof t.state !== "object" || t.state === null) return false;
-  const s = t.state as Record<string, unknown>;
+  const t = x as Record<string, unknown>;
   return (
-    (s.conversationId === null || typeof s.conversationId === "string") &&
-    typeof s.cwd === "string" &&
-    (s.turnState === "idle" || s.turnState === "running" || s.turnState === "interrupting") &&
-    (s.auth === null || typeof s.auth === "object") &&
-    (PERMISSION_MODES as string[]).includes(s.permissionMode as string) &&
-    (s.workModel === undefined || isWorkModelPayload(s.workModel)) &&
-    (s.planUsage === undefined || isPlanUsage(s.planUsage)) &&
-    (s.semanticView === undefined || typeof s.semanticView === "boolean") &&
-    (s.semanticModel === undefined || isSemanticModelPayload(s.semanticModel)) &&
-    (s.effortOverride === undefined || s.effortOverride === null || typeof s.effortOverride === "string") &&
-    (s.defaultEffort === undefined || typeof s.defaultEffort === "string") &&
-    (s.appliedModel === undefined || typeof s.appliedModel === "string") &&
-    (s.modelFallback === undefined || (isProfileObject(s.modelFallback) &&
-      isPlausibleNormalizedEvent(s.modelFallback.notice) && s.modelFallback.notice.kind === "model_refusal_fallback" &&
-      s.modelFallback.notice.scope === "session" && typeof s.modelFallback.appliedModel === "string" &&
-      (s.modelFallback.resolvedAt === undefined || isNumber(s.modelFallback.resolvedAt)) &&
-      (s.modelFallback.reopenedAt === undefined || isNumber(s.modelFallback.reopenedAt)) &&
-      (s.modelFallback.turnOriginalModel === undefined || typeof s.modelFallback.turnOriginalModel === "string") &&
-      (s.modelFallback.autoRevert === undefined ||
-        ([...FALLBACK_AUTO_REVERT_STARTS, ...FALLBACK_REVERT_OUTCOMES] as readonly unknown[]).includes(s.modelFallback.autoRevert)))) &&
-    (s.appliedEffort === undefined || s.appliedEffort === null ||
-      (typeof s.appliedEffort === "string" && ["low", "medium", "high", "xhigh", "max"].includes(s.appliedEffort))) &&
-    (s.recordedModel === undefined || typeof s.recordedModel === "string") &&
-    (s.llmAnalysisEnabled === undefined || typeof s.llmAnalysisEnabled === "boolean") &&
-    (s.llmAnalysisRunning === undefined || typeof s.llmAnalysisRunning === "boolean") &&
-    (s.llmAnalysisProgress === undefined ||
-      (s.llmAnalysisRunning === true && isLlmAnalysisRunProgress(s.llmAnalysisProgress))) &&
-    (s.sessionSummary === undefined ||
-      (typeof s.sessionSummary === "object" && s.sessionSummary !== null &&
-        typeof (s.sessionSummary as { text?: unknown }).text === "string" &&
-        typeof (s.sessionSummary as { model?: unknown }).model === "string")) &&
-    (s.sessionSummaryRunning === undefined || typeof s.sessionSummaryRunning === "boolean") &&
-    (s.llmDiagnostics === undefined || typeof s.llmDiagnostics === "boolean") &&
-    (s.resumeHydration === undefined || isResumeHydrationSnapshotState(s.resumeHydration)) &&
-    (s.headOmitted === undefined || isHeadOmitted(s.headOmitted)) &&
-    (s.backgroundActivity === undefined || isBackgroundActivitySnapshot(s.backgroundActivity)) &&
-    (s.autoResumeAt === undefined || s.autoResumeAt === null || isNumber(s.autoResumeAt)) &&
-    (s.handoffSource === undefined || isHandoffSource(s.handoffSource)) &&
-    Array.isArray(s.events) &&
-    (s.events as unknown[]).every(isPlausibleNormalizedEvent)
+    typeof t.tabId === "string" &&
+    typeof t.title === "string" &&
+    (t.deferred === undefined || t.deferred === true) &&
+    isConversationSnapshot(t.state)
   );
 }
 
@@ -4159,18 +4145,7 @@ const DECISION_TAG_VALUES: readonly string[] = ["GOAL", "KILLED", "DECIDED", "DR
 function isDecisionEntryList(v: unknown): v is HandoffDecisionEntry[] {
   return (
     Array.isArray(v) &&
-    v.every((item) => {
-      if (typeof item !== "object" || item === null) return false;
-      const e = item as Record<string, unknown>;
-      return (
-        typeof e.id === "string" &&
-        e.id.length > 0 &&
-        typeof e.t === "string" &&
-        DECISION_TAG_VALUES.includes(e.t) &&
-        isNonNegativeInt(e.g) &&
-        typeof e.s === "string"
-      );
-    })
+    v.every(isHandoffDecisionEntry)
   );
 }
 
@@ -4217,10 +4192,12 @@ export function isHandoffContextMeasurement(value: unknown): value is HandoffCon
 export function isHandoffContextUsage(value: unknown): value is HandoffContextUsage {
   if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
   const context = value as Record<string, unknown>;
-  return Object.prototype.hasOwnProperty.call(context, "before") &&
+  return (
     (context.before === null || isHandoffContextMeasurement(context.before)) &&
     (context.after === undefined || context.after === null || context.after === "pending" ||
-      isHandoffContextMeasurement(context.after));
+    isHandoffContextMeasurement(context.after)) &&
+    Object.prototype.hasOwnProperty.call(context, "before")
+  );
 }
 
 function isHandoffCompactStats(value: unknown): value is HandoffCompactStats | undefined {
@@ -4332,23 +4309,12 @@ export function isHostToWebview(v: unknown): v is HostToWebview {
       typeof m.message === "string" &&
       (m.phase === undefined || typeof m.phase === "string") &&
       (progress === undefined ||
-        (typeof progress === "object" &&
-          progress !== null &&
-          typeof progress.heartbeats === "number" &&
-          typeof progress.elapsedMs === "number" &&
-          (progress.since === "compact_start" || progress.since === "result"))) &&
+        isHandoffStatusProgress(progress)) &&
       (m.reason === undefined || typeof m.reason === "string") &&
       (m.detail === undefined || typeof m.detail === "string") &&
-      typeof source === "object" &&
-      source !== null &&
-      typeof source.sessionId === "string" &&
-      typeof source.title === "string" &&
+      isHandoffStatusSource(source) &&
       (fork === undefined ||
-        (typeof fork === "object" &&
-          fork !== null &&
-          typeof fork.sessionId === "string" &&
-          typeof fork.tabId === "string" &&
-          typeof fork.title === "string")) &&
+        isHandoffStatusFork(fork)) &&
       isHandoffCompactStats(m.compact) &&
       (m.contextUsage === undefined || isHandoffContextUsage(m.contextUsage)) &&
       (m.utteranceCount === undefined || typeof m.utteranceCount === "number") &&
@@ -4370,20 +4336,7 @@ export function isHostToWebview(v: unknown): v is HostToWebview {
       m.total >= 0 &&
       (m.summary === undefined || typeof m.summary === "string") &&
       Array.isArray(utterances) &&
-      utterances.every((u) => {
-        const item = u as Record<string, unknown>;
-        return (
-          typeof item === "object" &&
-          item !== null &&
-          typeof item.n === "number" &&
-          typeof item.at === "string" &&
-          (item.kind === "typed" || item.kind === "answer") &&
-          typeof item.text === "string" &&
-          (item.questions === undefined ||
-            (Array.isArray(item.questions) && item.questions.every((q) => typeof q === "string"))) &&
-          (item.imageRefs === undefined || isImageRefInfoArray(item.imageRefs))
-        );
-      }) &&
+      utterances.every(isHandoffUtterance) &&
       isHandoffDecisions(m.decisions)
     );
   }
@@ -4399,11 +4352,7 @@ export function isHostToWebview(v: unknown): v is HostToWebview {
       typeof tabId === "string" &&
       Array.isArray(commands) &&
       (commands as unknown[]).every(
-        (c) =>
-          typeof c === "object" &&
-          c !== null &&
-          typeof (c as { name?: unknown }).name === "string" &&
-          typeof (c as { description?: unknown }).description === "string"
+        isSlashCommandInfo
       )
     );
   }
@@ -4413,13 +4362,7 @@ export function isHostToWebview(v: unknown): v is HostToWebview {
       typeof tabId === "string" &&
       Array.isArray(models) &&
       (models as unknown[]).every(
-        (m) =>
-          typeof m === "object" &&
-          m !== null &&
-          typeof (m as { id?: unknown }).id === "string" &&
-          typeof (m as { label?: unknown }).label === "string" &&
-          typeof (m as { description?: unknown }).description === "string" &&
-          ((m as { olderVersion?: unknown }).olderVersion === undefined || typeof (m as { olderVersion?: unknown }).olderVersion === "boolean")
+        isModelInfo
       )
     );
   }
@@ -4471,14 +4414,7 @@ export function isHostToWebview(v: unknown): v is HostToWebview {
       Array.isArray(images) &&
       images.length <= IMAGE_MAX_COUNT &&
       (images as unknown[]).every(
-        (im) =>
-          typeof im === "object" &&
-          im !== null &&
-          ["image/png", "image/jpeg", "image/gif", "image/webp"].includes(
-            (im as { mediaType?: unknown }).mediaType as string
-          ) &&
-          typeof (im as { data?: unknown }).data === "string" &&
-          (im as { data: string }).data.length <= IMAGE_MAX_BASE64_LEN
+        isPickedImageAttachment
       )
     );
   }
@@ -4489,16 +4425,7 @@ export function isHostToWebview(v: unknown): v is HostToWebview {
       Array.isArray(items) &&
       items.length <= IMAGE_MAX_COUNT &&
       (items as unknown[]).every(
-        (it) =>
-          typeof it === "object" &&
-          it !== null &&
-          typeof (it as { id?: unknown }).id === "string" &&
-          ATTACHMENT_ID_RE.test((it as { id: string }).id) &&
-          ALLOWED_IMAGE_MEDIA_TYPES.includes(
-            (it as { mediaType?: unknown }).mediaType as ImageAttachment["mediaType"]
-          ) &&
-          typeof (it as { data?: unknown }).data === "string" &&
-          (it as { data: string }).data.length <= IMAGE_MAX_BASE64_LEN
+        isPendingAttachmentInfo
       )
     );
   }
@@ -4533,16 +4460,7 @@ export function isHostToWebview(v: unknown): v is HostToWebview {
       isSessionScanDegradation((v as { degraded?: unknown }).degraded) &&
       Array.isArray(sessions) &&
       (sessions as unknown[]).every(
-        (s) =>
-          typeof s === "object" &&
-          s !== null &&
-          typeof (s as { sessionId?: unknown }).sessionId === "string" &&
-          typeof (s as { filePath?: unknown }).filePath === "string" &&
-          typeof (s as { title?: unknown }).title === "string" &&
-          typeof (s as { cwd?: unknown }).cwd === "string" &&
-          typeof (s as { mtime?: unknown }).mtime === "number" &&
-          ((s as { originUnverified?: unknown }).originUnverified === undefined || typeof (s as { originUnverified?: unknown }).originUnverified === "boolean") &&
-          ((s as { hidden?: unknown }).hidden === undefined || typeof (s as { hidden?: unknown }).hidden === "boolean")
+        isSessionListItem
       )
     );
   }
@@ -4596,13 +4514,13 @@ export function isHostToWebview(v: unknown): v is HostToWebview {
     const progress = m.progress;
     const failure = m.failure as
       | {
-          reason?: unknown;
-          limit?: unknown;
-          elapsedMs?: unknown;
-          attemptedCalls?: unknown;
-          completedCalls?: unknown;
-          plannedCalls?: unknown;
-        }
+        reason?: unknown;
+        limit?: unknown;
+        elapsedMs?: unknown;
+        attemptedCalls?: unknown;
+        completedCalls?: unknown;
+        plannedCalls?: unknown;
+      }
       | undefined;
     const refusal = m.refusal;
     return (
@@ -4610,16 +4528,7 @@ export function isHostToWebview(v: unknown): v is HostToWebview {
       typeof m.running === "boolean" &&
       (progress === undefined || isLlmAnalysisRunProgress(progress)) &&
       (failure === undefined ||
-        (typeof failure === "object" &&
-          failure !== null &&
-          typeof failure.reason === "string" &&
-          (failure.limit === undefined ||
-            failure.limit === "per_call" ||
-            failure.limit === "total") &&
-          typeof failure.elapsedMs === "number" &&
-          typeof failure.attemptedCalls === "number" &&
-          typeof failure.completedCalls === "number" &&
-          typeof failure.plannedCalls === "number")) &&
+        isLlmAnalysisRunFailure(failure)) &&
       (refusal === undefined ||
         (typeof refusal === "string" && refusal.length > 0 && m.running === false && failure === undefined))
     );
@@ -4629,7 +4538,7 @@ export function isHostToWebview(v: unknown): v is HostToWebview {
     return typeof tabId === "string" && Object.keys(v).every(key => ["type", "tabId", "title", "reason"].includes(key)) &&
       ((typeof message.title === "string" && message.title.trim().length > 0 && message.title.length <= RENAME_TITLE_MAX &&
         !/[\r\n→]/.test(message.title) && message.reason === undefined) ||
-       (typeof message.reason === "string" && message.reason.trim().length > 0 && message.title === undefined));
+        (typeof message.reason === "string" && message.reason.trim().length > 0 && message.title === undefined));
   }
   if (t === "sessionSummary") {
     const summary = (v as { summary?: unknown }).summary;
@@ -4642,10 +4551,7 @@ export function isHostToWebview(v: unknown): v is HostToWebview {
       (saveFailed === undefined || saveFailed === true) &&
       (failure === undefined || (typeof failure === "string" && failure.length > 0 && running === false)) &&
       (summary === undefined ||
-        (typeof summary === "object" && summary !== null &&
-          typeof (summary as { text?: unknown }).text === "string" &&
-          (summary as { text: string }).text.length > 0 &&
-          typeof (summary as { model?: unknown }).model === "string"))
+        isSessionSummaryResult(summary))
     );
   }
   if (t === "llmFindingDiagnostics") {
@@ -4659,8 +4565,7 @@ export function isHostToWebview(v: unknown): v is HostToWebview {
     const fingerprint = message.fingerprint as Record<string, unknown> | undefined;
     return typeof tabId === "string" && typeof message.agentId === "string" &&
       typeof message.requestId === "string" && typeof message.generation === "number" &&
-      typeof fingerprint === "object" && fingerprint !== null &&
-      typeof fingerprint.size === "number" && typeof fingerprint.mtimeMs === "number" &&
+      isAgentInspectorFingerprint(fingerprint) &&
       isAgentInspectorPage(message.page);
   }
   if (t === "agentInspectorError") {
@@ -4681,8 +4586,8 @@ export function isHostToWebview(v: unknown): v is HostToWebview {
       typeof message.generation === "number" &&
       ["invalid-cursor", "unknown-anchor", "history-unavailable", "ambiguous-identity",
         "invalid-request", "stale-request", "host-error"].includes(
-        message.reason as string
-      );
+          message.reason as string
+        );
   }
   if (t === "worklogTranscriptResult") {
     const message = v as Record<string, unknown>;
@@ -4695,8 +4600,8 @@ export function isHostToWebview(v: unknown): v is HostToWebview {
       typeof message.generation === "number" &&
       ["invalid-cursor", "unknown-anchor", "history-unavailable", "ambiguous-identity",
         "invalid-request", "stale-request", "host-error"].includes(
-        message.reason as string
-      );
+          message.reason as string
+        );
   }
   if (t === "conversationHistoryResult") {
     const message = v as Record<string, unknown>;
@@ -4710,8 +4615,8 @@ export function isHostToWebview(v: unknown): v is HostToWebview {
       ["invalid-cursor", "unknown-anchor", "history-unavailable", "invalid-request",
         "session-unavailable", "session-scan-failed", "read-failed", "stale-request",
         "response-too-large", "host-error"].includes(
-        message.reason as string
-      );
+          message.reason as string
+        );
   }
   if (t === "sessionImageResult") {
     const m = v as Record<string, unknown>;
@@ -4756,4 +4661,712 @@ export function isHostToWebview(v: unknown): v is HostToWebview {
 
   t satisfies never;
   return false;
+}
+
+function isWorkRequestView(value: unknown): boolean {
+  if (!value || typeof value !== "object") return false;
+  const request = value as Record<string, unknown>;
+  return (
+    isStringArray(request.turnIds) &&
+    typeof request.number === "string" &&
+    isNumber(request.toolCount) &&
+    isNumber(request.agentCount) &&
+    isNumber(request.failCount) &&
+    isNumber(request.revision)
+  );
+}
+
+function isRunningMainToolView(tool: unknown): boolean {
+  if (!tool || typeof tool !== "object") return false;
+  const row = tool as Record<string, unknown>;
+  return (
+    (row.intentInput === undefined || isToolIntentInput(row.intentInput)) &&
+    typeof row.id === "string" &&
+    typeof row.name === "string" &&
+    isNumber(row.startedAt)
+  );
+}
+
+type KeysOfUnion<T> = T extends unknown ? keyof T : never;
+
+function isWorkPlanHistoryEntry(entry: unknown): boolean {
+  if (!entry || typeof entry !== "object") return false;
+  const row = entry as Record<string, unknown>;
+  const checks: { [K in KeysOfUnion<NonNullable<WorkModelPayload["planHistory"]>[number]>]-?: () => boolean } = {
+    at: () => isNumber(row.at),
+    kind: () => row.kind === "user" || row.kind === "todos" || row.kind === "resume",
+    source: () => row.kind !== "todos" || row.source === undefined || row.source === "tasks",
+    created: () => row.kind !== "todos" || row.created === undefined || typeof row.created === "boolean",
+    removed: () => row.kind !== "todos" || row.removed === undefined || typeof row.removed === "boolean",
+    items: () => row.kind !== "todos" || isArrayOf(row.items, isWorkTaskItemView),
+    agentId: () => row.kind !== "resume" || typeof row.agentId === "string",
+    description: () => row.kind !== "resume" || typeof row.description === "string",
+    status: () => row.kind !== "resume" || WORK_STATUSES.includes(row.status as string),
+    endedAt: () => row.kind !== "resume" || row.endedAt === undefined || isNumber(row.endedAt),
+  };
+  return Object.values(checks).every(check => check());
+}
+
+function isSummaryLlmAreaView(value: unknown): boolean {
+  if (typeof value !== "object" || value === null) return false;
+  const area = value as Record<string, unknown>;
+  const count = (n: unknown) => n === null || (Number.isSafeInteger(n) && (n as number) >= 0);
+  const percent = (n: unknown) => isNumber(n) && (n as number) >= 0 && (n as number) <= 100;
+  return (
+    typeof area.label === "string" &&
+    area.count !== null &&
+    count(area.count) &&
+    percent(area.percent)
+  );
+}
+
+function isRoleView(role: unknown): boolean {
+  if (typeof role !== "object" || role === null) return false;
+  const r = role as Record<string, unknown>;
+  return (
+    isNullableString(r.role) &&
+    typeof r.label === "string" &&
+    isNumber(r.count) &&
+    isNullableNumber(r.totalMs) &&
+    typeof r.totalMsPartial === "boolean" &&
+    isNullableNumber(r.totalTokens) &&
+    typeof r.totalTokensPartial === "boolean" &&
+    isTokenDisplay(r.tokenDisplay) &&
+    typeof r.running === "boolean" &&
+    isNullableNumber(r.timeWidthPercent) &&
+    isNullableNumber(r.tokenWidthPercent) &&
+    isArrayOf(r.runs, isRoleRunView)
+  );
+}
+
+function isAgentInspectorMessageItem(item: unknown): boolean {
+  if (typeof item !== "object" || item === null) return false;
+  const message = item as Record<string, unknown>;
+  return (
+    (message.role === "user" || message.role === "assistant") &&
+    typeof message.text === "string"
+  );
+}
+
+function isWorkSegmentView(item: unknown): boolean {
+  if (typeof item !== "object" || item === null) return false;
+  const segment = item as Record<string, unknown>;
+  return (
+    typeof segment.segmentId === "string" &&
+    typeof segment.phaseId === "string" &&
+    isOptionalString(segment.taskKey) &&
+    isNumber(segment.toolCount) &&
+    isNumber(segment.failCount) &&
+    isNumber(segment.childFailCount) &&
+    isNumber(segment.elapsedMs) &&
+    isNumber(segment.runningCount) &&
+    isNumber(segment.staleCount) &&
+    isNumber(segment.revision)
+  );
+}
+
+function isWorkAgentStateView(item: unknown): boolean {
+  if (typeof item !== "object" || item === null) return false;
+  const agent = item as Record<string, unknown>;
+  return (
+    typeof agent.toolUseId === "string" &&
+    (agent.runStartedAt === undefined || isNumber(agent.runStartedAt)) &&
+    (WORK_STATUSES as string[]).includes(agent.status as string) &&
+    isNumber(agent.childCount) &&
+    isNumber(agent.failCount) &&
+    isNumber(agent.elapsedMs) &&
+    (agent.tokens === undefined || isNumber(agent.tokens)) &&
+    isOptionalString(agent.modelMeasured) &&
+    isNumber(agent.revision)
+  );
+}
+
+function isHandoffDecisionEntry(item: unknown): boolean {
+  if (typeof item !== "object" || item === null) return false;
+  const e = item as Record<string, unknown>;
+  return (
+    typeof e.id === "string" &&
+    e.id.length > 0 &&
+    typeof e.t === "string" &&
+    DECISION_TAG_VALUES.includes(e.t) &&
+    isNonNegativeInt(e.g) &&
+    typeof e.s === "string"
+  );
+}
+
+function isRestoredQuestionSpec(value: unknown): boolean {
+  if (typeof value !== "object" || value === null) return false;
+  const row = value as Record<string, unknown>;
+  return (
+    Array.isArray(row.questions) &&
+    row.questions.every(isRestoredQuestionItem)
+  );
+}
+
+function isRestoredQuestionItem(value: unknown): boolean {
+  if (typeof value !== "object" || value === null) return false;
+  const row = value as Record<string, unknown>;
+  return (
+    typeof row.question === "string" &&
+    typeof row.multiSelect === "boolean" &&
+    isOptionalString(row.header) &&
+    Array.isArray(row.options) &&
+    row.options.every(isRestoredQuestionOption)
+  );
+}
+
+function isRestoredQuestionOption(value: unknown): boolean {
+  if (typeof value !== "object" || value === null) return false;
+  const row = value as Record<string, unknown>;
+  return (
+    typeof row.label === "string" &&
+    isOptionalString(row.description)
+  );
+}
+
+function isConversationHistoryCoverage(value: unknown): boolean {
+  if (typeof value !== "object" || value === null) return false;
+  const row = value as Record<string, unknown>;
+  return (
+    typeof row.returnedCount === "number" &&
+    typeof row.remainingOlderCount === "number" &&
+    typeof row.oldestReached === "boolean" &&
+    (row.malformedLineCount === undefined || isNumber(row.malformedLineCount)) &&
+    (row.droppedWithoutUuidCount === undefined || isNumber(row.droppedWithoutUuidCount))
+  );
+}
+
+function isWorkPlacementView(value: unknown): boolean {
+  if (typeof value !== "object" || value === null) return false;
+  const row = value as Record<string, unknown>;
+  return (
+    typeof row.phaseId === "string" &&
+    typeof row.counted === "boolean" &&
+    isOptionalString(row.segmentId) &&
+    isOptionalString(row.taskKey) &&
+    isOptionalString(row.ownerToolUseId)
+  );
+}
+
+function isConversationSnapshot(value: unknown): boolean {
+  if (typeof value !== "object" || value === null) return false;
+  const s = value as Record<string, unknown>;
+  const checks: { [K in keyof ConversationSnapshot]-?: () => boolean } = {
+    conversationId: () => s.conversationId === null || typeof s.conversationId === "string",
+    cwd: () => typeof s.cwd === "string",
+    turnState: () => s.turnState === "idle" || s.turnState === "running" || s.turnState === "interrupting",
+    auth: () => s.auth === null || typeof s.auth === "object",
+    permissionMode: () => (PERMISSION_MODES as string[]).includes(s.permissionMode as string),
+    workModel: () => s.workModel === undefined || isWorkModelPayload(s.workModel),
+    planUsage: () => s.planUsage === undefined || isPlanUsage(s.planUsage),
+    semanticView: () => s.semanticView === undefined || typeof s.semanticView === "boolean",
+    semanticModel: () => s.semanticModel === undefined || isSemanticModelPayload(s.semanticModel),
+    effortOverride: () => s.effortOverride === undefined || s.effortOverride === null || typeof s.effortOverride === "string",
+    defaultEffort: () => s.defaultEffort === undefined || typeof s.defaultEffort === "string",
+    appliedModel: () => s.appliedModel === undefined || typeof s.appliedModel === "string",
+    modelFallback: () => s.modelFallback === undefined || isModelFallbackState(s.modelFallback),
+    appliedEffort: () => s.appliedEffort === undefined || s.appliedEffort === null ||
+      (typeof s.appliedEffort === "string" && ["low", "medium", "high", "xhigh", "max"].includes(s.appliedEffort)),
+    recordedModel: () => s.recordedModel === undefined || typeof s.recordedModel === "string",
+    llmAnalysisEnabled: () => s.llmAnalysisEnabled === undefined || typeof s.llmAnalysisEnabled === "boolean",
+    llmAnalysisRunning: () => s.llmAnalysisRunning === undefined || typeof s.llmAnalysisRunning === "boolean",
+    sessionSummary: () => s.sessionSummary === undefined ||
+      isSessionSummarySnapshot(s.sessionSummary),
+    sessionSummaryRunning: () => s.sessionSummaryRunning === undefined || typeof s.sessionSummaryRunning === "boolean",
+    llmDiagnostics: () => s.llmDiagnostics === undefined || typeof s.llmDiagnostics === "boolean",
+    resumeHydration: () => s.resumeHydration === undefined || isResumeHydrationSnapshotState(s.resumeHydration),
+    headOmitted: () => s.headOmitted === undefined || isHeadOmitted(s.headOmitted),
+    backgroundActivity: () => s.backgroundActivity === undefined || isBackgroundActivitySnapshot(s.backgroundActivity),
+    autoResumeAt: () => s.autoResumeAt === undefined || s.autoResumeAt === null || isNumber(s.autoResumeAt),
+    handoffSource: () => s.handoffSource === undefined || isHandoffSource(s.handoffSource),
+    events: () => (Array.isArray(s.events)) && ((s.events as unknown[]).every(isPlausibleNormalizedEvent)),
+    configModel: () => true,
+    configEffort: () => true,
+    commands: () => true,
+    models: () => true,
+    modelOverride: () => true,
+    resumeSessionId: () => true,
+    resumeFilePath: () => true,
+    llmAnalysisProgress: () => s.llmAnalysisProgress === undefined ||
+      (s.llmAnalysisRunning === true && isLlmAnalysisRunProgress(s.llmAnalysisProgress)),
+  };
+  return Object.values(checks).every(check => check());
+}
+
+function isBackgroundActivityList(value: unknown, check: (item: unknown) => boolean): boolean {
+  return Array.isArray(value) && value.length <= BACKGROUND_ACTIVITY_LIST_MAX && value.every(check);
+}
+
+function isBackgroundTaskSnapshot(value: unknown): boolean {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
+  const row = value as Record<string, unknown>;
+  return (
+    typeof row.id === "string" &&
+    typeof row.type === "string" &&
+    typeof row.description === "string" &&
+    (row.ambient === undefined || row.ambient === true) &&
+    hasOnlyKeys(row, ["id", "type", "description", "ambient"])
+  );
+}
+
+function isBackgroundDelegationSnapshot(value: unknown): boolean {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
+  const row = value as Record<string, unknown>;
+  return (
+    typeof row.toolUseId === "string" &&
+    typeof row.label === "string" &&
+    isOptionalString(row.agentId) &&
+    typeof row.running === "boolean" &&
+    typeof row.background === "boolean" &&
+    hasOnlyKeys(row, ["toolUseId", "label", "agentId", "running", "background"])
+  );
+}
+
+function isAnalysisLlmTargets(value: unknown): boolean {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
+  const row = value as Record<string, unknown>;
+  return (
+    isNumber(row.toolCalls) &&
+    typeof row.label === "string" &&
+    hasOnlyKeys(row, ["toolCalls", "label"])
+  );
+}
+
+function isActionFindingCalculation(value: unknown): boolean {
+  if (typeof value !== "object" || value === null) return false;
+  const row = value as Record<string, unknown>;
+  return (
+    ["identity", "sum", "cardinality"].includes(row.op as string) &&
+    isStringArray(row.factIds)
+  );
+}
+
+function isActionFindingImpact(value: unknown): boolean {
+  if (typeof value !== "object" || value === null) return false;
+  const row = value as Record<string, unknown>;
+  return (
+    (row.unit === "ms" || row.unit === "count") &&
+    isNumber(row.value) &&
+    isActionFindingCalculation(row.calculation)
+  );
+}
+
+function isActionFindingAction(value: unknown): boolean {
+  if (typeof value !== "object" || value === null) return false;
+  const row = value as Record<string, unknown>;
+  return (
+    typeof row.kind === "string" &&
+    typeof row.destination === "string" &&
+    isStringArray(row.steps) &&
+    isOptionalString(row.target)
+  );
+}
+
+function isRoleExternalRunsCoverage(value: unknown): boolean {
+  if (typeof value !== "object" || value === null) return false;
+  const row = value as Record<string, unknown>;
+  return (
+    isNumber(row.unreadableLines) &&
+    (row.unreadableLines as number) >= 0 &&
+    typeof row.readError === "boolean"
+  );
+}
+
+function isAgentInspectorOverview(value: unknown): boolean {
+  if (typeof value !== "object" || value === null) return false;
+  const row = value as Record<string, unknown>;
+  return (
+    typeof row.description === "string" &&
+    typeof row.instruction === "string"
+  );
+}
+
+function isTimeAgentView(value: unknown): boolean {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
+  const row = value as Record<string, unknown>;
+  const checks: { [K in keyof TimeBucketView["agents"][number]]-?: () => boolean } = {
+    stepKey: () => row.stepKey === undefined || typeof row.stepKey === "string",
+    toolUseId: () => true,
+    turnId: () => true,
+    blockId: () => true,
+    start: () => true,
+    end: () => true,
+    open: () => true,
+    isBackground: () => true,
+    description: () => true,
+    subagentType: () => true,
+    model: () => true,
+    transcriptAgentId: () => true,
+    toolCount: () => true,
+    failCount: () => true,
+    toolMs: () => true,
+    generateMs: () => true,
+    endSource: () => true,
+  };
+  return Object.values(checks).every(check => check());
+}
+
+function isTimeRequestStrip(value: unknown): boolean {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
+  const row = value as Record<string, unknown>;
+  const checks: { [K in keyof NonNullable<TimeBucketView["blocks"][number]["strip"]>]-?: () => boolean } = {
+    generatePercent: () => (isNumber(row.generatePercent)) && ((row.generatePercent as number) >= 0) && ((row.generatePercent as number) <= 100),
+    toolPercent: () => (isNumber(row.toolPercent)) && ((row.toolPercent as number) >= 0) && ((row.toolPercent as number) <= 100),
+    subagentWaitPercent: () => (isNumber(row.subagentWaitPercent)) && ((row.subagentWaitPercent as number) >= 0) && ((row.subagentWaitPercent as number) <= 100),
+    confirmPercent: () => (isNumber(row.confirmPercent)) && ((row.confirmPercent as number) >= 0) && ((row.confirmPercent as number) <= 100),
+    replyPercent: () => (isNumber(row.replyPercent)) && ((row.replyPercent as number) >= 0) && ((row.replyPercent as number) <= 100),
+    remainderPercent: () => (isNumber(row.remainderPercent)) && ((row.remainderPercent as number) >= 0) && ((row.remainderPercent as number) <= 100),
+  };
+  return Object.values(checks).every(check => check());
+}
+
+function isPlanTokenTotal(value: unknown): boolean {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
+  const row = value as Record<string, unknown>;
+  return (
+    isNumber(row.tokens) &&
+    (row.tokens as number) >= 0 &&
+    isNumber(row.cacheRead) &&
+    (row.cacheRead as number) >= 0 &&
+    (row.outputTokens === undefined || isNumber(row.outputTokens) && (row.outputTokens as number) >= 0)
+  );
+}
+
+function isResumeDisplayEvent(value: unknown): boolean {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
+  const row = value as Record<string, unknown>;
+  return (
+    typeof row.journalEventId === "string" &&
+    isPlausibleNormalizedEvent(row.event) &&
+    hasOnlyKeys(row, ["journalEventId", "event"])
+  );
+}
+
+function isResumeSendDisposition(value: unknown): boolean {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
+  const row = value as Record<string, unknown>;
+  return (
+    typeof row.clientToken === "string" &&
+    (row.disposition === "accepted-human" || row.disposition === "accepted-nonhuman" || row.disposition === "rejected") &&
+    hasOnlyKeys(row, ["clientToken", "disposition"])
+  );
+}
+
+function isPlanToolView(tool: unknown): boolean {
+  if (!tool || typeof tool !== "object") return false;
+  const row = tool as Record<string, unknown>;
+  return (
+    (row.intentInput === undefined || isToolIntentInput(row.intentInput)) &&
+    typeof row.id === "string" &&
+    typeof row.name === "string" &&
+    typeof row.description === "string" &&
+    isNumber(row.startedAt)
+  );
+}
+
+function isSlashCommandInfo(value: unknown): boolean {
+  if (typeof value !== "object" || value === null) return false;
+  const row = value as Record<string, unknown>;
+  return (
+    typeof row.name === "string" &&
+    typeof row.description === "string"
+  );
+}
+
+function isModelInfo(value: unknown): boolean {
+  if (typeof value !== "object" || value === null) return false;
+  const row = value as Record<string, unknown>;
+  return (
+    typeof row.id === "string" &&
+    typeof row.label === "string" &&
+    typeof row.description === "string" &&
+    (row.olderVersion === undefined || typeof row.olderVersion === "boolean")
+  );
+}
+
+function isPickedImageAttachment(value: unknown): boolean {
+  if (typeof value !== "object" || value === null) return false;
+  const row = value as Record<string, unknown>;
+  return (
+    ["image/png", "image/jpeg", "image/gif", "image/webp"].includes(row.mediaType as string) &&
+    typeof row.data === "string" &&
+    row.data.length <= IMAGE_MAX_BASE64_LEN
+  );
+}
+
+function isPendingAttachmentInfo(value: unknown): boolean {
+  if (typeof value !== "object" || value === null) return false;
+  const row = value as Record<string, unknown>;
+  return (
+    typeof row.id === "string" &&
+    ATTACHMENT_ID_RE.test(row.id) &&
+    ALLOWED_IMAGE_MEDIA_TYPES.includes(row.mediaType as ImageAttachment["mediaType"]) &&
+    typeof row.data === "string" &&
+    row.data.length <= IMAGE_MAX_BASE64_LEN
+  );
+}
+
+function isSessionListItem(value: unknown): boolean {
+  if (typeof value !== "object" || value === null) return false;
+  const row = value as Record<string, unknown>;
+  const checks: { [K in keyof SessionListItem]-?: () => boolean } = {
+    sessionId: () => typeof row.sessionId === "string",
+    filePath: () => typeof row.filePath === "string",
+    title: () => typeof row.title === "string",
+    cwd: () => typeof row.cwd === "string",
+    mtime: () => typeof row.mtime === "number",
+    originUnverified: () => row.originUnverified === undefined || typeof row.originUnverified === "boolean",
+    hidden: () => row.hidden === undefined || typeof row.hidden === "boolean",
+  };
+  return Object.values(checks).every(check => check());
+}
+
+function isHandoffUtterance(u: unknown): boolean {
+  if (typeof u !== "object" || u === null) return false;
+  const item = u as Record<string, unknown>;
+  return (
+    typeof item.n === "number" &&
+    typeof item.at === "string" &&
+    (item.kind === "typed" || item.kind === "answer") &&
+    typeof item.text === "string" &&
+    (item.questions === undefined ||
+    (Array.isArray(item.questions) && item.questions.every((q) => typeof q === "string"))) &&
+    (item.imageRefs === undefined || isImageRefInfoArray(item.imageRefs))
+  );
+}
+
+function isSemanticExecutionSummary(value: unknown): boolean {
+  if (typeof value !== "object" || value === null) return false;
+  const row = value as Record<string, unknown>;
+  return (
+    isNumber(row.attemptCount) &&
+    isNumber(row.failCount) &&
+    (row.tokens === undefined || isNumber(row.tokens)) &&
+    typeof row.approvalPending === "boolean" &&
+    (row.footprint === undefined || isSemanticFootprint(row.footprint))
+  );
+}
+
+function isSemanticExecutionWindow(value: unknown): boolean {
+  if (typeof value !== "object" || value === null) return false;
+  const row = value as Record<string, unknown>;
+  return (
+    isNumber(row.startedAt) &&
+    (row.endedAt === undefined || isNumber(row.endedAt)) &&
+    isNumber(row.durationUnionMs) &&
+    SEMANTIC_COVERAGES.includes(row.coverage as string)
+  );
+}
+
+function isSemanticReconciledRole(value: unknown): boolean {
+  if (typeof value !== "object" || value === null) return false;
+  const row = value as Record<string, unknown>;
+  return (
+    (row.value === undefined || SEMANTIC_ATTEMPT_ROLES.includes(row.value as string)) &&
+    SEMANTIC_RECONCILE_STATES.includes(row.state as string)
+  );
+}
+
+function isSemanticActor(value: unknown): boolean {
+  if (typeof value !== "object" || value === null) return false;
+  const row = value as Record<string, unknown>;
+  return (
+    isOptionalString(row.agentId) &&
+    isOptionalString(row.agentType) &&
+    isOptionalString(row.model) &&
+    isOptionalString(row.effort) &&
+    typeof row.measured === "boolean"
+  );
+}
+
+function isSemanticAnchors(value: unknown): boolean {
+  if (typeof value !== "object" || value === null) return false;
+  const row = value as Record<string, unknown>;
+  return (
+    isStringArray(row.segmentIds) &&
+    isStringArray(row.agentIds)
+  );
+}
+
+function isSemanticResult(value: unknown): boolean {
+  if (typeof value !== "object" || value === null) return false;
+  const row = value as Record<string, unknown>;
+  return (
+    isNumber(row.failCount) &&
+    isNumber(row.childFailCount) &&
+    (row.tokens === undefined || isNumber(row.tokens))
+  );
+}
+
+function isLlmFindingDiagnosticsCounts(value: unknown): boolean {
+  if (typeof value !== "object" || value === null) return false;
+  const row = value as Record<string, unknown>;
+  return (
+    isNumber(row.candidate) &&
+    isNumber(row.schemaRejected) &&
+    isNumberRecord(row.schemaByReason) &&
+    isNumber(row.verified) &&
+    isNumber(row.accepted) &&
+    isNumber(row.rejected) &&
+    isNumberRecord(row.byReason)
+  );
+}
+
+function isHandoffStatusProgress(value: unknown): boolean {
+  if (typeof value !== "object" || value === null) return false;
+  const row = value as Record<string, unknown>;
+  return (
+    typeof row.heartbeats === "number" &&
+    typeof row.elapsedMs === "number" &&
+    (row.since === "compact_start" || row.since === "result")
+  );
+}
+
+function isHandoffStatusSource(value: unknown): boolean {
+  if (typeof value !== "object" || value === null) return false;
+  const row = value as Record<string, unknown>;
+  return (
+    typeof row.sessionId === "string" &&
+    typeof row.title === "string"
+  );
+}
+
+function isHandoffStatusFork(value: unknown): boolean {
+  if (typeof value !== "object" || value === null) return false;
+  const row = value as Record<string, unknown>;
+  return (
+    typeof row.sessionId === "string" &&
+    typeof row.tabId === "string" &&
+    typeof row.title === "string"
+  );
+}
+
+function isLlmAnalysisRunFailure(value: unknown): boolean {
+  if (typeof value !== "object" || value === null) return false;
+  const row = value as Record<string, unknown>;
+  return (
+    typeof row.reason === "string" &&
+    (row.limit === undefined || row.limit === "per_call" || row.limit === "total") &&
+    typeof row.elapsedMs === "number" &&
+    typeof row.attemptedCalls === "number" &&
+    typeof row.completedCalls === "number" &&
+    typeof row.plannedCalls === "number"
+  );
+}
+
+function isAgentInspectorFingerprint(value: unknown): boolean {
+  if (typeof value !== "object" || value === null) return false;
+  const row = value as Record<string, unknown>;
+  return (
+    typeof row.size === "number" &&
+    typeof row.mtimeMs === "number"
+  );
+}
+
+function isSessionSummarySnapshot(value: unknown): boolean {
+  if (typeof value !== "object" || value === null) return false;
+  const row = value as Record<string, unknown>;
+  return (
+    typeof row.text === "string" &&
+    typeof row.model === "string"
+  );
+}
+
+function isSessionSummaryResult(value: unknown): boolean {
+  if (typeof value !== "object" || value === null) return false;
+  const row = value as Record<string, unknown>;
+  return (
+    typeof row.text === "string" &&
+    row.text.length > 0 &&
+    typeof row.model === "string"
+  );
+}
+
+function isModelFallbackState(value: unknown): boolean {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
+  const row = value as Record<string, unknown>;
+  return (
+    isPlausibleNormalizedEvent(row.notice) &&
+    row.notice.kind === "model_refusal_fallback" &&
+    row.notice.scope === "session" &&
+    typeof row.appliedModel === "string" &&
+    (row.resolvedAt === undefined || isNumber(row.resolvedAt)) &&
+    (row.reopenedAt === undefined || isNumber(row.reopenedAt)) &&
+    (row.turnOriginalModel === undefined || typeof row.turnOriginalModel === "string") &&
+    (row.autoRevert === undefined || ([...FALLBACK_AUTO_REVERT_STARTS, ...FALLBACK_REVERT_OUTCOMES] as readonly unknown[]).includes(row.autoRevert))
+  );
+}
+
+function isConductorPreview(value: unknown): boolean {
+  if (!isProfileObject(value)) return false;
+  const row = value as Record<string, unknown>;
+  return (
+    typeof row.text === "string" &&
+    typeof row.tokens === "number" &&
+    Number.isFinite(row.tokens) &&
+    hasOnlyKeys(row, ["text", "tokens"])
+  );
+}
+
+function isReadyCursor(value: unknown): boolean {
+  if (typeof value !== "object" || value === null) return false;
+  const row = value as Record<string, unknown>;
+  return (
+    typeof row.generation === "number" &&
+    typeof row.seq === "number"
+  );
+}
+
+function isHistoryRequestAnchor(value: unknown): boolean {
+  if (typeof value !== "object" || value === null) return false;
+  const row = value as Record<string, unknown>;
+  return (
+    Number.isInteger(row.generation) &&
+    Number.isInteger(row.seq) &&
+    Object.keys(row).length === 2
+  );
+}
+
+function isInlineSessionImage(value: unknown): boolean {
+  if (typeof value !== "object" || value === null) return false;
+  const row = value as Record<string, unknown>;
+  return (
+    ALLOWED_IMAGE_MEDIA_TYPES.includes(row.mediaType as ImageAttachment["mediaType"]) &&
+    typeof row.data === "string" &&
+    row.data.length > 0 &&
+    row.data.length <= IMAGE_MAX_BASE64_LEN &&
+    Object.keys(row).every(key => ["mediaType", "data"].includes(key))
+  );
+}
+
+function isL3Metrics(value: unknown): boolean {
+  if (typeof value !== "object" || value === null) return false;
+  const row = value as Record<string, unknown>;
+  return (
+    isL3Metric(row.longGapMs) &&
+    isL3Metric(row.longGapCount) &&
+    isL3Metric(row.failureCount) &&
+    isL3Metric(row.actualConcurrency) &&
+    isL3Metric(row.fileWriteConflictCount) &&
+    isL3Metric(row.resourceDependencyCount) &&
+    isL3Metric(row.unknownEffectRatio) &&
+    isL3Metric(row.observedConstraintChainMs)
+  );
+}
+
+function isL3Estimates(value: unknown): boolean {
+  if (typeof value !== "object" || value === null) return false;
+  const row = value as Record<string, unknown>;
+  return isL3ParallelizationEstimate(row.parallelizationUpperBound);
+}
+
+function isDivergenceKinds(value: unknown): boolean {
+  if (typeof value !== "object" || value === null) return false;
+  const row = value as Record<string, unknown>;
+  return (
+    isDivergenceKindReportView(row.serialization) &&
+    isDivergenceKindReportView(row.unsupported_completion) &&
+    isDivergenceKindReportView(row.progress_stagnation) &&
+    isDivergenceKindReportView(row.declared_state_conflict)
+  );
 }

@@ -10,11 +10,12 @@ import type {
   TaskNotificationInfo,
   UsageSnapshot,
 } from "./protocol";
-import { captureToolIntentInput } from "./webview/status-line";
+import { captureToolIntentInput } from "./tool-intent";
 import { assistantUsageFromRaw, summarizeToolInput } from "./protocol";
 import type { HostArtifactAccess } from "./artifact-access";
 import { extractResumeSignals, extractStage0ToolFields, isResumeSignalToolName } from "./tool-observation";
 import { redactAbsolutePaths, redactOptional } from "./path-redaction";
+import { AUTO_MODE_UNEVALUATED } from "./tool-result-signals";
 import type { LearningToolResult } from "./learning-ingestion";
 
 export function localizeLocalCommandReply(record: Record<string, unknown>, text: string): string {
@@ -56,6 +57,7 @@ export interface ClaudeLiveNormalizerOptions {
   isClosed?: () => boolean;
   usageLimitPrefixes?: string[];
   onDelegateUsageLimitStop?: (agentId: string) => void;
+  knownBackgroundTask?: (taskId: string) => "agent" | "tool" | "unconfirmed" | undefined;
   onRawToolUse?: (toolUseId: string, tool: string, input: Record<string, unknown>, parent?: string) => void;
   onRawToolResult?: (result: LearningToolResult) => void;
 }
@@ -465,7 +467,7 @@ export class ClaudeLiveNormalizer {
               ...(record.decision_reason_type === "classifier" && typeof record.decision_reason === "string" && (
                 record.decision_reason === "Classifier unavailable" ||
                 record.decision_reason === "Auto mode unavailable — stopped after repeated responses with no safety verdict" ||
-                (record.decision_reason.startsWith("Auto mode could not evaluate this action and is blocking it for safety —") &&
+                (record.decision_reason.startsWith(`${AUTO_MODE_UNEVALUATED} —`) &&
                   !record.decision_reason.includes(" — a safety check separate from auto mode blocked this request because of earlier conversation content — it isn't about the action itself"))
               ) ? { classifierUnavailable: true } : {}),
               reason:
@@ -687,6 +689,10 @@ export class ClaudeLiveNormalizer {
         const parentToolUseId =
           typeof record.parent_tool_use_id === "string" ? record.parent_tool_use_id : null;
         const msgObj = record.message as Record<string, unknown> | undefined;
+        if (parentToolUseId !== null && typeof msgObj?.id === "string" && typeof msgObj.usage === "object" && msgObj.usage !== null) {
+          this.emit({ kind: "assistant_usage", turnId: this.currentTurnId ?? this.lastCompletedTurnId ?? `subagent:${parentToolUseId}`, parentToolUseId,
+            messageId: msgObj.id, usage: assistantUsageFromRaw(msgObj.usage, true) }, defaultMeta);
+        }
         if (
           parentToolUseId === null &&
           typeof msgObj?.model === "string" &&
@@ -899,6 +905,7 @@ export class ClaudeLiveNormalizer {
                 toolUseId: blockId,
                 parentToolUseId,
                 toolName: blockName,
+                ...(typeof msgObj?.id === "string" && msgObj.id.length > 0 ? { messageId: msgObj.id } : {}),
                 inputPreview:
                   blockName === "TodoWrite"
                     ? redactAbsolutePaths(JSON.stringify(block.input)).slice(0, 20_000)
@@ -1208,7 +1215,10 @@ export class ClaudeLiveNormalizer {
   }
 
   private emitTaskNotification(notification: TaskNotificationInfo, meta?: NormalizedOutMeta): boolean {
-    if (!this.observedAsyncAgentIds.has(notification.agentId) && !this.observedBackgroundTaskIds.has(notification.agentId)) {
+    const known = this.opts.knownBackgroundTask?.(notification.agentId);
+    if (known === "agent") this.observedAsyncAgentIds.add(notification.agentId);
+    else if (known === "tool") this.observedBackgroundTaskIds.add(notification.agentId);
+    if (known !== "unconfirmed" && !this.observedAsyncAgentIds.has(notification.agentId) && !this.observedBackgroundTaskIds.has(notification.agentId)) {
       this.droppedTaskNotificationCount++;
       if (meta?.timestamp !== undefined) this.pendingGapBoundaries.push(meta.timestamp);
       return false;

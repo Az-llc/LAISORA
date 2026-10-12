@@ -1,5 +1,5 @@
 import * as l10n from "@vscode/l10n";
-import type { AskBlock, AskOption } from "./ask-parser";
+import type { AskBlock, AskOption } from "../ask-parser";
 import { bindUserLabel } from "./user-label";
 
 function part<K extends keyof HTMLElementTagNameMap>(tag: K, cls: string, text?: string): HTMLElementTagNameMap[K] {
@@ -58,10 +58,14 @@ function renderOtherChoice(title: string, id: string | undefined, context?: AskR
   return button;
 }
 
+export function goalLabel(): HTMLElement {
+  return part("span", "plan-label", "GOAL");
+}
+
 export function renderGoal(goal: string, offset: number, context?: AskRenderContext): HTMLElement {
   const block = part("div", "laisora-plan");
   block.id = `goal-${context?.replyId ?? "message"}-${offset + (context?.offset ?? 0)}`;
-  block.append(part("span", "plan-label", "GOAL"), part("span", "declared-goal", goal));
+  block.append(goalLabel(), part("span", "declared-goal", goal));
   return block;
 }
 

@@ -1,7 +1,7 @@
-import type { AssistantUsage } from "./protocol";
+import type { AssistantUsage, OrchestrationView } from "./protocol";
 import type { RequestBlockRecord } from "./time-buckets";
 
-export interface PlanTokenTotal { tokens: number; cacheRead: number }
+export interface PlanTokenTotal { tokens: number; cacheRead: number; outputTokens?: number }
 export interface PlanUsageSlice extends PlanTokenTotal { start: number; end: number }
 export interface PlanUsageBlock extends PlanTokenTotal { blockId: string; slices: PlanUsageSlice[] }
 export interface PlanUsage { blocks: PlanUsageBlock[] }
@@ -46,14 +46,14 @@ export function foldPlanUsage(state: PlanUsageAccumulator | undefined, messageId
   const accumulator = state ?? PlanUsageAccumulator.empty();
   const previous = accumulator.get(messageId);
   const merged = { ...previous?.usage };
-  for (const key of ["inputTokens", "cacheCreationInputTokens", "cacheReadInputTokens", "outputTokens"] as const) {
+  for (const key of ["inputTokens", "cacheCreationInputTokens", "cacheReadInputTokens", "outputTokens", "cacheCreation5mInputTokens", "cacheCreation1hInputTokens"] as const) {
     const value = usage[key];
     if (value !== undefined && Number.isFinite(value) && value >= 0) merged[key] = Math.max(merged[key] ?? 0, value);
   }
   return accumulator.withMessage(messageId, { at: previous?.at ?? at, usage: merged });
 }
 
-export function projectPlanUsage(state: PlanUsageAccumulator | undefined, blocks: readonly Pick<RequestBlockRecord, "blockId" | "start">[]): PlanUsage {
+export function projectPlanUsage(state: PlanUsageAccumulator | undefined, blocks: readonly Pick<RequestBlockRecord, "blockId" | "start" | "closedAt">[]): PlanUsage {
   const result: PlanUsage = { blocks: blocks.map(block => ({ blockId: block.blockId, tokens: 0, cacheRead: 0, slices: [] })) };
   const slices = blocks.map(() => new Map<number, PlanUsageSlice>());
   for (const { at, usage } of state?.values() ?? []) {
@@ -66,14 +66,18 @@ export function projectPlanUsage(state: PlanUsageAccumulator | undefined, blocks
       else high = middle;
     }
     const index = low - 1;
-    if (index < 0) continue;
+    if (index < 0 || at >= (blocks[index].closedAt ?? Infinity)) continue;
     const block = result.blocks[index];
     const start = Math.max(blocks[index].start, Math.floor(at / 1000) * 1000);
-    const end = Math.min(start + 1000, blocks[index + 1]?.start ?? Infinity);
+    const end = Math.min(start + 1000, blocks[index + 1]?.start ?? Infinity, blocks[index].closedAt ?? Infinity);
     let slice = slices[index].get(start);
     if (!slice) { slice = { start, end, tokens: 0, cacheRead: 0 }; slices[index].set(start, slice); block.slices.push(slice); }
     const tokens = (usage.inputTokens ?? 0) + (usage.cacheCreationInputTokens ?? 0) + (usage.outputTokens ?? 0);
     const cacheRead = usage.cacheReadInputTokens ?? 0;
+    if (usage.outputTokens !== undefined) {
+      slice.outputTokens = (slice.outputTokens ?? 0) + usage.outputTokens;
+      block.outputTokens = (block.outputTokens ?? 0) + usage.outputTokens;
+    }
     slice.tokens += tokens;
     slice.cacheRead += cacheRead;
     block.tokens += tokens;
@@ -85,22 +89,25 @@ export function projectPlanUsage(state: PlanUsageAccumulator | undefined, blocks
 
 export interface MainTokenTotal extends PlanTokenTotal { messageCount: number; unmeasuredMessageCount: number; partial: boolean }
 
-export function summarizeMainTokens(state: PlanUsageAccumulator | undefined): MainTokenTotal | null {
+export function summarizeMainTokens(state: PlanUsageAccumulator | undefined, generationBoundaryAt?: number): MainTokenTotal | null {
   let tokens = 0;
   let cacheRead = 0;
+  let outputTokens: number | undefined;
   let messageCount = 0;
   let unmeasuredMessageCount = 0;
-  for (const { usage } of state?.values() ?? []) {
+  for (const { at, usage } of state?.values() ?? []) {
+    if (generationBoundaryAt !== undefined && at < generationBoundaryAt) continue;
     if (usage.inputTokens === undefined && usage.cacheCreationInputTokens === undefined && usage.outputTokens === undefined) {
       unmeasuredMessageCount++;
       continue;
     }
     messageCount++;
+    if (usage.outputTokens !== undefined) outputTokens = (outputTokens ?? 0) + usage.outputTokens;
     tokens += (usage.inputTokens ?? 0) + (usage.cacheCreationInputTokens ?? 0) + (usage.outputTokens ?? 0);
     cacheRead += usage.cacheReadInputTokens ?? 0;
   }
   if (messageCount === 0) return null;
-  return { tokens, cacheRead, messageCount, unmeasuredMessageCount, partial: unmeasuredMessageCount > 0 };
+  return { tokens, cacheRead, ...(outputTokens === undefined ? {} : { outputTokens }), messageCount, unmeasuredMessageCount, partial: unmeasuredMessageCount > 0 };
 }
 
 function exact(value: unknown, keys: string[]): value is Record<string, unknown> {
@@ -109,9 +116,44 @@ function exact(value: unknown, keys: string[]): value is Record<string, unknown>
 }
 function count(value: unknown): value is number { return typeof value === "number" && Number.isFinite(value) && value >= 0; }
 export function isPlanUsage(value: unknown): value is PlanUsage {
-  return exact(value, ["blocks"]) && Array.isArray(value.blocks) && value.blocks.every(block =>
-    exact(block, ["blockId", "tokens", "cacheRead", "slices"]) && typeof block.blockId === "string"
-    && count(block.tokens) && count(block.cacheRead) && Array.isArray(block.slices) && block.slices.every(slice =>
-      exact(slice, ["start", "end", "tokens", "cacheRead"]) && count(slice.start) && count(slice.end)
-      && slice.end >= slice.start && count(slice.tokens) && count(slice.cacheRead)));
+  if (!exact(value, ["blocks"])) return false;
+  return (
+    Array.isArray(value.blocks) &&
+    value.blocks.every(isPlanUsageBlock)
+  );
+}
+
+export function externalTokens(usage: OrchestrationView["runs"][number]["usage"]): PlanTokenTotal | null {
+  if (usage === null) return null;
+  const input = usage.input_tokens;
+  const output = usage.output_tokens;
+  const creation = usage.cache_creation_input_tokens;
+  if (input === undefined && output === undefined && creation === undefined) return null;
+  const cached = usage.cached_input_tokens ?? 0;
+  return { tokens: Math.max(0, (input ?? 0) - cached) + (creation ?? 0) + (output ?? 0),
+    cacheRead: usage.cache_read_input_tokens ?? usage.cache_read_tokens ?? cached, outputTokens: output ?? 0 };
+}
+
+function isPlanUsageBlock(value: unknown): boolean {
+  if (!exact(value, ["blockId", "tokens", "cacheRead", "slices", ...(value && typeof value === "object" && "outputTokens" in value ? ["outputTokens"] : [])])) return false;
+  return (
+    typeof value.blockId === "string" &&
+    count(value.tokens) &&
+    count(value.cacheRead) &&
+    (value.outputTokens === undefined || count(value.outputTokens)) &&
+    Array.isArray(value.slices) &&
+    value.slices.every(isPlanUsageSlice)
+  );
+}
+
+function isPlanUsageSlice(value: unknown): boolean {
+  if (!exact(value, ["start", "end", "tokens", "cacheRead", ...(value && typeof value === "object" && "outputTokens" in value ? ["outputTokens"] : [])])) return false;
+  return (
+    count(value.start) &&
+    count(value.end) &&
+    count(value.tokens) &&
+    count(value.cacheRead) &&
+    (value.outputTokens === undefined || count(value.outputTokens)) &&
+    (value.end as number) >= (value.start as number)
+  );
 }

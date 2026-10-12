@@ -1,16 +1,85 @@
 import * as l10n from "@vscode/l10n";
-import type { ExternalRunRecord } from "./orchestration-external";
-import { EXECUTORS } from "./orchestration-roster";
+import { conductorModelAtEnd, PLAN_UNPLANNED_ROW_KEY, planConductorRunning, splitByConductorModel, planFrame, planItemRowKey, planLive, planNow, planNumberedStep, planRowPeriod, planRowProvisional, planRowsAt, planRowTime, UNMEASURED_LABEL } from "./plan-steps";
+import { attestedExternalRun, type ExternalRunRecord } from "./orchestration-external";
+import { EXECUTORS, isOrchestrationEffort } from "./orchestration-roster";
 import type { WorkAgentNode, WorkPhaseView } from "./protocol";
 import { attributeSubagent, type RosterEvidence } from "./roster-evidence";
-import { externalTokens } from "./webview/plan-view";
+import { externalTokens, summarizeMainTokens, type PlanTokenTotal, type PlanUsageAccumulator } from "./plan-usage";
+import { keyedGet, keyedValues, largestRemainder, measureSpans, unionSpans, type ConductorModel, type KeyedLog, type RequestBlockView,
+  type TimeBucketView } from "./time-buckets";
+import type { AnalysisToolRecord } from "./session-facts";
+import { deriveExecLogFindings, deriveFailureSummary, type FailureSummaryView } from "./exec-log-marks";
+import { CACHE_HIT_TERM, claudeModelPrices, roleCacheTtl, runCacheTtlCost, type RoleCacheTtlView } from "./cache-ttl-cost";
+import type { CacheTtl } from "./claude-prices";
 
 export const ROLE_SHADE_MAX = 3;
+
+export interface TokenDisplay {
+  total: number | null;
+  cacheRead: number | null;
+  outputTokens: number | null;
+  label: string;
+  newPercent: number | null;
+  cachePercent: number | null;
+  cacheBarPercent: number | null;
+}
+
+export function tokenDisplay(total: number | null, cacheRead: number | null, outputTokens: number | null = 0): TokenDisplay {
+  const amount = total === null ? "?" : total >= 1000 ? `${(total / 1000).toFixed(1)}k` : String(Math.round(total));
+  const context = total === null || cacheRead === null || outputTokens === null ? null : total + cacheRead - outputTokens;
+  // No context means no hit ratio, not a 0% hit.
+  const cachePercent = context === null || context <= 0 ? null : cacheRead! / context * 100;
+  const whole = total === null ? null : total + (cacheRead ?? 0);
+  const cacheBarPercent = whole === null || cacheRead === null ? null : whole > 0 ? cacheRead / whole * 100 : 0;
+  return { total, cacheRead, outputTokens, label: cachePercent === null ? amount : `${amount} (${CACHE_HIT_TERM} ${Math.round(cachePercent)}%)`,
+    newPercent: whole === null ? null : whole === 0 ? 0 : total! / whole * 100, cachePercent, cacheBarPercent };
+}
+
+export interface AnalysisTimeView {
+  totalMs: number | null;
+  partial: boolean;
+  parts: { ms: number | null; percent: number | null; partial?: boolean }[];
+}
+
+export interface AnalysisPlanView {
+  key: string;
+  blockId: string;
+  stepKey?: string;
+  title: string;
+  number: string;
+  // null: nothing started; start, end, running and provisional come from src/plan-steps.ts#planRowPeriod at the view's last
+  // observation. A running row's end is shown with src/plan-steps.ts#planPeriodEnd at the screen's clock, as GRAPH does.
+  start: number | null;
+  end: number | null;
+  running: boolean;
+  provisional: boolean;
+  time: AnalysisTimeView;
+  timeWidthPercent: number | null;
+  tokens: TokenDisplay;
+  tokenWidthPercent: number | null;
+  tokensPartial: boolean;
+  roles: RoleSummaryView;
+  failures: FailureSummaryView;
+}
+
+export interface AnalysisPlansView {
+  plans: AnalysisPlanView[];
+  time: AnalysisTimeView;
+  mainTokens: number | null;
+  tokens: TokenDisplay;
+  roles: RoleSummaryView;
+  failures: FailureSummaryView;
+}
 
 export type RoleValueSource = "measured" | "requested";
 
 export interface RoleRunView {
-  source: "subagent" | "external";
+  source: "subagent" | "external" | "conductor";
+  toolUseId?: string;
+  blockId: string | null;
+  cacheRead: number | null;
+  outputTokens: number | null;
+  tokenDisplay: TokenDisplay;
   name: string;
   executor: string;
   model: string | null;
@@ -23,9 +92,12 @@ export interface RoleRunView {
   running: boolean;
   outcome: ExternalRunRecord["outcome"] | null;
   durationMs: number | null;
+  durationPartial?: boolean;
   tokens: number | null;
+  tokensPartial?: boolean;
   timePercent: number | null;
   tokenPercent: number | null;
+  count?: number;
 }
 
 export interface RoleView {
@@ -36,10 +108,12 @@ export interface RoleView {
   totalMsPartial: boolean;
   totalTokens: number | null;
   totalTokensPartial: boolean;
+  tokenDisplay: TokenDisplay;
   running: boolean;
   timeWidthPercent: number | null;
   tokenWidthPercent: number | null;
   runs: RoleRunView[];
+  cacheTtl?: RoleCacheTtlView;
 }
 
 export interface RoleSummaryView {
@@ -53,7 +127,7 @@ export interface ExternalRunsCoverage {
   readError: boolean;
 }
 
-interface RunDraft extends Omit<RoleRunView, "shade" | "timePercent" | "tokenPercent" | "variantLabel"> {
+interface RunDraft extends Omit<RoleRunView, "shade" | "timePercent" | "tokenPercent" | "variantLabel" | "tokenDisplay"> {
   role: string | null;
 }
 
@@ -64,15 +138,22 @@ function flattenAgents(nodes: readonly WorkAgentNode[], out: WorkAgentNode[]): v
   }
 }
 
-function subagentRun(agent: WorkAgentNode, evidence: RosterEvidence): RunDraft {
+function subagentRun(agent: WorkAgentNode, evidence: RosterEvidence, usage?: PlanUsageAccumulator, blockId: string | null = null): RunDraft {
   const attributed = attributeSubagent(evidence, agent);
   const variant = attributed?.definition;
   const measuredModel = agent.modelMeasured ?? attributed?.start?.model;
   const measuredEffort = agent.effortMeasured ?? attributed?.start?.effort;
   const requestedModel = agent.modelDeclared ?? variant?.model ?? null;
-  const requestedEffort = agent.effortDeclared ?? variant?.effort ?? null;
+  const callEffort = attributed?.perCallEffort && variant?.effort && isOrchestrationEffort(agent.intentInput?.effort) ? agent.intentInput.effort : undefined;
+  const requestedEffort = callEffort ?? agent.effortDeclared ?? variant?.effort ?? null;
   const finished = agent.origin === "live" && (agent.status === "completed" || agent.status === "failed");
+  const measured = summarizeMainTokens(usage);
+  const cacheMeasured = usage !== undefined && [...usage.values()].every(value => value.usage.cacheReadInputTokens !== undefined);
   return {
+    blockId,
+    toolUseId: agent.toolUseId,
+    cacheRead: measured && cacheMeasured ? measured.cacheRead : null,
+    outputTokens: measured?.outputTokens ?? null,
     role: variant?.role ?? null,
     source: "subagent",
     name: agent.agentType ?? agent.description,
@@ -85,30 +166,43 @@ function subagentRun(agent: WorkAgentNode, evidence: RosterEvidence): RunDraft {
     running: agent.status === "running",
     outcome: null,
     durationMs: finished ? agent.elapsedMs : null,
-    tokens: agent.tokens ?? null,
+    tokens: measured ? measured.tokens : agent.tokens ?? null,
+    tokensPartial: measured?.partial ?? false,
   };
 }
 
-function externalRun(run: ExternalRunRecord): RunDraft {
+// An external run starts when its tool call started, else at its record's start.
+export function externalRunStart(run: Pick<ExternalRunRecord, "toolUseId" | "startedAt">, tools: KeyedLog<AnalysisToolRecord> | undefined): number {
+  return (run.toolUseId && tools ? keyedGet(tools, run.toolUseId)?.startedAt : undefined) ?? Date.parse(run.startedAt);
+}
+
+function externalRun(run: ExternalRunRecord, tools: KeyedLog<AnalysisToolRecord> | undefined, blockId: string | null = null): RunDraft {
   const definition = EXECUTORS[run.executor];
-  const startedAt = Date.parse(run.startedAt);
+  const startedAt = externalRunStart(run, tools);
   const tokens = externalTokens(run.usage ?? null);
+  const attested = attestedExternalRun(run);
+  const model = attested?.model ?? run.model ?? null;
+  const effort = attested?.effort ?? run.effort ?? null;
   return {
+    blockId,
+    toolUseId: run.toolUseId,
+    cacheRead: run.usage && ["cache_read_input_tokens", "cache_read_tokens", "cached_input_tokens"].some(key => run.usage![key] !== undefined) ? tokens?.cacheRead ?? null : null,
+    outputTokens: tokens?.outputTokens ?? null,
     role: run.role,
     source: "external",
     name: run.model !== undefined && (run.effort !== undefined || run.executor !== "codex")
       ? definition.targetKey(run.role, run.model, run.effort)
       : `${run.role}/${run.executor}`,
     executor: run.executor,
-    model: run.model ?? null,
-    modelSource: run.model !== undefined ? "requested" : null,
-    effort: run.effort ?? null,
-    effortSource: run.effort !== undefined ? "requested" : null,
+    model,
+    modelSource: attested ? "measured" : model !== null ? "requested" : null,
+    effort,
+    effortSource: attested ? "measured" : effort !== null ? "requested" : null,
     startedAt: Number.isFinite(startedAt) ? startedAt : null,
     running: false,
     outcome: run.outcome,
     durationMs: Number.isFinite(run.durationMs) && run.durationMs >= 0 ? run.durationMs : null,
-    tokens: tokens?.tokens ?? null,
+    tokens: tokens ? tokens.tokens : null,
   };
 }
 
@@ -134,21 +228,36 @@ export function deriveRoleSummary(input: {
   externalRuns: readonly ExternalRunRecord[];
   rosterEvidence: RosterEvidence;
   externalRunsCoverage?: ExternalRunsCoverage;
+  generationBoundaryAt?: number;
+  subagentUsage?: ReadonlyMap<string, PlanUsageAccumulator>;
+  timeBuckets?: TimeBucketView;
+  analysisTools?: KeyedLog<AnalysisToolRecord>;
 }): RoleSummaryView {
   const agents: WorkAgentNode[] = [];
   let rollupAgentCount = 0;
   for (const phase of input.phases) {
-    if (phase.kind === "rollup") rollupAgentCount += phase.agentCount;
+    if (phase.kind === "rollup" && (input.generationBoundaryAt === undefined || phase.startedAt >= input.generationBoundaryAt)) rollupAgentCount += phase.agentCount;
     flattenAgents(phase.agents, agents);
   }
   flattenAgents(input.unlinkedAgents, agents);
-  const recoveredCount = agents.filter((a) => a.origin === "restored").length;
+  const currentAgents = agents.filter(a => input.generationBoundaryAt === undefined || a.startedAt !== undefined && a.startedAt >= input.generationBoundaryAt);
+  const recoveredCount = currentAgents.filter((a) => a.origin === "restored").length;
   const omittedSubagentCount = Math.max(0, rollupAgentCount - recoveredCount);
+  const blockByToolUseId = new Map<string, string | undefined>();
+  for (const span of [...input.timeBuckets?.agents ?? [], ...input.timeBuckets?.backgroundTasks ?? []]) {
+    blockByToolUseId.set(span.toolUseId, span.blockId);
+  }
   const drafts: RunDraft[] = [
-    ...agents.map((a) => subagentRun(a, input.rosterEvidence)),
-    ...input.externalRuns.map(externalRun),
+    ...currentAgents.map((a) => subagentRun(a, input.rosterEvidence, input.subagentUsage?.get(a.toolUseId),
+      blockByToolUseId.get(a.toolUseId) ?? null)),
+    ...input.externalRuns.filter(run => input.generationBoundaryAt === undefined || Date.parse(run.startedAt) >= input.generationBoundaryAt).map(run => externalRun(run,
+      input.analysisTools, run.toolUseId ? blockByToolUseId.get(run.toolUseId) ?? null : null)),
   ].sort(byStart);
 
+  return summarizeRoleRuns(drafts, omittedSubagentCount, input.externalRunsCoverage);
+}
+
+function summarizeRoleRuns(drafts: RunDraft[], omittedSubagentCount = 0, coverage?: ExternalRunsCoverage): RoleSummaryView {
   const groups = new Map<string | null, RunDraft[]>();
   for (const d of drafts) {
     const list = groups.get(d.role) ?? [];
@@ -164,10 +273,11 @@ export function deriveRoleSummary(input: {
       if (!shades.includes(key)) shades.push(key);
       return {
         ...r,
+        tokenDisplay: tokenDisplay(r.tokens, r.cacheRead, r.outputTokens),
         variantLabel: [r.executor, r.model, r.effort].filter((v): v is string => v !== null).join(" · "),
         shade: Math.min(shades.indexOf(key), ROLE_SHADE_MAX),
         timePercent: percentOf(r.durationMs, time.total),
-        tokenPercent: percentOf(r.tokens, tokens.total),
+        tokenPercent: percentOf(runTokenWhole(r), list.reduce((sum, run) => sum + (runTokenWhole(run) ?? 0), 0)),
       };
     });
     return {
@@ -175,9 +285,12 @@ export function deriveRoleSummary(input: {
       label: role ?? l10n.t("other"),
       count: runs.length,
       totalMs: time.total,
-      totalMsPartial: time.partial,
+      totalMsPartial: time.partial || list.some(r => r.durationPartial),
       totalTokens: tokens.total,
-      totalTokensPartial: tokens.partial,
+      totalTokensPartial: tokens.partial || list.some(r => r.tokensPartial),
+      tokenDisplay: tokenDisplay(tokens.total, list.every(r => r.tokens !== null && r.cacheRead !== null)
+        ? list.reduce((sum, r) => sum + r.cacheRead!, 0) : null,
+        list.every(r => r.outputTokens !== null) ? list.reduce((sum, r) => sum + r.outputTokens!, 0) : null),
       running: list.some((r) => r.running),
       timeWidthPercent: null,
       tokenWidthPercent: null,
@@ -185,13 +298,333 @@ export function deriveRoleSummary(input: {
     };
   });
   const maxMs = Math.max(0, ...roles.map((r) => r.totalMs ?? 0));
-  const maxTokens = Math.max(0, ...roles.map((r) => r.totalTokens ?? 0));
+  const maxTokens = Math.max(0, ...roles.map((r) => (r.totalTokens ?? 0) + (r.tokenDisplay.cacheRead ?? 0)));
   for (const r of roles) {
     r.timeWidthPercent = percentOf(r.totalMs, maxMs);
-    r.tokenWidthPercent = percentOf(r.totalTokens, maxTokens);
+    r.tokenWidthPercent = percentOf(r.totalTokens === null ? null : r.totalTokens + (r.tokenDisplay.cacheRead ?? 0), maxTokens);
   }
-  const coverage = input.externalRunsCoverage;
   return coverage !== undefined && (coverage.unreadableLines > 0 || coverage.readError)
     ? { roles, omittedSubagentCount, externalRunsCoverage: { unreadableLines: coverage.unreadableLines, readError: coverage.readError } }
     : { roles, omittedSubagentCount };
+}
+
+const runTokenWhole = (run: Pick<RoleRunView, "tokens" | "cacheRead">): number | null => run.tokens === null ? null : run.tokens + (run.cacheRead ?? 0);
+
+function mergeRoleRuns(role: RoleView): RoleView {
+  const groups = new Map<string, RoleRunView[]>();
+  for (const run of role.runs) {
+    const key = JSON.stringify([run.name, run.executor, run.model, run.modelSource, run.effort, run.effortSource]);
+    const list = groups.get(key);
+    if (list) list.push(run);
+    else groups.set(key, [run]);
+  }
+  const tokenWhole = role.runs.reduce((sum, run) => sum + (runTokenWhole(run) ?? 0), 0);
+  const runs = [...groups.values()].map((list): RoleRunView => {
+    const [first] = list;
+    if (list.length === 1) return first;
+    const { toolUseId: _toolUseId, ...shared } = first;
+    const time = sumOf(list.map(run => run.durationMs));
+    const tokens = sumOf(list.map(run => run.tokens));
+    const measured = list.filter(run => run.tokens !== null);
+    const cacheRead = measured.length > 0 && measured.every(run => run.cacheRead !== null) ? measured.reduce((sum, run) => sum + run.cacheRead!, 0) : null;
+    const outputTokens = measured.length > 0 && measured.every(run => run.outputTokens !== null) ? measured.reduce((sum, run) => sum + run.outputTokens!, 0) : null;
+    const starts = list.flatMap(run => run.startedAt === null ? [] : [run.startedAt]);
+    return { ...shared, count: list.length,
+      blockId: list.every(run => run.blockId === first.blockId) ? first.blockId : null,
+      startedAt: starts.length === 0 ? null : Math.min(...starts),
+      running: list.some(run => run.running),
+      outcome: list.every(run => run.outcome === first.outcome) ? first.outcome : null,
+      durationMs: time.total, durationPartial: time.partial || list.some(run => run.durationPartial),
+      tokens: tokens.total, tokensPartial: tokens.partial || list.some(run => run.tokensPartial),
+      cacheRead, outputTokens, tokenDisplay: tokenDisplay(tokens.total, cacheRead, outputTokens),
+      timePercent: percentOf(time.total, role.totalMs),
+      tokenPercent: percentOf(sumOf(list.map(runTokenWhole)).total, tokenWhole) };
+  });
+  return { ...role, runs };
+}
+
+const CONDUCTOR_BUCKETS = ["generate", "tool", "delegation", "confirm", "reply"] as const;
+
+const spanTotal = (intervals: readonly { start: number; end: number }[]): number => measureSpans(unionSpans(intervals.map(({ start, end }) => [start, end])));
+
+function analysisTime(values: (number | null)[]): AnalysisTimeView {
+  const sum = sumOf(values);
+  return { totalMs: sum.total, partial: sum.partial, parts: values.map(ms => ({ ms, percent: percentOf(ms, sum.total) })) };
+}
+
+function blockAt(blocks: readonly RequestBlockView[], at: number | null): RequestBlockView | undefined {
+  if (at === null) return undefined;
+  let low = 0;
+  let high = blocks.length;
+  while (low < high) {
+    const middle = (low + high) >>> 1;
+    if (blocks[middle].start <= at) low = middle + 1;
+    else high = middle;
+  }
+  const block = blocks[low - 1];
+  return block && (at < (block.closedAt ?? block.end) || block.closedAt === undefined && at === block.end) ? block : undefined;
+}
+
+// The ANALYSIS rows with their routed time, tokens and runs; the PLAN panel's placement reads the same rows
+// (src/role-summary.ts#derivePlanPlacement).
+function analysisRows(view: TimeBucketView | undefined, roles: RoleSummaryView, tools?: KeyedLog<AnalysisToolRecord>) {
+  const blocks = view?.blocks ?? [];
+  const frame = view === undefined ? undefined : planFrame(view);
+  const rows = (frame?.rows ?? []).map(frame => ({ key: frame.key, frame, block: frame.block, step: frame.item,
+    values: Array<number | null>(6).fill(null), tokens: null as PlanTokenTotal | null,
+    runs: [] as RunDraft[], toolCount: 0, failCount: 0, marks: [] as AnalysisToolRecord["marks"] }));
+  type Row = typeof rows[number];
+  const byKey = new Map(rows.map(row => [row.key, row]));
+  // Work whose own row is not in the frame goes to the 00; without one it stays in the header only.
+  const frameBlocks = frame === undefined ? [] : blocks;
+  const frameBlockIds = new Set(frameBlocks.map(block => block.blockId));
+  const rowOf = (blockId: string | undefined | null, stepKey?: string): Row | undefined => blockId == null ? undefined
+    : (stepKey === undefined ? undefined : byKey.get(planItemRowKey(blockId, stepKey)))
+      ?? (frameBlockIds.has(blockId) ? byKey.get(PLAN_UNPLANNED_ROW_KEY) : undefined);
+  const memberRow = new Map<string, Row>();
+  for (const row of rows) for (const member of [...row.frame.members.agents, ...row.frame.members.bgTasks]) memberRow.set(member.toolUseId, row);
+  const ownerRow = (owner: { toolUseId: string; blockId?: string; stepKey?: string; start: number }): Row | undefined =>
+    memberRow.get(owner.toolUseId) ?? rowOf(owner.blockId ?? blockAt(blocks, owner.start)?.blockId, owner.stepKey);
+  const routes = frame?.routes ?? [];
+  const live = view !== undefined && planLive(view);
+  const now = view === undefined ? -Infinity : planNow(view);
+  const rowsAt = (at: number): Row[] => planRowsAt(routes, at).map(key => byKey.get(key)).filter((row): row is Row => row !== undefined);
+  // A usage slice is a whole second; only its routed part (moments the view observed) is shared out, so a slice that runs
+  // past the last observation is not lost.
+  const routedShare = (start: number, end: number): Map<Row, number> => {
+    const routed = planRowTime(routes, start, end);
+    return new Map([...routed.rows].flatMap(([key, ms]) => { const row = byKey.get(key); return row === undefined ? [] : [[row, ms / routed.covered] as const]; }));
+  };
+  const blockValues = (block: RequestBlockView): (number | null)[] => {
+    const metrics = block.metrics;
+    return metrics === undefined ? [block.generateMs ?? null, block.toolMs ?? null, block.subagentWaitMs ?? null, block.confirmMs ?? null, block.replyMs ?? null, null]
+      : [metrics.generateMs ?? null, metrics.toolMs ?? null, metrics.subagentWaitMs ?? null,
+        metrics.decisionWaitMs ?? null, metrics.replyWaitMs ?? null, metrics.subagentOnlyMs ?? null];
+  };
+  for (const row of rows) {
+    const values = blockValues(row.block);
+    CONDUCTOR_BUCKETS.forEach((bucket, index) => {
+      row.values[index] = values[index] === null ? null
+        : row.frame.conductorWork.filter(interval => interval.bucket === bucket).reduce((sum, interval) => sum + interval.end - interval.start, 0);
+    });
+    // Without subagent-only spans a block measured at zero is zero on every row.
+    if (values[5] === 0) row.values[5] = 0;
+    if (row.block.metrics?.tokens != null) row.tokens = { tokens: 0, cacheRead: 0, outputTokens: 0 };
+  }
+  for (const block of frameBlocks) for (const slice of block.usageSlices ?? []) {
+    const shares = slice.end > slice.start ? routedShare(slice.start, slice.end) : new Map<Row, number>();
+    const allocation = shares.size > 0 ? shares : new Map(rowsAt(slice.start).map(row => [row, 1]));
+    for (const [row, ratio] of allocation) {
+      const tokens = row.tokens ??= { tokens: 0, cacheRead: 0, outputTokens: 0 };
+      tokens.tokens += slice.tokens * ratio;
+      tokens.cacheRead += slice.cacheRead * ratio;
+      tokens.outputTokens = (tokens.outputTokens ?? 0) + (slice.outputTokens ?? 0) * ratio;
+    }
+  }
+  if (view?.subagentOnlySpans !== undefined) {
+    for (const row of rows) row.values[5] = 0;
+    const activeOwners = [...view.agents, ...view.backgroundTasks.filter(task => task.subagent)];
+    for (const [start, end] of view.subagentOnlySpans) {
+      const active = activeOwners.filter(owner => owner.start < end && owner.end > start);
+      const points = [...new Set([start, end, ...active.flatMap(owner => [Math.max(start, owner.start), Math.min(end, owner.end)])])]
+        .sort((a, b) => a - b);
+      for (let i = 0; i + 1 < points.length; i++) {
+        const owners = new Set(active.filter(owner => owner.start < points[i + 1] && owner.end > points[i]).map(ownerRow));
+        for (const row of owners) if (row) row.values[5] = (row.values[5] ?? 0) + (points[i + 1] - points[i]);
+      }
+    }
+  }
+  const owners = new Map([...view?.agents ?? [], ...view?.backgroundTasks ?? []].map(owner => [owner.toolUseId, owner]));
+  const headerRuns: RunDraft[] = [];
+  const seenRuns = new Set<string>();
+  // A run without a span (a foreground external run) goes to the item its description number names, the same lookup as
+  // the launch guard (src/time-buckets.ts#numberedLaunchVerdict), else to the 00.
+  const runRow = (run: Pick<RoleRunView, "toolUseId" | "startedAt" | "blockId">): Row | undefined => {
+    const owner = run.toolUseId === undefined ? undefined : owners.get(run.toolUseId);
+    if (owner) return ownerRow(owner);
+    const at = run.startedAt;
+    const number = run.toolUseId === undefined || tools === undefined ? undefined : keyedGet(tools, run.toolUseId)?.itemNumber;
+    const numbered = number === undefined || at === null ? undefined : planNumberedStep(blocks, number, at);
+    if (numbered !== undefined) return rowOf(blocks[numbered.blockIndex].blockId, numbered.step.key);
+    return rowOf(run.blockId ?? blockAt(blocks, at)?.blockId) ?? (at === null ? undefined : rowsAt(at)[0]);
+  };
+  for (const role of roles.roles) for (const run of role.runs) {
+    const row = runRow(run);
+    if (!row || run.toolUseId !== undefined && seenRuns.has(run.toolUseId)) continue;
+    if (run.toolUseId !== undefined) seenRuns.add(run.toolUseId);
+    const draft = { ...run, blockId: row.block.blockId, role: role.role };
+    row.runs.push(draft);
+    headerRuns.push(draft);
+  }
+  return { frameBlocks, rows, rowsAt, ownerRow, owners, runRow, headerRuns, now, live, blockValues };
+}
+
+export interface PlanPlacement {
+  tokens: Map<string, PlanTokenTotal | null>;
+  placements: Array<{ toolUseId: string; agentId?: string; stepKey: string | null }>;
+}
+
+const NO_ROLES: RoleSummaryView = { roles: [], omittedSubagentCount: 0 };
+
+// Each lane sits on the ANALYSIS row a run with its id and start would take (src/role-summary.ts#analysisRows runRow);
+// only rows of the asked block name a step. Step tokens are those rows' routed tokens. Lanes start as their ANALYSIS
+// runs do: an external run by src/role-summary.ts#externalRunStart.
+export function derivePlanPlacements(view: TimeBucketView | undefined, tools: KeyedLog<AnalysisToolRecord> | undefined,
+  lanes: ReadonlyArray<{ toolUseId: string; start: number | null }>): (blockId: string) => PlanPlacement {
+  const { rows, owners, runRow } = analysisRows(view, NO_ROLES, tools);
+  const routed = new Map<string, { agentId?: string; row: (typeof rows)[number] | undefined }>();
+  for (const [toolUseId, owner] of owners) {
+    const agentId = "transcriptAgentId" in owner ? owner.transcriptAgentId : undefined;
+    routed.set(toolUseId, { ...(agentId === undefined ? {} : { agentId }), row: runRow({ toolUseId, startedAt: owner.start, blockId: null }) });
+  }
+  for (const lane of lanes) if (!routed.has(lane.toolUseId)) routed.set(lane.toolUseId, { row: runRow({ toolUseId: lane.toolUseId, startedAt: lane.start, blockId: null }) });
+  return blockId => ({
+    tokens: new Map(rows.filter(row => row.block.blockId === blockId && row.step !== undefined).map(row => [row.step!.key, row.tokens])),
+    placements: [...routed].map(([toolUseId, { agentId, row }]) => ({ toolUseId, ...(agentId === undefined ? {} : { agentId }),
+      stepKey: row?.block.blockId === blockId ? row.step?.key ?? null : null })),
+  });
+}
+
+export function derivePlanPlacement(view: TimeBucketView | undefined, tools: KeyedLog<AnalysisToolRecord> | undefined,
+  blockId: string, lanes: ReadonlyArray<{ toolUseId: string; start: number | null }>): PlanPlacement {
+  return derivePlanPlacements(view, tools, lanes)(blockId);
+}
+
+export interface AnalysisCacheTtlInput {
+  usage: ReadonlyMap<string, PlanUsageAccumulator> | undefined;
+  settings: ReadonlyMap<string, CacheTtl>;
+}
+
+function withCacheTtl(summary: RoleSummaryView, input: AnalysisCacheTtlInput): RoleSummaryView {
+  return { ...summary, roles: summary.roles.map((role) => {
+    const setting = role.role === null || role.role === "conductor" ? undefined : input.settings.get(role.role);
+    if (setting === undefined) return role;
+    const costs = role.runs.filter((run) => run.source === "subagent").map((run) => {
+      const usage = run.toolUseId === undefined ? undefined : input.usage?.get(run.toolUseId);
+      return usage === undefined || run.modelSource !== "measured" ? null : runCacheTtlCost([...usage.values()], claudeModelPrices(run.model));
+    });
+    const cacheTtl = roleCacheTtl(costs, setting);
+    return cacheTtl === undefined ? role : { ...role, cacheTtl };
+  }) };
+}
+
+export function deriveAnalysisPlans(view: TimeBucketView | undefined, roles: RoleSummaryView,
+  tools?: KeyedLog<AnalysisToolRecord>, cacheTtl?: AnalysisCacheTtlInput): AnalysisPlansView {
+  const { frameBlocks, rows, rowsAt, headerRuns, now, live, blockValues } = analysisRows(view, roles, tools);
+  const allMarks: AnalysisToolRecord["marks"] = [];
+  let headerToolCount = 0, headerFailCount = 0;
+  for (const tool of tools ? keyedValues(tools) : []) {
+    const calls = tool.startedAt === undefined ? [] : rowsAt(tool.startedAt);
+    for (const row of calls) row.toolCount++;
+    if (calls.length) headerToolCount++;
+    const failures = tool.failed && tool.finishedAt !== undefined ? rowsAt(tool.finishedAt) : [];
+    for (const row of failures) { row.failCount++; row.marks.push(...tool.marks); }
+    if (failures.length) { headerFailCount++; allMarks.push(...tool.marks); }
+  }
+  const conductorRun = (blockId: string | null, startedAt: number, time: AnalysisTimeView, mainTokens: PlanTokenTotal | null, running: boolean,
+    model: ConductorModel | null | undefined): RunDraft => {
+    const conductorTime = sumOf(time.parts.slice(0, 5).map(part => part.ms));
+    return { role: "conductor", source: "conductor", blockId, name: "Conductor", executor: "claude",
+      model: model?.model ?? null, modelSource: model ? "measured" : null, effort: model?.effort ?? null,
+      effortSource: model?.effort === undefined ? null : "measured", startedAt,
+      running,
+      outcome: null, durationMs: conductorTime.total, durationPartial: conductorTime.partial, tokens: mainTokens ? mainTokens.tokens : null,
+      cacheRead: mainTokens?.cacheRead ?? null, outputTokens: mainTokens?.outputTokens ?? (mainTokens ? 0 : null) };
+  };
+  const plans = rows.map(({ key, frame, block, step, values, tokens: mainTokens, runs: rowRuns, toolCount, failCount, marks }): AnalysisPlanView => {
+    const span = planRowPeriod(frame, now, live);
+    const unmeasured = span === undefined;
+    const empty = unmeasured && rowRuns.length === 0;
+    const time = analysisTime(empty ? values.map(() => null) : unmeasured ? values.map((ms, i) => i < 5 ? null : ms) : values);
+    time.partial = !empty && time.partial;
+    const planRoles = summarizeRoleRuns(unmeasured ? rowRuns : [conductorRun(block.blockId, step?.startedAt ?? block.start, time, mainTokens,
+      planConductorRunning(frame, span), conductorModelAtEnd(view?.mainModelSpans, frame.conductorWork)), ...rowRuns]);
+    const tokenTotal = sumOf(planRoles.roles.map(role => role.totalTokens));
+    const runs = planRoles.roles.flatMap(role => role.runs);
+    const counted = tokenDisplay(tokenTotal.total, runs.every(run => run.tokens !== null && run.cacheRead !== null)
+      ? runs.reduce((sum, run) => sum + run.cacheRead!, 0) : null,
+      runs.every(run => run.outputTokens !== null) ? runs.reduce((sum, run) => sum + run.outputTokens!, 0) : null);
+    return { key, blockId: block.blockId, ...(step ? { stepKey: step.key } : {}), title: frame.title,
+      number: frame.number, start: span?.start ?? null, end: span?.end ?? null, running: span?.running ?? false,
+      provisional: planRowProvisional(frame, span),
+      time, timeWidthPercent: null, tokens: runs.length === 0 ? { ...counted, label: UNMEASURED_LABEL } : counted, tokenWidthPercent: null,
+      tokensPartial: !empty && (unmeasured || tokenTotal.partial || planRoles.roles.some(role => role.totalTokensPartial)), roles: planRoles,
+      failures: deriveFailureSummary(deriveExecLogFindings(marks), [{ toolCount, failCount, childToolCount: 0, childFailCount: 0 }]) };
+  });
+  const maxTime = Math.max(0, ...plans.map(plan => plan.time.totalMs ?? 0));
+  const maxTokens = Math.max(0, ...plans.map(plan => (plan.tokens.total ?? 0) + (plan.tokens.cacheRead ?? 0)));
+  for (const plan of plans) {
+    plan.timeWidthPercent = percentOf(plan.time.totalMs, maxTime);
+    plan.tokenWidthPercent = percentOf(plan.tokens.total === null ? null : plan.tokens.total + (plan.tokens.cacheRead ?? 0), maxTokens);
+  }
+  // Block metrics already count interval unions and usage slices once, irrespective of row attribution.
+  const totals = frameBlocks.map(blockValues);
+  const timeSums = Array.from({ length: 6 }, (_, i) => sumOf(totals.map(values => values[i])));
+  const time = analysisTime(timeSums.map(sum => sum.total));
+  time.parts.forEach((part, i) => { part.partial = timeSums[i].partial; });
+  time.partial = timeSums.some(sum => sum.partial);
+  if (frameBlocks.length > 0) headerRuns.unshift(...headerConductorRuns());
+  function headerConductorRuns(): RunDraft[] {
+    const running = rows.some(row => planConductorRunning(row.frame, planRowPeriod(row.frame, now, live)));
+    const spans = view?.mainModelSpans;
+    const mainIntervals = (view?.intervals ?? []).filter(interval => interval.lane === "main");
+    const keyOf = (model: ConductorModel | null): string => model === null ? "" : JSON.stringify([model.model, model.effort ?? null]);
+    const parts = new Map<string, { model: ConductorModel | null; startedAt: number; values: (number | null)[][]; tokens: (PlanTokenTotal | null)[] }>();
+    let lastWindow = { start: 0, end: 1 };
+    for (const block of frameBlocks) {
+      const slices = (block.usageSlices ?? []).map(slice => ({ ...slice, end: slice.start + 1 }));
+      const window = { start: block.start, end: Math.max(block.start + 1, block.closedAt ?? Math.max(block.end, ...slices.map(slice => slice.end))) };
+      lastWindow = window;
+      const windowParts = splitByConductorModel(spans, [window]);
+      const keys = windowParts.map(part => keyOf(part.model));
+      const windowWeights = windowParts.map(part => spanTotal(part.intervals));
+      const share = <T extends { start: number; end: number }>(amount: number, pieces: T[], weight: (piece: T) => number): number[] => {
+        const byKey = new Map(splitByConductorModel(spans, pieces).map(part => [keyOf(part.model), part.intervals.reduce((sum, piece) => sum + weight(piece), 0)]));
+        const weights = keys.map(key => byKey.get(key) ?? 0);
+        const total = weights.reduce((sum, value) => sum + value, 0);
+        return total > 0 ? largestRemainder(weights, total, amount) : largestRemainder(windowWeights, window.end - window.start, amount);
+      };
+      const clipped = mainIntervals.flatMap(interval => {
+        const start = Math.max(interval.start, window.start), end = Math.min(interval.end, window.end);
+        return end > start ? [{ ...interval, start, end }] : [];
+      });
+      const values = blockValues(block);
+      const bucketValues = CONDUCTOR_BUCKETS.map((bucket, i) => values[i] === null ? null
+        : share(values[i]!, clipped.filter(piece => piece.bucket === bucket), piece => piece.end - piece.start));
+      const tokens = block.metrics?.tokens ?? null;
+      const tokenValues = tokens === null ? null : (["tokens", "cacheRead", "outputTokens"] as const)
+        .map(field => share(tokens[field] ?? 0, slices, slice => slice[field] ?? 0));
+      windowParts.forEach((windowPart, index) => {
+        const key = keys[index];
+        let part = parts.get(key);
+        if (part === undefined) parts.set(key, part = { model: windowPart.model, startedAt: windowPart.intervals[0].start, values: [], tokens: [] });
+        part.values.push(bucketValues.map(value => value === null ? null : value[index]));
+        part.tokens.push(tokenValues === null ? null : { tokens: tokenValues[0][index], cacheRead: tokenValues[1][index], outputTokens: tokenValues[2][index] });
+      });
+    }
+    const current = keyOf(conductorModelAtEnd(spans, [lastWindow]));
+    const runs = [...parts].map(([key, part]) => {
+      const buckets = CONDUCTOR_BUCKETS.map((_, i) => sumOf(part.values.map(values => values[i])));
+      const tokens = sumOf(part.tokens.map(value => value?.tokens ?? null));
+      const cacheRead = sumOf(part.tokens.map(value => value?.cacheRead ?? null));
+      const outputTokens = sumOf(part.tokens.map(value => value?.outputTokens ?? null));
+      const draft = conductorRun(null, part.startedAt, analysisTime(buckets.map(sum => sum.total)),
+        tokens.total === null ? null : { tokens: tokens.total, cacheRead: cacheRead.total!, outputTokens: outputTokens.total! }, running && key === current, part.model);
+      return { ...draft, durationPartial: draft.durationPartial || buckets.some(sum => sum.partial),
+        ...(tokens.partial ? { tokensPartial: true, cacheRead: null, outputTokens: null } : {}) };
+    });
+    const worked = runs.filter(run => run.durationMs !== 0 || run.durationPartial || (run.tokens ?? 0) > 0);
+    return worked.length > 0 ? worked : runs.slice(0, 1);
+  }
+  const summarized = summarizeRoleRuns(headerRuns, roles.omittedSubagentCount, roles.externalRunsCoverage);
+  const withTtl = cacheTtl === undefined ? summarized : withCacheTtl(summarized, cacheTtl);
+  const headerRoles = { ...withTtl, roles: withTtl.roles.map(mergeRoleRuns) };
+  const totalTokens = sumOf(headerRuns.map(run => run.tokens)).total;
+  const tokens = tokenDisplay(totalTokens, headerRuns.every(run => run.tokens !== null && run.cacheRead !== null)
+    ? headerRuns.reduce((sum, run) => sum + run.cacheRead!, 0) : null,
+    headerRuns.every(run => run.outputTokens !== null) ? headerRuns.reduce((sum, run) => sum + run.outputTokens!, 0) : null);
+  return { plans, time, mainTokens: headerRoles.roles.find(role => role.role === "conductor")?.totalTokens ?? null,
+    tokens, roles: headerRoles,
+    failures: deriveFailureSummary(deriveExecLogFindings(allMarks), [{ toolCount: headerToolCount,
+      failCount: headerFailCount, childToolCount: 0, childFailCount: 0 }]) };
 }

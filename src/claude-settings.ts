@@ -6,6 +6,7 @@ import { homedir } from "node:os";
 
 import { claudeConfigDir } from "./claude-env";
 import { normalizeDisplayName } from "./display-name";
+import { EVENT_LIMIT_DEFAULT, resolveEventLimit } from "./event-limits";
 import { extensionContext, output } from "./host-context";
 import { PERMISSION_MODES, PermissionModeId } from "./protocol";
 import type { ModelInfo } from "./protocol";
@@ -260,7 +261,7 @@ export function inheritedProfile(s: Session): { model: string | null | undefined
 }
 
 export function configuredClaudeExecutablePath(cfg: vscode.WorkspaceConfiguration): string | undefined {
-  return cfg.get<string>("claude.executablePath", "").trim() || undefined;
+  return cfg.get<string>("claude.executablePath")!.trim() || undefined;
 }
 
 export function normalizeDriveLetter(cwd: string): string {
@@ -279,6 +280,16 @@ export function getLaisoraConfiguration(): vscode.WorkspaceConfiguration {
   return vscode.workspace.getConfiguration("laisora");
 }
 
+export function configuredEventLimit(): number {
+  let raw: unknown = EVENT_LIMIT_DEFAULT;
+  try {
+    raw = getLaisoraConfiguration().get<unknown>("history.eventLimit");
+  } catch {
+    raw = EVENT_LIMIT_DEFAULT;
+  }
+  return resolveEventLimit(raw);
+}
+
 export function configuredDisplayName(): string {
-  return normalizeDisplayName(getLaisoraConfiguration().get<unknown>("appearance.displayName", ""));
+  return normalizeDisplayName(getLaisoraConfiguration().get<unknown>("appearance.displayName"));
 }

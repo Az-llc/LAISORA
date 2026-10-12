@@ -90,6 +90,7 @@ async function runHandoff(st: SessionStore, sender: vscode.Webview, target: Sess
   const sourceGeneration = target.logicalGeneration;
   const contextUsage: HandoffContextUsage = { before: null, after: "pending" };
   let snapshotWrite: Promise<void> = Promise.resolve();
+  let snapshotPending = false;
 
   if (busy()) {
     fail("source_busy");
@@ -116,7 +117,7 @@ async function runHandoff(st: SessionStore, sender: vscode.Webview, target: Sess
     try {
       runtime = await resolveHandoffRuntime(
         configuredClaudeExecutablePath(cfg),
-        normalizeApiKeyPolicy(cfg.get("claude.apiKeyPolicy", "inherit"))
+        normalizeApiKeyPolicy(cfg.get<string>("claude.apiKeyPolicy")!)
       );
     } catch (e) {
       fail("fork_failed", String(e));
@@ -130,7 +131,7 @@ async function runHandoff(st: SessionStore, sender: vscode.Webview, target: Sess
       env: runtime.env,
       model: profile.model ?? undefined,
       effort: profile.effort ?? undefined,
-      settingSources: cfg.get<Array<"user" | "project" | "local">>("claude.settingSources", ["user", "project", "local"]),
+      settingSources: cfg.get<Array<"user" | "project" | "local">>("claude.settingSources")!,
       lookupSessionFileById: async (id) => lookupSessionFile(id),
       readRecords: readHandoffRecords,
       fs: handoffFs,
@@ -151,8 +152,9 @@ async function runHandoff(st: SessionStore, sender: vscode.Webview, target: Sess
         });
       },
       onForkCreated: (forkSessionId) => {
+        snapshotPending = true;
         snapshotWrite = handoffPersist().update(handoffContextUsageKey(forkSessionId), { ...contextUsage }).catch((error) =>
-          output.appendLine("[handoff] context snapshot could not be saved: " + String(error)));
+          output.appendLine("[handoff] context snapshot could not be saved: " + String(error))).finally(() => { snapshotPending = false; });
       },
       onProgress: (info) => {
         st.post({
@@ -256,8 +258,14 @@ async function runHandoff(st: SessionStore, sender: vscode.Webview, target: Sess
       if (forkSession.logicalGeneration !== generation) return;
       if (!target.closed) st.post({ ...done, tabId: target.tabId });
       if (!forkSession.closed) st.post({ ...done, tabId: forkSession.tabId });
-      await snapshotWrite;
-      await handoffPersist().update(contextUsageKey, { ...contextUsage });
+      const saveFinal = async (): Promise<void> => {
+        await handoffPersist().update(contextUsageKey, { ...contextUsage });
+      };
+      if (snapshotPending) {
+        void snapshotWrite.then(saveFinal).catch((error) =>
+          output.appendLine("[handoff] context snapshot could not be saved: " + String(error)));
+      }
+      await saveFinal();
     }).catch((error) => {
       output.appendLine("[handoff] context snapshot could not be saved: " + String(error));
       if (forkSession.logicalGeneration === generation && !forkSession.closed) st.post({ ...done, tabId: forkSession.tabId });

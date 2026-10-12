@@ -4,9 +4,10 @@ import { progressSubjectKey } from "./progress-protocol";
 import type { HostArtifactAccess } from "./artifact-access";
 import { PROGRESS_WIRE_TOOL_NAME } from "./artifact-access";
 import type { TaskIntent, TaskStatus } from "./work-model";
-import { CLAUDE_VOCABULARY, taskCreateKeyFromResult } from "./work-model";
+import { CLAUDE_VOCABULARY, taskCreateKeyFromResult, createWorkModelState, reduceWorkModel, type WorkModelState } from "./work-model";
 import { isPureCommandWrapper } from "./human-input-vocabulary";
 import { redactAbsolutePaths } from "./path-redaction";
+import { isRejectedBeforeRun } from "./tool-result-signals";
 import { createTimeBucketState, foldTimeBuckets, type TimeBucketState } from "./time-buckets";
 import { createExecLogMarkState, foldExecLogMarks, type ExecLogMarkState } from "./exec-log-marks";
 
@@ -115,6 +116,7 @@ export interface GapScanState {
 }
 
 export interface SemanticEvidenceIndex {
+  currentGeneration?: { workModel: WorkModelState; evidence: SemanticEvidenceIndex; toolCalls: number };
   bindings: TaskIdentityBinding[];
   todoTransitions: TodoTransition[];
   transitionSummaries: TaskTransitionSummary[];
@@ -471,10 +473,29 @@ export function foldEvidence(
   index: SemanticEvidenceIndex,
   event: NormalizedEvent,
   hostArtifacts?: HostArtifactAccess[],
-  gapBoundaries?: readonly number[]
+  gapBoundaries?: readonly number[],
+  timeOptions?: Parameters<typeof foldTimeBuckets>[2]
+): SemanticEvidenceIndex {
+  const folded = foldEvidenceState(index, event, hostArtifacts, gapBoundaries, timeOptions);
+  const boundary = folded.timeBuckets.generationBoundaryAt;
+  if (boundary === undefined) return folded;
+  const previous = boundary === index.timeBuckets.generationBoundaryAt ? index.currentGeneration : undefined;
+  return { ...folded, currentGeneration: {
+    workModel: reduceWorkModel(previous?.workModel ?? createWorkModelState(), event),
+    evidence: foldEvidenceState(previous?.evidence ?? createEvidenceIndex(), event, hostArtifacts, gapBoundaries, timeOptions),
+    toolCalls: (previous?.toolCalls ?? 0) + (event.kind === "tool_call_started" ? 1 : 0),
+  } };
+}
+
+function foldEvidenceState(
+  index: SemanticEvidenceIndex,
+  event: NormalizedEvent,
+  hostArtifacts?: HostArtifactAccess[],
+  gapBoundaries?: readonly number[],
+  timeOptions?: Parameters<typeof foldTimeBuckets>[2]
 ): SemanticEvidenceIndex {
   const folded = foldGapScan(foldEvidenceBody(index, event, hostArtifacts), event, gapBoundaries);
-  const timeBuckets = foldTimeBuckets(index.timeBuckets, event);
+  const timeBuckets = foldTimeBuckets(index.timeBuckets, event, timeOptions);
   const execLogMarks = foldExecLogMarks(index.execLogMarks, event);
   if (timeBuckets === index.timeBuckets && execLogMarks === index.execLogMarks) return folded;
   return { ...folded, timeBuckets, execLogMarks };
@@ -498,7 +519,9 @@ function foldEvidenceBody(
       }
     }
     const di = next.delegations.findIndex((d) => d.toolUseId === event.toolUseId);
-    if (di >= 0) {
+    if (di >= 0 && isRejectedBeforeRun(event)) {
+      next = { ...next, delegations: next.delegations.filter((_, i) => i !== di), hash: "" };
+    } else if (di >= 0) {
       if (event.asyncLaunchedAgentId !== undefined && !event.isError) {
         if (next.delegations[di].transcriptAgentId !== event.asyncLaunchedAgentId) {
           const delegations = [...next.delegations];

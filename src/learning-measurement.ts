@@ -37,7 +37,7 @@ export class LearningMeasurement {
         .map(([key, value]) => [key, /^[\p{L}\p{N} ._:-]{1,200}$/u.test(value) ? value : this.ingestion.ref("tag", value)])) });
   }
   async cumulativeUsage(message: { modelUsage?: unknown; total_cost_usd?: unknown; is_error?: boolean }, session: string, resumed: boolean,
-    research: boolean, identity: string, completesTurn: boolean): Promise<void> {
+    identity: string, completesTurn: boolean): Promise<void> {
     const valid = (value: unknown): value is number => typeof value === "number" && Number.isFinite(value) && value >= 0;
     const models = message.modelUsage && typeof message.modelUsage === "object" && !Array.isArray(message.modelUsage)
       ? Object.values(message.modelUsage) : undefined;
@@ -54,9 +54,9 @@ export class LearningMeasurement {
       const prior = [...snapshots].reverse().find(record => valid(record.counts[key]))?.counts[key];
       return typeof prior === "number" ? current >= prior ? current - prior : current : resumed ? null : current;
     };
-    const promptTokens = delta("claudeCumulativePromptTokens", tokens), researchCost = delta("claudeCumulativeCost", cost);
+    const promptTokens = delta("claudeCumulativePromptTokens", tokens);
     await this.record({ claudeCumulativePromptTokens: tokens, claudeCumulativeCost: cost,
-      ...(completesTurn ? { usageResults: 1, promptTokens, ...(research ? { researchTokens: promptTokens, researchCost } : {}) } : {}) },
+      ...(completesTurn ? { usageResults: 1, promptTokens } : {}) },
       { executor: "claude", usageSession: sessionRef }, `usage:${sessionRef}:${identity}`);
   }
 }

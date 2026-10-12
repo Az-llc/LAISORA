@@ -1,8 +1,8 @@
 import MarkdownIt, { type Token } from "markdown-it";
 import { parseAskBlock, parsePlanBlock, type AskBlock } from "./ask-parser";
 import { isClosingFence } from "./commit-boundary";
-import { DEFAULT_SYSTEM_APP_EXTENSIONS } from "../file-link-open-mode";
-import { parseFileLinkTarget, type FileLinkPlatform, type FileLinkTarget } from "../file-link-target";
+import { DEFAULT_SYSTEM_APP_EXTENSIONS } from "./file-link-open-mode";
+import { parseFileLinkTarget, type FileLinkPlatform, type FileLinkTarget } from "./file-link-target";
 
 export type TableAlign = "left" | "center" | "right" | undefined;
 

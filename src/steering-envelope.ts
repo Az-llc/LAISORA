@@ -76,6 +76,7 @@ const SIGNAL_KINDS = new Set([
   "declared_state_conflict",
   "stagnation",
   "output_overrun",
+  "delegation_stopped",
 ]);
 const CONFIDENCES = new Set(["turn", "signature", "divergence", "observed"]);
 const hasOnlyKeys = (r: Record<string, unknown>, allowed: Set<string>): boolean => Object.keys(r).every((k) => allowed.has(k));
@@ -101,8 +102,15 @@ export function steeringInstruction(mode: SteeringMode, signals: readonly Steeri
         return `${s.kind} on ${onWhat} (count ${s.count}${lostTimeNote(s)})${s.taskId ? ` task ${s.taskId}` : ""}`;
       })
       .join("; ");
+    const stopped = signals
+      .filter((s) => s.kind === "delegation_stopped")
+      .map((s) =>
+        ` Delegation ${s.subjectId} stopped before it finished while PLAN step ${s.taskId ?? ""} is still in progress: ` +
+        `resume it with SendMessage to ${s.subjectId}, or update the step with the progress tool.`
+      )
+      .join("");
     return (
-      `Machine-generated LAISORA report; not a human message or request. Live Guardrail observed: ${observed}. ` +
+      `Machine-generated LAISORA report; not a human message or request. Live Guardrail observed: ${observed}.${stopped} ` +
       "Judge each observation against the corresponding task or delegation result and decide, for each, whether to continue, re-delegate with changed instructions, or stop it. Do not wait for a human decision."
     );
   }

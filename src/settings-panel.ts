@@ -8,17 +8,19 @@ import {
   settingsStateMessage,
   loadSettingsProfiles,
   projectConductorPreview,
-  requestModelProfileResearch,
+  recommendedRosterMessage,
+  applyRecommendedRoster,
   refreshExternalDetection,
   writeApiKeyPolicy,
   writeAccentSetting,
   writeDisplayName,
   writeLearningEnabled,
-  writeProfileSources,
+  writeCliAutoUpdate,
   writeComposerSendKey,
   writeFileLinkSetting,
   writeOrchestrationSetting,
   writeRestoreTabsOnStartup,
+  writeEventLimit,
   writeInitialModel,
 } from "./gateway-host-actions";
 
@@ -70,13 +72,18 @@ export async function handleSettingsPageMessage(webview: vscode.Webview, raw: un
       await loadSettingsProfiles();
       void webview.postMessage({ type: "conductorPreview", requestId: raw.requestId, ...projectConductorPreview(raw.policy) });
       return;
-    case "researchModelProfiles":
-      await loadSettingsProfiles();
-      requestModelProfileResearch(raw.targets, raw.purpose);
-      break;
     case "openVsCodeSettings":
       await vscode.commands.executeCommand("workbench.action.openSettings", "laisora");
       return;
+    case "proposeRecommendedRoster":
+      void webview.postMessage(recommendedRosterMessage());
+      return;
+    case "applyRecommendedRoster": {
+      const applied = await applyRecommendedRoster(raw.revision);
+      if (applied.stale) void webview.postMessage(recommendedRosterMessage());
+      writeFailure = applied.failure;
+      break;
+    }
     case "settingWriteFailureAction":
       await vscode.commands.executeCommand(raw.action === "reloadWindow" ? "workbench.action.reloadWindow" : "workbench.action.openSettingsJson");
       return;
@@ -106,11 +113,14 @@ export async function handleSettingsPageMessage(webview: vscode.Webview, raw: un
     case "setRestoreTabsOnStartup":
       writeFailure = await writeRestoreTabsOnStartup(raw.enabled);
       break;
+    case "setEventLimit":
+      writeFailure = await writeEventLimit(raw.value);
+      break;
+    case "setCliAutoUpdate":
+      writeFailure = await writeCliAutoUpdate(raw.executor, raw.enabled);
+      break;
     case "setLearningEnabled":
       writeFailure = await writeLearningEnabled(raw.enabled);
-      break;
-    case "setProfileSources":
-      writeFailure = await writeProfileSources(raw.sources);
       break;
     case "setOrchestrationSetting":
       writeFailure = await writeOrchestrationSetting(raw.setting, raw.value);

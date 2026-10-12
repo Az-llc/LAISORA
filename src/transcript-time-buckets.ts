@@ -1,4 +1,5 @@
 import type { NormalizedEvent, TimeBucketsCoverage } from "./protocol";
+import type { RosterSource } from "./roster-evidence";
 import { readSessionHistory, readSubagentAgents, type HistoryEvent } from "./session-transcript";
 import {
   attachTimeBucketRequestNumbers,
@@ -70,7 +71,7 @@ export function timeBucketsFromHistory(
       conversationId: ids.conversationId,
       generation: ids.generation,
     } as NormalizedEvent;
-    state = foldTimeBuckets(state, ev);
+    state = foldTimeBuckets(state, ev, { childSpans, modelMarks });
     if (ev.kind === "assistant_usage" && ev.parentToolUseId === null) usage = foldPlanUsage(usage, ev.messageId, e.timestamp, ev.usage);
     if (ev.kind === "turn_started" || ev.kind === "user_message") {
       requests = reduceWorkModel(requests, ev);
@@ -82,6 +83,7 @@ export function timeBucketsFromHistory(
 }
 
 export interface TranscriptTimeBucketsRead {
+  rosterSources?: RosterSource[];
   view: TimeBucketView | undefined;
   coverage: TimeBucketsCoverage | undefined;
 }
@@ -104,14 +106,16 @@ export function subagentReadCoverage(restored: {
 export async function readTranscriptTimeBucketsWithCoverage(
   file: string,
   isAllowedPath: (p: string) => boolean,
-  ids: TranscriptIds
+  ids: TranscriptIds,
+  generationSessionId?: string
 ): Promise<TranscriptTimeBucketsRead> {
-  const history = await readSessionHistory(file, isAllowedPath);
+  const history = await readSessionHistory(file, isAllowedPath, generationSessionId === undefined ? undefined : { generationSessionId });
   const sessionReadError = history.readError ?? history.subagentsReadError;
-  if (sessionReadError !== undefined) return { view: undefined, coverage: { sessionReadError } };
+  if (sessionReadError !== undefined) return { view: undefined, coverage: { sessionReadError }, rosterSources: history.rosterSources };
   const restored = await readSubagentAgents(file, isAllowedPath);
   return {
     view: timeBucketsFromHistory(history.events, childSpansOf(restored.agents), ids),
+    rosterSources: history.rosterSources,
     coverage: subagentReadCoverage(restored),
   };
 }
@@ -119,7 +123,8 @@ export async function readTranscriptTimeBucketsWithCoverage(
 export async function readTranscriptTimeBuckets(
   file: string,
   isAllowedPath: (p: string) => boolean,
-  ids: TranscriptIds
+  ids: TranscriptIds,
+  generationSessionId?: string
 ): Promise<TimeBucketView | undefined> {
-  return (await readTranscriptTimeBucketsWithCoverage(file, isAllowedPath, ids)).view;
+  return (await readTranscriptTimeBucketsWithCoverage(file, isAllowedPath, ids, generationSessionId)).view;
 }

@@ -2,10 +2,10 @@ import { createLoader } from "./loader";
 import { mergeAskChoice } from "./ask-choice";
 import { createSessionHeader } from "./session-header";
 import { PlanPanel } from "./plan-panel";
-import { applyFallbackModel, fallbackNeedsConfirmation, fallbackNoticeOriginal, foldModelFallback, resolveFallbackByChoice } from "../protocol";
+import { applyFallbackModel, fallbackNoticeOriginal, foldModelFallback, resolveFallbackByChoice } from "../protocol";
 import type { ModelFallbackState } from "../protocol";
 import { YouList } from "./you-list";
-import { bindUserLabel, onUserLabelChange, userLabel } from "./user-label";
+import { bindUserLabel, onUserLabelChange } from "./user-label";
 import type { YouItem } from "./you-items";
 import { resolveModelDisplayName } from "../model-display-name";
 import type {
@@ -40,7 +40,7 @@ import { uiLocale } from "./l10n";
 import { createCopyButton, renderMarkdownInto } from "./markdown";
 import { askHeading, askOptionContent, updateAskCounters } from "./ask-view";
 import { createYouItems, encodeAskDismissal, encodeAskResolution, youAnchor, type AskIdentity, type AskResolutionRecord, type YouItemsReader } from "./you-items";
-import { appendRecordPart, findCommitBoundary, joinRecordTexts, prependRecordParts, recordSeparator, type RecordTextPart } from "./commit-boundary";
+import { appendRecordPart, findCommitBoundary, joinRecordTexts, prependRecordParts, recordSeparator, type RecordTextPart } from "../commit-boundary";
 import { isConvRenderableEvent } from "../conv-renderable";
 import {
   applyActivityEvent,
@@ -57,7 +57,8 @@ import type { HandoffFailReason } from "../handoff-runner";
 import type { WorkViewMode } from "./work-overview";
 import type { GraphScrollPort } from "./work-graph";
 import { refreshFind, refreshFindCount } from "./find-bar";
-import { deriveStatusLine, statusLineText, truncateToolIntent, type ToolIntentInput } from "./status-line";
+import { deriveStatusLine, statusLineText, truncateToolIntent } from "./status-line";
+import type { ToolIntentInput } from "../tool-intent";
 import {
   SCROLL_BOTTOM_GAP_PX,
   activeTabId,
@@ -591,19 +592,21 @@ function setRowChip(data: WorkRowData, kind: string, text: string): void {
   chips.sort((a, b) => chipRank(a.kind) - chipRank(b.kind));
 }
 
-function fillChips(chipsEl: HTMLElement, data: WorkRowData): void {
+function fillChips(chipsEl: HTMLElement, data: WorkRowData, models: readonly ModelInfo[]): void {
   chipsEl.textContent = "";
   for (const chip of data.chips ?? []) {
+    const text = chip.kind === "model" ? resolveModelDisplayName(models, chip.text) : chip.text;
+    if (text === undefined) continue;
     const el = document.createElement("span");
     el.className = `agent-chip agent-chip-${chip.kind}`;
     el.dataset.chip = chip.kind;
-    el.textContent = chip.text;
+    el.textContent = text;
     chipsEl.appendChild(el);
   }
 }
 
-function shortModelLabel(model: string): string {
-  return model.replace(/^claude-/, "");
+function shouldApplyAgentState(stored: WorkAgentStateView | undefined, incoming: WorkAgentStateView, acceptRunChange = false): boolean {
+  return stored === undefined || stored.revision < incoming.revision || (acceptRunChange && stored.runStartedAt !== incoming.runStartedAt);
 }
 
 function taskLabel(item: WorkTaskItemView): string {
@@ -760,6 +763,9 @@ export function setOnConvViewShown(fn: typeof onConvViewShown): void {
 }
 
 const ASK_MESSAGE_STATE_MAX = 500;
+const READING_ROW_PROBE_STEP_PX = 8;
+const READING_ROW_PROBE_SPAN_PX = 64;
+const READING_ROW_WIDTH_SLACK_PX = 0.5;
 
 export class Tab {
   private youStoreValue?: ReturnType<typeof createYouItems>;
@@ -922,6 +928,10 @@ export class Tab {
   private viewNavObserver?: ResizeObserver;
   private turnRailResizeObserver?: ResizeObserver;
   private turnRailMutationObserver?: MutationObserver;
+  private convWidthObserver?: ResizeObserver;
+  private convWidth: number | undefined;
+  private readingAnchor: { row: HTMLElement; point: number; height: number } | undefined;
+  private readingAnchorFrame: number | undefined;
   private changingView = false;
   setWorkViewMode?: (mode: WorkViewMode) => void;
   syncWorkVisibility?: () => void;
@@ -1404,39 +1414,49 @@ export class Tab {
   private fallbackText(ev: Extract<NormalizedEvent, { kind: "model_refusal_fallback" }>): string {
     const label = (model: string): string => this.modelLabel(model);
     return ev.scope === "local"
-      ? l10n.t("Local model fallback: {0} → {1} (category: {2})", label(ev.originalModel), label(ev.fallbackModel), ev.category ?? l10n.t("Unknown"))
-      : l10n.t("Model switched: {0} → {1} (category: {2})", label(ev.originalModel), label(ev.fallbackModel), ev.category ?? l10n.t("Unknown"));
+      ? l10n.t("Local model fallback: {0} → {1}", label(ev.originalModel), label(ev.fallbackModel))
+      : l10n.t("Model switched: {0} → {1}", label(ev.originalModel), label(ev.fallbackModel));
   }
 
   private fallbackStatusText(ev: Extract<NormalizedEvent, { kind: "model_refusal_fallback" }>): string | undefined {
+    if (ev.scope === "local") return undefined;
     const original = this.modelLabel(fallbackNoticeOriginal(this.modelFallback, ev));
-    return ev.autoRevert === "pending" ? l10n.t("{0} will be restored automatically when this turn ends.", original)
-      : ev.autoRevert === "off" ? l10n.t("Automatic restore is off; restore {0} from {1}.", original, userLabel())
-        : undefined;
+    const notice = this.modelFallback?.notice;
+    const state = notice?.conversationId === ev.conversationId && notice?.generation === ev.generation && notice?.seq === ev.seq
+      ? this.modelFallback : undefined;
+    if (state?.resolvedAt !== undefined) return undefined;
+    return (state?.autoRevert ?? ev.autoRevert) === "pending" && state?.reopenedAt === undefined
+      ? l10n.t("{0} will be restored automatically when this turn ends.", original)
+      : l10n.t("Could not restore the original model {0}. Please switch the model manually.", original);
   }
 
   private fallbackRevertText(ev: Extract<NormalizedEvent, { kind: "model_fallback_revert" }>): string {
     const original = this.modelLabel(ev.originalModel);
     return ev.outcome === "applied" ? l10n.t("Restored the original model {0} automatically.", original)
       : ev.outcome === "deferred" ? l10n.t("The conversation will start on the original model {0} next time.", original)
-        : ev.outcome === "failed" ? l10n.t("Could not restore the original model {0} automatically; restore it from {1}.", original, userLabel())
+        : ev.outcome === "failed" ? l10n.t("Could not restore the original model {0}. Please switch the model manually.", original)
           : l10n.t("Your model selection replaced the fallback model.");
   }
 
   private fallbackLogText(ev: Extract<NormalizedEvent, { kind: "model_refusal_fallback" }>): string {
-    const status = this.fallbackStatusText(ev);
-    return status === undefined ? this.fallbackText(ev) : `${this.fallbackText(ev)} ${status}`;
+    return [this.fallbackText(ev), ev.category ? l10n.t("Safety filter: {0}", ev.category) : undefined,
+      ev.explanation, this.fallbackStatusText(ev)].filter(Boolean).join(" ");
   }
 
   private decorateFallbackBlock(block: HTMLElement, ev: Extract<NormalizedEvent, { kind: "model_refusal_fallback" }>): void {
-    block.id = youAnchor(this.tabId, `fallback:${ev.generation}:${ev.seq}`);
+    if (ev.category) {
+      const category = document.createElement("p");
+      category.className = "you-kind";
+      category.textContent = l10n.t("Safety filter: {0}", ev.category);
+      block.append(category);
+    }
     if (ev.explanation) {
       const summary = document.createElement("p");
       summary.className = "you-summary";
       summary.textContent = ev.explanation;
       block.append(summary);
     }
-    if (this.fallbackStatusText(ev) !== undefined) {
+    if (ev.scope === "session") {
       const status = document.createElement("p");
       status.className = "fallback-status";
       block.append(this.bindModelText(status, () => this.fallbackStatusText(ev) ?? ""));
@@ -1445,25 +1465,16 @@ export class Tab {
 
   setModelFallback(state: ModelFallbackState | undefined): void {
     this.modelFallback = state;
-    if (state && fallbackNeedsConfirmation(state)) {
-      this.youStore.fallback(state, this.fallbackText(state.notice));
-      this.youStore.appliedModel(state.appliedModel, state.resolvedAt ?? state.notice.timestamp, this.models);
-    }
+    this.refreshModelTexts();
   }
 
   observeAppliedModel(model: string | null | undefined): void {
     const next = applyFallbackModel(this.modelFallback, model, Date.now(), this.models);
     if (next !== this.modelFallback) this.setModelFallback(next);
-    if (model) this.youStore.appliedModel(model, Date.now(), this.models);
   }
 
   chooseModel(model: string | null | undefined): void {
     this.setModelFallback(resolveFallbackByChoice(this.modelFallback, model, Date.now(), this.models));
-    if (model) this.youStore.appliedModel(model, Date.now(), this.models);
-  }
-
-  private restoreFallbackModel(model: string): void {
-    vscode.postMessage({ type: "setModel", tabId: this.tabId, model, sessionOnly: true });
   }
 
   recordedModel: string | undefined;
@@ -1520,7 +1531,6 @@ export class Tab {
   private pastConvFooters = new Map<string, HTMLElement>();
   private pastTurnCompletedAt = new Map<string, number>();
   private lastPastModel: string | null = null;
-  private workReplayMarkerShown = false;
   private todoCardEl: HTMLDetailsElement | null = null;
   private todoSummaryEl: HTMLElement | null = null;
   private todoListEl: HTMLElement | null = null;
@@ -1626,12 +1636,13 @@ export class Tab {
       this.planPanel.setWaiting(count);
       this.openYouCount = count;
       if (this.tabBtn !== undefined) this.updateStrip();
-    }, item => this.dismissYou(item), model => this.restoreFallbackModel(model));
-    this.summaryYou = new YouList(this.youItems, item => this.navigateToYou(item), undefined, item => this.dismissYou(item), model => this.restoreFallbackModel(model));
+    }, item => this.dismissYou(item));
+    this.summaryYou = new YouList(this.youItems, item => this.navigateToYou(item), undefined, item => this.dismissYou(item));
     this.planPanel.you.append(this.chatYou.element);
     this.logEl.appendChild(content);
     logsEl.appendChild(this.logEl);
     this.observeTurnRails();
+    this.observeConvWidth();
 
     this.tabBtn = document.createElement("div");
     this.tabBtn.className = "tab";
@@ -1674,6 +1685,8 @@ export class Tab {
     this.viewNavObserver?.disconnect();
     this.turnRailResizeObserver?.disconnect();
     this.turnRailMutationObserver?.disconnect();
+    this.convWidthObserver?.disconnect();
+    if (this.readingAnchorFrame !== undefined) cancelAnimationFrame(this.readingAnchorFrame);
     this.sessionHeader.mountMenu(null);
     this.logEl.remove();
     this.tabBtn.remove();
@@ -1694,6 +1707,50 @@ export class Tab {
       this.syncTurnRails();
     });
     this.turnRailMutationObserver.observe(this.convEl, { childList: true, subtree: true });
+  }
+
+  private observeConvWidth(): void {
+    if (typeof ResizeObserver === "undefined") return;
+    this.convWidthObserver = new ResizeObserver(entries => {
+      const size = entries[entries.length - 1]?.borderBoxSize?.[0];
+      if (size === undefined) return;
+      if (size.inlineSize !== this.convWidth) this.keepReadingOnWidthChange(size.inlineSize);
+      else if (this.scrollRestored) this.measureReadingRow();
+    });
+    this.convWidthObserver.observe(this.convEl);
+  }
+
+  private keepReadingOnWidthChange(width: number): void {
+    if (width <= 0 || width === this.convWidth) return;
+    const previous = this.convWidth;
+    this.convWidth = width;
+    if (previous === undefined) return;
+    if (activeTabId !== this.tabId || this.viewMode !== "conv" || !this.scrollRestored || this.awaitedConvAnchor !== undefined) return;
+    if (this.atBottom.conv) {
+      logsEl.scrollTop = logsEl.scrollHeight;
+      this.scrollPos.conv = logsEl.scrollTop;
+      return;
+    }
+    const reading = this.readingAnchor;
+    if (reading !== undefined && reading.row.isConnected && reading.row.getClientRects().length > 0) {
+      const rect = reading.row.getBoundingClientRect();
+      const line = this.readingLine();
+      const place = reading.point > 0 && reading.height > 0 ? line - reading.point * rect.height / reading.height : line - reading.point;
+      logsEl.scrollTop += rect.top - place;
+      this.scrollPos.conv = logsEl.scrollTop;
+      this.preservedScroll = { mode: "conv", top: logsEl.scrollTop };
+      delete this.knownAnchor.conv;
+      this.anchorMeasuredTop = undefined;
+      this.measureReadingRow();
+      return;
+    }
+    const placed = this.preservedScroll?.mode === "conv" && this.preservedScroll.top === this.scrollPos.conv;
+    const anchor = placed || this.anchorMeasuredTop === this.scrollPos.conv ? this.knownAnchor.conv : undefined;
+    if (anchor === undefined || !this.alignToAnchor("conv", anchor)) this.measureReadingRow();
+  }
+
+  private keepReadingOnReturn(): void {
+    if (this.viewMode === "conv") this.keepReadingOnWidthChange(this.convEl.getBoundingClientRect().width);
   }
 
   private syncTurnRails(): void {
@@ -1939,6 +1996,7 @@ export class Tab {
         this.scrollPos[this.viewMode] = logsEl.scrollTop;
         this.knownAnchor[this.viewMode] = this.atBottom[this.viewMode] ? undefined : this.measureAnchor(this.viewMode);
         this.anchorMeasuredTop = undefined;
+        this.measureReadingRow();
       }
       this.viewMode = mode;
     }
@@ -1952,6 +2010,7 @@ export class Tab {
     if (activeTabId === this.tabId) {
       this.syncHeadLayout();
       this.placeSurface(mode);
+      this.keepReadingOnReturn();
       if (moveFocus) this.syncViewTabs(true);
     }
     this.setWorkViewVisible?.(mode === "work");
@@ -2317,11 +2376,14 @@ export class Tab {
   }
 
   noteScroll(): void {
+    if (this.viewMode === "conv" && this.convWidth !== undefined &&
+      Math.abs(this.convEl.getBoundingClientRect().width - this.convWidth) > READING_ROW_WIDTH_SLACK_PX) return;
     this.scrollPos[this.viewMode] = logsEl.scrollTop;
     if (this.preservedScroll?.mode === this.viewMode && logsEl.scrollTop === this.preservedScroll.top) return;
     this.preservedScroll = undefined;
     const gap = logsEl.scrollHeight - logsEl.scrollTop - logsEl.clientHeight;
     this.atBottom[this.viewMode] = gap <= SCROLL_BOTTOM_GAP_PX && !(this.viewMode === "work" && this.holdsWorkScroll());
+    if (this.viewMode === "conv" && !this.atBottom.conv) this.scheduleReadingRow();
   }
 
   restoreScroll(): void {
@@ -2330,6 +2392,7 @@ export class Tab {
     this.preservedScroll = this.atBottom[this.viewMode] ? undefined : { mode: this.viewMode, top: logsEl.scrollTop };
     this.unappliedCarry = undefined;
     this.scrollRestored = true;
+    this.keepReadingOnReturn();
   }
 
   private placeSurface(mode: ViewMode): void {
@@ -2362,6 +2425,7 @@ export class Tab {
     if (row === null) return false;
     logsEl.scrollTop += row.getBoundingClientRect().top - logsEl.getBoundingClientRect().top - anchor.offset;
     this.atBottom[mode] = false;
+    if (mode === "conv") this.measureReadingRow();
     this.scrollPos[mode] = logsEl.scrollTop;
     this.preservedScroll = { mode, top: logsEl.scrollTop };
     this.knownAnchor[mode] = anchor;
@@ -2392,6 +2456,49 @@ export class Tab {
     let row = this.anchorRowInDom(mode, anchor);
     while (row !== null && row !== root && row.getClientRects().length === 0) row = row.parentElement;
     return row === root ? null : row;
+  }
+
+  noteConvContentShift(): void {
+    if (activeTabId === this.tabId && this.viewMode === "conv" && this.scrollRestored) this.measureReadingRow();
+    else this.readingAnchor = undefined;
+  }
+
+  private readingLine(): number {
+    return Math.max(logsEl.getBoundingClientRect().top, this.headEl.getBoundingClientRect().bottom);
+  }
+
+  private scheduleReadingRow(): void {
+    if (this.readingAnchorFrame !== undefined) return;
+    this.readingAnchorFrame = requestAnimationFrame(() => {
+      this.readingAnchorFrame = undefined;
+      if (!this.scrollRestored || this.convWidth === undefined) return;
+      if (Math.abs(this.convEl.getBoundingClientRect().width - this.convWidth) > READING_ROW_WIDTH_SLACK_PX) return;
+      this.measureReadingRow();
+    });
+  }
+
+  private blockAt(xs: number[], y: number): HTMLElement | null {
+    for (const x of xs) {
+      const row = document.elementFromPoint(x, y)?.closest<HTMLElement>(".block");
+      if (row != null && this.convEl.contains(row)) return row;
+    }
+    return null;
+  }
+
+  private measureReadingRow(): void {
+    if (activeTabId !== this.tabId || this.viewMode !== "conv" || this.atBottom.conv) return;
+    const area = this.convEl.getBoundingClientRect();
+    if (area.width <= 0) return;
+    const line = this.readingLine();
+    const xs = [area.left + area.width / 2, area.right - Math.min(12, area.width / 2)];
+    for (let y = line + 1; y < line + READING_ROW_PROBE_SPAN_PX; y += READING_ROW_PROBE_STEP_PX) {
+      const row = this.blockAt(xs, y);
+      if (row === null) continue;
+      const rect = row.getBoundingClientRect();
+      this.readingAnchor = { row, point: line - rect.top, height: rect.height };
+      return;
+    }
+    this.readingAnchor = undefined;
   }
 
   private measureAnchor(mode: ViewMode): RowAnchor | undefined {
@@ -2489,6 +2596,7 @@ export class Tab {
   noteLeavingScroll(): void {
     this.awaitedConvAnchor = undefined;
     this.knownAnchor[this.viewMode] = this.atBottom[this.viewMode] ? undefined : this.measureAnchor(this.viewMode);
+    this.measureReadingRow();
     this.anchorMeasuredTop = undefined;
     this.scrollRestored = false;
   }
@@ -2685,7 +2793,7 @@ export class Tab {
       childIds: [],
     };
     if (ev.subagentType) setRowChip(data, "type", ev.subagentType);
-    if (ev.subagentModel) setRowChip(data, "model", shortModelLabel(ev.subagentModel));
+    if (ev.subagentModel) setRowChip(data, "model", ev.subagentModel);
     if (ev.subagentEffort) setRowChip(data, "effort", `effort: ${ev.subagentEffort}`);
     this.rowData.set(ev.toolUseId, data);
     const entry = this.buildAgentCardDom(data);
@@ -2722,7 +2830,7 @@ export class Tab {
     childrenEl.className = "agent-children";
     card.appendChild(childrenEl);
     const entry: AgentCardEntry = { card, statusEl: status, metaEl: meta, chipsEl, childrenEl };
-    fillChips(chipsEl, data);
+    fillChips(chipsEl, data, this.models);
     for (const childId of data.childIds ?? []) {
       const child = this.buildRowDom(childId);
       if (child) childrenEl.appendChild(child);
@@ -2752,8 +2860,8 @@ export class Tab {
     entry.metaEl.textContent = l10n.t("{0} calls · {1}", state.childCount, formatDuration(elapsed));
     entry.metaEl.title = AGENT_STATUS_WORD[state.status];
     if (state.modelMeasured) {
-      setRowChip(data, "model", shortModelLabel(state.modelMeasured));
-      fillChips(entry.chipsEl, data);
+      setRowChip(data, "model", state.modelMeasured);
+      fillChips(entry.chipsEl, data, this.models);
     }
   }
 
@@ -4057,11 +4165,20 @@ export class Tab {
     this.scrollToBottom("conv");
   }
 
+  // installConvHistoryHead inserts earlier history before this anchor.
+  private markReplayStart(): void {
+    if (this.replayMarkerShown) return;
+    this.replayMarkerShown = true;
+    this.endAssistantTurnBeforeConvBlock();
+    const anchor = document.createElement("div");
+    anchor.className = "replay-anchor";
+    anchor.hidden = true;
+    this.convEl.appendChild(anchor);
+    this.replayMarkerEl = anchor;
+  }
+
   private onReplayedMessage(ev: Extract<NormalizedEvent, { kind: "replayed_message" }>): void {
-    if (!this.replayMarkerShown) {
-      this.replayMarkerShown = true;
-      this.replayMarkerEl = this.addBlock("system", l10n.t("── Restored previous session ──"));
-    }
+    this.markReplayStart();
     if (ev.restoredApproval) {
       if (ev.uuid && this.convMessageUuids.has(ev.uuid)) return;
       const card = buildRestoredApprovalCard(ev.restoredApproval, this.tabId);
@@ -4151,7 +4268,7 @@ export class Tab {
     }
     const visitAgent = (agent: WorkModelPayload["unlinkedAgents"][number]): void => {
       const before = this.agentStates.get(agent.toolUseId);
-      if (!before || before.revision < agent.revision || before.runStartedAt !== agent.runStartedAt) {
+      if (shouldApplyAgentState(before, agent, true)) {
         this.agentStates.set(agent.toolUseId, agent);
         this.renderAgentMeta(agent.toolUseId);
       }
@@ -4203,10 +4320,6 @@ export class Tab {
     const isHistory = ev.provenance?.path === "history";
     if (!isHistory && ev.parentToolUseId === null) {
       if (!this.withSuspendedReply(ev.turnId, () => this.closeLiveRecord()) && ev.turnId === this.currentTurnId) this.closeLiveRecord();
-    }
-    if (isHistory && !this.workReplayMarkerShown) {
-      this.workReplayMarkerShown = true;
-      this.addBlock("system", l10n.t("── Restored previous session ──"), false, "work");
     }
     this.toolStartTimes.set(ev.toolUseId, ev.timestamp);
     if (!isHistory && ev.parentToolUseId === null) {
@@ -4508,8 +4621,8 @@ export class Tab {
       }
       return;
     }
-    setRowChip(data, "model", shortModelLabel(ev.model));
-    fillChips(entry.chipsEl, data);
+    setRowChip(data, "model", ev.model);
+    fillChips(entry.chipsEl, data, this.models);
   }
 
   modelDisplayName(model: string): string | undefined {
@@ -4518,8 +4631,11 @@ export class Tab {
 
   setModels(models: ModelInfo[]): void {
     this.models = models;
+    for (const [id, entry] of this.agentCards) {
+      const data = this.rowData.get(id);
+      if (data) fillChips(entry.chipsEl, data, this.models);
+    }
     const changed = this.refreshModelTexts();
-    if (this.modelFallback && fallbackNeedsConfirmation(this.modelFallback)) this.youStore.fallback(this.modelFallback, this.fallbackText(this.modelFallback.notice));
     if (changed && this.tabId === activeTabId) refreshFind();
   }
 
@@ -5369,7 +5485,7 @@ export class Tab {
     }
     for (const agent of work?.agents ?? []) {
       const stored = this.pastAgentStates.get(agent.toolUseId);
-      if (stored !== undefined && stored.revision >= agent.revision) continue;
+      if (!shouldApplyAgentState(stored, agent)) continue;
       this.pastAgentStates.set(agent.toolUseId, agent);
       this.renderAgentMeta(agent.toolUseId);
     }
@@ -5442,8 +5558,8 @@ export class Tab {
       }
       return "skipped";
     }
-    setRowChip(data, "model", shortModelLabel(ev.model));
-    fillChips(entry.chipsEl, data);
+    setRowChip(data, "model", ev.model);
+    fillChips(entry.chipsEl, data, this.models);
     return "applied";
   }
 
@@ -5463,10 +5579,7 @@ export class Tab {
 
   renderResumePreview(messages: ResumePreviewMessage[]): void {
     if (messages.length === 0) return;
-    if (!this.replayMarkerShown) {
-      this.replayMarkerShown = true;
-      this.replayMarkerEl = this.addBlock("system", l10n.t("── Restored previous session ──"));
-    }
+    this.markReplayStart();
     for (const msg of messages) {
       if (msg.role === "user") {
         const block = this.addBlock("user replayed", msg.text);

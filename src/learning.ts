@@ -252,17 +252,18 @@ function refuse(code: LearningRefusalCode, requirement: string, field?: string):
 }
 export function validateLearningInput(input: unknown): { ok: true; input: LearningRecordInput } | Extract<LearningAdmission, { ok: false }> {
   if (!objectR27(input)) return refuse("unknown-field", "R-LRN-06");
-  if (!["llm-orchestration", "project", "uncertain"].includes(input.subject as string)) return refuse("invalid-subject", "R-LRN-15");
-  if (input.subject !== "llm-orchestration") return refuse("out-of-scope", "R-LRN-15");
+  if (!["llm-orchestration", "project", "uncertain"].includes(input.subject as string)) return refuse("invalid-subject", "R-LRN-15", "subject");
+  if (input.subject !== "llm-orchestration") return refuse("out-of-scope", "R-LRN-15", "subject");
   if (input.kind === "candidate" && input.binding === "general") return refuse("out-of-scope", "R-LRN-14", "binding");
   const profile = input.kind === "modelProfile", requirement = profile ? "R-LRN-10" : "R-LRN-03";
   const fields = profile ? ["kind", "subject", "requestId", "executor", "model", "sources", "strengths", "effort", "caveats"]
     : ["kind", "subject", "requestId", "ruleId", "text", "domain", "binding", "sourceAt", "source", "evidence", "expectHash", ...(input.binding === "model" ? ["model"] : [])];
-  if ((!profile && input.kind !== "candidate") || Object.keys(input).some(key => !fields.includes(key)))
-    return refuse("unknown-field", requirement);
+  if (!profile && input.kind !== "candidate") return refuse("unknown-field", requirement, "kind");
+  if (Object.keys(input).some(key => !fields.includes(key))) return refuse("unknown-field", requirement);
   if (!refR32(input.requestId)) return refuse("unknown-reference", requirement, "requestId");
   if (profile) {
-    if (!["claude", "codex", "agy"].includes(input.executor as string) || !refR32(input.model)) return refuse("unknown-model", requirement);
+    if (!["claude", "codex", "agy"].includes(input.executor as string)) return refuse("unknown-model", requirement, "executor");
+    if (!refR32(input.model)) return refuse("unknown-model", requirement, "model");
     if (!Array.isArray(input.sources) || !input.sources.length) return refuse("missing-source", requirement, "sources");
     if (input.sources.length > 3) return refuse("invalid-source", requirement, "sources");
     for (const source of input.sources) {
@@ -273,15 +274,17 @@ export function validateLearningInput(input: unknown): { ok: true; input: Learni
       if (!("url" in source)) return refuse("missing-source", requirement, "url");
       if (!sourceUrlR10(source.url)) return refuse("invalid-source", requirement, "url");
     }
-    if (!["strengths", "effort", "caveats"].some(key => key in input)) return refuse("unknown-field", requirement);
+    if (!["strengths", "effort", "caveats"].some(key => key in input)) return refuse("unknown-field", requirement, "effort");
     for (const field of ["strengths", "effort", "caveats"]) {
       if (typeof input[field] === "string" && privateTextR06(input[field])) return refuse("private-content", "R-LRN-06", field);
       if (field in input && !singleLineR10(input[field], 120)) return refuse("text-over-cap", requirement, field);
     }
   } else {
-    if (!domainR03(input.domain) || !["model", "general"].includes(input.binding as string)) return refuse("unknown-field", requirement);
+    if (!domainR03(input.domain)) return refuse("unknown-field", requirement, "domain");
+    if (!["model", "general"].includes(input.binding as string)) return refuse("unknown-field", requirement, "binding");
     if (input.binding === "model" && !refR32(input.model)) return refuse("unknown-model", requirement, "model");
-    if (!refR32(input.ruleId) || !evidenceR29(input.evidence)) return refuse("unknown-reference", requirement);
+    if (!refR32(input.ruleId)) return refuse("unknown-reference", requirement, "ruleId");
+    if (!evidenceR29(input.evidence)) return refuse("unknown-reference", requirement, "evidence");
     if (typeof input.text === "string" && privateTextR06(input.text)) return refuse("private-content", "R-LRN-06", "text");
     if (!singleLineR10(input.text, 500)) return refuse("text-over-cap", requirement, "text");
     if (!("sourceAt" in input)) return refuse("missing-date", requirement, "sourceAt");

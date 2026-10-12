@@ -1,11 +1,11 @@
 import { applyFallbackModel, fallbackOriginalModel, resolveFallbackByChoice, type EventProvenance, type FallbackRevertOutcome, type NormalizedEventBody } from "./protocol";
 import { join } from "node:path";
+import { randomUUID } from "node:crypto";
 import { getLaisoraConfiguration } from "./claude-settings";
 import { EXPERIMENT_HOLDOUT_PERCENT } from "./learning-experiment";
-import { cancelPendingModelProfileResearch, finishModelProfileResearch, flushModelProfileResearch } from "./learning-research";
 import { postSettingsState } from "./settings-panel";
-import { persistInitialTabTitle } from "./session-list-wiring";
-import { cachedExternalModels, configuredProfileRoster } from "./gateway-host-actions";
+import { cachedExternalModels } from "./gateway-host-actions";
+import { noteCliUpdateOpportunity } from "./claude-cli-update";
 
 import {
   PERMISSION_MODE_KEY,
@@ -23,6 +23,7 @@ import { createBackgroundActivityState } from "./background-activity";
 import { ClaudeConversation } from "./claudeHost";
 import { OrchestrationViewPublisher, orchestrationViewForConversation } from "./orchestration-view";
 import { orchestrationRunsDirectoryOf } from "./orchestration-external";
+import { orchestrationPluginDirectoryOf } from "./orchestration-plugin";
 import { postAttachments } from "./composer-io";
 import { pendingAttachments } from "./pending-attachments";
 import * as l10n from "@vscode/l10n";
@@ -37,6 +38,8 @@ import { normalizeProgressTracking } from "./progress-protocol";
 import { normalizeApiKeyPolicy, type ModelInfo, type WebviewToHost } from "./protocol";
 import { displayTitleFromSummary } from "./session-list";
 import type { SessionStore } from "./store-surfaces";
+import { numberedLaunchVerdict } from "./time-buckets";
+import { knownBackgroundTask } from "./work-model";
 
 const orchestrationPublishers = new WeakMap<ClaudeConversation, OrchestrationViewPublisher>();
 
@@ -49,11 +52,11 @@ export function postOrchestrationView(s: Session): void {
       if (s.closed || s.conversation !== conv) return undefined;
       const current = getLaisoraConfiguration();
       return orchestrationViewForConversation(conv, {
-        orchestrationEnabled: current.get<boolean>("orchestration.enabled", false),
-        learningEnabled: current.get<boolean>("learning.enabled", false),
-        orchestrationAgents: current.get<unknown>("orchestration.agents", []),
-        externalTimeoutMinutes: current.get<number>("orchestration.externalTimeoutMinutes", 10),
-        conductorPolicy: current.get<string>("orchestration.conductorPolicy", ""),
+        orchestrationEnabled: current.get<boolean>("orchestration.enabled")!,
+        learningEnabled: current.get<boolean>("learning.enabled")!,
+        orchestrationAgents: current.get<unknown>("orchestration.agents"),
+        externalTimeoutMinutes: current.get<number>("orchestration.externalTimeoutMinutes")!,
+        conductorPolicy: current.get<string>("orchestration.conductorPolicy")!,
       });
     }, (state) => store?.post({ type: "orchestrationView", tabId: s.tabId, state }));
     orchestrationPublishers.set(conv, publisher);
@@ -219,7 +222,7 @@ async function applyEffortChange(
   requested: NonNullable<Session["effortOverride"]> | null
 ): Promise<void> {
   const logicalGeneration = s.logicalGeneration;
-  const persistable = !s.modelsFromLastRun;
+  const persistable = !s.modelsFromLastRun && s.conversation !== null && !s.conversation.isClosed;
   const run = async (): Promise<void> => {
     if (s.closed || s.logicalGeneration !== logicalGeneration) return;
     const processGeneration = s.generation;
@@ -284,7 +287,7 @@ async function applyEffortChange(
           st,
           s,
           cwd,
-          cfg.get<Array<"user" | "project" | "local">>("claude.settingSources", ["user", "project", "local"]),
+          cfg.get<Array<"user" | "project" | "local">>("claude.settingSources")!,
           conv
         );
       }
@@ -304,12 +307,11 @@ async function applyModelChange(
   st: SessionStore,
   s: Session,
   requestedRaw: string | null,
-  sessionOnly = false,
   restore?: FallbackRestore
 ): Promise<FallbackRevertOutcome | "discarded" | "unwanted"> {
-  const persistable = !s.modelsFromLastRun;
+  const persistable = !s.modelsFromLastRun && s.conversation !== null && !s.conversation.isClosed;
   const requested =
-    requestedRaw === "default" && !sessionOnly && s.models.some((m) => m.id === "default") ? null : requestedRaw;
+    requestedRaw === "default" && restore === undefined && s.models.some((m) => m.id === "default") ? null : requestedRaw;
   const logicalGeneration = s.logicalGeneration;
   const run = async (): Promise<FallbackRevertOutcome | "discarded" | "unwanted"> => {
     if (s.closed || s.logicalGeneration !== logicalGeneration) return "discarded";
@@ -353,12 +355,10 @@ async function applyModelChange(
     s.launchModelCheck = undefined;
     clearObservedEffort(s);
     const knownRow = persistable && (requested === null || s.models.some((m) => m.id === requested));
-    const saved: SettingsWriteResult | null = knownRow && !sessionOnly ? updateClaudeCodeSettings({ model: requested }) : null;
+    const saved: SettingsWriteResult | null = knownRow && restore === undefined ? updateClaudeCodeSettings({ model: requested }) : null;
     if (conv !== null && s.conversation === conv) s.effectiveModel = requested;
     const label = requested === null ? null : s.models.find((m) => m.id === requested)?.label ?? requested;
-    const notice = sessionOnly
-      ? l10n.t("Changed model to {0} for this conversation.", label ?? "")
-      : saved === null
+    const notice = saved === null
       ? s.models.length === 0 || !persistable
         ? l10n.t("LAISORA: Changed model to {0} for this session; it was not saved to settings.json because the model list has not loaded yet.", label ?? s.models.find((m) => m.id === "default")?.label ?? "default")
         : l10n.t("LAISORA: Changed model to {0} for this session; it was not saved to settings.json because the model is not in the model list.", label ?? "")
@@ -396,7 +396,7 @@ async function applyModelChange(
           st,
           s,
           cwd,
-          cfg.get<Array<"user" | "project" | "local">>("claude.settingSources", ["user", "project", "local"]),
+          cfg.get<Array<"user" | "project" | "local">>("claude.settingSources")!,
           conv
         );
       }
@@ -408,14 +408,12 @@ async function applyModelChange(
   return await queued;
 }
 
-export const FALLBACK_REVERT_SETTING = "claude.restoreModelAfterRefusalFallback";
-const FALLBACK_REVERT_TURN_END_KINDS: ReadonlySet<NormalizedEventBody["kind"]> =
+const TURN_END_KINDS: ReadonlySet<NormalizedEventBody["kind"]> =
   new Set(["turn_completed", "turn_failed", "turn_interrupted", "conversation_closed"]);
 type LiveEventBody = NormalizedEventBody & { provenance?: EventProvenance };
 
 function noteFallbackRevert(s: Session, conv: ClaudeConversation, ev: LiveEventBody): LiveEventBody {
   if (ev.kind !== "model_refusal_fallback" || ev.scope !== "session") return ev;
-  if (getLaisoraConfiguration().get<boolean>(FALLBACK_REVERT_SETTING, true) === false) return { ...ev, autoRevert: "off" };
   const pending = s.fallbackRevert;
   if (pending?.conversation !== conv || pending.turnId !== ev.turnId || s.modelFallback?.resolvedAt !== undefined) {
     s.fallbackRevert = { conversation: conv, turnId: ev.turnId, originalModel: ev.originalModel, priorOverride: s.modelOverride };
@@ -426,7 +424,7 @@ function noteFallbackRevert(s: Session, conv: ClaudeConversation, ev: LiveEventB
 function settleFallbackRevert(st: SessionStore | null | undefined, s: Session, conv: ClaudeConversation, ev: LiveEventBody): void {
   const pending = s.fallbackRevert;
   if (pending === undefined || pending.conversation !== conv) return;
-  if (!FALLBACK_REVERT_TURN_END_KINDS.has(ev.kind) && !(ev.kind === "model_refusal_fallback" && conv.state === "idle")) return;
+  if (!TURN_END_KINDS.has(ev.kind) && !(ev.kind === "model_refusal_fallback" && conv.state === "idle")) return;
   s.fallbackRevert = undefined;
   const notice = s.modelFallback?.notice;
   const stillWanted = (): boolean => s.modelFallback !== undefined && s.modelFallback.notice === notice &&
@@ -440,7 +438,7 @@ function settleFallbackRevert(st: SessionStore | null | undefined, s: Session, c
   }
   if (!conv.isClosed) conv.rearmRootModelObservation();
   const logicalGeneration = s.logicalGeneration;
-  void applyModelChange(st, s, pending.originalModel, true, { override: pending.priorOverride, stillWanted }).then((result) => {
+  void applyModelChange(st, s, pending.originalModel, { override: pending.priorOverride, stillWanted }).then((result) => {
     if (result !== "discarded" && result !== "unwanted" && !s.closed && s.logicalGeneration === logicalGeneration) record(result);
   });
 }
@@ -517,9 +515,11 @@ export async function handleConversationMessage(
       }
       msg.images = pendingAttachments.take(target!.tabId);
       postAttachments(st, target!.tabId);
+      // One uuid for the live event and the CLI's transcript record, so both name the request alike.
+      const messageUuid = randomUUID();
       if (!isNonHumanCommandInput(msg.text)) {
         target!.pushEvent(
-          { kind: "user_message", turnId: null, text: msg.text, images: msg.images, sentAt: Date.now() },
+          { kind: "user_message", turnId: null, text: msg.text, images: msg.images, sentAt: Date.now(), uuid: messageUuid },
           undefined,
           undefined,
           clientToken
@@ -528,7 +528,7 @@ export async function handleConversationMessage(
       } else {
         disposition("accepted-nonhuman");
       }
-      target!.conversation!.send(msg.text, msg.images, sessionObservedTimestampSeed(target!));
+      target!.conversation!.send(msg.text, msg.images, sessionObservedTimestampSeed(target!), false, messageUuid);
       break;
     }
     case "cancelAutoResume":
@@ -554,7 +554,7 @@ export async function handleConversationMessage(
     }
     case "setModel": {
       const s = target!;
-      await applyModelChange(st, s, msg.model, msg.sessionOnly);
+      await applyModelChange(st, s, msg.model);
       break;
     }
   }
@@ -580,11 +580,8 @@ async function ensureConversation(s: Session): Promise<void> {
   if (s.closed || s.logicalGeneration !== logicalGeneration) {
     throw new Error(l10n.t("The logical session of this tab changed while the conversation was starting (restore or clear)."));
   }
-  const generation = s.logicalGeneration;
   const p = ensureConversationInner(s, requestedAt);
-  s.starting = p.catch(() => {
-    cancelPendingModelProfileResearch(s, generation);
-  }).then(() => {
+  s.starting = p.catch(() => {}).then(() => {
     s.starting = null;
   });
   return p;
@@ -607,11 +604,10 @@ async function ensureConversationInner(s: Session, requestedAt: number): Promise
   }
   if (s.conversation) return;
 
+  s.modelsFromLastRun = s.models.length > 0;
+
   const cfg = getLaisoraConfiguration();
-  const settingSources = cfg.get<Array<"user" | "project" | "local">>(
-    "claude.settingSources",
-    ["user", "project", "local"]
-  );
+  const settingSources = cfg.get<Array<"user" | "project" | "local">>("claude.settingSources")!;
   const cwd = resolveSessionCwd(s);
   if (!cwd) {
     throw new Error(l10n.t("The working directory could not be determined (open a workspace or set laisora.defaultCwd)."));
@@ -620,14 +616,14 @@ async function ensureConversationInner(s: Session, requestedAt: number): Promise
 
   invalidateClaudeCodeSettingsCache();
   if (s.initialModel === undefined) {
-    s.initialModel = cfg.get<string>("claude.initialModel", "").trim() || null;
+    s.initialModel = cfg.get<string>("claude.initialModel")!.trim() || null;
   }
   s.effectiveModel = launchModel(s);
   s.effectiveEffort = undefined;
 
   const initialObservedTimestamp = sessionObservedTimestampSeed(s);
 
-  const learningEnabled = cfg.get<boolean>("learning.enabled", false) === true;
+  const learningEnabled = cfg.get<boolean>("learning.enabled")! === true;
   const learningConfiguredSnapshot = learningEnabled ? await resolveConfiguredEffortSnapshot(cwd, settingSources) : undefined;
   if (s.closed || s.logicalGeneration !== logicalGenerationAtStart) {
     throw new Error(l10n.t("The logical session of this tab changed while the conversation was starting (restore or clear)."));
@@ -635,24 +631,24 @@ async function ensureConversationInner(s: Session, requestedAt: number): Promise
   const conv = new ClaudeConversation({
     cwd,
     initialObservedTimestamp,
+    knownBackgroundTask: taskId => knownBackgroundTask(s.workModel, s.hydration, taskId),
     resumeSessionId: s.resumeSessionId ?? crashResumeSessionId,
     model: s.effectiveModel ?? undefined,
     effort: s.effortOverride ?? undefined,
     permissionMode: s.permissionMode,
     settingSources,
-    remoteControlAtStartup: cfg.get("claude.remoteControlAtStartup", false),
-    progressTracking: normalizeProgressTracking(cfg.get("progressTracking", "observe")),
+    remoteControlAtStartup: cfg.get<boolean>("claude.remoteControlAtStartup")!,
+    progressTracking: normalizeProgressTracking(cfg.get<string>("progressTracking")!),
     claudeCodeExecutablePath: configuredClaudeExecutablePath(cfg),
-    apiKeyPolicy: normalizeApiKeyPolicy(cfg.get("claude.apiKeyPolicy", "inherit")),
-    fileLinkInstruction: cfg.get<boolean>("claude.fileLinkInstruction", true) !== false,
-    planInstruction: cfg.get<boolean>("claude.planInstruction", true) !== false,
-    orchestrationEnabled: cfg.get<boolean>("orchestration.enabled", false) === true,
+    apiKeyPolicy: normalizeApiKeyPolicy(cfg.get<string>("claude.apiKeyPolicy")!),
+    fileLinkInstruction: cfg.get<boolean>("claude.fileLinkInstruction")! !== false,
+    planInstruction: cfg.get<boolean>("claude.planInstruction")! !== false,
+    planLaunchVerdict: description => numberedLaunchVerdict(s.evidenceIndex.timeBuckets, description),
+    orchestrationEnabled: cfg.get<boolean>("orchestration.enabled")! === true,
     learningEnabled,
-    learningEvidenceSource: s.learningEvidenceSource,
-    learningDedicated: s.learningDedicated,
     learningSwitches: () => {
       const current = getLaisoraConfiguration();
-      return { enabled: current.get<boolean>("learning.enabled", false), automaticAdoption: current.get<boolean>("learning.automaticAdoption", true),
+      return { enabled: current.get<boolean>("learning.enabled")!, automaticAdoption: current.get<boolean>("learning.automaticAdoption", true),
         targetInjection: current.get<boolean>("learning.targetInjection", true), observationDelivery: current.get<boolean>("learning.observationDelivery", true),
         publicDelivery: current.get<boolean>("learning.publicDelivery", true), experiment: current.get<boolean>("learning.experiment", true),
         guard: current.get<boolean>("learning.guard", true) };
@@ -660,16 +656,18 @@ async function ensureConversationInner(s: Session, requestedAt: number): Promise
     learningHoldoutPercent: () => getLaisoraConfiguration().get<number>("learning.holdoutPercent", EXPERIMENT_HOLDOUT_PERCENT),
     learningDirectory: extensionContext?.globalStorageUri?.fsPath ? join(extensionContext.globalStorageUri.fsPath, "laisora-learning") : undefined,
     configuredResolvedModel: learningConfiguredSnapshot?.resolvedModel,
-    orchestrationAgents: cfg.get<unknown>("orchestration.agents", []),
+    orchestrationAgents: cfg.get<unknown>("orchestration.agents"),
     externalModels: cachedExternalModels(),
-    externalTimeoutMinutes: cfg.get<number>("orchestration.externalTimeoutMinutes", 10),
+    externalTimeoutMinutes: cfg.get<number>("orchestration.externalTimeoutMinutes")!,
     orchestrationRunsDirectory: orchestrationRunsDirectoryOf(extensionContext?.globalStorageUri?.fsPath),
-    conductorPolicy: cfg.get<string>("orchestration.conductorPolicy", ""),
+    orchestrationPluginDirectory: orchestrationPluginDirectoryOf(extensionContext?.globalStorageUri?.fsPath),
+    rosterEvidenceDirectory: store?.rosterEvidenceDirectory,
+    conductorPolicy: cfg.get<string>("orchestration.conductorPolicy")!,
     onLearningRecorded: postSettingsState,
     onOrchestrationChanged: () => {
       if (s.conversation === conv) postOrchestrationView(s);
     },
-    interruptForceKillTimeoutMs: cfg.get("interruptForceKillTimeoutMs", 5000),
+    interruptForceKillTimeoutMs: cfg.get<number>("interruptForceKillTimeoutMs")!,
     onEvent: (raw, conversationId, meta) => {
       const own = conversationId === s.expectedConversationId && !s.closed;
       const ev = own ? noteFallbackRevert(s, conv, raw) : raw;
@@ -685,15 +683,8 @@ async function ensureConversationInner(s: Session, requestedAt: number): Promise
         rederiveConfiguredEffort(store, s);
       }
       s.pushEvent(ev, conversationId, meta);
-      if (conversationId === s.expectedConversationId &&
-        ["auth_status", "turn_completed", "turn_failed", "turn_interrupted"].includes(ev.kind)) {
-        persistInitialTabTitle(s);
-      }
-      if (["turn_completed", "turn_failed", "turn_interrupted"].includes(ev.kind)) {
-        finishModelProfileResearch(s, conv);
-        setTimeout(() => flushModelProfileResearch(s, getLaisoraConfiguration().get<boolean>("learning.enabled", false), cachedExternalModels(), configuredProfileRoster()), 0);
-      }
       if (own) settleFallbackRevert(store, s, conv, ev);
+      if (TURN_END_KINDS.has(ev.kind)) noteCliUpdateOpportunity();
       if (ev.kind === "auth_status" && conversationId === s.expectedConversationId && ev.auth?.billingRealm === "api") {
         store?.post({
           type: "tabNotice",
@@ -727,7 +718,6 @@ async function ensureConversationInner(s: Session, requestedAt: number): Promise
       throw new Error(l10n.t("The logical session of this tab changed while the conversation was starting (restore or clear)."));
     }
     s.conversation = conv;
-    flushModelProfileResearch(s, getLaisoraConfiguration().get<boolean>("learning.enabled", false), cachedExternalModels(), configuredProfileRoster());
     postOrchestrationView(s);
     refreshConfiguredEffort(store, s, cwd, settingSources, conv);
     void conv.supportedCommands().then((cmds) => {
@@ -743,6 +733,7 @@ async function ensureConversationInner(s: Session, requestedAt: number): Promise
         `[${s.title}] ${sinceActivation()} モデル一覧: ${s.models.length}件（起動要求から ${Date.now() - requestedAt}ms / start 後 ${Date.now() - startedAt}ms）`
       );
       observeLaunchModel(store, s, conv, undefined, models.length > 0);
+      if (models.length > 0) noteCliUpdateOpportunity(true);
     });
   } catch (e) {
     void conv.dispose();

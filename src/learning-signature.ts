@@ -1,5 +1,6 @@
 import { createHmac } from "node:crypto";
-import { HUMAN_REJECTED_TOOL_RESULT_RE, isUsageLimitResult } from "./guardrail";
+import { isUsageLimitResult } from "./guardrail";
+import { HOOK_DENIAL_RE, HUMAN_REJECTED_TOOL_RESULT_RE, INPUT_VALIDATION_TOOL_RESULT_RE, stripToolUseErrorTags } from "./tool-result-signals";
 
 export const SIG_VERSION = 1;
 
@@ -51,7 +52,6 @@ const KNOWN_ERRNOS = new Set(["ECONNRESET", "ECONNREFUSED", "ENOTFOUND", "EAI_AG
   "ENOENT", "EACCES", "EPERM", "EBUSY", "EEXIST"]);
 const SDK_ERROR_KINDS = ["authentication_failed", "oauth_org_not_allowed", "billing_error", "rate_limit", "overloaded", "server_error"];
 const HEAD_KEYWORD_RE = /error|fatal|failed|exception|denied|not found|invalid|cannot|unable/i;
-const HOOK_DENIAL_RE = /^PreToolUse(?::[\w|*]+)? hook error:/;
 const PROBE_PATH = String.raw`(?:"[^"$\x60\r\n]*"|'[^'\r\n]*'|[^\s"'$\x60;&|<>()[\]{}*?\\]+)`;
 const TEST_PROBE_RE = new RegExp(String.raw`^\s*(?:test\s+-[efd]\s+(${PROBE_PATH})|\[\s+-e\s+(${PROBE_PATH})\s+\])\s*$`);
 const LIST_PROBE_RE = new RegExp(String.raw`^\s*(ls)\s+(${PROBE_PATH})\s*$`);
@@ -96,7 +96,7 @@ export const SIGNATURE_CLASSES: readonly SignatureClassRule[] = Object.freeze([
   { group: "counted", match: when("edit_not_read", (f) => has(f, /File has not been read yet\. Read it first before writing to it/)) },
   { group: "counted", match: when("edit_mismatch", (f) => has(f, /String to replace not found in file/)) },
   { group: "counted", match: when("edit_multi", (f) => has(f, /Found \d+ matches of the string to replace, but replace_all is false/)) },
-  { group: "counted", match: when("input_validation", (f) => has(f, /InputValidationError|Invalid arguments for tool/)) },
+  { group: "counted", match: when("input_validation", (f) => has(f, INPUT_VALIDATION_TOOL_RESULT_RE)) },
   { group: "counted", match: when("tool_timeout", (f) => has(f, /Command timed out/)) },
   { group: "counted", match: when("ps_parse", (f) => has(f, /ParserError|is not a valid statement separator/)) },
   { group: "counted", match: when("cmd_not_found", (f) => f.exitCode === 127 || has(f, /command not found|is not recognized as/)) },
@@ -115,7 +115,7 @@ export const FAILURE_LABELS: Readonly<Record<string, readonly FailureLabel[]>> =
   edit_mismatch: [{ pattern: /String to replace not found in file/, text: "old_string did not match the file content" }],
   edit_multi: [{ pattern: /Found \d+ matches of the string to replace/, text: "old_string matched more than one place; add surrounding context or set replace_all" }],
   cmd_not_found: [{ pattern: /command not found|is not recognized as/, text: "the command is not installed or not on PATH" }],
-  input_validation: [{ pattern: /InputValidationError|Invalid arguments for tool/, text: "the tool input did not match the tool's input schema" }],
+  input_validation: [{ pattern: INPUT_VALIDATION_TOOL_RESULT_RE, text: "the tool input did not match the tool's input schema" }],
   tool_timeout: [{ pattern: /Command timed out/, text: "the command ran past the tool's timeout" }],
   hook_block: [{ pattern: HOOK_DENIAL_RE, text: "a hook denied the call before it ran" }],
 });
@@ -292,10 +292,6 @@ export function callKey(tool: string, input: unknown, failureText = ""): string 
     if (path !== undefined) return `${tool}\u0000${path.replace(/\\/g, "/").toLowerCase()}`;
   }
   return tool;
-}
-
-function stripToolUseErrorTags(text: string): string {
-  return text.replace(/<\/?tool_use_error>/g, "");
 }
 
 function normalizeHeadLine(line: string): string {

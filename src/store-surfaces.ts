@@ -328,7 +328,7 @@ export function warnTabLimit(): void {
 export function tabLimit(): number {
   let raw: unknown = TAB_LIMIT_DEFAULT;
   try {
-    raw = getLaisoraConfiguration().get<unknown>("tabLimit", TAB_LIMIT_DEFAULT);
+    raw = getLaisoraConfiguration().get<unknown>("tabLimit");
   } catch {
     raw = TAB_LIMIT_DEFAULT;
   }

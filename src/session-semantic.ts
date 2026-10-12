@@ -1,20 +1,24 @@
 import { getLaisoraConfiguration } from "./claude-settings";
 import { projectPlanUsage, summarizeMainTokens, type PlanUsage } from "./plan-usage";
 import * as l10n from "@vscode/l10n";
-import { deriveFailureSummary } from "./exec-log-marks";
+import { deriveExecLogFindings, deriveFailureSummary } from "./exec-log-marks";
 import { readSessionExternalRuns, type ExternalRunRecord, type SessionExternalRuns } from "./orchestration-external";
-import { deriveRoleSummary, type ExternalRunsCoverage } from "./role-summary";
+import { resolveOrchestrationCacheTtl, resolveOrchestrationRoster } from "./orchestration-roster";
+import type { CacheTtl } from "./claude-prices";
+import { deriveAnalysisPlans, derivePlanPlacements, deriveRoleSummary, externalRunStart, type ExternalRunsCoverage, type PlanPlacement } from "./role-summary";
 import {
   emptyRosterEvidence,
   hasInjectedRoster,
   mergeRosterEvidence,
   readRosterEvidence,
+  readSourceRosterEvidence,
+  type RosterSource,
   writeRosterEvidence,
   type RosterEvidence,
 } from "./roster-evidence";
 
 import { projectAnalysisFactsView, projectSummaryAnalysis } from "./analysis-facts-view";
-import type { SemanticEvidenceIndex } from "./evidence-index";
+import { createEvidenceIndex, foldEvidence, type SemanticEvidenceIndex } from "./evidence-index";
 import { output } from "./host-context";
 import { deriveL3 } from "./l3-analysis";
 import { deriveDivergences, type DivergenceReport } from "./l3-divergence";
@@ -23,6 +27,7 @@ import { projectDivergences, projectSemanticModel } from "./projection";
 import {
   type AnalysisPanelView,
   type L3ReportPayload,
+  type PlanContext,
   type RestoredAgent,
   type SemanticModelPayload,
   type TimeBucketsCoverage,
@@ -31,13 +36,14 @@ import {
 } from "./protocol";
 import { deriveSemanticModel, type SemanticModel } from "./semantic-model";
 import { deriveSessionFacts, type SessionFacts, type SessionFactsAccumulator } from "./session-facts";
-import { inspectorSessionFile, isInSessionStore } from "./session-files";
+import { isInSessionStore, sessionTranscriptRef } from "./session-files";
 import type { Session } from "./extension";
 import type { LearningFacts } from "./learning";
 import type { SessionStore } from "./store-surfaces";
 import { currentWorkBlock, deriveTimeBuckets, overlayLiveTimeBucketState, projectWorkBlockTokens, type TimeBucketState, type TimeBucketView } from "./time-buckets";
+import { planContextOf } from "./plan-steps";
 import { childSpansOf, readTranscriptTimeBucketsWithCoverage } from "./transcript-time-buckets";
-import { findToolPlacement, type WorkCoverage, type WorkModelState } from "./work-model";
+import { createWorkModelState, reduceWorkModel, findToolPlacement, type WorkCoverage, type WorkModelState } from "./work-model";
 
 export const SEMANTIC_MODEL_POST_INTERVAL_MS = 1000;
 const WORK_MODEL_POST_INTERVAL_MS = 120;
@@ -46,7 +52,7 @@ const TRANSCRIPT_TIME_BUCKETS_DELAY_MS = 1500;
 export function semanticViewEnabled(): boolean {
   try {
     return (
-      getLaisoraConfiguration().get<boolean>("workLog.semanticView", true) !==
+      getLaisoraConfiguration().get<boolean>("workLog.semanticView")! !==
       false
     );
   } catch {
@@ -57,7 +63,7 @@ export function semanticViewEnabled(): boolean {
 export function llmAnalysisEnabled(): boolean {
   try {
     return (
-      getLaisoraConfiguration().get<boolean>("workLog.llmAnalysis", true) ===
+      getLaisoraConfiguration().get<boolean>("workLog.llmAnalysis")! ===
       true
     );
   } catch {
@@ -68,7 +74,7 @@ export function llmAnalysisEnabled(): boolean {
 export function llmDiagnosticsAudience(): LlmDiagnosticsAudience {
   try {
     return getLaisoraConfiguration()
-      .get<boolean>("workLog.llmAnalysisDiagnostics", false) === true
+      .get<boolean>("workLog.llmAnalysisDiagnostics")! === true
       ? "opt-in-diagnostics"
       : "off";
   } catch {
@@ -76,6 +82,13 @@ export function llmDiagnosticsAudience(): LlmDiagnosticsAudience {
   }
 }
 
+
+function configuredCacheTtls(): Map<string, CacheTtl> {
+  const config = getLaisoraConfiguration();
+  if (config.get<boolean>("orchestration.enabled") !== true) return new Map();
+  const { roster } = resolveOrchestrationRoster(config.get<unknown>("orchestration.agents"));
+  return new Map(roster.map((entry) => [entry.role, resolveOrchestrationCacheTtl(entry)]));
+}
 
 function externalOf(conv: Session["conversation"]): ExternalRunRecord[] {
   return (conv?.orchestrationRuns ?? []).filter((run): run is ExternalRunRecord => run.kind === "external");
@@ -124,6 +137,10 @@ export function derivationFailureLabel(stage: DerivationFailure["stage"]): strin
   }
 }
 
+function placedPlanContext(context: PlanContext, placement: PlanPlacement): PlanContext {
+  return { ...context, steps: context.steps?.map(step => ({ ...step, tokens: placement.tokens.get(step.key) ?? null })), placements: placement.placements };
+}
+
 export class SessionSemantic {
   private workModelPostTimer: ReturnType<typeof setTimeout> | null = null;
   private semanticModelPostTimer: ReturnType<typeof setTimeout> | null = null;
@@ -139,9 +156,11 @@ export class SessionSemantic {
     liveDelegationRev: number;
     sessionFacts: SessionFactsAccumulator;
     learningKey: string | undefined;
+    generationBoundaryAt: number | undefined;
     restoredAgents: RestoredAgent[];
     derivation: {
       model: SemanticModel;
+      analysisWorkModel: WorkModelState;
       payload: SemanticModelPayload;
       divergenceReport?: DivergenceReport;
     } | undefined;
@@ -184,19 +203,21 @@ export class SessionSemantic {
   }
 
   private async refreshTranscriptTimeBuckets(): Promise<void> {
-    const file = inspectorSessionFile(this.host);
-    if (file === null) return;
+    const ref = sessionTranscriptRef(this.host);
+    if (ref === null) return;
     const logicalGeneration = this.host.logicalGeneration;
     this.transcriptTimeBucketsReading = true;
     let view: TimeBucketView | undefined;
     let coverage: TimeBucketsCoverage | undefined;
+    let rosterSources: RosterSource[] | undefined;
     try {
-      const read = await readTranscriptTimeBucketsWithCoverage(file, isInSessionStore, {
+      const read = await readTranscriptTimeBucketsWithCoverage(ref.file, isInSessionStore, {
         conversationId: this.host.tabId,
         generation: this.host.generation,
-      });
+      }, ref.sessionId);
       view = read.view;
       coverage = read.coverage;
+      rosterSources = read.rosterSources;
     } catch (error) {
       output.appendLine(`[${this.host.title}] transcript time buckets failed: ${String(error)}`);
       coverage = { sessionReadError: String(error) };
@@ -204,6 +225,7 @@ export class SessionSemantic {
       this.transcriptTimeBucketsReading = false;
     }
     if (!this.host.closed && logicalGeneration === this.host.logicalGeneration) {
+      this.setRosterSources(ref.sessionId, rosterSources ?? []);
       if (coverage !== undefined) {
         output.appendLine(`[${this.host.title}] transcript time buckets degraded: ${JSON.stringify(coverage)}`);
       }
@@ -220,9 +242,11 @@ export class SessionSemantic {
 
   projectedWorkModel(): WorkModelPayload {
     const model = projectWorkModel(this.host.workModel, this.host.restoredAgents);
-    const time = this.host.evidenceIndex.timeBuckets;
-    const block = currentWorkBlock(time);
-    if (block) {
+    // The displayed view, so the PLAN panel shows what GRAPH and ANALYSIS show, whether or not the semantic view is on.
+    const displayed = this.displayedTimeBuckets();
+    const time = displayed === undefined ? undefined : projectWorkBlockTokens(displayed, this.projectedPlanUsage(displayed.blocks));
+    const block = time === undefined ? undefined : currentWorkBlock(time);
+    if (time && block) {
       const state = this.host.workModel;
       const approvalToolIds = this.host.conversation?.pendingApprovalToolUseIds ?? [];
       const approvalTools = new Set(approvalToolIds);
@@ -266,9 +290,21 @@ export class SessionSemantic {
           return tool !== undefined && !tool.stale && tool.toolName === "AskUserQuestion" && blocksForeground(id);
         });
       const runningWork = [...liveIds].some(runnable);
-      model.planContext = { blockId: block.blockId, text: block.text, start: block.start,
-        end: Math.max(block.start, time.lastAt ?? block.start), running: state.turnActive && !waiting ||
-          this.host.streamOpen() && runningWork };
+      const context = planContextOf(block, time.lastAt ?? block.start, state.turnActive && !waiting ||
+        this.host.streamOpen() && runningWork);
+      const agentLanes = (agent: (typeof model.phases)[number]["agents"][number]): { toolUseId: string; start: number | null }[] =>
+        [...agent.toolUseId === undefined ? [] : [{ toolUseId: agent.toolUseId, start: agent.startedAt ?? null }], ...agent.children.flatMap(agentLanes)];
+      const tools = this.host.sessionFacts.analysisTools;
+      // Work posts stay cheap (B5-PLAN-cheap), so only this conversation's external runs, the ones the panel shows
+      // (src/orchestration-view.ts#orchestrationViewForConversation), get a placement.
+      const lanes = [...model.phases.flatMap(phase => phase.agents.flatMap(agentLanes)), ...(model.unlinkedAgents ?? []).flatMap(agentLanes),
+        ...(model.planTools ?? []).map(tool => ({ toolUseId: tool.id, start: tool.startedAt })),
+        ...externalOf(this.host.conversation).flatMap(run => run.toolUseId === undefined ? [] : [{ toolUseId: run.toolUseId, start: externalRunStart(run, tools) }])];
+      const placementOf = derivePlanPlacements(time, tools, lanes);
+      model.planContext = placedPlanContext(context, placementOf(block.blockId));
+      const earlierPlans = time.blocks.filter(value => value !== block && value.kind === "plan" && value.steps?.length)
+        .map(value => placedPlanContext(planContextOf(value, value.end, false), placementOf(value.blockId)));
+      if (earlierPlans.length) model.earlierPlans = earlierPlans;
     }
     const semanticDerivationFailed: WorkCoverage["semanticDerivationFailed"] | undefined =
       this.semanticDerivationFailedLast && semanticViewEnabled()
@@ -320,8 +356,8 @@ export class SessionSemantic {
     }
   }
 
-  projectedPlanUsage(blocks: readonly { blockId: string; start: number }[] = this.displayedTimeBuckets()?.blocks ?? this.host.evidenceIndex.timeBuckets.blocks): PlanUsage {
-    const partition = JSON.stringify(blocks.map(block => [block.blockId, block.start]));
+  projectedPlanUsage(blocks: readonly { blockId: string; start: number; closedAt?: number }[] = this.displayedTimeBuckets()?.blocks ?? this.host.evidenceIndex.timeBuckets.blocks): PlanUsage {
+    const partition = JSON.stringify(blocks.map(block => [block.blockId, block.start, block.closedAt]));
     const memo = this.planUsageMemo;
     if (memo?.facts === this.host.sessionFacts && memo.partition === partition) return memo.usage;
     const usage = projectPlanUsage(this.host.sessionFacts.planUsage, blocks);
@@ -349,12 +385,14 @@ export class SessionSemantic {
 
   semanticDerivation(): {
     model: SemanticModel;
+    analysisWorkModel: WorkModelState;
     payload: SemanticModelPayload;
     divergenceReport?: DivergenceReport;
   } | undefined {
     const streamOpen = this.host.streamOpen();
     const learning = this.host.learningFacts?.();
     const learningKey = JSON.stringify(learning);
+    const generationBoundaryAt = this.displayedTimeBuckets()?.generationBoundaryAt ?? this.host.evidenceIndex.timeBuckets.generationBoundaryAt;
     const memo = this.semanticMemo;
     if (
       memo !== null &&
@@ -364,12 +402,14 @@ export class SessionSemantic {
       memo.liveDelegationRev === this.host.liveDelegationRev &&
       memo.sessionFacts === this.host.sessionFacts &&
       memo.learningKey === learningKey &&
+      memo.generationBoundaryAt === generationBoundaryAt &&
       memo.restoredAgents === this.host.restoredAgents
     ) {
       return memo.derivation;
     }
     let derivation: {
       model: SemanticModel;
+      analysisWorkModel: WorkModelState;
       payload: SemanticModelPayload;
       divergenceReport?: DivergenceReport;
     } | undefined;
@@ -383,17 +423,26 @@ export class SessionSemantic {
       });
       let payload = projectSemanticModel(model);
       let divergenceReport: DivergenceReport | undefined;
+      let analysisWorkModel = this.host.workModel;
       try {
-        divergenceReport = deriveDivergences(model);
-        const facts = deriveSessionFacts(this.host.sessionFacts, this.host.evidenceIndex, {
+        const current = this.analysisGeneration(generationBoundaryAt);
+        analysisWorkModel = current?.workModel ?? this.host.workModel;
+        const analysisEvidence = current?.evidence ?? this.host.evidenceIndex;
+        const analysisModel = current === undefined ? model : deriveSemanticModel(current.workModel, analysisEvidence, {
+          conversationId: this.host.tabId, streamOpen, liveDelegationAgentIds: this.host.liveDelegationAgentIds,
+          childSpans: childSpansOf(this.host.restoredAgents),
+        });
+        divergenceReport = deriveDivergences(analysisModel);
+        const facts = deriveSessionFacts(current === undefined ? this.host.sessionFacts : { ...this.host.sessionFacts, toolCalls: current.toolCalls }, analysisEvidence, {
           eventLogTrimmed: (this.host.workModel.coverage.droppedEventCount ?? 0) > 0,
         });
-        payload = { ...payload, l3: deriveL3Payload(model, this.host.evidenceIndex, divergenceReport, facts, learning) };
+        payload = { ...payload, l3: deriveL3Payload(analysisModel, analysisEvidence, divergenceReport, facts, learning),
+          execLogFindings: deriveExecLogFindings(analysisEvidence.execLogMarks.marks) };
       } catch (error) {
         derivationError = { stage: "metrics", detail: String(error) };
         output.appendLine(`[${this.host.title}] L3 derivation failed: ${derivationError.detail}`);
       }
-      derivation = { model, payload, divergenceReport };
+      derivation = { model, analysisWorkModel, payload, divergenceReport };
     } catch (error) {
       derivationError = { stage: "model", detail: String(error) };
       output.appendLine(`[${this.host.title}] SemanticModel derivation failed: ${derivationError.detail}`);
@@ -406,12 +455,40 @@ export class SessionSemantic {
       liveDelegationRev: this.host.liveDelegationRev,
       sessionFacts: this.host.sessionFacts,
       learningKey,
+      generationBoundaryAt,
       restoredAgents: this.host.restoredAgents,
       derivation,
       derivationError,
     };
     this.semanticDerivationFailedLast = derivationError?.stage === "model";
     return derivation;
+  }
+
+  private analysisGeneration(generationBoundaryAt: number | undefined): SemanticEvidenceIndex["currentGeneration"] {
+    if (generationBoundaryAt === undefined) return undefined;
+    const index = this.host.evidenceIndex;
+    if (index.timeBuckets.generationBoundaryAt === generationBoundaryAt && index.currentGeneration !== undefined) {
+      return index.currentGeneration;
+    }
+    let workModel = createWorkModelState();
+    let evidence = createEvidenceIndex();
+    evidence.timeBuckets = { ...evidence.timeBuckets, generationBoundaryAt };
+    let toolCalls = 0;
+    const artifacts = new Map<string, typeof index.artifactAccesses>();
+    for (const access of index.artifactAccesses) {
+      if (access.at < generationBoundaryAt) continue;
+      const entries = artifacts.get(access.toolUseId) ?? [];
+      entries.push(access);
+      artifacts.set(access.toolUseId, entries);
+    }
+    for (const event of this.host.events) {
+      if (event.timestamp < generationBoundaryAt) continue;
+      workModel = reduceWorkModel(workModel, event);
+      evidence = foldEvidence(evidence, event, event.kind === "tool_call_started" ? artifacts.get(event.toolUseId) : undefined);
+      if (event.kind === "tool_call_started") toolCalls++;
+    }
+    workModel = { ...workModel, coverage: { ...workModel.coverage, ...this.host.workModel.coverage } };
+    return { workModel, evidence, toolCalls };
   }
 
   semanticBasePayload(): SemanticModelPayload | undefined {
@@ -435,19 +512,29 @@ export class SessionSemantic {
       this.projectedPlanUsage(withCoverage.timeBuckets.blocks)) } : withCoverage;
     const payload = this.attachLlm(withUsage, base);
     if (payload === undefined) return undefined;
-    const work = projectWorkModel(this.host.workModel, this.host.restoredAgents);
+    const generationBoundaryAt = timeBuckets?.generationBoundaryAt ?? this.host.evidenceIndex.timeBuckets.generationBoundaryAt;
+    const work = projectWorkModel(this.semanticMemo?.derivation?.analysisWorkModel ?? this.host.workModel, this.host.restoredAgents);
     const conv = this.host.conversation;
+    const allWork = projectWorkModel(this.host.workModel, this.host.restoredAgents);
+    const analysisPlans = deriveAnalysisPlans(payload.timeBuckets, deriveRoleSummary({
+      phases: allWork.phases, unlinkedAgents: allWork.unlinkedAgents, ...this.externalRuns(conv),
+      rosterEvidence: this.rosterEvidence(), subagentUsage: this.host.sessionFacts.subagentUsage, timeBuckets: payload.timeBuckets,
+      analysisTools: this.host.sessionFacts.analysisTools,
+    }), this.host.sessionFacts.analysisTools, { usage: this.host.sessionFacts.subagentUsage, settings: configuredCacheTtls() });
     return {
       ...payload,
+      analysisPlans,
       roleSummary: deriveRoleSummary({
         phases: work.phases,
         unlinkedAgents: work.unlinkedAgents,
         ...this.externalRuns(conv),
         rosterEvidence: this.rosterEvidence(),
+        subagentUsage: this.host.sessionFacts.subagentUsage,
+        generationBoundaryAt,
       }),
       failureSummary: deriveFailureSummary(payload.execLogFindings ?? [], work.phases),
       summaryAnalysis: projectSummaryAnalysis(payload.execLogFindings, payload.l3?.llm),
-      mainTokens: summarizeMainTokens(this.host.sessionFacts.planUsage),
+      mainTokens: summarizeMainTokens(this.host.sessionFacts.planUsage, generationBoundaryAt),
     };
   }
 
@@ -492,6 +579,12 @@ export class SessionSemantic {
 
   private rosterEvidenceCache: { ownerId: string; persisted: RosterEvidence; serialized: string } | undefined;
   private rosterEvidenceWrite: Promise<void> = Promise.resolve();
+  private sourceRoster: { ownerId: string; evidence: RosterEvidence } | undefined;
+
+  setRosterSources(ownerId: string, sources: readonly RosterSource[]): void {
+    const directory = this.store.rosterEvidenceDirectory;
+    this.sourceRoster = { ownerId, evidence: directory ? readSourceRosterEvidence(directory, sources) : emptyRosterEvidence() };
+  }
 
   rosterEvidence(): RosterEvidence {
     const live = this.host.conversation?.rosterEvidence ?? emptyRosterEvidence();
@@ -515,7 +608,7 @@ export class SessionSemantic {
           output.appendLine(`[${this.host.title}] [roster-evidence] write failed: ${String(error)}`);
         });
     }
-    return merged;
+    return this.sourceRoster?.ownerId === owner ? mergeRosterEvidence(this.sourceRoster.evidence, merged) : merged;
   }
 
   flushRosterEvidence(): Promise<void> {

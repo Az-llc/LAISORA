@@ -112,8 +112,6 @@ export class Session {
   readonly summaryRunner: SessionSummaryWiring;
   sessionFacts: SessionFactsAccumulator = initialSessionFacts();
   readonly learningFacts?: () => LearningFacts | undefined = () => this.conversation?.learningFacts;
-  learningEvidenceSource?: string;
-  learningDedicated?: boolean;
   liveDelegationAgentIds = new Set<string>();
   liveDelegationRev = 0;
   backgroundActivity: BackgroundActivityState = createBackgroundActivityState();

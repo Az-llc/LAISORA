@@ -906,6 +906,7 @@ async function runResumeHydrationStages(
     }
   }
   stage("commit");
+  s.semantic.setRosterSources(h.sessionId, history.rosterSources ?? []);
   const snapshot = s.snapshot();
   stage("snapshot");
   st.post({ type: "tabCleared", tab: snapshot });
