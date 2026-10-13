@@ -44,3 +44,13 @@ export function captureToolIntentInput(name: string, input: unknown): ToolIntent
   }
   return Object.keys(result).length ? result : undefined;
 }
+
+export function conductorStopTarget(toolName: string, inputPreview: string): string | undefined {
+  if (toolName !== "TaskStop") return undefined;
+  try {
+    const taskId = (JSON.parse(inputPreview) as { task_id?: unknown }).task_id;
+    return typeof taskId === "string" && taskId !== "" ? taskId : undefined;
+  } catch {
+    return undefined;
+  }
+}

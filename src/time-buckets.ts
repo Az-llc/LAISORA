@@ -6,6 +6,7 @@ import { planItemNumber, planItemNumberOf, planNumberedStep, planStepActiveSpans
 import type { PlanUsage, PlanTokenTotal } from "./plan-usage";
 import { isExternalRunTool } from "./orchestration-executors";
 import { isRejectedBeforeRun } from "./tool-result-signals";
+import { conductorStopTarget } from "./tool-intent";
 import * as l10n from "@vscode/l10n";
 
 export type TimeBucket = "generate" | "tool" | "delegation" | "confirm" | "reply";
@@ -19,6 +20,7 @@ export function isSubagentWaitTool(toolName: string): boolean {
 }
 export const MAX_TIME_TOOL_INTERVALS = 8192;
 export const MAX_TIME_BLOCKS = 500;
+const MAX_STOPPED_TASK_IDS = 256;
 export const MAX_BLOCK_TEXT = 600;
 export const MAX_MODEL_MARKS = 4096;
 export const MAIN_MODEL_TOP_COUNT = 3;
@@ -217,9 +219,12 @@ export interface TimeBucketState {
   lastAt?: number;
   turnSpans: AppendList<TurnSpan>;
   openTurn?: TurnOrigin & { turnId: string; startedAt: number };
-  openTools: Record<string, { at: number; toolName: string; lane: TimeLane; parentToolUseId: string | null; turnId: string; messageId?: string; description?: string; taskIntent?: TaskIntent }>;
-  // The assistant message of the latest main-lane call (src/time-buckets.ts#numberedLaunchVerdict).
+  openTools: Record<string, { at: number; toolName: string; lane: TimeLane; parentToolUseId: string | null; turnId: string; messageId?: string; description?: string;
+    taskIntent?: TaskIntent; stopTarget?: string }>;
+  // The assistant message of the latest main-lane call (src/time-buckets.ts#withMessagePlanCalls).
   mainMessageId?: string;
+  // Task ids a successful conductor TaskStop ended, until their notification or a resume (src/time-buckets.ts#laneRunning).
+  stoppedTaskIds?: string[];
   planText?: PlanTextState;
   mainTools: ToolInterval[];
   subTools: ToolInterval[];
@@ -639,6 +644,7 @@ export function foldTimeBuckets(state: TimeBucketState, event: NormalizedEvent, 
         try { taskIntent = parseTaskIntentFromRawInput(event.toolName, JSON.parse(event.inputPreview), event.toolUseId); }
         catch { taskIntent = undefined; }
       }
+      const stopTarget = lane === "main" ? conductorStopTarget(event.toolName, event.inputPreview) : undefined;
       n.openTools = {
         ...state.openTools,
         [event.toolUseId]: {
@@ -650,6 +656,7 @@ export function foldTimeBuckets(state: TimeBucketState, event: NormalizedEvent, 
           ...(event.messageId === undefined ? {} : { messageId: event.messageId }),
           ...(taskIntent ? { taskIntent } : {}),
           ...(summary !== undefined ? { description: redactAbsolutePaths(summary).slice(0, 200) } : {}),
+          ...(stopTarget !== undefined ? { stopTarget } : {}),
         },
       };
       if (lane === "main" && event.messageId !== undefined) n.mainMessageId = event.messageId;
@@ -694,11 +701,19 @@ export function foldTimeBuckets(state: TimeBucketState, event: NormalizedEvent, 
         const hit = delegationOfAgent(n0, event.resumedAgentId, (d) => d.notifiedEndedAt !== undefined);
         if (hit !== undefined) putDelegation(n0, n0.delegations, { ...hit, notifiedEndedAt: undefined });
       }
+      const settledStop = event.taskNotification?.agentId ?? (event.isError !== true ? event.resumedAgentId : undefined);
+      if (settledStop !== undefined && next.stoppedTaskIds?.includes(settledStop)) {
+        const n0 = touch();
+        n0.stoppedTaskIds = n0.stoppedTaskIds!.filter(id => id !== settledStop);
+      }
       const open = state.openTools[event.toolUseId];
       if (open === undefined || ts === undefined) return next;
       const n = touch();
       const { [event.toolUseId]: _, ...rest } = state.openTools;
       n.openTools = rest;
+      if (open.stopTarget !== undefined && event.isError !== true && !n.stoppedTaskIds?.includes(open.stopTarget)) {
+        n.stoppedTaskIds = [...n.stoppedTaskIds ?? [], open.stopTarget].slice(-MAX_STOPPED_TASK_IDS);
+      }
       if (open.lane === "main" && event.backgroundTaskId !== undefined && event.isError !== true && keyedGet(n.backgroundTasks, event.toolUseId) === undefined) {
         n.backgroundTasks = keyedSet(n.backgroundTasks, event.toolUseId, {
           toolUseId: event.toolUseId,
@@ -1563,17 +1578,23 @@ export function planItemKeys(block: RequestBlockRecord): string[] {
 }
 
 export type NumberedLaunchVerdict = { kind: "allow" } | { kind: "unnumbered"; numbers: number[] } | { kind: "not-in-progress"; number: number };
+export type ResumeVerdict = { kind: "allow" } | { kind: "step-completed"; number: number };
+export type CompletionVerdict = { kind: "allow" } | { kind: "running-lanes"; steps: { number: number; lanes: string[] }[] };
 
-// While a PLAN has items, a delegation or external run may run only for an item the conductor itself marked in progress;
-// the Host never changes item state for a launch. Plan-tool calls issued earlier in the same assistant message count with
-// the status they send, folded by the same rule as their results.
-export function numberedLaunchVerdict(state: TimeBucketState, description: string | undefined): NumberedLaunchVerdict {
-  // The current assistant message is the one that issued the latest main-lane call; a plan call left open by a cut stream
-  // or an earlier message is not folded.
+// Plan-tool calls observed in the same assistant message, in any order, count with the status they send, folded by the
+// same rule as their results. The current assistant message is the one that issued the latest main-lane call; a plan call left open
+// by a cut stream or an earlier message is not folded. `except` is the call being judged, whose own start may already be open.
+function withMessagePlanCalls(state: TimeBucketState, except?: string): TimeBucketState {
   const current = state.mainMessageId;
-  const planned = Object.entries(state.openTools).reduce((next, [toolUseId, tool]) => tool.lane === "main" && tool.taskIntent !== undefined
+  return Object.entries(state.openTools).reduce((next, [toolUseId, tool]) => toolUseId !== except && tool.lane === "main" && tool.taskIntent !== undefined
     && tool.taskIntent.kind !== "create" && current !== undefined && tool.messageId === current && tool.turnId === state.openTurn?.turnId
     ? applyPlanTask(next, tool.taskIntent, tool.at, tool.turnId, "", { live: true, toolUseId }) : next, state);
+}
+
+// While a PLAN has items, a delegation or external run may run only for an item the conductor itself marked in progress;
+// the Host never changes item state for a launch.
+export function numberedLaunchVerdict(state: TimeBucketState, description: string | undefined): NumberedLaunchVerdict {
+  const planned = withMessagePlanCalls(state);
   const block = currentWorkBlock(planned);
   if (block?.kind !== "plan") return { kind: "allow" };
   const listed = (block.steps ?? []).filter(step => !step.removed).map(step => step.number);
@@ -1606,6 +1627,80 @@ export function inProgressStepOfDelegation(state: TimeBucketState, dispatch: { d
     ?? launchStep(state.blocks, selections, planItemNumberOf(dispatch.description), dispatch.launchedAt);
   const step = item === undefined ? undefined : state.blocks[item.blockIndex].steps?.find(value => value.key === item.key);
   return step !== undefined && !step.removed && step.status === "in_progress" ? step.number : undefined;
+}
+
+function launchPlacedStep(state: TimeBucketState, selections: readonly { at: number; selected: SelectedItem[] }[], description: string,
+  launchedAt: number): { blockIndex: number; step: PlanBlockStepRecord } | undefined {
+  const item = launchStep(state.blocks, selections, planItemNumberOf(description), launchedAt);
+  const step = item === undefined ? undefined : state.blocks[item.blockIndex].steps?.find(value => value.key === item.key);
+  return item === undefined || step === undefined ? undefined : { blockIndex: item.blockIndex, step };
+}
+
+const isCompletedStep = (step: PlanBlockStepRecord | undefined): boolean => step !== undefined && !step.removed && step.status === "completed";
+
+// `running` is the PLAN panel's rule (src/work-model.ts#isRunningMainLane), so the guards never see a lane as running that
+// the panel shows ended, or the reverse; only a successful TaskStop ends a lane earlier, so a completion can follow it.
+function laneRunning(state: TimeBucketState, running: (toolUseId: string) => boolean, toolUseId: string, taskId: string | undefined): boolean {
+  return running(toolUseId) && (taskId === undefined || !state.stoppedTaskIds?.includes(taskId));
+}
+
+// A resumed lane keeps the item its launch placed it on (R-DSP-42), so the placement is the launch's, not the resume's.
+export function resumeVerdict(state: TimeBucketState, to: string, namedToolUseId: string | undefined, toolUseId: string,
+  running: (toolUseId: string) => boolean): ResumeVerdict {
+  const agentId = keyedGet(state.delegationsByAgent, to) !== undefined ? to
+    : namedToolUseId === undefined ? undefined : keyedGet(state.delegations, namedToolUseId)?.transcriptAgentId;
+  const resumed = agentId === undefined ? undefined : delegationOfAgent(state, agentId, d => d.isBackground);
+  if (resumed === undefined || laneRunning(state, running, resumed.toolUseId, agentId)) return { kind: "allow" };
+  const planned = withMessagePlanCalls(state, toolUseId);
+  const placed = launchPlacedStep(planned, responseSelections(planned.blocks, turnSpansUntil(planned, Number.POSITIVE_INFINITY)), resumed.description, resumed.startedAt);
+  return placed !== undefined && isCompletedStep(placed.step) && reopenable(planned, placed.blockIndex, placed.step)
+    ? { kind: "step-completed", number: placed.step.number } : { kind: "allow" };
+}
+
+// A resume is denied only onto an item the denial's instruction can set back in progress, else the agent could never be
+// resumed: TodoWrite reaches only its own items in the open PLAN block; TaskUpdate reaches a task item through
+// applyPlanTask's own lookup, but not one whose TaskCreate result gave no id (the pending key), since no id can be sent.
+function reopenable(state: TimeBucketState, blockIndex: number, step: PlanBlockStepRecord): boolean {
+  const block = state.blocks[blockIndex];
+  if (!step.taskKey.startsWith("task:")) return blockIndex === state.blocks.length - 1 && block.kind === "plan" && block.closedAt === undefined;
+  if (step.taskKey.startsWith(taskCreateKeyFromResult("", ""))) return false;
+  const reopened = applyPlanTask(state, { kind: "update", taskKey: step.taskKey, status: "in_progress" }, state.lastAt ?? 0, state.openTurn?.turnId ?? "", "",
+    { live: true, toolUseId: "" });
+  return reopened.blocks[blockIndex].steps?.find(value => value.key === step.key)?.status === "in_progress";
+}
+
+// A launch that has not returned yet counts only once its PreToolUse let it run (`admitted`, the hook's own decisions);
+// re-judging it here would fold the call being judged and drop a launch that is already running.
+export function completionVerdict(state: TimeBucketState, toolName: string, input: Record<string, unknown> | undefined, toolUseId: string,
+  running: (toolUseId: string) => boolean, admitted: ReadonlySet<string>): CompletionVerdict {
+  const intent = parseTaskIntentFromRawInput(toolName, input, toolUseId);
+  if (intent === undefined || intent.kind === "create") return { kind: "allow" };
+  const before = withMessagePlanCalls(state, toolUseId);
+  const after = applyPlanTask(before, intent, before.lastAt ?? 0, before.openTurn?.turnId ?? "", "", { live: true, toolUseId });
+  const completing = after.blocks.flatMap(block => (block.steps ?? [])
+    .filter(step => isCompletedStep(step) && !isCompletedStep(before.blocks.find(value => value.blockId === block.blockId)?.steps?.find(value => value.key === step.key)))
+    .map(step => ({ blockId: block.blockId, step })));
+  if (completing.length === 0) return { kind: "allow" };
+  const lanes = [
+    ...keyedValues(before.delegations).filter(d => !d.rejectedBeforeRun && laneRunning(before, running, d.toolUseId, d.transcriptAgentId)
+      && (d.ackEndedAt !== undefined || admitted.has(d.toolUseId)))
+      .map(d => ({ description: d.description, at: d.startedAt, id: d.transcriptAgentId })),
+    ...keyedValues(before.backgroundTasks).filter(b => isExternalRunTool(b.toolName) && laneRunning(before, running, b.toolUseId, b.taskId))
+      .map(b => ({ description: b.description, at: b.startedAt, id: b.taskId as string | undefined })),
+    ...Object.entries(before.openTools).filter(([id, tool]) => tool.lane === "main" && isExternalRunTool(tool.toolName)
+      && keyedGet(before.backgroundTasks, id) === undefined && laneRunning(before, running, id, undefined) && admitted.has(id))
+      .map(([, tool]) => ({ description: tool.description ?? tool.toolName, at: tool.at, id: undefined as string | undefined })),
+  ];
+  const selections = responseSelections(before.blocks, turnSpansUntil(before, Number.POSITIVE_INFINITY));
+  const placed = lanes.map(lane => {
+    const step = launchPlacedStep(before, selections, lane.description, lane.at);
+    return { lane, blockId: step === undefined ? undefined : before.blocks[step.blockIndex].blockId, key: step?.step.key };
+  });
+  const steps = completing.map(({ blockId, step }) => ({ number: step.number,
+    lanes: placed.filter(entry => entry.blockId === blockId && entry.key === step.key)
+      .map(({ lane }) => lane.id === undefined ? lane.description : `${lane.description} (${lane.id})`) }))
+    .filter(entry => entry.lanes.length > 0);
+  return steps.length > 0 ? { kind: "running-lanes", steps } : { kind: "allow" };
 }
 
 function retainObserved<T extends object>(measured: T, live: T): T {

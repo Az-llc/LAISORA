@@ -940,6 +940,7 @@
   "Export conversation to Markdown": "Export conversation to Markdown",
   "In progress": "In progress",
   "Close plan": "Close plan",
+  "Agents {0}": "Agents {0}",
   "Working {0}": "Working {0}",
   "Waiting for input": "Waiting for input",
   "Cache read: {0} tokens": "Cache read: {0} tokens",

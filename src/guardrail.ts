@@ -6,6 +6,7 @@ import { redactAbsolutePaths } from "./path-redaction";
 import { planItemLabel } from "./plan-steps";
 import { HUMAN_REJECTED_TOOL_RESULT_RE } from "./tool-result-signals";
 import type { SteeringSignalSummary } from "./steering-envelope";
+import { conductorStopTarget } from "./tool-intent";
 
 export const MAX_RECENT_FINISHED = 200;
 export const MAX_SIGNALS = 200;
@@ -782,16 +783,6 @@ export function foldGuardrail(state: GuardrailState, input: GuardrailInput): Gua
 }
 
 const STOPPED_TASK_STATUSES: ReadonlySet<string> = new Set(["stopped", "killed"]);
-
-function conductorStopTarget(toolName: string, inputPreview: string): string | undefined {
-  if (toolName !== "TaskStop") return undefined;
-  try {
-    const taskId = (JSON.parse(inputPreview) as { task_id?: unknown }).task_id;
-    return typeof taskId === "string" && taskId !== "" ? taskId : undefined;
-  } catch {
-    return undefined;
-  }
-}
 
 function foldDelegation(state: GuardrailState, event: NormalizedEvent, stepOf: () => number | undefined): GuardrailState {
   if (event.kind === "tool_call_started") {

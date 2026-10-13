@@ -50,6 +50,7 @@ export { settingsStateMessage, setExternalDetectorForTest } from "./gateway-host
 import { openSettingsPanel, postSettingsState } from "./settings-panel";
 import { postOrchestrationView } from "./conversation-lifecycle";
 import { registerReadOnlyFileProvider } from "./composer-io";
+import { pasteClipboardTextIntoComposer, setComposerFocus } from "./composer-paste";
 export { Session, historyScopeKey, historyTranscriptScopeKey, isUnusedSession } from "./session";
 export {
   createHydrationDraft,
@@ -166,7 +167,8 @@ function activateReady(context: vscode.ExtensionContext): void {
   if (readOnlyFiles) context.subscriptions.push(readOnlyFiles);
   context.subscriptions.push(
     vscode.commands.registerCommand("laisora.open", () => openPanel(context)),
-    vscode.commands.registerCommand("laisora.openSettings", () => openSettingsPanel(context))
+    vscode.commands.registerCommand("laisora.openSettings", () => openSettingsPanel(context)),
+    vscode.commands.registerCommand("laisora.pasteText", () => pasteClipboardTextIntoComposer(store))
   );
   const displayConfigSub = vscode.workspace.onDidChangeConfiguration?.((e) => {
     if (["enabled", "agents", "externalTimeoutMinutes", "conductorPolicy"]
@@ -269,6 +271,7 @@ function activateReady(context: vscode.ExtensionContext): void {
             disposeHooked.add(view);
             view.onDidDispose(() => {
               releaseAccountUsageWaiter(view.webview);
+              setComposerFocus(view.webview, false);
               store?.detach(view.webview);
             });
           }
@@ -331,6 +334,7 @@ function openPanel(context: vscode.ExtensionContext): void {
 
   panel.onDidDispose(() => {
     releaseAccountUsageWaiter(panel.webview);
+    setComposerFocus(panel.webview, false);
     if (store) {
       store.detach(panel.webview);
       store.panel = null;

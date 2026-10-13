@@ -2,7 +2,7 @@ import * as l10n from "@vscode/l10n";
 import { truncateToolIntent } from "./status-line";
 import type { OrchestrationView, WorkModelPayload } from "../protocol";
 import type { PlanUsage } from "../plan-usage";
-import { deriveEarlierPlanViews, derivePlanView, planStepFolds, planStepSettled, type PlanLane, type PlanStep, type PlanView } from "./plan-view";
+import { deriveEarlierPlanViews, derivePlanView, planLaneRunning, planStepFolds, planStepSettled, type PlanLane, type PlanStep, type PlanView } from "./plan-view";
 import { createLoader } from "./loader";
 import { planItemLabel } from "../plan-steps";
 import { goalLabel } from "./ask-view";
@@ -126,7 +126,7 @@ export class PlanPanel {
     this.barNumber.textContent = current ? itemNumber(current) : "";
     this.barTitle.textContent = current?.title ?? "";
     const earlierLanes = earlier.flatMap(plan => plan.steps.filter(planStepSettled).flatMap(step => step.lanes));
-    const running = [...view.now, ...view.steps.flatMap(step => step.lanes), ...earlierLanes].filter(lane => lane.status === "running").length;
+    const running = [...view.now, ...view.steps.flatMap(step => step.lanes), ...earlierLanes].filter(planLaneRunning).length;
     this.barRunning.textContent = running ? l10n.t("Working {0}", running) : "";
     this.barLoader.hidden = !planRunning || !(running || current?.status === "in_progress") || !view.steps.length;
     this.barStats.textContent = view.steps.length ? `${planDuration(view.elapsed)} · ${view.claude ? "≈" : ""}${planTokens(view.claude?.tokens ?? null)}` : "";
@@ -155,10 +155,12 @@ function renderLane(lane: PlanLane): HTMLElement {
   return row;
 }
 
+const laneOpenState = new WeakMap<HTMLElement, Set<string>>();
+
 export function renderPlanSection(section: HTMLElement, view: PlanView, nowStatus?: string, earlier: readonly PlanView[] = []): void {
   section.lang = document.documentElement.lang;
   const noPlan = !view.goal && !view.steps.length;
-  const earlierDone = earlier.map(plan => ({ goal: plan.goal,
+  const earlierDone = earlier.map(plan => ({ block: plan.block, goal: plan.goal,
     steps: plan.steps.filter(planStepSettled) })).filter(plan => plan.steps.length);
   section.hidden = nowStatus === undefined && noPlan && !view.now.length && !earlierDone.length;
   const top = node("div", "plan-top");
@@ -182,18 +184,21 @@ export function renderPlanSection(section: HTMLElement, view: PlanView, nowStatu
     const toggle = node("button", "plan-done-toggle", `✓ ${l10n.t("{0} steps done", String(doneCount))} ${collapsed ? "▸" : "▾"}`);
     toggle.type = "button";
     toggle.setAttribute("aria-expanded", String(!collapsed));
+    toggle.dataset.foldKey = "done";
     toggle.onclick = () => {
       section.dataset.doneOpen = String(collapsed);
       renderPlanSection(section, view, nowStatus, earlier);
-      section.querySelector<HTMLElement>(".plan-done-toggle")?.focus();
     };
     children.push(toggle);
   }
-  const earlierShown = earlierDone.map(plan => ({ goal: plan.goal, steps: plan.steps.filter(step => !collapsed || !planStepFolds(step)) }))
+  const earlierShown = earlierDone.map(plan => ({ block: plan.block, goal: plan.goal, steps: plan.steps.filter(step => !collapsed || !planStepFolds(step)) }))
     .filter(plan => plan.steps.length);
   const grouped = earlierShown.length > 0;
-  for (const plan of earlierShown) children.push(planGroup(plan.goal, plan.steps.map(step => renderPlanItem(step, undefined))));
-  const items = view.steps.filter(step => !collapsed || !done.includes(step)).map(step => renderPlanItem(step, current));
+  let openLanes = laneOpenState.get(section);
+  if (!openLanes) laneOpenState.set(section, openLanes = new Set());
+  const lanesOpen = openLanes;
+  for (const plan of earlierShown) children.push(planGroup(plan.goal, plan.steps.map(step => renderPlanItem(step, undefined, lanesOpen, plan.block))));
+  const items = view.steps.filter(step => !collapsed || !done.includes(step)).map(step => renderPlanItem(step, current, lanesOpen, view.block));
   if (grouped && items.length) children.push(planGroup(view.goal, items));
   else children.push(...items);
   if (view.now.length || nowStatus !== undefined) {
@@ -205,7 +210,10 @@ export function renderPlanSection(section: HTMLElement, view: PlanView, nowStatu
   }
   const body = node("div", "plan-section-body");
   body.append(...children);
+  const active = document.activeElement as HTMLElement | null | undefined;
+  const focused = active && section.contains(active) ? active.dataset.foldKey : undefined;
   section.replaceChildren(head, body);
+  if (focused !== undefined) Array.from(section.querySelectorAll<HTMLElement>("[data-fold-key]")).find(toggle => toggle.dataset.foldKey === focused)?.focus({ preventScroll: true });
 }
 
 function planGroup(goal: string, items: HTMLElement[]): HTMLElement {
@@ -218,7 +226,30 @@ function planGroup(goal: string, items: HTMLElement[]): HTMLElement {
   return group;
 }
 
-export function renderPlanItem(step: PlanStep, current: PlanStep | undefined): HTMLElement {
+function laneFold(lanes: readonly PlanLane[], openLanes: Set<string>, key: string): HTMLElement[] {
+  const list = node("div", "plan-lanes");
+  list.append(...lanes.map(renderLane));
+  const toggle = node("button", "plan-lane-toggle");
+  toggle.type = "button";
+  toggle.dataset.foldKey = key;
+  const running = lanes.filter(planLaneRunning).length;
+  const failed = lanes.filter(lane => lane.status === "failed").length;
+  const label = [l10n.t("Agents {0}", lanes.length), running ? l10n.t("Working {0}", running) : ""].filter(Boolean).join(" · ");
+  const paint = () => {
+    const open = openLanes.has(key);
+    list.hidden = !open;
+    toggle.replaceChildren(label, ...failed ? [" · ", node("span", "plan-lane-failed", `${status("failed")} ${failed}`)] : [], ` ${open ? "▾" : "▸"}`);
+    toggle.setAttribute("aria-expanded", String(open));
+  };
+  toggle.onclick = () => {
+    if (!openLanes.delete(key)) openLanes.add(key);
+    paint();
+  };
+  paint();
+  return [toggle, list];
+}
+
+export function renderPlanItem(step: PlanStep, current: PlanStep | undefined, openLanes = new Set<string>(), block = ""): HTMLElement {
   const item = node("div", "plan-item");
   item.classList.toggle("plan-current", step === current);
   item.classList.toggle("plan-ahead", step.ahead || step.added && step.status === "in_progress");
@@ -236,7 +267,7 @@ export function renderPlanItem(step: PlanStep, current: PlanStep | undefined): H
     metric.title = l10n.t("Approximate time attribution. Cache read: {0} tokens", planTokens(step.tokens?.cacheRead ?? null));
     body.append(metric);
   }
-  for (const lane of step.lanes) body.append(renderLane(lane));
+  if (step.lanes.length) body.append(...laneFold(step.lanes, openLanes, `lanes\u0000${block}\u0000${step.key}`));
   item.append(node("span", "plan-number", itemNumber(step)), body);
   return item;
 }

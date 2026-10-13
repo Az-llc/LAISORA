@@ -2,7 +2,7 @@
   "name": "laisora",
   "displayName": "LAISORA",
   "description": "%extension.description%",
-  "version": "1.6.0",
+  "version": "1.6.1",
   "publisher": "az-llc",
   "categories": [
     "AI",
@@ -44,6 +44,14 @@
       {
         "command": "laisora.openSettings",
         "title": "%command.laisora.openSettings.title%"
+      }
+    ],
+    "keybindings": [
+      {
+        "key": "ctrl+shift+v",
+        "mac": "cmd+shift+v",
+        "command": "laisora.pasteText",
+        "when": "laisora.composerFocused"
       }
     ],
     "viewsContainers": {

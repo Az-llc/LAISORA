@@ -1,6 +1,7 @@
 import * as vscode from "vscode";
 
 import { handleComposerMessage } from "./composer-io";
+import { setComposerFocus } from "./composer-paste";
 import { handleAnalysisMessage } from "./analysis-messages";
 import { handleConversationMessage } from "./conversation-lifecycle";
 import { handleHandoffMessage } from "./handoff-wiring";
@@ -83,6 +84,9 @@ export async function handleWebviewMessage(
       case "conversationHistoryRequest":
       case "worklogTranscriptRequest":
         await handleHistoryMessage(st, msg, sender, target);
+        break;
+      case "composerFocus":
+        setComposerFocus(sender, msg.focused);
         break;
       case "runHostAction":
         await runHostActionMessage(msg);

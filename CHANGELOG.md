@@ -1,5 +1,17 @@
 # Changelog
 
+## 1.6.1
+
+- **Paste text with Ctrl+Shift+V.** In the message box, Ctrl+V still attaches images, and
+  Ctrl+Shift+V pastes only the clipboard text (cells copied from a spreadsheet arrive as text).
+  It works in both the editor panel and the sidebar view.
+- **PLAN agent rows fold.** Each step's agents fold into one line with the count and how many are
+  working or failed; press it to open or close that step's agents. The open state survives
+  re-renders.
+- **Completed steps stay completed.** The conductor can no longer mark a step done while one of its
+  agents is still running, or resume an agent on a step that is already done without reopening the
+  step first.
+
 ## 1.6.0
 
 - **Work follows the PLAN.** GRAPH, ANALYSIS and SUMMARY now split a conversation by the steps of

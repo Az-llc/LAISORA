@@ -2347,6 +2347,12 @@ function initMessageBus(): void {
         if (tabs.has(msg.tabId)) setActiveTab(msg.tabId);
         break;
       }
+      case "pasteText": {
+        if (document.activeElement === inputEl) {
+          document.execCommand("insertText", false, msg.text);
+        }
+        break;
+      }
       case "tabRenamed": {
         tabs.get(msg.tabId)?.rename(msg.title);
         break;
@@ -2647,6 +2653,9 @@ function initComposer(): void {
       send();
     }
   });
+
+  inputEl.addEventListener("focus", () => vscode.postMessage({ type: "composerFocus", focused: true }));
+  inputEl.addEventListener("blur", () => vscode.postMessage({ type: "composerFocus", focused: false }));
 
   inputEl.addEventListener("paste", (e) => {
     const items = e.clipboardData?.items;

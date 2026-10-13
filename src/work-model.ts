@@ -1712,6 +1712,21 @@ function settlePendingStale(d: Draft, timestamp: number): void {
   }
 }
 
+export function runningMainPlacement(state: WorkModelState, toolUseId: string): WorkTool | undefined {
+  const tool = findToolPlacement(state, toolUseId);
+  return tool !== undefined && !tool.stale && tool.parentToolUseId === null ? tool : undefined;
+}
+
+// The values the PLAN panel shows a lane's state from: an agent lane's WorkAgent.status (src/webview/plan-view.ts#planLaneRunning),
+// a tool lane's running main placement (planTools in src/protocol.ts#projectWorkModel).
+export function isRunningMainLane(state: WorkModelState, toolUseId: string): boolean {
+  for (let index = state.phases.length - 1; index >= 0; index--) {
+    const agent = state.phases[index].agents.find(value => value.toolUseId === toolUseId && value.parentToolUseId === null);
+    if (agent !== undefined) return agent.status === "running";
+  }
+  return state.runningToolUseIds.includes(toolUseId) && runningMainPlacement(state, toolUseId) !== undefined;
+}
+
 export function knownBackgroundTask(state: WorkModelState, hydration: { phase: ResumeHydrationPhase } | null, taskId: string):
   "agent" | "tool" | "unconfirmed" | undefined {
   return hydration === null || hydration.phase === "complete" ? state.backgroundTasks[taskId]?.kind : "unconfirmed";

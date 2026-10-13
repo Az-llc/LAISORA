@@ -513,6 +513,7 @@ button#auth.chip:hover { filter: brightness(1.15); }
 .plan-lane { display: grid; grid-template-columns: auto minmax(0, 1fr) auto; gap: 4px 8px; align-items: baseline; font-size: 11.5px; padding: 4px 0; }
 .plan-agent { color: var(--vscode-descriptionForeground); font-size: 10px; font-weight: 600; letter-spacing: .08em; text-transform: uppercase; overflow-wrap: anywhere; max-width: 110px; }
 .plan-lane-title { overflow-wrap: anywhere; }
+.plan-lane-toggle { display: block; max-width: 100%; margin: 4px 0 0; padding: 0; border: 0; }
 .plan-metric { justify-self: end; font-size: 11.5px; white-space: nowrap; }
 .plan-now { border-top: 1px solid var(--vscode-panel-border); padding: 12px 0; }
 .plan-now-state { font-size: 11.5px; line-height: 1.5; padding: 4px 0; color: var(--vscode-descriptionForeground); overflow-wrap: anywhere; }
@@ -542,7 +543,7 @@ button#auth.chip:hover { filter: brightness(1.15); }
 .plan-lede, .plan-lane, .plan-metric, .plan-step-metric, .plan-stats { line-height: 1.5; }
 .plan-mark, .plan-bar-waiting { color: var(--vscode-descriptionForeground); }
 .plan-bar-waiting { font-size: 11.5px; }
-.plan-failed .plan-metric { color: var(--vscode-errorForeground); }
+.plan-failed .plan-metric, .plan-lane-failed { color: var(--vscode-errorForeground); }
 @container log-content (min-width: 1100px) {
   .plan-chat { grid-template-columns: minmax(0, 1fr) 380px; gap: 44px; }
   .plan-chat > .plan-side { display: block; position: sticky; top: var(--log-head-h, 0px); align-self: start; padding: 8px 0 0 12px; max-height: calc(100dvh - var(--log-head-h, 0px) - 100px); overflow-y: auto; scrollbar-width: thin; }
@@ -555,8 +556,9 @@ button#auth.chip:hover { filter: brightness(1.15); }
   .plan-side:has(> .plan-section:not([hidden])) .plan-section-head { grid-row: 1 / span 3; grid-template-rows: subgrid; }
   .plan-side:has(> .plan-section:not([hidden])) .plan-section-body, .plan-side:has(> .plan-section:not([hidden])) .you-section-body { align-self: start; }
 }
-.plan-done-toggle { display: block; box-sizing: border-box; width: 100%; padding: 12px 0; border: 0; border-top: 1px solid var(--vscode-panel-border); background: none; color: var(--vscode-descriptionForeground); font: inherit; font-size: 11.5px; line-height: 1.5; font-variant-numeric: tabular-nums; text-align: left; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; cursor: pointer; }
-.plan-done-toggle:focus-visible { outline: 1px solid var(--vscode-focusBorder); outline-offset: -1px; }
+.plan-done-toggle, .plan-lane-toggle { background: none; color: var(--vscode-descriptionForeground); font: inherit; font-size: 11.5px; line-height: 1.5; font-variant-numeric: tabular-nums; text-align: left; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; cursor: pointer; }
+.plan-done-toggle { display: block; box-sizing: border-box; width: 100%; padding: 12px 0; border: 0; border-top: 1px solid var(--vscode-panel-border); }
+.plan-done-toggle:focus-visible, .plan-lane-toggle:focus-visible { outline: 1px solid var(--vscode-focusBorder); outline-offset: -1px; }
 .plan-group-goal { border-top: 1px solid var(--vscode-panel-border); padding-top: 12px; overflow-wrap: anywhere; }
 .session-header { display: flex; align-items: baseline; min-width: 0; }
 .session-heading-block { flex: 1 1 0; min-width: 0; }

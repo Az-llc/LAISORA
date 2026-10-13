@@ -15,7 +15,7 @@ export type { OrchestrationView } from "./orchestration-view";
 import * as l10n from "@vscode/l10n";
 import { FILE_LINK_TARGET_MAX_LEN } from "./file-link-target";
 export { FILE_LINK_TARGET_MAX_LEN } from "./file-link-target";
-import { findToolPlacement, findWorkSegment, phaseStateOf } from "./work-model";
+import { findToolPlacement, findWorkSegment, phaseStateOf, runningMainPlacement } from "./work-model";
 import { BACKGROUND_ACTIVITY_LIST_MAX, type BackgroundActivitySnapshot } from "./background-activity";
 export { BACKGROUND_ACTIVITY_LIST_MAX } from "./background-activity";
 export type { BackgroundActivitySnapshot } from "./background-activity";
@@ -804,6 +804,7 @@ export type WebviewToHost =
       answers?: Record<string, string>;
     }
   | { type: "newTab" }
+  | { type: "composerFocus"; focused: boolean }
   | { type: "closeTab"; tabId: string }
   | { type: "clearTab"; tabId: string }
   | { type: "setMode"; tabId: string; mode: PermissionModeId }
@@ -1607,13 +1608,13 @@ export function projectWorkModel(
     planHistoryTruncated: state.planHistoryTruncated,
     planHistoryLostThrough: state.planHistoryLostThrough,
     planTools: state.runningToolUseIds.flatMap(id => {
-      const tool = findToolPlacement(state, id);
-      return tool && !tool.stale && tool.parentToolUseId === null
+      const tool = runningMainPlacement(state, id);
+      return tool
         ? [{ id, name: tool.toolName, description: tool.description, startedAt: tool.startedAt, intentInput: tool.intentInput }] : [];
     }),
     runningMainTools: [...state.runningToolUseIds, ...state.runningAgentToolUseIds].flatMap(id => {
-      const tool = findToolPlacement(state, id);
-      return tool && !tool.stale && tool.parentToolUseId === null && tool.background === undefined
+      const tool = runningMainPlacement(state, id);
+      return tool && tool.background === undefined
         ? [{ id, name: tool.toolName, startedAt: tool.startedAt, intentInput: tool.intentInput }] : [];
     }).sort((a, b) => a.startedAt - b.startedAt),
     revision: state.revision,
@@ -3125,6 +3126,7 @@ export type HostToWebview =
   | { type: "tabCreated"; tab: TabSnapshot; activate: boolean }
   | { type: "tabClosed"; tabId: string }
   | { type: "activateTab"; tabId: string }
+  | { type: "pasteText"; text: string }
   | { type: "tabCleared"; tab: TabSnapshot }
   | { type: "tabRestored"; tab: TabSnapshot }
   | { type: "tabRenamed"; tabId: string; title: string }
@@ -3344,6 +3346,10 @@ export function isWebviewToHost(v: unknown): v is WebviewToHost {
       diagnostic.message.length <= 2000;
   }
   if (t === "newTab") return true;
+  if (t === "composerFocus") {
+    return hasOnlyKeys(v as Record<string, unknown>, ["type", "focused"])
+      && typeof (v as { focused?: unknown }).focused === "boolean";
+  }
   if (t === "setMode") {
     return (
       typeof tabId === "string" &&
@@ -4291,6 +4297,10 @@ export function isHostToWebview(v: unknown): v is HostToWebview {
     );
   }
   if (t === "tabClosed" || t === "activateTab") return typeof tabId === "string";
+  if (t === "pasteText") {
+    return hasOnlyKeys(v as Record<string, unknown>, ["type", "text"])
+      && typeof (v as { text?: unknown }).text === "string";
+  }
   if (t === "tabCleared") return isTabSnapshotShape((v as { tab?: unknown }).tab);
   if (t === "tabRestored") return isTabSnapshotShape((v as { tab?: unknown }).tab);
   if (t === "tabRenamed") {

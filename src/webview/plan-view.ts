@@ -18,7 +18,7 @@ export interface PlanStep {
   tokens: PlanTokenTotal | null; lanes: PlanLane[];
 }
 export interface PlanView {
-  goal: string; steps: PlanStep[]; now: PlanLane[]; current: number | null; completed: number;
+  block?: string; goal: string; steps: PlanStep[]; now: PlanLane[]; current: number | null; completed: number;
   elapsed: number | null; claude: PlanTokenTotal | null; external: PlanTokenTotal | null; partial: boolean;
 }
 
@@ -31,7 +31,11 @@ export function planStepSettled(step: { removed: boolean; status: TaskStatus }):
 }
 
 export function planStepFolds(step: PlanStep): boolean {
-  return planStepSettled(step) && !step.lanes.some(lane => lane.status === "running");
+  return planStepSettled(step) && !step.lanes.some(planLaneRunning);
+}
+
+export function planLaneRunning(lane: PlanLane): boolean {
+  return lane.status === "running";
 }
 
 export function deriveEarlierPlanViews(model: WorkModelPayload | undefined, orchestration: OrchestrationView | undefined,
@@ -44,7 +48,7 @@ export function deriveEarlierPlanViews(model: WorkModelPayload | undefined, orch
 
 export function derivePlanView(model: WorkModelPayload | undefined, orchestration: OrchestrationView | undefined,
   usage: PlanUsage | undefined, nowMs: number, context: PlanContext | undefined = model?.planContext): PlanView {
-  const view: PlanView = { goal: context?.goal ?? "", steps: [], now: [], current: null,
+  const view: PlanView = { block: context?.blockId, goal: context?.goal ?? "", steps: [], now: [], current: null,
     completed: 0, elapsed: context ? Math.max(0, (context.running ? Math.max(nowMs, context.end) : context.end) - context.start) : null,
     claude: null, external: null, partial: context !== undefined && model?.planHistoryLostThrough !== undefined &&
       model.planHistoryLostThrough >= context.start || model?.coverage.summary === "prefix-truncated" };

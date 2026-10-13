@@ -67,7 +67,7 @@ import { resolveClaudeProfileModel } from "./orchestration-profiles";
 import { LearningRecorder, type LearningRecordResult as LearningResult, type LearningToolKind } from "./learning-recording";
 import { createLearningMcpServer, LearningRootGate, LEARNING_INSTRUCTION, LEARNING_TOOL_NAMES } from "./learning-mcp";
 import { claudeModelIdLabel, isExternalRunTool } from "./orchestration-executors";
-import type { NumberedLaunchVerdict } from "./time-buckets";
+import type { CompletionVerdict, NumberedLaunchVerdict, ResumeVerdict } from "./time-buckets";
 import { planItemLabel } from "./plan-steps";
 import { LearningIngestion, delegationInvalidFields, type LearningToolResult, type LearningSubject } from "./learning-ingestion";
 import { AgentAttribution } from "./orchestration-attribution";
@@ -134,6 +134,18 @@ export function planLaunchDenial(verdict: NumberedLaunchVerdict): string | undef
   return verdict.kind === "allow" ? undefined : verdict.kind === "unnumbered" ? planItemDenial(verdict.numbers) : planItemNotInProgressDenial(verdict.number);
 }
 
+export function planResumeDenial(verdict: ResumeVerdict): string | undefined {
+  if (verdict.kind === "allow") return undefined;
+  const step = planItemLabel(verdict.number);
+  return `Rejected before running: this message would resume an agent placed on PLAN step ${step}, which is completed. Mark ${step} in progress again first (TaskUpdate with status in_progress, or TodoWrite), then send the same call again.`;
+}
+
+export function planCompletionDenial(verdict: CompletionVerdict): string | undefined {
+  if (verdict.kind === "allow") return undefined;
+  const steps = verdict.steps.map(entry => `${planItemLabel(entry.number)} (${entry.lanes.join("; ")})`).join(", ");
+  return `Rejected before running: agents placed on PLAN step ${steps} are still running. Wait for them to finish or stop them (TaskStop), then send the same call again.`;
+}
+
 export function conversationSystemPrompt(fileLinkInstruction: boolean, planInstruction = true, cwd = ""): NonNullable<ClaudeCodeOptions["systemPrompt"]> {
   return { type: "custom", prompt: [fileLinkInstruction ? FILE_LINK_INSTRUCTION(cwd) : "", planInstruction ? PLAN_INSTRUCTION : "", PLACEMENT_LINE].filter(Boolean).join("\n\n"), snapshot: false };
 }
@@ -172,6 +184,8 @@ export interface ClaudeHostOptions {
   fileLinkInstruction?: boolean;
   planInstruction?: boolean;
   planLaunchVerdict?: (description: string | undefined) => NumberedLaunchVerdict;
+  planResumeVerdict?: (to: string, namedToolUseId: string | undefined, toolUseId: string) => ResumeVerdict;
+  planCompletionVerdict?: (toolName: string, input: Record<string, unknown> | undefined, toolUseId: string, admittedLaunches: ReadonlySet<string>) => CompletionVerdict;
   orchestrationEnabled?: boolean;
   orchestrationAgents?: unknown;
   externalModels?: ExternalModels;
@@ -1044,15 +1058,28 @@ ${ctxJson}`
       };
       options.hooks = { ...(options.hooks ?? {}), PreToolUse: [{ hooks: [guard] }, ...(options.hooks?.PreToolUse ?? [])] };
     }
-    const planLaunchVerdict = this.opts.planInstruction !== false ? this.opts.planLaunchVerdict : undefined;
-    if (planLaunchVerdict) {
+    const planInstruction = this.opts.planInstruction !== false;
+    const planLaunchVerdict = planInstruction ? this.opts.planLaunchVerdict : undefined;
+    const planResumeVerdict = planInstruction ? this.opts.planResumeVerdict : undefined;
+    const planCompletionVerdict = planInstruction ? this.opts.planCompletionVerdict : undefined;
+    if (planLaunchVerdict || planResumeVerdict || planCompletionVerdict) {
+      const launchByName = new Map<string, string>();
+      const admittedLaunches = new Set<string>();
       const planItemGuard: ClaudeCodeSdk.HookCallback = async input => {
-        if (input.hook_event_name !== "PreToolUse" || input.agent_id || !(["Agent", "Task"].includes(input.tool_name) || isExternalRunTool(input.tool_name))) return {};
+        if (input.hook_event_name !== "PreToolUse" || input.agent_id) return {};
+        const value = input.tool_input as Record<string, unknown> | undefined;
+        const launch = ["Agent", "Task"].includes(input.tool_name) || isExternalRunTool(input.tool_name);
+        const to = input.tool_name === "SendMessage" && typeof value?.to === "string" ? value.to : undefined;
+        const completion = input.tool_name === "TaskUpdate" || input.tool_name === "TodoWrite";
+        if (!launch && to === undefined && !completion) return {};
         return failClosedGuard(() => {
-          const description = (input.tool_input as Record<string, unknown> | undefined)?.description;
-          const reason = planLaunchDenial(planLaunchVerdict(typeof description === "string" ? description : undefined));
-          if (reason === undefined) return {};
-          return { hookSpecificOutput: { hookEventName: "PreToolUse", permissionDecision: "deny", permissionDecisionReason: reason } };
+          const reason = launch ? planLaunchVerdict && planLaunchDenial(planLaunchVerdict(typeof value?.description === "string" ? value.description : undefined))
+            : to !== undefined ? planResumeVerdict && planResumeDenial(planResumeVerdict(to, launchByName.get(to), input.tool_use_id))
+            : planCompletionVerdict && planCompletionDenial(planCompletionVerdict(input.tool_name, value, input.tool_use_id, admittedLaunches));
+          if (reason) return { hookSpecificOutput: { hookEventName: "PreToolUse", permissionDecision: "deny", permissionDecisionReason: reason } };
+          if (launch) admittedLaunches.add(input.tool_use_id);
+          if (launch && typeof value?.name === "string") launchByName.set(value.name, input.tool_use_id);
+          return {};
         }, this.opts.log);
       };
       const [first, ...rest] = options.hooks?.PreToolUse ?? [];

@@ -38,8 +38,8 @@ import { normalizeProgressTracking } from "./progress-protocol";
 import { normalizeApiKeyPolicy, type ModelInfo, type WebviewToHost } from "./protocol";
 import { displayTitleFromSummary } from "./session-list";
 import type { SessionStore } from "./store-surfaces";
-import { numberedLaunchVerdict } from "./time-buckets";
-import { knownBackgroundTask } from "./work-model";
+import { completionVerdict, numberedLaunchVerdict, resumeVerdict } from "./time-buckets";
+import { isRunningMainLane, knownBackgroundTask } from "./work-model";
 
 const orchestrationPublishers = new WeakMap<ClaudeConversation, OrchestrationViewPublisher>();
 
@@ -644,6 +644,10 @@ async function ensureConversationInner(s: Session, requestedAt: number): Promise
     fileLinkInstruction: cfg.get<boolean>("claude.fileLinkInstruction")! !== false,
     planInstruction: cfg.get<boolean>("claude.planInstruction")! !== false,
     planLaunchVerdict: description => numberedLaunchVerdict(s.evidenceIndex.timeBuckets, description),
+    planResumeVerdict: (to, namedToolUseId, toolUseId) => resumeVerdict(s.evidenceIndex.timeBuckets, to, namedToolUseId, toolUseId,
+      id => isRunningMainLane(s.workModel, id)),
+    planCompletionVerdict: (toolName, input, toolUseId, admittedLaunches) => completionVerdict(s.evidenceIndex.timeBuckets, toolName, input, toolUseId,
+      id => isRunningMainLane(s.workModel, id), admittedLaunches),
     orchestrationEnabled: cfg.get<boolean>("orchestration.enabled")! === true,
     learningEnabled,
     learningSwitches: () => {
