@@ -64,6 +64,11 @@ function hasNegativeColonLocation(value: string): boolean {
   return /:-\d+(?::-?\d+)?$|:\d+:-\d+$/.test(value);
 }
 
+export function fileLinkCopyText(absolutePath: string, link: Pick<FileLinkTarget, "line" | "column">): string {
+  const location = link.line === undefined ? "" : `:${link.line}${link.column === undefined ? "" : `:${link.column}`}`;
+  return absolutePath + location;
+}
+
 export function parseFileLinkTarget(target: string, platform: FileLinkPlatform): FileLinkTarget | null {
   if (
     target.length === 0 ||

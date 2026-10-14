@@ -72,6 +72,7 @@ import { planItemLabel } from "./plan-steps";
 import { LearningIngestion, delegationInvalidFields, type LearningToolResult, type LearningSubject } from "./learning-ingestion";
 import { AgentAttribution } from "./orchestration-attribution";
 import type { NormalizedOutMeta } from "./claude-normalizer";
+import { askQualityDenial, rejectedAskTitles } from "./markdown-ast";
 
 type UserContentBlock =
   | { type: "text"; text: string }
@@ -101,8 +102,8 @@ export const FILE_LINK_INSTRUCTION = (cwd = ""): string => {
 
 export const ASK_DECIDE_FORMAT = () => [
   l10n.t("Use a fenced code block whose language is exactly laisora-ask. Use the user's language for values. This is a strict YAML-like subset: one nonempty scalar key: value per line; no comments, multiline scalars, nesting, aliases or flow collections. Plain text and JSON double-quoted strings are supported; a plain value must not start with |, >, &, * or ! (use a JSON double-quoted string instead). Keys are unique. List entries use exactly two spaces before '- ' and four spaces before subsequent keys."),
-  l10n.t("A decision requires kind, title, why, options and default. Every option requires label, effect, pros and cons; mark your recommended option with recommended: true and explain why in its effect. Other options omit recommended."),
-  l10n.t("```laisora-ask\nkind: decide\ntitle: What should we choose?\nwhy: Why this decision matters now.\noptions:\n  - label: First choice\n    effect: What happens next and why I recommend it.\n    pros: Its benefit in plain words.\n    cons: Its drawback in plain words.\n    recommended: true\n  - label: Second choice\n    effect: What happens next.\n    pros: Its benefit.\n    cons: Its drawback.\ndefault: Without an answer, I will continue with A.\n```"),
+  l10n.t("A decision requires kind, title, why, options and default. Every option requires label, effect, pros and cons; mark your recommended option with recommended: true and cite in its effect the fact it rests on. Other options omit recommended."),
+  l10n.t("```laisora-ask\nkind: decide\ntitle: What should we choose?\nwhy: Observed: 3 of 5 runs failed (run.log). Question: retry or skip? You decide because it changes your workflow.\noptions:\n  - label: First choice\n    effect: What changes on your screen or in your work; the fact behind the recommendation.\n    pros: Benefit versus the others, including other features.\n    cons: Drawback versus the others, including other features.\n    recommended: true\n  - label: Second choice\n    effect: What changes for you.\n    pros: Benefit versus the first.\n    cons: Drawback versus the first.\ndefault: Without an answer, I will continue with A.\n```"),
 ].join("\n");
 
 export const PLAN_INSTRUCTION = [
@@ -112,13 +113,15 @@ export const PLAN_INSTRUCTION = [
   "Put an action that waits for the user's approval (such as merging or publishing) in its own step, separate from work you can finish yourself, and do not mark it in_progress until the user answers.",
   "While TaskCreate steps exist, start the description of every Agent call and external run with the number of the step it serves exactly as the PLAN panel shows it (the task id, zero-padded to at least two digits) followed by a space, as in \"03 Remove model research\". A delegation without a valid step number is rejected before it runs.",
   "When you need the user's decision or a real-machine check, do not bury it in prose. Write a ```laisora-ask block (format below) at the point you ask.",
-  "In every decision, whether in a laisora-ask block or AskUserQuestion, state: what is being decided and why now; for each option, what happens after choosing it, with its merits and drawbacks in plain words rather than technical terms; your recommendation and why; and what you will do if there is no answer.",
+  "Before asking, check earlier decisions (ledger, contracts, earlier answers here) instead of re-asking, and investigate first if the current state is unknown.",
+  "In every decision (laisora-ask or AskUserQuestion): why = what you observed (facts, numbers, sources) + the exact question + why the user, not you, must decide; never restate the title. effect = the concrete change to the user's screen, operation or work; never restate the label. pros/cons = compared with the other options, including effects on other features and operations. Give technical reasons, not history; explain terms the user may not share. For LAISORA's own behaviour, state the current behaviour and its technical reason from contracts or facts, or 理由の記録なし.",
+  "Keep why short. Put material the user may need but not always (current behaviour and its technical reason, numbers, sources, terms explained) in the optional details key after why, so the user rarely has to ask back; the card shows it folded. details is a JSON double-quoted string; write \\n for a line break.",
   "Use AskUserQuestion only when you cannot continue without the answer; otherwise use a laisora-ask block and continue with the stated default.",
   "<format>",
   "A laisora-plan fence contains only goal: followed by one nonempty line in the user's language, using the same scalar rules below: ```laisora-plan\ngoal: Make progress visible throughout the work\n```.",
   ASK_DECIDE_FORMAT(),
   "A real-machine check requires kind, title, why, steps and default. Every step requires do (the action) and look (what to observe). Do not mix options and steps.",
-  "```laisora-ask\nkind: check\ntitle: Check the result on your machine\nwhy: What I cannot verify here.\nsteps:\n  - do: Open the changed screen.\n    look: Confirm the labels fit without clipping.\n  - do: Resize the window.\n    look: Confirm every action remains reachable.\ndefault: While awaiting the result, I will continue with the independent work.\n```",
+  "```laisora-ask\nkind: check\ntitle: Check the result on your machine\nwhy: What I cannot verify here, and why.\nsteps:\n  - do: Open the changed screen.\n    look: Confirm the labels fit without clipping.\n  - do: Resize the window.\n    look: Confirm every action remains reachable.\ndefault: While awaiting the result, I will continue with the independent work.\n```",
   "</format>",
 ].join("\n");
 
@@ -146,6 +149,8 @@ export function planCompletionDenial(verdict: CompletionVerdict): string | undef
   return `Rejected before running: agents placed on PLAN step ${steps} are still running. Wait for them to finish or stop them (TaskStop), then send the same call again.`;
 }
 
+export const ASK_QUALITY_REWRITE_LIMIT = 2;
+
 export function conversationSystemPrompt(fileLinkInstruction: boolean, planInstruction = true, cwd = ""): NonNullable<ClaudeCodeOptions["systemPrompt"]> {
   return { type: "custom", prompt: [fileLinkInstruction ? FILE_LINK_INSTRUCTION(cwd) : "", planInstruction ? PLAN_INSTRUCTION : "", PLACEMENT_LINE].filter(Boolean).join("\n\n"), snapshot: false };
 }
@@ -171,7 +176,6 @@ interface QueryHandle extends AsyncIterable<any> {
 
 export interface ClaudeHostOptions {
   cwd: string;
-  initialObservedTimestamp?: number;
   knownBackgroundTask?: (taskId: string) => "agent" | "tool" | "unconfirmed" | undefined;
   model?: string;
   effort?: "low" | "medium" | "high" | "xhigh" | "max";
@@ -183,6 +187,7 @@ export interface ClaudeHostOptions {
   apiKeyPolicy?: ApiKeyPolicy;
   fileLinkInstruction?: boolean;
   planInstruction?: boolean;
+  askQualityCheck?: boolean;
   planLaunchVerdict?: (description: string | undefined) => NumberedLaunchVerdict;
   planResumeVerdict?: (to: string, namedToolUseId: string | undefined, toolUseId: string) => ResumeVerdict;
   planCompletionVerdict?: (toolName: string, input: Record<string, unknown> | undefined, toolUseId: string, admittedLaunches: ReadonlySet<string>) => CompletionVerdict;
@@ -611,6 +616,7 @@ export class ClaudeConversation {
 
   readonly conversationId = randomUUID();
   lastRecordReceivedAt: number | undefined;
+  private turnAssistantText: string[] = [];
   private normalizer: ClaudeLiveNormalizer;
   private readonly usageLimitResume: UsageLimitResume;
   private readonly unsubscribeAutoContinue: () => void;
@@ -676,7 +682,6 @@ export class ClaudeConversation {
       parent => this.attribution.subject(parent), opts.resumeSessionId);
     this.normalizer = new ClaudeLiveNormalizer({
       cwd: this.opts.cwd,
-      initialObservedTimestamp: this.opts.initialObservedTimestamp,
       knownBackgroundTask: this.opts.knownBackgroundTask,
       log: this.opts.log,
       loadAgentDef: (subagentType: string) => this.loadAgentDef(subagentType),
@@ -1085,6 +1090,27 @@ ${ctxJson}`
       const [first, ...rest] = options.hooks?.PreToolUse ?? [];
       options.hooks = { ...(options.hooks ?? {}), PreToolUse: [...(first ? [first] : []), { hooks: [planItemGuard] }, ...rest] };
     }
+    if (planInstruction && this.opts.askQualityCheck === true) {
+      let rewrites = 0;
+      const askQualityGate: ClaudeCodeSdk.HookCallback = async input => {
+        if (input.hook_event_name !== "Stop") return {};
+        if (!input.stop_hook_active) rewrites = 0;
+        try {
+          const text = [...this.turnAssistantText, input.last_assistant_message ?? ""].join("\n\n");
+          const reason = askQualityDenial(text);
+          if (!reason || rewrites >= ASK_QUALITY_REWRITE_LIMIT) return {};
+          rewrites++;
+          this.turnAssistantText = [];
+          const turnId = this.normalizer.currentTurnId;
+          if (turnId !== null) this.emit({ kind: "ask_rejected", turnId, titles: rejectedAskTitles(text) });
+          return { decision: "block", reason };
+        } catch (error) {
+          this.opts.log?.(`ask quality gate failed: ${String(error)}`);
+          return {};
+        }
+      };
+      options.hooks = { ...(options.hooks ?? {}), Stop: [...(options.hooks?.Stop ?? []), { hooks: [askQualityGate] }] };
+    }
     if (this.ingestion) {
       const observeFailure: ClaudeCodeSdk.HookCallback = async input => {
         if (input.hook_event_name === "PreToolUse") {
@@ -1242,7 +1268,7 @@ ${ctxJson}`
     return [...this.pendingApprovals.values()].flatMap(p => p.toolUseId === undefined ? [] : [p.toolUseId]);
   }
 
-  send(text: string, images?: ImageAttachment[], observedTimestampSeed?: number, automatic = false, uuid?: `${string}-${string}-${string}-${string}-${string}`): void {
+  send(text: string, images?: ImageAttachment[], sentAt = Date.now(), automatic = false, uuid?: `${string}-${string}-${string}-${string}-${string}`): void {
     if (!automatic) this.usageLimitResume.manualSend();
     if (this.closed) {
       this.emit({
@@ -1262,8 +1288,7 @@ ${ctxJson}`
     }
     const runningAlready = this.normalizer.turnState !== "idle";
     if (!runningAlready) {
-      this.normalizer.seedObservedTimestamp(observedTimestampSeed);
-      this.normalizer.startTurn(undefined, undefined, automatic);
+      this.normalizer.startTurn(undefined, { timestamp: sentAt }, automatic);
     }
     const content: UserContentBlock[] = [
       ...(images ?? []).map(
@@ -1442,6 +1467,10 @@ ${ctxJson}`
       const dispatch = this.attribution.dispatchRef(msg.parent_tool_use_id);
       if (dispatch) void this.queueLearningR33(() => this.delivery?.observed(dispatch, claudeModelIdLabel(msg.message.model), "unknown", ["claude:assistant:model"]) ?? Promise.resolve());
     }
+    if (msg?.type === "assistant" && msg.parent_tool_use_id == null && Array.isArray(msg.message?.content)) {
+      const text = msg.message.content.filter((block: any) => block?.type === "text" && typeof block.text === "string").map((block: any) => block.text).join("");
+      if (text) this.turnAssistantText.push(text);
+    }
     if (msg?.type !== "tool_progress") this.lastRecordReceivedAt = Date.now();
     if (msg?.type === "system" && msg?.subtype === "init" && Array.isArray(msg.capabilities)) {
       this.cliCapabilities = msg.capabilities.filter((c: unknown): c is string => typeof c === "string");
@@ -1458,6 +1487,7 @@ ${ctxJson}`
     if (ev.kind === "turn_started" || ev.kind === "compact_boundary" || ev.kind === "tool_call_finished") {
       this.invalidateHandoffContextUsage();
     }
+    if (ev.kind === "turn_started") this.turnAssistantText = [];
     if (ev.kind === "turn_started") void this.queueLearningR33(() => this.measurement?.record({ turnStarts: 1 }, {}, `turn-start:${ev.turnId}`) ?? Promise.resolve());
     if (ev.kind === "turn_completed" || ev.kind === "turn_failed" || ev.kind === "turn_interrupted") {
       const missingUsage = !this.handlingResult;

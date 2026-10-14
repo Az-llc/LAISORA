@@ -33,7 +33,6 @@ import { resolveModelDisplayName } from "./model-display-name";
 import { clearProcessEphemeral } from "./guardrail";
 import { extensionContext, output, sinceActivation, store } from "./host-context";
 import { INJECTED_TAG_RE as HUMAN_INPUT_INJECTED_TAG_RE, isNonHumanCommandInput } from "./human-input-vocabulary";
-import { observedTimestampSeed } from "./observed-timestamp-seed";
 import { normalizeProgressTracking } from "./progress-protocol";
 import { normalizeApiKeyPolicy, type ModelInfo, type WebviewToHost } from "./protocol";
 import { displayTitleFromSummary } from "./session-list";
@@ -517,18 +516,19 @@ export async function handleConversationMessage(
       postAttachments(st, target!.tabId);
       // One uuid for the live event and the CLI's transcript record, so both name the request alike.
       const messageUuid = randomUUID();
+      const sentAt = Date.now();
       if (!isNonHumanCommandInput(msg.text)) {
         target!.pushEvent(
-          { kind: "user_message", turnId: null, text: msg.text, images: msg.images, sentAt: Date.now(), uuid: messageUuid },
+          { kind: "user_message", turnId: null, text: msg.text, images: msg.images, sentAt, uuid: messageUuid },
           undefined,
-          undefined,
+          { timestamp: sentAt },
           clientToken
         );
         disposition("accepted-human");
       } else {
         disposition("accepted-nonhuman");
       }
-      target!.conversation!.send(msg.text, msg.images, sessionObservedTimestampSeed(target!), false, messageUuid);
+      target!.conversation!.send(msg.text, msg.images, sentAt, false, messageUuid);
       break;
     }
     case "cancelAutoResume":
@@ -565,11 +565,6 @@ export function warmup(s: Session): void {
   void ensureConversation(s).catch((e: unknown) =>
     output.appendLine(`[${s.title}] ${sinceActivation()} warmup失敗: ${String(e)}`)
   );
-}
-
-function sessionObservedTimestampSeed(s: Session): number | undefined {
-  const hydrating = s.hydration !== null && s.hydration.buffering ? s.hydration : null;
-  return observedTimestampSeed(hydrating?.arrivalTimestamp, s.lastRecordedEventTimestamp);
 }
 
 async function ensureConversation(s: Session): Promise<void> {
@@ -621,8 +616,6 @@ async function ensureConversationInner(s: Session, requestedAt: number): Promise
   s.effectiveModel = launchModel(s);
   s.effectiveEffort = undefined;
 
-  const initialObservedTimestamp = sessionObservedTimestampSeed(s);
-
   const learningEnabled = cfg.get<boolean>("learning.enabled")! === true;
   const learningConfiguredSnapshot = learningEnabled ? await resolveConfiguredEffortSnapshot(cwd, settingSources) : undefined;
   if (s.closed || s.logicalGeneration !== logicalGenerationAtStart) {
@@ -630,7 +623,6 @@ async function ensureConversationInner(s: Session, requestedAt: number): Promise
   }
   const conv = new ClaudeConversation({
     cwd,
-    initialObservedTimestamp,
     knownBackgroundTask: taskId => knownBackgroundTask(s.workModel, s.hydration, taskId),
     resumeSessionId: s.resumeSessionId ?? crashResumeSessionId,
     model: s.effectiveModel ?? undefined,
@@ -643,6 +635,7 @@ async function ensureConversationInner(s: Session, requestedAt: number): Promise
     apiKeyPolicy: normalizeApiKeyPolicy(cfg.get<string>("claude.apiKeyPolicy")!),
     fileLinkInstruction: cfg.get<boolean>("claude.fileLinkInstruction")! !== false,
     planInstruction: cfg.get<boolean>("claude.planInstruction")! !== false,
+    askQualityCheck: cfg.get<boolean>("claude.askQualityCheck") === true,
     planLaunchVerdict: description => numberedLaunchVerdict(s.evidenceIndex.timeBuckets, description),
     planResumeVerdict: (to, namedToolUseId, toolUseId) => resumeVerdict(s.evidenceIndex.timeBuckets, to, namedToolUseId, toolUseId,
       id => isRunningMainLane(s.workModel, id)),

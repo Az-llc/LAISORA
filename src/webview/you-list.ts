@@ -44,7 +44,7 @@ export class YouList {
         square.setAttribute("aria-hidden", "true");
         const body = node("div", "you-body");
         const kind = item.kind === "approve" ? l10n.t("Approval") : item.kind === "decide" ? l10n.t("Decision") : l10n.t("Machine check");
-        body.append(node("div", "you-kind", item.resolvedAt === undefined ? kind
+        body.append(node("div", "you-kind", item.resolvedAt === undefined ? (item.awaitingDetail ? l10n.t("{0} · Awaiting explanation", kind) : kind)
           : item.resolution === "historical" ? l10n.t("{0} · Recorded", kind) : l10n.t("{0} · Resolved", kind)));
         const title = node("div", "you-title");
         const link = node("button", "you-link", item.anchor.approvalRef ? l10n.t("↗ Card") : l10n.t("↗ Message"));

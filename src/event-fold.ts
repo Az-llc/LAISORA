@@ -15,8 +15,10 @@ import {
   SlashCommandInfo,
   isGuardrailOnlyEventKind,
   isInternalSlashCommand,
+  isObservedTime,
   projectWorkEvent,
   requiresTimestamp,
+  UNOBSERVED_TIME,
 } from "./protocol";
 import { foldSessionFacts, type SessionFactsAccumulator } from "./session-facts";
 import { backgroundAgentDispatch, markEventLogTrimmed, reduceWorkModel, type WorkModelState } from "./work-model";
@@ -110,6 +112,20 @@ export type EventMeta = {
   arrivalJudged?: boolean;
 };
 
+export function eventTime(partial: { kind: string; provenance?: EventProvenance }, own: number | undefined,
+  last: number | undefined, arrivedAt: number): number | undefined {
+  if (isObservedTime(own)) return own;
+  if (partial.provenance?.path === "live") return Math.max(arrivedAt, last ?? UNOBSERVED_TIME);
+  if (last === undefined) return arrivedAt;
+  return requiresTimestamp(partial.kind) ? undefined : last;
+}
+
+export function stampEventMeta<M extends EventMeta>(partial: { kind: string; provenance?: EventProvenance }, meta: M | undefined,
+  last: number | undefined, arrivedAt: number): (M & { timestamp: number }) | undefined {
+  const at = eventTime(partial, meta?.timestamp, last, arrivedAt);
+  return at === undefined ? undefined : { ...meta, timestamp: at } as M & { timestamp: number };
+}
+
 export function foldEventState(
   draft: EventFoldDraft,
   partial: NormalizedEventBody & { provenance?: EventProvenance },
@@ -140,10 +156,8 @@ export function foldEventState(
     });
     return { draft, normalizedEvent: null, effects };
   }
-  draft.sessionFacts = foldSessionFacts(draft.sessionFacts, {
-    ...partial,
-    timestamp: meta?.timestamp ?? draft.lastEventTimestamp,
-  });
+  const stamped = eventTime(partial, meta?.timestamp, draft.lastEventTimestamp, Date.now());
+  const at = stamped ?? draft.lastEventTimestamp ?? UNOBSERVED_TIME;
   if (isGuardrailOnlyEventKind(partial.kind)) {
     const ev = {
       ...partial,
@@ -151,20 +165,9 @@ export function foldEventState(
       conversationId: conversationId ?? draft.conversation?.conversationId ?? "pending",
       generation: draft.generation,
       seq: draft.seq,
-      timestamp: meta?.timestamp ?? draft.lastEventTimestamp ?? 0,
+      timestamp: at,
     } as NormalizedEvent;
-    try {
-      const before = draft.guardrail;
-      draft.guardrail = foldGuardrail(draft.guardrail, { type: "event", event: ev });
-      if (ev.provenance?.path === "live") {
-        for (const id of touchedSignalIds(before, draft.guardrail)) draft.liveGuardrailSignalIds.add(id);
-      }
-    } catch (error) {
-      effects.push({
-        type: "log",
-        message: `[${draft.title}] Guardrail fold failed: ${String(error)}`,
-      });
-    }
+    foldReaders(draft, ev, true, undefined, effects);
     effects.push({ type: "schedule_guardrail_refresh" });
     if (!meta?.suppressPost) effects.push({ type: "schedule_work_model_post" });
     if (partial.provenance?.path === "live") effects.push({ type: "schedule_guardrail_tick" });
@@ -189,9 +192,7 @@ export function foldEventState(
   }
   if (
     meta?.arrivalJudged !== true &&
-    meta?.timestamp === undefined &&
-    requiresTimestamp(partial.kind) &&
-    draft.lastEventTimestamp !== undefined
+    stamped === undefined
   ) {
     draft.timestampContractViolations += 1;
     effects.push({
@@ -200,7 +201,7 @@ export function foldEventState(
     });
     return { draft, normalizedEvent: null, effects };
   }
-  if (meta?.timestamp !== undefined) draft.lastEventTimestamp = meta.timestamp;
+  if (isObservedTime(meta?.timestamp) || partial.provenance?.path === "live") draft.lastEventTimestamp = Math.max(draft.lastEventTimestamp ?? at, at);
   draft.seq += 1;
   const ev = {
     ...partial,
@@ -208,7 +209,7 @@ export function foldEventState(
     conversationId: conversationId ?? draft.conversation?.conversationId ?? "pending",
     generation: draft.generation,
     seq: draft.seq,
-    timestamp: meta?.timestamp ?? draft.lastEventTimestamp ?? 0,
+    timestamp: at,
   } as NormalizedEvent;
   const previousFallback = draft.modelFallback;
   draft.modelFallback = foldModelFallback(previousFallback, ev, draft.models);
@@ -237,6 +238,66 @@ export function foldEventState(
       }
     }
   }
+  foldReaders(draft, ev, false, meta?.hostArtifacts, effects);
+  if (ev.provenance?.path === "live") {
+    effects.push({ type: "schedule_guardrail_tick" });
+  }
+  effects.push({ type: "schedule_guardrail_refresh" });
+  applyActivityEvent(draft.backgroundActivity, ev);
+  const trimmed = trimEventLog([...draft.events, ev]);
+  draft.workModel = markEventLogTrimmed(draft.workModel, draft.events.length + 1 - trimmed.length);
+  draft.events = trimmed;
+  if (
+    ev.kind === "turn_completed" &&
+    ev.provenance?.path === "live" &&
+    !draft.titleRefreshed &&
+    !draft.titleRefreshing &&
+    !draft.resuming &&
+    !draft.closed
+  ) {
+    draft.titleRefreshing = true;
+    effects.push({ type: "refresh_tab_title" });
+  }
+  if (
+    (ev.kind === "turn_started" ||
+      ev.kind === "turn_completed" ||
+      ev.kind === "turn_interrupted" ||
+      ev.kind === "turn_failed") &&
+    ev.provenance?.path === "live" &&
+    !draft.resuming
+  ) {
+    effects.push({ type: "schedule_transcript_time_buckets" });
+  }
+  if (meta?.suppressPost !== true) {
+    effects.push({
+      type: "post_events",
+      tabId: draft.tabId,
+      events: [ev],
+    });
+    effects.push({ type: "schedule_work_model_post" });
+    effects.push({ type: "schedule_semantic_model_post" });
+  }
+  return { draft, normalizedEvent: ev, effects };
+}
+
+function foldReaders(draft: EventFoldDraft, ev: NormalizedEvent, guardrailOnly: boolean,
+  hostArtifacts: HostArtifactAccess[] | undefined, effects: FoldEffect[]): void {
+  draft.sessionFacts = foldSessionFacts(draft.sessionFacts, ev);
+  if (guardrailOnly) {
+    try {
+      const before = draft.guardrail;
+      draft.guardrail = foldGuardrail(draft.guardrail, { type: "event", event: ev });
+      if (ev.provenance?.path === "live") {
+        for (const id of touchedSignalIds(before, draft.guardrail)) draft.liveGuardrailSignalIds.add(id);
+      }
+    } catch (error) {
+      effects.push({
+        type: "log",
+        message: `[${draft.title}] Guardrail fold failed: ${String(error)}`,
+      });
+    }
+    return;
+  }
   const previousWorkModel = draft.workModel;
   const reduced = reduceWorkModelSafely(draft.workModel, ev);
   draft.workModel = reduced.state;
@@ -252,7 +313,7 @@ export function foldEventState(
     draft.evidenceIndex = foldEvidence(
       draft.evidenceIndex,
       ev,
-      meta?.hostArtifacts,
+      hostArtifacts,
       boundaries.length > 0 ? boundaries : undefined,
       ev.provenance?.path === "history" ? undefined : { appliedEffort: draft.appliedEffort }
     );
@@ -297,45 +358,6 @@ export function foldEventState(
   if (draft.guardrailLiveSince === undefined && ev.provenance?.path === "live") {
     draft.guardrailLiveSince = ev.timestamp;
   }
-  if (ev.provenance?.path === "live") {
-    effects.push({ type: "schedule_guardrail_tick" });
-  }
-  effects.push({ type: "schedule_guardrail_refresh" });
   const work = projectWorkEvent(previousWorkModel, draft.workModel, ev);
   if (work !== undefined) ev.work = work;
-  applyActivityEvent(draft.backgroundActivity, ev);
-  const trimmed = trimEventLog([...draft.events, ev]);
-  draft.workModel = markEventLogTrimmed(draft.workModel, draft.events.length + 1 - trimmed.length);
-  draft.events = trimmed;
-  if (
-    ev.kind === "turn_completed" &&
-    ev.provenance?.path === "live" &&
-    !draft.titleRefreshed &&
-    !draft.titleRefreshing &&
-    !draft.resuming &&
-    !draft.closed
-  ) {
-    draft.titleRefreshing = true;
-    effects.push({ type: "refresh_tab_title" });
-  }
-  if (
-    (ev.kind === "turn_started" ||
-      ev.kind === "turn_completed" ||
-      ev.kind === "turn_interrupted" ||
-      ev.kind === "turn_failed") &&
-    ev.provenance?.path === "live" &&
-    !draft.resuming
-  ) {
-    effects.push({ type: "schedule_transcript_time_buckets" });
-  }
-  if (meta?.suppressPost !== true) {
-    effects.push({
-      type: "post_events",
-      tabId: draft.tabId,
-      events: [ev],
-    });
-    effects.push({ type: "schedule_work_model_post" });
-    effects.push({ type: "schedule_semantic_model_post" });
-  }
-  return { draft, normalizedEvent: ev, effects };
 }

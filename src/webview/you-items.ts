@@ -1,5 +1,5 @@
 import type { NormalizedEvent, RestoredApprovalCard } from "../protocol";
-import type { AskBlock } from "../ask-parser";
+import { askTextFeatures, bigramSimilarity, normalizeAskText, type AskBlock, type AskTextFeatures } from "../ask-parser";
 
 export interface YouItem {
   readonly id: string;
@@ -10,6 +10,7 @@ export interface YouItem {
   readonly createdAt: number;
   readonly resolvedAt?: number;
   readonly resolution?: "replied" | "resolved" | "superseded" | "dismissed" | "historical";
+  readonly awaitingDetail?: true;
   readonly anchor: { readonly id: string; readonly approvalRef?: string };
 }
 
@@ -42,14 +43,43 @@ function isAfter(earlier: Ordered, later: Ordered): boolean {
     : earlier.at > 0 && later.at > earlier.at;
 }
 
-function answers(item: YouItem, text: string): boolean {
-  return item.kind === "decide" ? text.includes(`${item.title} → `) : text.includes(item.title);
+function choicesAfter(title: string, text: string): string[] {
+  const prefix = `${title} → `;
+  const choices: string[] = [];
+  for (let at = text.indexOf(prefix); at >= 0; at = text.indexOf(prefix, at + prefix.length)) choices.push(text.slice(at + prefix.length));
+  return choices;
 }
 
-function confirmsCompletedCheck(text: string): boolean {
-  const report = text.trim();
-  return /^(?:直ったのを確認した|直ったのを確認しました|修正を確認した|修正を確認しました|問題ないことを確認した|問題ないことを確認しました)[。.!！]?$/.test(report)
-    || /^(?:I (?:verified|confirmed) the fix|The fix is verified)[.!]?$/i.test(report);
+export const DECIDE_TITLE_SIMILARITY_MIN = 0.9;
+export const DECIDE_TITLE_CONTAINMENT_MIN_CHARS = 8;
+export const DECIDE_TITLE_CONTAINMENT_MIN_RATIO = 0.6;
+export const DECIDE_OPTION_SET_TITLE_SIMILARITY_MIN = 0.5;
+
+interface AskFeatures extends AskTextFeatures {
+  readonly kind: AskBlock["kind"];
+  readonly title: string;
+  readonly options: string;
+}
+
+function askFeatures(ask: AskBlock): AskFeatures {
+  const options = ask.kind === "decide" ? [...new Set(ask.options.map((option) => normalizeAskText(option.label)))].sort().join("\n") : "";
+  return { kind: ask.kind, title: ask.title, ...askTextFeatures(ask.title), options };
+}
+
+function similarTitles(a: AskFeatures, b: AskFeatures): boolean {
+  const [shorter, longer] = a.normalized.length <= b.normalized.length ? [a, b] : [b, a];
+  if (shorter.normalized === "") return false;
+  const contained = shorter.normalized.length >= DECIDE_TITLE_CONTAINMENT_MIN_CHARS
+    && shorter.normalized.length >= DECIDE_TITLE_CONTAINMENT_MIN_RATIO * longer.normalized.length
+    && longer.normalized.includes(shorter.normalized);
+  return contained || bigramSimilarity(a, b) >= DECIDE_TITLE_SIMILARITY_MIN;
+}
+
+function replaceable(a: AskFeatures, b: AskFeatures): boolean {
+  if (a.kind !== b.kind) return false;
+  if (a.title === b.title) return true;
+  return a.kind === "decide" && (similarTitles(a, b)
+    || (a.options !== "" && a.options === b.options && bigramSimilarity(a, b) >= DECIDE_OPTION_SET_TITLE_SIMILARITY_MIN));
 }
 
 export type LocateAsk = (replyId: string, offset: number) => { readonly message: string; readonly start: number } | undefined;
@@ -110,20 +140,44 @@ export interface SavedAskDismissals {
   readonly resolvedMessages?: Iterable<string>;
 }
 
-export function createYouItems(tabId: string, saved: SavedAskDismissals = {}, locate?: LocateAsk) {
+export const OTHER_REPLY_QUESTION_PATTERN = /[？?]$|分からない|わからない|詳しく|詳細|どういう|なぜ/u;
+
+export function otherReplyAsksBack(choice: string, otherChoice: string): boolean {
+  if (!choice.startsWith(`${otherChoice}:`)) return false;
+  const rest = choice.slice(otherChoice.length + 1);
+  const nextAnswer = rest.search(/\r?\n[^\r\n]* → /);
+  return OTHER_REPLY_QUESTION_PATTERN.test((nextAnswer < 0 ? rest : rest.slice(0, nextAnswer)).trim());
+}
+
+export function createYouItems(tabId: string, saved: SavedAskDismissals = {}, locate?: LocateAsk, otherChoice?: string) {
+  const isDetailRequest = (choice: string): boolean => otherChoice !== undefined && otherReplyAsksBack(choice, otherChoice);
+  const answers = (item: YouItem, text: string): boolean => item.kind !== "decide" || choicesAfter(item.title, text).some((choice) => !isDetailRequest(choice));
+  const requestsDetail = (item: YouItem, text: string): boolean => item.kind === "decide" && choicesAfter(item.title, text).some(isDetailRequest);
   const items = new Map<string, YouItem>();
   const asks = new Map<string, YouItem>();
-  const blocks = new Map<string, AskBlock>();
   const positions = new Map<string, AskPosition>();
   const messageKeys = new Map<string, string>();
   const replies = new Map<string, Ordered & { text: string }>();
-  const assistantReplies = new Map<string, Ordered>();
+  const completedChecks = new Map<string, number>();
+  const contents = new Map<string, string>();
+  const features = new Map<string, AskFeatures>();
+  const replaceableWith = new Map<string, Set<string>>();
+  const answeredAt = new Map<string, number>();
+  const detailAt = new Map<string, number>();
+  const unticked = new Map<string, YouItem>();
+  const anchors = new Map<string, string>();
   const resolutions = new Map<string, number>();
   const dismissals: { id?: string; message?: string; content?: string; at: number }[] =
     [...(saved.tab ?? [])].map((entry) => ({ ...decodeAskDismissal(entry), at: 0 }));
   const dismissedMessages = new Set(saved.messages ?? []);
-  const savedResolutions = [...(saved.resolvedTab ?? []), ...(saved.resolvedMessages ?? [])]
-    .map(decodeAskResolution).filter((entry): entry is AskResolutionRecord => entry !== undefined);
+  const savedResolutions = new Map<string, AskResolutionRecord[]>();
+  for (const entry of [...(saved.resolvedTab ?? []), ...(saved.resolvedMessages ?? [])]) {
+    const record = decodeAskResolution(entry);
+    if (record === undefined) continue;
+    const list = savedResolutions.get(record.identity.content) ?? [];
+    list.push(record);
+    savedResolutions.set(record.identity.content, list);
+  }
   const identityOf = (id: string): AskIdentity => {
     const position = positions.get(id)!;
     let message = messageKeys.get(id);
@@ -138,7 +192,7 @@ export function createYouItems(tabId: string, saved: SavedAskDismissals = {}, lo
         messageKeys.set(id, message);
       }
     }
-    const content = contentKey(blocks.get(id)!);
+    const content = contents.get(id)!;
     return message === undefined ? { content } : { message, content };
   };
   const dismissedAt = (id: string): number | undefined => {
@@ -153,90 +207,120 @@ export function createYouItems(tabId: string, saved: SavedAskDismissals = {}, lo
     }
     return at;
   };
+  const askIdOf = (anchorId: string): string | undefined => anchors.get(anchorId);
   const listeners = new Set<() => void>();
   const notify = (): void => { for (const listener of listeners) listener(); };
   const orderOf = (position: AskPosition): Ordered => ({ at: position.createdAt, order: position.order, generation: position.generation });
-  const matchesIdentity = (savedIdentity: AskIdentity, identity: AskIdentity): boolean =>
-    savedIdentity.message !== undefined && identity.message !== undefined
-      ? savedIdentity.message === identity.message && savedIdentity.content === identity.content
-      : savedIdentity.content === identity.content;
-  const pendingAt = (id: string, at: Ordered, includeKnownResolution = true): boolean => {
-    const position = positions.get(id)!;
-    if (!isAfter(orderOf(position), at)) return false;
+  const replyBetween = (earlier: Ordered, later: Ordered): boolean => {
+    for (const reply of replies.values()) if (isAfter(earlier, reply) && isAfter(reply, later)) return true;
+    return false;
+  };
+  const replyTime = (id: string, matches: (item: YouItem, text: string) => boolean): number | undefined => {
+    const position = orderOf(positions.get(id)!);
     const item = asks.get(id)!;
+    let at: number | undefined;
+    for (const reply of replies.values()) {
+      if (isAfter(position, reply) && matches(item, reply.text) && (at === undefined || reply.at < at)) at = reply.at;
+    }
+    return at;
+  };
+  const track = (id: string): void => {
+    for (const [times, matches] of [[answeredAt, answers], [detailAt, requestsDetail]] as const) {
+      const at = replyTime(id, matches);
+      if (at === undefined) times.delete(id); else times.set(id, at);
+    }
+  };
+  const unlink = (id: string): void => {
+    for (const other of replaceableWith.get(id) ?? []) replaceableWith.get(other)?.delete(id);
+    replaceableWith.delete(id);
+  };
+  const link = (id: string): void => {
+    unlink(id);
+    const position = positions.get(id)!;
+    const own = features.get(id)!;
+    const linked = new Set<string>();
+    for (const [otherId, other] of features) {
+      const otherPosition = positions.get(otherId)!;
+      if (otherId === id || other.kind !== own.kind || otherPosition.replyId === position.replyId) continue;
+      const newer = isAfter(orderOf(position), orderOf(otherPosition));
+      const otherResolvedAt = unticked.get(otherId)?.resolvedAt;
+      if (!newer && otherResolvedAt !== undefined && otherResolvedAt <= orderOf(position).at) continue;
+      if (!replaceable(own, other)) continue;
+      linked.add(otherId);
+      replaceableWith.get(otherId)?.add(id);
+    }
+    replaceableWith.set(id, linked);
+  };
+  const resolveUnticked = (id: string, item: YouItem): YouItem => {
+    const position = orderOf(positions.get(id)!);
+    let first: { at: number; resolution: "replied" | "superseded" | "dismissed" } | undefined;
+    const consider = (at: number, resolution: "replied" | "superseded" | "dismissed"): void => {
+      if (first === undefined || at < first.at) first = { at, resolution };
+    };
+    const answered = answeredAt.get(id);
+    if (answered !== undefined) consider(answered, "replied");
+    for (const otherId of replaceableWith.get(id) ?? []) {
+      const next = orderOf(positions.get(otherId)!);
+      if (isAfter(position, next) && replyBetween(position, next)) consider(next.at, "superseded");
+    }
     const dismissal = dismissedAt(id);
-    if (dismissal !== undefined && dismissal <= at.at) return false;
-    const known = items.get(id);
-    if (includeKnownResolution && known?.resolvedAt !== undefined && known.resolvedAt <= at.at && known.resolution !== "historical") return false;
+    if (dismissal !== undefined) consider(dismissal, "dismissed");
     const identity = identityOf(id);
-    if (savedResolutions.some((saved) => matchesIdentity(saved.identity, identity) && saved.at <= at.at)) return false;
-    for (const reply of replies.values()) {
-      if (isAfter(orderOf(position), reply) && isAfter(reply, at) && answers(item, reply.text)) return false;
-    }
-    for (const [otherId, other] of positions) {
-      if (otherId !== id && other.replyId !== position.replyId && asks.get(otherId)?.title === item.title
-        && isAfter(orderOf(position), orderOf(other)) && isAfter(orderOf(other), at)) return false;
-    }
-    return true;
-  };
-  const shortCheckAnswer = (id: string, item: YouItem, reply: Ordered & { text: string }): boolean => {
-    if (item.kind !== "check" || !confirmsCompletedCheck(reply.text) || !pendingAt(id, reply, false)) return false;
-    const position = orderOf(positions.get(id)!);
-    for (const other of replies.values()) {
-      if (other !== reply && isAfter(position, other) && isAfter(other, reply)) return false;
-    }
-    for (const otherId of asks.keys()) {
-      if (otherId !== id && pendingAt(otherId, reply)) return false;
-    }
-    for (const other of items.values()) {
-      if ((other.kind === "approve" || other.kind === "decide") && other.id.startsWith("approval:")
-        && other.resolvedAt === undefined && isAfter({ at: other.createdAt }, reply)) return false;
-    }
-    const preceding = [...assistantReplies.entries()]
-      .filter(([, seen]) => isAfter(seen, reply))
-      .sort((a, b) => isAfter(b[1], a[1]) ? -1 : isAfter(a[1], b[1]) ? 1 : 0)[0];
-    if (preceding === undefined || (preceding[0] !== positions.get(id)!.replyId
-      && !positions.get(id)!.replyId.startsWith(`${preceding[0]}:part:`))) return false;
-    return true;
-  };
-  const resolveAsk = (id: string, item: YouItem): YouItem => {
-    const position = orderOf(positions.get(id)!);
-    const replyId = positions.get(id)!.replyId;
-    const candidates: { at: number; resolution: "replied" | "superseded" | "dismissed" }[] = [];
-    for (const reply of replies.values()) {
-      if (isAfter(position, reply) && (answers(item, reply.text) || shortCheckAnswer(id, item, reply))) candidates.push({ at: reply.at, resolution: "replied" });
-    }
-    for (const [otherId, other] of positions) {
-      const next = orderOf(other);
-      if (otherId !== id && other.replyId !== replyId && asks.get(otherId)?.title === item.title && isAfter(position, next)) {
-        candidates.push({ at: next.at, resolution: "superseded" });
+    for (const saved of savedResolutions.get(identity.content) ?? []) {
+      if (saved.identity.message === undefined || identity.message === undefined || saved.identity.message === identity.message) {
+        consider(saved.at, saved.resolution);
       }
     }
-    const dismissal = dismissedAt(id);
-    if (dismissal !== undefined) candidates.push({ at: dismissal, resolution: "dismissed" });
-    const identity = identityOf(id);
-    for (const saved of savedResolutions) {
-      if (matchesIdentity(saved.identity, identity)) candidates.push({ at: saved.at, resolution: saved.resolution });
-    }
-    const first = candidates.sort((a, b) => a.at - b.at)[0];
     return first ? { ...item, resolvedAt: first.at, resolution: first.resolution } : item;
   };
   const refresh = (): boolean => {
     let changed = false;
-    for (const [id, base] of asks) {
-      const next = resolveAsk(id, base);
-      if (JSON.stringify(items.get(id)) !== JSON.stringify(next)) { items.set(id, next); changed = true; }
+    for (const [id, item] of asks) {
+      const base = resolveUnticked(id, item);
+      unticked.set(id, base);
+      const completed = completedChecks.get(id);
+      const settled = completed !== undefined && (base.resolvedAt === undefined || completed <= base.resolvedAt)
+        ? { ...item, resolvedAt: completed, resolution: "replied" as const } : base;
+      const next = settled.resolvedAt === undefined && detailAt.has(id) ? { ...settled, awaitingDetail: true as const } : settled;
+      const shown = items.get(id);
+      if (shown === undefined || shown.title !== next.title || shown.kind !== next.kind || shown.createdAt !== next.createdAt
+        || shown.resolvedAt !== next.resolvedAt || shown.resolution !== next.resolution || shown.options !== next.options || shown.steps !== next.steps
+        || shown.awaitingDetail !== next.awaitingDetail) {
+        items.set(id, next);
+        changed = true;
+      }
     }
     return changed;
   };
   const reply = (id: string, at: number, order?: number, generation?: number, text = ""): void => {
-    replies.set(id, { at, order, generation, text });
+    const replaced = replies.has(id);
+    const entry = { at, order, generation, text };
+    replies.set(id, entry);
+    for (const [askId, item] of asks) {
+      if (replaced) track(askId);
+      else if (isAfter(orderOf(positions.get(askId)!), entry)) {
+        for (const [times, matches] of [[answeredAt, answers], [detailAt, requestsDetail]] as const) {
+          const previous = times.get(askId);
+          if (matches(item, text) && (previous === undefined || at < previous)) times.set(askId, at);
+        }
+      }
+    }
     refresh();
     notify();
   };
-  const assistantReply = (id: string, at: number, order?: number, generation?: number): void => {
-    assistantReplies.set(id, { at, order, generation });
-    if (refresh()) notify();
+  const drop = (id: string): void => {
+    positions.delete(id);
+    messageKeys.delete(id);
+    unlink(id);
+    anchors.delete(asks.get(id)!.anchor.id);
+    asks.delete(id);
+    items.delete(id);
+    completedChecks.delete(id);
+    contents.delete(id);
+    features.delete(id);
+    answeredAt.delete(id);
+    detailAt.delete(id);
+    unticked.delete(id);
   };
   const reader: YouItemsReader = {
     get: () => [...items.values()].sort((a, b) => a.createdAt - b.createdAt || a.id.localeCompare(b.id)),
@@ -258,21 +342,32 @@ export function createYouItems(tabId: string, saved: SavedAskDismissals = {}, lo
   return {
     reader,
     reply,
-    assistantReply,
     restoreApproval,
+    tick(anchorId: string, ticked: (step: number) => boolean, at = Date.now()): void {
+      const id = askIdOf(anchorId);
+      if (id === undefined) return;
+      const steps = asks.get(id)!.steps;
+      if (steps === undefined || steps.length === 0) return;
+      if (!steps.every((_, step) => ticked(step))) completedChecks.delete(id);
+      else if (!completedChecks.has(id)) completedChecks.set(id, at);
+      if (refresh()) notify();
+    },
     retain(replyId: string, from: number, to: number, ids: ReadonlySet<string>): void {
       let changed = false;
       for (const [id, position] of positions) {
         if (position.replyId === replyId && position.offset >= from && position.offset < to && !ids.has(id)) {
-          positions.delete(id);
-          messageKeys.delete(id);
-          asks.delete(id);
-          blocks.delete(id);
-          items.delete(id);
+          drop(id);
           changed = true;
         }
       }
       if (refresh() || changed) notify();
+    },
+    withdraw(anchorId: string): void {
+      const id = askIdOf(anchorId);
+      if (id === undefined) return;
+      drop(id);
+      refresh();
+      notify();
     },
     observe(ev: NormalizedEvent): void {
       if (ev.kind === "replayed_message" && ev.restoredApproval) {
@@ -302,10 +397,6 @@ export function createYouItems(tabId: string, saved: SavedAskDismissals = {}, lo
         reply(`event:${ev.generation}:${ev.seq}`, ev.sentAt ?? ev.timestamp, ev.seq, ev.generation, ev.text);
       } else if (ev.kind === "replayed_message" && ev.role === "user") {
         reply(ev.uuid ?? `event:${ev.generation}:${ev.seq}`, ev.recordedAt ?? ev.sentAt ?? 0, ev.seq, ev.generation, ev.text);
-      } else if (ev.kind === "replayed_message" && ev.role === "assistant") {
-        assistantReply(ev.uuid ?? `event:${ev.generation}:${ev.seq}`, ev.recordedAt ?? ev.timestamp, ev.seq, ev.generation);
-      } else if (ev.kind === "assistant_text_delta") {
-        assistantReply(ev.turnId, ev.timestamp, ev.seq, ev.generation);
       }
     },
     ask(ask: AskBlock, position: AskPosition): string {
@@ -313,13 +404,23 @@ export function createYouItems(tabId: string, saved: SavedAskDismissals = {}, lo
       const previous = positions.get(id);
       if (previous) position = previous;
       positions.set(id, position);
+      const content = contentKey(ask);
+      const known = asks.get(id);
+      if (known !== undefined && contents.get(id) === content) {
+        if (refresh()) notify();
+        return known.anchor.id;
+      }
       const item: YouItem = {
         id, kind: ask.kind, title: ask.title, createdAt: position.createdAt,
         anchor: { id: youAnchor(tabId, id) },
         ...(ask.kind === "decide" ? { options: ask.options.map((o) => ({ label: o.label, description: o.effect })) } : { steps: ask.steps }),
       };
       asks.set(id, item);
-      blocks.set(id, ask);
+      anchors.set(item.anchor.id, id);
+      contents.set(id, content);
+      features.set(id, askFeatures(ask));
+      track(id);
+      link(id);
       if (refresh()) notify();
       return item.anchor.id;
     },
@@ -344,15 +445,15 @@ export function createYouItems(tabId: string, saved: SavedAskDismissals = {}, lo
     },
     resolutionRecords(): AskResolutionRecord[] {
       const records: AskResolutionRecord[] = [];
-      for (const [id, item] of items) {
-        if (!asks.has(id) || (item.resolution !== "replied" && item.resolution !== "superseded")) continue;
+      for (const [id, item] of unticked) {
+        if (item.resolution !== "replied" && item.resolution !== "superseded") continue;
         records.push({ identity: identityOf(id), resolution: item.resolution, at: item.resolvedAt ?? 0 });
       }
       return records;
     },
     messageOf(anchorId: string): string | undefined {
-      for (const [id, item] of asks) if (item.anchor.id === anchorId) return identityOf(id).message;
-      return undefined;
+      const id = askIdOf(anchorId);
+      return id === undefined ? undefined : identityOf(id).message;
     },
   };
 }

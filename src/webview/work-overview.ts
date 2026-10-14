@@ -457,7 +457,7 @@ export class WorkOverview {
     const time = this.activeSemantic()?.timeBuckets;
     const block = time?.blocks.at(-1);
     const context = this.payload?.planContext ?? (block && block.closedAt === undefined ? planContextOf(block, block.end, this.turnRunning) : undefined);
-    const view = derivePlanView(this.payload, this.planOrchestration, this.planUsage, this.lastTickMs ?? 0, context);
+    const view = derivePlanView(this.payload, this.planOrchestration, this.lastTickMs ?? 0, context);
     for (const agent of time?.agents ?? []) {
       if (this.payload?.planTools !== undefined) continue;
       if (!agent.open || !this.turnRunning) continue;
@@ -472,7 +472,7 @@ export class WorkOverview {
       view.now.push({ id: `background:${task.taskId}`, agent: "Claude", title: task.description,
         start: task.start, elapsed: (this.nowMs(time) ?? task.end) - task.start, status: "running", tokens: null, cacheRead: 0, external: false });
     }
-    renderPlanSection(this.planSection, view, undefined, deriveEarlierPlanViews(this.payload, this.planOrchestration, this.planUsage, this.lastTickMs ?? 0));
+    renderPlanSection(this.planSection, view, undefined, deriveEarlierPlanViews(this.payload, this.planOrchestration, this.lastTickMs ?? 0));
   }
 
   update(payload: WorkModelPayload | undefined): void {

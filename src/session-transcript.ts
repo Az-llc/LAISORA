@@ -18,6 +18,7 @@ import {
   parseRefusalStop,
 } from "./claude-normalizer";
 import { parseHandoffEnvelope, type HandoffEnvelopeV2 } from "./handoff-envelope";
+import { ASK_QUALITY_DENIAL_HEAD, feedbackRejectedTitles, resolveRejectedAsks, type AskRejection } from "./markdown-ast";
 import {
   COMMAND_ARGS_RE,
   COMMAND_NAME_RE,
@@ -311,6 +312,35 @@ interface RawHistoryItem {
   fileOrder: number;
 }
 
+function historyTurnTexts(rawEvents: readonly RawHistoryItem[], turnId: string): RawHistoryItem[] {
+  return rawEvents.filter((item) => item.body.kind === "assistant_text_delta" && item.body.turnId === turnId);
+}
+
+function applyHistoryAskRejections(rawEvents: RawHistoryItem[], rejections: readonly (AskRejection & { turnId: string })[]): void {
+  for (const turnId of new Set(rejections.map((rejection) => rejection.turnId))) {
+    const items = historyTurnTexts(rawEvents, turnId);
+    const resolved = resolveRejectedAsks(items.map((item) => (item.body as { text: string }).text), rejections.filter((rejection) => rejection.turnId === turnId));
+    items.forEach((item, index) => {
+      const text = resolved[index];
+      const at = rawEvents.indexOf(item);
+      if (text === null) rawEvents.splice(at, 1);
+      else if (text !== (item.body as { text: string }).text) rawEvents[at] = { ...item, body: { ...item.body, text } as RawHistoryItem["body"] };
+    });
+  }
+}
+
+function resolveMessageAskRejections(messages: ConversationMessage[], from: number, rejections: readonly AskRejection[]): void {
+  if (rejections.length === 0) return;
+  const assistants = messages.slice(from).filter((message) => message.role === "assistant");
+  const resolved = resolveRejectedAsks(assistants.map((message) => message.text), rejections);
+  assistants.forEach((message, index) => {
+    const text = resolved[index];
+    const at = messages.indexOf(message);
+    if (text === null) messages.splice(at, 1);
+    else if (text !== message.text) messages[at] = { ...message, text };
+  });
+}
+
 interface ParentTurnSpan {
   turnId: string;
   startedAt: number;
@@ -406,6 +436,7 @@ export async function readSessionHistory(
   }
 
   const rawEvents: RawHistoryItem[] = [];
+  const askRejections: (AskRejection & { turnId: string })[] = [];
   const usageSources = new Map<string, number>();
   const preBoundaryCompacts = new Set<RawHistoryItem>();
   const parentTurns: ParentTurnSpan[] = [];
@@ -605,6 +636,12 @@ export async function readSessionHistory(
           currentTurnId = null;
           pendingSilentTurn = true;
         }
+        const askFeedback = cliInsertedText !== null && currentTurnId !== null && cliInsertedText.includes(ASK_QUALITY_DENIAL_HEAD) ? cliInsertedText : null;
+        if (askFeedback !== null && currentTurnId !== null) {
+          const texts = historyTurnTexts(rawEvents, currentTurnId).map((item) => (item.body as { text: string }).text);
+          askRejections.push({ turnId: currentTurnId, upTo: texts.length, titles: feedbackRejectedTitles(texts.join("\n\n"), askFeedback) });
+        }
+        const turnInsertedText = askFeedback === null ? cliInsertedText : null;
         const absorbedMidTurn = extractQueuedPromptRecord(obj) !== null && prompt !== null && currentTurnId !== null;
         if (absorbedMidTurn && prompt !== null) {
           rawEvents.push({
@@ -614,7 +651,7 @@ export async function readSessionHistory(
           });
           lastTurnActivityTimestamp = recordTime;
         }
-        if (!absorbedMidTurn && (prompt !== null || cliInsertedText !== null)) {
+        if (!absorbedMidTurn && (prompt !== null || turnInsertedText !== null)) {
           pendingSilentTurn = false;
           if (currentTurnId !== null) {
             const completedTime = lastTurnActivityTimestamp || recordTime;
@@ -646,7 +683,7 @@ export async function readSessionHistory(
             body: {
               kind: "turn_started",
               turnId: currentTurnId,
-              ...(cliInsertedText !== null ? { cliInserted: true as const } : {}),
+              ...(turnInsertedText !== null ? { cliInserted: true as const } : {}),
               provenance: { path: "history" },
             },
             timestamp: recordTime,
@@ -938,6 +975,7 @@ export async function readSessionHistory(
     }
 
     flushPendingUsage();
+    applyHistoryAskRejections(rawEvents, askRejections);
 
     if (currentTurnId !== null) {
       const finalTimestamp = lastTurnActivityTimestamp || lastParentTimestamp || 0;
@@ -1355,6 +1393,8 @@ export async function readConversationMessages(
   const seenQueuedPrompts = new Set<string>();
   const approvalResults = indexApprovalResults(lines);
   let lastTimestamp = 0;
+  let askTurnFrom = 0;
+  const askRejections: AskRejection[] = [];
   const endsAtBoundary = text.endsWith("\n");
   const maybeYield = createParseYielder();
   for (let i = 0; i < lines.length; i++) {
@@ -1394,6 +1434,11 @@ export async function readConversationMessages(
     const uuid = prompt?.uuid ?? (typeof obj.uuid === "string" ? obj.uuid : "");
     if (obj.type === "user" || obj.type === "attachment") {
       if (prompt === null) {
+        const feedback = obj.type === "user" ? extractCliInsertedUserText(obj) : null;
+        if (feedback !== null && feedback.includes(ASK_QUALITY_DENIAL_HEAD)) {
+          const texts = messages.slice(askTurnFrom).filter((message) => message.role === "assistant").map((message) => message.text);
+          askRejections.push({ upTo: texts.length, titles: feedbackRejectedTitles(texts.join("\n\n"), feedback) });
+        }
         {
           const raw = verbatimTextOf(obj);
           if (raw.startsWith("<laisora-handoff")) {
@@ -1410,6 +1455,8 @@ export async function readConversationMessages(
         continue;
       }
       const { text: body, imageRefs } = prompt;
+      resolveMessageAskRejections(messages, askTurnFrom, askRejections.splice(0));
+      askTurnFrom = messages.length;
       messages.push({
         uuid,
         role: "user",
@@ -1441,6 +1488,7 @@ export async function readConversationMessages(
     }
     messages.push(...approvalMessages);
   }
+  resolveMessageAskRejections(messages, askTurnFrom, askRejections);
   return {
     messages: messages.slice(cutFrom),
     malformedLineCount,

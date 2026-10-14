@@ -1,4 +1,4 @@
-import type { NormalizedEvent } from "./protocol";
+import { isObservedTime, type NormalizedEvent } from "./protocol";
 import { redactAbsolutePaths } from "./path-redaction";
 import { isPureCommandWrapper, INJECTED_TAG_RE, STEER_TAG_RE } from "./human-input-vocabulary";
 import { isBookkeepingTool, foldPlanDeclarationText, parseTaskIntentFromRawInput, taskCreateKeyFromResult, type TaskIntent, type PlanTextState } from "./work-model";
@@ -518,7 +518,7 @@ function unsettledBackgroundOfTask(state: TimeBucketState, taskId: string): Back
 }
 
 export function foldTimeBuckets(state: TimeBucketState, event: NormalizedEvent, options?: Parameters<typeof deriveTimeBuckets>[1]): TimeBucketState {
-  const ts = typeof event.timestamp === "number" && event.timestamp > 0 ? event.timestamp : undefined;
+  const ts = isObservedTime(event.timestamp) ? event.timestamp : undefined;
   let next: TimeBucketState = state;
   const touch = (): TimeBucketState => (next === state ? (next = { ...state }) : next);
   if (ts !== undefined && isWindowKind(event.kind)) {

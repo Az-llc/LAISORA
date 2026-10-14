@@ -2,31 +2,17 @@ import * as l10n from "@vscode/l10n";
 import { vscode } from "./dom";
 import { renderAsk, renderGoal, type AskRenderContext } from "./ask-view";
 import { fileLinkDisplayKind, parseHostFileLinkTarget, parseMarkdown, type MdNode } from "../markdown-ast";
+import { assembleCodeBlock, captureCodeFocus, codeActionIcon, codeBlockKey, restoreCodeFocus, svgElement, type CodeBlockDeps } from "./markdown-codeblock";
 
 const artifactIds = new WeakMap<HTMLElement, string[]>();
-const SVG_NS = "http://www.w3.org/2000/svg";
 
-function codeActionIcon(kind: "copy" | "check" | "error" | "preview" | "wrap"): SVGSVGElement {
-  const paths = {
-    copy: "M6 5V2.5h7.5V10H11M2.5 5.5H10v8H2.5z",
-    check: "M3 8l3 3 7-7",
-    error: "M8 3v6M8 12v.5",
-    preview: "M1 8s2.5-4.5 7-4.5S15 8 15 8s-2.5 4.5-7 4.5S1 8 1 8zm9 0a2 2 0 1 0-4 0 2 2 0 0 0 4 0",
-    wrap: "M2 3.5h12M2 7h9a3 3 0 0 1 0 6H8m2-2-2 2 2 2M2 10.5h3",
-  };
-  const svg = svgElement("svg");
-  svg.setAttribute("viewBox", "0 0 16 16");
-  svg.setAttribute("aria-hidden", "true");
-  svg.setAttribute("focusable", "false");
-  const path = svgElement("path");
-  path.setAttribute("d", paths[kind]);
-  svg.appendChild(path);
-  return svg;
-}
-
-function svgElement<K extends keyof SVGElementTagNameMap>(name: K): SVGElementTagNameMap[K] {
-  return document.createElementNS(SVG_NS, name);
-}
+const codeDeps: CodeBlockDeps = {
+  createCopyButton,
+  wrapDefault: {
+    get: () => vscode.getState()?.codeWrap !== false,
+    set: (wrapped) => vscode.setState({ ...(vscode.getState() ?? { activeTabId: null }), codeWrap: wrapped }),
+  },
+};
 
 const COPY_REVERT_MS = 2000;
 
@@ -34,6 +20,37 @@ export function createCopyButton(
   className: string,
   idleTitle: string,
   source: () => string
+): { button: HTMLButtonElement; status: HTMLElement } {
+  return createCopyAction(className, idleTitle, () => navigator.clipboard.writeText(source()));
+}
+
+const COPY_FILE_PATH_TIMEOUT_MS = 10_000;
+let copyFilePathSeq = 0;
+const pendingCopyFilePath = new Map<number, (ok: boolean) => void>();
+
+export function handleCopyFilePathResult(reqId: number, ok: boolean): void {
+  pendingCopyFilePath.get(reqId)?.(ok);
+}
+
+function copyFilePathOnHost(tabId: string, target: string): Promise<void> {
+  const reqId = ++copyFilePathSeq;
+  return new Promise<void>((resolve, reject) => {
+    const settle = (ok: boolean): void => {
+      clearTimeout(timer);
+      pendingCopyFilePath.delete(reqId);
+      if (ok) resolve();
+      else reject(new Error("copyFilePath refused"));
+    };
+    const timer = setTimeout(() => settle(false), COPY_FILE_PATH_TIMEOUT_MS);
+    pendingCopyFilePath.set(reqId, settle);
+    vscode.postMessage({ type: "copyFilePath", tabId, target, reqId });
+  });
+}
+
+function createCopyAction(
+  className: string,
+  idleTitle: string,
+  write: () => Promise<void>
 ): { button: HTMLButtonElement; status: HTMLElement } {
   const button = document.createElement("button");
   button.type = "button";
@@ -60,7 +77,7 @@ export function createCopyButton(
     if (revertTimer !== undefined) clearTimeout(revertTimer);
     button.setAttribute("aria-busy", "true");
     try {
-      await navigator.clipboard.writeText(source());
+      await write();
       button.replaceChildren(codeActionIcon("check"));
       button.dataset.copyState = "copied";
       status.textContent = l10n.t("Copied");
@@ -104,7 +121,25 @@ function linkKindIcon(kind: "file" | "folder" | "app" | "web" | "mail"): SVGSVGE
   return svg;
 }
 
-export function renderMarkdownInto(container: HTMLElement, src: string, tabId?: string, askContext?: AskRenderContext): void {
+function externalLinkCopyText(url: URL): string {
+  if (url.protocol !== "mailto:") return url.href;
+  try {
+    return decodeURIComponent(url.pathname);
+  } catch {
+    return url.pathname;
+  }
+}
+
+function appendLinkCopyButton(target: HTMLElement, idleTitle: string, write: () => Promise<void>): void {
+  const { button, status } = createCopyAction("link-copy-button", idleTitle, write);
+  target.appendChild(button);
+  target.appendChild(status);
+}
+
+export function renderMarkdownInto(container: HTMLElement, src: string, tabId?: string, askContext?: AskRenderContext, options?: { collapseCode?: boolean }): void {
+  const collapseCode = options?.collapseCode ?? true;
+  const codeReply = tabId !== undefined && askContext !== undefined && askContext.replyId !== "" ? { tabId, replyId: askContext.replyId, offset: askContext.offset ?? 0 } : undefined;
+  const codeFocus = captureCodeFocus(container);
   container.textContent = "";
   const containerArtifactIds = artifactIds.get(container) ?? [];
   artifactIds.set(container, containerArtifactIds);
@@ -120,7 +155,7 @@ export function renderMarkdownInto(container: HTMLElement, src: string, tabId?: 
         break;
       }
       case "ask": {
-        target.appendChild(renderAsk(node.ask, node.offset, askContext));
+        target.appendChild(renderAsk(node.ask, node.offset, askContext, node.rejected === true));
         fencedIndex++;
         break;
       }
@@ -179,29 +214,16 @@ export function renderMarkdownInto(container: HTMLElement, src: string, tabId?: 
         if (lang) pre.dataset.lang = lang;
         const codeEl = document.createElement("code");
         const content = node.value;
-        codeEl.textContent = content;
-        pre.appendChild(codeEl);
 
         const actions = document.createElement("div");
         actions.className = "artifact-preview-actions";
-        const wrap = document.createElement("button");
-        wrap.type = "button";
-        wrap.className = "code-wrap-button";
-        wrap.title = l10n.t("Wrap lines");
-        wrap.setAttribute("aria-label", wrap.title);
-        wrap.setAttribute("aria-pressed", "false");
-        wrap.appendChild(codeActionIcon("wrap"));
-        wrap.addEventListener("click", () => {
-          const enabled = pre.classList.toggle("is-wrapped");
-          wrap.setAttribute("aria-pressed", String(enabled));
-          wrap.title = enabled ? l10n.t("Disable line wrapping") : l10n.t("Wrap lines");
-          wrap.setAttribute("aria-label", wrap.title);
-        });
-        actions.appendChild(wrap);
         const { button: copy, status } = createCopyButton("code-copy-button", l10n.t("Copy code block"), () => content);
         actions.appendChild(copy);
         actions.appendChild(status);
-        pre.appendChild(actions);
+        assembleCodeBlock(pre, codeEl, actions, lang, content, codeDeps, {
+          collapsible: collapseCode && node.closed,
+          key: codeReply === undefined ? undefined : codeBlockKey(codeReply.tabId, codeReply.replyId, codeReply.offset + node.offset),
+        });
 
         if (node.fenced) {
           if (lang === "html" || lang === "svg") {
@@ -261,24 +283,27 @@ export function renderMarkdownInto(container: HTMLElement, src: string, tabId?: 
         break;
       }
       case "link": {
-        let externalProtocol: "http:" | "https:" | "mailto:" | undefined;
+        let externalUrl: URL | undefined;
         try {
-          const protocol = new URL(node.href).protocol;
-          if (protocol === "http:" || protocol === "https:" || protocol === "mailto:") {
-            externalProtocol = protocol;
+          const url = new URL(node.href);
+          if (url.protocol === "http:" || url.protocol === "https:" || url.protocol === "mailto:") {
+            externalUrl = url;
           }
         } catch {
-          externalProtocol = undefined;
+          externalUrl = undefined;
         }
-        if (externalProtocol !== undefined) {
+        const fileTarget = externalUrl === undefined && tabId !== undefined ? parseHostFileLinkTarget(node.href) : null;
+        if (externalUrl !== undefined) {
           const a = document.createElement("a");
           a.href = node.href;
           a.rel = "noopener noreferrer";
           if (node.title) a.title = node.title;
-          a.appendChild(linkKindIcon(externalProtocol === "mailto:" ? "mail" : "web"));
+          a.appendChild(linkKindIcon(externalUrl.protocol === "mailto:" ? "mail" : "web"));
           for (const child of node.children) renderNode(child, a);
           target.appendChild(a);
-        } else if (tabId !== undefined && parseHostFileLinkTarget(node.href) !== null) {
+          const copyText = externalLinkCopyText(externalUrl);
+          appendLinkCopyButton(target, l10n.t("Copy link"), () => navigator.clipboard.writeText(copyText));
+        } else if (tabId !== undefined && fileTarget !== null) {
           const button = document.createElement("button");
           button.type = "button";
           button.className = "file-link";
@@ -291,6 +316,7 @@ export function renderMarkdownInto(container: HTMLElement, src: string, tabId?: 
           button.appendChild(linkKindIcon(kind));
           for (const child of node.children) renderNode(child, button);
           target.appendChild(button);
+          appendLinkCopyButton(target, l10n.t("Copy path"), () => copyFilePathOnHost(tabId, node.href));
         } else {
           for (const child of node.children) renderNode(child, target);
         }
@@ -349,4 +375,5 @@ export function renderMarkdownInto(container: HTMLElement, src: string, tabId?: 
   for (const node of nodes) {
     renderNode(node, container);
   }
+  restoreCodeFocus(container, codeFocus);
 }

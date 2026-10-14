@@ -179,7 +179,7 @@ function activateReady(context: vscode.ExtensionContext): void {
         if (cacheTtlSetting) session.semantic.scheduleSemanticModelPost();
       }
     }
-    if (affectsProductConfiguration(e, "composer.sendKey") || affectsProductConfiguration(e, "appearance")) store?.post(userSettingsMessage());
+    if (affectsProductConfiguration(e, "composer.sendKey") || affectsProductConfiguration(e, "appearance") || affectsProductConfiguration(e, "claude.askQualityCheck")) store?.post(userSettingsMessage());
     if (
       affectsProductConfiguration(e, "appearance") ||
       affectsProductConfiguration(e, "composer.sendKey") ||

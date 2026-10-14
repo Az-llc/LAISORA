@@ -3,7 +3,7 @@ import * as vscode from "vscode";
 import * as l10n from "@vscode/l10n";
 import { createHash } from "node:crypto";
 import { homedir } from "node:os";
-import { lstatSync, readlinkSync } from "node:fs";
+import { lstatSync, readlinkSync, type Stats } from "node:fs";
 import { readFile, stat } from "node:fs/promises";
 import { dirname, extname, isAbsolute, join, parse, relative, resolve, sep, win32 } from "node:path";
 
@@ -12,6 +12,7 @@ import { lexicalPathIsInsideForEarlyRejectOnly, type RealPath } from "./path-con
 import { ArtifactServer, type ArtifactMime } from "./artifactServer";
 import type { Session } from "./extension";
 import {
+  fileLinkCopyText,
   hasNonDriveColon,
   hasWindowsReservedDeviceName,
   isNetworkOrDevicePath,
@@ -374,18 +375,27 @@ export function registerReadOnlyFileProvider(): vscode.Disposable | undefined {
   });
 }
 
-export async function openConversationFile(session: Session, rawTarget: string, fromEditorPanel: boolean): Promise<void> {
+interface ResolvedFileLink {
+  realCandidate: string;
+  parsed: FileLinkTarget;
+  info: Stats;
+  outside: { confirm: boolean; readOnly: boolean } | null;
+  inside: boolean;
+}
+
+async function resolveConversationFileLink(
+  session: Session,
+  rawTarget: string
+): Promise<ResolvedFileLink | { refused: string }> {
+  const cannotOpen = { refused: l10n.t("LAISORA: This file link cannot be opened.") };
+  const outsideBoundary = { refused: l10n.t("LAISORA: The file is outside this workspace and conversation folder.") };
   const parsed = parseFileLinkTarget(rawTarget, { windows: process.platform === "win32" });
-  if (parsed === null) {
-    void vscode.window.showWarningMessage(l10n.t("LAISORA: This file link cannot be opened."));
-    return;
-  }
+  if (parsed === null) return cannotOpen;
 
   const relativePath =
     parsed.kind === "path" && !isAbsolute(parsed.resource) && !win32.isAbsolute(parsed.resource);
   if ((relativePath && session.cwd.length === 0) || (parsed.kind === "path" && isWindowsReservedOrStreamPath(parsed.resource))) {
-    void vscode.window.showWarningMessage(l10n.t("LAISORA: This file link cannot be opened."));
-    return;
+    return cannotOpen;
   }
 
   let candidate: string;
@@ -397,18 +407,14 @@ export async function openConversationFile(session: Session, rawTarget: string, 
           ? resolve(session.cwd, parsed.resource)
           : parsed.resource;
   } catch {
-    void vscode.window.showWarningMessage(l10n.t("LAISORA: This file link cannot be opened."));
-    return;
+    return cannotOpen;
   }
 
   const rootCandidates = [
     ...(session.cwd.length === 0 ? [] : [session.cwd]),
     ...(vscode.workspace.workspaceFolders ?? []).map((folder) => folder.uri.fsPath),
   ];
-  if (isWindowsDevicePath(candidate) || isWindowsReservedOrStreamPath(candidate)) {
-    void vscode.window.showWarningMessage(l10n.t("LAISORA: This file link cannot be opened."));
-    return;
-  }
+  if (isWindowsDevicePath(candidate) || isWindowsReservedOrStreamPath(candidate)) return cannotOpen;
 
   const roots = rootCandidates
     .map((raw) => ({ raw: resolve(raw), real: realPathOrNearestSync(raw) }))
@@ -420,80 +426,82 @@ export async function openConversationFile(session: Session, rawTarget: string, 
     );
   if (preflightRoot === undefined) {
     const config = vscode.workspace.getConfiguration("laisora");
-    if (config.get<boolean>("fileLinks.allowOutsideWorkspace")! !== true) {
-      void vscode.window.showWarningMessage(
-        l10n.t("LAISORA: The file is outside this workspace and conversation folder.")
-      );
-      return;
-    }
-    if (isNetworkOrDevicePath(candidate) || linkChainReachesNetworkOrDevice(candidate, 0)) {
-      void vscode.window.showWarningMessage(l10n.t("LAISORA: This file link cannot be opened."));
-      return;
-    }
+    if (config.get<boolean>("fileLinks.allowOutsideWorkspace")! !== true) return outsideBoundary;
+    if (isNetworkOrDevicePath(candidate) || linkChainReachesNetworkOrDevice(candidate, 0)) return cannotOpen;
     const realOutside = realPathOrNearestSync(candidate);
-    if (realOutside === null || isNetworkOrDevicePath(realOutside)) {
-      void vscode.window.showWarningMessage(l10n.t("LAISORA: This file link cannot be opened."));
-      return;
-    }
+    if (realOutside === null || isNetworkOrDevicePath(realOutside)) return cannotOpen;
     const outsideRoots = !roots.some((root) => pathIsInside(root.real, realOutside));
-    await openResolvedFile(realOutside, parsed, outsideRoots
+    return statResolvedFileLink(realOutside, parsed, outsideRoots
       ? {
           confirm: config.get<boolean>("fileLinks.confirmOutsideWorkspace")! !== false,
           readOnly: config.get<boolean>("fileLinks.openOutsideReadOnly")! !== false,
         }
-      : null, fromEditorPanel, !outsideRoots);
-    return;
+      : null, !outsideRoots);
   }
-  if (hasSymlinkBelowRoot(preflightRoot, candidate) !== false) {
-    void vscode.window.showWarningMessage(l10n.t("LAISORA: This file link cannot be opened."));
-    return;
-  }
+  if (hasSymlinkBelowRoot(preflightRoot, candidate) !== false) return cannotOpen;
 
   const realCandidate = realPathOrNearestSync(candidate);
-  if (
-    realCandidate === null ||
-    !roots.some((root) => pathIsInside(root.real, realCandidate))
-  ) {
-    void vscode.window.showWarningMessage(
-      realCandidate === null
-        ? l10n.t("LAISORA: This file link cannot be opened.")
-        : l10n.t("LAISORA: The file is outside this workspace and conversation folder.")
-    );
-    return;
-  }
-  await openResolvedFile(realCandidate, parsed, null, fromEditorPanel,
-    roots.some((root) => pathIsInside(root.real, realCandidate)));
+  if (realCandidate === null) return cannotOpen;
+  if (!roots.some((root) => pathIsInside(root.real, realCandidate))) return outsideBoundary;
+  return statResolvedFileLink(realCandidate, parsed, null, true);
 }
 
-async function openResolvedFile(
+async function statResolvedFileLink(
   realCandidate: string,
   parsed: FileLinkTarget,
-  outside: { confirm: boolean; readOnly: boolean } | null,
-  fromEditorPanel: boolean,
+  outside: ResolvedFileLink["outside"],
   inside: boolean
-): Promise<void> {
-  if (isWindowsReservedOrStreamPath(realCandidate)) {
-    void vscode.window.showWarningMessage(l10n.t("LAISORA: This file link cannot be opened."));
-    return;
-  }
+): Promise<ResolvedFileLink | { refused: string }> {
+  if (isWindowsReservedOrStreamPath(realCandidate)) return { refused: l10n.t("LAISORA: This file link cannot be opened.") };
   let info;
   try {
     info = await stat(realCandidate);
   } catch (error) {
     const code = (error as NodeJS.ErrnoException).code;
-    if (code === "ENOENT" || code === "ENOTDIR") {
-      void vscode.window.showWarningMessage(l10n.t("LAISORA: The file was not found."));
-    } else {
-      void vscode.window.showWarningMessage(l10n.t("LAISORA: This file link cannot be opened."));
-    }
+    return {
+      refused: code === "ENOENT" || code === "ENOTDIR"
+        ? l10n.t("LAISORA: The file was not found.")
+        : l10n.t("LAISORA: This file link cannot be opened."),
+    };
+  }
+  if (!info.isFile() && !info.isDirectory()) return { refused: l10n.t("LAISORA: The file was not found.") };
+  return { realCandidate, parsed, info, outside, inside };
+}
+
+export async function openConversationFile(session: Session, rawTarget: string, fromEditorPanel: boolean): Promise<void> {
+  const resolved = await resolveConversationFileLink(session, rawTarget);
+  if ("refused" in resolved) {
+    void vscode.window.showWarningMessage(resolved.refused);
     return;
   }
+  await openResolvedFile(resolved, fromEditorPanel);
+}
+
+async function copyConversationFilePath(session: Session, rawTarget: string): Promise<boolean> {
+  const resolved = await resolveConversationFileLink(session, rawTarget);
+  if ("refused" in resolved) {
+    output.appendLine(`[file-link] copy refused: ${resolved.refused}`);
+    return false;
+  }
+  try {
+    await vscode.env.clipboard.writeText(fileLinkCopyText(resolved.realCandidate, resolved.parsed));
+    return true;
+  } catch (error) {
+    output.appendLine(`[file-link] copy failed: ${String(error)}`);
+    return false;
+  }
+}
+
+async function openResolvedFile(
+  { realCandidate, parsed, info, outside, inside }: ResolvedFileLink,
+  fromEditorPanel: boolean
+): Promise<void> {
   const extensions = systemAppExtensions(
     vscode.workspace.getConfiguration("laisora").get<unknown>("fileLinks.openWithSystemApp"),
     () => output.appendLine(l10n.t("R-CNV-20: Invalid or blocked extensions in the default app setting were ignored."))
   );
   const mode = decideOpenMode(realCandidate, { isDirectory: info.isDirectory(), inside, systemAppExtensions: extensions });
-  if (mode === "refuse" || (!info.isFile() && !info.isDirectory())) {
+  if (mode === "refuse") {
     void vscode.window.showWarningMessage(l10n.t("LAISORA: The file was not found."));
     return;
   }
@@ -560,7 +568,7 @@ export async function handleComposerMessage(
   st: SessionStore,
   msg: Extract<
     WebviewToHost,
-    | { type: "queryFiles" | "pickFiles" | "openFile" | "exportTab" | "artifact/preview" | "openThemePicker" }
+    | { type: "queryFiles" | "pickFiles" | "openFile" | "copyFilePath" | "exportTab" | "artifact/preview" | "openThemePicker" }
     | { type: "attachImage" | "removeAttachment" }
   >,
   target: Session | undefined,
@@ -589,6 +597,11 @@ export async function handleComposerMessage(
     }
     case "openFile": {
       await openConversationFile(target!, msg.target, st.panel !== null && st.panel.webview === sender);
+      break;
+    }
+    case "copyFilePath": {
+      const ok = await copyConversationFilePath(target!, msg.target);
+      void st.postTo(sender, { type: "copyFilePathResult", reqId: msg.reqId, ok });
       break;
     }
     case "exportTab": {

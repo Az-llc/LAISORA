@@ -60,6 +60,7 @@ export async function handleWebviewMessage(
       case "queryFiles":
       case "pickFiles":
       case "openFile":
+      case "copyFilePath":
       case "exportTab":
       case "artifact/preview":
       case "openThemePicker":

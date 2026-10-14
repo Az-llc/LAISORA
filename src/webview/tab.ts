@@ -38,7 +38,9 @@ import { buildApprovalBody, buildRestoredApprovalCard } from "./approval";
 import { clock, formatDuration, monthDayClock, toolSummary } from "./format";
 import { uiLocale } from "./l10n";
 import { createCopyButton, renderMarkdownInto } from "./markdown";
-import { askHeading, askOptionContent, updateAskCounters } from "./ask-view";
+import { forgetCodeBlockStates } from "./markdown-codeblock";
+import { askOtherChoice, askHeading, askOptionContent, rejectRenderedAsks, settleUncheckedAsks, updateAskCounters } from "./ask-view";
+import { askQualityCheckEnabled } from "./menu";
 import { createYouItems, encodeAskDismissal, encodeAskResolution, youAnchor, type AskIdentity, type AskResolutionRecord, type YouItemsReader } from "./you-items";
 import { appendRecordPart, findCommitBoundary, joinRecordTexts, prependRecordParts, recordSeparator, type RecordTextPart } from "../commit-boundary";
 import { isConvRenderableEvent } from "../conv-renderable";
@@ -775,7 +777,7 @@ export class Tab {
       this.youStoreValue = createYouItems(this.tabId,
         { tab: state?.askDismissed?.[this.tabId] ?? [], messages: state?.askDismissedMessages ?? [],
           resolvedTab: state?.askResolved?.[this.tabId] ?? [], resolvedMessages: state?.askResolvedMessages ?? [] },
-        (replyId, offset) => this.locateAsk(replyId, offset));
+        (replyId, offset) => this.locateAsk(replyId, offset), askOtherChoice());
     }
     return this.youStoreValue;
   }
@@ -861,15 +863,43 @@ export class Tab {
 
   private readonly askChoiceLines = new Map<string, string>();
 
+  private readonly endedAskTurns = new Set<string>();
+  private readonly rejectedAskKeys = new Set<string>();
+
+  private onAskRejected(ev: Extract<NormalizedEvent, { kind: "ask_rejected" }>): void {
+    this.flushDelta();
+    rejectRenderedAsks(this.convEl, ev.turnId, ev.titles, (key, anchorId) => {
+      this.rejectedAskKeys.add(key);
+      if (anchorId) this.youStore.withdraw(anchorId);
+    });
+    this.settleAskChecks();
+  }
+
+  private settleAskChecks(endedTurn?: string): void {
+    if (endedTurn !== undefined) this.endedAskTurns.add(endedTurn);
+    settleUncheckedAsks(this.convEl, (turn) => this.endedAskTurns.has(turn));
+    updateAskCounters(this.convEl);
+  }
+
   private renderReplyMarkdown(container: HTMLElement, text: string, replyId = this.currentAssistantBlock?.dataset.askSource ?? this.currentSegTurnId ?? this.currentTurnId ?? "", offset = 0, at?: number, order?: number, generation?: number): void {
     const event = this.askReplyEvents.get(replyId) ?? this.askReplyEvents.get(this.currentSegTurnId ?? "");
     const ids = new Set<string>();
     const hadAsks = container.querySelector(".laisora-ask") !== null;
+    const isChecked = (id: string, step: number): boolean => {
+      const state = vscode.getState();
+      const message = this.youStore.messageOf(id);
+      const byMessage = message === undefined ? undefined : state?.askCheckedMessages?.[message]?.[step];
+      return (byMessage ?? state?.askChecks?.[this.tabId]?.[id]?.[step]) === true;
+    };
+    if (container.dataset.askQualityTurn === undefined && askQualityCheckEnabled() && this.replayDone && this.currentTurnId !== null) container.dataset.askQualityTurn = this.currentTurnId;
     renderMarkdownInto(container, text, this.tabId, {
-      replyId, offset,
+      replyId, offset, qualityTurn: container.dataset.askQualityTurn,
+      turnId: this.currentSegTurnId ?? this.currentTurnId ?? undefined,
+      rejected: (key) => this.rejectedAskKeys.has(key),
       register: (ask, position) => {
         ids.add(`ask:${replyId}:${position}`);
         const id = this.youStore.ask(ask, { replyId, offset: position, createdAt: at ?? event?.timestamp ?? 0, order: order ?? event?.seq, generation: generation ?? event?.generation });
+        this.youStore.tick(id, (index) => isChecked(id, index));
         return id;
       },
       choose: (value, askKey, title) => {
@@ -882,12 +912,7 @@ export class Tab {
         inputEl.setSelectionRange(merged.caret, merged.caret);
         persistState();
       },
-      checked: (id, step) => {
-        const state = vscode.getState();
-        const message = this.youStore.messageOf(id);
-        const byMessage = message === undefined ? undefined : state?.askCheckedMessages?.[message]?.[step];
-        return (byMessage ?? state?.askChecks?.[this.tabId]?.[id]?.[step]) === true;
-      },
+      checked: isChecked,
       check: (id, step, checked) => {
         const state = vscode.getState() ?? { activeTabId: null };
         const askChecks = { ...state.askChecks };
@@ -905,10 +930,12 @@ export class Tab {
           askCheckedMessages = Object.fromEntries([...Object.entries(rest), [message, next]].slice(-ASK_MESSAGE_STATE_MAX));
         }
         vscode.setState({ ...state, askChecks, askCheckedMessages });
+        this.youStore.tick(id, (index) => isChecked(id, index));
       },
     });
     this.youStore.retain(replyId, offset, Math.max(offset + text.length, this.askRenderEnds.get(container) ?? 0), ids);
     this.askRenderEnds.set(container, offset + text.length);
+    if (container.dataset.askQualityTurn !== undefined || this.rejectedAskKeys.size > 0) this.settleAskChecks();
     if (ids.size > 0) this.persistAskResolutions();
     if ((hadAsks || ids.size > 0) && !this.askCountersScheduled) {
       this.askCountersScheduled = true;
@@ -1676,6 +1703,7 @@ export class Tab {
   }
 
   destroy(): void {
+    forgetCodeBlockStates(this.tabId);
     this.unsubscribeUserLabel();
     this.clearHandoffStatus();
     this.chatYou.destroy();
@@ -3077,7 +3105,10 @@ export class Tab {
   private rebuildAssistantSegment(seg: HTMLElement): void {
     const text = joinRecordTexts(this.assistantRuns.filter((run) => run.seg === seg).map((run) => run.text));
     const askSource = seg.dataset.askSource ?? seg.closest<HTMLElement>("[data-turn-id]")?.dataset.turnId;
-    if (askSource !== undefined) this.youStore.retain(askSource, 0, Infinity, new Set());
+    if (askSource !== undefined) {
+      this.youStore.retain(askSource, 0, Infinity, new Set());
+      forgetCodeBlockStates(this.tabId, askSource);
+    }
     const open = this.currentAssistantBlock === seg;
     if (this.topConvSeg !== null && this.topConvSeg.el === seg) this.topConvSeg = null;
     if (this.convCursorEl === seg) this.convCursorEl = null;
@@ -3764,14 +3795,20 @@ export class Tab {
       case "turn_started":
         this.onTurnStarted(ev);
         break;
+      case "ask_rejected":
+        this.onAskRejected(ev);
+        break;
       case "turn_completed":
         this.onTurnCompleted(ev);
+        this.settleAskChecks(ev.turnId);
         break;
       case "turn_interrupted":
         this.onTurnInterrupted(ev);
+        this.settleAskChecks(ev.turnId);
         break;
       case "turn_failed":
         this.onTurnFailed(ev);
+        this.settleAskChecks(ev.turnId);
         break;
       case "api_retry":
         this.onApiRetry(ev);
@@ -3804,7 +3841,7 @@ export class Tab {
         this.onSubagentInfo(ev);
         break;
       case "model_observed":
-        this.onModelObserved(ev);
+        if (isConvRenderableEvent(ev)) this.onModelObserved(ev);
         break;
       case "compact_boundary":
         if (isConvRenderableEvent(ev)) this.onCompactBoundary(ev);
@@ -5277,7 +5314,6 @@ export class Tab {
         if (m.role === "assistant") {
           this.recordReplyIds.add(m.uuid);
           this.renderReplyMarkdown(div, m.text, m.uuid, 0, m.timestamp ?? 0);
-          this.youStore.assistantReply(m.uuid, m.timestamp ?? 0);
         }
         else if (m.role === "user") {
           div.textContent = m.text;

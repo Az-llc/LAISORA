@@ -1,7 +1,6 @@
 import * as l10n from "@vscode/l10n";
 import { truncateToolIntent } from "./status-line";
 import type { OrchestrationView, WorkModelPayload } from "../protocol";
-import type { PlanUsage } from "../plan-usage";
 import { deriveEarlierPlanViews, derivePlanView, planLaneRunning, planStepFolds, planStepSettled, type PlanLane, type PlanStep, type PlanView } from "./plan-view";
 import { createLoader } from "./loader";
 import { planItemLabel } from "../plan-steps";
@@ -55,7 +54,6 @@ export class PlanPanel {
   private readonly barRunning = node("span", "plan-bar-running");
   private model?: WorkModelPayload;
   private orchestration?: OrchestrationView;
-  private usage?: PlanUsage;
   private nowMs = 0;
   private signature = "";
   private nowStatus = "";
@@ -110,13 +108,12 @@ export class PlanPanel {
   close(restoreFocus = true): void { if (!restoreFocus) this.returnFocus = null; if (this.dialog.open) this.dialog.close(); }
   destroy(): void { this.close(); this.resize.disconnect(); this.theme.disconnect(); this.dialog.remove(); }
   setModel(model: WorkModelPayload | undefined): void { this.model = model; this.render(); }
-  setUsage(usage: PlanUsage | undefined): void { this.usage = usage; this.render(); }
   setOrchestration(view: OrchestrationView): void { this.orchestration = view; this.render(); }
   tick(nowMs: number): void { this.nowMs = nowMs; this.render(); }
 
   private render(): void {
-    const view = derivePlanView(this.model, this.orchestration, this.usage, this.nowMs);
-    const earlier = deriveEarlierPlanViews(this.model, this.orchestration, this.usage, this.nowMs);
+    const view = derivePlanView(this.model, this.orchestration, this.nowMs);
+    const earlier = deriveEarlierPlanViews(this.model, this.orchestration, this.nowMs);
     const planRunning = this.model?.planContext?.running === true;
     const signature = JSON.stringify([view, earlier, planRunning, this.nowStatus]);
     if (signature === this.signature) return;

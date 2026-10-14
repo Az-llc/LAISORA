@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 import type { DivergenceReport } from "./l3-divergence";
 import { progressSubjectKey } from "./progress-protocol";
-import type { NormalizedEvent } from "./protocol";
+import { isObservedTime, type NormalizedEvent } from "./protocol";
 import { redactAbsolutePaths } from "./path-redaction";
 import { planItemLabel } from "./plan-steps";
 import { HUMAN_REJECTED_TOOL_RESULT_RE } from "./tool-result-signals";
@@ -567,10 +567,6 @@ function foldEvent(state: GuardrailState, ev: NormalizedEvent): GuardrailState {
   }
 
   return state;
-}
-
-function isObservedTime(t: number | undefined): t is number {
-  return typeof t === "number" && Number.isFinite(t) && t > 0;
 }
 
 function discardRecoveredFailures(state: GuardrailState, subjectId: string, turnId: string, toolName?: string): void {

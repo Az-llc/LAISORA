@@ -1,6 +1,6 @@
 import { toolIntentLabel } from "./status-line";
 import type { OrchestrationView, PlanContext, WorkAgentNode, WorkModelPayload } from "../protocol";
-import { externalTokens, type PlanUsage, type PlanTokenTotal } from "../plan-usage";
+import { externalTokens, type PlanTokenTotal } from "../plan-usage";
 import type { TaskStatus, WorkStatus } from "../work-model";
 import { planItemNumber, planSpansMs, planStepKey, transitionPlanStep, type PlanSpan } from "../plan-steps";
 export { normalizePlanContent, planStepKey } from "../plan-steps";
@@ -39,15 +39,15 @@ export function planLaneRunning(lane: PlanLane): boolean {
 }
 
 export function deriveEarlierPlanViews(model: WorkModelPayload | undefined, orchestration: OrchestrationView | undefined,
-  usage: PlanUsage | undefined, nowMs: number): PlanView[] {
+  nowMs: number): PlanView[] {
   return (model?.earlierPlans ?? []).map(context => {
-    const view = derivePlanView(model, orchestration, usage, nowMs, context);
+    const view = derivePlanView(model, orchestration, nowMs, context);
     return { ...view, goal: view.goal || context.text };
   });
 }
 
 export function derivePlanView(model: WorkModelPayload | undefined, orchestration: OrchestrationView | undefined,
-  usage: PlanUsage | undefined, nowMs: number, context: PlanContext | undefined = model?.planContext): PlanView {
+  nowMs: number, context: PlanContext | undefined = model?.planContext): PlanView {
   const view: PlanView = { block: context?.blockId, goal: context?.goal ?? "", steps: [], now: [], current: null,
     completed: 0, elapsed: context ? Math.max(0, (context.running ? Math.max(nowMs, context.end) : context.end) - context.start) : null,
     claude: null, external: null, partial: context !== undefined && model?.planHistoryLostThrough !== undefined &&
@@ -146,16 +146,7 @@ export function derivePlanView(model: WorkModelPayload | undefined, orchestratio
     const end = Math.max(...remaining.map(step => step.endedAt ?? unit.start));
     view.elapsed = Math.max(0, end - unit.start);
   }
-  const slices = usage?.blocks.flatMap(block => block.slices).filter(slice => slice.end > unit.start && slice.start <= unit.end) ?? [];
-  if (slices.length) {
-    view.claude = { tokens: 0, cacheRead: 0 };
-    for (const original of slices) {
-      const start = Math.max(original.start, unit.start);
-      const ratio = (original.end - start) / Math.max(1, original.end - original.start);
-      view.claude.tokens += original.tokens * ratio;
-      view.claude.cacheRead += original.cacheRead * ratio;
-    }
-  }
+  view.claude = context?.tokens ?? null;
   const seen = new Set<string>();
   const inWindow = (lane: PlanLane): boolean =>
     (lane.status === "running" || context !== undefined && (lane.start === null || lane.start >= unit.start)) &&

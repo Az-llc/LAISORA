@@ -4,7 +4,7 @@ import type { WebviewToHost } from "../protocol";
 type VsCodeWebviewApi = {
   postMessage(msg: WebviewToHost): void;
   getState():
-    | { activeTabId: string | null; drafts?: Record<string, string>; askChecks?: Record<string, Record<string, boolean[]>>; askDismissed?: Record<string, string[]>; askDismissedMessages?: string[]; askResolved?: Record<string, string[]>; askResolvedMessages?: string[]; askCheckedMessages?: Record<string, boolean[]>; views?: Record<string, "conv" | "work">; analysisViews?: Record<string, "script" | "ai">; workViews?: Record<string, "summary" | "graph" | "analysis" | "log"> }
+    | { activeTabId: string | null; drafts?: Record<string, string>; askChecks?: Record<string, Record<string, boolean[]>>; askDismissed?: Record<string, string[]>; askDismissedMessages?: string[]; askResolved?: Record<string, string[]>; askResolvedMessages?: string[]; askCheckedMessages?: Record<string, boolean[]>; views?: Record<string, "conv" | "work">; analysisViews?: Record<string, "script" | "ai">; workViews?: Record<string, "summary" | "graph" | "analysis" | "log">; codeWrap?: boolean }
     | undefined;
   setState(s: {
     activeTabId: string | null;
@@ -12,6 +12,7 @@ type VsCodeWebviewApi = {
     views?: Record<string, "conv" | "work">;
     analysisViews?: Record<string, "script" | "ai">;
     workViews?: Record<string, "summary" | "graph" | "analysis" | "log">;
+    codeWrap?: boolean;
   }): void;
 };
 

@@ -62,6 +62,7 @@ export function userSettingsMessage(): Extract<HostToWebview, { type: "userSetti
     appearance: accentSettings(),
     displayName: configuredDisplayName(),
     composerSendKey: normalizeComposerSendKey(getLaisoraConfiguration().get<string>("composer.sendKey")!),
+    askQualityCheck: getLaisoraConfiguration().get<boolean>("claude.askQualityCheck") === true,
   };
 }
 

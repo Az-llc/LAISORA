@@ -1,5 +1,22 @@
 # Changelog
 
+## 1.7.0
+
+- **Clearer decision cards.** Claude is asked to state the facts behind a decision, the concrete
+  effect of each option and how the options compare. A card can carry folded details, and "Other"
+  lets you answer in your own words.
+- **Decision quality check (beta).** `laisora.claude.askQualityCheck` (off by default) hides a
+  decision whose reason or option effects only repeat its title or labels, and asks Claude to
+  rewrite it.
+- **Code blocks.** Code blocks show as cards with a language label, wrap long lines by default, and
+  fold long blocks with a reader that shows the whole block.
+- **Copy links.** Links in the chat have a copy button; file links copy the full resolved path.
+- **Times.** Events without their own time are stamped when they arrive, and a sent message starts
+  at the time it was sent. An automatic denial shows the reason given by the check that denied it.
+- **YOU list.** A newer item of the same kind replaces the older one after you reply, and a
+  checklist closes when every item is ticked or you send the next message.
+- Claude Agent SDK 0.3.299 (Claude Code CLI 2.1.299).
+
 ## 1.6.1
 
 - **Paste text with Ctrl+Shift+V.** In the message box, Ctrl+V still attaches images, and

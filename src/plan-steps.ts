@@ -330,9 +330,10 @@ export function planStepKey(entry: { source?: "tasks" }, item: { taskKey: string
 const TASK_STEP_KEY_RE = /^task\ntask:(\d+)$/;
 const ITEM_NUMBER_PREFIX_RE = /^(\d{2,}) /;
 
-export function planContextOf(block: { blockId: string; text: string; start: number; goal?: string; steps?: ReadonlyArray<PlanStepTiming & { number: number; activeSpans?: PlanSpan[] }> },
-  end: number, running: boolean): PlanContext {
+export function planContextOf(block: { blockId: string; text: string; start: number; goal?: string; steps?: ReadonlyArray<PlanStepTiming & { number: number; activeSpans?: PlanSpan[] }>;
+  metrics?: { tokens?: PlanContext["tokens"] } }, end: number, running: boolean): PlanContext {
   return { blockId: block.blockId, text: block.text, start: block.start, ...(block.goal === undefined ? {} : { goal: block.goal }),
+    ...(block.metrics?.tokens === undefined ? {} : { tokens: block.metrics.tokens }),
     steps: (block.steps ?? []).map(({ key, number, title, status, removed, startedAt, endedAt, activeSpans }) =>
       ({ key, number, title, status, removed, startedAt, endedAt, ...(activeSpans === undefined ? {} : { activeSpans }) })),
     end: Math.max(block.start, end), running };

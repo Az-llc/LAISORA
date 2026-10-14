@@ -8,6 +8,11 @@
   --l-chart-unobserved: color-mix(in srgb, var(--vscode-descriptionForeground) 22%, var(--vscode-editor-background));
   --l-chart-wait: color-mix(in srgb, var(--vscode-descriptionForeground) 16%, var(--vscode-editor-background));
   --l-chart-track: color-mix(in srgb, var(--vscode-descriptionForeground) 12%, var(--vscode-editor-background));
+  --l-card-border: var(--vscode-contrastBorder, color-mix(in srgb, var(--vscode-foreground) 20%, var(--vscode-editor-background)));
+  --l-card-radius: 2px;
+  --l-code: 12px;
+  /* Full-width glyphs must be exactly two half-width cells; every family here is a single font covering both scripts. */
+  --l-code-font: "UDEV Gothic", "UDEV Gothic NF", "HackGen", "HackGen NF", "PlemolJP", "BIZ UDGothic", "MS Gothic", "Sarasa Mono J", "Noto Sans Mono CJK JP", monospace;
   --l-title: 18px;
   --l-heading: 14px;
   --l-body: 13px;

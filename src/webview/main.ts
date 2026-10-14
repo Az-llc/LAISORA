@@ -62,6 +62,7 @@ import {
 } from "./menu";
 import { closeSuggest, handleFilesResponse, initSuggest, insertFilePaths } from "./suggest";
 import { setFileLinkHostPlatform, setFileLinkSystemAppExtensions } from "../markdown-ast";
+import { handleCopyFilePathResult } from "./markdown";
 import type { ScrollCarry, ViewMode } from "./tab";
 import {
   Tab,
@@ -177,8 +178,8 @@ export function persistState(): void {
   for (const [id, t] of tabs) workViews[id] = t.workViewMode;
   for (const [id, overview] of overviews) analysisViews[id] = overview.analysisSubtab;
   for (const [id, t] of tabs) scrollAnchors[id] = t.captureScrollCarry(false);
-  const { askDismissedMessages, askResolvedMessages, askCheckedMessages } = vscode.getState() ?? {};
-  const next: PersistedState = { activeTabId, drafts: out, views, workViews, analysisViews, scrollAnchors, askChecks, askDismissed, askDismissedMessages, askResolved, askResolvedMessages, askCheckedMessages };
+  const { askDismissedMessages, askResolvedMessages, askCheckedMessages, codeWrap } = vscode.getState() ?? {};
+  const next: PersistedState = { activeTabId, drafts: out, views, workViews, analysisViews, scrollAnchors, askChecks, askDismissed, askDismissedMessages, askResolved, askResolvedMessages, askCheckedMessages, codeWrap };
   vscode.setState(next);
 }
 
@@ -1858,7 +1859,6 @@ function addTab(snap: TabSnapshot, scrollCarry?: ScrollCarry): Tab {
   t.observeSessionTime(snap.state.semanticModel?.timeBuckets?.firstAt, "session");
   t.observeSessionTime(snap.state.events[0]?.timestamp, "fallback");
   tabs.set(snap.tabId, t);
-  t.planPanel.setUsage(snap.state.planUsage);
   tabsAddedInDocument.add(snap.tabId);
   t.auth = snap.state.auth;
   t.configModel = snap.state.configModel;
@@ -2230,7 +2230,6 @@ function initMessageBus(): void {
         break;
       }
       case "planUsage": {
-        tabs.get(msg.tabId)?.planPanel.setUsage(msg.state);
         overviews.get(msg.tabId)?.setPlanUsage(msg.state);
         break;
       }
@@ -2451,6 +2450,10 @@ function initMessageBus(): void {
       }
       case "pickedFiles": {
         onPickedFiles(msg.reqId, msg.paths, msg.images);
+        break;
+      }
+      case "copyFilePathResult": {
+        handleCopyFilePathResult(msg.reqId, msg.ok);
         break;
       }
       case "attachments": {

@@ -21,6 +21,7 @@ import { isConvRenderableEvent } from "./conv-renderable";
 import { releaseConversationHistory } from "./conversation-history";
 import { createEvidenceIndex, type SemanticEvidenceIndex } from "./evidence-index";
 import {
+  stampEventMeta,
   foldEventState,
   type EventMeta,
   type FoldEffect,
@@ -58,7 +59,7 @@ import {
   type HandoffSourceSnapshot,
   isInternalSlashCommand,
   projectWorkModel,
-  requiresTimestamp,
+  UNOBSERVED_TIME,
 } from "./protocol";
 import type { ResumeHydration, HydrationJournalEntry, HydrationVerdict } from "./resume-hydration";
 import { SessionAnalysisStore } from "./session-analysis-store";
@@ -196,10 +197,6 @@ export class Session {
     this.analysisStore = new SessionAnalysisStore(this, store);
     this.llmRunner = new SessionLlm(this, store);
     this.summaryRunner = new SessionSummaryWiring(this, store);
-  }
-
-  get lastRecordedEventTimestamp(): number | undefined {
-    return this.lastEventTimestamp;
   }
 
   resetLogicalSession(): void {
@@ -392,14 +389,16 @@ export class Session {
       return;
     }
     const before = this.timestampContractViolations;
-    const { effects } = foldEventState(this, partial, conversationId, meta);
+    const journaled = h !== null && h.phase === "failed";
+    const folded = journaled ? stampEventMeta(partial, meta, this.lastEventTimestamp, Date.now()) ?? meta : meta;
+    const { effects } = foldEventState(this, partial, conversationId, folded);
     this.executeFoldEffects(effects);
-    if (h !== null && h.phase === "failed") {
+    if (journaled) {
       h.journal.push({
         journalEventId: `${h.attemptId}#${++h.journalSeq}`,
         partial,
         conversationId,
-        meta,
+        meta: folded,
         verdict: this.timestampContractViolations > before ? "dropped-timestamp" : "accepted",
         displayed: true,
       });
@@ -426,28 +425,27 @@ export class Session {
     const guardrailOnly = GUARDRAIL_ONLY_EVENT_KINDS.has(partial.kind);
     const commandsChanged = partial.kind === "commands_changed";
     let verdict: HydrationVerdict = "accepted";
+    let stampedMeta = meta;
     if (stale) {
       verdict = "dropped-stale";
       output.appendLine(`[${this.title}] [drop] stale event from old conversation: ${partial.kind}`);
-    } else if (!guardrailOnly && !commandsChanged) {
-      if (
-        meta?.timestamp === undefined &&
-        requiresTimestamp(partial.kind) &&
-        h.arrivalTimestamp !== undefined
-      ) {
+    } else {
+      const stamped = stampEventMeta(partial, meta, h.arrivalTimestamp, Date.now());
+      if (stamped === undefined) {
         verdict = "dropped-timestamp";
         output.appendLine(
           `[${this.title}] [contract] ${partial.kind} に timestamp が無い（実時計で補完しない・破棄）`
         );
-      } else if (meta?.timestamp !== undefined) {
-        h.arrivalTimestamp = meta.timestamp;
+      } else {
+        stampedMeta = stamped;
+        h.arrivalTimestamp = Math.max(h.arrivalTimestamp ?? stamped.timestamp, stamped.timestamp);
       }
     }
     const entry: HydrationJournalEntry = {
       journalEventId: `${h.attemptId}#${++h.journalSeq}`,
       partial,
       conversationId,
-      meta,
+      meta: stampedMeta,
       verdict,
       displayed: false,
       ...(clientToken === undefined ? {} : { clientToken }),
@@ -469,7 +467,7 @@ export class Session {
       conversationId: conversationId ?? this.conversation?.conversationId ?? "pending",
       generation: this.generation,
       seq: h.liveSeqBase + h.acceptedSinceBuffering,
-      timestamp: meta?.timestamp ?? h.arrivalTimestamp ?? 0,
+      timestamp: stampedMeta?.timestamp ?? h.arrivalTimestamp ?? UNOBSERVED_TIME,
     } as NormalizedEvent;
     this.store.post({
       type: "resumeHydrationState",

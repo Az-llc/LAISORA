@@ -47,9 +47,15 @@ export interface NormalizedOutMeta {
   gapBoundaries?: readonly number[];
 }
 
+export function permissionDeniedReason(record: Record<string, unknown>): string {
+  for (const value of [record.decision_reason, record.message, record.decision_reason_type]) {
+    if (typeof value === "string" && value.trim().length > 0) return redactAbsolutePaths(value.trim());
+  }
+  return redactAbsolutePaths(JSON.stringify(record));
+}
+
 export interface ClaudeLiveNormalizerOptions {
   cwd: string;
-  initialObservedTimestamp?: number;
   log: (msg: string) => void;
   loadAgentDef?: (subagentType: string) => { model?: string; effort?: string } | undefined;
   emit: (body: NormalizedEventBody & { provenance?: EventProvenance }, meta?: NormalizedOutMeta) => void;
@@ -317,14 +323,9 @@ export class ClaudeLiveNormalizer {
   droppedTaskNotificationCount = 0;
 
   constructor(private readonly opts: ClaudeLiveNormalizerOptions) {
-    this.lastObservedTimestamp = opts.initialObservedTimestamp;
     if (opts.usageLimitPrefixes) {
       this.usageLimitPrefixes = [...opts.usageLimitPrefixes];
     }
-  }
-
-  seedObservedTimestamp(timestamp: number | undefined): void {
-    if (this.lastObservedTimestamp === undefined) this.lastObservedTimestamp = timestamp;
   }
 
   setUsageLimitPrefixes(prefixes: string[]): void {
@@ -350,6 +351,9 @@ export class ClaudeLiveNormalizer {
     this.refusalWithoutFallback = null;
     this.refusalNoticeEmitted = false;
     this.unlabeledAssistantText = false;
+    if (meta?.timestamp !== undefined && !(this.lastObservedTimestamp !== undefined && this.lastObservedTimestamp > meta.timestamp)) {
+      this.lastObservedTimestamp = meta.timestamp;
+    }
     const startMeta =
       meta?.timestamp === undefined && this.lastObservedTimestamp !== undefined
         ? { ...meta, timestamp: this.lastObservedTimestamp }
@@ -470,10 +474,7 @@ export class ClaudeLiveNormalizer {
                 (record.decision_reason.startsWith(`${AUTO_MODE_UNEVALUATED} —`) &&
                   !record.decision_reason.includes(" — a safety check separate from auto mode blocked this request because of earlier conversation content — it isn't about the action itself"))
               ) ? { classifierUnavailable: true } : {}),
-              reason:
-                typeof record.decision_reason_type === "string"
-                  ? record.decision_reason_type
-                  : JSON.stringify(record),
+              reason: permissionDeniedReason(record),
             },
             defaultMeta
           );

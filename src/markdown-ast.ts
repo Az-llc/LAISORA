@@ -1,6 +1,5 @@
 import MarkdownIt, { type Token } from "markdown-it";
-import { parseAskBlock, parsePlanBlock, type AskBlock } from "./ask-parser";
-import { isClosingFence } from "./commit-boundary";
+import { askQualityIssues, parseAskBlock, parsePlanBlock, type AskBlock, type AskQualityIssue } from "./ask-parser";
 import { DEFAULT_SYSTEM_APP_EXTENSIONS } from "./file-link-open-mode";
 import { parseFileLinkTarget, type FileLinkPlatform, type FileLinkTarget } from "./file-link-target";
 
@@ -46,8 +45,10 @@ export interface MdCodeInlineNode {
 export interface MdCodeBlockNode {
   type: "code_block";
   fenced: boolean;
+  closed: boolean;
   lang: string;
   value: string;
+  offset: number;
 }
 
 export interface MdListNode {
@@ -108,7 +109,7 @@ export interface MdHardbreakNode {
 
 export type MdNode =
   | { type: "plan"; goal: string; offset: number }
-  | { type: "ask"; ask: AskBlock; offset: number }
+  | { type: "ask"; ask: AskBlock; offset: number; rejected?: true }
   | MdHeadingNode
   | MdParagraphNode
   | MdTextNode
@@ -153,6 +154,17 @@ md.validateLink = (url) => defaultValidateLink(url) || parseHostFileLinkTarget(u
 md.linkify.set({ fuzzyLink: true, fuzzyEmail: true });
 const linkifyMatch = md.linkify.match.bind(md.linkify);
 md.linkify.match = (text) => (linkifyMatch(text) ?? []).filter((m) => m.schema !== "" || /^www\./i.test(m.raw));
+
+function fenceClosed(token: Token): boolean {
+  if (token.map === null) return false;
+  const content = token.content;
+  const contentLines = content === "" ? 0 : content.split("\n").length - (content.endsWith("\n") ? 1 : 0);
+  return token.map[1] - token.map[0] - 1 > contentLines;
+}
+
+function blockOffset(lines: string[], token: Token): number {
+  return lines.slice(0, token.map?.[0] ?? 0).reduce((n, line) => n + line.length + 1, 0);
+}
 
 function extractAlign(token: Token): TableAlign {
   const style = token.attrGet("style");
@@ -243,6 +255,84 @@ interface TableBuilder {
   section: "head" | "body" | null;
   currentRow: MdTableCellNode[] | null;
   currentCell: MdTableCellNode | null;
+}
+
+export const ASK_FENCE_INFO = "laisora-ask";
+export const ASK_REJECTED_FENCE_INFO = "laisora-ask rejected";
+
+function isAskFenceInfo(info: string): boolean {
+  const trimmed = info.trim();
+  return trimmed === ASK_FENCE_INFO || trimmed === ASK_REJECTED_FENCE_INFO;
+}
+
+function askFences(src: string): { ask: AskBlock; startLine: number; endLine: number }[] {
+  return md.parse(src, {}).flatMap((token) => {
+    if (token.type !== "fence" || !isAskFenceInfo(token.info) || !token.map) return [];
+    const ask = parseAskBlock(token.content);
+    return ask ? [{ ask, startLine: token.map[0], endLine: token.map[1] }] : [];
+  });
+}
+
+export function askBlocksIn(src: string): AskBlock[] {
+  return askFences(src).map((fence) => fence.ask);
+}
+
+export const ASK_QUALITY_DENIAL_HEAD = "Rejected before display: these laisora-ask decisions were not shown to the user.";
+
+const rejectedTitleKey = (title: string): string => `${JSON.stringify(title)}: `;
+
+function askQualityProblem(issue: AskQualityIssue): string {
+  return issue.kind === "why-restates-title" ? "why restates the title; state what you observed, the exact question and why the user must decide."
+    : issue.kind === "why-states-only-need" ? "why only says that a decision is needed; state what you observed (a number, a quoted name, an identifier or the source you checked) and why the user must decide."
+    : `the effect of ${JSON.stringify(issue.label)} restates its label; state the concrete change to the user's screen, operation or work.`;
+}
+
+export function askQualityDenial(text: string): string | undefined {
+  const problems = askBlocksIn(text).flatMap((ask) => {
+    const issues = askQualityIssues(ask);
+    return issues.length ? [`${rejectedTitleKey(ask.title)}${issues.map(askQualityProblem).join(" ")}`] : [];
+  });
+  return problems.length ? `${ASK_QUALITY_DENIAL_HEAD} ${problems.join(" ")} Rewrite each block in full, then continue.` : undefined;
+}
+
+export function rejectedAskTitles(text: string): string[] {
+  return askBlocksIn(text).filter((ask) => askQualityIssues(ask).length > 0).map((ask) => ask.title);
+}
+
+export function feedbackRejectedTitles(text: string, feedback: string): string[] {
+  return feedback.includes(ASK_QUALITY_DENIAL_HEAD) ? askBlocksIn(text).filter((ask) => feedback.includes(rejectedTitleKey(ask.title))).map((ask) => ask.title) : [];
+}
+
+export function isRejectedAsk(ask: AskBlock, titles: readonly string[]): boolean {
+  return ask.kind === "decide" && titles.includes(ask.title);
+}
+
+export interface AskRejection { readonly upTo: number; readonly titles: readonly string[] }
+
+export function resolveRejectedAsks(texts: readonly string[], rejections: readonly AskRejection[]): (string | null)[] {
+  const fences = texts.map((text) => askFences(text));
+  const rejected = new Set<string>();
+  let from = 0;
+  for (const rejection of [...rejections].sort((a, b) => a.upTo - b.upTo)) {
+    for (let k = from; k < Math.min(rejection.upTo, texts.length); k++) {
+      fences[k].forEach((fence, index) => { if (isRejectedAsk(fence.ask, rejection.titles)) rejected.add(`${k}:${index}`); });
+    }
+    from = Math.max(from, rejection.upTo);
+  }
+  const laterDecide = (k: number, index: number): boolean =>
+    fences[k].some((fence, i) => i > index && fence.ask.kind === "decide") || fences.slice(k + 1).some((list) => list.some((fence) => fence.ask.kind === "decide"));
+  return texts.map((text, k) => {
+    const marks = fences[k].flatMap((fence, index) => rejected.has(`${k}:${index}`) ? [{ fence, hide: laterDecide(k, index) }] : []);
+    if (marks.length === 0) return text;
+    const lines = text.split("\n");
+    const dropped = new Set<number>();
+    for (const { fence, hide } of marks) {
+      if (hide) for (let line = fence.startLine; line < fence.endLine; line++) dropped.add(line);
+      else lines[fence.startLine] = lines[fence.startLine].replace(new RegExp(`${ASK_FENCE_INFO}(?: rejected)?\\s*$`), ASK_REJECTED_FENCE_INFO);
+    }
+    const kept = lines.filter((_, line) => !dropped.has(line)).join("\n");
+    return kept.trim() ? kept : null;
+  });
 }
 
 export function parseMarkdown(src: string): MdNode[] {
@@ -413,32 +503,35 @@ export function parseMarkdown(src: string): MdNode[] {
         }
       } else if (token.type === "fence") {
         const lines = src.split("\n");
-        const plan = token.info.trim() === "laisora-plan" && token.map &&
-          isClosingFence(lines[token.map[1] - 1] ?? "", token.markup) ? parsePlanBlock(token.content) : null;
+        const offset = blockOffset(lines, token);
+        const closed = fenceClosed(token);
+        const plan = token.info.trim() === "laisora-plan" && closed ? parsePlanBlock(token.content) : null;
         if (plan) {
-          const offset = lines.slice(0, token.map?.[0] ?? 0).reduce((n, line) => n + line.length + 1, 0);
           currentContainer().push({ type: "plan", goal: plan.goal, offset });
           continue;
         }
         const lang = token.info ? token.info.trim().split(/\s+/)[0].toLowerCase() : "";
-        const ask = token.info.trim() === "laisora-ask" ? parseAskBlock(token.content) : null;
+        const ask = isAskFenceInfo(token.info) ? parseAskBlock(token.content) : null;
         if (ask) {
-          const offset = src.split("\n").slice(0, token.map?.[0] ?? 0).reduce((n, line) => n + line.length + 1, 0);
-          currentContainer().push({ type: "ask", ask, offset });
+          currentContainer().push({ type: "ask", ask, offset, ...(token.info.trim() === ASK_REJECTED_FENCE_INFO ? { rejected: true as const } : {}) });
           continue;
         }
         currentContainer().push({
           type: "code_block",
           fenced: true,
+          closed,
           lang,
           value: token.content,
+          offset,
         });
       } else if (token.type === "code_block") {
         currentContainer().push({
           type: "code_block",
           fenced: false,
+          closed: false,
           lang: "",
           value: token.content,
+          offset: blockOffset(src.split("\n"), token),
         });
       } else if (token.type === "hr") {
         currentContainer().push({ type: "hr" });

@@ -196,6 +196,12 @@ export function requiresTimestamp(kind: string): boolean {
   return TIMESTAMP_REQUIRED_KINDS.includes(kind);
 }
 
+export const UNOBSERVED_TIME = 0;
+
+export function isObservedTime(at: number | undefined): at is number {
+  return typeof at === "number" && Number.isFinite(at) && at > UNOBSERVED_TIME;
+}
+
 export type NormalizedEventBody =
   (
     | { kind: "conversation_opened"; cwd: string; model?: string }
@@ -224,6 +230,7 @@ export type NormalizedEventBody =
       }
     | { kind: "assistant_text_delta"; turnId: string; text: string; recordUuid?: string | null }
     | { kind: "assistant_message_uuid"; turnId: string; uuid: string }
+    | { kind: "ask_rejected"; turnId: string; titles: string[] }
     | { kind: "assistant_retracted"; turnId: string | null; uuids: string[] }
     | { kind: "local_command_output"; text: string; uuid?: string; priorGeneration?: true }
     | ({ kind: "model_refusal_fallback" } & ModelRefusalFallback)
@@ -813,6 +820,7 @@ export type WebviewToHost =
   | { type: "queryFiles"; reqId: number; query: string }
   | { type: "pickFiles"; reqId: number; imageSlots: number }
   | { type: "openFile"; tabId: string; target: string }
+  | { type: "copyFilePath"; tabId: string; target: string; reqId: number }
   | { type: "exportTab"; tabId: string }
   | { type: "renameTab"; tabId: string; title: string }
   | { type: "listSessions"; source?: "laisora" | "claude"; cursor?: string; showHidden?: boolean }
@@ -1216,6 +1224,7 @@ export interface PlanContextPlacement { toolUseId: string; agentId?: string; ste
 export interface PlanContext {
   blockId: string; start: number; end: number; text: string; goal?: string; running: boolean; steps?: PlanContextStep[];
   placements?: PlanContextPlacement[];
+  tokens?: import("./plan-usage").PlanTokenTotal | null;
 }
 
 export interface WorkModelPayload {
@@ -1986,7 +1995,8 @@ function isPlanContext(value: unknown): boolean {
     isNumber(row.end) &&
     typeof row.running === "boolean" &&
     (row.steps === undefined || isArrayOf(row.steps, isPlanContextStep)) &&
-    (row.placements === undefined || isArrayOf(row.placements, isPlanContextPlacement))
+    (row.placements === undefined || isArrayOf(row.placements, isPlanContextPlacement)) &&
+    (row.tokens === undefined || row.tokens === null || isPlanTokenTotal(row.tokens))
   );
 }
 
@@ -3170,6 +3180,7 @@ export type HostToWebview =
   | { type: "configuredEffortChanged"; tabId: string; effort: string | null; model?: string | null; defaultEffort?: string | null; appliedModel?: string | null; appliedEffort?: string | null }
   | { type: "files"; reqId: number; paths: string[] }
   | { type: "pickedFiles"; reqId: number; paths: string[]; images: ImageAttachment[] }
+  | { type: "copyFilePathResult"; reqId: number; ok: boolean }
   | { type: "attachments"; tabId: string; items: PendingAttachmentInfo[] }
   | { type: "sessions"; source?: "laisora" | "claude"; showHidden?: boolean; nextCursor?: string; append?: boolean; requestId: number; sessions: SessionListItem[]; complete: boolean; degraded?: SessionScanDegradation }
   | { type: "sessionRenamed"; sessionId: string; title: string; requestId?: string }
@@ -3182,7 +3193,7 @@ export type HostToWebview =
   | { type: "workModel"; tabId: string; model: WorkModelPayload }
   | { type: "semanticModel"; tabId: string; model: SemanticModelPayload }
   | { type: "llmAnalysisSetting"; enabled: boolean }
-  | { type: "userSettings"; appearance?: AccentSettings; displayName?: string; composerSendKey: ComposerSendKey }
+  | { type: "userSettings"; appearance?: AccentSettings; displayName?: string; composerSendKey: ComposerSendKey; askQualityCheck?: boolean }
   | { type: "tabNotice"; tabId: string; text: string }
   | {
       type: "llmAnalysisRunState";
@@ -3384,10 +3395,11 @@ export function isWebviewToHost(v: unknown): v is WebviewToHost {
       typeof message.sessionId === "string" && SESSION_ID_RE.test(message.sessionId) &&
       typeof message.hidden === "boolean";
   }
-  if (t === "openFile") {
+  if (t === "openFile" || t === "copyFilePath") {
     const message = v as Record<string, unknown>;
-    const allowed = new Set(["type", "tabId", "target"]);
+    const allowed = new Set(t === "openFile" ? ["type", "tabId", "target"] : ["type", "tabId", "target", "reqId"]);
     return (
+      (t === "openFile" || Number.isSafeInteger(message.reqId)) &&
       Object.keys(message).every((key) => allowed.has(key)) &&
       typeof message.tabId === "string" &&
       message.tabId.length > 0 &&
@@ -4413,6 +4425,12 @@ export function isHostToWebview(v: unknown): v is HostToWebview {
       (paths as unknown[]).every((p) => typeof p === "string")
     );
   }
+  if (t === "copyFilePathResult") {
+    const message = v as Record<string, unknown>;
+    return hasOnlyKeys(message, ["type", "reqId", "ok"]) &&
+      Number.isSafeInteger(message.reqId) &&
+      typeof message.ok === "boolean";
+  }
   if (t === "pickedFiles") {
     const paths = (v as { paths?: unknown }).paths;
     const images = (v as { images?: unknown }).images;
@@ -4513,7 +4531,8 @@ export function isHostToWebview(v: unknown): v is HostToWebview {
     const displayName = (v as { displayName?: unknown }).displayName;
     return (appearance === undefined || isAccentSettings(appearance))
       && (displayName === undefined || isDisplayName(displayName))
-      && (COMPOSER_SEND_KEYS as readonly string[]).includes((v as { composerSendKey?: unknown }).composerSendKey as string);
+      && (COMPOSER_SEND_KEYS as readonly string[]).includes((v as { composerSendKey?: unknown }).composerSendKey as string)
+      && [undefined, true, false].includes((v as { askQualityCheck?: unknown }).askQualityCheck as boolean | undefined);
   }
   if (t === "tabNotice") {
     const text = (v as { text?: unknown }).text;

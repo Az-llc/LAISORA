@@ -101,7 +101,7 @@ export function buildApprovalBody(toolName: string, inputJson?: string, inputSum
       if (plan) {
         const box = document.createElement("div");
         box.className = "approval-plan";
-        renderMarkdownInto(box, plan);
+        renderMarkdownInto(box, plan, undefined, undefined, { collapseCode: false });
         out.push(box);
       }
       break;

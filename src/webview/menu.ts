@@ -17,9 +17,15 @@ import type { Tab } from "./tab";
 const INPUT_PLACEHOLDER_SHIFT_ENTER = l10n.t("Type a message (Shift+Enter to send / Enter for a new line)");
 
 let sendKey: ComposerSendKey = "enter";
+let askQualityCheck = false;
 
 export function applyUserSettings(msg: Extract<HostToWebview, { type: "userSettings" }>): void {
   sendKey = msg.composerSendKey;
+  askQualityCheck = msg.askQualityCheck === true;
+}
+
+export function askQualityCheckEnabled(): boolean {
+  return askQualityCheck;
 }
 
 export function composerSendKey(): ComposerSendKey {
