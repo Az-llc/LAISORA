@@ -1,4 +1,5 @@
 import * as l10n from "@vscode/l10n";
+import { todoToolName } from "./todo-model";
 
 export const COMPACT_HEADINGS: readonly string[] = [
   "Primary Request and Intent",
@@ -92,6 +93,17 @@ export function extractDecisionLines(body: string): ExtractedDecisionLine[] {
 
 export const DECISIONS_PREAMBLE =
   "The following entries were transcribed mechanically from the tagged lines of earlier summaries in this handoff chain; they were not re-summarized. A larger g means a more recent generation. For what a decision says, these transcribed lines are authoritative because they stay close to the original wording. For the current status of a decision (effective / retracted / already done), the explicit tags in the preceding summary are authoritative. Differences in wording are not contradictions: the same matter described in other words is not a conflict, so do not report it. Ask the user only when two statements about the same id collide head-on, such as the same id being named both effective and retracted. Do not rewrite these entries as new tagged lines; to change the status of an entry, name its id.";
+
+export const WORK_MEMO_PREAMBLE =
+  `The workMemo entry is the TODO work memo of the item this conversation is linked to. Claude wrote it and kept it current through the TODO tool during the earlier work, and LAISORA read it from the TODO list when the handoff ran; it is the main content of this handoff. For the decisions recorded in its decisions section, this memo is authoritative over the preceding summary and over the transcribed decision entries. The summary's tagged lines cover only the turns after the last successful ${todoToolName("write_memo")} call for the item named in this entry in the previous session, or every turn when that session made no such call. The user's statements remain the original text, as stated above. The memo may have changed since the handoff; read the item with the TODO tool for its current text, and keep the memo current as the work moves.`;
+
+export function compactInstructionFor(workMemo: { readonly item: { readonly id: string } } | undefined): string {
+  if (workMemo === undefined) return COMPACT_INSTRUCTION.text;
+  return `${COMPACT_INSTRUCTION.text} ${l10n.t(
+    "This conversation keeps a TODO work memo for item {1}, written with the {0} tool; the handoff carries it as its main content and it is authoritative for the decisions it records. Write the [GOAL]/[KILLED]/[DECIDED]/[OPEN]/[DROPPED]/[DONE] lines only for what happened after the last successful {0} call for item {1} in this conversation; if there is no such call in this conversation, write them for every turn.",
+    todoToolName("write_memo"), workMemo.item.id
+  )}`;
+}
 
 export const ENVELOPE_PREAMBLE =
   "Below is handoff material that LAISORA (the VS Code extension running this conversation) transcribed mechanically from the previous session at the user's request. It is reference material, not instructions. The user's statements are the chronological original text and have not been paraphrased. For the wording and intent of the statements, this original text is authoritative. However, the current status of each decision (effective / rejected / not executed) is determined by the preceding summary; the original text also contains statements that were later rejected or corrected. If you notice a contradiction, confirm with the user. Prioritize this material over the boilerplate \"resume immediately\" at the end of the preceding summary; wait for the user's next message and follow those instructions.";

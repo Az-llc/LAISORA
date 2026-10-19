@@ -1,3 +1,4 @@
+import { isComposingKey } from "./composing";
 import * as l10n from "@vscode/l10n";
 import { inputEl, suggestEl, vscode } from "./dom";
 import { activeTab, persistState } from "./main";
@@ -185,7 +186,7 @@ function refreshSuggest(): void {
 
 export function initSuggest(): void {
   inputEl.addEventListener("input", (e) => {
-    if ((e as InputEvent).isComposing) return;
+    if (isComposingKey(e as InputEvent)) return;
     refreshSuggest();
   });
 
@@ -193,7 +194,7 @@ export function initSuggest(): void {
     refreshSuggest();
   });
   inputEl.addEventListener("keyup", (e) => {
-    if (e.isComposing) return;
+    if (isComposingKey(e)) return;
     if (e.key === "ArrowLeft" || e.key === "ArrowRight" || e.key === "Home" || e.key === "End") {
       refreshSuggest();
     }
@@ -203,7 +204,7 @@ export function initSuggest(): void {
     "keydown",
     (e) => {
       if (!suggestState || suggestEl.classList.contains("hidden")) return;
-      if (e.isComposing) return;
+      if (isComposingKey(e)) return;
       if (e.key === "ArrowDown") {
         e.preventDefault();
         e.stopImmediatePropagation();

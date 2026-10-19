@@ -144,9 +144,9 @@ html, body {
 .hist-sources button[aria-pressed="true"] { font-weight: 600; color: var(--vscode-button-foreground); background: var(--vscode-button-background); border-color: var(--vscode-contrastActiveBorder, var(--vscode-button-background)); }
 .hist-search { position: relative; flex: 1 1 auto; min-width: 0; }
 .hist-search > .l-icon { position: absolute; left: 5px; top: 50%; transform: translateY(-50%); color: var(--vscode-descriptionForeground); pointer-events: none; }
-#histsearch { box-sizing: border-box; width: 100%; height: 26px; padding: 2px 26px; font: inherit; font-size: var(--l-note); color: var(--vscode-input-foreground); background: var(--vscode-input-background); border: 1px solid var(--vscode-input-border, transparent); border-radius: 2px; }
-#histsearch::placeholder { color: var(--vscode-input-placeholderForeground); }
-#histsearch:focus-visible { outline: 1px solid var(--vscode-focusBorder); outline-offset: -1px; }
+#histsearch, .todo-search-input { box-sizing: border-box; width: 100%; height: 26px; padding: 2px 26px; font: inherit; font-size: var(--l-note); color: var(--vscode-input-foreground); background: var(--vscode-input-background); border: 1px solid var(--vscode-input-border, transparent); border-radius: 2px; }
+#histsearch::placeholder, .todo-search-input::placeholder { color: var(--vscode-input-placeholderForeground); }
+#histsearch:focus-visible, .todo-search-input:focus-visible { outline: 1px solid var(--vscode-focusBorder); outline-offset: -1px; }
 .hist-clear { position: absolute; right: 3px; top: 3px; width: 20px; height: 20px; padding: 0; border: 0; border-radius: 2px; background: none; color: var(--vscode-descriptionForeground); font-size: var(--l-body); line-height: 20px; cursor: pointer; }
 .hist-clear[hidden] { display: none; }
 .hist-clear:hover { background: var(--vscode-toolbar-hoverBackground); color: var(--vscode-foreground); }
@@ -225,7 +225,7 @@ html, body {
   background: var(--vscode-tab-inactiveBackground, transparent);
   color: var(--vscode-tab-inactiveForeground, var(--vscode-descriptionForeground));
   cursor: pointer;
-  font-size: 12px;
+  font-size: var(--l-note);
   max-width: 160px;
 }
 .tab.active {
@@ -275,7 +275,7 @@ html, body {
 }
 .tab-close:focus-visible { outline: 1px solid var(--vscode-focusBorder); opacity: 1; }
 .tab-close:hover { opacity: 1; background: var(--vscode-toolbar-hoverBackground, rgba(128,128,128,0.2)); }
-#newtab {
+#newtab, .todo-menu-toggle.todo-add-btn {
   flex: 0 0 auto;
   background: transparent;
   color: var(--vscode-foreground);
@@ -449,6 +449,8 @@ button#auth.chip:hover { filter: brightness(1.15); }
 .fallback-status { font-size: 11.5px; line-height: 1.5; color: var(--vscode-descriptionForeground); margin: 4px 0 0; overflow-wrap: anywhere; }
 .you-resolved .you-square { background: none; border: 1px solid var(--vscode-descriptionForeground); }
 .you-resolved .you-title-text { color: var(--vscode-descriptionForeground); text-decoration: line-through; }
+.laisora-ask .ask-closed-note { margin-top: 4px; font-size: var(--l-note); line-height: 1.5; color: var(--vscode-descriptionForeground); }
+.laisora-ask.ask-closed-todo :is(.ask-options, .ask-steps) { opacity: 0.6; }
 .laisora-ask.flash, .block.approval.flash { outline: 2px solid var(--laisora-accent); outline-offset: 4px; }
 .work-overview { container: summary / inline-size; }
 .wo-plan-you { display: grid; grid-template-columns: minmax(0, 1.35fr) minmax(0, 1fr); grid-template-rows: auto auto minmax(20px, auto) auto auto; column-gap: 44px; padding: 16px 0 16px var(--conv-gutter); }
@@ -570,9 +572,11 @@ button#auth.chip:hover { filter: brightness(1.15); }
 .session-rename-icon:hover { background: var(--vscode-toolbar-hoverBackground); }
 @media (hover: none) { .session-rename-icon { opacity: 1; } }
 .session-actions { position: relative; margin-left: auto; flex: none; }
-.session-actions summary { cursor: pointer; list-style: none; padding: 3px 6px; border-radius: 3px; }
+.session-actions summary, .todo-menu-toggle { cursor: pointer; list-style: none; padding: 3px 6px; border-radius: 3px; }
+.todo-menu-toggle { flex: none; border: 0; background: transparent; color: var(--vscode-foreground); font: inherit; line-height: 1; }
 .session-actions summary::-webkit-details-marker { display: none; }
-.session-actions summary:hover { background: var(--vscode-toolbar-hoverBackground); }
+.session-actions summary:hover, .todo-menu-toggle:hover, .todo-menu-toggle[aria-expanded="true"] { background: var(--vscode-toolbar-hoverBackground); }
+.todo-menu-toggle:focus-visible { outline: 1px solid var(--vscode-focusBorder); outline-offset: 1px; }
 .session-menu-surface { position: absolute; right: 0; top: 100%; z-index: 10; width: max-content; max-width: calc(100vw - 40px); padding: 4px; background: var(--vscode-menu-background, var(--vscode-editor-background)); color: var(--vscode-menu-foreground, var(--vscode-foreground)); border: 1px solid var(--vscode-panel-border); border-radius: 4px; box-shadow: 0 3px 8px var(--vscode-widget-shadow); }
 .session-menu-surface button { display: flex; align-items: center; gap: 8px; width: 100%; border: 0; padding: 6px 8px; text-align: left; color: inherit; background: transparent; cursor: pointer; }
 .session-menu-surface button:hover, .session-menu-surface button:focus-visible { background: var(--vscode-menu-selectionBackground); color: var(--vscode-menu-selectionForeground); }
@@ -1051,6 +1055,113 @@ details.handoff-row[open] > summary .handoff-row-chev { transform: rotate(90deg)
   opacity: 1;
   pointer-events: auto;
 }
+.edit-summary {
+  max-width: 760px;
+  margin: 0 0 var(--l-space-3);
+  border-block: 1px solid var(--vscode-panel-border);
+  font-size: var(--l-note);
+  line-height: 1.5;
+}
+.edit-summary-head {
+  display: flex;
+  align-items: baseline;
+  gap: var(--l-space-2);
+  padding: var(--l-space-1) 0;
+}
+.edit-summary-title {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--vscode-descriptionForeground);
+  font-weight: 600;
+  font-feature-settings: "palt";
+}
+.edit-summary-stat {
+  display: inline-flex;
+  gap: var(--l-space-2);
+  flex: none;
+  margin-inline-start: auto;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+.edit-summary-added, .edit-summary-removed, .edit-summary-muted { min-width: 5ch; text-align: right; }
+.edit-summary-muted { color: var(--vscode-descriptionForeground); }
+.edit-summary-added { color: var(--vscode-gitDecoration-addedResourceForeground, var(--vscode-testing-iconPassed)); }
+.edit-summary-removed { color: var(--vscode-gitDecoration-deletedResourceForeground, var(--vscode-errorForeground)); }
+.edit-summary-list { margin: 0; padding: 0; list-style: none; }
+.edit-summary-row {
+  display: flex;
+  align-items: baseline;
+  gap: var(--l-space-2);
+  box-sizing: border-box;
+  width: 100%;
+  min-width: 0;
+  padding: var(--l-space-1) 0;
+  border: 0;
+  border-top: 1px solid var(--vscode-panel-border);
+  background: none;
+  color: var(--vscode-foreground);
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+.edit-summary-row:hover { background: var(--vscode-list-hoverBackground); }
+.edit-summary-row:focus-visible, .edit-summary-toggle:focus-visible { outline: 1px solid var(--vscode-focusBorder); outline-offset: -1px; }
+.edit-summary-name, .edit-summary-dir { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.edit-summary-name { flex: 0 1 auto; }
+.edit-summary-dir { flex: 0 1000 auto; color: var(--vscode-descriptionForeground); }
+.edit-summary-files {
+  --edit-summary-name-max: 40%;
+  display: grid;
+  grid-template-columns: fit-content(var(--edit-summary-name-max)) minmax(0, 1fr) auto;
+  column-gap: var(--l-space-2);
+}
+.edit-summary-files > li,
+.edit-summary-files .edit-summary-row {
+  display: grid;
+  grid-column: 1 / -1;
+  grid-template-columns: subgrid;
+  column-gap: inherit;
+}
+.edit-summary-files > li[hidden] {
+  visibility: hidden;
+  block-size: 0;
+  overflow: hidden;
+}
+.edit-summary-file {
+  grid-column: 1;
+  display: flex;
+  align-items: baseline;
+  gap: var(--l-space-2);
+  min-width: 0;
+  overflow: hidden;
+}
+.edit-summary-files .edit-summary-dir { grid-column: 2; }
+.edit-summary-files .edit-summary-stat { grid-column: 3; margin-inline-start: 0; }
+.edit-summary-created {
+  flex: none;
+  color: var(--vscode-descriptionForeground);
+  font-size: var(--l-label);
+  font-weight: 600;
+  letter-spacing: .08em;
+  text-transform: uppercase;
+  font-feature-settings: "palt";
+}
+.edit-summary-toggle {
+  display: block;
+  box-sizing: border-box;
+  width: 100%;
+  padding: var(--l-space-1) 0;
+  border: 0;
+  border-top: 1px solid var(--vscode-panel-border);
+  background: none;
+  color: var(--vscode-descriptionForeground);
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+.edit-summary-toggle:hover { color: var(--vscode-foreground); }
 /* 発言フッター（R-CNV-16）。吹き出しの外（直後の兄弟）に置く。hover / focus-within で
    opacity と pointer-events だけを切り替える。display や要素の出し入れで切り替えると
    行の高さが変わり会話面が揺れる。左の字下げは `.block.user` に合わせる */
@@ -1482,16 +1593,6 @@ hr.md-hr {
   display: flex;
   flex: none;
   gap: var(--l-space-1);
-  opacity: 0;
-  pointer-events: none;
-}
-.codeblock:hover .artifact-preview-actions,
-.codeblock:focus-within .artifact-preview-actions {
-  opacity: 1;
-  pointer-events: auto;
-}
-@media (hover: none) {
-  .codeblock .artifact-preview-actions { opacity: 1; pointer-events: auto; }
 }
 .artifact-preview-button,
 .code-copy-button,
@@ -1631,7 +1732,7 @@ hr.md-hr {
 .todocard-summary-label { font-weight: 600; }
 .todocard-summary-stats {
   font-weight: 400;
-  font-size: 11px;
+  font-size: var(--l-note);
   color: var(--vscode-descriptionForeground);
 }
 .todocard-summary-stats.has-fail { color: var(--vscode-errorForeground); }
@@ -3704,3 +3805,589 @@ mark.find-match-current {
 .panel-work .worklog-turn:focus-visible, .panel-work .wl-tag > button:focus-visible, .panel-work .wl-chip:focus-visible { outline: 1px solid var(--vscode-focusBorder); outline-offset: 4px; }
 
 .panel-work .todo-work-badge { display: none; }
+
+.todo-cats-host { position: relative; }
+.todo-cats { position: absolute; left: 0; right: 0; bottom: 0; height: 0; overflow: visible; pointer-events: none; }
+.todo-cats[hidden] { display: none; }
+.todo-cats > canvas { position: absolute; left: 0; top: 0; image-rendering: pixelated; }
+.todo-cats > canvas[hidden] { display: none; }
+.todo-cats > canvas.todo-cat-front { z-index: 1; }
+.todo-cat-sign { position: absolute; left: 0; bottom: 0; image-rendering: pixelated; }
+.todo-cat-sign[hidden] { display: none; }
+
+body {
+  --l-todo-group-1: #5fb3a5;
+  --l-todo-group-2: #d07f93;
+  --l-todo-group-3: #a294d9;
+  --l-todo-group-4: #9cba6a;
+  --l-todo-group-5: #c2ae78;
+  --l-todo-group-6: #97a3bb;
+}
+body.vscode-light,
+body.vscode-high-contrast-light {
+  --l-todo-group-1: #1f7a6c;
+  --l-todo-group-2: #a8455c;
+  --l-todo-group-3: #6450b0;
+  --l-todo-group-4: #4f7a1c;
+  --l-todo-group-5: #7a6630;
+  --l-todo-group-6: #55607a;
+}
+.tab-todo { flex: none; letter-spacing: 0.08em; font-feature-settings: "palt"; }
+.tab-todo-icon { flex: none; margin-right: 6px; }
+#app:has(#todo-pane.active) #composer { display: none; }
+.todo-pane { display: none; outline: none; }
+.todo-pane.active { display: block; container: todo-pane / inline-size; padding-bottom: 24px; }
+#logs:has(> .todo-pane.active) { padding-left: 0; padding-right: 0; }
+.todo-pane > * { --todo-head-g: 44px; }
+@container todo-pane (max-width: 560px) { .todo-pane > * { --todo-head-g: 24px; } }
+.todo-list { padding: 0 12px 0 calc(var(--todo-head-g, 16px) - 16px); }
+.todo-headwrap {
+  position: sticky;
+  top: 0;
+  z-index: 6;
+  background: var(--vscode-editor-background);
+  border-bottom: 1px solid var(--vscode-panel-border);
+}
+.todo-head {
+  position: relative;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  height: 56px;
+  padding: 0 16px 0 var(--todo-head-g);
+}
+.todo-where { flex: none; margin: 0; font-size: var(--l-heading); font-weight: 700; line-height: 1.4; white-space: nowrap; font-feature-settings: "palt"; }
+.todo-where-up { color: var(--vscode-descriptionForeground); font-weight: 400; }
+.todo-chips { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; padding: 0 16px 8px var(--todo-head-g); }
+.todo-chips:empty, .todo-chips[hidden], .todo-searchrow[hidden], .todo-history-tabs[hidden] { display: none; }
+.todo-chips > .todo-cats-mount { align-self: stretch; }
+.todo-searchrow { display: flex; align-items: center; gap: 8px; padding: 0 16px 8px var(--todo-head-g); }
+.todo-chips > .todo-chip-groups { min-width: 0; }
+.todo-searchrow > .todo-done-toggle { flex: none; }
+.todo-chip.todo-done-toggle { border: 1px solid var(--vscode-panel-border); border-radius: 3px; }
+.todo-close { flex: none; height: 24px; padding: 0 10px; border: 1px solid var(--vscode-panel-border); border-radius: 3px; background: transparent; color: var(--vscode-foreground); font: inherit; font-size: var(--l-note); white-space: nowrap; cursor: pointer; }
+.todo-text-btn { flex: none; height: 24px; padding: 0 8px; border: 0; border-radius: 3px; background: transparent; color: var(--vscode-foreground); font: inherit; font-size: var(--l-note); white-space: nowrap; cursor: pointer; }
+:is(.todo-close, .todo-text-btn):hover:not(:disabled) { background: var(--vscode-toolbar-hoverBackground); }
+:is(.todo-close, .todo-text-btn):focus-visible { outline: 1px solid var(--vscode-focusBorder); outline-offset: 1px; }
+.todo-close:disabled { opacity: 0.4; cursor: default; }
+.todo-chip-set { display: inline-flex; flex-wrap: wrap; border: 1px solid var(--vscode-panel-border); border-radius: 3px; }
+.todo-chip { height: 24px; padding: 0 8px; border: 0; background: transparent; color: var(--vscode-descriptionForeground); font: inherit; font-size: var(--l-note); line-height: 22px; white-space: nowrap; cursor: pointer; }
+.todo-chip + .todo-chip { border-left: 1px solid var(--vscode-panel-border); }
+.todo-chip-inbox { border: 1px solid var(--vscode-panel-border); border-radius: 3px; }
+.todo-search { flex: 0 1 320px; min-width: 0; margin: 0; }
+@container todo-pane (max-width: 560px) { .todo-search { flex: 1 1 auto; } }
+.todo-search-input::-webkit-search-cancel-button { display: none; }
+.todo-search-results { margin: 0 0 var(--l-space-2); border-block: 1px solid var(--vscode-panel-border); font-size: var(--l-note); }
+.todo-search-row { display: flex; align-items: baseline; gap: var(--l-space-2); padding: var(--l-space-1) 0; color: var(--vscode-descriptionForeground); }
+.todo-search-row + .todo-search-row { border-top: 1px solid var(--vscode-panel-border); }
+.todo-search-text { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.todo-chip:hover { color: var(--vscode-foreground); background: var(--vscode-toolbar-hoverBackground); }
+.todo-chip:is([aria-checked="true"], [aria-pressed="true"]) { color: var(--vscode-foreground); font-weight: 600; box-shadow: inset 0 -1px 0 var(--vscode-foreground); }
+.todo-chip:focus-visible { outline: 1px solid var(--vscode-focusBorder); outline-offset: -1px; }
+.todo-chip-n { margin-left: 4px; font-weight: 400; color: var(--vscode-descriptionForeground); font-variant-numeric: tabular-nums; }
+.todo-chip-n.alert { color: var(--vscode-errorForeground); }
+.todo-chip-due { display: inline-flex; align-items: center; gap: 8px; }
+.todo-done-toggle[hidden] { display: none; }
+.todo-filter-btn { display: none; }
+@container todo-pane (max-width: 560px) {
+  .todo-filter-btn { display: inline-flex; }
+  .todo-chip-groups, .todo-chip-due { display: none; }
+  .todo-head { gap: 8px; }
+}
+.todo-filter-btn {
+  flex: none;
+  min-width: 0;
+  align-items: center;
+  gap: 4px;
+  height: 24px;
+  padding: 0 8px;
+  border: 1px solid var(--vscode-panel-border);
+  border-radius: 3px;
+  background: transparent;
+  color: var(--vscode-foreground);
+  font-size: var(--l-note);
+  line-height: 22px;
+  font-feature-settings: "palt";
+  white-space: nowrap;
+  cursor: pointer;
+}
+.todo-filter-label { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+.todo-filter-btn:not(.active) .todo-filter-label { color: var(--vscode-descriptionForeground); }
+.todo-caret { flex: none; color: var(--vscode-descriptionForeground); }
+.todo-filter-btn:hover, .todo-filter-btn[aria-expanded="true"] { background: var(--vscode-toolbar-hoverBackground, rgba(128,128,128,0.2)); }
+.todo-filter-btn:focus-visible, .todo-menu-item:focus-visible { outline: 1px solid var(--vscode-focusBorder); outline-offset: 1px; }
+.todo-dot[hidden] { display: none; }
+.todo-menu {
+  position: absolute;
+  top: 44px;
+  left: var(--todo-head-g, 12px);
+  z-index: 30;
+  min-width: 180px;
+  padding: 4px 0;
+  border: 1px solid var(--vscode-menu-border, var(--vscode-panel-border));
+  border-radius: 3px;
+  background: var(--vscode-menu-background, var(--vscode-editor-background));
+  color: var(--vscode-menu-foreground, var(--vscode-foreground));
+  box-shadow: 0 2px 8px var(--vscode-widget-shadow, rgba(0,0,0,0.36));
+}
+.todo-menu[hidden] { display: none; }
+.todo-menu-head { padding: 4px 12px 0; font-size: var(--l-label); font-weight: 600; letter-spacing: 0.08em; line-height: 1.4; color: var(--vscode-descriptionForeground); font-feature-settings: "palt"; }
+.todo-menu-group { display: flex; flex-direction: column; padding-bottom: 4px; }
+.todo-menu-item { display: flex; align-items: center; gap: 4px; padding: 0 12px 0 4px; border: 0; background: transparent; color: inherit; font-size: var(--l-note); line-height: 24px; text-align: left; cursor: pointer; }
+.todo-menu-item:hover, .todo-menu-item:focus { background: var(--vscode-menu-selectionBackground, var(--vscode-toolbar-hoverBackground)); color: var(--vscode-menu-selectionForeground, inherit); }
+.todo-menu-mark { flex: none; width: 16px; text-align: center; }
+.todo-cats-mount { flex: 1 1 auto; align-self: stretch; }
+.todo-dot { flex: none; width: 6px; height: 6px; border-radius: 50%; background: var(--todo-gc); }
+.todo-note { margin: 16px 12px; font-size: var(--l-note); line-height: 1.5; color: var(--vscode-descriptionForeground); }
+.todo-section { margin-top: 24px; }
+.todo-section:first-child { margin-top: 8px; }
+.todo-group { position: relative; display: flex; align-items: baseline; gap: 8px; padding: 12px 4px 4px 12px; }
+.todo-group-bar { position: absolute; left: 12px; top: 0; width: 24px; height: 2px; background: var(--todo-gc, var(--vscode-panel-border)); }
+.todo-group-name { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: var(--l-label); font-weight: 600; letter-spacing: 0.08em; line-height: 1.4; font-feature-settings: "palt"; }
+.todo-group-count { margin-left: auto; flex: none; font-size: var(--l-label); line-height: 1.4; color: var(--vscode-descriptionForeground); font-variant-numeric: tabular-nums; }
+.todo-family { position: relative; padding: 8px 0; }
+.todo-family.doing.grouped::before { content: ""; position: absolute; left: 0; top: 8px; bottom: 8px; border-left: 2px solid var(--todo-gc); pointer-events: none; }
+.todo-top { display: grid; grid-template-columns: 44px minmax(0, 1fr); align-items: start; padding: 0 4px 0 12px; }
+.todo-line { display: grid; grid-template-columns: minmax(0, 1fr) auto 20px; column-gap: 8px; align-items: start; }
+.todo-meta { display: flex; flex-wrap: wrap; align-items: center; gap: 0 8px; margin-top: 4px; font-size: var(--l-note); line-height: 20px; color: var(--vscode-descriptionForeground); font-variant-numeric: tabular-nums; }
+.todo-sub { display: grid; grid-template-columns: 28px minmax(0, 1fr) auto auto 20px; column-gap: 8px; align-items: start; padding: 4px 4px 0 calc(56px + (var(--todo-depth) - 1) * 20px); }
+.todo-num { font-variant-numeric: tabular-nums; color: var(--vscode-descriptionForeground); }
+.todo-top .todo-num { font-size: var(--l-step-number); font-weight: 300; line-height: 1; }
+.todo-sub .todo-num { font-size: var(--l-note); line-height: 20px; }
+.todo-family.doing.grouped > .todo-top .todo-num { color: var(--todo-gc); }
+.todo-title { min-width: 0; line-height: 20px; overflow-wrap: anywhere; word-break: auto-phrase; }
+.todo-top .todo-title { font-size: var(--l-heading); font-feature-settings: "palt"; }
+.todo-top .todo-title-wrap { text-wrap: balance; }
+.todo-sub .todo-title { font-size: var(--l-body); text-wrap: pretty; }
+.todo-row.st-doing .todo-title { font-weight: 700; }
+.todo-row.st-done :is(.todo-title, .todo-due) { opacity: 0.6; }
+.todo-top.st-done .todo-num { opacity: 0.45; }
+.todo-sub.st-done .todo-num { opacity: 0.6; }
+.todo-row.context .todo-title { color: var(--vscode-descriptionForeground); }
+.todo-due { font-size: var(--l-note); line-height: 20px; color: var(--vscode-descriptionForeground); font-variant-numeric: tabular-nums; white-space: nowrap; text-align: right; }
+.todo-twisty { width: 16px; height: 20px; padding: 0; border: 0; border-radius: 3px; background: transparent; color: var(--vscode-descriptionForeground); font-size: var(--l-body); line-height: 20px; cursor: pointer; }
+.todo-twisty::before { content: "▾"; }
+.todo-twisty[aria-expanded="false"]::before { content: "▸"; }
+.todo-twisty:hover { background: var(--vscode-toolbar-hoverBackground, rgba(128,128,128,0.2)); }
+.todo-twisty:focus-visible { outline: 1px solid var(--vscode-focusBorder); }
+.todo-state { display: inline-grid; place-items: center; width: 20px; height: 20px; color: var(--todo-ic, var(--vscode-foreground)); }
+.todo-state .todo-check { stroke: var(--vscode-editor-background); }
+@container todo-pane (max-width: 480px) {
+  .todo-sub { padding-left: calc(56px + (var(--todo-depth) - 1) * 12px); }
+}
+@media (forced-colors: active) {
+  .todo-state, .todo-family.doing.grouped > .todo-top .todo-num { color: CanvasText; }
+  .todo-family.doing.grouped::before { border-left-color: CanvasText; }
+}
+.todo-row { cursor: pointer; border-radius: 3px; }
+.todo-row:not(.selected, .todo-inline):hover { background: var(--vscode-list-hoverBackground); }
+.todo-row:focus-visible { outline: 1px solid var(--vscode-focusBorder); outline-offset: -1px; }
+.todo-title-in, .todo-dlg-title-in {
+  min-width: 0;
+  width: 100%;
+  box-sizing: border-box;
+  padding: 0 4px;
+  border: 1px solid var(--vscode-focusBorder);
+  border-radius: 2px;
+  background: var(--vscode-input-background);
+  color: var(--vscode-input-foreground);
+  font: inherit;
+  line-height: 20px;
+  outline: none;
+}
+.todo-state-btn { padding: 0; border: 0; border-radius: 3px; background: transparent; cursor: pointer; }
+.todo-state-btn:hover { background: var(--vscode-toolbar-hoverBackground); }
+.todo-state-btn:focus-visible { outline: 1px solid var(--vscode-focusBorder); }
+.todo-actions { flex: none; display: flex; align-items: center; gap: 8px; margin-left: auto; }
+.todo-notice { padding: 4px 16px 4px var(--todo-head-g, 12px); font-size: var(--l-note); line-height: 1.5; color: var(--vscode-foreground); background: var(--vscode-editorWidget-background, var(--vscode-editor-background)); border-bottom: 1px solid var(--vscode-panel-border); }
+.todo-notice:not(.todo-draft) { display: flex; align-items: center; gap: 8px; }
+.todo-notice-text { flex: 1 1 auto; min-width: 0; }
+.todo-notice[hidden] { display: none; }
+.todo-link { padding: 0; border: 0; background: transparent; color: var(--vscode-textLink-foreground); font: inherit; font-size: var(--l-note); text-align: left; cursor: pointer; }
+.todo-link:hover { text-decoration: underline; }
+.todo-link:focus-visible { outline: 1px solid var(--vscode-focusBorder); outline-offset: 1px; }
+.todo-popmenu {
+  position: fixed;
+  z-index: 90;
+  display: flex;
+  flex-direction: column;
+  min-width: 240px;
+  padding: 4px 0;
+  border: 1px solid var(--vscode-menu-border, var(--vscode-widget-border, var(--vscode-panel-border)));
+  border-radius: 4px;
+  background: var(--vscode-menu-background, var(--vscode-editorWidget-background));
+  color: var(--vscode-menu-foreground, var(--vscode-foreground));
+  box-shadow: 0 2px 8px var(--vscode-widget-shadow);
+}
+.todo-popmenu-item { display: flex; align-items: baseline; gap: 8px; padding: 2px 12px 2px 24px; border: 0; background: transparent; color: inherit; font: inherit; font-size: var(--l-body); line-height: 22px; text-align: left; cursor: pointer; }
+.todo-popmenu-item[aria-checked="true"] { padding-left: 8px; }
+.todo-popmenu-item[aria-checked="true"]::before { content: "✓"; flex: none; display: inline-block; width: 16px; }
+.todo-popmenu-label { flex: 1 1 auto; min-width: 0; }
+.todo-popmenu-value { flex: none; max-width: 14em; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: var(--l-note); color: var(--vscode-descriptionForeground); }
+.todo-popmenu-sub { flex: none; color: var(--vscode-descriptionForeground); }
+.todo-popmenu-title { padding: 2px 12px 4px; max-width: 320px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: var(--l-label); font-weight: 600; letter-spacing: 0.08em; line-height: 1.4; color: var(--vscode-descriptionForeground); font-feature-settings: "palt"; }
+.todo-popmenu-section { padding: 6px 12px 0; font-size: var(--l-label); font-weight: 600; letter-spacing: 0.08em; line-height: 1.4; color: var(--vscode-descriptionForeground); font-feature-settings: "palt"; }
+.todo-popmenu-item:is(:hover, :focus) { background: var(--vscode-menu-selectionBackground, var(--vscode-list-activeSelectionBackground)); color: var(--vscode-menu-selectionForeground, var(--vscode-list-activeSelectionForeground)); outline: none; }
+.todo-log-back { margin: 8px 12px 0; }
+.todo-log-title { margin: 8px 12px 0; font-size: var(--l-heading); font-weight: 600; }
+.todo-log-view { padding: 0 12px; }
+.todo-log-lead { margin: 4px 0 8px; font-size: var(--l-note); line-height: 1.5; color: var(--vscode-descriptionForeground); }
+.todo-change-list { margin: 0; padding: 0; list-style: none; }
+.todo-change { display: flex; flex-wrap: wrap; gap: 0 12px; align-items: baseline; padding: 4px 0; border-bottom: 1px solid var(--vscode-panel-border); font-size: var(--l-note); line-height: 1.5; }
+.todo-change:last-child { border-bottom: 0; }
+.todo-change-at { flex: none; color: var(--vscode-descriptionForeground); font-variant-numeric: tabular-nums; }
+.todo-change-who { flex: none; font-weight: 600; }
+.todo-change-what { flex: 1 1 200px; min-width: 0; overflow-wrap: anywhere; color: var(--vscode-foreground); }
+.todo-change-revert { flex: none; margin-left: auto; }
+.todo-change-blocked, .todo-deleted-meta { flex: none; color: var(--vscode-descriptionForeground); }
+.todo-deleted-meta { margin-left: 8px; }
+.todo-dlg-wrap { position: fixed; inset: 0; z-index: 80; background: color-mix(in srgb, var(--vscode-editor-background) 72%, transparent); }
+.todo-dlg-wrap[hidden] { display: none; }
+.todo-dlg {
+  position: absolute;
+  top: 48px;
+  bottom: 48px;
+  left: 50%;
+  transform: translateX(-50%);
+  width: min(1040px, calc(100% - 48px));
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  border: 1px solid var(--vscode-contrastBorder, var(--vscode-editorWidget-border, var(--vscode-panel-border)));
+  border-radius: 2px;
+  background: var(--vscode-editorWidget-background, var(--vscode-editor-background));
+  box-shadow: 0 8px 32px var(--vscode-widget-shadow);
+  outline: none;
+}
+.todo-dlg.max { top: 8px; bottom: 8px; width: calc(100% - 16px); }
+.todo-dlg-h { flex: none; display: flex; gap: 4px; align-items: flex-start; padding: 12px 12px 8px 16px; border-bottom: 1px solid var(--vscode-panel-border); }
+.todo-dlg-ht { flex: 1; min-width: 0; }
+.todo-dlg-crumb { display: flex; flex-wrap: wrap; gap: 0 6px; align-items: center; font-size: var(--l-note); line-height: 1.5; color: var(--vscode-descriptionForeground); }
+.todo-dlg-tl { display: flex; gap: 4px 8px; align-items: center; margin-top: 4px; }
+.todo-dlg-num { flex: none; font-size: var(--l-note); color: var(--vscode-descriptionForeground); font-variant-numeric: tabular-nums; }
+.todo-dlg-title { min-width: 0; font-size: var(--l-heading); font-weight: 600; line-height: 1.5; overflow-wrap: anywhere; border-radius: 2px; cursor: text; }
+.todo-dlg-title:hover { text-decoration: underline; text-decoration-color: var(--vscode-panel-border); text-underline-offset: 4px; }
+.todo-dlg-title:focus-visible { outline: 1px solid var(--vscode-focusBorder); }
+.todo-dlg-sum { margin-top: 4px; font-size: var(--l-note); line-height: 1.5; color: var(--vscode-descriptionForeground); font-variant-numeric: tabular-nums; }
+.todo-dlg-sum:empty { display: none; }
+.todo-dlg-max { flex: none; display: inline-flex; align-items: center; justify-content: center; width: 26px; height: 24px; padding: 0; border: 0; border-radius: 3px; background: transparent; color: var(--vscode-foreground); font-size: var(--l-body); cursor: pointer; }
+.todo-dlg-max:hover { background: var(--vscode-toolbar-hoverBackground); }
+.todo-dlg-max:focus-visible { outline: 1px solid var(--vscode-focusBorder); }
+.todo-dlg-max-icon { position: relative; box-sizing: border-box; width: 10px; height: 10px; border: 1px solid currentColor; }
+.todo-dlg.max .todo-dlg-max-icon { width: 8px; height: 8px; margin: 3px 3px 1px 1px; }
+.todo-dlg.max .todo-dlg-max-icon::before { content: ""; position: absolute; top: -3px; right: -3px; box-sizing: border-box; width: 8px; height: 8px; border-top: 1px solid currentColor; border-right: 1px solid currentColor; }
+.todo-dlg-b { flex: 1; min-height: 0; overflow: auto; padding: 4px 16px 16px; font-size: var(--l-note); line-height: 1.5; color: var(--vscode-descriptionForeground); }
+.todo-dlg-note { padding: 8px 0; border-bottom: 1px solid var(--vscode-panel-border); color: var(--vscode-foreground); }
+.todo-dlg-note-label { font-weight: 600; }
+.todo-ds { border-bottom: 1px solid var(--vscode-panel-border); }
+.todo-ds:last-child { border-bottom: 0; }
+.todo-ds.dragging { opacity: 0.45; }
+.todo-ds.drop-before { box-shadow: inset 0 2px 0 var(--vscode-focusBorder); }
+.todo-ds.drop-after { box-shadow: inset 0 -2px 0 var(--vscode-focusBorder); }
+.todo-ds-hrow { position: relative; display: flex; align-items: center; }
+.todo-ds-grip { position: absolute; left: -14px; top: 50%; transform: translateY(-50%); font-size: var(--l-label); letter-spacing: -2px; color: var(--vscode-descriptionForeground); opacity: 0.45; cursor: grab; user-select: none; }
+.todo-ds-hrow:is(:hover, :focus-within) .todo-ds-grip { opacity: 1; }
+.todo-ds-h { flex: 1; min-width: 0; display: flex; gap: 8px; align-items: center; padding: 8px 0; border: 0; background: transparent; color: var(--vscode-foreground); font: inherit; font-size: var(--l-note); text-align: left; cursor: pointer; }
+div.todo-ds-h { cursor: grab; }
+.todo-ds-h:focus-visible { outline: 1px solid var(--vscode-focusBorder); }
+.todo-ds-chev { flex: none; display: inline-block; width: 12px; color: var(--vscode-descriptionForeground); transition: transform 0.16s; }
+.todo-ds.open .todo-ds-chev { transform: rotate(90deg); }
+.todo-ds-label { flex: none; font-size: var(--l-label); font-weight: 600; letter-spacing: 0.08em; }
+.todo-ds-hint { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--vscode-descriptionForeground); }
+.todo-ds-b { padding: 0 0 12px; }
+.todo-note-v { min-height: 28px; padding: 2px 6px; margin: 0 -6px; border-radius: 2px; white-space: pre-wrap; overflow-wrap: anywhere; font-size: var(--l-body); line-height: 1.7; color: var(--vscode-foreground); cursor: text; }
+.todo-note-v:hover { box-shadow: 0 0 0 1px var(--vscode-panel-border); }
+.todo-note-v:focus-visible { outline: 1px solid var(--vscode-focusBorder); }
+.todo-note-v.empty { color: var(--vscode-descriptionForeground); }
+.todo-note-in { display: block; box-sizing: border-box; width: 100%; min-height: 96px; padding: 2px 6px; border: 1px solid var(--vscode-focusBorder); border-radius: 2px; background: var(--vscode-input-background); color: var(--vscode-input-foreground); font: inherit; font-size: var(--l-body); line-height: 1.7; resize: vertical; outline: none; }
+.todo-mb { display: block; font-size: var(--l-label); line-height: 1.4; color: var(--vscode-descriptionForeground); }
+.todo-mk { font-size: var(--l-label); font-weight: 600; letter-spacing: 0.08em; line-height: 1.4; color: var(--vscode-foreground); }
+.todo-dn-r { display: grid; grid-template-columns: 104px minmax(0, 1fr); gap: 0 12px; align-items: baseline; }
+.todo-dn-t { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: var(--l-body); line-height: 1.7; color: var(--vscode-foreground); }
+.todo-dn-t.empty { color: var(--vscode-descriptionForeground); }
+.todo-mr { display: grid; grid-template-columns: 104px minmax(0, 1fr); gap: 4px 12px; align-items: baseline; padding: 4px 0; }
+.todo-mt { display: block; white-space: pre-wrap; overflow-wrap: anywhere; font-size: var(--l-body); line-height: 1.7; color: var(--vscode-foreground); }
+.todo-kids { margin: 0; padding: 0; list-style: none; }
+.todo-kid { display: flex; gap: 4px 12px; align-items: center; padding: 4px 0; border-bottom: 1px solid var(--vscode-panel-border); }
+.todo-kid:last-child { border-bottom: 0; }
+.todo-kid .todo-state { color: var(--todo-ic, var(--vscode-foreground)); }
+.todo-kid-t { flex: 1 1 200px; min-width: 0; display: flex; gap: 8px; align-items: baseline; padding: 0; border: 0; background: transparent; color: var(--vscode-foreground); font: inherit; font-size: var(--l-body); line-height: 1.7; text-align: left; overflow-wrap: anywhere; cursor: pointer; }
+.todo-kid-t:hover { text-decoration: underline; text-underline-offset: 3px; }
+.todo-kid.st-done .todo-kid-t { color: var(--vscode-descriptionForeground); }
+.todo-kid-due { flex: none; margin-left: auto; color: var(--vscode-descriptionForeground); font-variant-numeric: tabular-nums; white-space: nowrap; }
+.todo-fg { display: grid; grid-template-columns: 88px minmax(0, 1fr); gap: 6px 12px; align-items: center; }
+.todo-fl { font-size: var(--l-label); font-weight: 600; letter-spacing: 0.08em; line-height: 1.4; color: var(--vscode-descriptionForeground); }
+.todo-fv { min-width: 0; display: flex; flex-wrap: wrap; gap: 4px 8px; align-items: center; font-size: var(--l-body); color: var(--vscode-foreground); }
+.todo-places { display: contents; }
+.todo-seg { display: inline-flex; flex-wrap: wrap; border: 1px solid var(--vscode-panel-border); border-radius: 2px; }
+.todo-seg > button { padding: 0 8px; border: 0; border-right: 1px solid var(--vscode-panel-border); background: transparent; color: var(--vscode-descriptionForeground); font: inherit; font-size: var(--l-note); line-height: 22px; cursor: pointer; }
+.todo-seg > button:last-child { border-right: 0; }
+.todo-seg > button.on { background: var(--vscode-toolbar-hoverBackground); color: var(--vscode-foreground); font-weight: 600; }
+.todo-seg > button:focus-visible { outline: 1px solid var(--vscode-focusBorder); outline-offset: -1px; }
+:is(.todo-date, .todo-group-in, .todo-parent-in) { min-width: 0; max-width: 100%; height: 24px; padding: 0 6px; border: 1px solid var(--vscode-input-border, var(--vscode-panel-border)); border-radius: 2px; background: var(--vscode-input-background); color: var(--vscode-input-foreground); font: inherit; font-size: var(--l-body); }
+.todo-parent-in { background: var(--vscode-dropdown-background, var(--vscode-input-background)); color: var(--vscode-dropdown-foreground, var(--vscode-input-foreground)); }
+:is(.todo-date, .todo-group-in, .todo-parent-in):focus { outline: none; border-color: var(--vscode-focusBorder); }
+.todo-ro { color: var(--vscode-descriptionForeground); }
+.todo-dlg.drag-over { outline: 1px dashed var(--vscode-focusBorder); outline-offset: -8px; }
+.todo-doc-images { display: flex; flex-wrap: wrap; gap: 12px; margin: 4px 0 8px; }
+.todo-doc-image { margin: 0; width: 168px; }
+.todo-doc-thumb { display: grid; place-items: center; width: 168px; height: 96px; padding: 0; border: 1px solid var(--vscode-panel-border); border-radius: 2px; overflow: hidden; background: var(--vscode-editor-background); cursor: zoom-in; }
+.todo-doc-thumb:is(:hover, :focus-visible) { border-color: var(--vscode-focusBorder); outline: none; }
+.todo-doc-thumb img { display: block; width: 100%; height: 100%; object-fit: cover; }
+.todo-doc-missing { font-size: var(--l-note); color: var(--vscode-descriptionForeground); }
+.todo-doc-links { margin: 0 0 8px; padding: 0; list-style: none; }
+.todo-doc-link { display: flex; flex-wrap: wrap; gap: 0 12px; align-items: baseline; padding: 4px 0; border-bottom: 1px solid var(--vscode-panel-border); }
+.todo-doc-kind { flex: none; color: var(--vscode-descriptionForeground); }
+.todo-doc-open { flex: 1 1 200px; min-width: 0; font-size: var(--l-body); text-decoration: underline; overflow-wrap: anywhere; }
+.todo-doc-rm { flex: none; margin-left: auto; }
+.todo-doc-actions { display: flex; flex-wrap: wrap; gap: 4px 16px; align-items: center; }
+.todo-doc-in { flex: 1 1 320px; min-width: 0; height: 24px; padding: 0 6px; border: 1px solid var(--vscode-focusBorder); border-radius: 2px; background: var(--vscode-input-background); color: var(--vscode-input-foreground); font: inherit; font-size: var(--l-body); outline: none; }
+@media (max-width: 560px) {
+  .todo-dlg, .todo-dlg.max { left: 0; top: 0; bottom: 0; transform: none; width: 100%; border: 0; border-radius: 0; box-shadow: none; }
+  .todo-dlg-max { display: none; }
+  .todo-fg { grid-template-columns: minmax(0, 1fr); }
+}
+@media (prefers-reduced-motion: reduce) {
+  .todo-ds-chev { transition: none; }
+}
+.todo-row { position: relative; }
+.todo-row-add { position: absolute; left: 0; top: -10px; width: 12px; height: 20px; padding: 0; border: 0; border-radius: 2px; background: transparent; color: var(--vscode-descriptionForeground); font-size: var(--l-note); line-height: 20px; cursor: pointer; opacity: 0.3; }
+.todo-row:is(:hover, :focus-within) > .todo-row-add { opacity: 1; }
+.todo-row-add:hover { background: var(--vscode-toolbar-hoverBackground); color: var(--vscode-foreground); }
+.todo-addrow { display: block; width: calc(100% - 16px); margin: 0 8px; padding: 0 4px 0 48px; border: 0; border-radius: 2px; background: transparent; color: var(--vscode-textLink-foreground); font: inherit; font-size: var(--l-note); line-height: 24px; text-align: left; cursor: pointer; }
+.todo-addrow:is(:hover, :focus-visible) { text-decoration: underline; text-underline-offset: 3px; }
+.todo-addrow:focus-visible { outline: 1px solid var(--vscode-focusBorder); outline-offset: -1px; }
+.todo-inline { padding: 4px 4px 4px calc(56px + max(var(--todo-depth) - 1, 0) * 20px); cursor: default; }
+.todo-inline-in { width: 100%; box-sizing: border-box; height: 24px; padding: 0 6px; border: 1px solid var(--vscode-focusBorder); border-radius: 2px; background: var(--vscode-input-background); color: var(--vscode-input-foreground); font: inherit; font-size: var(--l-body); outline: none; }
+.todo-inline-in::placeholder, .todo-sheet-title::placeholder { color: var(--vscode-input-placeholderForeground); }
+.todo-draft { display: flex; align-items: center; gap: 8px; }
+.todo-sheet { position: fixed; top: 0; right: 0; bottom: 0; z-index: 65; display: flex; flex-direction: column; width: min(380px, 100%); box-sizing: border-box; background: var(--vscode-editor-background); border-left: 1px solid var(--vscode-panel-border); container: todo-sheet / inline-size; }
+body:has(.todo-sheet:not([hidden])) .todo-pane.active { margin-right: 380px; }
+@media (max-width: 760px) {
+  .todo-sheet { width: 100%; border-left: 0; }
+  body:has(.todo-sheet:not([hidden])) .todo-pane.active { margin-right: 0; }
+}
+.todo-sheet[hidden] { display: none; }
+.todo-sheet-scroll { flex: 1 1 auto; min-height: 0; overflow: auto; padding: 16px 16px 16px 20px; display: flex; flex-direction: column; gap: 8px; }
+.todo-sheet-head { flex: none; display: flex; align-items: center; gap: 8px; min-height: 48px; padding: 4px 16px 4px 20px; border-bottom: 1px solid var(--vscode-panel-border); }
+.todo-sheet-heading { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+.todo-sheet-field { display: flex; flex-direction: column; gap: 4px; }
+.todo-sheet-title { width: 100%; box-sizing: border-box; height: 28px; padding: 0 8px; border: 1px solid var(--vscode-input-border, var(--vscode-panel-border)); border-radius: 2px; background: var(--vscode-input-background); color: var(--vscode-input-foreground); font: inherit; font-size: var(--l-body); }
+.todo-sheet-title:focus, .todo-sheet-memo:focus { outline: none; border-color: var(--vscode-focusBorder); }
+.todo-sheet-hint { margin: 0; font-size: var(--l-note); line-height: 1.5; color: var(--vscode-descriptionForeground); }
+.todo-sheet-memo { width: 100%; box-sizing: border-box; padding: 4px 6px; border: 1px solid var(--vscode-input-border, var(--vscode-panel-border)); border-radius: 2px; background: var(--vscode-input-background); color: var(--vscode-input-foreground); font: inherit; font-size: var(--l-body); resize: vertical; }
+.todo-sheet-added ol { margin: 4px 0 0; padding-left: 20px; font-size: var(--l-note); line-height: 1.6; }
+.todo-sheet-foot { flex: none; display: flex; align-items: center; gap: 8px; padding: 8px 16px; border-top: 1px solid var(--vscode-panel-border); }
+.todo-sheet-btn { height: 26px; padding: 0 12px; border: 1px solid var(--vscode-button-border, var(--vscode-panel-border)); border-radius: 2px; background: var(--vscode-button-secondaryBackground, transparent); color: var(--vscode-button-secondaryForeground, var(--vscode-foreground)); font: inherit; font-size: var(--l-note); cursor: pointer; }
+.todo-sheet-btn.primary { border-color: var(--vscode-button-border, transparent); background: var(--vscode-button-background); color: var(--vscode-button-foreground); }
+.todo-sheet-btn:focus-visible { outline: 1px solid var(--vscode-focusBorder); outline-offset: 1px; }
+.todo-sheet-keep { margin-left: auto; display: inline-flex; align-items: center; gap: 4px; font-size: var(--l-note); }
+@container todo-sheet (max-width: 320px) {
+  .todo-sheet-fields { grid-template-columns: minmax(0, 1fr); }
+}
+.todo-grip { position: absolute; left: 0; top: 10px; width: 12px; height: 20px; padding: 0; border: 0; border-radius: 2px; background: transparent; color: var(--vscode-descriptionForeground); cursor: grab; opacity: 0.45; touch-action: none; }
+.todo-grip::before { content: "⋮⋮"; font-size: var(--l-label); letter-spacing: -2px; line-height: 20px; }
+.todo-row:is(:hover, :focus-within) > .todo-grip, .todo-row.selected > .todo-grip { opacity: 1; }
+.todo-dragging, .todo-dragging .todo-grip { cursor: grabbing; }
+.todo-list { position: relative; }
+.todo-row.todo-dragged { opacity: 0.4; }
+.todo-row.selected { background: var(--vscode-list-inactiveSelectionBackground); }
+.todo-row.selected:focus { background: var(--vscode-list-activeSelectionBackground); color: var(--vscode-list-activeSelectionForeground, inherit); }
+.todo-row.todo-drop-parent { outline: 1px dashed var(--vscode-focusBorder); outline-offset: -1px; }
+.todo-drop-line { position: absolute; right: 8px; z-index: 5; height: 0; border-top: 2px solid var(--vscode-focusBorder); pointer-events: none; }
+.todo-drop-label { position: absolute; right: 0; top: -10px; padding: 0 6px; border-radius: 2px; background: var(--vscode-editorWidget-background, var(--vscode-editor-background)); color: var(--vscode-foreground); font-size: var(--l-label); line-height: 18px; white-space: nowrap; box-shadow: 0 1px 4px var(--vscode-widget-shadow); }
+.todo-selbar { display: flex; flex-wrap: wrap; align-items: baseline; gap: 4px 16px; padding: 4px 16px 4px var(--todo-head-g); border-top: 1px solid var(--vscode-panel-border); font-size: var(--l-note); }
+.todo-selbar-clear { margin-left: auto; }
+.todo-selbar[hidden] { display: none; }
+.todo-selbar-count { font-weight: 600; font-variant-numeric: tabular-nums; }
+.todo-popmenu-filter, .todo-popmenu-input { margin: 0 4px 4px; height: 24px; padding: 0 6px; border: 1px solid var(--vscode-input-border, var(--vscode-panel-border)); border-radius: 2px; background: var(--vscode-input-background); color: var(--vscode-input-foreground); font: inherit; font-size: var(--l-body); }
+.todo-popmenu-filter:focus, .todo-popmenu-input:focus { outline: none; border-color: var(--vscode-focusBorder); }
+.todo-popmenu-body { display: flex; flex-direction: column; max-height: 60vh; overflow: auto; }
+.todo-popmenu-back { color: var(--vscode-descriptionForeground); }
+.todo-popmenu-preview { min-height: 18px; padding: 0 12px; font-size: var(--l-note); line-height: 18px; color: var(--vscode-descriptionForeground); }
+.todo-popmenu-empty { padding: 2px 12px; font-size: var(--l-note); color: var(--vscode-descriptionForeground); }
+#tododrawerbtn {
+  display: inline-grid;
+  place-items: center;
+  flex: 0 0 auto;
+  width: 30px;
+  height: 26px;
+  margin: 0 1px;
+  padding: 0;
+  border: 1px solid transparent;
+  border-radius: 2px;
+  background: transparent;
+  color: var(--vscode-foreground);
+  cursor: pointer;
+}
+#tododrawerbtn:hover, #tododrawerbtn[aria-expanded="true"] { background: var(--vscode-toolbar-hoverBackground); }
+#tododrawerbtn[aria-expanded="true"] { border-color: var(--vscode-contrastActiveBorder, transparent); }
+#tododrawerbtn:focus-visible, .todo-link-chip:focus-visible, .todo-play:focus-visible { outline: 1px solid var(--vscode-focusBorder); outline-offset: 1px; }
+.l-icon-checklist { --l-icon: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16' fill='none' stroke='black' stroke-width='1.1'%3E%3Cpath d='M2.5 4.2 3.7 5.4 5.8 3'/%3E%3Cpath d='M2.5 9.7 3.7 10.9 5.8 8.5'/%3E%3Cpath d='M8 4.5h5.5M8 10h5.5'/%3E%3C/svg%3E"); }
+.l-icon-chat { --l-icon: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16' fill='none' stroke='black' stroke-width='1.1' stroke-linejoin='round'%3E%3Cpath d='M2.5 3.5h11v7h-6l-3 2.5v-2.5h-2z'/%3E%3C/svg%3E"); }
+.todo-link-chip { display: inline-flex; align-items: center; gap: 4px; flex: 0 1 auto; min-width: 0; max-width: 220px; height: 22px; margin: 0 2px; padding: 0 6px; border: 1px solid var(--vscode-panel-border); border-radius: 2px; background: transparent; color: var(--vscode-foreground); font-size: var(--l-note); cursor: pointer; }
+.todo-link-chip:hover { background: var(--vscode-toolbar-hoverBackground); }
+.todo-link-chip > svg { flex: none; color: var(--todo-ic, var(--vscode-foreground)); }
+.todo-link-num { flex: none; color: var(--vscode-descriptionForeground); font-variant-numeric: tabular-nums; }
+.todo-link-title { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.todo-drawer { position: fixed; top: 0; right: 0; bottom: 0; z-index: 70; display: flex; flex-direction: column; width: min(440px, 100%); background: var(--vscode-editor-background); border-left: 1px solid var(--vscode-panel-border); box-shadow: -2px 0 8px var(--vscode-widget-shadow); container: todo-pane / inline-size; }
+.todo-drawer[hidden] { display: none; }
+.todo-drawer-head { flex: none; border-bottom: 1px solid var(--vscode-panel-border); font-size: var(--l-note); }
+.todo-drawer-bar { display: flex; align-items: center; gap: 8px; min-height: 48px; padding: 4px 12px 4px 16px; }
+.todo-drawer-title { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+.todo-drawer-actions { flex: none; display: flex; align-items: center; gap: 4px; }
+.todo-drawer-sub { display: flex; flex-wrap: wrap; align-items: baseline; gap: 4px 12px; padding: 0 12px 8px 16px; }
+.todo-drawer-scope { display: inline-flex; gap: 12px; }
+.todo-drawer-scope[hidden] { display: none; }
+.todo-drawer-scope .todo-link.on { color: var(--vscode-foreground); font-weight: 600; text-decoration: underline; text-underline-offset: 3px; }
+.todo-drawer-count { margin-left: auto; font-size: var(--l-label); color: var(--vscode-descriptionForeground); font-variant-numeric: tabular-nums; }
+.todo-drawer-list { flex: 1 1 auto; overflow-y: auto; padding-bottom: 16px; }
+.todo-play { flex: none; padding: 0 6px; border: 1px solid var(--vscode-panel-border); border-radius: 3px; background: transparent; color: var(--vscode-foreground); font: inherit; font-size: var(--l-note); font-weight: 600; line-height: 18px; white-space: nowrap; cursor: pointer; }
+.todo-play:hover { background: var(--vscode-toolbar-hoverBackground); }
+.todo-talk { display: inline-flex; flex: none; align-items: center; gap: 6px; font-size: var(--l-note); line-height: 20px; color: var(--vscode-descriptionForeground); white-space: nowrap; }
+.todo-talk-dot { flex: none; width: 6px; height: 6px; border-radius: 50%; background: var(--vscode-descriptionForeground); }
+.todo-talk.running .todo-talk-dot { background: var(--vscode-foreground); animation: todo-breathe 2.4s ease-in-out infinite; }
+.todo-talk.waiting .todo-talk-word { color: var(--vscode-foreground); }
+@keyframes todo-breathe { 50% { opacity: 0.35; } }
+@media (prefers-reduced-motion: reduce) { .todo-talk.running .todo-talk-dot { animation: none; } }
+.todo-sub-title { display: flex; align-items: start; gap: 4px; min-width: 0; }
+.todo-sub-text { flex: 0 1 auto; min-width: 0; line-height: 20px; overflow-wrap: anywhere; word-break: auto-phrase; }
+:is(.todo-sub-text, .todo-title-wrap) > :not(.todo-title, .todo-title-in) { margin-left: 8px; vertical-align: baseline; }
+.todo-ask { display: grid; grid-template-columns: 7px auto minmax(0, 1fr); column-gap: 8px; align-items: baseline; padding: 4px 4px 0 calc(56px - 15px + min(var(--todo-depth), 1) * 16px + var(--todo-depth) * 20px); }
+.todo-ask .you-square { align-self: start; margin-top: 7px; }
+.todo-ask-meta { grid-column: 3; display: flex; flex-wrap: wrap; align-items: baseline; gap: 0 8px; min-width: 0; }
+.todo-ask-src { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: var(--l-note); line-height: 1.5; color: var(--vscode-descriptionForeground); }
+.todo-ask-q { font-size: var(--l-body); line-height: 20px; overflow-wrap: anywhere; word-break: auto-phrase; text-wrap: pretty; }
+.todo-ask.stale :is(.todo-ask-q, .you-kind) { color: var(--vscode-descriptionForeground); }
+.todo-ask.stale .you-square { background: none; border: 1px solid var(--vscode-descriptionForeground); }
+.todo-ask-stale { font-size: var(--l-label); line-height: 1.4; color: var(--vscode-descriptionForeground); white-space: nowrap; }
+.todo-ask-note { display: block; font-size: var(--l-note); line-height: 20px; color: var(--vscode-descriptionForeground); }
+.todo-ask-acts { grid-column: 2 / -1; display: flex; flex-wrap: wrap; align-items: center; gap: 0 12px; padding-bottom: 4px; line-height: 20px; white-space: nowrap; }
+.todo-you-count { flex: none; display: inline-flex; align-items: center; gap: 6px; font-size: var(--l-note); line-height: 20px; white-space: nowrap; font-variant-numeric: tabular-nums; }
+.todo-you-count::before { content: ""; width: 7px; height: 7px; background: var(--laisora-accent); }
+.todo-you-count[hidden] { display: none; }
+.todo-you-n { margin-left: 4px; }
+@container todo-pane (max-width: 480px) {
+  .todo-ask { padding-left: calc(56px - 15px + min(var(--todo-depth), 1) * 24px + var(--todo-depth) * 12px); }
+}
+.todo-stale { margin: 0 0 4px; font-size: var(--l-note); line-height: 1.5; color: var(--vscode-editorWarning-foreground, var(--vscode-descriptionForeground)); }
+.todo-result .todo-mt { white-space: pre-wrap; }
+.todo-mt.empty { color: var(--vscode-descriptionForeground); }
+.tab-todo-count { margin-left: 6px; font-size: var(--l-note); letter-spacing: 0; color: var(--vscode-descriptionForeground); font-variant-numeric: tabular-nums; }
+.tab-todo-count:empty { display: none; }
+.tab-todo-fresh { margin-left: 4px; padding: 0 4px; border-radius: 8px; font-size: var(--l-note); line-height: 16px; letter-spacing: 0; background: var(--vscode-badge-background); color: var(--vscode-badge-foreground); font-variant-numeric: tabular-nums; }
+.tab-todo-fresh[hidden] { display: none; }
+button.todo-you-count { padding: 0 6px; border: 1px solid transparent; border-radius: 3px; background: transparent; color: var(--vscode-foreground); font: inherit; font-size: var(--l-note); cursor: pointer; }
+button.todo-you-count:hover { background: var(--vscode-toolbar-hoverBackground); }
+button.todo-you-count.active { border-color: var(--vscode-focusBorder); }
+button.todo-you-count:focus-visible { outline: 1px solid var(--vscode-focusBorder); outline-offset: 1px; }
+.todo-stale-all { flex: none; font-size: var(--l-note); white-space: nowrap; }
+.todo-stale-all[hidden] { display: none; }
+.todo-group { cursor: pointer; }
+.todo-group-fold { flex: none; width: 16px; height: 16px; padding: 0; border: 0; border-radius: 3px; background: transparent; color: var(--vscode-descriptionForeground); font: inherit; line-height: 16px; cursor: pointer; }
+.todo-group-fold::before { content: "▾"; }
+.todo-group-fold[aria-expanded="false"]::before { content: "▸"; }
+.todo-group-fold:hover { background: var(--vscode-toolbar-hoverBackground); color: var(--vscode-foreground); }
+.todo-group-fold:focus-visible, .todo-group-name-btn:focus-visible { outline: 1px solid var(--vscode-focusBorder); outline-offset: 1px; }
+.todo-group-name-btn { padding: 0; border: 0; background: transparent; color: inherit; font-family: inherit; text-align: left; cursor: text; }
+.todo-group-name-btn:hover { text-decoration: underline; text-underline-offset: 3px; }
+.todo-group-rename { min-width: 0; flex: 0 1 240px; height: 22px; padding: 0 6px; border: 1px solid var(--vscode-focusBorder); border-radius: 2px; background: var(--vscode-input-background); color: var(--vscode-input-foreground); font: inherit; font-size: var(--l-label); }
+.todo-group-status { flex: none; font-size: var(--l-note); line-height: 1.4; color: var(--vscode-descriptionForeground); }
+.todo-done-fold { display: block; margin: 2px 8px; padding: 0 4px 0 calc(48px + var(--todo-depth, 0) * 20px); border: 0; background: transparent; color: var(--vscode-textLink-foreground); font: inherit; font-size: var(--l-note); line-height: 22px; text-align: left; cursor: pointer; }
+.todo-done-fold:is(:hover, :focus-visible) { text-decoration: underline; text-underline-offset: 3px; }
+.todo-done-fold:focus-visible { outline: 1px solid var(--vscode-focusBorder); outline-offset: -1px; }
+.todo-addgroup { margin-top: 12px; padding-left: 12px; }
+.todo-title-wrap { min-width: 0; line-height: 20px; overflow-wrap: anywhere; word-break: auto-phrase; }
+:is(.todo-p0, .todo-prio, .todo-held) { flex: none; display: inline-flex; align-items: baseline; gap: 4px; font-size: var(--l-label); font-weight: 600; letter-spacing: 0.08em; line-height: 20px; white-space: nowrap; font-feature-settings: "palt"; }
+.todo-p0 { color: var(--vscode-foreground); }
+.todo-prio, .todo-held { color: var(--vscode-descriptionForeground); }
+.todo-claude-dot { flex: none; align-self: center; width: 6px; height: 6px; padding: 0; border: 0; border-radius: 50%; background: var(--vscode-descriptionForeground); opacity: .7; cursor: pointer; }
+.todo-claude-dot:hover { opacity: 1; }
+.todo-claude-dot:focus-visible { outline: 1px solid var(--vscode-focusBorder); outline-offset: 2px; }
+.todo-change-basis { margin-inline-start: var(--l-space-2); color: var(--vscode-descriptionForeground); }
+.todo-history-btn { display: inline-flex; align-items: center; gap: 4px; height: 24px; padding: 0 6px; border: 0; border-radius: 2px; background: none; color: var(--vscode-foreground); font: inherit; font-size: var(--l-note); cursor: pointer; }
+.todo-history-btn:hover { background: var(--vscode-toolbar-hoverBackground); }
+.todo-history-btn[hidden] { display: none; }
+.todo-history-btn:focus-visible { outline: 1px solid var(--vscode-focusBorder); outline-offset: -1px; }
+.todo-history-badge { min-width: 14px; padding: 0 4px; border-radius: 7px; background: var(--vscode-badge-background); color: var(--vscode-badge-foreground); font-size: var(--l-label); line-height: 14px; text-align: center; }
+.todo-history-tabs { display: flex; gap: var(--l-space-3); padding: 0 16px 0 var(--todo-head-g); }
+.todo-history-tab { padding: var(--l-space-1) 0; border: 0; border-bottom: 2px solid transparent; background: none; color: var(--vscode-descriptionForeground); font: inherit; cursor: pointer; }
+.todo-history-tab[aria-selected="true"] { border-bottom-color: var(--laisora-accent); color: var(--vscode-foreground); }
+.todo-history-tab:focus-visible { outline: 1px solid var(--vscode-focusBorder); outline-offset: -1px; }
+.todo-guess { margin-left: 4px; font-size: var(--l-note); color: var(--vscode-descriptionForeground); text-decoration: underline dotted; text-underline-offset: 3px; cursor: help; }
+.todo-date-due.overdue { color: var(--vscode-errorForeground); }
+.todo-date-due.tomorrow { color: var(--vscode-foreground); }
+:is(.todo-date-due.today, .todo-date-soon) { color: var(--vscode-foreground); font-weight: 600; }
+.todo-row.flash { animation: todo-flash 2.4s ease-out 1; }
+@keyframes todo-flash { from { background: var(--vscode-editor-findMatchHighlightBackground, var(--vscode-list-hoverBackground)); } to { background: transparent; } }
+@media (prefers-reduced-motion: reduce) { .todo-row.flash { animation: none; outline: 1px solid var(--vscode-focusBorder); outline-offset: -1px; } }
+.todo-kids-line { margin: 0 0 4px; font-size: var(--l-note); line-height: 1.6; color: var(--vscode-descriptionForeground); }
+.todo-hist .todo-seg { margin-bottom: 6px; }
+.todo-hist-text { flex-basis: 100%; margin: 4px 0 0; padding: 6px 8px; max-height: 320px; overflow: auto; border: 1px solid var(--vscode-panel-border); border-radius: 2px; background: var(--vscode-textCodeBlock-background, transparent); font-family: inherit; font-size: var(--l-note); line-height: 1.6; white-space: pre-wrap; overflow-wrap: anywhere; }
+.todo-doc-label { font-size: var(--l-note); }
+.todo-viewer { position: absolute; inset: 0; z-index: 2; display: flex; flex-direction: column; background: var(--vscode-editor-background); outline: none; }
+.todo-viewer-stage { flex: 1 1 auto; min-height: 0; display: flex; align-items: center; justify-content: center; padding: 12px; overflow: hidden; }
+.todo-viewer-stage img { max-width: 100%; max-height: 100%; object-fit: contain; }
+.todo-viewer-bar { flex: none; display: flex; align-items: center; gap: 8px; min-height: 48px; padding: 0 12px 0 16px; border-bottom: 1px solid var(--vscode-panel-border); }
+.todo-viewer-where { flex: 1 1 auto; min-width: 0; display: flex; align-items: baseline; gap: 8px; }
+.todo-viewer-count { flex: none; font-size: var(--l-note); color: var(--vscode-descriptionForeground); font-variant-numeric: tabular-nums; }
+.todo-viewer-actions { flex: none; display: flex; align-items: center; gap: 4px; }
+.todo-viewer-nav { flex: none; display: flex; justify-content: center; align-items: center; gap: 16px; padding: 8px 12px 12px; }
+.todo-drawer-marks { display: flex; flex-wrap: wrap; align-items: baseline; gap: 8px; padding: 4px 12px; border-bottom: 1px solid var(--vscode-panel-border); font-size: var(--l-note); }
+.todo-drawer-marks[hidden] { display: none; }
+.todo-drawer-marks-label { font-weight: 600; }
+.todo-popmenu-item .todo-dot { display: inline-block; margin-right: 6px; vertical-align: middle; }
+.todo-brief .todo-brief-text { min-height: 280px; line-height: 1.6; }
+.todo-group-pick { display: inline-flex; min-width: 0; max-width: 100%; }
+.tab-todo-dot { width: 6px; height: 6px; }
+.tab-todo-child { flex: none; color: var(--vscode-descriptionForeground); }
+.tab-todo-child[hidden], .tab-unread[hidden] { display: none; }
+.tab-unread { flex: none; min-width: 16px; padding: 0 4px; box-sizing: border-box; border-radius: 8px; font-size: var(--l-note); line-height: 16px; text-align: center; background: var(--vscode-badge-background); color: var(--vscode-badge-foreground); font-variant-numeric: tabular-nums; }
+.tab.dragging { opacity: 0.5; }
+.tab.drop-before { box-shadow: inset 2px 0 0 var(--vscode-focusBorder); }
+.tab.drop-after { box-shadow: inset -2px 0 0 var(--vscode-focusBorder); }
+.todo-crumbs { display: flex; flex-wrap: wrap; align-items: center; gap: 4px; min-width: 0; font-size: var(--l-note); color: var(--vscode-descriptionForeground); }
+.todo-crumbs[hidden] { display: none; }
+.todo-crumb { min-width: 0; max-width: 24ch; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; padding: 0; border: 0; background: none; color: var(--vscode-textLink-foreground); font: inherit; cursor: pointer; }
+.todo-crumb:hover { text-decoration: underline; }
+.todo-crumb-deleted { color: var(--vscode-descriptionForeground); font-style: italic; cursor: default; }
+.todo-crumb-sep { color: var(--vscode-descriptionForeground); }
+.todo-conv-head { display: flex; flex-direction: column; gap: 8px; margin: 8px 0; }
+.todo-conv-head[hidden] { display: none; }
+.panel-conv:has(.block.user, .block.assistant, .block.assistant-turn) .todo-empty-hint { display: none; }
+.todo-empty-hint { margin: 0; font-size: var(--l-note); color: var(--vscode-descriptionForeground); }
+.todo-start-card, .todo-split-card { padding: 8px 12px; border: 1px solid var(--vscode-panel-border); border-left: 3px solid var(--todo-gc, var(--vscode-panel-border)); border-radius: 4px; background: var(--vscode-editorWidget-background, transparent); font-size: var(--l-note); }
+.todo-start-head, .todo-split-head { font-weight: 600; letter-spacing: 0.04em; }
+.todo-start-memo { display: grid; grid-template-columns: max-content minmax(0, 1fr); gap: 8px; margin-top: 4px; }
+.todo-start-label { color: var(--vscode-descriptionForeground); }
+.todo-start-text { white-space: pre-wrap; overflow-wrap: anywhere; }
+.todo-start-passed { margin-top: 6px; }
+.todo-start-passed > summary { cursor: pointer; color: var(--vscode-descriptionForeground); }
+.todo-start-brief { margin: 4px 0 0; max-height: 240px; overflow: auto; white-space: pre-wrap; font-size: var(--l-note); }
+.todo-start-stale { margin-top: 4px; color: var(--vscode-editorWarning-foreground, var(--vscode-descriptionForeground)); }
+.todo-split-line { display: flex; flex-wrap: wrap; align-items: baseline; gap: 8px; padding-left: 8px; border-left: 3px solid var(--todo-gc, var(--vscode-panel-border)); font-size: var(--l-note); color: var(--vscode-descriptionForeground); }
+.todo-split-item { margin-top: 4px; font-weight: 600; }
+.todo-split-reason { margin-top: 2px; }
+.todo-split-acts { display: flex; flex-wrap: wrap; gap: 12px; margin-top: 6px; }
+.todo-tool-error { color: var(--vscode-errorForeground); white-space: pre-wrap; }
+p.todo-tool-error { margin: 4px 0 0; }
+.todo-card-row { cursor: default; }
+.todo-card-row:hover { background: none; }
+.todo-card-num { flex: none; min-width: 5ch; color: var(--vscode-descriptionForeground); font-variant-numeric: tabular-nums; }
+.todo-card-title { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; padding-inline-start: calc(max(var(--todo-depth, 1) - 1, 0) * 1.25em); text-align: left; }
+.todo-card-group .todo-card-title { font-weight: 600; }
+.todo-card-context .todo-card-title, .todo-card-context .todo-card-num { color: var(--vscode-descriptionForeground); opacity: 0.75; }
+.todo-card-removed .todo-card-title { text-decoration: line-through; color: var(--vscode-descriptionForeground); }
+.todo-card-mark { flex: none; min-width: 2ch; margin-inline-start: auto; text-align: right; }
+.todo-card-row.undone .todo-card-title, .todo-card-row.undone .todo-card-mark { color: var(--vscode-descriptionForeground); opacity: 0.6; }
+.todo-tool-state { flex: none; color: var(--vscode-descriptionForeground); }
+.todo-tool-revert { flex: none; }
+.todo-tool-note { margin: 0; padding: var(--l-space-1) 0; color: var(--vscode-descriptionForeground); }
+.todo-tool-status { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); white-space: nowrap; }
+.todo-tool-card { position: relative; }
+.todo-agent-link { display: inline-flex; flex-wrap: wrap; align-items: baseline; gap: 8px; margin-left: 8px; padding-left: 6px; border-left: 3px solid var(--todo-gc, var(--vscode-panel-border)); font-size: var(--l-note); }
+.hist-todo { display: flex; align-items: center; gap: 4px; min-width: 0; margin-top: 2px; font-size: var(--l-note); color: var(--vscode-descriptionForeground); }
+.hist-todo-text, .hist-todo-parent { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.hist-todo-parent::before { content: "· "; }
+.todo-drawer.in-rail { right: auto; bottom: auto; box-shadow: none; border-left: 1px solid var(--vscode-panel-border); }
+#tododrawerbtn:disabled { opacity: 0.4; background: transparent; cursor: default; }

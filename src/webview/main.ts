@@ -38,6 +38,7 @@ import {
   exportBtn,
   findBarEl,
   handoffBtn,
+  histBtn,
   inputEl,
   logsEl,
   modeBtn,
@@ -48,7 +49,7 @@ import {
   vscode,
   CONTEXT_CHIP_EMPTY,
 } from "./dom";
-import { applySessionChunk, applySessionHiddenChanged, applySessionListActionFailed, applySessionRenamed, initHistory, openHistPanel } from "./history";
+import { applySessionChunk, applySessionHiddenChanged, applySessionListActionFailed, applySessionRenamed, initHistory, openHistPanel, refreshHistList, setHistoryTodoOpened } from "./history";
 import {
   applyUserSettings,
   closeAuthPicker,
@@ -70,6 +71,9 @@ import {
   handleSessionImageError,
   handleSessionImageResult,
   isScrollCarry,
+  persistAskDismissals,
+  savedMessageAskState,
+  setOnAskDismissed,
   setOnConvViewShown,
   setOnTabActivity,
 } from "./tab";
@@ -79,6 +83,14 @@ import type { CoverageBackfillHint } from "./work-graph";
 import { renderLlmDiagnosticsView } from "./llm-diagnostics-view";
 import { closeFindBar, findNext, initFindBar, isFindBarOpen, openFindBar, refreshFind } from "./find-bar";
 import { uiLocale } from "./l10n";
+import { isComposingKey } from "./composing";
+import { initTodoApp } from "./todo-app";
+import { TodoDrawer } from "./todo-drawer";
+import { readImageAsBase64 } from "./todo-edit";
+import { TodoTab } from "./todo-view";
+import { receiveTodoChanges, refreshTodoSplitCards, refreshTodoToolCards, todoSplitCard } from "./todo-chat";
+import { initTodoLinks } from "./todo-links";
+import { setTodoSplitRenderer } from "./markdown";
 
 export const MODE_LABELS: Record<PermissionModeId, string> = {
   default: l10n.t("Ask before actions"),
@@ -102,12 +114,118 @@ const tabs = new Map<string, Tab>();
 const overviews = new Map<string, WorkOverview>();
 setOnTabActivity((tabId, active) => overviews.get(tabId)?.setActive(active));
 setOnConvViewShown((tabId) => resumeConversationChase(tabId));
+setOnAskDismissed((tabId, identity) => todoTab.noteTabDismissal(tabId, identity));
 const localEventDrops = new Map<string, number>();
 const hostDroppedAtInstall = new Map<string, number>();
 export let activeTabId: string | null = vscode.getState()?.activeTabId ?? null;
 let activeTabAfterInit: string | null = null;
 const drafts = new Map<string, string>(Object.entries(vscode.getState()?.drafts ?? {}));
 const forgottenTabIds = new Set<string>();
+const TODO_TAB_KEY = "todo";
+const TAB_DRAG_MIME = "application/x-laisora-tab";
+let todoReturnTabId: string | null = null;
+let todoShowPending = false;
+const todoApp = initTodoApp((message) => vscode.postMessage(message), {
+  items: () => todoTab.items,
+  numberOf: (id) => todoTab.numberOf(id),
+  colorOf: (id) => todoTab.colorOf(id),
+  undoKeysActive: () => todoTab.shown || todoDrawer.isOpen,
+});
+const todoTab = new TodoTab(vscode.getState()?.todo, {
+  activate: () => showTodoTab(),
+  changed: () => persistState(),
+  post: (message) => vscode.postMessage(message),
+  asks: {
+    tabs: () => [...tabs.values()].map((t) => ({ tabId: t.tabId, title: t.title, reader: t.youItems, messageOf: (item: Parameters<Tab["youMessageOf"]>[0]) => t.youMessageOf(item) })),
+    open: (tabId, item) => {
+      const t = tabs.get(tabId);
+      if (!t) return;
+      setActiveTab(tabId);
+      t.navigateToYou(item);
+    },
+    activate: (tabId) => {
+      const t = tabs.get(tabId);
+      if (!t) return;
+      setActiveTab(tabId);
+      if (t.viewMode !== "conv") t.setViewMode("conv");
+      resumeConversationChase(tabId);
+    },
+    findByMessage: (tabId, message) => tabs.get(tabId)?.youItemOfMessage(message),
+    historyState: (tabId) => {
+      const pager = convPagers.get(tabId);
+      if (pager === undefined || pager.status === "exhausted") return "done";
+      if (pager.status === "error") return "failed";
+      if (pager.status === "idle" && pager.chasePaused === true) {
+        resumeConversationChase(tabId);
+        return "loading";
+      }
+      return pager.status === "inflight" ? "loading" : "failed";
+    },
+    applyDismissals: (messages) => { for (const t of tabs.values()) t.applyAskDismissals(messages); },
+    dismiss: (tabId, item) => tabs.get(tabId)?.dismissYou(item),
+    persistDismissals: (identities) => persistAskDismissals(null, identities),
+    savedState: () => savedMessageAskState(),
+  },
+  unreadOfTab: (tabId) => tabs.get(tabId)?.unreadCount ?? 0,
+}, todoApp);
+const todoDrawer = new TodoDrawer(todoTab, {
+  rail: (tabId) => tabs.get(tabId)?.rightRail() ?? null,
+  showInTodoTab: (itemId) => {
+    showTodoTab();
+    if (itemId !== undefined) todoApp.open(itemId);
+  },
+});
+histBtn.before(todoDrawer.linkButton, todoDrawer.button);
+document.getElementById("app")!.append(todoDrawer.root);
+let pendingDrawerReveal: { itemId: string; until: number } | null = null;
+const TODO_REVEAL_WAIT_MS = 30_000;
+
+function tryPendingDrawerReveal(): void {
+  const pending = pendingDrawerReveal;
+  if (pending === null) return;
+  if (Date.now() > pending.until) { pendingDrawerReveal = null; return; }
+  if (activeTabId === null || todoTab.itemOfTab(activeTabId) !== pending.itemId) return;
+  pendingDrawerReveal = null;
+  todoDrawer.reveal(pending.itemId);
+}
+
+initTodoLinks({
+  enabled: () => todoTab.enabled,
+  items: () => todoTab.items,
+  tabItem: (tabId) => todoTab.tabItem(tabId),
+  tabsOfItem: (itemId) => todoTab.tabsOfItem(itemId).filter((tabId) => tabs.has(tabId)),
+  tabTitle: (tabId) => tabs.get(tabId)?.title,
+  deletedTab: (tabId) => todoTab.isDeletedTab(tabId),
+  sessionLink: (sessionId) => todoTab.sessionLink(sessionId),
+  numberOf: (id) => todoTab.numberOf(id),
+  groupColorOf: (name) => todoTab.groupColorOf(name),
+  openDetail: (id) => { todoApp.open(id); },
+  splitChild: (id) => todoApp.splitChild(id),
+  openConversation: (id) => todoApp.openConversation(id, false),
+  activateTab: (tabId) => setActiveTab(tabId),
+  reveal: (id) => todoDrawer.reveal(id),
+  showTodoTab: () => showTodoTab(),
+  splitDeclined: (id) => todoTab.splitDeclined(id),
+  declineSplit: (id) => todoTab.declineSplit(id),
+  edit: (edit) => todoApp.edits.send(edit),
+  post: (message) => vscode.postMessage(message),
+  onChange: (listener) => todoTab.onChange(listener),
+});
+setTodoSplitRenderer((item, reason, tabId) => todoSplitCard(item, reason, tabId));
+setHistoryTodoOpened((itemId) => { pendingDrawerReveal = { itemId, until: Date.now() + TODO_REVEAL_WAIT_MS }; });
+todoTab.onChange(() => {
+  for (const t of tabs.values()) t.refreshTodo();
+  refreshTodoSplitCards();
+  refreshTodoToolCards(todoTab.storeRevision);
+  refreshHistList();
+  tryPendingDrawerReveal();
+});
+
+function postDrawerKeyFocus(): void {
+  vscode.postMessage({ type: "todoDrawerFocus", focused: todoTab.enabled && document.hasFocus() });
+}
+window.addEventListener("focus", postDrawerKeyFocus);
+window.addEventListener("blur", postDrawerKeyFocus);
 
 export type ResumeHostState = ResumeHydrationPhase;
 export type ResumePagerState = "not-installed" | "running" | "exhausted" | "failed";
@@ -179,7 +297,7 @@ export function persistState(): void {
   for (const [id, overview] of overviews) analysisViews[id] = overview.analysisSubtab;
   for (const [id, t] of tabs) scrollAnchors[id] = t.captureScrollCarry(false);
   const { askDismissedMessages, askResolvedMessages, askCheckedMessages, codeWrap } = vscode.getState() ?? {};
-  const next: PersistedState = { activeTabId, drafts: out, views, workViews, analysisViews, scrollAnchors, askChecks, askDismissed, askDismissedMessages, askResolved, askResolvedMessages, askCheckedMessages, codeWrap };
+  const next: PersistedState = { activeTabId: activeTabId ?? todoReturnTabId, drafts: out, views, workViews, analysisViews, scrollAnchors, askChecks, askDismissed, askDismissedMessages, askResolved, askResolvedMessages, askCheckedMessages, codeWrap, todo: todoTab.viewState() };
   vscode.setState(next);
 }
 
@@ -236,6 +354,7 @@ export function noteSurfaceChange(): void {
 
 export function setActiveTab(tabId: string): void {
   if (!tabs.has(tabId)) return;
+  todoTab.setShown(false);
   closeSuggest();
   closeModeMenu();
   closeAuthPicker();
@@ -249,6 +368,9 @@ export function setActiveTab(tabId: string): void {
   }
   if (activeTabId !== tabId) inputEl.value = drafts.get(tabId) ?? "";
   activeTabId = tabId;
+  todoDrawer.setActiveTab(tabId);
+  if (tabs.get(tabId)!.clearUnread() && todoTab.enabled) todoTab.render();
+  tryPendingDrawerReveal();
   tabActivationDepth += 1;
   noteSurfaceChange();
   try {
@@ -270,6 +392,53 @@ export function setActiveTab(tabId: string): void {
   } finally {
     tabActivationDepth -= 1;
   }
+}
+
+function showTodoTab(): void {
+  if (!todoTab.enabled) return;
+  if (!initReceived) {
+    todoShowPending = true;
+    return;
+  }
+  closeSuggest();
+  closeModeMenu();
+  closeAuthPicker();
+  closeLightbox();
+  closeFindBar(false);
+  closeUsagePanel();
+  if (activeTabId && tabs.has(activeTabId)) {
+    drafts.set(activeTabId, inputEl.value);
+    const leaving = tabs.get(activeTabId)!;
+    leaving.noteScroll();
+    leaving.noteLeavingScroll();
+    todoReturnTabId = activeTabId;
+  }
+  activeTabId = null;
+  todoDrawer.setActiveTab(null);
+  noteSurfaceChange();
+  for (const t of tabs.values()) {
+    t.tabBtn.classList.remove("active");
+    t.tabBtn.setAttribute("aria-selected", "false");
+    t.logEl.classList.remove("active");
+    t.setSessionMenuActive(false);
+  }
+  todoTab.setShown(true);
+  logsEl.scrollTop = 0;
+  persistState();
+  refreshChrome();
+}
+
+function tabKeys(): string[] {
+  return [...(todoTab.enabled ? [TODO_TAB_KEY] : []), ...tabs.keys()];
+}
+
+function activateTabKey(key: string): void {
+  if (key === TODO_TAB_KEY) showTodoTab();
+  else setActiveTab(key);
+}
+
+function tabButtonOf(key: string): HTMLElement | undefined {
+  return key === TODO_TAB_KEY ? todoTab.tabBtn : tabs.get(key)?.tabBtn;
 }
 
 export function findTabBySessionId(sessionId: string): Tab | undefined {
@@ -1856,9 +2025,12 @@ function addTab(snap: TabSnapshot, scrollCarry?: ScrollCarry): Tab {
   if (snap.state.workModel === undefined) lastWorkModels.delete(snap.tabId);
   lastSemanticModels.delete(snap.tabId);
   const t = new Tab(snap.tabId, snap.title);
+  t.tabBtn.draggable = true;
   t.observeSessionTime(snap.state.semanticModel?.timeBuckets?.firstAt, "session");
   t.observeSessionTime(snap.state.events[0]?.timestamp, "fallback");
   tabs.set(snap.tabId, t);
+  todoTab.syncAskTabs();
+  t.refreshTodo();
   tabsAddedInDocument.add(snap.tabId);
   t.auth = snap.state.auth;
   t.configModel = snap.state.configModel;
@@ -2029,16 +2201,32 @@ function addTab(snap: TabSnapshot, scrollCarry?: ScrollCarry): Tab {
   return t;
 }
 
+function applyTabOrder(order: readonly string[]): void {
+  const known = order.filter((tabId) => tabs.has(tabId));
+  const ordered = [...known, ...[...tabs.keys()].filter((tabId) => !known.includes(tabId))].map((tabId) => tabs.get(tabId)!);
+  if (ordered.every((t, index) => [...tabs.values()][index] === t)) return;
+  const anchor = [...tabs.values()][0]?.tabBtn ?? null;
+  const parent = anchor?.parentElement;
+  if (!parent || !anchor) return;
+  let before: ChildNode | null = anchor;
+  for (const t of ordered) { parent.insertBefore(t.tabBtn, before); before = t.tabBtn.nextSibling; }
+  tabs.clear();
+  for (const t of ordered) tabs.set(t.tabId, t);
+  persistState();
+}
+
 function rebuildTabInPlace(snap: TabSnapshot, preserveScroll: boolean): void {
   const old = tabs.get(snap.tabId);
   if (!old) return;
   const btnNext = old.tabBtn.nextSibling;
   const logNext = old.logEl.nextSibling;
   const scrollCarry = preserveScroll ? old.captureScrollCarry() : undefined;
+  const unread = old.unreadCount;
   old.destroy();
   tabs.delete(snap.tabId);
   overviews.delete(snap.tabId);
   const t = addTab(snap, scrollCarry);
+  t.carryUnread(unread);
   tabbarEl.insertBefore(t.tabBtn, btnNext);
   logsEl.insertBefore(t.logEl, logNext);
   if (activeTabId === snap.tabId) setActiveTab(snap.tabId);
@@ -2129,13 +2317,19 @@ function initMessageBus(): void {
           }
         }
         const first = tabs.keys().next().value ?? null;
-        const chosen = activeTabId && tabs.has(activeTabId) ? activeTabId : first;
+        const todoWasShown = todoTab.shown;
+        const preferred = activeTabId ?? todoReturnTabId;
+        const chosen = preferred && tabs.has(preferred) ? preferred : first;
         if (chosen) {
           inputEl.value = drafts.get(chosen) ?? "";
           autosizeComposer();
           activateFirstUsableTab(chosen);
         }
         activeTabAfterInit = activeTabId;
+        if (todoWasShown || todoShowPending) {
+          todoShowPending = false;
+          showTodoTab();
+        }
         const activeSnap = msg.tabs.find((t) => t.tabId === chosen);
         reportWebviewDiagnostic(
           "first-paint",
@@ -2149,7 +2343,17 @@ function initMessageBus(): void {
       case "events": {
         const t = tabs.get(msg.tabId);
         if (msg.events.some((event) => event.kind === "conversation_opened")) overviews.get(msg.tabId)?.setOrchestration(undefined);
-        if (t) for (const ev of msg.events) t.handleEvent(ev);
+        let unread = false;
+        if (t) {
+          for (const ev of msg.events) {
+            t.handleEvent(ev);
+            if (ev.kind === "turn_completed" && ev.provenance?.path !== "history" && msg.tabId !== activeTabId) {
+              t.noteUnreadReply();
+              unread = true;
+            }
+          }
+        }
+        if (unread && todoTab.enabled) todoTab.render();
         if (t) overviews.get(msg.tabId)?.syncVisibility();
         break;
       }
@@ -2336,10 +2540,18 @@ function initMessageBus(): void {
         if (tabs.has(msg.tab.tabId)) {
           rebuildTabInPlace(msg.tab, false);
           if (msg.activate && activeTabId === activeTabAfterInit) setActiveTab(msg.tab.tabId);
+        } else if (msg.replacement && todoTab.shown) {
+          addTab(msg.tab);
+          todoReturnTabId = msg.tab.tabId;
+          persistState();
         } else {
           addTab(msg.tab);
           if (msg.activate) setActiveTab(msg.tab.tabId);
         }
+        break;
+      }
+      case "tabOrder": {
+        applyTabOrder(msg.order);
         break;
       }
       case "activateTab": {
@@ -2517,6 +2729,40 @@ function initMessageBus(): void {
         }
         break;
       }
+      case "todoSnapshot": {
+        const wasShown = todoTab.shown;
+        const wasEnabled = todoTab.enabled;
+        const { restoreShown } = todoTab.apply(msg);
+        if (wasEnabled !== todoTab.enabled) postDrawerKeyFocus();
+        if (todoTab.enabled) {
+          if (!todoTab.tabBtn.isConnected) tabbarEl.prepend(todoTab.tabBtn);
+          if (!todoTab.pane.isConnected) logsEl.prepend(todoTab.pane);
+          if (restoreShown && !todoTab.shown) showTodoTab();
+        } else if (wasShown) {
+          const back = todoReturnTabId && tabs.has(todoReturnTabId) ? todoReturnTabId : tabs.keys().next().value;
+          if (back) setActiveTab(back);
+          else persistState();
+        }
+        break;
+      }
+      case "todoEditResult":
+      case "todoDetail":
+      case "todoWork":
+      case "todoImage":
+        todoApp.receive(msg);
+        break;
+      case "todoLog":
+        todoTab.receive(msg);
+        break;
+      case "todoAskSource":
+        todoTab.receiveAskSource(msg);
+        break;
+      case "todoChanges":
+        receiveTodoChanges(msg);
+        break;
+      case "todoToggleDrawer":
+        todoDrawer.toggle();
+        break;
       case "tabCleared": {
         rebuildTabInPlace(msg.tab, false);
         break;
@@ -2542,9 +2788,11 @@ function initMessageBus(): void {
           attachmentsByTab.delete(msg.tabId);
           forgottenTabIds.add(msg.tabId);
           if (activeTabId === msg.tabId) activeTabId = null;
+          if (todoReturnTabId === msg.tabId) todoReturnTabId = null;
+          todoTab.syncAskTabs();
           persistState();
           const next = [...tabs.keys()][0] ?? null;
-          if (!activeTabId && next) setActiveTab(next);
+          if (!activeTabId && next && !todoTab.shown) setActiveTab(next);
           else if (!activeTabId) refreshChrome();
         }
         break;
@@ -2596,17 +2844,12 @@ function addImageFile(file: File, mediaType: string): void {
   const tabId = activeTabId;
   if (!tabId) return;
   if (attachmentsOf(tabId).length >= IMAGE_MAX_COUNT) return;
-  const reader = new FileReader();
-  reader.onload = () => {
-    const dataUrl = String(reader.result);
-    vscode.postMessage({
-      type: "attachImage",
-      tabId,
-      mediaType: mediaType as ImageAttachment["mediaType"],
-      data: dataUrl.slice(dataUrl.indexOf(",") + 1),
-    });
-  };
-  reader.readAsDataURL(file);
+  void readImageAsBase64(file).then((data) => vscode.postMessage({
+    type: "attachImage",
+    tabId,
+    mediaType: mediaType as ImageAttachment["mediaType"],
+    data,
+  }));
 }
 
 let pickFilesSeq = 0;
@@ -2650,7 +2893,7 @@ function initComposer(): void {
     }
   };
   inputEl.addEventListener("keydown", (e) => {
-    if (e.key !== "Enter" || e.isComposing || e.keyCode === 229) return;
+    if (e.key !== "Enter" || isComposingKey(e)) return;
     if (e.shiftKey === (composerSendKey() === "shiftEnter")) {
       e.preventDefault();
       send();
@@ -2698,16 +2941,17 @@ function initComposer(): void {
 }
 
 function cycleTab(direction: 1 | -1): void {
-  const ids = [...tabs.keys()];
+  const ids = tabKeys();
   if (ids.length < 2) return;
-  const idx = activeTabId ? ids.indexOf(activeTabId) : -1;
+  const current = todoTab.shown ? TODO_TAB_KEY : activeTabId;
+  const idx = current ? ids.indexOf(current) : -1;
   const next =
     idx === -1
       ? direction === 1
         ? ids[0]
         : ids[ids.length - 1]
       : ids[(idx + direction + ids.length) % ids.length];
-  setActiveTab(next);
+  activateTabKey(next);
 }
 
 function initGlobalShortcuts(): void {
@@ -2731,6 +2975,7 @@ function initGlobalShortcuts(): void {
     if (!mod || e.altKey) return;
     const key = e.key.toLowerCase();
     if (key === "f" && !e.shiftKey) {
+      if (!activeTabId) return;
       e.preventDefault();
       e.stopPropagation();
       abandonAwaitedScrollAnchor();
@@ -2753,15 +2998,71 @@ function initGlobalShortcuts(): void {
   });
 }
 
+function initTabDrag(): void {
+  let dragging: string | null = null;
+  const clearMarks = () => {
+    for (const t of tabs.values()) t.tabBtn.classList.remove("drop-before", "drop-after", "dragging");
+  };
+  const dropSlot = (x: number): { target: Tab; after: boolean } | null => {
+    const list = [...tabs.values()];
+    for (const t of list) {
+      const rect = t.tabBtn.getBoundingClientRect();
+      if (x < rect.left + rect.width / 2) return { target: t, after: false };
+    }
+    const last = list.at(-1);
+    return last ? { target: last, after: true } : null;
+  };
+  tabbarEl.addEventListener("dragstart", (e) => {
+    const btn = (e.target as HTMLElement).closest<HTMLElement>(".tab");
+    const t = [...tabs.values()].find((entry) => entry.tabBtn === btn);
+    if (!t) return;
+    dragging = t.tabId;
+    e.dataTransfer?.setData(TAB_DRAG_MIME, t.tabId);
+    if (e.dataTransfer) e.dataTransfer.effectAllowed = "move";
+    t.tabBtn.classList.add("dragging");
+  });
+  tabbarEl.addEventListener("dragover", (e) => {
+    if (dragging === null) return;
+    e.preventDefault();
+    if (e.dataTransfer) e.dataTransfer.dropEffect = "move";
+    const slot = dropSlot(e.clientX);
+    for (const t of tabs.values()) t.tabBtn.classList.remove("drop-before", "drop-after");
+    slot?.target.tabBtn.classList.add(slot.after ? "drop-after" : "drop-before");
+  });
+  tabbarEl.addEventListener("drop", (e) => {
+    if (dragging === null) return;
+    e.preventDefault();
+    const slot = dropSlot(e.clientX);
+    const moved = tabs.get(dragging);
+    dragging = null;
+    clearMarks();
+    if (!slot || !moved || slot.target === moved) return;
+    const order = [...tabs.values()].filter((t) => t !== moved);
+    order.splice(order.indexOf(slot.target) + (slot.after ? 1 : 0), 0, moved);
+    if (slot.after) slot.target.tabBtn.after(moved.tabBtn);
+    else slot.target.tabBtn.before(moved.tabBtn);
+    const entries = order.map((t) => [t.tabId, t] as const);
+    tabs.clear();
+    for (const [id, t] of entries) tabs.set(id, t);
+    vscode.postMessage({ type: "reorderTabs", order: order.map((t) => t.tabId) });
+    persistState();
+  });
+  tabbarEl.addEventListener("dragend", () => {
+    dragging = null;
+    clearMarks();
+  });
+}
+
 function initTabbarKeys(): void {
   tabbarEl.addEventListener("keydown", (e) => {
     if (e.key !== "ArrowLeft" && e.key !== "ArrowRight") return;
-    const ids = [...tabs.keys()];
-    if (!activeTabId || ids.length < 2) return;
-    const idx = ids.indexOf(activeTabId);
+    const ids = tabKeys();
+    const current = todoTab.shown ? TODO_TAB_KEY : activeTabId;
+    if (!current || ids.length < 2) return;
+    const idx = ids.indexOf(current);
     const next = ids[(idx + (e.key === "ArrowRight" ? 1 : ids.length - 1)) % ids.length];
-    setActiveTab(next);
-    tabs.get(next)?.tabBtn.focus();
+    activateTabKey(next);
+    tabButtonOf(next)?.focus();
     e.preventDefault();
   });
 }
@@ -2970,6 +3271,7 @@ for (const [name, step] of [
   ["initFindBar", initFindBar],
   ["initSuggest", initSuggest],
   ["initTabbarKeys", initTabbarKeys],
+  ["initTabDrag", initTabDrag],
   ["initHistory", initHistory],
   ["initTicker", initTicker],
 ] as const) {

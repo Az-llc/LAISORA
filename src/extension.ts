@@ -11,6 +11,10 @@ export { handleHandoffMessage } from "./handoff-wiring";
 export { handleSurfaceMessage } from "./store-surfaces";
 export { readSessionTranscript } from "./session-transcript";
 export { normalizeDriveLetter } from "./claude-settings";
+import { TODO_BETA_SETTING } from "./todo-store";
+import { disposeTodoSurface, releaseOwnedTodoConversations, syncTodoSurface, toggleTodoDrawer } from "./todo-surface";
+import { EDIT_SUMMARY_SETTING } from "./edit-summary";
+import { registerEditDiffProvider } from "./edit-diff-host";
 export { reduceWorkModelSafely, trimEventLog } from "./event-fold";
 export type { EventFoldDraft, FoldEffect, FoldEventResult } from "./event-fold";
 import {
@@ -43,6 +47,7 @@ import {
   readPersistedOpenTabs,
   releaseAccountUsageWaiter,
   restoreTabsOnStartupEnabled,
+  writeHeldChosenTitle,
   type PersistedOpenTab,
 } from "./session-list-wiring";
 import { configuredSystemAppExtensions, userSettingsMessage } from "./gateway-host-actions";
@@ -157,20 +162,26 @@ function activateReady(context: vscode.ExtensionContext): void {
     claudeProjectsDir()
   ).catch((e) => output.appendLine(`[startup] handoff の孤児回収に失敗: ${String(e)}`));
   scheduleCliUpdates(context);
+  syncTodoSurface();
   context.subscriptions.push({
     dispose: () => {
       void artifactServer?.dispose();
       setArtifactServer(null);
+      disposeTodoSurface();
     },
   });
   const readOnlyFiles = registerReadOnlyFileProvider();
   if (readOnlyFiles) context.subscriptions.push(readOnlyFiles);
+  const editDiffs = registerEditDiffProvider();
+  if (editDiffs) context.subscriptions.push(editDiffs);
   context.subscriptions.push(
     vscode.commands.registerCommand("laisora.open", () => openPanel(context)),
     vscode.commands.registerCommand("laisora.openSettings", () => openSettingsPanel(context)),
-    vscode.commands.registerCommand("laisora.pasteText", () => pasteClipboardTextIntoComposer(store))
+    vscode.commands.registerCommand("laisora.pasteText", () => pasteClipboardTextIntoComposer(store)),
+    vscode.commands.registerCommand("laisora.todoToggleDrawer", () => toggleTodoDrawer())
   );
   const displayConfigSub = vscode.workspace.onDidChangeConfiguration?.((e) => {
+    if (affectsProductConfiguration(e, TODO_BETA_SETTING)) syncTodoSurface();
     if (["enabled", "agents", "externalTimeoutMinutes", "conductorPolicy"]
       .some((key) => affectsProductConfiguration(e, `orchestration.${key}`))) {
       const cacheTtlSetting = ["enabled", "agents"].some((key) => affectsProductConfiguration(e, `orchestration.${key}`));
@@ -179,13 +190,16 @@ function activateReady(context: vscode.ExtensionContext): void {
         if (cacheTtlSetting) session.semantic.scheduleSemanticModelPost();
       }
     }
-    if (affectsProductConfiguration(e, "composer.sendKey") || affectsProductConfiguration(e, "appearance") || affectsProductConfiguration(e, "claude.askQualityCheck")) store?.post(userSettingsMessage());
+    if (affectsProductConfiguration(e, "composer.sendKey") || affectsProductConfiguration(e, "appearance") || affectsProductConfiguration(e, "claude.askQualityCheck") || affectsProductConfiguration(e, EDIT_SUMMARY_SETTING)) store?.post(userSettingsMessage());
     if (
       affectsProductConfiguration(e, "appearance") ||
       affectsProductConfiguration(e, "composer.sendKey") ||
       affectsProductConfiguration(e, "claude.apiKeyPolicy") ||
       affectsProductConfiguration(e, "claude.initialModel") ||
       affectsProductConfiguration(e, "restoreTabsOnStartup") ||
+      affectsProductConfiguration(e, TODO_BETA_SETTING) ||
+      affectsProductConfiguration(e, EDIT_SUMMARY_SETTING) ||
+      affectsProductConfiguration(e, "learning.enabled") ||
       Object.values(CLI_AUTO_UPDATE_SETTINGS).some((key) => affectsProductConfiguration(e, key)) ||
       affectsProductConfiguration(e, "history.eventLimit") ||
       affectsProductConfiguration(e, "claude.fileLinkInstruction") ||
@@ -446,7 +460,9 @@ function buildHtml(context: vscode.ExtensionContext, webview: vscode.Webview): s
 }
 
 export async function deactivate(): Promise<void> {
+  if (store) await Promise.all([...store.sessions.values()].map((s) => writeHeldChosenTitle(s)));
   disposeAccountUsage();
+  await releaseOwnedTodoConversations();
   if (store) {
     for (const s of store.sessions.values()) {
       s.semantic.clearSemanticModelPostTimer();

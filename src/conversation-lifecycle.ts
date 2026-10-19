@@ -24,8 +24,10 @@ import { ClaudeConversation } from "./claudeHost";
 import { OrchestrationViewPublisher, orchestrationViewForConversation } from "./orchestration-view";
 import { orchestrationRunsDirectoryOf } from "./orchestration-external";
 import { orchestrationPluginDirectoryOf } from "./orchestration-plugin";
+import { hostTodoStore, noteTodoConversationEvent, postTodoSnapshot, todoBetaEnabled, todoLinkedItemAtStart } from "./todo-surface";
 import { postAttachments } from "./composer-io";
 import { pendingAttachments } from "./pending-attachments";
+import { flushChosenTitle } from "./session-list-wiring";
 import * as l10n from "@vscode/l10n";
 import { isUnusedSession, type Session } from "./session";
 import { applyLiveDiscoveredModels, modelsMessage } from "./gateway-models";
@@ -39,6 +41,7 @@ import { displayTitleFromSummary } from "./session-list";
 import type { SessionStore } from "./store-surfaces";
 import { completionVerdict, numberedLaunchVerdict, resumeVerdict } from "./time-buckets";
 import { isRunningMainLane, knownBackgroundTask } from "./work-model";
+import { parseLaisoraInput, type LaisoraInput } from "./laisora-input";
 
 const orchestrationPublishers = new WeakMap<ClaudeConversation, OrchestrationViewPublisher>();
 
@@ -450,6 +453,12 @@ function launchModel(s: Session): string | null | undefined {
   return s.initialModel ?? undefined;
 }
 
+export async function sendLaisoraInput(s: Session, input: LaisoraInput, text: string): Promise<void> {
+  await ensureConversation(s);
+  if (s.closed || s.clearing || !s.conversation) return;
+  s.conversation.send(text, undefined, Date.now(), input);
+}
+
 export async function handleConversationMessage(
   st: SessionStore,
   msg: Extract<WebviewToHost, { type: "send" | "cancelAutoResume" | "interrupt" | "approvalDecision" | "setMode" | "setEffort" | "setModel" }>,
@@ -478,11 +487,11 @@ export async function handleConversationMessage(
         disposition("rejected");
         break;
       }
-      if (HUMAN_INPUT_INJECTED_TAG_RE.test(msg.text.trimStart())) {
+      if (HUMAN_INPUT_INJECTED_TAG_RE.test(msg.text.trimStart()) || parseLaisoraInput(msg.text) !== undefined) {
         target!.pushEvent({
           kind: "error",
           message: l10n.t(
-            "Input that starts with a reserved tag (<laisora-…>, <system-reminder>, etc.) cannot be sent. Add text before it or wrap the tag in a code block."
+            "Input that starts with a reserved tag (<laisora-…>, <system-reminder>, [LAISORA:…], etc.) cannot be sent. Add text before it or wrap the tag in a code block."
           ),
           fatal: false,
         });
@@ -618,6 +627,8 @@ async function ensureConversationInner(s: Session, requestedAt: number): Promise
 
   const learningEnabled = cfg.get<boolean>("learning.enabled")! === true;
   const learningConfiguredSnapshot = learningEnabled ? await resolveConfiguredEffortSnapshot(cwd, settingSources) : undefined;
+  const todoEnabled = todoBetaEnabled(cfg);
+  const todoLinkedItem = todoEnabled ? await todoLinkedItemAtStart(s) : undefined;
   if (s.closed || s.logicalGeneration !== logicalGenerationAtStart) {
     throw new Error(l10n.t("The logical session of this tab changed while the conversation was starting (restore or clear)."));
   }
@@ -636,6 +647,8 @@ async function ensureConversationInner(s: Session, requestedAt: number): Promise
     fileLinkInstruction: cfg.get<boolean>("claude.fileLinkInstruction")! !== false,
     planInstruction: cfg.get<boolean>("claude.planInstruction")! !== false,
     askQualityCheck: cfg.get<boolean>("claude.askQualityCheck") === true,
+    todoStore: todoEnabled ? hostTodoStore() : undefined,
+    todoLinkedItem,
     planLaunchVerdict: description => numberedLaunchVerdict(s.evidenceIndex.timeBuckets, description),
     planResumeVerdict: (to, namedToolUseId, toolUseId) => resumeVerdict(s.evidenceIndex.timeBuckets, to, namedToolUseId, toolUseId,
       id => isRunningMainLane(s.workModel, id)),
@@ -681,7 +694,9 @@ async function ensureConversationInner(s: Session, requestedAt: number): Promise
       }
       s.pushEvent(ev, conversationId, meta);
       if (own) settleFallbackRevert(store, s, conv, ev);
+      if (own && todoEnabled) noteTodoConversationEvent(s, ev);
       if (TURN_END_KINDS.has(ev.kind)) noteCliUpdateOpportunity();
+      if (own && TURN_END_KINDS.has(ev.kind) && s.unpersistedChosenTitle !== null) void flushChosenTitle(s);
       if (ev.kind === "auth_status" && conversationId === s.expectedConversationId && ev.auth?.billingRealm === "api") {
         store?.post({
           type: "tabNotice",
@@ -715,7 +730,9 @@ async function ensureConversationInner(s: Session, requestedAt: number): Promise
       throw new Error(l10n.t("The logical session of this tab changed while the conversation was starting (restore or clear)."));
     }
     s.conversation = conv;
+    void flushChosenTitle(s);
     postOrchestrationView(s);
+    if (todoLinkedItem) postTodoSnapshot();
     refreshConfiguredEffort(store, s, cwd, settingSources, conv);
     void conv.supportedCommands().then((cmds) => {
       if (s.conversation !== conv || cmds.length === 0) return;

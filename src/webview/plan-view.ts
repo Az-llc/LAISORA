@@ -7,7 +7,7 @@ export { normalizePlanContent, planStepKey } from "../plan-steps";
 
 export interface PlanLane {
   id: string; agent: string; title: string; start: number | null; elapsed: number | null;
-  status: WorkStatus | "stopped"; tokens: number | null; cacheRead: number; external: boolean; resumedAt?: number;
+  status: WorkStatus | "stopped"; tokens: number | null; cacheRead: number; external: boolean; resumedAt?: number; description?: string;
 }
 export interface PlanStep {
   key: string; number: number | null; title: string; activeForm?: string; status: TaskStatus;
@@ -169,7 +169,7 @@ export function derivePlanView(model: WorkModelPayload | undefined, orchestratio
         ? Math.max(agent.elapsedMs, nowMs - agent.startedAt)
         : agent.origin === "restored" && (agent.startedAt === undefined || agent.endedAt === undefined) ? null : agent.elapsedMs,
       status: agent.status, tokens: agent.tokens ?? externalTokens(observed?.usage ?? null)?.tokens ?? null,
-      cacheRead: externalTokens(observed?.usage ?? null)?.cacheRead ?? 0, external: false };
+      cacheRead: externalTokens(observed?.usage ?? null)?.cacheRead ?? 0, external: false, ...(agent.description ? { description: agent.description } : {}) };
     const resumed = resumes.get(agent.agentId);
     const owner = { toolUseId: agent.toolUseId, agentId: agent.transcriptAgentId ?? agent.agentId };
     if (!resumed) attach(lane, owner);

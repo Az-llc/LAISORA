@@ -11,7 +11,12 @@ export interface YouItem {
   readonly resolvedAt?: number;
   readonly resolution?: "replied" | "resolved" | "superseded" | "dismissed" | "historical";
   readonly awaitingDetail?: true;
+  readonly turn?: string;
   readonly anchor: { readonly id: string; readonly approvalRef?: string };
+}
+
+export function isWaitingYouItem(item: YouItem): boolean {
+  return item.resolvedAt === undefined;
 }
 
 export interface YouItemsReader {
@@ -25,6 +30,7 @@ export interface AskPosition {
   createdAt: number;
   order?: number;
   generation?: number;
+  turn?: string;
 }
 
 export function youAnchor(tabId: string, id: string): string {
@@ -411,7 +417,7 @@ export function createYouItems(tabId: string, saved: SavedAskDismissals = {}, lo
         return known.anchor.id;
       }
       const item: YouItem = {
-        id, kind: ask.kind, title: ask.title, createdAt: position.createdAt,
+        id, kind: ask.kind, title: ask.title, createdAt: position.createdAt, turn: position.turn ?? position.replyId,
         anchor: { id: youAnchor(tabId, id) },
         ...(ask.kind === "decide" ? { options: ask.options.map((o) => ({ label: o.label, description: o.effect })) } : { steps: ask.steps }),
       };
@@ -430,6 +436,11 @@ export function createYouItems(tabId: string, saved: SavedAskDismissals = {}, lo
       dismissals.push({ id, ...identity, at: Date.now() });
       if (refresh()) notify();
       return identity;
+    },
+    dismissMessages(messages: Iterable<string>): void {
+      const before = dismissedMessages.size;
+      for (const message of messages) dismissedMessages.add(message);
+      if (dismissedMessages.size !== before && refresh()) notify();
     },
     relabel(): AskIdentity[] {
       const upgraded: AskIdentity[] = [];

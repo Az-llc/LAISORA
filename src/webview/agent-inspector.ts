@@ -164,7 +164,9 @@ export class AgentInspector {
     this.closeEl = element("button", "wi-act wi-close");
     this.closeEl.type = "button";
     this.closeEl.setAttribute("aria-keyshortcuts", "Escape");
-    this.closeEl.append(l10n.t("Close"), element("kbd", "", "Esc"));
+    this.closeEl.textContent = "×";
+    this.closeEl.title = l10n.t("Close (Esc)");
+    this.closeEl.setAttribute("aria-label", l10n.t("Close"));
     this.closeEl.onclick = () => this.close();
     actions.append(this.maxEl, this.closeEl);
     line.append(this.kindEl, actions);

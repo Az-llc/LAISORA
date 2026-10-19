@@ -1,5 +1,6 @@
-import { ENVELOPE_PREAMBLE } from "./handoff-accept";
+import { ENVELOPE_PREAMBLE, WORK_MEMO_PREAMBLE } from "./handoff-accept";
 import { isImageRefInfo, isIsoTimestamp, type HandoffDecisionCounts, type ImageRefInfo } from "./protocol";
+import { memoUpdatedAt, WORK_MEMO_SECTIONS, type TodoItem, type WorkMemoSection } from "./todo-model";
 export { isHandoffContextUsage } from "./protocol";
 
 export const HANDOFF_TAG = "laisora-handoff";
@@ -71,6 +72,34 @@ export interface HandoffEnvelopeV2 {
   };
   userUtterances: HandoffUtterance[];
   decisions?: HandoffDecisions;
+  workMemo?: HandoffWorkMemo;
+}
+
+export interface HandoffWorkMemo {
+  preamble: string;
+  item: { id: string; title: string };
+  updatedAt: string;
+  sections: Partial<Record<WorkMemoSection, string>>;
+}
+
+export function handoffWorkMemoOf(item: Pick<TodoItem, "id" | "title" | "workMemo">): HandoffWorkMemo | undefined {
+  const updatedAt = memoUpdatedAt(item);
+  if (updatedAt === undefined) return undefined;
+  const sections = Object.fromEntries(WORK_MEMO_SECTIONS.flatMap(section => {
+    const text = item.workMemo[section]?.text;
+    return text ? [[section, text]] : [];
+  })) as HandoffWorkMemo["sections"];
+  if (Object.keys(sections).length === 0) return undefined;
+  return { preamble: WORK_MEMO_PREAMBLE, item: { id: item.id, title: item.title }, updatedAt: new Date(updatedAt).toISOString(), sections };
+}
+
+function parseWorkMemo(value: unknown): HandoffWorkMemo | undefined {
+  if (!isRecord(value) || typeof value.preamble !== "string" || !isRecord(value.item) || !isIsoTimestamp(value.updatedAt) || !isRecord(value.sections)) return undefined;
+  const { id, title } = value.item;
+  if (typeof id !== "string" || id.length === 0 || typeof title !== "string") return undefined;
+  const entries = Object.entries(value.sections);
+  if (!entries.every(([section, text]) => (WORK_MEMO_SECTIONS as readonly string[]).includes(section) && typeof text === "string")) return undefined;
+  return { preamble: value.preamble, item: { id, title }, updatedAt: value.updatedAt as string, sections: Object.fromEntries(entries) as HandoffWorkMemo["sections"] };
 }
 
 export type { HandoffContextMeasurement, HandoffContextUsage } from "./protocol";
@@ -82,7 +111,7 @@ export interface HandoffCompactStats {
 }
 
 export type HandoffParseResult =
-  | { ok: true; version: "2"; envelope: HandoffEnvelopeV2; raw: string; decisionsDropped?: true; imageRefsDropped?: true }
+  | { ok: true; version: "2"; envelope: HandoffEnvelopeV2; raw: string; decisionsDropped?: true; imageRefsDropped?: true; workMemoDropped?: true }
   | { ok: false; reason: HandoffRejectReason };
 
 const OPEN_RE = new RegExp(`^<${HANDOFF_TAG}(\\s[^>]*)?>`, "i");
@@ -222,12 +251,14 @@ function parseV2(parsed: Record<string, unknown>, raw: string): HandoffParseResu
   }
 
   const decisions = parsed.decisions === undefined ? undefined : parseDecisions(parsed.decisions);
+  const workMemo = parsed.workMemo === undefined ? undefined : parseWorkMemo(parsed.workMemo);
   const compact = parseCompactMetadata(snapshot.compact);
 
   return {
     ok: true,
     version: "2",
     ...(parsed.decisions !== undefined && decisions === undefined ? { decisionsDropped: true as const } : {}),
+    ...(parsed.workMemo !== undefined && workMemo === undefined ? { workMemoDropped: true as const } : {}),
     ...(imageRefsDropped ? { imageRefsDropped: true as const } : {}),
     raw,
     envelope: {
@@ -241,6 +272,7 @@ function parseV2(parsed: Record<string, unknown>, raw: string): HandoffParseResu
       },
       userUtterances: utterances,
       ...(decisions !== undefined ? { decisions } : {}),
+      ...(workMemo !== undefined ? { workMemo } : {}),
     },
   };
 }

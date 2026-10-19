@@ -4,16 +4,18 @@ import { handleComposerMessage } from "./composer-io";
 import { setComposerFocus } from "./composer-paste";
 import { handleAnalysisMessage } from "./analysis-messages";
 import { handleConversationMessage } from "./conversation-lifecycle";
+import { openEditDiff } from "./edit-diff-host";
 import { handleHandoffMessage } from "./handoff-wiring";
 import { handleResumeMessage } from "./resume-hydration";
-import { handleSurfaceMessage } from "./store-surfaces";
+import { handleSurfaceMessage, reorderSessionTabs } from "./store-surfaces";
 import { runHostActionMessage, userSettingsMessage } from "./gateway-host-actions";
 
 import { handleHistoryMessage } from "./history-serving";
 import { output } from "./host-context";
 import { handleInspectorMessage } from "./inspector-wiring";
 import { handleSessionFileMessage } from "./session-list-wiring";
-import { isWebviewToHost } from "./protocol";
+import { handleTodoMessage, openTodoConversation, setTodoDrawerFocus } from "./todo-surface";
+import { isWebviewToHost, rejectedTodoEditId } from "./protocol";
 import type { SessionStore } from "./store-surfaces";
 
 export async function handleWebviewMessage(
@@ -23,6 +25,8 @@ export async function handleWebviewMessage(
 ): Promise<void> {
   if (!isWebviewToHost(raw)) {
     output.appendLine(`[drop] invalid webview message: ${JSON.stringify(raw).slice(0, 200)}`);
+    const requestId = rejectedTodoEditId(raw);
+    if (requestId !== undefined) void st.postTo(sender, { type: "todoEditResult", requestId, ok: false, error: "rejected" });
     return;
   }
   const msg = raw;
@@ -68,6 +72,9 @@ export async function handleWebviewMessage(
       case "removeAttachment":
         await handleComposerMessage(st, msg, target, sender);
         break;
+      case "openEditDiff":
+        await openEditDiff(target!, msg);
+        break;
       case "renameTab":
       case "renameSession":
       case "setSessionHidden":
@@ -106,6 +113,30 @@ export async function handleWebviewMessage(
       case "resumeHydrationRetry":
         await handleResumeMessage(st, msg, target);
         break;
+      case "todoEdit":
+      case "todoDetailRequest":
+      case "todoLogRequest":
+      case "todoSectionOrder":
+      case "todoImageRequest":
+      case "todoOpenDoc":
+      case "todoAskSourceRequest":
+      case "todoAskDismiss":
+      case "todoChangesRequest":
+        await handleTodoMessage(msg, sender);
+        break;
+      case "todoDrawerFocus":
+        setTodoDrawerFocus(sender, msg.focused);
+        break;
+      case "reorderTabs":
+        reorderSessionTabs(st, msg.order, sender);
+        break;
+      case "todoOpenConversation":
+        await openTodoConversation(st, msg, sender);
+        break;
+      default: {
+        const unrouted: never = msg;
+        output.appendLine(`[drop] unrouted webview message: ${(unrouted as { type: string }).type}`);
+      }
     }
   } catch (e) {
     output.appendLine(`[error] ${String(e)}`);

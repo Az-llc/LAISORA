@@ -10,7 +10,7 @@ import type {
 } from "@anthropic-ai/claude-agent-sdk" with { "resolution-mode": "import" };
 import {
   acceptCompactSummary,
-  COMPACT_INSTRUCTION,
+  compactInstructionFor,
   DECISIONS_PREAMBLE,
   ENVELOPE_PREAMBLE,
   extractDecisionLines,
@@ -25,6 +25,7 @@ import {
   type HandoffDecisions,
   type HandoffEnvelopeV2,
   type HandoffUtterance,
+  type HandoffWorkMemo,
 } from "./handoff-envelope";
 import {
   createParseYielder,
@@ -427,6 +428,7 @@ function previousDecisionsOf(
     const parsed = parseHandoffEnvelope(textFromRecord(records[i]));
     if (!parsed.ok || parsed.version !== "2") continue;
     if (parsed.decisionsDropped) log("handoff previous decisions dropped: envelope decisions failed validation");
+    if (parsed.workMemoDropped) log("handoff previous work memo dropped: envelope workMemo failed validation");
     return parsed.envelope.decisions;
   }
   return undefined;
@@ -539,7 +541,8 @@ export class HandoffRunner {
   private async compactRound(
     runId: string,
     forkSessionId: string,
-    registryEntry: PersistedHandoff
+    registryEntry: PersistedHandoff,
+    workMemo: HandoffWorkMemo | undefined
   ): Promise<{ hookBody?: string; streamCompact?: HandoffCompactStats }> {
     if (this.terminal !== undefined) return {};
     const queue = new InputQueue();
@@ -548,7 +551,7 @@ export class HandoffRunner {
     this.abortController = abortController;
     queue.push({
       type: "user",
-      message: { role: "user", content: `/compact ${COMPACT_INSTRUCTION.text}` },
+      message: { role: "user", content: `/compact ${compactInstructionFor(workMemo)}` },
       parent_tool_use_id: null,
       session_id: forkSessionId,
     });
@@ -779,6 +782,7 @@ export class HandoffRunner {
     sourceTitle: string;
     runId: string;
     sourceBusy: () => boolean;
+    workMemo?: HandoffWorkMemo;
   }): Promise<HandoffOutcome> {
     if (this.started) return { ok: false, runId: input.runId, reason: "already_running" };
     this.started = true;
@@ -863,7 +867,7 @@ export class HandoffRunner {
           if (this.terminal === undefined) {
             this.transition("compacting");
             const priorBoundary = lastCompactBoundaryIndex(currentRecords);
-            const roundResult = await this.compactRound(input.runId, forkSessionId, registryEntry);
+            const roundResult = await this.compactRound(input.runId, forkSessionId, registryEntry, input.workMemo);
             if (this.terminal === undefined) {
               const roundRead = await this.deps.readRecords(forkFilePath);
               unreadableLineCount = Math.max(unreadableLineCount, roundRead.unreadableLineCount);
@@ -926,6 +930,7 @@ export class HandoffRunner {
               },
               userUtterances: utterances,
               ...(carryDecisions !== undefined ? { decisions: carryDecisions } : {}),
+              ...(input.workMemo !== undefined ? { workMemo: input.workMemo } : {}),
             };
             if (this.terminal === undefined) await this.appendEnvelopeOnly(forkSessionId, envelope, registryEntry);
           }

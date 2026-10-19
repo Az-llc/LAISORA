@@ -37,7 +37,7 @@ import {
 } from "./protocol";
 import { createGuardrailState } from "./guardrail";
 import { initialSessionFacts } from "./session-facts";
-import { isInSessionStore } from "./session-files";
+import { isInSessionStore, lookupSessionFile } from "./session-files";
 import { foldTitleRecords, splitCompleteLines } from "./session-display-title";
 import { displayTitleFromSummary } from "./session-list";
 import { rememberSession, refreshTabTitle, sessionSummaryOf } from "./session-list-wiring";
@@ -206,6 +206,29 @@ function restoredHandoffContextUsage(value: unknown): HandoffContextUsage | unde
   const { before, after } = value as Record<string, unknown>;
   if (before !== null && !isHandoffContextMeasurement(before)) return undefined;
   return after === null || isHandoffContextMeasurement(after) ? { before, after } : { before };
+}
+
+export async function openSessionById(
+  st: SessionStore,
+  sender: vscode.Webview,
+  sessionId: string
+): Promise<"activated" | "opened" | "not_opened" | "not_found" | "scan_failed"> {
+  const existing = [...st.sessions.values()].find(
+    (s) => !s.closed && (s.resumeSessionId === sessionId || s.auth?.sessionId === sessionId)
+  );
+  if (existing) {
+    await st.postTo(sender, { type: "activateTab", tabId: existing.tabId });
+    return "activated";
+  }
+  const lookup = lookupSessionFile(sessionId);
+  if (lookup.reason === "not_found") return "not_found";
+  if (lookup.reason === "scan_failed") {
+    output.appendLine(`[resume] session lookup failed: ${sessionId}: ${lookup.detail}`);
+    return "scan_failed";
+  }
+  if (!lookup.path) return "not_opened";
+  const opened = await openResumedSession(st, { sessionId, filePath: lookup.path, activate: true });
+  return opened.tabPosted ? "opened" : "not_opened";
 }
 
 export async function openResumedSession(

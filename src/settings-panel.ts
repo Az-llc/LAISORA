@@ -15,6 +15,8 @@ import {
   writeAccentSetting,
   writeDisplayName,
   writeLearningEnabled,
+  writeTodoEnabled,
+  writeEditSummaryEnabled,
   writeCliAutoUpdate,
   writeComposerSendKey,
   writeFileLinkSetting,
@@ -121,6 +123,12 @@ export async function handleSettingsPageMessage(webview: vscode.Webview, raw: un
       break;
     case "setLearningEnabled":
       writeFailure = await writeLearningEnabled(raw.enabled);
+      break;
+    case "setTodoEnabled":
+      writeFailure = await writeTodoEnabled(raw.enabled);
+      break;
+    case "setEditSummaryEnabled":
+      writeFailure = await writeEditSummaryEnabled(raw.enabled);
       break;
     case "setOrchestrationSetting":
       writeFailure = await writeOrchestrationSetting(raw.setting, raw.value);

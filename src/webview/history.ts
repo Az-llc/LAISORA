@@ -15,10 +15,22 @@ import {
   histToolsEl,
   vscode,
 } from "./dom";
+import { isComposingKey } from "./composing";
 import { formatDateTime } from "./l10n";
 import { createLoader } from "./loader";
 import { activeTabId } from "./main";
 import { bindTitleEditor } from "./session-header";
+import { todoHistoryLink } from "./todo-links";
+
+let onTodoSessionOpened: ((itemId: string) => void) | null = null;
+
+export function setHistoryTodoOpened(hook: ((itemId: string) => void) | null): void {
+  onTodoSessionOpened = hook;
+}
+
+export function refreshHistList(): void {
+  if (!histPanelEl.classList.contains("hidden") && editing === undefined) paintHistList();
+}
 
 let historySource: "laisora" | "claude" = "laisora";
 let showHidden = false;
@@ -172,7 +184,7 @@ function paintHistList(): void {
   }
   const query = histSearchEl.value.trim();
   const needle = query.toLowerCase();
-  const filtered = query ? sessions.filter((s) => s.title.toLowerCase().includes(needle)) : sessions;
+  const filtered = query ? sessions.filter((s) => s.title.toLowerCase().includes(needle) || (todoHistoryLink(s.sessionId)?.text.toLowerCase().includes(needle) ?? false)) : sessions;
   filteredRows = filtered;
   if (selectedId !== undefined && !filtered.some((s) => s.sessionId === selectedId)) selectedId = undefined;
   if (selectedId === undefined && query && filtered.length > 0) selectedId = filtered[0].sessionId;
@@ -253,6 +265,8 @@ function paintHistList(): void {
 }
 
 function openSession(s: SessionListItem): void {
+  const itemId = todoHistoryLink(s.sessionId)?.itemId;
+  if (itemId !== undefined) onTodoSessionOpened?.(itemId);
   vscode.postMessage({
     type: "resumeSession",
     sessionId: s.sessionId,
@@ -274,6 +288,23 @@ function buildRow(s: SessionListItem, query: string): HTMLElement {
   title.title = s.title;
   appendMatches(title, s.title, query);
   cell.appendChild(title);
+  const todo = todoHistoryLink(s.sessionId);
+  if (todo) {
+    const line = span("hist-todo");
+    if (todo.color) {
+      const dot = span("todo-dot hist-todo-dot");
+      dot.setAttribute("aria-hidden", "true");
+      dot.style.setProperty("--todo-gc", todo.color);
+      line.append(dot);
+    }
+    if (todo.child) line.append(span("hist-todo-child", "↳"));
+    const text = span("hist-todo-text");
+    appendMatches(text, todo.text, query);
+    line.append(text);
+    if (todo.parentTitle !== undefined) line.append(span("hist-todo-parent", l10n.t("Parent conversation: {0}", todo.parentTitle)));
+    line.title = todo.parentTitle !== undefined ? `${todo.text}\n${l10n.t("Parent conversation: {0}", todo.parentTitle)}` : todo.text;
+    cell.appendChild(line);
+  }
   const time = span("hist-time", relativeTime(s.mtime));
   time.title = formatDateTime(s.mtime);
   const meta = span("hist-meta");
@@ -479,7 +510,7 @@ export function applySessionListActionFailed(reason: string, sessionId?: string,
 
 export function onHistoryKeydown(e: KeyboardEvent): void {
   if (histPanelEl.classList.contains("hidden") || editing !== undefined) return;
-  if (e.isComposing || searchComposing || e.keyCode === 229) return;
+  if (isComposingKey(e) || searchComposing) return;
   const target = e.target as HTMLElement | null;
   const onButton = String(target?.tagName ?? "").toLowerCase() === "button";
   const inSearch = target === histSearchEl;

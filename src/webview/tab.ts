@@ -1,6 +1,9 @@
 import { createLoader } from "./loader";
 import { mergeAskChoice } from "./ask-choice";
 import { createSessionHeader } from "./session-header";
+import { onTodoAsksClosedInTodo, todoAsksClosedInTodo } from "./todo-asks";
+import { addTodoToolCall, isTodoWriteTool, renderTodoHead, setTodoToolCardResult, todoToolCard } from "./todo-chat";
+import { renderTodoCrumbs, todoAgentLabel, todoAgentText, todoLinkHub, todoTabMarks } from "./todo-links";
 import { PlanPanel } from "./plan-panel";
 import { applyFallbackModel, fallbackNoticeOriginal, foldModelFallback, resolveFallbackByChoice } from "../protocol";
 import type { ModelFallbackState } from "../protocol";
@@ -40,7 +43,8 @@ import { uiLocale } from "./l10n";
 import { createCopyButton, renderMarkdownInto } from "./markdown";
 import { forgetCodeBlockStates } from "./markdown-codeblock";
 import { askOtherChoice, askHeading, askOptionContent, rejectRenderedAsks, settleUncheckedAsks, updateAskCounters } from "./ask-view";
-import { askQualityCheckEnabled } from "./menu";
+import { askQualityCheckEnabled, editSummaryEnabled, onEditSummaryChange } from "./menu";
+import { aggregateTurnEdits, buildEditSummaryCard, type TurnFileEdit } from "./edit-summary-card";
 import { createYouItems, encodeAskDismissal, encodeAskResolution, youAnchor, type AskIdentity, type AskResolutionRecord, type YouItemsReader } from "./you-items";
 import { appendRecordPart, findCommitBoundary, joinRecordTexts, prependRecordParts, recordSeparator, type RecordTextPart } from "../commit-boundary";
 import { isConvRenderableEvent } from "../conv-renderable";
@@ -764,10 +768,39 @@ export function setOnConvViewShown(fn: typeof onConvViewShown): void {
   onConvViewShown = fn;
 }
 
+let onAskDismissed: ((tabId: string, identity: AskIdentity) => void) | undefined;
+export function setOnAskDismissed(fn: typeof onAskDismissed): void {
+  onAskDismissed = fn;
+}
+
 const ASK_MESSAGE_STATE_MAX = 500;
 const READING_ROW_PROBE_STEP_PX = 8;
 const READING_ROW_PROBE_SPAN_PX = 64;
 const READING_ROW_WIDTH_SLACK_PX = 0.5;
+
+export function persistAskDismissals(tabId: string | null, identities: readonly AskIdentity[]): void {
+  if (identities.length === 0) return;
+  const state = vscode.getState() ?? { activeTabId: null };
+  let askDismissed = state.askDismissed;
+  if (tabId !== null) {
+    askDismissed = { ...askDismissed };
+    const superseded = new Set(identities.filter((i) => i.message !== undefined).map((i) => encodeAskDismissal({ content: i.content })));
+    askDismissed[tabId] = [...new Set([...(askDismissed[tabId] ?? []).filter((e) => !superseded.has(e)), ...identities.map(encodeAskDismissal)])];
+  }
+  const messages = identities.flatMap((i) => (i.message === undefined ? [] : [i.message]));
+  const askDismissedMessages = [...new Set([...(state.askDismissedMessages ?? []), ...messages])].slice(-ASK_MESSAGE_STATE_MAX);
+  vscode.setState({ ...state, askDismissed, askDismissedMessages });
+}
+
+export function savedMessageAskState(): { dismissed: readonly string[]; resolved: readonly string[]; checked: Readonly<Record<string, readonly boolean[]>> } {
+  const state = vscode.getState();
+  return { dismissed: state?.askDismissedMessages ?? [], resolved: state?.askResolvedMessages ?? [], checked: state?.askCheckedMessages ?? {} };
+}
+
+type InsertedTurn = boolean | "laisora";
+
+type EditTurnEnd = { kind: "live" } | { kind: "history"; endedAt: number } | { kind: "after"; el: HTMLElement };
+const EDIT_TURN_ENDS_MAX = 512;
 
 export class Tab {
   private youStoreValue?: ReturnType<typeof createYouItems>;
@@ -797,14 +830,7 @@ export class Tab {
   }
 
   private persistAskDismissals(identities: readonly AskIdentity[]): void {
-    if (identities.length === 0) return;
-    const state = vscode.getState() ?? { activeTabId: null };
-    const askDismissed = { ...state.askDismissed };
-    const superseded = new Set(identities.filter((i) => i.message !== undefined).map((i) => encodeAskDismissal({ content: i.content })));
-    askDismissed[this.tabId] = [...new Set([...(askDismissed[this.tabId] ?? []).filter((e) => !superseded.has(e)), ...identities.map(encodeAskDismissal)])];
-    const messages = identities.flatMap((i) => (i.message === undefined ? [] : [i.message]));
-    const askDismissedMessages = [...new Set([...(state.askDismissedMessages ?? []), ...messages])].slice(-ASK_MESSAGE_STATE_MAX);
-    vscode.setState({ ...state, askDismissed, askDismissedMessages });
+    persistAskDismissals(this.tabId, identities);
   }
   private askResolutionBatchDepth = 0;
   private withAskResolutionBatch<T extends { failed: number }>(work: () => T): T {
@@ -935,6 +961,7 @@ export class Tab {
     });
     this.youStore.retain(replyId, offset, Math.max(offset + text.length, this.askRenderEnds.get(container) ?? 0), ids);
     this.askRenderEnds.set(container, offset + text.length);
+    if (ids.size > 0) this.syncTodoClosedAsks(container);
     if (container.dataset.askQualityTurn !== undefined || this.rejectedAskKeys.size > 0) this.settleAskChecks();
     if (ids.size > 0) this.persistAskResolutions();
     if ((hadAsks || ids.size > 0) && !this.askCountersScheduled) {
@@ -1057,6 +1084,123 @@ export class Tab {
     this.labelEl.textContent = title;
     this.labelEl.title = title;
     this.sessionHeader.updateTitle(title);
+    this.refreshTodo();
+  }
+
+  private readonly todoToolCards = new Map<string, HTMLElement>();
+  private readonly todoTurnCards = new Map<string, HTMLElement>();
+  private readonly pendingTodoCards = new Map<string, HTMLElement[]>();
+  private readonly todoHeadEl = document.createElement("div");
+  private readonly todoCrumbsEl = document.createElement("nav");
+  private readonly todoTabDotEl = document.createElement("span");
+  private readonly todoChildEl = document.createElement("span");
+  private readonly unreadEl = document.createElement("span");
+  private unreadReplies = 0;
+
+  get unreadCount(): number {
+    return this.unreadReplies;
+  }
+
+  noteUnreadReply(): void {
+    this.unreadReplies += 1;
+    this.paintUnread();
+  }
+
+  carryUnread(count: number): void {
+    this.unreadReplies = count;
+    this.paintUnread();
+  }
+
+  clearUnread(): boolean {
+    if (this.unreadReplies === 0) return false;
+    this.unreadReplies = 0;
+    this.paintUnread();
+    return true;
+  }
+
+  private paintUnread(): void {
+    this.unreadEl.hidden = this.unreadReplies === 0;
+    this.unreadEl.textContent = String(this.unreadReplies);
+    this.unreadEl.title = l10n.t("Replies finished while you were away: {0}", this.unreadReplies);
+  }
+
+  private runningAgentCount(): number {
+    return [...this.agentStates.values()].filter(state => state.status === "running").length;
+  }
+
+  rightRail(): HTMLElement | null {
+    const rail = this.planPanel.aside;
+    if (!rail.isConnected || !rail.parentElement?.classList.contains("plan-chat") || getComputedStyle(rail).display === "none") return null;
+    return rail.getBoundingClientRect().width > 0 ? rail : null;
+  }
+
+  refreshTodo(): void {
+    if (this.tabBtn === undefined) return;
+    this.planPanel.refreshTodo();
+    const marks = todoTabMarks(this.tabId, this.title, { runningAgents: this.runningAgentCount() });
+    this.todoTabDotEl.hidden = !marks?.color;
+    if (marks?.color) this.todoTabDotEl.style.setProperty("--todo-gc", marks.color);
+    this.todoChildEl.hidden = !marks?.child;
+    this.labelEl.title = marks?.tooltip ?? this.title;
+    renderTodoCrumbs(this.todoCrumbsEl, this.tabId);
+    if (!this.todoHeadEl.isConnected) this.convEl.insertBefore(this.todoHeadEl, this.convEl.firstChild);
+    renderTodoHead(this.todoHeadEl, this.tabId);
+    for (const [toolUseId, entry] of this.agentCards) {
+      const data = this.rowData.get(toolUseId);
+      if (data) this.paintAgentTodo(entry, data);
+    }
+  }
+
+  private paintAgentTodo(entry: AgentCardEntry, data: WorkRowData): void {
+    entry.card.querySelector(":scope > summary > .todo-agent-link")?.remove();
+    if (!todoLinkHub()) return;
+    const state = this.agentStates.get(data.toolUseId) ?? this.pastAgentStates.get(data.toolUseId);
+    const label = todoAgentLabel(this.tabId, data.summaryText, (state?.status ?? data.status) === "running");
+    if (label) entry.card.querySelector(":scope > summary")?.insertBefore(label, entry.metaEl);
+  }
+
+  private placeTodoToolCard(ev: Extract<NormalizedEvent, { kind: "tool_call_started" }>, pastTurn?: HTMLElement): void {
+    if (ev.parentToolUseId !== null || !isTodoWriteTool(ev.toolName) || this.todoToolCards.has(ev.toolUseId)) return;
+    const turnCard = ev.turnId === null ? undefined : this.todoTurnCards.get(ev.turnId);
+    if (turnCard) {
+      this.todoToolCards.set(ev.toolUseId, turnCard);
+      addTodoToolCall(turnCard, ev.toolUseId, ev.toolName);
+      return;
+    }
+    const card = todoToolCard(ev.toolUseId, ev.toolName);
+    this.todoToolCards.set(ev.toolUseId, card);
+    if (ev.turnId !== null) this.todoTurnCards.set(ev.turnId, card);
+    if (pastTurn) { (pastTurn.closest(".block.assistant-turn") ?? pastTurn).appendChild(card); return; }
+    if (ev.provenance?.path !== "history") {
+      const turn = this.currentAssistantTurn?.isConnected && ev.turnId === this.currentTurnId ? this.currentAssistantTurn : this.convTurnBlock(ev.turnId);
+      if (turn) turn.appendChild(card);
+      else this.convEl.appendChild(card);
+      return;
+    }
+    const turn = this.convTurnBlock(ev.turnId);
+    if (turn) { turn.appendChild(card); return; }
+    if (ev.turnId === null) return;
+    this.pendingTodoCards.set(ev.turnId, [...(this.pendingTodoCards.get(ev.turnId) ?? []), card]);
+  }
+
+  private convTurnBlock(turnId: string | null): HTMLElement | null {
+    if (turnId === null) return null;
+    const blocks = this.convEl.querySelectorAll<HTMLElement>(`.block.assistant-turn[data-turn-id="${CSS.escape(turnId)}"]`);
+    return blocks.length ? blocks[blocks.length - 1] : null;
+  }
+
+  private finishTodoToolCard(ev: Extract<NormalizedEvent, { kind: "tool_call_finished" }>): void {
+    const card = ev.taskNotification === undefined ? this.todoToolCards.get(ev.toolUseId) : undefined;
+    if (card) setTodoToolCardResult(card, ev.toolUseId, ev.resultPreview, ev.isError, ev.provenance?.path !== "history");
+  }
+
+  private attachPendingTodoCards(endedTurnId?: string): void {
+    for (const [turnId, pending] of this.pendingTodoCards) {
+      const turn = this.convTurnBlock(turnId);
+      if (!turn && turnId !== endedTurnId) continue;
+      for (const card of pending) (turn ?? this.convEl).appendChild(card);
+      this.pendingTodoCards.delete(turnId);
+    }
   }
 
   showHandoffStatus(msg: HandoffStatusMessage): void {
@@ -1514,6 +1658,7 @@ export class Tab {
     this.refreshModelTexts();
     if (this.tabId === activeTabId) refreshFind();
   });
+  private readonly unsubscribeTodoClosed = onTodoAsksClosedInTodo(() => this.syncTodoClosedAsks());
   modelOverride: string | null | undefined = undefined;
   effortOverride: string | null | undefined = undefined;
   turnState: "idle" | "running" | "interrupting" = "idle";
@@ -1557,6 +1702,11 @@ export class Tab {
   private assistantLeadingRecord: { turnId: string; uuid: string } | null = null;
   private pastConvFooters = new Map<string, HTMLElement>();
   private pastTurnCompletedAt = new Map<string, number>();
+  private readonly turnFileEdits = new Map<string, (TurnFileEdit & { order: readonly [number, number] })[]>();
+  private readonly editSummarySlots = new Map<string, HTMLElement>();
+  private readonly editTurnEnds = new Map<string, EditTurnEnd>();
+  private readonly historyTurnStarts = new Map<string, number>();
+  private readonly unsubscribeEditSummary = onEditSummaryChange(() => this.refreshEditSummaries());
   private lastPastModel: string | null = null;
   private todoCardEl: HTMLDetailsElement | null = null;
   private todoSummaryEl: HTMLElement | null = null;
@@ -1635,7 +1785,12 @@ export class Tab {
     heading.className = "session-header";
     const titleBlock = document.createElement("div");
     titleBlock.className = "session-heading-block";
-    titleBlock.appendChild(this.sessionHeader.element);
+    this.todoCrumbsEl.className = "todo-crumbs";
+    this.todoCrumbsEl.setAttribute("aria-label", l10n.t("ToDo path"));
+    this.todoCrumbsEl.hidden = true;
+    this.todoHeadEl.className = "todo-conv-head";
+    this.todoHeadEl.hidden = true;
+    titleBlock.append(this.todoCrumbsEl, this.sessionHeader.element);
     this.headEl.appendChild(heading);
     this.buildViewSwitch();
     const progress = document.createElement("div");
@@ -1697,7 +1852,16 @@ export class Tab {
       e.stopPropagation();
       vscode.postMessage({ type: "closeTab", tabId: this.tabId });
     };
-    this.tabBtn.append(dot, label, close);
+    this.todoTabDotEl.className = "todo-dot tab-todo-dot";
+    this.todoTabDotEl.setAttribute("aria-hidden", "true");
+    this.todoTabDotEl.hidden = true;
+    this.todoChildEl.className = "tab-todo-child";
+    this.todoChildEl.textContent = "↳";
+    this.todoChildEl.setAttribute("aria-hidden", "true");
+    this.todoChildEl.hidden = true;
+    this.unreadEl.className = "tab-unread";
+    this.unreadEl.hidden = true;
+    this.tabBtn.append(dot, this.todoTabDotEl, this.todoChildEl, label, this.unreadEl, close);
     this.tabBtn.onclick = () => setActiveTab(this.tabId);
     tabbarEl.appendChild(this.tabBtn);
   }
@@ -1705,6 +1869,8 @@ export class Tab {
   destroy(): void {
     forgetCodeBlockStates(this.tabId);
     this.unsubscribeUserLabel();
+    this.unsubscribeTodoClosed();
+    this.unsubscribeEditSummary();
     this.clearHandoffStatus();
     this.chatYou.destroy();
     this.summaryYou.destroy();
@@ -2076,7 +2242,36 @@ export class Tab {
 
   dismissYou(item: YouItem): void {
     const identity = this.youStore.dismiss(item.id);
-    if (identity !== undefined) this.persistAskDismissals([identity]);
+    if (identity !== undefined) this.recordAskDismissals([identity]);
+  }
+
+  private recordAskDismissals(identities: readonly AskIdentity[]): void {
+    this.persistAskDismissals(identities);
+    for (const identity of identities) onAskDismissed?.(this.tabId, identity);
+  }
+
+  youMessageOf(item: YouItem): string | undefined {
+    return this.youStore.messageOf(item.anchor.id);
+  }
+
+  private syncTodoClosedAsks(root: HTMLElement = this.convEl): void {
+    const closed = todoAsksClosedInTodo();
+    root.querySelectorAll<HTMLElement>(".laisora-ask[id]").forEach((block) => {
+      const message = this.youStore.messageOf(block.id);
+      const on = message !== undefined && closed.has(message);
+      block.classList.toggle("ask-closed-todo", on);
+      const note = block.querySelector(":scope > .ask-closed-note");
+      if (on && !note) block.querySelector(":scope > .ask-title")?.after(Object.assign(document.createElement("div"), { className: "ask-closed-note", textContent: l10n.t("Done (closed in ToDo)") }));
+      else if (!on) note?.remove();
+    });
+  }
+
+  applyAskDismissals(messages: Iterable<string>): void {
+    this.youStore.dismissMessages(messages);
+  }
+
+  youItemOfMessage(message: string): YouItem | undefined {
+    return this.youStore.reader.get().find((item) => this.youStore.messageOf(item.anchor.id) === message);
   }
 
   navigateToYou(item: YouItem): void {
@@ -2669,6 +2864,7 @@ export class Tab {
 
   finalizeReplay(stillRunning: boolean): void {
     if (!stillRunning) this.endAssistantTurn();
+    this.placePendingHistoryEditSummaries();
   }
 
   private applyStaled(toolUseIds: readonly string[]): void {
@@ -2840,7 +3036,7 @@ export class Tab {
     status.append(createLoader(12));
     const nameEl = document.createElement("span");
     nameEl.className = "agent-name";
-    nameEl.textContent = data.summaryText;
+    nameEl.textContent = todoAgentText(data.summaryText);
     const chipsEl = document.createElement("span");
     chipsEl.className = "agent-chips";
     const meta = document.createElement("span");
@@ -2891,6 +3087,7 @@ export class Tab {
       setRowChip(data, "model", state.modelMeasured);
       fillChips(entry.chipsEl, data, this.models);
     }
+    this.paintAgentTodo(entry, data);
   }
 
   private renderAgentMeta(toolUseId: string): void {
@@ -3013,6 +3210,7 @@ export class Tab {
       this.convEl.appendChild(turn);
       this.currentAssistantTurn = turn;
       this.replyFooterAnchor = turn;
+      if (this.pendingTodoCards.size > 0) this.attachPendingTodoCards();
     }
     const seg = document.createElement("div");
     seg.className = "assistant-seg streaming";
@@ -3069,7 +3267,8 @@ export class Tab {
         this.assistantRuns[i].uuid = ev.uuid;
       }
     }
-    this.persistAskDismissals(this.youStore.relabel());
+    this.recordAskDismissals(this.youStore.relabel());
+    this.syncTodoClosedAsks();
     this.persistAskResolutions();
     this.closeLiveRecord();
     this.liveRecordOpen = this.assistantRuns.some(run => run.uuid === null && !run.complete);
@@ -3355,7 +3554,7 @@ export class Tab {
     turnId: string,
     timestamp: number,
     headline: string | null,
-    cliInserted = false
+    cliInserted: InsertedTurn = false
   ): HTMLElement {
     const anchor = this.buildTurnAnchor(turnId, timestamp, headline, false, cliInserted);
     this.workEl.appendChild(anchor);
@@ -3368,7 +3567,7 @@ export class Tab {
     timestamp: number,
     headline: string | null,
     past: boolean,
-    cliInserted = false
+    cliInserted: InsertedTurn = false
   ): HTMLElement {
     const anchor = document.createElement("div");
     anchor.className = past ? "worklog-turn hll-past" : "worklog-turn";
@@ -3387,9 +3586,11 @@ export class Tab {
       if (event.key === "Enter" || event.key === " ") { event.preventDefault(); toggle(); }
     };
     const b = document.createElement("b");
-    b.dataset.emptyLabel = cliInserted
-      ? l10n.t("Started by Claude Code (not your message)")
-      : l10n.t("Turn started");
+    b.dataset.emptyLabel = cliInserted === "laisora"
+      ? l10n.t("Sent by LAISORA (not your message)")
+      : cliInserted
+        ? l10n.t("Started by Claude Code (not your message)")
+        : l10n.t("Turn started");
     if (headline !== null) b.textContent = headline;
     const time = document.createElement("span");
     time.textContent = timestamp > 0 ? clockLabel(timestamp) : past ? l10n.t("Time not observed") : clockLabel(Date.now());
@@ -3793,6 +3994,7 @@ export class Tab {
         this.updateStrip();
         break;
       case "turn_started":
+        this.noteHistoryTurnStart(ev);
         this.onTurnStarted(ev);
         break;
       case "ask_rejected":
@@ -3801,14 +4003,17 @@ export class Tab {
       case "turn_completed":
         this.onTurnCompleted(ev);
         this.settleAskChecks(ev.turnId);
+        this.showEditSummary(ev);
         break;
       case "turn_interrupted":
         this.onTurnInterrupted(ev);
         this.settleAskChecks(ev.turnId);
+        this.showEditSummary(ev);
         break;
       case "turn_failed":
         this.onTurnFailed(ev);
         this.settleAskChecks(ev.turnId);
+        this.showEditSummary(ev);
         break;
       case "api_retry":
         this.onApiRetry(ev);
@@ -3835,6 +4040,7 @@ export class Tab {
         this.onToolCallStarted(ev);
         break;
       case "tool_call_finished":
+        if (!this.runningChildTools.has(ev.toolUseId)) this.noteFileEdit(ev);
         this.onToolCallFinished(ev, activityChanged);
         break;
       case "subagent_info":
@@ -3961,7 +4167,7 @@ export class Tab {
   private beginTurn(
     turnId: string,
     timestamp: number,
-    cliInserted: boolean,
+    cliInserted: InsertedTurn,
     work: WorkEventInfo | undefined
   ): void {
     this.pendingSend = false;
@@ -3998,18 +4204,23 @@ export class Tab {
   }
 
   private onTurnStarted(ev: Extract<NormalizedEvent, { kind: "turn_started" }>): void {
+    if (ev.provenance?.path !== "history") {
+      this.dropLiveEditTurnEnds();
+      this.placePendingHistoryEditSummaries();
+    }
     this.clearCancelledHandoffNotice();
     if (this.adoptedTurnIds.has(ev.turnId)) {
       this.applyWork(ev.work);
       return;
     }
-    this.beginTurn(ev.turnId, ev.timestamp, ev.cliInserted === true, ev.work);
+    this.beginTurn(ev.turnId, ev.timestamp, ev.laisoraInput === true ? "laisora" : ev.cliInserted === true, ev.work);
   }
 
   private onTurnCompleted(ev: Extract<NormalizedEvent, { kind: "turn_completed" }>): void {
     if (this.finishSuspendedReply(ev)) return;
     this.knownTurnIds.add(ev.turnId);
     this.endAssistantTurn();
+    if (this.pendingTodoCards.size > 0) this.attachPendingTodoCards(ev.turnId);
     this.applyWork(ev.work);
     this.runningChildTools.clear();
     this.runningMainTools.clear();
@@ -4036,6 +4247,152 @@ export class Tab {
         this.scrollToBottom("conv");
       }
     }
+  }
+
+  private noteFileEdit(ev: Extract<NormalizedEvent, { kind: "tool_call_finished" }>): void {
+    if (ev.fileEdit === undefined || ev.taskNotification !== undefined) return;
+    const edits = this.turnFileEdits.get(ev.turnId) ?? [];
+    if (edits.some((edit) => edit.toolUseId === ev.toolUseId)) return;
+    edits.push({ toolUseId: ev.toolUseId, fileEdit: ev.fileEdit, order: [ev.generation, ev.seq] });
+    edits.sort((a, b) => a.order[0] - b.order[0] || a.order[1] - b.order[1]);
+    this.turnFileEdits.set(ev.turnId, edits);
+    this.settleEditSummary(ev.turnId);
+  }
+
+  private noteHistoryTurnStart(ev: Extract<NormalizedEvent, { kind: "turn_started" }>): void {
+    if (ev.provenance?.path === "history" && ev.timestamp > 0) this.historyTurnStarts.set(ev.turnId, ev.timestamp);
+  }
+
+  private noteReplayAnchor(at: number | null | undefined, foot: HTMLElement | null): void {
+    if (typeof at === "number" && at > 0 && foot !== null) foot.dataset.editAnchorAt = String(at);
+  }
+
+  private renderEditSummarySlot(turnId: string, slot: HTMLElement): void {
+    const edits = this.turnFileEdits.get(turnId);
+    if (edits === undefined || edits.length === 0 || !editSummaryEnabled()) {
+      slot.replaceChildren();
+      slot.hidden = true;
+      return;
+    }
+    slot.hidden = false;
+    slot.replaceChildren(buildEditSummaryCard(aggregateTurnEdits(edits), (file) => vscode.postMessage({
+      type: "openEditDiff",
+      tabId: this.tabId,
+      firstToolUseId: file.firstToolUseId,
+      lastToolUseId: file.lastToolUseId,
+    })));
+  }
+
+  private createEditSummarySlot(turnId: string): HTMLElement {
+    const slot = document.createElement("div");
+    slot.className = "edit-summary-slot";
+    slot.dataset.turnId = turnId;
+    slot.hidden = true;
+    return slot;
+  }
+
+  private adoptEditSummarySlot(turnId: string, slot: HTMLElement): void {
+    this.editSummarySlots.set(turnId, slot);
+    this.editTurnEnds.delete(turnId);
+    this.renderEditSummarySlot(turnId, slot);
+  }
+
+  private editSummaryAnchors(): { at: number; el: HTMLElement }[] {
+    return Array.from(this.convEl.querySelectorAll<HTMLElement>("[data-edit-anchor-at]"), (el) => ({ at: Number(el.dataset.editAnchorAt), el }));
+  }
+
+  private insertEditSummarySlot(turnId: string, end: EditTurnEnd, slot: HTMLElement, anchors: { at: number; el: HTMLElement }[] | null): boolean {
+    if (end.kind === "after") {
+      if (end.el.parentNode === null) return false;
+      end.el.after(slot);
+      return true;
+    }
+    if (end.kind === "live") {
+      const turns = this.convEl.querySelectorAll<HTMLElement>(`.block.assistant-turn[data-turn-id="${CSS.escape(turnId)}"]`);
+      const turn = turns.length > 0 ? turns[turns.length - 1] : null;
+      if (turn === null) {
+        this.convEl.appendChild(slot);
+        return true;
+      }
+      const footer = turn.nextElementSibling;
+      (footer !== null && footer.classList.contains("reply-footer") ? footer : turn).after(slot);
+      return true;
+    }
+    if (anchors === null) return false;
+    const startedAt = this.historyTurnStarts.get(turnId) ?? -Infinity;
+    let anchor: { at: number; el: HTMLElement } | null = null;
+    for (const entry of anchors) {
+      if (entry.at < startedAt || entry.at > end.endedAt) continue;
+      if (anchor === null || entry.at >= anchor.at) anchor = entry;
+    }
+    if (anchor === null) return false;
+    let after: Element = anchor.el;
+    while (after.nextElementSibling !== null && after.nextElementSibling.classList.contains("edit-summary-slot")) after = after.nextElementSibling;
+    after.after(slot);
+    return true;
+  }
+
+  private settleEditSummary(turnId: string, anchors: { at: number; el: HTMLElement }[] | null = null): void {
+    const placed = this.editSummarySlots.get(turnId);
+    if (placed !== undefined) {
+      this.renderEditSummarySlot(turnId, placed);
+      return;
+    }
+    const end = this.editTurnEnds.get(turnId);
+    if (end === undefined || !this.turnFileEdits.has(turnId)) return;
+    const slot = this.createEditSummarySlot(turnId);
+    if (this.insertEditSummarySlot(turnId, end, slot, anchors)) this.adoptEditSummarySlot(turnId, slot);
+  }
+
+  private endEditTurn(turnId: string, end: EditTurnEnd): void {
+    if (!this.editSummarySlots.has(turnId)) {
+      this.editTurnEnds.delete(turnId);
+      this.editTurnEnds.set(turnId, end);
+      if (this.editTurnEnds.size > EDIT_TURN_ENDS_MAX) this.editTurnEnds.delete(this.editTurnEnds.keys().next().value!);
+    }
+    this.settleEditSummary(turnId);
+  }
+
+  private dropLiveEditTurnEnds(): void {
+    for (const [turnId, end] of this.editTurnEnds) if (end.kind === "live") this.editTurnEnds.delete(turnId);
+  }
+
+  private showEditSummary(ev: Extract<NormalizedEvent, { kind: "turn_completed" | "turn_interrupted" | "turn_failed" }>): void {
+    this.endEditTurn(ev.turnId, ev.provenance?.path === "history" ? { kind: "history", endedAt: ev.timestamp } : { kind: "live" });
+    if (ev.provenance?.path !== "history" && this.editSummarySlots.get(ev.turnId)?.hidden === false) this.scrollToBottom("conv");
+  }
+
+  private showPastEditSummary(ev: Extract<NormalizedEvent, { kind: "turn_completed" | "turn_interrupted" | "turn_failed" }>, frag: DocumentFragment): void {
+    if (ev.provenance?.path === "history") {
+      this.endEditTurn(ev.turnId, { kind: "history", endedAt: ev.timestamp });
+      return;
+    }
+    const footer = this.pastConvFooters.get(ev.turnId);
+    if (footer !== undefined) {
+      this.endEditTurn(ev.turnId, { kind: "after", el: footer });
+      return;
+    }
+    if (this.editSummarySlots.has(ev.turnId)) return;
+    const slot = this.createEditSummarySlot(ev.turnId);
+    frag.appendChild(slot);
+    this.adoptEditSummarySlot(ev.turnId, slot);
+  }
+
+  private placePendingHistoryEditSummaries(): void {
+    let anchors: { at: number; el: HTMLElement }[] | null = null;
+    for (const [turnId, end] of [...this.editTurnEnds]) {
+      if (end.kind !== "history" || !this.turnFileEdits.has(turnId)) continue;
+      anchors ??= this.editSummaryAnchors();
+      this.settleEditSummary(turnId, anchors);
+    }
+  }
+
+  private refreshEditSummaries(): void {
+    for (const [turnId, slot] of [...this.editSummarySlots]) {
+      if (slot.parentNode === null) this.editSummarySlots.delete(turnId);
+      else this.renderEditSummarySlot(turnId, slot);
+    }
+    this.placePendingHistoryEditSummaries();
   }
 
   private onTurnInterrupted(ev: Extract<NormalizedEvent, { kind: "turn_interrupted" }>): void {
@@ -4251,8 +4608,11 @@ export class Tab {
       scheduleImageLoads(this);
     }
     this.observeSessionTime(ev.recordedAt ?? ev.sentAt);
-    if (ev.role === "user") this.appendUserFoot(block, ev.recordedAt ?? ev.sentAt ?? undefined, ev.text);
-    else if (ev.role === "assistant") this.appendReplyFooter(ev.recordedAt, () => ev.text);
+    if (ev.role === "user") this.noteReplayAnchor(ev.recordedAt ?? ev.sentAt, this.appendUserFoot(block, ev.recordedAt ?? ev.sentAt ?? undefined, ev.text));
+    else if (ev.role === "assistant") {
+      this.appendReplyFooter(ev.recordedAt, () => ev.text);
+      this.noteReplayAnchor(ev.recordedAt, this.latestReplyFooter);
+    }
     this.scrollToBottom("conv");
   }
 
@@ -4359,6 +4719,7 @@ export class Tab {
       if (!this.withSuspendedReply(ev.turnId, () => this.closeLiveRecord()) && ev.turnId === this.currentTurnId) this.closeLiveRecord();
     }
     this.toolStartTimes.set(ev.toolUseId, ev.timestamp);
+    this.placeTodoToolCard(ev);
     if (!isHistory && ev.parentToolUseId === null) {
       this.runningMainTools.set(ev.toolUseId, { name: ev.toolName, intentInput: ev.intentInput });
       this.updateStrip();
@@ -4406,6 +4767,7 @@ export class Tab {
 
   private onToolCallFinished(ev: Extract<NormalizedEvent, { kind: "tool_call_finished" }>, activityChanged: boolean): void {
     this.runningChildTools.delete(ev.toolUseId);
+    this.finishTodoToolCard(ev);
     const mainToolFinished = this.runningMainTools.delete(ev.toolUseId);
     if (activityChanged || mainToolFinished) this.updateStrip();
     this.applyWork(ev.work);
@@ -5003,7 +5365,7 @@ export class Tab {
     body.className = "convlog-history-body";
     head.append(body);
     const marker = this.replayMarkerEl;
-    const cards = new Set([this.restoredHandoffCard, ...this.handoffCardEls.values()]);
+    const cards = new Set([this.todoHeadEl, this.restoredHandoffCard, ...this.handoffCardEls.values()]);
     const lastCard = Array.from(this.convEl.children).filter((el) => cards.has(el as HTMLElement)).pop();
     const before = lastCard ? lastCard.nextSibling
       : marker !== null && marker.parentNode === this.convEl ? marker : this.convEl.firstChild;
@@ -5052,6 +5414,9 @@ export class Tab {
         duplicates++;
         continue;
       }
+      if (ev.kind === "tool_call_finished") this.noteFileEdit(ev);
+      else if (ev.kind === "turn_started") this.noteHistoryTurnStart(ev);
+      else if (ev.kind === "turn_completed" || ev.kind === "turn_interrupted" || ev.kind === "turn_failed") this.showPastEditSummary(ev, frag);
       try {
         const outcome = this.renderPastConvEvent(ev, frag, turns);
         if (ev.provenance?.path !== "history" && (ev.kind === "assistant_text_delta" || ev.kind === "assistant_message_uuid")) {
@@ -5092,7 +5457,9 @@ export class Tab {
     this.installConvHistoryHead();
     const body = this.convHistoryBodyEl!;
     body.insertBefore(frag, body.firstChild);
+    this.attachPendingTodoCards();
     this.refreshLatestReplyFooter();
+    this.placePendingHistoryEditSummaries();
     this.convPrependedTotal += rendered;
     scheduleImageLoads(this);
     return {
@@ -5109,12 +5476,46 @@ export class Tab {
     });
   }
 
+  private pastConvTurn(turnId: string, frag: DocumentFragment, turns: Map<string, { el: HTMLElement }>): boolean {
+    if (turns.has(turnId)) return false;
+    const carried = this.pastConvTurns.get(turnId);
+    if (carried !== undefined && carried.el.isConnected) {
+      turns.set(turnId, { el: carried.el });
+      return false;
+    }
+    const top = this.topConvSeg;
+    if (top !== null && top.turnId === turnId && top.el.isConnected) {
+      turns.set(turnId, { el: top.el });
+      return false;
+    }
+    const turn = document.createElement("div");
+    turn.className = "block assistant-turn";
+    this.prependTurnLabel(turn, "assistant", null);
+    turn.dataset.convPast = "1";
+    turn.dataset.turnId = turnId;
+    const seg = document.createElement("div");
+    seg.className = "assistant-seg";
+    turn.appendChild(seg);
+    frag.appendChild(turn);
+    turns.set(turnId, { el: seg });
+    const footer = this.buildReplyFooter(undefined, () => this.pastConvTurns.get(turnId)?.text ?? "");
+    this.pastConvFooters.set(turnId, footer);
+    frag.appendChild(footer);
+    return true;
+  }
+
   private renderPastConvEvent(
     ev: NormalizedEvent,
     frag: DocumentFragment,
     turns: Map<string, { el: HTMLElement }>
   ): "created" | "duplicate" | "continued" | "skipped" {
     this.observeYouEvent(ev);
+    if (ev.kind === "tool_call_started" && ev.turnId !== null && ev.parentToolUseId === null && isTodoWriteTool(ev.toolName)) {
+      const created = this.pastConvTurn(ev.turnId, frag, turns);
+      this.placeTodoToolCard(ev, turns.get(ev.turnId)?.el);
+      return created ? "created" : "skipped";
+    }
+    if (ev.kind === "tool_call_finished") this.finishTodoToolCard(ev);
     if (!isConvRenderableEvent(ev)) return "skipped";
     if (ev.kind === "local_command_output") {
       if (ev.uuid && this.convMessageUuids.has(ev.uuid)) return "duplicate";
@@ -5174,8 +5575,8 @@ export class Tab {
         }
       }
       frag.appendChild(div);
-      if (ev.role === "user") this.appendUserFoot(div, ev.recordedAt ?? ev.sentAt ?? undefined, ev.text);
-      else if (ev.role === "assistant") frag.appendChild(this.buildReplyFooter(ev.recordedAt, () => ev.text));
+      if (ev.role === "user") this.noteReplayAnchor(ev.recordedAt ?? ev.sentAt, this.appendUserFoot(div, ev.recordedAt ?? ev.sentAt ?? undefined, ev.text));
+      else if (ev.role === "assistant") this.noteReplayAnchor(ev.recordedAt, frag.appendChild(this.buildReplyFooter(ev.recordedAt, () => ev.text)));
       return "created";
     }
     if (ev.kind === "user_message") {
@@ -5203,37 +5604,7 @@ export class Tab {
       this.appendUserFoot(div, ev.sentAt ?? (ev.timestamp > 0 ? ev.timestamp : undefined), ev.text);
       return "created";
     }
-    if (ev.kind === "assistant_text_delta") {
-      const existing = turns.get(ev.turnId);
-      if (existing !== undefined) {
-        return "continued";
-      }
-      const carried = this.pastConvTurns.get(ev.turnId);
-      if (carried !== undefined && carried.el.isConnected) {
-        turns.set(ev.turnId, { el: carried.el });
-        return "continued";
-      }
-      const top = this.topConvSeg;
-      if (top !== null && top.turnId === ev.turnId && top.el.isConnected) {
-        turns.set(ev.turnId, { el: top.el });
-        return "continued";
-      }
-      const turn = document.createElement("div");
-      turn.className = "block assistant-turn";
-      this.prependTurnLabel(turn, "assistant", null);
-      turn.dataset.convPast = "1";
-      turn.dataset.turnId = ev.turnId;
-      const seg = document.createElement("div");
-      seg.className = "assistant-seg";
-      turn.appendChild(seg);
-      frag.appendChild(turn);
-      turns.set(ev.turnId, { el: seg });
-      const turnId = ev.turnId;
-      const footer = this.buildReplyFooter(undefined, () => this.pastConvTurns.get(turnId)?.text ?? "");
-      this.pastConvFooters.set(turnId, footer);
-      frag.appendChild(footer);
-      return "created";
-    }
+    if (ev.kind === "assistant_text_delta") return this.pastConvTurn(ev.turnId, frag, turns) ? "created" : "continued";
     if (ev.kind === "model_observed") {
       const turn = ev.turnId === null ? undefined : turns.get(ev.turnId) ?? this.pastConvTurns.get(ev.turnId);
       const label = turn?.el.closest(".block.assistant-turn")?.querySelector<HTMLElement>(":scope > .turn-label > .turn-label-name");
@@ -5328,8 +5699,8 @@ export class Tab {
           }
         }
         frag.appendChild(div);
-        if (m.role === "user") this.appendUserFoot(div, m.timestamp, m.text);
-        else if (m.role === "assistant") frag.appendChild(this.buildReplyFooter(m.timestamp, () => m.text));
+        if (m.role === "user") this.noteReplayAnchor(m.timestamp, this.appendUserFoot(div, m.timestamp, m.text));
+        else if (m.role === "assistant") this.noteReplayAnchor(m.timestamp, frag.appendChild(this.buildReplyFooter(m.timestamp, () => m.text)));
       } catch (error) {
         failed++;
         if (failures.length < 5) failures.push(String(error));
@@ -5341,7 +5712,9 @@ export class Tab {
     this.installConvHistoryHead();
     const body = this.convHistoryBodyEl!;
     body.insertBefore(frag, body.firstChild);
+    this.attachPendingTodoCards();
     this.refreshLatestReplyFooter();
+    this.placePendingHistoryEditSummaries();
     this.convPrependedTotal += rendered + dividersCreated;
     scheduleImageLoads(this);
     return {
@@ -5530,7 +5903,7 @@ export class Tab {
   private renderPastTurnStart(
     ev: Extract<NormalizedEvent, { kind: "turn_started" }>
   ): PastRenderOutcome {
-    const cliInserted = ev.cliInserted === true;
+    const cliInserted: InsertedTurn = ev.laisoraInput === true ? "laisora" : ev.cliInserted === true;
     const stash = this.pastHeadline;
     const takes =
       stash !== null &&

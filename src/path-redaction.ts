@@ -3,7 +3,7 @@ const UNC = /(?:(?<=^|[\s"'`=(\[{,:;<>|])\\{2,}|\\{4,})(?:[^\s"'`|;)\]}>\\<]|\\(
 const FILE_URI = /file:\/\/(?:[^\s"'`|;)\]}>\\<]|\\(?!"))+/gi;
 const POSIX_ABS = /(?<=^|[^\p{L}\p{N}\p{M}_./\\~%+-]|\\[nrt]|(?:^|[^\p{L}\p{N}\p{M}_./\\~%+-])-[A-Za-z])(?!(?<=<)\/[A-Za-z][\w:-]*>)(?!(?<=(?<!\\)[A-Za-z0-9+.-]:)\/\/)\/+(?!(?:dev|proc|sys)\/)[^\s"'`|;)\]}>\\<]+/gu;
 
-function basenameOf(token: string): string {
+export function basenameOf(token: string): string {
   const parts = token.split(/[\\/]+/).filter((p) => p.length > 0);
   return parts.length > 0 ? parts[parts.length - 1] : "";
 }

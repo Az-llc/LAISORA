@@ -1,3 +1,4 @@
+import { isComposingKey } from "./composing";
 import * as l10n from "@vscode/l10n";
 import {
   INPUT_PLACEHOLDER,
@@ -18,14 +19,29 @@ const INPUT_PLACEHOLDER_SHIFT_ENTER = l10n.t("Type a message (Shift+Enter to sen
 
 let sendKey: ComposerSendKey = "enter";
 let askQualityCheck = false;
+let editSummary = false;
+const editSummaryListeners = new Set<() => void>();
 
 export function applyUserSettings(msg: Extract<HostToWebview, { type: "userSettings" }>): void {
   sendKey = msg.composerSendKey;
   askQualityCheck = msg.askQualityCheck === true;
+  const nextEditSummary = msg.editSummaryEnabled === true;
+  if (nextEditSummary === editSummary) return;
+  editSummary = nextEditSummary;
+  for (const listener of editSummaryListeners) listener();
+}
+
+export function onEditSummaryChange(listener: () => void): () => void {
+  editSummaryListeners.add(listener);
+  return () => editSummaryListeners.delete(listener);
 }
 
 export function askQualityCheckEnabled(): boolean {
   return askQualityCheck;
+}
+
+export function editSummaryEnabled(): boolean {
+  return editSummary;
 }
 
 export function composerSendKey(): ComposerSendKey {
@@ -200,7 +216,7 @@ function menuOpener(chip: HTMLElement): HTMLElement {
 
 function onMenuKeydown(e: KeyboardEvent): void {
   if (!menuKbd || menuKbd.container.classList.contains("hidden")) return;
-  if (e.isComposing) return;
+  if (isComposingKey(e)) return;
   if (e.ctrlKey || e.metaKey || e.altKey) return;
   switch (e.key) {
     case "ArrowDown":
@@ -525,7 +541,7 @@ export function initMenu(): void {
   modeMenuEl.addEventListener("keydown", onMenuKeydown);
   authPickerEl.addEventListener("keydown", onMenuKeydown);
   inputEl.addEventListener("keydown", (e) => {
-    if (e.key === "Tab" && e.shiftKey && !e.isComposing) {
+    if (e.key === "Tab" && e.shiftKey && !isComposingKey(e)) {
       e.preventDefault();
       const t = activeTab();
       if (!t || !activeTabId) return;

@@ -29,19 +29,27 @@ export function learningToolReply(result: LearningResult) {
   return { ...(!result.ok ? { isError: true } : {}), content: [{ type: "text" as const, text: JSON.stringify(result) }] };
 }
 
+export interface RootGateScope {
+  readonly tools: readonly string[];
+  readonly denial: string;
+}
+
+const LEARNING_ROOT_SCOPE: RootGateScope = { tools: LEARNING_TOOL_NAMES, denial: JSON.stringify(CALLER_UNVERIFIED) };
+
 export class LearningRootGate {
   private readonly marks = new Map<string, number>();
 
-  constructor(private readonly now: () => number = Date.now, private readonly log: (message: string) => void = () => {}) {}
+  constructor(private readonly now: () => number = Date.now, private readonly log: (message: string) => void = () => {},
+    readonly scope: RootGateScope = LEARNING_ROOT_SCOPE) {}
 
   readonly hook: Sdk.HookCallback = async (input) => {
     const value = input as unknown as Record<string, unknown>;
-    if (!LEARNING_TOOL_NAMES.includes(String(value.tool_name))) return {};
+    if (!this.scope.tools.includes(String(value.tool_name))) return {};
     if (value.hook_event_name !== "PreToolUse") { this.revoke(value.tool_use_id); return {}; }
     return failClosedGuard(() => {
       if (value.agent_id !== undefined) {
         return { hookSpecificOutput: { hookEventName: "PreToolUse" as const, permissionDecision: "deny" as const,
-          permissionDecisionReason: JSON.stringify(CALLER_UNVERIFIED) } };
+          permissionDecisionReason: this.scope.denial } };
       }
       if (typeof value.tool_use_id === "string" && value.tool_use_id) this.mark(value.tool_use_id);
       return {};

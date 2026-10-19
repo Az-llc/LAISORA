@@ -384,7 +384,7 @@ interface ResolvedFileLink {
 }
 
 async function resolveConversationFileLink(
-  session: Session,
+  cwd: string,
   rawTarget: string
 ): Promise<ResolvedFileLink | { refused: string }> {
   const cannotOpen = { refused: l10n.t("LAISORA: This file link cannot be opened.") };
@@ -394,7 +394,7 @@ async function resolveConversationFileLink(
 
   const relativePath =
     parsed.kind === "path" && !isAbsolute(parsed.resource) && !win32.isAbsolute(parsed.resource);
-  if ((relativePath && session.cwd.length === 0) || (parsed.kind === "path" && isWindowsReservedOrStreamPath(parsed.resource))) {
+  if ((relativePath && cwd.length === 0) || (parsed.kind === "path" && isWindowsReservedOrStreamPath(parsed.resource))) {
     return cannotOpen;
   }
 
@@ -404,14 +404,14 @@ async function resolveConversationFileLink(
       parsed.kind === "file-uri"
         ? vscode.Uri.parse(parsed.resource, true).fsPath
         : relativePath
-          ? resolve(session.cwd, parsed.resource)
+          ? resolve(cwd, parsed.resource)
           : parsed.resource;
   } catch {
     return cannotOpen;
   }
 
   const rootCandidates = [
-    ...(session.cwd.length === 0 ? [] : [session.cwd]),
+    ...(cwd.length === 0 ? [] : [cwd]),
     ...(vscode.workspace.workspaceFolders ?? []).map((folder) => folder.uri.fsPath),
   ];
   if (isWindowsDevicePath(candidate) || isWindowsReservedOrStreamPath(candidate)) return cannotOpen;
@@ -469,7 +469,11 @@ async function statResolvedFileLink(
 }
 
 export async function openConversationFile(session: Session, rawTarget: string, fromEditorPanel: boolean): Promise<void> {
-  const resolved = await resolveConversationFileLink(session, rawTarget);
+  await openFileLink(session.cwd, rawTarget, fromEditorPanel);
+}
+
+export async function openFileLink(cwd: string, rawTarget: string, fromEditorPanel: boolean): Promise<void> {
+  const resolved = await resolveConversationFileLink(cwd, rawTarget);
   if ("refused" in resolved) {
     void vscode.window.showWarningMessage(resolved.refused);
     return;
@@ -478,7 +482,7 @@ export async function openConversationFile(session: Session, rawTarget: string, 
 }
 
 async function copyConversationFilePath(session: Session, rawTarget: string): Promise<boolean> {
-  const resolved = await resolveConversationFileLink(session, rawTarget);
+  const resolved = await resolveConversationFileLink(session.cwd, rawTarget);
   if ("refused" in resolved) {
     output.appendLine(`[file-link] copy refused: ${resolved.refused}`);
     return false;

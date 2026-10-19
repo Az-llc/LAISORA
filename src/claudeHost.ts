@@ -7,8 +7,8 @@ import { readConversationRuns, appendRunRecord, DISPATCH_BUDGET_EXCEEDED, DISPAT
 import { randomUUID } from "node:crypto";
 import { isDeepStrictEqual } from "node:util";
 import { readdirSync, readFileSync } from "node:fs";
-import { join } from "node:path";
-import { tmpdir } from "node:os";
+import { isAbsolute, join } from "node:path";
+import { homedir, tmpdir } from "node:os";
 import { prepareOrchestrationPlugin } from "./orchestration-plugin";
 import * as l10n from "@vscode/l10n";
 
@@ -47,6 +47,7 @@ import { admitReportSend, admitSteeringSend, type SteeringAdmission } from "./st
 export type SteeringSendResult = SteeringAdmission;
 import type { ProgressTrackingMode } from "./progress-protocol";
 import { PROGRESS_WIRE_TOOL_NAME } from "./artifact-access";
+import { FILE_WRITING_TOOLS } from "./file-writing-tools";
 import { z } from "zod";
 import { ClaudeLiveNormalizer, parseAliases } from "./claude-normalizer";
 import { AGENT_EFFORT_ARGUMENT_CLI_VERSION, agentEffortArgumentSupported, conductorInstruction, delegationEffort, orchestrationExternalTargets, orchestrationAgents, orchestrationVariants, resolveOrchestrationRoster, type OrchestrationRow, type ExternalModels } from "./orchestration-roster";
@@ -65,7 +66,10 @@ import { LearningDelivery, learningRoster, sectionFromLedger, readMeasuredRuns, 
 import type { SectionResult } from "./learning-section";
 import { resolveClaudeProfileModel } from "./orchestration-profiles";
 import { LearningRecorder, type LearningRecordResult as LearningResult, type LearningToolKind } from "./learning-recording";
-import { createLearningMcpServer, LearningRootGate, LEARNING_INSTRUCTION, LEARNING_TOOL_NAMES } from "./learning-mcp";
+import { createLearningMcpServer, LearningRootGate, LEARNING_INSTRUCTION } from "./learning-mcp";
+import { laisoraInputLine, markLaisoraInput, type LaisoraInput } from "./laisora-input";
+import { createTodoMcpServer, TODO_ROOT_SCOPE, TODO_SERVER_NAME, TODO_TOOL_NAMES, todoLinkedInstruction, todoWorkspaceRoots, type TodoLinkedItem } from "./todo-mcp";
+import type { TodoStore } from "./todo-store";
 import { claudeModelIdLabel, isExternalRunTool } from "./orchestration-executors";
 import type { CompletionVerdict, NumberedLaunchVerdict, ResumeVerdict } from "./time-buckets";
 import { planItemLabel } from "./plan-steps";
@@ -92,6 +96,7 @@ type PermissionResult = ClaudeCodePermissionResult;
 type InterruptReceipt = { still_queued?: string[]; cancelled?: string[] };
 
 const CAP_INTERRUPT_CANCEL_QUEUED = "interrupt_cancel_queued_v1";
+const TODO_RECENT_FILES = 20;
 
 export const FILE_LINK_INSTRUCTION = (cwd = ""): string => {
   const base = cwd
@@ -150,6 +155,7 @@ export function planCompletionDenial(verdict: CompletionVerdict): string | undef
 }
 
 export const ASK_QUALITY_REWRITE_LIMIT = 2;
+export const RENAME_SESSION_TIMEOUT_MS = 5000;
 
 export function conversationSystemPrompt(fileLinkInstruction: boolean, planInstruction = true, cwd = ""): NonNullable<ClaudeCodeOptions["systemPrompt"]> {
   return { type: "custom", prompt: [fileLinkInstruction ? FILE_LINK_INSTRUCTION(cwd) : "", planInstruction ? PLAN_INSTRUCTION : "", PLACEMENT_LINE].filter(Boolean).join("\n\n"), snapshot: false };
@@ -162,6 +168,7 @@ interface QueryHandle extends AsyncIterable<any> {
   setModel(model?: string): Promise<void>;
   applyFlagSettings(settings: { effortLevel: "low" | "medium" | "high" | "xhigh" | "max" | null }): Promise<void>;
   getSettings?(): Promise<unknown>;
+  renameSession?(title: string, sessionId?: string): Promise<void>;
   supportedModels(): Promise<Array<{ model?: string; id?: string; value?: string; resolvedModel?: string; displayName?: string; description?: string; supportsEffort?: boolean; supportedEffortLevels?: string[] }>>;
   initializationResult(): Promise<unknown>;
   usage_EXPERIMENTAL_MAY_CHANGE_DO_NOT_RELY_ON_THIS_API_YET?(opts?: { skipBehaviors?: boolean }): Promise<unknown>;
@@ -188,6 +195,8 @@ export interface ClaudeHostOptions {
   fileLinkInstruction?: boolean;
   planInstruction?: boolean;
   askQualityCheck?: boolean;
+  todoStore?: TodoStore;
+  todoLinkedItem?: TodoLinkedItem;
   planLaunchVerdict?: (description: string | undefined) => NumberedLaunchVerdict;
   planResumeVerdict?: (to: string, namedToolUseId: string | undefined, toolUseId: string) => ResumeVerdict;
   planCompletionVerdict?: (toolName: string, input: Record<string, unknown> | undefined, toolUseId: string, admittedLaunches: ReadonlySet<string>) => CompletionVerdict;
@@ -450,6 +459,8 @@ export class ClaudeConversation {
   private recorder?: LearningRecorder;
   private learningSessionRef?: string;
   private learningGate?: LearningRootGate;
+  private todoGate?: LearningRootGate;
+  private todoFiles: readonly string[] = [];
   private measurement?: LearningMeasurement;
   private handlingResult = false;
   private learningObservation: Promise<void> = Promise.resolve();
@@ -652,7 +663,7 @@ export class ClaudeConversation {
       enabled: () => readClaudeCodeSettings(true).autoContinueAtUsageLimit !== false,
       connected: () => this.q !== null && !this.closed,
       live: () => this.q !== null && !this.closed && this.state === "idle" && this.inputQueue.length === 0,
-      send: (text) => this.send(text, undefined, undefined, true),
+      send: (text) => this.send(text, undefined, undefined, { kind: "resume" }),
       notify: (event) => this.emit(event),
     });
     this.unsubscribeAutoContinue = onAutoContinueSettingChange(() => {
@@ -801,11 +812,12 @@ ${ctxJson}`
         expiresAt: null,
         questions,
       });
-      const learningCall = LEARNING_TOOL_NAMES.includes(toolName) ? ctx.toolUseID : undefined;
-      self.learningGate?.hold(learningCall);
+      const rootGate = [self.learningGate, self.todoGate].find(gate => gate?.scope.tools.includes(toolName));
+      const rootCall = ctx.toolUseID;
+      rootGate?.hold(rootCall);
       const pendingDecision = self.opts.onApprovalRequest({ requestId, toolName, toolUseId: ctx.toolUseID, rawInputJson });
       const onAbort = (): void => {
-        self.learningGate?.revoke(learningCall);
+        rootGate?.revoke(rootCall);
         self.resolveApproval(requestId, "withdrawn", undefined, "withdrawn");
       };
       ctx.signal.addEventListener("abort", onAbort, { once: true });
@@ -817,12 +829,12 @@ ${ctxJson}`
         ctx.signal.removeEventListener("abort", onAbort);
       }
       if (ctx.signal.aborted || decision.behavior === "withdrawn") {
-        self.learningGate?.revoke(learningCall);
+        rootGate?.revoke(rootCall);
         self.emit({ kind: "approval_resolved", requestId, behavior: "withdrawn", resolvedBy: "withdrawn" });
         return null;
       }
-      if (decision.behavior === "deny") self.learningGate?.revoke(learningCall);
-      else self.learningGate?.release(learningCall);
+      if (decision.behavior === "deny") rootGate?.revoke(rootCall);
+      else rootGate?.release(rootCall);
       self.emit({ kind: "approval_resolved", requestId, behavior: decision.behavior, resolvedBy: decision.resolvedBy ?? "user", answers: decision.answers });
       if (decision.behavior === "deny") {
         return { behavior: "deny", message: laisoraDenialMessage() };
@@ -980,14 +992,35 @@ ${ctxJson}`
       const prompt = options.systemPrompt as { type: "custom"; snapshot: false; prompt: string };
       options.systemPrompt = { ...prompt, prompt: [prompt.prompt, !this.orchestrationEnabled ? deliverySection : "", LEARNING_INSTRUCTION].filter(Boolean).join("\n\n") };
     }
-    if (this.ingestion || this.opts.learningEnabled === true) {
-      const gate = this.learningGate = new LearningRootGate(undefined, this.opts.log);
-      options.mcpServers = { ...(options.mcpServers ?? {}), laisora_learning: createLearningMcpServer(sdk, gate, (input, root, kind) => this.recordLearningR12(input, root, kind)) };
-      const gated = { matcher: LEARNING_TOOL_NAMES.join("|"), hooks: [gate.hook] };
+    const addRootGate = (gate: LearningRootGate) => {
+      const gated = { matcher: gate.scope.tools.join("|"), hooks: [gate.hook] };
       options.hooks = { ...(options.hooks ?? {}),
         PreToolUse: [...(options.hooks?.PreToolUse ?? []), gated],
         PermissionDenied: [...(options.hooks?.PermissionDenied ?? []), gated],
         PostToolUseFailure: [...(options.hooks?.PostToolUseFailure ?? []), gated] };
+    };
+    if (this.ingestion || this.opts.learningEnabled === true) {
+      const gate = this.learningGate = new LearningRootGate(undefined, this.opts.log);
+      options.mcpServers = { ...(options.mcpServers ?? {}), laisora_learning: createLearningMcpServer(sdk, gate, (input, root, kind) => this.recordLearningR12(input, root, kind)) };
+      addRootGate(gate);
+    }
+    if (this.opts.todoStore) {
+      const gate = this.todoGate = new LearningRootGate(undefined, this.opts.log, TODO_ROOT_SCOPE);
+      options.mcpServers = { ...(options.mcpServers ?? {}), [TODO_SERVER_NAME]: createTodoMcpServer(sdk, this.opts.todoStore, gate, this.opts.log, () => this.learningSessionRef ?? this.opts.resumeSessionId,
+        () => ({ cwd: this.opts.cwd, files: this.todoFiles, roots: todoWorkspaceRoots(), home: homedir() })) };
+      options.allowedTools = [...(options.allowedTools ?? []), ...TODO_TOOL_NAMES];
+      addRootGate(gate);
+      const noteFile: ClaudeCodeSdk.HookCallback = async input => {
+        const value = input.hook_event_name === "PreToolUse" ? input.tool_input as Record<string, unknown> | undefined : undefined;
+        const path = value?.file_path ?? value?.notebook_path;
+        if (typeof path === "string" && isAbsolute(path)) this.todoFiles = [...this.todoFiles.filter(entry => entry !== path), path].slice(-TODO_RECENT_FILES);
+        return {};
+      };
+      options.hooks = { ...(options.hooks ?? {}), PreToolUse: [...(options.hooks?.PreToolUse ?? []), { matcher: "Read|Edit|Write|MultiEdit|NotebookEdit", hooks: [noteFile] }] };
+      if (this.opts.todoLinkedItem) {
+        const prompt = options.systemPrompt as { type: "custom"; snapshot: false; prompt: string };
+        options.systemPrompt = { ...prompt, prompt: [prompt.prompt, todoLinkedInstruction(this.opts.todoLinkedItem)].filter(Boolean).join("\n\n") };
+      }
     }
     {
       const guard: ClaudeCodeSdk.HookCallback = async input => {
@@ -1021,7 +1054,7 @@ ${ctxJson}`
         });
         const delegate = typeof input.agent_id === "string" && input.agent_id.length > 0;
         if (settings && !settings.guard && !delegate) return {};
-        if (!["Write", "Edit", "MultiEdit", ...(delegate ? ["NotebookEdit"] : [])].includes(input.tool_name) && !isShellTool(input.tool_name)) return {};
+        if (!([...FILE_WRITING_TOOLS, ...(delegate ? ["NotebookEdit"] : [])] as string[]).includes(input.tool_name) && !isShellTool(input.tool_name)) return {};
         return failClosedGuard(async () => {
           if (!settings) throw settingsError;
           const value = input.tool_input as Record<string, unknown>;
@@ -1039,7 +1072,7 @@ ${ctxJson}`
           let memoryDecision: MemoryDecision | undefined = delegate && decision.destination === "memory"
             ? { destination: "memory", blocked: true, reasons: ["delegate"], blockedLines: [] } : undefined;
           const filePath = input.tool_name === "NotebookEdit" ? value.notebook_path : value.file_path;
-          if (["Write", "Edit", "MultiEdit", "NotebookEdit"].includes(input.tool_name) && typeof filePath === "string") {
+          if (([...FILE_WRITING_TOOLS, "NotebookEdit"] as string[]).includes(input.tool_name) && typeof filePath === "string") {
             const path = placementPath(filePath, cwd, false);
             let current: string | undefined;
             if (path) {
@@ -1268,7 +1301,7 @@ ${ctxJson}`
     return [...this.pendingApprovals.values()].flatMap(p => p.toolUseId === undefined ? [] : [p.toolUseId]);
   }
 
-  send(text: string, images?: ImageAttachment[], sentAt = Date.now(), automatic = false, uuid?: `${string}-${string}-${string}-${string}-${string}`): void {
+  send(text: string, images?: ImageAttachment[], sentAt = Date.now(), automatic: LaisoraInput | false = false, uuid?: `${string}-${string}-${string}-${string}-${string}`): void {
     if (!automatic) this.usageLimitResume.manualSend();
     if (this.closed) {
       this.emit({
@@ -1288,7 +1321,13 @@ ${ctxJson}`
     }
     const runningAlready = this.normalizer.turnState !== "idle";
     if (!runningAlready) {
-      this.normalizer.startTurn(undefined, { timestamp: sentAt }, automatic);
+      this.normalizer.startTurn(undefined, { timestamp: sentAt }, automatic !== false);
+    }
+    if (automatic) {
+      uuid ??= randomUUID();
+      const line = laisoraInputLine(automatic);
+      if (line !== undefined) this.emit({ kind: "local_command_output", text: line, uuid });
+      text = markLaisoraInput(automatic, text);
     }
     const content: UserContentBlock[] = [
       ...(images ?? []).map(
@@ -1525,6 +1564,7 @@ ${ctxJson}`
     this.closed = true;
     this.resolveInitialContextUsage(null);
     this.learningGate?.clear();
+    this.todoGate?.clear();
     if (this.interruptTimer) {
       clearTimeout(this.interruptTimer);
       this.interruptTimer = null;
@@ -1601,6 +1641,26 @@ ${ctxJson}`
     } catch (error) {
       this.opts.log(`getSettings failed: ${String(error)}`);
       return undefined;
+    }
+  }
+
+  async renameSession(title: string, sessionId?: string): Promise<boolean> {
+    const q = this.q;
+    if (!q || this.closed || typeof q.renameSession !== "function") return false;
+    let timeout: ReturnType<typeof setTimeout> | null = null;
+    try {
+      await Promise.race([
+        q.renameSession(title, sessionId),
+        new Promise<never>((_, reject) => {
+          timeout = setTimeout(() => reject(new Error("rename_session timeout")), RENAME_SESSION_TIMEOUT_MS);
+        }),
+      ]);
+      return true;
+    } catch (error) {
+      this.opts.log(`renameSession failed: ${String(error)}`);
+      return false;
+    } finally {
+      if (timeout) clearTimeout(timeout);
     }
   }
 

@@ -1,6 +1,7 @@
 import * as l10n from "@vscode/l10n";
 import type { SessionListItem, SessionScanDegradation } from "./protocol";
 import { formatSessionTitleForDisplay, normalizeTitleValue } from "./session-display-title";
+import { parseLaisoraInput } from "./laisora-input";
 
 export const SESSION_LIST_LIMIT = 40;
 export const SESSION_TITLE_MAX = 60;
@@ -50,7 +51,7 @@ export function displayTitleFromSummary(
   sessionId: string,
   maxLength?: number
 ): string {
-  const normalized = normalizeTitleValue(summary);
+  const normalized = normalizeTitleValue(parseLaisoraInput(summary)?.text ?? summary);
   if (normalized === null) return untitledLabel(sessionId);
   return formatSessionTitleForDisplay(normalized, maxLength ?? SESSION_TITLE_MAX);
 }

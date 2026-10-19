@@ -67,7 +67,7 @@ import { initialSessionFacts, type SessionFactsAccumulator } from "./session-fac
 import { SessionGuardrail } from "./session-guardrail";
 import { SessionLlm } from "./session-llm";
 import { displayTitleFromSummary } from "./session-list";
-import { refreshTabTitle } from "./session-list-wiring";
+import { refreshTabTitle, writeHeldChosenTitle } from "./session-list-wiring";
 import {
   SessionSemantic,
   llmAnalysisEnabled,
@@ -158,6 +158,7 @@ export class Session {
   lastContextTotalTokens: number | null = null;
 
   autoTitled = false;
+  unpersistedChosenTitle: { title: string; failedAttempts: number } | null = null;
   titleRefreshed = false;
   titleRefreshing = false;
   permissionMode: PermissionModeId = resolveInitialMode();
@@ -180,6 +181,8 @@ export class Session {
   launchModelCheck: { conversation: ClaudeConversation; requested: string; observed?: string; listSettled: boolean } | undefined;
   defaultEffort: ConfiguredEffort | undefined;
   resumeSessionId: string | undefined;
+  todoItemId: string | undefined;
+  todoTurnStartedAt: number | undefined;
   handoffSource?: HandoffSourceSnapshot;
   resuming = false;
   hydration: ResumeHydration | null = null;
@@ -200,7 +203,10 @@ export class Session {
   }
 
   resetLogicalSession(): void {
+    void writeHeldChosenTitle(this);
     this.initialModel = undefined;
+    this.todoItemId = undefined;
+    this.todoTurnStartedAt = undefined;
     this.cancelResumePreparation();
     this.hydration = null;
     this.hydrationCoverageUnconfirmed = false;
@@ -833,6 +839,7 @@ export class Session {
 
   async disposeConversation(): Promise<void> {
     while (this.starting) await this.starting;
+    await writeHeldChosenTitle(this);
     const conv = this.detachConversation();
     if (conv) await conv.dispose();
   }

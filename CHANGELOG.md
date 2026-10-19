@@ -1,5 +1,20 @@
 # Changelog
 
+## 1.8.0
+
+- **ToDo (beta).** `laisora.todo.enabled` (off by default) adds a fixed ToDo tab shared by all
+  windows on this PC. Claude adds and organizes tasks from the conversation, each turn's changes
+  show as one card you can revert, and open decisions show under the task they belong to.
+- **Tasks and conversations.** Start or continue a task in its own conversation, split a child task
+  into a child conversation with a handoff brief, and open a conversation's ToDo drawer with
+  Ctrl+Alt+T.
+- **Edit summary.** At the end of each turn a card lists the edited files with lines added and
+  removed; press a file to open that turn's diff read-only. Turn it off with
+  `laisora.editSummary.enabled` (on by default).
+- **Code blocks.** Copy, preview and full view are always visible in the code block header.
+- **Titles.** A conversation title chosen in LAISORA is kept after a restart.
+- Claude Agent SDK 0.3.303 (Claude Code CLI 2.1.303).
+
 ## 1.7.0
 
 - **Clearer decision cards.** Claude is asked to state the facts behind a decision, the concrete

@@ -110,6 +110,7 @@ export interface MdHardbreakNode {
 export type MdNode =
   | { type: "plan"; goal: string; offset: number }
   | { type: "ask"; ask: AskBlock; offset: number; rejected?: true }
+  | { type: "todoSplit"; item: string; reason: string; offset: number }
   | MdHeadingNode
   | MdParagraphNode
   | MdTextNode
@@ -259,6 +260,20 @@ interface TableBuilder {
 
 export const ASK_FENCE_INFO = "laisora-ask";
 export const ASK_REJECTED_FENCE_INFO = "laisora-ask rejected";
+export const TODO_SPLIT_FENCE_INFO = "laisora-todo-split";
+const TODO_SPLIT_REASON_MAX = 500;
+
+function parseTodoSplit(content: string): { item: string; reason: string } | null {
+  try {
+    const value = JSON.parse(content) as unknown;
+    if (typeof value !== "object" || value === null) return null;
+    const { item, reason } = value as Record<string, unknown>;
+    return typeof item === "string" && /^[0-9a-f]{1,64}$/.test(item) && typeof reason === "string" && reason.trim().length > 0
+      ? { item, reason: reason.trim().slice(0, TODO_SPLIT_REASON_MAX) } : null;
+  } catch {
+    return null;
+  }
+}
 
 function isAskFenceInfo(info: string): boolean {
   const trimmed = info.trim();
@@ -508,6 +523,11 @@ export function parseMarkdown(src: string): MdNode[] {
         const plan = token.info.trim() === "laisora-plan" && closed ? parsePlanBlock(token.content) : null;
         if (plan) {
           currentContainer().push({ type: "plan", goal: plan.goal, offset });
+          continue;
+        }
+        const split = token.info.trim() === TODO_SPLIT_FENCE_INFO && closed ? parseTodoSplit(token.content) : null;
+        if (split) {
+          currentContainer().push({ type: "todoSplit", ...split, offset });
           continue;
         }
         const lang = token.info ? token.info.trim().split(/\s+/)[0].toLowerCase() : "";

@@ -17,6 +17,7 @@ import { FILE_LINK_TARGET_MAX_LEN } from "./file-link-target";
 export { FILE_LINK_TARGET_MAX_LEN } from "./file-link-target";
 import { findToolPlacement, findWorkSegment, phaseStateOf, runningMainPlacement } from "./work-model";
 import { BACKGROUND_ACTIVITY_LIST_MAX, type BackgroundActivitySnapshot } from "./background-activity";
+import { isTodoAskIdentity, TODO_OPERATION_ERRORS, TODO_PLACEMENT_BASES, TODO_REVERT_BLOCKS, type TodoPlacementBasis, type TodoChangePlace, TODO_CAPTURE_VIA, type TodoCaptured, TODO_ASK_PLACES, type TodoAskPlace, TODO_ASK_SOURCE_MESSAGES_MAX, TODO_BATCH_MAX, type TodoBatchStep, TODO_DOC_KINDS, TODO_DOC_LABEL_MAX, TODO_DOC_TARGET_MAX, TODO_DUE_PATTERN, TODO_GROUP_COLOR_COUNT, TODO_GROUP_MAX, TODO_WAITING_MAX, TODO_TAGS_MAX, TODO_ESTIMATE_PATTERN, TODO_REPEAT_PATTERN, TODO_TEMPLATE_NAME_MAX, TODO_BRIEF_MAX, TODO_ACKNOWLEDGE_MAX, TODO_GUESS_REASON_MAX, TODO_IMAGE_EXTENSIONS, TODO_IMAGE_FILE, TODO_PRIORITIES, TODO_STATES, TODO_TITLE_MAX, TODO_TEXT_FIELDS, WORK_MEMO_SECTIONS, TODO_START_KINDS, type TodoStartKind, type TodoAuthor, type TodoCompletion, type TodoDocKind, type TodoImageMediaType, type TodoOperationError, type TodoPriority, type TodoRevertBlock, type TodoState, type WorkMemoSection } from "./todo-model";
 export { BACKGROUND_ACTIVITY_LIST_MAX } from "./background-activity";
 export type { BackgroundActivitySnapshot } from "./background-activity";
 import type {
@@ -183,6 +184,14 @@ export interface ModelFallbackState {
   autoRevert?: FallbackAutoRevertStart | FallbackRevertOutcome;
 }
 
+export interface FileEdit {
+  file: string;
+  key: string;
+  added: number;
+  removed: number;
+  created: boolean;
+}
+
 export const TIMESTAMP_REQUIRED_KINDS: readonly string[] = [
   "turn_started",
   "turn_completed",
@@ -206,7 +215,7 @@ export type NormalizedEventBody =
   (
     | { kind: "conversation_opened"; cwd: string; model?: string }
     | { kind: "conversation_closed"; reason: string }
-    | { kind: "turn_started"; turnId: string; cliInserted?: true }
+    | { kind: "turn_started"; turnId: string; cliInserted?: true; laisoraInput?: true }
     | { kind: "auto_resume"; state: "pending"; at: number }
     | { kind: "auto_resume"; state: "cancelled" | "fired" | "exhausted" }
     | { kind: "turn_completed"; turnId: string; usage?: UsageSnapshot }
@@ -290,6 +299,7 @@ export type NormalizedEventBody =
         resumedAgentId?: string;
         backgroundTaskId?: string;
         taskNotification?: TaskNotificationInfo;
+        fileEdit?: FileEdit;
       }
     | {
         kind: "approval_request";
@@ -640,6 +650,8 @@ export type SettingsPageToHost =
   | { type: "setCliAutoUpdate"; requestId: number; executor: ExecutorId; enabled: boolean }
   | { type: "setEventLimit"; requestId: number; value: number }
   | { type: "setLearningEnabled"; requestId: number; enabled: boolean }
+  | { type: "setTodoEnabled"; requestId: number; enabled: boolean }
+  | { type: "setEditSummaryEnabled"; requestId: number; enabled: boolean }
   | { type: "setOrchestrationSetting"; requestId: number; setting: "enabled" | "agents" | "conductorPolicy" | "externalTimeoutMinutes"; value: unknown }
   | { type: "setFileLinkSetting"; requestId: number; setting: FileLinkBooleanSetting; enabled: boolean }
   | { type: "setFileLinkSetting"; requestId: number; setting: "openWithSystemApp"; value: string[] }
@@ -668,7 +680,7 @@ export interface SettingsProfileProjection {
 export type HostToSettingsPage =
   | { type: "conductorPreview"; requestId: number; text: string; tokens: number }
   | { type: "recommendedRoster"; revision: string; changes: RecommendedRosterChange[] }
-  | ({ type: "settingsState"; appearance?: AccentSettings; displayName?: string; eventLimit?: number; composerSendKey: ComposerSendKey; apiKeyPolicy: ApiKeyPolicy; restoreTabsOnStartup: boolean; cliAutoUpdate: Record<ExecutorId, boolean>; initialModel?: string; autoContinueAtUsageLimit: boolean; learningEnabled: boolean; replyTo?: number; writeFailure?: SettingWriteFailure }
+  | ({ type: "settingsState"; appearance?: AccentSettings; displayName?: string; eventLimit?: number; composerSendKey: ComposerSendKey; apiKeyPolicy: ApiKeyPolicy; restoreTabsOnStartup: boolean; cliAutoUpdate: Record<ExecutorId, boolean>; initialModel?: string; autoContinueAtUsageLimit: boolean; learningEnabled: boolean; todoEnabled: boolean; editSummaryEnabled: boolean; replyTo?: number; writeFailure?: SettingWriteFailure }
     & SettingsProfileProjection & Record<FileLinkBooleanSetting, boolean> & { openWithSystemApp: string[] } & { orchestrationEnabled: boolean; orchestrationAgents: OrchestrationSettingRow[]; orchestrationDefaults: OrchestrationSettingRow[]; conductorPolicy: string; conductorPolicyDefault: string; externalTimeoutMinutes: number; externalDetection: Record<ExecutorId, ExternalDetection>; externalModels: ExternalModels });
 
 function isSettingsRequestId(v: unknown): v is number {
@@ -707,7 +719,7 @@ export function isSettingsPageToHost(v: unknown): v is SettingsPageToHost {
     return isSettingsRequestId(m.requestId)
       && (API_KEY_POLICIES as readonly string[]).includes(m.policy as string) && hasOnlyKeys(m, ["type", "requestId", "policy"]);
   }
-  if (t === "setAutoContinueAtUsageLimit" || t === "setRestoreTabsOnStartup" || t === "setLearningEnabled") {
+  if (t === "setAutoContinueAtUsageLimit" || t === "setRestoreTabsOnStartup" || t === "setLearningEnabled" || t === "setTodoEnabled" || t === "setEditSummaryEnabled") {
     return isSettingsRequestId(m.requestId) && typeof m.enabled === "boolean" && hasOnlyKeys(m, ["type", "requestId", "enabled"]);
   }
   if (t === "setCliAutoUpdate") {
@@ -777,7 +789,8 @@ export function isHostToSettingsPage(v: unknown): v is HostToSettingsPage {
       && (API_KEY_POLICIES as readonly string[]).includes(m.apiKeyPolicy as string)
       && typeof m.restoreTabsOnStartup === "boolean" && isCliAutoUpdate(m.cliAutoUpdate)
       && (m.initialModel === undefined || typeof m.initialModel === "string")
-      && typeof m.autoContinueAtUsageLimit === "boolean" && typeof m.learningEnabled === "boolean"
+      && typeof m.autoContinueAtUsageLimit === "boolean" && typeof m.learningEnabled === "boolean" && typeof m.todoEnabled === "boolean"
+      && typeof m.editSummaryEnabled === "boolean"
       && typeof m.orchestrationEnabled === "boolean" && typeof m.conductorPolicy === "string"
       && typeof m.conductorPolicyDefault === "string"
       && isOrchestrationSettingRoster(m.orchestrationAgents) && isOrchestrationSettingRoster(m.orchestrationDefaults)
@@ -786,7 +799,7 @@ export function isHostToSettingsPage(v: unknown): v is HostToSettingsPage {
       && Array.isArray(m.openWithSystemApp) && m.openWithSystemApp.every((item) => typeof item === "string")
       && (m.replyTo === undefined || isSettingsRequestId(m.replyTo))
       && (m.writeFailure === undefined || m.replyTo !== undefined && isSettingWriteFailure(m.writeFailure))
-      && hasOnlyKeys(m, ["type", "initialModel", "appearance", "displayName", "eventLimit", "composerSendKey", "apiKeyPolicy", "restoreTabsOnStartup", "cliAutoUpdate", "autoContinueAtUsageLimit", "learningEnabled", ...FILE_LINK_SETTINGS, "orchestrationEnabled", "orchestrationAgents", "orchestrationDefaults", "conductorPolicy", "conductorPolicyDefault", "externalTimeoutMinutes", "externalDetection", "externalModels", "replyTo", "writeFailure", "conductorPreview", "recommendedRosterSame"]);
+      && hasOnlyKeys(m, ["type", "initialModel", "appearance", "displayName", "eventLimit", "composerSendKey", "apiKeyPolicy", "restoreTabsOnStartup", "cliAutoUpdate", "autoContinueAtUsageLimit", "learningEnabled", "todoEnabled", "editSummaryEnabled", ...FILE_LINK_SETTINGS, "orchestrationEnabled", "orchestrationAgents", "orchestrationDefaults", "conductorPolicy", "conductorPolicyDefault", "externalTimeoutMinutes", "externalDetection", "externalModels", "replyTo", "writeFailure", "conductorPreview", "recommendedRosterSame"]);
   }
   t satisfies never;
   return false;
@@ -820,6 +833,7 @@ export type WebviewToHost =
   | { type: "queryFiles"; reqId: number; query: string }
   | { type: "pickFiles"; reqId: number; imageSlots: number }
   | { type: "openFile"; tabId: string; target: string }
+  | { type: "openEditDiff"; tabId: string; firstToolUseId: string; lastToolUseId: string }
   | { type: "copyFilePath"; tabId: string; target: string; reqId: number }
   | { type: "exportTab"; tabId: string }
   | { type: "renameTab"; tabId: string; title: string }
@@ -909,7 +923,192 @@ export type WebviewToHost =
     }
   | { type: "resumeSession"; sessionId: string; filePath: string; intoTabId?: string }
   | { type: "resumeHydrationRetry"; tabId: string }
-  | { type: "activeTab"; tabId: string };
+  | { type: "activeTab"; tabId: string }
+  | { type: "todoEdit"; requestId: string; edit: TodoEdit }
+  | { type: "todoDetailRequest"; id: string }
+  | { type: "todoLogRequest"; view: TodoLogView }
+  | { type: "todoSectionOrder"; order: TodoDetailSection[] }
+  | { type: "todoImageRequest"; name: string }
+  | { type: "todoOpenDoc"; itemId: string; docId: string }
+  | { type: "todoOpenConversation"; itemId: string; fresh: boolean; brief?: string }
+  | { type: "todoAskSourceRequest"; sessionId: string; requestId: number }
+  | { type: "todoAskDismiss"; itemId: string; message: string; place: TodoAskPlace }
+  | { type: "todoChangesRequest"; requestId: number; ids: string[]; revisions?: number[][] }
+  | { type: "todoDrawerFocus"; focused: boolean }
+  | { type: "reorderTabs"; order: string[] };
+
+export const TODO_USER_MEMO_MAX = 20_000;
+export { TODO_GROUP_MAX } from "./todo-model";
+const TODO_ID_MAX = 64;
+export const TODO_DETAIL_SECTIONS = ["fields", "note", "docs", "kids", "now", "memo", "info", "hist"] as const;
+export const TODO_DETAIL_SECTIONS_PREVIOUS_DEFAULTS: readonly (readonly TodoDetailSection[])[] = [
+  ["note", "now", "memo", "docs", "kids", "fields", "hist"],
+  ["note", "fields", "kids", "docs", "now", "memo", "hist"],
+  ["fields", "note", "docs", "kids", "now", "memo", "hist"],
+];
+export type TodoDetailSection = typeof TODO_DETAIL_SECTIONS[number];
+export const TODO_LOG_VIEWS = ["claude", "deleted"] as const;
+export type TodoLogView = typeof TODO_LOG_VIEWS[number];
+export const TODO_CHANGE_FIELDS: readonly string[] = ["item", ...TODO_TEXT_FIELDS, "state", "position", "deletedAt", "docs", "docLabel", "groups", "groupBindings", "unboundFolders", "templates", ...WORK_MEMO_SECTIONS.map(section => `workMemo.${section}`)];
+const TODO_EDIT_ERRORS: readonly TodoEditError[] = [...TODO_OPERATION_ERRORS, "invalid-doc", "link-too-long", "rejected", "disabled", "store"];
+
+export type TodoEdit =
+  | { kind: "add"; parentId: string | null; title: string; group?: string; due?: string; start?: string; priority?: TodoPriority; state?: TodoState; userMemo?: string; position?: number; templateId?: string;
+      waiting?: string; repeat?: string; estimate?: string; tags?: string }
+  | { kind: "update"; id: string; title?: string; group?: string | null; due?: string | null; start?: string | null; priority?: TodoPriority | null; userMemo?: string; state?: TodoState;
+      waiting?: string | null; repeat?: string | null; estimate?: string | null; tags?: string | null }
+  | { kind: "groupCreate"; name: string }
+  | { kind: "groupRename"; name: string; to: string }
+  | { kind: "groupColor"; name: string; color: number }
+  | { kind: "groupMove"; name: string; direction: -1 | 1 }
+  | { kind: "groupDelete"; name: string }
+  | { kind: "groupFolderRemove"; name: string; path: string }
+  | { kind: "groupFolderAdd"; name: string; path: string }
+  | { kind: "groupAliasRemove"; name: string; words: string }
+  | { kind: "templateSave"; id: string; name: string }
+  | { kind: "docLabel"; id: string; docId: string; label: string }
+  | { kind: "acknowledge"; changeIds: string[] }
+  | { kind: "setState"; id: string; state: TodoState }
+  | { kind: "move"; id: string; parentId: string | null; position?: number; before?: string | null }
+  | { kind: "batch"; steps: TodoBatchStep[] }
+  | { kind: "delete"; id: string }
+  | { kind: "restore"; id: string }
+  | { kind: "addLink"; id: string; target: string; label?: string }
+  | { kind: "addImage"; id: string; mediaType: TodoImageMediaType; data: string; label?: string }
+  | { kind: "removeDoc"; id: string; docId: string }
+  | { kind: "undo"; revision: number }
+  | { kind: "revertClaude"; changeId: string }
+  | { kind: "revertClaude"; changeIds: string[] }
+  | { kind: "revertClaude"; revisions: number[] };
+
+const TODO_BATCH_KINDS: readonly unknown[] = ["update", "setState", "move", "delete"] satisfies ReadonlyArray<TodoBatchStep["kind"]>;
+
+export type TodoEditError = TodoOperationError | "invalid-doc" | "link-too-long" | "rejected" | "disabled" | "store";
+
+export interface TodoChangeView {
+  readonly id: string;
+  readonly at: number;
+  readonly author: TodoAuthor;
+  readonly itemId: string;
+  readonly itemTitle: string;
+  readonly field: string;
+  readonly before: string | null;
+  readonly after: string | null;
+  readonly cascade?: true;
+  readonly revert?: "ok" | TodoRevertBlock;
+  readonly acknowledged?: true;
+  readonly basis?: TodoPlacementBasis;
+  readonly from?: TodoChangePlace;
+  readonly to?: TodoChangePlace;
+}
+
+export interface TodoTurnRevert {
+  readonly revisions: readonly number[];
+  readonly revert: "ok" | TodoRevertBlock;
+}
+
+export interface TodoBatchRevert {
+  readonly revision: number;
+  readonly revert: "ok" | TodoRevertBlock;
+}
+
+export interface TodoMemoView {
+  readonly text: string;
+  readonly at: number;
+}
+
+export interface TodoGuessView {
+  readonly due?: string;
+  readonly priority?: string;
+}
+
+export interface TodoConversationView {
+  readonly at: number;
+  readonly handoffs: number;
+}
+
+export interface TodoBriefView {
+  readonly at: number;
+  readonly text: string;
+}
+
+export interface TodoWorkView {
+  readonly ms: number;
+  readonly withChildrenMs?: number;
+}
+
+export interface TodoTotalsView {
+  readonly kids: number;
+  readonly done: number;
+  readonly firstStartedAt?: number;
+  readonly lastDoneAt?: number;
+}
+
+export interface TodoDetailItem {
+  readonly id: string;
+  readonly parentId: string | null;
+  readonly title: string;
+  readonly state: TodoState;
+  readonly completion?: TodoCompletion;
+  readonly group?: string;
+  readonly due?: string;
+  readonly start?: string;
+  readonly priority?: TodoPriority;
+  readonly userMemo: string;
+  readonly workMemo: Readonly<Partial<Record<WorkMemoSection, TodoMemoView>>>;
+  readonly docs: readonly TodoDocView[];
+  readonly createdAt: number;
+  readonly updatedAt: number;
+  readonly changes: readonly TodoChangeView[];
+  readonly memoStaleSince?: number;
+  readonly waiting?: string;
+  readonly repeat?: string;
+  readonly estimate?: string;
+  readonly tags?: string;
+  readonly by?: "claude";
+  readonly guesses?: TodoGuessView;
+  readonly startedAt?: number;
+  readonly doneAt?: number;
+  readonly conversations: readonly TodoConversationView[];
+  readonly briefs: readonly TodoBriefView[];
+  readonly splitBrief?: string;
+  readonly totals?: TodoTotalsView;
+  readonly source?: TodoSourceView;
+}
+
+export interface TodoSourceView {
+  readonly sessionId: string;
+  readonly title?: string;
+}
+
+export interface TodoDocView {
+  readonly id: string;
+  readonly kind: TodoDocKind;
+  readonly target: string;
+  readonly label?: string;
+  readonly at: number;
+}
+
+export interface TodoDeletedView {
+  readonly id: string;
+  readonly title: string;
+  readonly group?: string;
+  readonly deletedAt: number;
+  readonly expiresAt: number;
+  readonly descendants: number;
+}
+
+export type TodoEditResultMessage = Extract<HostToWebview, { type: "todoEditResult" }>;
+
+export function rejectedTodoEditId(value: unknown): string | undefined {
+  if (typeof value !== "object" || value === null) return undefined;
+  const message = value as Record<string, unknown>;
+  return message.type === "todoEdit" && isTodoId(message.requestId) ? message.requestId : undefined;
+}
+export type TodoDetailMessage = Extract<HostToWebview, { type: "todoDetail" }>;
+export type TodoWorkMessage = Extract<HostToWebview, { type: "todoWork" }>;
+export type TodoLogMessage = Extract<HostToWebview, { type: "todoLog" }>;
+export type TodoImageMessage = Extract<HostToWebview, { type: "todoImage" }>;
 
 export interface SessionListItem {
   originUnverified?: boolean;
@@ -3133,8 +3332,9 @@ export type HostToWebview =
       displayEvent?: undefined;
       sendDisposition: ResumeHydrationSendDisposition;
     }
-  | { type: "tabCreated"; tab: TabSnapshot; activate: boolean }
+  | { type: "tabCreated"; tab: TabSnapshot; activate: boolean; replacement?: true }
   | { type: "tabClosed"; tabId: string }
+  | { type: "tabOrder"; order: string[] }
   | { type: "activateTab"; tabId: string }
   | { type: "pasteText"; text: string }
   | { type: "tabCleared"; tab: TabSnapshot }
@@ -3193,7 +3393,7 @@ export type HostToWebview =
   | { type: "workModel"; tabId: string; model: WorkModelPayload }
   | { type: "semanticModel"; tabId: string; model: SemanticModelPayload }
   | { type: "llmAnalysisSetting"; enabled: boolean }
-  | { type: "userSettings"; appearance?: AccentSettings; displayName?: string; composerSendKey: ComposerSendKey; askQualityCheck?: boolean }
+  | { type: "userSettings"; appearance?: AccentSettings; displayName?: string; composerSendKey: ComposerSendKey; askQualityCheck?: boolean; editSummaryEnabled: boolean }
   | { type: "tabNotice"; tabId: string; text: string }
   | {
       type: "llmAnalysisRunState";
@@ -3293,7 +3493,123 @@ export type HostToWebview =
       artifactId: string;
       persistence: PersistenceState;
       persistenceLabel: string;
-    };
+    }
+  | { type: "todoSnapshot"; seq: number; enabled: false }
+  | { type: "todoSnapshot"; seq: number; enabled: true; revision: number; items: TodoListItem[]; groups: TodoGroupColor[]; templates: TodoTemplateView[]; tabItems: TodoTabItem[]; askSources: TodoAskSourceRef[]; askDismissals: string[]; askClosedInTodo: string[];
+      deletedTabs: string[]; sessions: TodoSessionLinkView[]; claudeRecent: number[] }
+  | { type: "todoChanges"; requestId: number; revision: number; changes: TodoChangeView[]; turns?: TodoTurnRevert[]; more?: true }
+  | { type: "todoToggleDrawer" }
+  | { type: "todoSnapshot"; seq: number; enabled: true; unreadable: true }
+  | { type: "todoAskSource"; sessionId: string; requestId: number; key: string; endedAt: number; messages: TodoAskSourceMessage[] }
+  | { type: "todoAskSource"; sessionId: string; requestId: number; key: null }
+  | { type: "todoEditResult"; requestId: string; ok: true; revision: number; changed: boolean; skipped: number }
+  | { type: "todoEditResult"; requestId: string; ok: false; error: TodoEditError }
+  | { type: "todoDetail"; id: string; revision: number; item: TodoDetailItem | null; sectionOrder: TodoDetailSection[] }
+  | { type: "todoWork"; id: string; revision: number; work?: TodoWorkView }
+  | { type: "todoLog"; view: "claude"; revision: number; changes: TodoChangeView[]; batches: TodoBatchRevert[] }
+  | { type: "todoLog"; view: "deleted"; revision: number; items: TodoDeletedView[] }
+  | { type: "todoImage"; name: string; mediaType: TodoImageMediaType; data: string }
+  | { type: "todoImage"; name: string; missing: true };
+
+export interface TodoGroupColor {
+  readonly name: string;
+  readonly color: number;
+  readonly folders?: readonly string[];
+  readonly aliases?: readonly { readonly words: string; readonly parentId?: string }[];
+}
+
+export interface TodoTemplateView {
+  readonly id: string;
+  readonly name: string;
+  readonly title: string;
+  readonly size: number;
+}
+
+export interface TodoListItem {
+  readonly id: string;
+  readonly parentId: string | null;
+  readonly title: string;
+  readonly state: TodoState;
+  readonly completion?: TodoCompletion;
+  readonly group?: string;
+  readonly due?: string;
+  readonly start?: string;
+  readonly priority?: TodoPriority;
+  readonly waiting?: string;
+  readonly by?: "claude";
+  readonly guess?: TodoGuessView;
+  readonly marks?: readonly string[];
+  readonly markInfo?: readonly TodoMarkInfo[];
+  readonly captured?: TodoCaptured;
+  readonly talk?: TodoTalk;
+}
+
+export interface TodoMarkPart {
+  readonly field: string;
+  readonly before: string | null;
+  readonly after: string | null;
+}
+
+export interface TodoMarkInfo {
+  readonly id: string;
+  readonly ids: readonly string[];
+  readonly at: number;
+  readonly parts: readonly TodoMarkPart[];
+}
+
+export const TODO_TALKS = ["linked", "running"] as const;
+export type TodoTalk = typeof TODO_TALKS[number];
+
+export interface TodoTabItem {
+  readonly tabId: string;
+  readonly itemId: string;
+  readonly start?: TodoStartView;
+  readonly decisions?: string;
+  readonly splits?: readonly TodoSplitView[];
+}
+
+export interface TodoStartView {
+  readonly at: number;
+  readonly kind: TodoStartKind;
+  readonly brief: string;
+  readonly current?: string;
+  readonly next?: string;
+  readonly stale?: true;
+}
+
+export interface TodoSplitView {
+  readonly itemId: string;
+  readonly at: number;
+}
+
+export type TodoSessionLinkView = { readonly sessionId: string; readonly itemId: string } | { readonly sessionId: string; readonly deleted: string };
+export const TODO_CHANGES_REQUEST_MAX = 200;
+export const TODO_REORDER_MAX = 200;
+export const TAB_ID_MAX = 200;
+
+function isTabOrder(order: unknown): order is string[] {
+  return Array.isArray(order) && order.length <= TODO_REORDER_MAX && order.every(id => typeof id === "string" && id.length > 0 && id.length <= TAB_ID_MAX) && new Set(order).size === order.length;
+}
+
+export const TODO_ASK_WHERE = ["here", "elsewhere", "closed"] as const;
+export type TodoAskWhere = typeof TODO_ASK_WHERE[number];
+
+export interface TodoAskSourceRef {
+  readonly itemId: string;
+  readonly sessionId: string;
+  readonly key: string | null;
+  readonly where: TodoAskWhere;
+}
+
+export interface TodoAskSourceMessage {
+  readonly uuid: string;
+  readonly role: "user" | "assistant";
+  readonly text: string;
+  readonly timestamp: number;
+}
+
+export type TodoSnapshotMessage = Extract<HostToWebview, { type: "todoSnapshot" }>;
+export type TodoAskSourceMessageEnvelope = Extract<HostToWebview, { type: "todoAskSource" }>;
 
 export interface TabSnapshot {
   tabId: string;
@@ -3357,6 +3673,56 @@ export function isWebviewToHost(v: unknown): v is WebviewToHost {
       diagnostic.message.length <= 2000;
   }
   if (t === "newTab") return true;
+  if (t === "todoEdit") {
+    const m = v as Record<string, unknown>;
+    return hasOnlyKeys(m, ["type", "requestId", "edit"]) && isTodoId(m.requestId) && isTodoEdit(m.edit);
+  }
+  if (t === "todoDetailRequest") {
+    const m = v as Record<string, unknown>;
+    return hasOnlyKeys(m, ["type", "id"]) && isTodoId(m.id);
+  }
+  if (t === "todoLogRequest") {
+    const m = v as Record<string, unknown>;
+    return hasOnlyKeys(m, ["type", "view"]) && (TODO_LOG_VIEWS as readonly unknown[]).includes(m.view);
+  }
+  if (t === "todoSectionOrder") {
+    const m = v as Record<string, unknown>;
+    return hasOnlyKeys(m, ["type", "order"]) && isTodoSectionOrder(m.order);
+  }
+  if (t === "todoImageRequest") {
+    const m = v as Record<string, unknown>;
+    return hasOnlyKeys(m, ["type", "name"]) && isTodoImageName(m.name);
+  }
+  if (t === "todoOpenDoc") {
+    const m = v as Record<string, unknown>;
+    return hasOnlyKeys(m, ["type", "itemId", "docId"]) && isTodoId(m.itemId) && isTodoId(m.docId);
+  }
+  if (t === "todoOpenConversation") {
+    const m = v as Record<string, unknown>;
+    return hasOnlyKeys(m, ["type", "itemId", "fresh", "brief"]) && isTodoId(m.itemId) && typeof m.fresh === "boolean"
+      && (m.brief === undefined || (m.fresh === true && typeof m.brief === "string" && m.brief.trim().length > 0 && m.brief.length <= TODO_BRIEF_MAX));
+  }
+  if (t === "todoAskSourceRequest") {
+    const m = v as Record<string, unknown>;
+    return hasOnlyKeys(m, ["type", "sessionId", "requestId"]) && isTodoSessionId(m.sessionId) && isRevision(m.requestId);
+  }
+  if (t === "todoAskDismiss") {
+    const m = v as Record<string, unknown>;
+    return hasOnlyKeys(m, ["type", "itemId", "message", "place"]) && isTodoId(m.itemId) && isTodoAskIdentity(m.message) && (TODO_ASK_PLACES as readonly unknown[]).includes(m.place);
+  }
+  if (t === "todoChangesRequest") {
+    const m = v as Record<string, unknown>;
+    return hasOnlyKeys(m, ["type", "requestId", "ids", "revisions"]) && isRevision(m.requestId) && Array.isArray(m.ids) && m.ids.length <= TODO_CHANGES_REQUEST_MAX && m.ids.every(isTodoId)
+      && (m.revisions === undefined || isRevisionGroups(m.revisions));
+  }
+  if (t === "todoDrawerFocus") {
+    const m = v as Record<string, unknown>;
+    return hasOnlyKeys(m, ["type", "focused"]) && typeof m.focused === "boolean";
+  }
+  if (t === "reorderTabs") {
+    const m = v as Record<string, unknown>;
+    return hasOnlyKeys(m, ["type", "order"]) && isTabOrder(m.order);
+  }
   if (t === "composerFocus") {
     return hasOnlyKeys(v as Record<string, unknown>, ["type", "focused"])
       && typeof (v as { focused?: unknown }).focused === "boolean";
@@ -3403,12 +3769,18 @@ export function isWebviewToHost(v: unknown): v is WebviewToHost {
       Object.keys(message).every((key) => allowed.has(key)) &&
       typeof message.tabId === "string" &&
       message.tabId.length > 0 &&
-      message.tabId.length <= 200 &&
+      message.tabId.length <= TAB_ID_MAX &&
       typeof message.target === "string" &&
       message.target.length > 0 &&
       message.target.length <= FILE_LINK_TARGET_MAX_LEN &&
       !message.target.includes("\0")
     );
+  }
+  if (t === "openEditDiff") {
+    const message = v as Record<string, unknown>;
+    return hasOnlyKeys(message, ["type", "tabId", "firstToolUseId", "lastToolUseId"]) &&
+      typeof message.tabId === "string" && message.tabId.length > 0 && message.tabId.length <= 200 &&
+      isToolUseIdRef(message.firstToolUseId) && isToolUseIdRef(message.lastToolUseId);
   }
   if (t === "exportTab") return typeof tabId === "string";
   if (t === "renameTab") {
@@ -3433,7 +3805,7 @@ export function isWebviewToHost(v: unknown): v is WebviewToHost {
     return (
       Object.keys(v).every((key) => key === "type" || key === "tabId" || key === "requestId") &&
       isAccountUsageRequestId((v as { requestId?: unknown }).requestId) &&
-      (tabId === undefined || (typeof tabId === "string" && tabId.length > 0 && tabId.length <= 200))
+      (tabId === undefined || (typeof tabId === "string" && tabId.length > 0 && tabId.length <= TAB_ID_MAX))
     );
   }
   if (t === "agentInspectorRequest") {
@@ -3441,7 +3813,7 @@ export function isWebviewToHost(v: unknown): v is WebviewToHost {
     const allowed = new Set(["type", "tabId", "agentId", "section", "requestId", "cursor"]);
     return (
       Object.keys(message).every((key) => allowed.has(key)) &&
-      typeof message.tabId === "string" && message.tabId.length > 0 && message.tabId.length <= 200 &&
+      typeof message.tabId === "string" && message.tabId.length > 0 && message.tabId.length <= TAB_ID_MAX &&
       typeof message.agentId === "string" && message.agentId.length > 0 && message.agentId.length <= 200 &&
       ["overview", "tools", "messages", "report"].includes(message.section as string) &&
       typeof message.requestId === "string" && message.requestId.length > 0 && message.requestId.length <= 100 &&
@@ -3453,7 +3825,7 @@ export function isWebviewToHost(v: unknown): v is WebviewToHost {
     const message = v as Record<string, unknown>;
     const allowed = new Set(["type", "tabId", "requestId", "cursor", "anchor"]);
     if (!Object.keys(message).every((key) => allowed.has(key))) return false;
-    if (typeof message.tabId !== "string" || message.tabId.length === 0 || message.tabId.length > 200) {
+    if (typeof message.tabId !== "string" || message.tabId.length === 0 || message.tabId.length > TAB_ID_MAX) {
       return false;
     }
     if (
@@ -3475,7 +3847,7 @@ export function isWebviewToHost(v: unknown): v is WebviewToHost {
     const message = v as Record<string, unknown>;
     const allowedKeys = new Set(["type", "tabId", "requestId", "cursor", "anchor"]);
     if (!Object.keys(message).every((key) => allowedKeys.has(key))) return false;
-    if (typeof message.tabId !== "string" || message.tabId.length === 0 || message.tabId.length > 200) {
+    if (typeof message.tabId !== "string" || message.tabId.length === 0 || message.tabId.length > TAB_ID_MAX) {
       return false;
     }
     if (
@@ -3503,7 +3875,7 @@ export function isWebviewToHost(v: unknown): v is WebviewToHost {
       Object.keys(message).every((key) => allowed.has(key)) &&
       typeof message.tabId === "string" &&
       message.tabId.length > 0 &&
-      message.tabId.length <= 200
+      message.tabId.length <= TAB_ID_MAX
     );
   }
   if (t === "setLlmAnalysisEnabled") {
@@ -3518,7 +3890,7 @@ export function isWebviewToHost(v: unknown): v is WebviewToHost {
     const message = v as Record<string, unknown>;
     const allowed = new Set(["type", "tabId", "requestId", "cursor", "anchorUuid"]);
     if (!Object.keys(message).every((key) => allowed.has(key))) return false;
-    if (typeof message.tabId !== "string" || message.tabId.length === 0 || message.tabId.length > 200) {
+    if (typeof message.tabId !== "string" || message.tabId.length === 0 || message.tabId.length > TAB_ID_MAX) {
       return false;
     }
     if (
@@ -3549,7 +3921,7 @@ export function isWebviewToHost(v: unknown): v is WebviewToHost {
       Object.keys(message).every((key) => allowed.has(key)) &&
       typeof message.tabId === "string" &&
       message.tabId.length > 0 &&
-      message.tabId.length <= 200 &&
+      message.tabId.length <= TAB_ID_MAX &&
       typeof message.requestId === "string" &&
       message.requestId.length > 0 &&
       message.requestId.length <= 100 &&
@@ -3563,7 +3935,7 @@ export function isWebviewToHost(v: unknown): v is WebviewToHost {
       !Object.keys(message).every((key) => allowed.has(key)) ||
       typeof message.tabId !== "string" ||
       message.tabId.length === 0 ||
-      message.tabId.length > 200
+      message.tabId.length > TAB_ID_MAX
     ) {
       return false;
     }
@@ -3720,7 +4092,7 @@ export function isWebviewToHost(v: unknown): v is WebviewToHost {
     const allowed = new Set(["type", "tabId", "findingId", "analysisRunId", "semanticHash"]);
     return (
       Object.keys(message).every((key) => allowed.has(key)) &&
-      typeof message.tabId === "string" && message.tabId.length > 0 && message.tabId.length <= 200 &&
+      typeof message.tabId === "string" && message.tabId.length > 0 && message.tabId.length <= TAB_ID_MAX &&
       typeof message.findingId === "string" && message.findingId.length > 0 && message.findingId.length <= 200 &&
       typeof message.analysisRunId === "string" && message.analysisRunId.length > 0 && message.analysisRunId.length <= 200 &&
       typeof message.semanticHash === "string" && message.semanticHash.length > 0 && message.semanticHash.length <= 200
@@ -3731,7 +4103,7 @@ export function isWebviewToHost(v: unknown): v is WebviewToHost {
     const allowed = new Set(["type", "tabId", "artifactId", "findingId"]);
     return (
       Object.keys(message).every((key) => allowed.has(key)) &&
-      typeof message.tabId === "string" && message.tabId.length > 0 && message.tabId.length <= 200 &&
+      typeof message.tabId === "string" && message.tabId.length > 0 && message.tabId.length <= TAB_ID_MAX &&
       typeof message.artifactId === "string" && message.artifactId.length > 0 && message.artifactId.length <= 200 &&
       typeof message.findingId === "string" && message.findingId.length > 0 && message.findingId.length <= 200
     );
@@ -3741,7 +4113,7 @@ export function isWebviewToHost(v: unknown): v is WebviewToHost {
     const allowed = new Set(["type", "tabId", "artifactId"]);
     return (
       Object.keys(message).every((key) => allowed.has(key)) &&
-      typeof message.tabId === "string" && message.tabId.length > 0 && message.tabId.length <= 200 &&
+      typeof message.tabId === "string" && message.tabId.length > 0 && message.tabId.length <= TAB_ID_MAX &&
       typeof message.artifactId === "string" && message.artifactId.length > 0 && message.artifactId.length <= 200
     );
   }
@@ -4014,6 +4386,326 @@ function isPlausibleNormalizedEvent(x: unknown): x is NormalizedEvent {
 function hasOnlyKeys(value: Record<string, unknown>, keys: readonly string[]): boolean {
   const allowed = new Set(keys);
   return Object.keys(value).every((key) => allowed.has(key));
+}
+
+function isToolUseIdRef(value: unknown): value is string {
+  return typeof value === "string" && /^[A-Za-z0-9_-]{1,200}$/.test(value);
+}
+
+function isTodoGroupColor(value: unknown): value is TodoGroupColor {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
+  const group = value as Record<string, unknown>;
+  return hasOnlyKeys(group, ["name", "color", "folders", "aliases"]) && typeof group.name === "string" && group.name.length > 0
+    && (group.aliases === undefined || (Array.isArray(group.aliases) && group.aliases.every(alias => typeof alias === "object" && alias !== null
+      && hasOnlyKeys(alias as Record<string, unknown>, ["words", "parentId"]) && isTodoGroup((alias as { words?: unknown }).words)
+      && ((alias as { parentId?: unknown }).parentId === undefined || isTodoId((alias as { parentId?: unknown }).parentId)))))
+    && typeof group.color === "number" && Number.isSafeInteger(group.color) && group.color >= 1 && group.color <= TODO_GROUP_COLOR_COUNT
+    && (group.folders === undefined || (Array.isArray(group.folders) && group.folders.every(path => typeof path === "string" && path.length > 0 && path.length <= TODO_DOC_TARGET_MAX)));
+}
+
+function isRevisionGroups(value: unknown): value is number[][] {
+  return Array.isArray(value) && value.length <= TODO_CHANGES_REQUEST_MAX && value.every(group => Array.isArray(group) && group.length > 0 && group.length <= TODO_CHANGES_REQUEST_MAX && group.every(isRevision))
+    && value.reduce((count: number, group: unknown[]) => count + group.length, 0) <= TODO_CHANGES_REQUEST_MAX;
+}
+
+const isRevertView = (value: unknown) => value === "ok" || (TODO_REVERT_BLOCKS as readonly unknown[]).includes(value);
+
+function isTodoTurnRevert(value: unknown): value is TodoTurnRevert {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
+  const turn = value as Record<string, unknown>;
+  return hasOnlyKeys(turn, ["revisions", "revert"]) && isRevisionGroups([turn.revisions]) && isRevertView(turn.revert);
+}
+
+function isTodoBatchRevert(value: unknown): value is TodoBatchRevert {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
+  const batch = value as Record<string, unknown>;
+  return hasOnlyKeys(batch, ["revision", "revert"]) && isRevision(batch.revision) && isRevertView(batch.revert);
+}
+
+function isTodoChangePlace(value: unknown): value is TodoChangePlace {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
+  const place = value as Record<string, unknown>;
+  return hasOnlyKeys(place, ["group", "path"]) && (place.group === null || (typeof place.group === "string" && place.group.length > 0))
+    && Array.isArray(place.path) && place.path.length <= TODO_CHANGES_REQUEST_MAX && place.path.every(step => typeof step === "object" && step !== null
+      && hasOnlyKeys(step as Record<string, unknown>, ["id", "title"]) && isTodoId((step as { id?: unknown }).id) && typeof (step as { title?: unknown }).title === "string");
+}
+
+function isTodoCaptured(value: unknown): value is TodoCaptured {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
+  const captured = value as Record<string, unknown>;
+  return hasOnlyKeys(captured, ["text", "at", "via"]) && typeof captured.text === "string" && isTime(captured.at) && (TODO_CAPTURE_VIA as readonly unknown[]).includes(captured.via);
+}
+
+function isTodoListItem(value: unknown): value is TodoListItem {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
+  const item = value as Record<string, unknown>;
+  return hasOnlyKeys(item, ["id", "parentId", "title", "state", "completion", "group", "due", "start", "priority", "waiting", "by", "guess", "marks", "markInfo", "captured", "talk"])
+    && typeof item.id === "string" && item.id.length > 0
+    && (item.talk === undefined || (TODO_TALKS as readonly unknown[]).includes(item.talk))
+    && (item.parentId === null || (typeof item.parentId === "string" && item.parentId.length > 0))
+    && typeof item.title === "string"
+    && (TODO_STATES as readonly unknown[]).includes(item.state)
+    && (item.completion === undefined || item.completion === "auto" || item.completion === "manual")
+    && (item.group === undefined || (typeof item.group === "string" && item.group.length > 0))
+    && (item.due === undefined || (typeof item.due === "string" && TODO_DUE_PATTERN.test(item.due)))
+    && (item.start === undefined || isTodoDate(item.start))
+    && (item.priority === undefined || (TODO_PRIORITIES as readonly unknown[]).includes(item.priority))
+    && (item.waiting === undefined || typeof item.waiting === "string")
+    && (item.by === undefined || item.by === "claude")
+    && (item.guess === undefined || isTodoGuessView(item.guess))
+    && (item.marks === undefined || (Array.isArray(item.marks) && item.marks.length <= TODO_ACKNOWLEDGE_MAX && item.marks.every(isTodoId)))
+    && (item.markInfo === undefined || (Array.isArray(item.markInfo) && item.markInfo.length <= TODO_ACKNOWLEDGE_MAX
+      && item.markInfo.every(info => typeof info === "object" && info !== null && hasOnlyKeys(info as Record<string, unknown>, ["id", "ids", "at", "parts"])
+        && isTodoId((info as { id?: unknown }).id) && isTime((info as { at?: unknown }).at)
+        && Array.isArray((info as { ids?: unknown }).ids) && (info as { ids: unknown[] }).ids.length > 0 && (info as { ids: unknown[] }).ids.length <= TODO_CHANGES_REQUEST_MAX && (info as { ids: unknown[] }).ids.every(isTodoId)
+        && Array.isArray((info as { parts?: unknown }).parts) && (info as { parts: unknown[] }).parts.length <= TODO_CHANGES_REQUEST_MAX && (info as { parts: unknown[] }).parts.every(isTodoMarkPart))))
+    && (item.captured === undefined || isTodoCaptured(item.captured));
+}
+
+function isTodoMarkPart(value: unknown): boolean {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
+  const part = value as Record<string, unknown>;
+  return hasOnlyKeys(part, ["field", "before", "after"]) && TODO_CHANGE_FIELDS.includes(part.field as string)
+    && (part.before === null || typeof part.before === "string") && (part.after === null || typeof part.after === "string");
+}
+
+function isTodoGuessView(value: unknown): boolean {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
+  const guess = value as Record<string, unknown>;
+  return hasOnlyKeys(guess, ["due", "priority"]) && (guess.due === undefined || typeof guess.due === "string") && (guess.priority === undefined || typeof guess.priority === "string");
+}
+
+function isTodoTemplateView(value: unknown): boolean {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
+  const entry = value as Record<string, unknown>;
+  return hasOnlyKeys(entry, ["id", "name", "title", "size"]) && isTodoId(entry.id) && typeof entry.name === "string" && typeof entry.title === "string" && isRevision(entry.size);
+}
+
+const isOptionalText = (value: unknown, max: number) => value === undefined || value === null || (typeof value === "string" && value.length <= max);
+
+const isTodoId = (value: unknown): value is string => typeof value === "string" && value.length > 0 && value.length <= TODO_ID_MAX;
+
+function isTodoTabItem(value: unknown): value is TodoTabItem {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
+  const entry = value as Record<string, unknown>;
+  return hasOnlyKeys(entry, ["tabId", "itemId", "start", "decisions", "splits"]) && typeof entry.tabId === "string" && entry.tabId.length > 0 && entry.tabId.length <= TAB_ID_MAX && isTodoId(entry.itemId)
+    && (entry.start === undefined || isTodoStartView(entry.start)) && isOptionalText(entry.decisions, TODO_MEMO_TEXT_MAX)
+    && (entry.splits === undefined || (Array.isArray(entry.splits) && entry.splits.every(split => typeof split === "object" && split !== null
+      && hasOnlyKeys(split as Record<string, unknown>, ["itemId", "at"]) && isTodoId((split as Record<string, unknown>).itemId) && isTime((split as Record<string, unknown>).at))));
+}
+
+const TODO_MEMO_TEXT_MAX = 100_000;
+
+function isTodoStartView(value: unknown): value is TodoStartView {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
+  const start = value as Record<string, unknown>;
+  return hasOnlyKeys(start, ["at", "kind", "brief", "current", "next", "stale"]) && isTime(start.at) && (TODO_START_KINDS as readonly unknown[]).includes(start.kind)
+    && typeof start.brief === "string" && start.brief.length <= TODO_BRIEF_MAX && isOptionalText(start.current, TODO_MEMO_TEXT_MAX) && isOptionalText(start.next, TODO_MEMO_TEXT_MAX)
+    && (start.stale === undefined || start.stale === true);
+}
+
+function isTodoSessionLinkView(value: unknown): value is TodoSessionLinkView {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
+  const link = value as Record<string, unknown>;
+  if (!isTodoSessionId(link.sessionId)) return false;
+  return "deleted" in link ? hasOnlyKeys(link, ["sessionId", "deleted"]) && typeof link.deleted === "string" : hasOnlyKeys(link, ["sessionId", "itemId"]) && isTodoId(link.itemId);
+}
+
+const isTodoSessionId = (value: unknown): value is string => typeof value === "string" && /^[0-9A-Za-z_-]{1,100}$/.test(value);
+
+function isTodoAskSourceRef(value: unknown): value is TodoAskSourceRef {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
+  const entry = value as Record<string, unknown>;
+  return hasOnlyKeys(entry, ["itemId", "sessionId", "key", "where"]) && isTodoId(entry.itemId) && isTodoSessionId(entry.sessionId)
+    && (entry.key === null || (typeof entry.key === "string" && entry.key.length > 0 && entry.key.length <= 100))
+    && (TODO_ASK_WHERE as readonly unknown[]).includes(entry.where);
+}
+
+function isTodoAskSourceMessage(value: unknown): value is TodoAskSourceMessage {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
+  const m = value as Record<string, unknown>;
+  return hasOnlyKeys(m, ["uuid", "role", "text", "timestamp"]) && (m.role === "user" || m.role === "assistant") && isConversationHistoryMessage(m);
+}
+const isTodoDate = (value: unknown) => typeof value === "string" && TODO_DUE_PATTERN.test(value);
+const isRevision = (value: unknown) => typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
+const isTime = (value: unknown) => typeof value === "number" && Number.isFinite(value) && value >= 0;
+const isTodoGroup = (value: unknown) => typeof value === "string" && value.trim().length > 0 && value.length <= TODO_GROUP_MAX;
+const isTodoTitle = (value: unknown) => typeof value === "string" && value.trim().length > 0 && value.length <= TODO_TITLE_MAX;
+const isTodoSectionOrder = (value: unknown) => Array.isArray(value) && value.length === TODO_DETAIL_SECTIONS.length
+  && TODO_DETAIL_SECTIONS.every(section => value.includes(section));
+
+const isTodoDocLabel = (value: unknown) => typeof value === "string" && value.length <= TODO_DOC_LABEL_MAX;
+const isTodoImageMediaType = (value: unknown): value is TodoImageMediaType => typeof value === "string" && value in TODO_IMAGE_EXTENSIONS;
+const isTodoImageName = (value: unknown): value is string => typeof value === "string" && TODO_IMAGE_FILE.test(value);
+
+function isTodoDocView(value: unknown): value is TodoDocView {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
+  const doc = value as Record<string, unknown>;
+  return hasOnlyKeys(doc, ["id", "kind", "target", "label", "at"]) && isTodoId(doc.id) && (TODO_DOC_KINDS as readonly unknown[]).includes(doc.kind)
+    && typeof doc.target === "string" && doc.target.length > 0 && doc.target.length <= TODO_DOC_TARGET_MAX
+    && (doc.kind !== "image" || isTodoImageName(doc.target)) && (doc.label === undefined || isTodoDocLabel(doc.label)) && isTime(doc.at);
+}
+
+function isTodoEdit(value: unknown): value is TodoEdit {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
+  const edit = value as Record<string, unknown>;
+  switch (edit.kind) {
+    case "add":
+      return hasOnlyKeys(edit, ["kind", "parentId", "title", "group", "due", "start", "priority", "state", "userMemo", "position", "templateId", "waiting", "repeat", "estimate", "tags"])
+        && isOptionalText(edit.waiting, TODO_WAITING_MAX) && isOptionalText(edit.tags, TODO_TAGS_MAX) && edit.waiting !== null && edit.tags !== null
+        && (edit.repeat === undefined || (typeof edit.repeat === "string" && TODO_REPEAT_PATTERN.test(edit.repeat)))
+        && (edit.estimate === undefined || (typeof edit.estimate === "string" && TODO_ESTIMATE_PATTERN.test(edit.estimate)))
+        && (edit.parentId === null || isTodoId(edit.parentId)) && isTodoTitle(edit.title)
+        && (edit.templateId === undefined || isTodoId(edit.templateId))
+        && (edit.group === undefined || isTodoGroup(edit.group))
+        && (edit.due === undefined || isTodoDate(edit.due))
+        && (edit.start === undefined || isTodoDate(edit.start))
+        && (edit.priority === undefined || (TODO_PRIORITIES as readonly unknown[]).includes(edit.priority))
+        && (edit.state === undefined || (TODO_STATES as readonly unknown[]).includes(edit.state))
+        && (edit.userMemo === undefined || (typeof edit.userMemo === "string" && edit.userMemo.length <= TODO_USER_MEMO_MAX))
+        && (edit.position === undefined || isRevision(edit.position));
+    case "update":
+      return hasOnlyKeys(edit, ["kind", "id", "title", "group", "due", "start", "priority", "userMemo", "state", "waiting", "repeat", "estimate", "tags"]) && isTodoId(edit.id)
+        && Object.keys(edit).length > 2
+        && isOptionalText(edit.waiting, TODO_WAITING_MAX) && isOptionalText(edit.tags, TODO_TAGS_MAX)
+        && (edit.repeat === undefined || edit.repeat === null || (typeof edit.repeat === "string" && TODO_REPEAT_PATTERN.test(edit.repeat)))
+        && (edit.estimate === undefined || edit.estimate === null || (typeof edit.estimate === "string" && TODO_ESTIMATE_PATTERN.test(edit.estimate)))
+        && (edit.state === undefined || (TODO_STATES as readonly unknown[]).includes(edit.state))
+        && (edit.title === undefined || isTodoTitle(edit.title))
+        && (edit.group === undefined || edit.group === null || isTodoGroup(edit.group))
+        && (edit.due === undefined || edit.due === null || isTodoDate(edit.due))
+        && (edit.start === undefined || edit.start === null || isTodoDate(edit.start))
+        && (edit.priority === undefined || edit.priority === null || (TODO_PRIORITIES as readonly unknown[]).includes(edit.priority))
+        && (edit.userMemo === undefined || (typeof edit.userMemo === "string" && edit.userMemo.length <= TODO_USER_MEMO_MAX));
+    case "setState":
+      return hasOnlyKeys(edit, ["kind", "id", "state"]) && isTodoId(edit.id) && (TODO_STATES as readonly unknown[]).includes(edit.state);
+    case "move":
+      return hasOnlyKeys(edit, ["kind", "id", "parentId", "position", "before"]) && isTodoId(edit.id) && (edit.parentId === null || isTodoId(edit.parentId))
+        && (edit.position === undefined || isRevision(edit.position)) && (edit.before === undefined || edit.before === null || isTodoId(edit.before))
+        && !(edit.position !== undefined && edit.before !== undefined);
+    case "batch":
+      return hasOnlyKeys(edit, ["kind", "steps"]) && Array.isArray(edit.steps) && edit.steps.length > 0 && edit.steps.length <= TODO_BATCH_MAX
+        && edit.steps.every(entry => typeof entry === "object" && entry !== null && TODO_BATCH_KINDS.includes((entry as { kind?: unknown }).kind) && isTodoEdit(entry));
+    case "delete":
+    case "restore":
+      return hasOnlyKeys(edit, ["kind", "id"]) && isTodoId(edit.id);
+    case "undo":
+      return hasOnlyKeys(edit, ["kind", "revision"]) && isRevision(edit.revision) && (edit.revision as number) > 0;
+    case "revertClaude":
+      return (hasOnlyKeys(edit, ["kind", "changeId"]) && isTodoId(edit.changeId))
+        || (hasOnlyKeys(edit, ["kind", "changeIds"]) && Array.isArray(edit.changeIds) && edit.changeIds.length > 0 && edit.changeIds.length <= TODO_CHANGES_REQUEST_MAX
+          && edit.changeIds.every(isTodoId) && new Set(edit.changeIds).size === edit.changeIds.length)
+        || (hasOnlyKeys(edit, ["kind", "revisions"]) && Array.isArray(edit.revisions) && edit.revisions.length > 0 && edit.revisions.length <= TODO_CHANGES_REQUEST_MAX
+          && edit.revisions.every(revision => isRevision(revision) && (revision as number) > 0) && new Set(edit.revisions).size === edit.revisions.length);
+    case "addLink":
+      return hasOnlyKeys(edit, ["kind", "id", "target", "label"]) && isTodoId(edit.id)
+        && typeof edit.target === "string" && edit.target.trim().length > 0 && edit.target.length <= TODO_DOC_TARGET_MAX && !edit.target.includes("\0")
+        && (edit.label === undefined || isTodoDocLabel(edit.label));
+    case "addImage":
+      return hasOnlyKeys(edit, ["kind", "id", "mediaType", "data", "label"]) && isTodoId(edit.id) && isTodoImageMediaType(edit.mediaType)
+        && typeof edit.data === "string" && edit.data.length > 0 && edit.data.length <= IMAGE_MAX_BASE64_LEN
+        && (edit.label === undefined || isTodoDocLabel(edit.label));
+    case "removeDoc":
+      return hasOnlyKeys(edit, ["kind", "id", "docId"]) && isTodoId(edit.id) && isTodoId(edit.docId);
+    case "groupCreate":
+    case "groupDelete":
+      return hasOnlyKeys(edit, ["kind", "name"]) && isTodoGroup(edit.name);
+    case "groupRename":
+      return hasOnlyKeys(edit, ["kind", "name", "to"]) && isTodoGroup(edit.name) && isTodoGroup(edit.to);
+    case "groupColor":
+      return hasOnlyKeys(edit, ["kind", "name", "color"]) && isTodoGroup(edit.name)
+        && typeof edit.color === "number" && Number.isSafeInteger(edit.color) && edit.color >= 1 && edit.color <= TODO_GROUP_COLOR_COUNT;
+    case "groupMove":
+      return hasOnlyKeys(edit, ["kind", "name", "direction"]) && isTodoGroup(edit.name) && (edit.direction === 1 || edit.direction === -1);
+    case "groupFolderRemove":
+    case "groupFolderAdd":
+      return hasOnlyKeys(edit, ["kind", "name", "path"]) && isTodoGroup(edit.name) && typeof edit.path === "string" && edit.path.length > 0 && edit.path.length <= TODO_DOC_TARGET_MAX;
+    case "groupAliasRemove":
+      return hasOnlyKeys(edit, ["kind", "name", "words"]) && isTodoGroup(edit.name) && isTodoGroup(edit.words);
+    case "templateSave":
+      return hasOnlyKeys(edit, ["kind", "id", "name"]) && isTodoId(edit.id)
+        && typeof edit.name === "string" && edit.name.trim().length > 0 && edit.name.length <= TODO_TEMPLATE_NAME_MAX;
+    case "docLabel":
+      return hasOnlyKeys(edit, ["kind", "id", "docId", "label"]) && isTodoId(edit.id) && isTodoId(edit.docId) && isTodoDocLabel(edit.label);
+    case "acknowledge":
+      return hasOnlyKeys(edit, ["kind", "changeIds"]) && Array.isArray(edit.changeIds) && edit.changeIds.length > 0
+        && edit.changeIds.length <= TODO_ACKNOWLEDGE_MAX && edit.changeIds.every(isTodoId);
+  }
+  return false;
+}
+
+function isTodoChangeView(value: unknown): value is TodoChangeView {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
+  const change = value as Record<string, unknown>;
+  return hasOnlyKeys(change, ["id", "at", "author", "itemId", "itemTitle", "field", "before", "after", "cascade", "revert", "acknowledged", "basis", "from", "to"])
+    && (change.from === undefined || isTodoChangePlace(change.from)) && (change.to === undefined || isTodoChangePlace(change.to))
+    && (change.basis === undefined || (TODO_PLACEMENT_BASES as readonly unknown[]).includes(change.basis))
+    && isTodoId(change.id) && isTime(change.at) && (change.author === "human" || change.author === "claude")
+    && (change.itemId === "" || isTodoId(change.itemId)) && typeof change.itemTitle === "string"
+    && (change.acknowledged === undefined || change.acknowledged === true)
+    && typeof change.field === "string" && TODO_CHANGE_FIELDS.includes(change.field)
+    && (change.before === null || typeof change.before === "string") && (change.after === null || typeof change.after === "string")
+    && (change.cascade === undefined || change.cascade === true)
+    && (change.revert === undefined || change.revert === "ok" || (TODO_REVERT_BLOCKS as readonly unknown[]).includes(change.revert));
+}
+
+function isTodoMemoEntry(section: string, entry: unknown): boolean {
+  if (!(WORK_MEMO_SECTIONS as readonly string[]).includes(section) || typeof entry !== "object" || entry === null || Array.isArray(entry)) return false;
+  const memo = entry as Record<string, unknown>;
+  return hasOnlyKeys(memo, ["text", "at"]) && typeof memo.text === "string" && isTime(memo.at);
+}
+
+function isTodoDetailItem(value: unknown): value is TodoDetailItem {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
+  const item = value as Record<string, unknown>;
+  const memo = item.workMemo;
+  return hasOnlyKeys(item, ["id", "parentId", "title", "state", "completion", "group", "due", "start", "priority", "userMemo", "workMemo", "docs", "createdAt", "updatedAt", "changes", "memoStaleSince",
+    "waiting", "repeat", "estimate", "tags", "by", "guesses", "startedAt", "doneAt", "conversations", "briefs", "splitBrief", "totals", "source"])
+    && (item.source === undefined || (typeof item.source === "object" && item.source !== null && hasOnlyKeys(item.source as Record<string, unknown>, ["sessionId", "title"])
+      && isTodoSessionId((item.source as Record<string, unknown>).sessionId) && isOptionalText((item.source as Record<string, unknown>).title, RENAME_TITLE_MAX)))
+    && Array.isArray(item.docs) && item.docs.every(isTodoDocView)
+    && isOptionalText(item.waiting, TODO_WAITING_MAX) && isOptionalText(item.tags, TODO_TAGS_MAX) && isOptionalText(item.splitBrief, TODO_BRIEF_MAX)
+    && (item.repeat === undefined || (typeof item.repeat === "string" && TODO_REPEAT_PATTERN.test(item.repeat)))
+    && (item.estimate === undefined || (typeof item.estimate === "string" && TODO_ESTIMATE_PATTERN.test(item.estimate)))
+    && (item.by === undefined || item.by === "claude")
+    && (item.guesses === undefined || (isTodoGuessView(item.guesses) && Object.values(item.guesses as object).every(reason => typeof reason === "string" && reason.length <= TODO_GUESS_REASON_MAX)))
+    && (item.startedAt === undefined || isTime(item.startedAt)) && (item.doneAt === undefined || isTime(item.doneAt))
+    && Array.isArray(item.conversations) && item.conversations.every(entry => typeof entry === "object" && entry !== null
+      && hasOnlyKeys(entry as Record<string, unknown>, ["at", "handoffs"]) && isTime((entry as Record<string, unknown>).at) && isRevision((entry as Record<string, unknown>).handoffs))
+    && Array.isArray(item.briefs) && item.briefs.every(entry => typeof entry === "object" && entry !== null
+      && hasOnlyKeys(entry as Record<string, unknown>, ["at", "text"]) && isTime((entry as Record<string, unknown>).at) && isOptionalText((entry as Record<string, unknown>).text, TODO_BRIEF_MAX))
+    && (item.totals === undefined || isTodoTotalsView(item.totals))
+    && (item.memoStaleSince === undefined || isTime(item.memoStaleSince))
+    && isTodoListItem({ id: item.id, parentId: item.parentId, title: item.title, state: item.state, group: item.group, due: item.due })
+    && (item.completion === undefined || item.completion === "auto" || item.completion === "manual")
+    && (item.start === undefined || isTodoDate(item.start))
+    && (item.priority === undefined || (TODO_PRIORITIES as readonly unknown[]).includes(item.priority))
+    && typeof item.userMemo === "string"
+    && typeof memo === "object" && memo !== null && !Array.isArray(memo)
+    && Object.entries(memo).every(([section, entry]) => isTodoMemoEntry(section, entry))
+    && isTime(item.createdAt) && isTime(item.updatedAt)
+    && Array.isArray(item.changes) && item.changes.every(isTodoChangeView);
+}
+
+function isTodoWorkView(value: unknown): boolean {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
+  const work = value as Record<string, unknown>;
+  return hasOnlyKeys(work, ["ms", "withChildrenMs"]) && isRevision(work.ms) && (work.withChildrenMs === undefined || isRevision(work.withChildrenMs));
+}
+
+function isTodoTotalsView(value: unknown): boolean {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
+  const totals = value as Record<string, unknown>;
+  return hasOnlyKeys(totals, ["kids", "done", "firstStartedAt", "lastDoneAt"]) && isRevision(totals.kids) && isRevision(totals.done)
+    && (totals.firstStartedAt === undefined || isTime(totals.firstStartedAt)) && (totals.lastDoneAt === undefined || isTime(totals.lastDoneAt));
+}
+
+function isTodoDeletedView(value: unknown): value is TodoDeletedView {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
+  const item = value as Record<string, unknown>;
+  return hasOnlyKeys(item, ["id", "title", "group", "deletedAt", "expiresAt", "descendants"]) && isTodoId(item.id) && typeof item.title === "string"
+    && (item.group === undefined || (typeof item.group === "string" && item.group.length > 0))
+    && isTime(item.deletedAt) && isTime(item.expiresAt) && isRevision(item.descendants);
 }
 
 function isResumePreviewMessage(value: unknown): value is ResumePreviewMessage {
@@ -4305,9 +4997,11 @@ export function isHostToWebview(v: unknown): v is HostToWebview {
   if (t === "tabCreated") {
     return (
       isTabSnapshotShape((v as { tab?: unknown }).tab) &&
-      typeof (v as { activate?: unknown }).activate === "boolean"
+      typeof (v as { activate?: unknown }).activate === "boolean" &&
+      [undefined, true].includes((v as { replacement?: unknown }).replacement as true | undefined)
     );
   }
+  if (t === "tabOrder") return hasOnlyKeys(v as Record<string, unknown>, ["type", "order"]) && isTabOrder((v as { order?: unknown }).order);
   if (t === "tabClosed" || t === "activateTab") return typeof tabId === "string";
   if (t === "pasteText") {
     return hasOnlyKeys(v as Record<string, unknown>, ["type", "text"])
@@ -4506,7 +5200,7 @@ export function isHostToWebview(v: unknown): v is HostToWebview {
     const allowed = new Set(["type", "kind", "tabId", "reason"]);
     if (!Object.keys(m).every((key) => allowed.has(key))) return false;
     if (m.kind !== "script" && m.kind !== "action") return false;
-    if (tabId !== undefined && (typeof tabId !== "string" || tabId.length === 0 || tabId.length > 200)) return false;
+    if (tabId !== undefined && (typeof tabId !== "string" || tabId.length === 0 || tabId.length > TAB_ID_MAX)) return false;
     if (m.reason !== undefined && (typeof m.reason !== "string" || m.reason.length === 0)) return false;
     return m.kind === "script" || (typeof tabId === "string" && typeof m.reason === "string");
   }
@@ -4532,7 +5226,71 @@ export function isHostToWebview(v: unknown): v is HostToWebview {
     return (appearance === undefined || isAccentSettings(appearance))
       && (displayName === undefined || isDisplayName(displayName))
       && (COMPOSER_SEND_KEYS as readonly string[]).includes((v as { composerSendKey?: unknown }).composerSendKey as string)
-      && [undefined, true, false].includes((v as { askQualityCheck?: unknown }).askQualityCheck as boolean | undefined);
+      && [undefined, true, false].includes((v as { askQualityCheck?: unknown }).askQualityCheck as boolean | undefined)
+      && typeof (v as { editSummaryEnabled?: unknown }).editSummaryEnabled === "boolean";
+  }
+  if (t === "todoSnapshot") {
+    const m = v as Record<string, unknown>;
+    if (typeof m.seq !== "number" || !Number.isSafeInteger(m.seq) || m.seq < 0) return false;
+    if (m.enabled === false) return hasOnlyKeys(m, ["type", "seq", "enabled"]);
+    if (m.enabled !== true) return false;
+    if (m.unreadable !== undefined) return m.unreadable === true && hasOnlyKeys(m, ["type", "seq", "enabled", "unreadable"]);
+    return hasOnlyKeys(m, ["type", "seq", "enabled", "revision", "items", "groups", "templates", "tabItems", "askSources", "askDismissals", "askClosedInTodo", "deletedTabs", "sessions", "claudeRecent"])
+      && Array.isArray(m.claudeRecent) && m.claudeRecent.length <= TODO_ACKNOWLEDGE_MAX && m.claudeRecent.every(isTime)
+      && Array.isArray(m.deletedTabs) && m.deletedTabs.every(id => typeof id === "string" && id.length > 0)
+      && Array.isArray(m.sessions) && m.sessions.every(isTodoSessionLinkView)
+      && typeof m.revision === "number" && Number.isSafeInteger(m.revision) && m.revision >= 0
+      && Array.isArray(m.items) && m.items.every(isTodoListItem)
+      && Array.isArray(m.groups) && m.groups.every(isTodoGroupColor)
+      && Array.isArray(m.templates) && m.templates.every(isTodoTemplateView)
+      && Array.isArray(m.tabItems) && m.tabItems.every(isTodoTabItem)
+      && Array.isArray(m.askSources) && m.askSources.every(isTodoAskSourceRef)
+      && Array.isArray(m.askDismissals) && m.askDismissals.every(isTodoAskIdentity)
+      && Array.isArray(m.askClosedInTodo) && m.askClosedInTodo.every(isTodoAskIdentity);
+  }
+  if (t === "todoChanges") {
+    const m = v as Record<string, unknown>;
+    return hasOnlyKeys(m, ["type", "requestId", "revision", "changes", "turns", "more"]) && isRevision(m.requestId) && isRevision(m.revision)
+      && Array.isArray(m.changes) && m.changes.length <= TODO_CHANGES_REQUEST_MAX && m.changes.every(isTodoChangeView)
+      && (m.turns === undefined || (Array.isArray(m.turns) && m.turns.length <= TODO_CHANGES_REQUEST_MAX && m.turns.every(isTodoTurnRevert)))
+      && (m.more === undefined || m.more === true);
+  }
+  if (t === "todoToggleDrawer") return hasOnlyKeys(v as Record<string, unknown>, ["type"]);
+  if (t === "todoAskSource") {
+    const m = v as Record<string, unknown>;
+    if (!isTodoSessionId(m.sessionId) || !isRevision(m.requestId)) return false;
+    if (m.key === null) return hasOnlyKeys(m, ["type", "sessionId", "requestId", "key"]);
+    return hasOnlyKeys(m, ["type", "sessionId", "requestId", "key", "endedAt", "messages"]) && typeof m.key === "string" && m.key.length > 0 && m.key.length <= 100
+      && isTime(m.endedAt) && Array.isArray(m.messages) && m.messages.length <= TODO_ASK_SOURCE_MESSAGES_MAX && m.messages.every(isTodoAskSourceMessage);
+  }
+  if (t === "todoEditResult") {
+    const m = v as Record<string, unknown>;
+    if (!isTodoId(m.requestId)) return false;
+    if (m.ok === true) return hasOnlyKeys(m, ["type", "requestId", "ok", "revision", "changed", "skipped"]) && isRevision(m.revision) && typeof m.changed === "boolean" && isRevision(m.skipped);
+    return m.ok === false && hasOnlyKeys(m, ["type", "requestId", "ok", "error"]) && (TODO_EDIT_ERRORS as readonly unknown[]).includes(m.error);
+  }
+  if (t === "todoDetail") {
+    const m = v as Record<string, unknown>;
+    return hasOnlyKeys(m, ["type", "id", "revision", "item", "sectionOrder"]) && isTodoId(m.id) && isRevision(m.revision)
+      && isTodoSectionOrder(m.sectionOrder) && (m.item === null || (isTodoDetailItem(m.item) && (m.item as TodoDetailItem).id === m.id));
+  }
+  if (t === "todoWork") {
+    const m = v as Record<string, unknown>;
+    return hasOnlyKeys(m, ["type", "id", "revision", "work"]) && isTodoId(m.id) && isRevision(m.revision) && (m.work === undefined || isTodoWorkView(m.work));
+  }
+  if (t === "todoImage") {
+    const m = v as Record<string, unknown>;
+    if (!isTodoImageName(m.name)) return false;
+    if (m.missing !== undefined) return m.missing === true && hasOnlyKeys(m, ["type", "name", "missing"]);
+    return hasOnlyKeys(m, ["type", "name", "mediaType", "data"]) && isTodoImageMediaType(m.mediaType)
+      && typeof m.data === "string" && m.data.length > 0 && m.data.length <= IMAGE_MAX_BASE64_LEN;
+  }
+  if (t === "todoLog") {
+    const m = v as Record<string, unknown>;
+    if (!isRevision(m.revision)) return false;
+    if (m.view === "claude") return hasOnlyKeys(m, ["type", "view", "revision", "changes", "batches"]) && Array.isArray(m.changes) && m.changes.every(isTodoChangeView)
+      && Array.isArray(m.batches) && m.batches.every(isTodoBatchRevert);
+    return m.view === "deleted" && hasOnlyKeys(m, ["type", "view", "revision", "items"]) && Array.isArray(m.items) && m.items.every(isTodoDeletedView);
   }
   if (t === "tabNotice") {
     const text = (v as { text?: unknown }).text;

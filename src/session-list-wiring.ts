@@ -10,7 +10,7 @@ import { AccountUsageFetcher, rateLimitsViaUsageCommand } from "./account-usage"
 import { claudeConfigDir, claudeProjectsDir } from "./claude-env";
 import { configuredClaudeExecutablePath, getLaisoraConfiguration, resolveSessionCwd } from "./claude-settings";
 import { resolveClaudeCodeStartup } from "./claudeCliResolver";
-import { sdkClaudeCodeVersion } from "./claudeHost";
+import { sdkClaudeCodeVersion, type ClaudeConversation } from "./claudeHost";
 import type { Session } from "./extension";
 import { extensionContext, output, sinceActivation, store } from "./host-context";
 import {
@@ -23,15 +23,16 @@ import {
   type WebviewToHost,
 } from "./protocol";
 import {
-  appendSessionRecordOnFreshLine,
   errText,
+  persistChosenTitle,
   resolveSessionImage,
   sessionTranscriptRef,
 } from "./session-files";
-import { formatCustomTitleRecord, normalizeTitleValue } from "./session-display-title";
+import { normalizeTitleValue } from "./session-display-title";
 import type { SessionCandidate } from "./session-list";
 import { SESSION_RESOLVE_BATCH, candidatePathIndex, displayTitleFromSummary, rankSessionCandidates, streamSessionRows } from "./session-list";
 import type { SessionStore } from "./store-surfaces";
+import { postTodoSnapshot } from "./todo-surface";
 
 const USED_SESSIONS_KEY = "history.laisoraSessions";
 let usedSessions: Record<string, string> | undefined;
@@ -105,6 +106,7 @@ export function persistOpenTabs(): Promise<void> {
     const entries = openTabEntries();
     const serialized = JSON.stringify(entries);
     if (serialized === lastPersistedOpenTabs) return Promise.resolve();
+    postTodoSnapshot();
     const update = openTabsMemento()?.update(OPEN_TABS_KEY, entries);
     if (!update) return Promise.resolve();
     lastPersistedOpenTabs = serialized;
@@ -224,6 +226,7 @@ export async function refreshTabTitle(session: Session): Promise<void> {
     if (summary === undefined) return;
     if (session.logicalGeneration !== generation || session.closed) return;
     session.titleRefreshed = true;
+    if (session.unpersistedChosenTitle !== null) return;
     const title = displayTitleFromSummary(summary, sessionId);
     if (title === session.title) return;
     session.title = title;
@@ -407,10 +410,6 @@ async function listPastSessions(
   );
 }
 
-function writeCustomTitle(file: string, sessionId: string, title: string): Promise<void> {
-  return appendSessionRecordOnFreshLine(file, sessionId, formatCustomTitleRecord(sessionId, title));
-}
-
 const renameQueues = new Map<string, Promise<void>>();
 function queueRename<T>(sessionId: string, run: () => Promise<T>): Promise<T> {
   const result = (renameQueues.get(sessionId) ?? Promise.resolve()).then(run);
@@ -420,9 +419,57 @@ function queueRename<T>(sessionId: string, run: () => Promise<T>): Promise<T> {
   return result;
 }
 
+export const CHOSEN_TITLE_NOTICE_FAILURES = 2;
+
+function liveTitleCli(s: Session, ref: { sessionId: string } | null): ClaudeConversation | null {
+  const conversation = s.conversation;
+  if (conversation === null || conversation.isClosed) return null;
+  const cliSessionId = s.auth?.sessionId;
+  return ref === null || cliSessionId === undefined || cliSessionId === ref.sessionId ? conversation : null;
+}
+
+export function writeHeldChosenTitle(s: Session): Promise<void> {
+  const pending = s.unpersistedChosenTitle;
+  if (pending === null) return Promise.resolve();
+  const ref = sessionTranscriptRef(s);
+  s.unpersistedChosenTitle = null;
+  if (ref === null) return Promise.resolve();
+  return persistChosenTitle(null, ref, pending.title).then(
+    () => undefined,
+    (error) => output.appendLine(`[${s.title}] Could not save the name: ${errText(error)}`)
+  );
+}
+
+export async function flushChosenTitle(s: Session): Promise<void> {
+  const pending = s.unpersistedChosenTitle;
+  if (pending === null) return;
+  const ref = sessionTranscriptRef(s);
+  let outcome: "cli" | "file" | "pending";
+  try {
+    outcome = await persistChosenTitle(liveTitleCli(s, ref), ref, pending.title);
+  } catch (error) {
+    output.appendLine(`[${s.title}] Could not save the name: ${errText(error)}`);
+    outcome = "pending";
+  }
+  if (s.unpersistedChosenTitle !== pending) return;
+  if (outcome !== "pending") {
+    s.unpersistedChosenTitle = null;
+    return;
+  }
+  pending.failedAttempts += 1;
+  if (pending.failedAttempts === CHOSEN_TITLE_NOTICE_FAILURES) {
+    s.pushEvent({
+      kind: "error",
+      message: l10n.t("The name could not be passed to Claude Code yet. LAISORA keeps retrying and saves it to the session record at the latest when the tab closes."),
+      fatal: false,
+    });
+  }
+}
+
 function applyCustomTitle(st: SessionStore, s: Session, sessionId: string, title: string): void {
   s.title = displayTitleFromSummary(title, sessionId);
   s.autoTitled = true;
+  s.unpersistedChosenTitle = null;
   st.post({ type: "tabRenamed", tabId: s.tabId, title: s.title });
 }
 
@@ -462,13 +509,21 @@ async function renameOpenSession(
   const { ref, generation } = target;
   const title = normalizeTitleValue(rawTitle);
   if (title === null) return refuse(l10n.t("Usage: /rename <new name>"));
-  try {
-    await writeCustomTitle(ref.file, ref.sessionId, title);
-  } catch (error) {
-    return refuse(l10n.t("/rename: Could not write to the session file ({0})", String(error)));
+  const starting = s.starting;
+  let outcome: "cli" | "file" | "pending" = "pending";
+  if (starting === null) {
+    try {
+      outcome = await persistChosenTitle(liveTitleCli(s, ref), ref, title);
+    } catch (error) {
+      return refuse(l10n.t("/rename: Could not write to the session file ({0})", String(error)));
+    }
   }
   const shown = displayTitleFromSummary(title, ref.sessionId);
-  if (!s.closed && s.logicalGeneration === generation) applyCustomTitle(st, s, ref.sessionId, title);
+  if (!s.closed && s.logicalGeneration === generation) {
+    applyCustomTitle(st, s, ref.sessionId, title);
+    if (outcome === "pending") s.unpersistedChosenTitle = { title, failedAttempts: starting === null ? 1 : 0 };
+  }
+  if (starting !== null) void starting.then(() => flushChosenTitle(s));
   st.post({ type: "sessionRenamed", sessionId: ref.sessionId, title: shown, ...(requestId !== undefined ? { requestId } : {}) });
   return { title };
 }
@@ -494,7 +549,7 @@ async function renameListedSession(st: SessionStore, msg: Extract<WebviewToHost,
   const title = normalizeTitleValue(msg.title);
   if (title === null) { fail(l10n.t("Enter a name.")); return; }
   try {
-    await writeCustomTitle(msg.filePath, msg.sessionId, title);
+    await persistChosenTitle(null, { sessionId: msg.sessionId, file: msg.filePath }, title);
   } catch (error) {
     output.appendLine(`[history] Could not save the name: ${msg.sessionId} — ${errText(error)}`);
     fail(l10n.t("Could not save the name ({0})", errText(error)));

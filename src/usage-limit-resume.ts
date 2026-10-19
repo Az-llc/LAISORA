@@ -1,6 +1,6 @@
+import { USAGE_LIMIT_RESET_NOTICE } from "./laisora-input";
 import type { NormalizedEventBody } from "./protocol";
 
-const USAGE_LIMIT_RESET_NOTICE = "Your claude.ai usage limit has reset.";
 export const USAGE_LIMIT_CONTINUATION = `${USAGE_LIMIT_RESET_NOTICE} Continue the task you were working on when the limit was reached; do not repeat work that is already complete.`;
 export const SDK_AUTO_CONTINUE_SETTINGS = { autoContinueAtUsageLimit: false } as const;
 const LIVENESS_TICK_MS = 60_000;

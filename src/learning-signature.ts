@@ -1,5 +1,7 @@
 import { createHmac } from "node:crypto";
 import { isUsageLimitResult } from "./guardrail";
+import { FILE_WRITING_TOOLS } from "./file-writing-tools";
+import { isShellTool } from "./shell-tools";
 import { HOOK_DENIAL_RE, HUMAN_REJECTED_TOOL_RESULT_RE, INPUT_VALIDATION_TOOL_RESULT_RE, stripToolUseErrorTags } from "./tool-result-signals";
 
 export const SIG_VERSION = 1;
@@ -37,8 +39,7 @@ export interface FailureSignature {
 
 export const PLACEMENT_GUARD_REASON_PREFIX = "LAISORA placement guard:";
 
-const SHELL_TOOLS = new Set(["Bash", "PowerShell"]);
-const FILE_TOOLS = new Set(["Read", "Edit", "Write", "MultiEdit", "NotebookEdit"]);
+const FILE_TOOLS = new Set<string>(["Read", ...FILE_WRITING_TOOLS, "NotebookEdit"]);
 const HEAD_SUBCOMMAND_PROGRAMS = new Set(["git", "npm", "pnpm", "yarn", "gh", "docker", "cargo", "go", "dotnet", "pip"]);
 const HEAD_PLAIN_PROGRAMS = new Set(["node", "python", "pwsh", "powershell", "bash", "sh", "cd", "pushd", "set-location"]);
 const LEADING_DIRECTORY_CHANGE_RE = /^\s*(?:cd|pushd|set-location(?:\s+-(?:literal)?path)?)\s+(?:"([^"]*)"|'([^']*)'|([^\s"';&|]+))\s*(?:&&|;|\r?\n)\s*/i;
@@ -120,7 +121,7 @@ export const FAILURE_LABELS: Readonly<Record<string, readonly FailureLabel[]>> =
   hook_block: [{ pattern: HOOK_DENIAL_RE, text: "a hook denied the call before it ran" }],
 });
 
-export function isShellTool(tool: string): boolean { return SHELL_TOOLS.has(tool); }
+export { isShellTool };
 export function isFileTool(tool: string): boolean { return FILE_TOOLS.has(tool); }
 
 export interface ShellSegment { readonly words: readonly string[]; readonly operators?: readonly number[] }

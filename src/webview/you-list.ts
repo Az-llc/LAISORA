@@ -1,6 +1,15 @@
 import * as l10n from "@vscode/l10n";
-import type { YouItem, YouItemsReader } from "./you-items";
+import { isWaitingYouItem, type YouItem, type YouItemsReader } from "./you-items";
 import { bindUserLabel } from "./user-label";
+
+export function youKindLabel(item: Pick<YouItem, "kind">): string {
+  return item.kind === "approve" ? l10n.t("Approval") : item.kind === "decide" ? l10n.t("Decision") : l10n.t("Machine check");
+}
+
+export function youWaitingKindLabel(item: Pick<YouItem, "kind" | "awaitingDetail">): string {
+  const kind = youKindLabel(item);
+  return item.awaitingDetail ? l10n.t("{0} · Awaiting explanation", kind) : kind;
+}
 
 function node<K extends keyof HTMLElementTagNameMap>(tag: K, className: string, text?: string): HTMLElementTagNameMap[K] {
   const element = document.createElement(tag);
@@ -26,8 +35,8 @@ export class YouList {
       const next = JSON.stringify(items);
       if (!force && signature === next) return;
       signature = next;
-      const open = items.filter(item => item.resolvedAt === undefined);
-      const resolved = items.filter(item => item.resolvedAt !== undefined && item.resolution !== "dismissed");
+      const open = items.filter(isWaitingYouItem);
+      const resolved = items.filter(item => !isWaitingYouItem(item) && item.resolution !== "dismissed");
       const folded = this.element.dataset.resolvedOpen !== "true";
       onCount?.(open.length, items.length);
       const head = node("header", "plan-section-head");
@@ -43,8 +52,8 @@ export class YouList {
         const square = node("span", "you-square");
         square.setAttribute("aria-hidden", "true");
         const body = node("div", "you-body");
-        const kind = item.kind === "approve" ? l10n.t("Approval") : item.kind === "decide" ? l10n.t("Decision") : l10n.t("Machine check");
-        body.append(node("div", "you-kind", item.resolvedAt === undefined ? (item.awaitingDetail ? l10n.t("{0} · Awaiting explanation", kind) : kind)
+        const kind = youKindLabel(item);
+        body.append(node("div", "you-kind", isWaitingYouItem(item) ? youWaitingKindLabel(item)
           : item.resolution === "historical" ? l10n.t("{0} · Recorded", kind) : l10n.t("{0} · Resolved", kind)));
         const title = node("div", "you-title");
         const link = node("button", "you-link", item.anchor.approvalRef ? l10n.t("↗ Card") : l10n.t("↗ Message"));

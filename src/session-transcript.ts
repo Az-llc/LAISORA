@@ -8,6 +8,8 @@ import { assistantUsageFromRaw, RESUME_PREVIEW_MESSAGE_MAX, summarizeToolInput }
 import type { WorkCoverage } from "./work-model";
 import { extractResumeSignals, extractStage0ToolFields, isResumeSignalToolName, parseTaskNotification } from "./tool-observation";
 import { redactAbsolutePaths, redactOptional } from "./path-redaction";
+import { advanceRunRoot, countFileEdit, singleToolUseResult, type RunRootState } from "./edit-summary";
+import { isFileWritingTool } from "./file-writing-tools";
 import {
   formatRefusalMessage,
   extractAssistantTextBlocks,
@@ -18,6 +20,7 @@ import {
   parseRefusalStop,
 } from "./claude-normalizer";
 import { parseHandoffEnvelope, type HandoffEnvelopeV2 } from "./handoff-envelope";
+import { isLaisoraInputText, laisoraInputLine, parseLaisoraInput } from "./laisora-input";
 import { ASK_QUALITY_DENIAL_HEAD, feedbackRejectedTitles, resolveRejectedAsks, type AskRejection } from "./markdown-ast";
 import {
   COMMAND_ARGS_RE,
@@ -312,6 +315,10 @@ interface RawHistoryItem {
   fileOrder: number;
 }
 
+function recordCwd(record: Record<string, unknown>, fallback: string): string {
+  return typeof record.cwd === "string" && record.cwd.length > 0 ? record.cwd : fallback;
+}
+
 function historyTurnTexts(rawEvents: readonly RawHistoryItem[], turnId: string): RawHistoryItem[] {
   return rawEvents.filter((item) => item.body.kind === "assistant_text_delta" && item.body.turnId === turnId);
 }
@@ -447,6 +454,8 @@ export async function readSessionHistory(
   const observedAsyncAgentIds = new Set<string>();
   const observedBackgroundTaskIds = new Set<string>();
   const resumeSignalToolNames = new Map<string, string>();
+  const editToolNames = new Map<string, string>();
+  let runRoot: RunRootState = { shellInTurn: false };
   let droppedTaskNotificationCount = 0;
   const makeNotificationFields = (text: string | TaskNotificationInfo, record?: Record<string, unknown>) => {
     const notification = typeof text === "string" ? parseTaskNotification(text, {
@@ -577,6 +586,7 @@ export async function readSessionHistory(
         inlineSidechainSkipped++;
         continue;
       }
+      runRoot = advanceRunRoot(runRoot, obj);
 
       const rawTs = typeof obj.timestamp === "string" ? Date.parse(obj.timestamp) : NaN;
       const recordTime = Number.isFinite(rawTs) ? rawTs : lastParentTimestamp;
@@ -684,6 +694,7 @@ export async function readSessionHistory(
               kind: "turn_started",
               turnId: currentTurnId,
               ...(turnInsertedText !== null ? { cliInserted: true as const } : {}),
+              ...(turnInsertedText !== null && isLaisoraInputText(turnInsertedText) ? { laisoraInput: true as const } : {}),
               provenance: { path: "history" },
             },
             timestamp: recordTime,
@@ -734,6 +745,10 @@ export async function readSessionHistory(
             if (resumeSignals?.asyncLaunchedAgentId) observedAsyncAgentIds.add(resumeSignals.asyncLaunchedAgentId);
             if (resumeSignals?.resumedAgentId) observedAsyncAgentIds.add(resumeSignals.resumedAgentId);
             if (resumeSignals?.backgroundTaskId) observedBackgroundTaskIds.add(resumeSignals.backgroundTaskId);
+            const editToolName = editToolNames.get(toolUseId);
+            const fileEdit = editToolName !== undefined && !isError
+              ? countFileEdit(editToolName, singleToolUseResult(content, obj.toolUseResult), runRoot.root ?? cwd)
+              : undefined;
 
             rawEvents.push({
               body: {
@@ -743,6 +758,7 @@ export async function readSessionHistory(
                 isError,
                 resultPreview: preview,
                 ...(resumeSignals ?? {}),
+                ...(fileEdit ? { fileEdit } : {}),
                 provenance: { path: "history" },
               },
               timestamp: recordTime,
@@ -858,9 +874,10 @@ export async function readSessionHistory(
             if (isResumeSignalToolName(toolUse.name)) {
               resumeSignalToolNames.set(toolUseId, toolUse.name);
             }
+            if (isFileWritingTool(toolUse.name)) editToolNames.set(toolUseId, toolUse.name);
 
             const rawInput = asRecord(toolUse.input) ?? undefined;
-            const currentCwd = (typeof obj.cwd === "string" && obj.cwd.length > 0 ? obj.cwd : cwd);
+            const currentCwd = recordCwd(obj, cwd);
             const stage0 = extractStage0ToolFields(toolUse.name, rawInput, toolUseId, currentCwd);
             const inputSummary = redactOptional(summarizeToolInput(toolUse.name, toolUse.input) ?? undefined);
             const inputPreview = redactAbsolutePaths(JSON.stringify(toolUse.input) ?? "").slice(0, 2000);
@@ -1192,7 +1209,7 @@ export async function readSessionHistory(
                 }
 
                 const rawInput = asRecord(toolUse.input) ?? undefined;
-                const currentCwd = (typeof obj.cwd === "string" && obj.cwd.length > 0 ? obj.cwd : cwd);
+                const currentCwd = recordCwd(obj, cwd);
                 const stage0 = extractStage0ToolFields(toolUse.name, rawInput, toolUseId, currentCwd);
                 const inputSummary = redactOptional(summarizeToolInput(toolUse.name, toolUse.input) ?? undefined);
                 const inputPreview = redactAbsolutePaths(JSON.stringify(toolUse.input) ?? "").slice(0, 2000);
@@ -1339,6 +1356,162 @@ export async function readSessionHistory(
   };
 }
 
+export interface ConversationMessageParser {
+  push(lines: readonly string[], options?: { lastLineMayBePartial?: boolean }): Promise<void>;
+  result(): {
+    messages: ConversationMessage[];
+    malformedLineCount: number;
+    droppedWithoutUuidCount: number;
+    boundaryPartialExcludedCount: number;
+    handoffEnvelope?: HandoffEnvelopeV2;
+    lastTimestamp: number;
+  };
+}
+
+export function createConversationMessageParser(sessionId?: string, keep?: (message: ConversationMessage) => boolean): ConversationMessageParser {
+  let messages: ConversationMessage[] = [];
+  let malformedLineCount = 0;
+  let droppedWithoutUuidCount = 0;
+  let boundaryPartialExcludedCount = 0;
+  let handoffEnvelope: HandoffEnvelopeV2 | undefined;
+  let cutFrom = 0;
+  const acceptRecord = createRecordUuidFilter();
+  const queuedSources = new Map<string, string | undefined>();
+  const seenQueuedPrompts = new Set<string>();
+  const approvalResults: ApprovalRestoreIndex = { results: new Map(), seen: new Set() };
+  let lastTimestamp = 0;
+  let askTurnFrom = 0;
+  const askRejections: AskRejection[] = [];
+  const compactBeforeTurn = (): void => {
+    if (keep === undefined) return;
+    messages = messages.slice(cutFrom).filter(keep);
+    cutFrom = 0;
+  };
+  return {
+    async push(lines, options = {}) {
+      for (const [source, uuid] of queuedPromptSources(lines)) if (!queuedSources.has(source)) queuedSources.set(source, uuid);
+      for (const [id, result] of indexApprovalResults(lines).results) approvalResults.results.set(id, result);
+      const maybeYield = createParseYielder();
+      for (let i = 0; i < lines.length; i++) {
+        const line = lines[i];
+        if (!line.trim()) continue;
+        const pendingYield = maybeYield();
+        if (pendingYield) await pendingYield;
+        let obj: Record<string, unknown>;
+        try {
+          const parsed: unknown = JSON.parse(line);
+          if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+            malformedLineCount++;
+            continue;
+          }
+          obj = parsed as Record<string, unknown>;
+        } catch {
+          if (options.lastLineMayBePartial && i === lines.length - 1) {
+            boundaryPartialExcludedCount++;
+            continue;
+          }
+          malformedLineCount++;
+          continue;
+        }
+        if (!acceptRecord(obj)) continue;
+        if (obj.isSidechain === true) continue;
+        if (isHandoffGenerationBoundary(obj, sessionId)) cutFrom = messages.length;
+        lastTimestamp = recordTimestamp(obj.timestamp, lastTimestamp);
+        const localOutput = localCommandOutput(obj);
+        if (localOutput !== undefined) {
+          const uuid = typeof obj.uuid === "string" ? obj.uuid : "";
+          if (!uuid) { droppedWithoutUuidCount++; continue; }
+          messages.push({ uuid, role: "system", text: localOutput, timestamp: lastTimestamp });
+          continue;
+        }
+        const approvalMessages = extractRestoredApprovalMessages(obj, approvalResults, lastTimestamp);
+        const prompt = extractHumanUserPrompt(obj, queuedSources, seenQueuedPrompts);
+        const uuid = prompt?.uuid ?? (typeof obj.uuid === "string" ? obj.uuid : "");
+        if (obj.type === "user" || obj.type === "attachment") {
+          if (prompt === null) {
+            const feedback = obj.type === "user" ? extractCliInsertedUserText(obj) : null;
+            const sentByLaisora = feedback === null ? undefined : parseLaisoraInput(feedback);
+            if (sentByLaisora !== undefined) {
+              const line = laisoraInputLine(sentByLaisora.input);
+              if (line !== undefined && uuid.length > 0) messages.push({ uuid, role: "system", text: line, timestamp: lastTimestamp });
+              continue;
+            }
+            if (feedback !== null && feedback.includes(ASK_QUALITY_DENIAL_HEAD)) {
+              const texts = messages.slice(askTurnFrom).filter((message) => message.role === "assistant").map((message) => message.text);
+              askRejections.push({ upTo: texts.length, titles: feedbackRejectedTitles(texts.join("\n\n"), feedback) });
+            }
+            {
+              const raw = verbatimTextOf(obj);
+              if (raw.startsWith("<laisora-handoff")) {
+                const parsed = parseHandoffEnvelope(raw);
+                if (parsed.ok && parsed.version === "2") {
+                  handoffEnvelope = parsed.envelope;
+                }
+              }
+            }
+            continue;
+          }
+          if (uuid.length === 0) {
+            droppedWithoutUuidCount++;
+            continue;
+          }
+          const earlier = obj.type === "attachment" ? messages.findIndex((message) => message.role === "user" && message.uuid === uuid) : -1;
+          if (earlier >= 0) {
+            messages.splice(earlier, 1);
+            if (earlier < cutFrom) cutFrom--;
+            if (earlier < askTurnFrom) askTurnFrom--;
+          }
+          const { text: body, imageRefs } = prompt;
+          resolveMessageAskRejections(messages, askTurnFrom, askRejections.splice(0));
+          compactBeforeTurn();
+          askTurnFrom = messages.length;
+          messages.push({
+            uuid,
+            role: "user",
+            text: body,
+            timestamp: lastTimestamp,
+            ...(imageRefs ? { imageRefs } : {}),
+          });
+        } else if (obj.type === "assistant") {
+          const message = asRecord(obj.message);
+          const body = extractAssistantRecordText(message?.content, obj.narration_block_indexes);
+          if (!body || isRefusalErrorProse(obj, message)) {
+            messages.push(...approvalMessages);
+            continue;
+          }
+          if (uuid.length === 0) {
+            droppedWithoutUuidCount++;
+            messages.push(...approvalMessages);
+            continue;
+          }
+          const rawModel = message?.model;
+          const model = typeof rawModel === "string" && rawModel.length > 0 && !rawModel.startsWith("<") ? rawModel : undefined;
+          messages.push({
+            uuid,
+            role: "assistant",
+            text: body,
+            timestamp: lastTimestamp,
+            ...(model ? { model } : {}),
+          });
+        }
+        messages.push(...approvalMessages);
+      }
+    },
+    result() {
+      const settled = messages.slice();
+      resolveMessageAskRejections(settled, askTurnFrom, askRejections);
+      return {
+        messages: settled.slice(cutFrom),
+        malformedLineCount,
+        droppedWithoutUuidCount,
+        boundaryPartialExcludedCount,
+        ...(handoffEnvelope ? { handoffEnvelope } : {}),
+        lastTimestamp,
+      };
+    },
+  };
+}
+
 export async function readConversationMessages(
   filePath: string,
   isAllowedPath: (filePath: string) => boolean,
@@ -1352,23 +1525,11 @@ export async function readConversationMessages(
   readError?: string;
   handoffEnvelope?: HandoffEnvelopeV2;
 }> {
-  const messages: ConversationMessage[] = [];
-  let malformedLineCount = 0;
-  let droppedWithoutUuidCount = 0;
-  let boundaryPartialExcludedCount = 0;
-  let handoffEnvelope: HandoffEnvelopeV2 | undefined;
-  let cutFrom = 0;
-
-  if (!isAllowedPath(filePath)) {
-    return {
-      messages,
-      malformedLineCount,
-      droppedWithoutUuidCount,
-      ...(resumeReadSet ? { boundaryPartialExcludedCount } : {}),
-      readError: "outside-session-store",
-    };
-  }
-
+  const failed = (readError: string) => ({
+    messages: [], malformedLineCount: 0, droppedWithoutUuidCount: 0,
+    ...(resumeReadSet ? { boundaryPartialExcludedCount: 0 } : {}), readError,
+  });
+  if (!isAllowedPath(filePath)) return failed("outside-session-store");
   let text: string;
   try {
     if (resumeReadSet) {
@@ -1378,124 +1539,12 @@ export async function readConversationMessages(
       text = await readFile(filePath, "utf8");
     }
   } catch (error) {
-    return {
-      messages,
-      malformedLineCount,
-      droppedWithoutUuidCount,
-      ...(resumeReadSet ? { boundaryPartialExcludedCount } : {}),
-      readError: error instanceof Error ? error.message : String(error),
-    };
+    return failed(error instanceof Error ? error.message : String(error));
   }
-
-  const lines = text.split("\n");
-  const acceptRecord = createRecordUuidFilter();
-  const queuedSources = queuedPromptSources(lines);
-  const seenQueuedPrompts = new Set<string>();
-  const approvalResults = indexApprovalResults(lines);
-  let lastTimestamp = 0;
-  let askTurnFrom = 0;
-  const askRejections: AskRejection[] = [];
-  const endsAtBoundary = text.endsWith("\n");
-  const maybeYield = createParseYielder();
-  for (let i = 0; i < lines.length; i++) {
-    const line = lines[i];
-    if (!line.trim()) continue;
-    const pendingYield = maybeYield();
-    if (pendingYield) await pendingYield;
-    let obj: Record<string, unknown>;
-    try {
-      const parsed: unknown = JSON.parse(line);
-      if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
-        malformedLineCount++;
-        continue;
-      }
-      obj = parsed as Record<string, unknown>;
-    } catch {
-      if (resumeReadSet && !endsAtBoundary && i === lines.length - 1) {
-        boundaryPartialExcludedCount++;
-        continue;
-      }
-      malformedLineCount++;
-      continue;
-    }
-    if (!acceptRecord(obj)) continue;
-    if (obj.isSidechain === true) continue;
-    if (isHandoffGenerationBoundary(obj, sessionId)) cutFrom = messages.length;
-    lastTimestamp = recordTimestamp(obj.timestamp, lastTimestamp);
-    const localOutput = localCommandOutput(obj);
-    if (localOutput !== undefined) {
-      const uuid = typeof obj.uuid === "string" ? obj.uuid : "";
-      if (!uuid) { droppedWithoutUuidCount++; continue; }
-      messages.push({ uuid, role: "system", text: localOutput, timestamp: lastTimestamp });
-      continue;
-    }
-    const approvalMessages = extractRestoredApprovalMessages(obj, approvalResults, lastTimestamp);
-    const prompt = extractHumanUserPrompt(obj, queuedSources, seenQueuedPrompts);
-    const uuid = prompt?.uuid ?? (typeof obj.uuid === "string" ? obj.uuid : "");
-    if (obj.type === "user" || obj.type === "attachment") {
-      if (prompt === null) {
-        const feedback = obj.type === "user" ? extractCliInsertedUserText(obj) : null;
-        if (feedback !== null && feedback.includes(ASK_QUALITY_DENIAL_HEAD)) {
-          const texts = messages.slice(askTurnFrom).filter((message) => message.role === "assistant").map((message) => message.text);
-          askRejections.push({ upTo: texts.length, titles: feedbackRejectedTitles(texts.join("\n\n"), feedback) });
-        }
-        {
-          const raw = verbatimTextOf(obj);
-          if (raw.startsWith("<laisora-handoff")) {
-            const parsed = parseHandoffEnvelope(raw);
-            if (parsed.ok && parsed.version === "2") {
-              handoffEnvelope = parsed.envelope;
-            }
-          }
-        }
-        continue;
-      }
-      if (uuid.length === 0) {
-        droppedWithoutUuidCount++;
-        continue;
-      }
-      const { text: body, imageRefs } = prompt;
-      resolveMessageAskRejections(messages, askTurnFrom, askRejections.splice(0));
-      askTurnFrom = messages.length;
-      messages.push({
-        uuid,
-        role: "user",
-        text: body,
-        timestamp: lastTimestamp,
-        ...(imageRefs ? { imageRefs } : {}),
-      });
-    } else if (obj.type === "assistant") {
-      const message = asRecord(obj.message);
-      const body = extractAssistantRecordText(message?.content, obj.narration_block_indexes);
-      if (!body || isRefusalErrorProse(obj, message)) {
-        messages.push(...approvalMessages);
-        continue;
-      }
-      if (uuid.length === 0) {
-        droppedWithoutUuidCount++;
-        messages.push(...approvalMessages);
-        continue;
-      }
-      const rawModel = message?.model;
-      const model = typeof rawModel === "string" && rawModel.length > 0 && !rawModel.startsWith("<") ? rawModel : undefined;
-      messages.push({
-        uuid,
-        role: "assistant",
-        text: body,
-        timestamp: lastTimestamp,
-        ...(model ? { model } : {}),
-      });
-    }
-    messages.push(...approvalMessages);
-  }
-  resolveMessageAskRejections(messages, askTurnFrom, askRejections);
-  return {
-    messages: messages.slice(cutFrom),
-    malformedLineCount,
-    droppedWithoutUuidCount,
-    ...(resumeReadSet ? { boundaryPartialExcludedCount } : {}),
-    ...(handoffEnvelope ? { handoffEnvelope } : {}),
-  };
+  const parser = createConversationMessageParser(sessionId);
+  await parser.push(text.split("\n"), { lastLineMayBePartial: resumeReadSet !== undefined && !text.endsWith("\n") });
+  const { boundaryPartialExcludedCount, lastTimestamp: _last, ...read } = parser.result();
+  return { ...read, ...(resumeReadSet ? { boundaryPartialExcludedCount } : {}) };
 }
 
 export async function readSessionTranscript(
@@ -2062,7 +2111,12 @@ function extractUserRecordText(obj: Record<string, unknown>): string | null {
 
 export function extractHumanUserText(obj: Record<string, unknown>): string | null {
   const record = extractQueuedPromptRecord(obj) ?? obj;
-  return record.isMeta === true ? null : extractUserRecordText(record);
+  return record.isMeta === true || isLaisoraInputRecord(record) ? null : extractUserRecordText(record);
+}
+
+function isLaisoraInputRecord(record: Record<string, unknown>): boolean {
+  const text = extractUserRecordText(record);
+  return text !== null && isLaisoraInputText(text);
 }
 
 export function extractQueuedPromptRecord(obj: Record<string, unknown>): Record<string, unknown> | null {
@@ -2110,7 +2164,7 @@ function queuedPromptSources(lines: readonly string[]): Map<string, string | und
 }
 
 export function extractCliInsertedUserText(obj: Record<string, unknown>): string | null {
-  return obj.isMeta === true ? extractUserRecordText(obj) : null;
+  return obj.isMeta === true || isLaisoraInputRecord(obj) ? extractUserRecordText(obj) : null;
 }
 
 export interface VerbatimUtterance {

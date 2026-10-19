@@ -2,7 +2,7 @@
   "name": "laisora",
   "displayName": "LAISORA",
   "description": "%extension.description%",
-  "version": "1.7.0",
+  "version": "1.8.0",
   "publisher": "az-llc",
   "categories": [
     "AI",
@@ -52,6 +52,12 @@
         "mac": "cmd+shift+v",
         "command": "laisora.pasteText",
         "when": "laisora.composerFocused"
+      },
+      {
+        "key": "ctrl+alt+t",
+        "mac": "ctrl+alt+t",
+        "command": "laisora.todoToggleDrawer",
+        "when": "laisora.todoDrawerKey"
       }
     ],
     "viewsContainers": {
@@ -169,6 +175,18 @@
           "default": false,
           "scope": "application",
           "description": "%config.laisora.claude.askQualityCheck.description%"
+        },
+        "laisora.todo.enabled": {
+          "type": "boolean",
+          "default": false,
+          "scope": "application",
+          "description": "%config.laisora.todo.enabled.description%"
+        },
+        "laisora.editSummary.enabled": {
+          "type": "boolean",
+          "default": true,
+          "scope": "application",
+          "description": "%config.laisora.editSummary.enabled.description%"
         },
         "laisora.claude.fileLinkInstruction": {
           "type": "boolean",
@@ -483,7 +501,7 @@
     "typecheck": "tsc --noEmit"
   },
   "devDependencies": {
-    "@anthropic-ai/claude-agent-sdk": "^0.3.299",
+    "@anthropic-ai/claude-agent-sdk": "^0.3.303",
     "@types/node": "^24.0.0",
     "@types/vscode": "^1.90.0",
     "@vscode/l10n": "0.0.18",

@@ -7,6 +7,7 @@ import { claudeProjectsDir } from "./claude-env";
 import type { Session } from "./extension";
 import { output } from "./host-context";
 import { SESSION_ID_RE, type ImageAttachment, type SessionImageRef } from "./protocol";
+import { formatCustomTitleRecord } from "./session-display-title";
 import { extractHumanUserPrompt } from "./session-transcript";
 
 export function isInSessionStore(filePath: string): boolean {
@@ -84,6 +85,22 @@ export async function appendSessionRecordOnFreshLine(
   } finally {
     await fh.close();
   }
+}
+
+export interface ChosenTitleCli {
+  readonly isClosed: boolean;
+  renameSession(title: string, sessionId?: string): Promise<boolean>;
+}
+
+export async function persistChosenTitle(
+  cli: ChosenTitleCli | null,
+  ref: { sessionId: string; file: string } | null,
+  title: string
+): Promise<"cli" | "file" | "pending"> {
+  if (cli !== null && !cli.isClosed) return (await cli.renameSession(title, ref?.sessionId)) ? "cli" : "pending";
+  if (ref === null) return "pending";
+  await appendSessionRecordOnFreshLine(ref.file, ref.sessionId, formatCustomTitleRecord(ref.sessionId, title));
+  return "file";
 }
 
 export async function resolveSessionImage(

@@ -1,6 +1,8 @@
 import * as l10n from "@vscode/l10n";
 import { RENAME_TITLE_MAX, type HostToWebview, type WebviewToHost } from "../protocol";
+import { isComposingKey } from "./composing";
 import { createLoader } from "./loader";
+import { ACTIONS_MENU_GLYPH } from "./todo-edit";
 
 export interface SessionMenuExtra { label: string; icon: string; run: () => void }
 let sessionMenuExtras: (() => SessionMenuExtra[]) | null = null;
@@ -21,7 +23,7 @@ export function bindTitleEditor(input: HTMLInputElement, commit: (title: string)
   input.addEventListener("compositionstart", () => { composing = true; });
   input.addEventListener("compositionend", () => { composing = false; });
   input.onkeydown = event => {
-    if (event.isComposing || composing || event.keyCode === 229) return;
+    if (isComposingKey(event) || composing) return;
     if (event.key === "Enter") {
       event.preventDefault(); event.stopPropagation();
       const value = input.value.trim();
@@ -43,7 +45,7 @@ export function createSessionHeader(tabId: string, title: string, send: (message
   const menu = document.createElement("details");
   menu.className = "session-actions";
   const toggle = document.createElement("summary");
-  toggle.textContent = "☰";
+  toggle.textContent = ACTIONS_MENU_GLYPH;
   toggle.title = l10n.t("Session actions");
   toggle.setAttribute("aria-label", toggle.title);
   toggle.setAttribute("aria-haspopup", "menu");

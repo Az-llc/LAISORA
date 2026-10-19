@@ -15,6 +15,7 @@ import { assistantUsageFromRaw, summarizeToolInput } from "./protocol";
 import type { HostArtifactAccess } from "./artifact-access";
 import { extractResumeSignals, extractStage0ToolFields, isResumeSignalToolName } from "./tool-observation";
 import { redactAbsolutePaths, redactOptional } from "./path-redaction";
+import { countFileEdit, singleToolUseResult } from "./edit-summary";
 import { AUTO_MODE_UNEVALUATED } from "./tool-result-signals";
 import type { LearningToolResult } from "./learning-ingestion";
 
@@ -293,6 +294,7 @@ export class ClaudeLiveNormalizer {
   initSlashCommands: string[] | null = null;
 
   private sawMessageStartForTurn = false;
+  private sessionCwd: string | undefined;
   private lastCompletedTurnId: string | null = null;
   private lastCompletedAssistantTextEvidence: AssistantTextEvidenceState | null = null;
   private lastAssistantError: string | null = null;
@@ -358,7 +360,7 @@ export class ClaudeLiveNormalizer {
       meta?.timestamp === undefined && this.lastObservedTimestamp !== undefined
         ? { ...meta, timestamp: this.lastObservedTimestamp }
         : meta;
-    this.emit({ kind: "turn_started", turnId: id, ...(automatic ? { cliInserted: true as const } : {}) }, startMeta);
+    this.emit({ kind: "turn_started", turnId: id, ...(automatic ? { cliInserted: true as const, laisoraInput: true as const } : {}) }, startMeta);
     return id;
   }
 
@@ -430,6 +432,7 @@ export class ClaudeLiveNormalizer {
     switch (record.type) {
       case "system":
         if (record.subtype === "init") {
+          if (typeof record.cwd === "string" && record.cwd.length > 0) this.sessionCwd = record.cwd;
           if (Array.isArray(record.slash_commands)) {
             this.initSlashCommands = record.slash_commands as string[];
           }
@@ -965,6 +968,9 @@ export class ClaudeLiveNormalizer {
                   ...(ts !== undefined ? { at: new Date(ts).toISOString() } : {}) });
               }
               this.learningTools.delete(toolUseId);
+              const fileEdit = resultParentToolUseId === null && block.is_error !== true && tool
+                ? countFileEdit(tool.tool, singleToolUseResult(content, record.tool_use_result), this.sessionCwd ?? this.opts.cwd)
+                : undefined;
               const resumeSignals = extractedResumeSignals
                 ?? (this.mcpTaskByToolUseId.has(toolUseId) ? { backgroundTaskId: this.mcpTaskByToolUseId.get(toolUseId)! } : undefined);
               if (resumeSignals?.asyncLaunchedAgentId) {
@@ -984,6 +990,7 @@ export class ClaudeLiveNormalizer {
                   isError: block.is_error === true,
                   resultPreview: toolResultPreview(block.content),
                   ...(resumeSignals ?? {}),
+                  ...(fileEdit ? { fileEdit } : {}),
                 },
                 defaultMeta
               );

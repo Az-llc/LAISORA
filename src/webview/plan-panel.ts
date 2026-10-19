@@ -5,6 +5,9 @@ import { deriveEarlierPlanViews, derivePlanView, planLaneRunning, planStepFolds,
 import { createLoader } from "./loader";
 import { planItemLabel } from "../plan-steps";
 import { goalLabel } from "./ask-view";
+import { todoAgentLabel, todoAgentText } from "./todo-links";
+
+type PlanLaneLabel = (lane: PlanLane) => HTMLElement | null;
 
 function node<K extends keyof HTMLElementTagNameMap>(tag: K, className: string, text?: string): HTMLElementTagNameMap[K] {
   const element = document.createElement(tag);
@@ -60,8 +63,10 @@ export class PlanPanel {
   private readonly resize: ResizeObserver;
   private readonly theme: MutationObserver;
   private returnFocus: HTMLElement | null = null;
+  private readonly laneLabel: PlanLaneLabel;
 
-  constructor(content: HTMLElement, head: HTMLElement, tabId: string) {
+  constructor(content: HTMLElement, head: HTMLElement, private readonly tabId: string) {
+    this.laneLabel = lane => todoAgentLabel(this.tabId, lane.description ?? lane.title, planLaneRunning(lane));
     this.aside.id = `plan-side-${tabId}`;
     this.aside.setAttribute("aria-label", "PLAN");
     this.aside.append(this.you, this.section);
@@ -110,6 +115,7 @@ export class PlanPanel {
   setModel(model: WorkModelPayload | undefined): void { this.model = model; this.render(); }
   setOrchestration(view: OrchestrationView): void { this.orchestration = view; this.render(); }
   tick(nowMs: number): void { this.nowMs = nowMs; this.render(); }
+  refreshTodo(): void { this.signature = ""; this.render(); }
 
   private render(): void {
     const view = derivePlanView(this.model, this.orchestration, this.nowMs);
@@ -127,7 +133,7 @@ export class PlanPanel {
     this.barRunning.textContent = running ? l10n.t("Working {0}", running) : "";
     this.barLoader.hidden = !planRunning || !(running || current?.status === "in_progress") || !view.steps.length;
     this.barStats.textContent = view.steps.length ? `${planDuration(view.elapsed)} · ${view.claude ? "≈" : ""}${planTokens(view.claude?.tokens ?? null)}` : "";
-    renderPlanSection(this.section, view, this.nowStatus || l10n.t("Waiting for input"), earlier);
+    renderPlanSection(this.section, view, this.nowStatus || l10n.t("Waiting for input"), earlier, this.laneLabel);
   }
 
 }
@@ -138,23 +144,26 @@ function currentStep(view: PlanView): PlanStep | undefined {
 function itemCount(view: PlanView): number { return view.steps.filter(step => step.number !== null).length; }
 function itemNumber(step: PlanStep): string { return step.number === null ? "" : planItemLabel(step.number); }
 
-function renderLane(lane: PlanLane): HTMLElement {
+function renderLane(lane: PlanLane, laneLabel?: PlanLaneLabel): HTMLElement {
   const row = node("div", "plan-lane");
   row.dataset.laneId = lane.id;
   const name = node("span", "plan-agent", lane.agent);
   const metric = node("span", "plan-metric", `${status(lane.status)} ${planDuration(lane.elapsed)} · ${planTokens(lane.tokens)}`);
   metric.title = l10n.t("Cache read: {0} tokens", planTokens(lane.cacheRead));
   row.classList.toggle("plan-failed", lane.status === "failed");
-  const text = lane.resumedAt === undefined ? lane.title : l10n.t("Resumed {0}: {1}", planClock(lane.resumedAt), lane.title);
+  const text = lane.resumedAt === undefined ? todoAgentText(lane.title) : l10n.t("Resumed {0}: {1}", planClock(lane.resumedAt), todoAgentText(lane.title));
   const title = node("span", "plan-lane-title", truncateToolIntent(text));
   title.title = text;
-  row.append(name, title, metric);
+  row.append(name, title);
+  const todo = laneLabel?.(lane);
+  if (todo) row.append(todo);
+  row.append(metric);
   return row;
 }
 
 const laneOpenState = new WeakMap<HTMLElement, Set<string>>();
 
-export function renderPlanSection(section: HTMLElement, view: PlanView, nowStatus?: string, earlier: readonly PlanView[] = []): void {
+export function renderPlanSection(section: HTMLElement, view: PlanView, nowStatus?: string, earlier: readonly PlanView[] = [], laneLabel?: PlanLaneLabel): void {
   section.lang = document.documentElement.lang;
   const noPlan = !view.goal && !view.steps.length;
   const earlierDone = earlier.map(plan => ({ block: plan.block, goal: plan.goal,
@@ -184,7 +193,7 @@ export function renderPlanSection(section: HTMLElement, view: PlanView, nowStatu
     toggle.dataset.foldKey = "done";
     toggle.onclick = () => {
       section.dataset.doneOpen = String(collapsed);
-      renderPlanSection(section, view, nowStatus, earlier);
+      renderPlanSection(section, view, nowStatus, earlier, laneLabel);
     };
     children.push(toggle);
   }
@@ -194,14 +203,14 @@ export function renderPlanSection(section: HTMLElement, view: PlanView, nowStatu
   let openLanes = laneOpenState.get(section);
   if (!openLanes) laneOpenState.set(section, openLanes = new Set());
   const lanesOpen = openLanes;
-  for (const plan of earlierShown) children.push(planGroup(plan.goal, plan.steps.map(step => renderPlanItem(step, undefined, lanesOpen, plan.block))));
-  const items = view.steps.filter(step => !collapsed || !done.includes(step)).map(step => renderPlanItem(step, current, lanesOpen, view.block));
+  for (const plan of earlierShown) children.push(planGroup(plan.goal, plan.steps.map(step => renderPlanItem(step, undefined, lanesOpen, plan.block, laneLabel))));
+  const items = view.steps.filter(step => !collapsed || !done.includes(step)).map(step => renderPlanItem(step, current, lanesOpen, view.block, laneLabel));
   if (grouped && items.length) children.push(planGroup(view.goal, items));
   else children.push(...items);
   if (view.now.length || nowStatus !== undefined) {
     const now = node("div", "plan-now");
     now.append(node("div", "plan-label", "NOW"));
-    for (const lane of view.now) now.append(renderLane(lane));
+    for (const lane of view.now) now.append(renderLane(lane, laneLabel));
     if (!view.now.length && nowStatus !== undefined) now.append(node("div", "plan-now-state", nowStatus));
     children.push(now);
   }
@@ -223,9 +232,9 @@ function planGroup(goal: string, items: HTMLElement[]): HTMLElement {
   return group;
 }
 
-function laneFold(lanes: readonly PlanLane[], openLanes: Set<string>, key: string): HTMLElement[] {
+function laneFold(lanes: readonly PlanLane[], openLanes: Set<string>, key: string, laneLabel?: PlanLaneLabel): HTMLElement[] {
   const list = node("div", "plan-lanes");
-  list.append(...lanes.map(renderLane));
+  list.append(...lanes.map(lane => renderLane(lane, laneLabel)));
   const toggle = node("button", "plan-lane-toggle");
   toggle.type = "button";
   toggle.dataset.foldKey = key;
@@ -246,7 +255,7 @@ function laneFold(lanes: readonly PlanLane[], openLanes: Set<string>, key: strin
   return [toggle, list];
 }
 
-export function renderPlanItem(step: PlanStep, current: PlanStep | undefined, openLanes = new Set<string>(), block = ""): HTMLElement {
+export function renderPlanItem(step: PlanStep, current: PlanStep | undefined, openLanes = new Set<string>(), block = "", laneLabel?: PlanLaneLabel): HTMLElement {
   const item = node("div", "plan-item");
   item.classList.toggle("plan-current", step === current);
   item.classList.toggle("plan-ahead", step.ahead || step.added && step.status === "in_progress");
@@ -264,7 +273,7 @@ export function renderPlanItem(step: PlanStep, current: PlanStep | undefined, op
     metric.title = l10n.t("Approximate time attribution. Cache read: {0} tokens", planTokens(step.tokens?.cacheRead ?? null));
     body.append(metric);
   }
-  if (step.lanes.length) body.append(...laneFold(step.lanes, openLanes, `lanes\u0000${block}\u0000${step.key}`));
+  if (step.lanes.length) body.append(...laneFold(step.lanes, openLanes, `lanes\u0000${block}\u0000${step.key}`, laneLabel));
   item.append(node("span", "plan-number", itemNumber(step)), body);
   return item;
 }

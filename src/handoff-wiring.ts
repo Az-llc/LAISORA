@@ -8,7 +8,7 @@ import { join } from "node:path";
 import { configuredClaudeExecutablePath, inheritedProfile, resolveSessionCwd } from "./claude-settings";
 import { claudeConfigDir } from "./claude-env";
 import { resolveHandoffRuntime } from "./claudeHost";
-import { openResumedSession } from "./resume-hydration";
+import { openResumedSession, openSessionById } from "./resume-hydration";
 import type { Session } from "./session";
 import {
   handoffDecisionCounts,
@@ -35,6 +35,7 @@ import { lookupSessionFile } from "./session-files";
 import { displayTitleFromSummary } from "./session-list";
 import { sessionSummaryOf } from "./session-list-wiring";
 import type { SessionStore } from "./store-surfaces";
+import { relinkTodoConversation, todoHandoffMemo } from "./todo-surface";
 
 export const handoffDetailSources = new Map<string, { runId: string; detail: HandoffDetail }>();
 
@@ -181,11 +182,13 @@ async function runHandoff(st: SessionStore, sender: vscode.Webview, target: Sess
       !target.closed && target.conversation === sourceConversation && target.logicalGeneration === sourceGeneration;
     const before = sourceUnchanged() ? await sourceConversation?.captureHandoffContextUsage() ?? null : null;
     contextUsage.before = sourceUnchanged() ? before : null;
+    const workMemo = await todoHandoffMemo(source.sessionId);
     const outcome: HandoffOutcome = await runner.run({
       sourceSessionId: source.sessionId,
       sourceTitle,
       runId,
       sourceBusy: busy,
+      ...(workMemo !== undefined ? { workMemo } : {}),
     });
     if (!outcome.ok) {
       const forkSessionId = outcome.forkSessionId;
@@ -201,6 +204,7 @@ async function runHandoff(st: SessionStore, sender: vscode.Webview, target: Sess
       void handoffPersist().update(handoffUnreadableLinesKey(outcome.forkSessionId), outcome.unreadableLineCount).catch((error) =>
         output.appendLine("[handoff] unreadable line count could not be saved: " + String(error)));
     }
+    await relinkTodoConversation(source.sessionId, outcome.forkSessionId);
     const opened = await openResumedSession(st, {
       sessionId: outcome.forkSessionId,
       filePath: outcome.forkFilePath,
@@ -372,37 +376,19 @@ async function openHandoffSourceSession(
   origin: Session,
   sourceSessionId: string
 ): Promise<void> {
-  const existing = [...st.sessions.values()].find(
-    (s) => !s.closed && (s.resumeSessionId === sourceSessionId || s.auth?.sessionId === sourceSessionId)
-  );
-  if (existing) {
-    await st.postTo(sender, { type: "activateTab", tabId: existing.tabId });
-    return;
-  }
-  const lookup = lookupSessionFile(sourceSessionId);
-  if (lookup.reason === "not_found") {
+  const opened = await openSessionById(st, sender, sourceSessionId);
+  if (opened === "not_found") {
     output.appendLine(`[handoff] source not found: ${sourceSessionId}`);
     origin.pushEvent({
       kind: "error",
       message: l10n.t("LAISORA: The previous conversation was not found ({0}).", sourceSessionId),
       fatal: false,
     });
-    return;
-  }
-  if (lookup.reason === "scan_failed") {
-    output.appendLine(`[handoff] source lookup failed: ${sourceSessionId}: ${lookup.detail}`);
+  } else if (opened === "scan_failed") {
     origin.pushEvent({
       kind: "error",
       message: l10n.t("LAISORA: Could not check the previous conversation's record. Please try again."),
       fatal: false,
-    });
-    return;
-  }
-  if (lookup.path) {
-    await openResumedSession(st, {
-      sessionId: sourceSessionId,
-      filePath: lookup.path,
-      activate: true,
     });
   }
 }

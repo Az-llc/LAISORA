@@ -1,3 +1,4 @@
+import { isComposingKey } from "./composing";
 import { createAccentSettings } from "./accent-settings";
 import { bindUserLabel, setDisplayName } from "./user-label";
 import { DISPLAY_NAME_MAX, displayNameLength, normalizeDisplayName } from "../display-name";
@@ -335,7 +336,7 @@ function capDisplayNameInput(): void {
 }
 displayNameInput.addEventListener("input", (event) => {
   displayNameEdited = true;
-  if (!(event as InputEvent).isComposing) capDisplayNameInput();
+  if (!isComposingKey(event as InputEvent)) capDisplayNameInput();
   renderDisplayNameInput();
 });
 displayNameInput.addEventListener("compositionend", () => {
@@ -359,7 +360,7 @@ displayNameInput.addEventListener("change", () => {
   writeDisplayName(displayNameInput.value);
 });
 displayNameInput.addEventListener("keydown", (event) => {
-  if (event.key === "Enter" && !event.isComposing) displayNameInput.dispatchEvent(new Event("change"));
+  if (event.key === "Enter" && !isComposingKey(event)) displayNameInput.dispatchEvent(new Event("change"));
 });
 displayNameReset.addEventListener("click", () => {
   displayNameInput.value = "";
@@ -389,6 +390,9 @@ const chatCard = section(generalCategory, l10n.t("Chat"));
 const learningCard = section(generalCategory, l10n.t("Learning"));
 const learningSwitch = switchButton("setting-learning-enabled");
 const learningText = row(learningCard, l10n.t("Enable learning"), l10n.t("Turning learning off stops delivery in running conversations. Turning it on applies from the next conversation. Recording remains available."), learningSwitch);
+const todoCard = section(generalCategory, "ToDo");
+const todoSwitch = switchButton("setting-todo-enabled");
+const todoText = row(todoCard, l10n.t("(Beta) Enable ToDo"), l10n.t("The ToDo tab, drawer and cats switch right away. Claude's ToDo tools are available from the next conversation you start or resume."), todoSwitch);
 
 const sendKeySelect = select<ComposerSendKey>([
   ["enter", "Enter"],
@@ -471,6 +475,8 @@ eventLimitInput.addEventListener("change", () => {
 
 const autoContinueSwitch = switchButton("setting-auto-continue-usage-limit");
 row(chatCard, l10n.t("Resume automatically when the usage limit resets"), l10n.t("When the claude.ai usage limit stops a conversation, continue it automatically after the limit resets. The same setting is used by Claude Code in the terminal."), autoContinueSwitch);
+const editSummarySwitch = switchButton("setting-edit-summary-enabled");
+const editSummaryText = row(chatCard, l10n.t("Show edited files after each reply"), l10n.t("At the end of each reply, list the files Claude edited in that turn with the lines added and removed. Click a file to compare it before and after the turn."), editSummarySwitch);
 
 const apiKeyGroup = element("div", "settings-segmented");
 apiKeyGroup.id = "setting-api-key-policy";
@@ -1246,7 +1252,7 @@ generalCategory.appendChild(footer);
 let current: SettingsState | null = null;
 let requestSerial = 0;
 const nextRequestId = (): number => ++requestSerial;
-const pending: { autoContinue: number | null; restore: number | null; apiKey: number | null; learning: number | null } = { autoContinue: null, restore: null, apiKey: null, learning: null };
+const pending: { autoContinue: number | null; restore: number | null; apiKey: number | null; learning: number | null; todo: number | null; editSummary: number | null } = { autoContinue: null, restore: null, apiKey: null, learning: null, todo: null, editSummary: null };
 const pendingAutoUpdate = new Map<ExecutorId, number>();
 const pendingFileLink: Record<FileLinkBooleanSetting, number | null> = {
   fileLinkInstruction: null,
@@ -1276,6 +1282,8 @@ function writeAnchor(message: SettingsPageToHost): HTMLElement | undefined {
     case "setCliAutoUpdate": return detectionControls.find(({ executor }) => executor === message.executor)?.text;
     case "setEventLimit": return eventLimitText;
     case "setLearningEnabled": return learningText;
+    case "setTodoEnabled": return todoText;
+    case "setEditSummaryEnabled": return editSummaryText;
     case "setApiKeyPolicy": return apiKeyText;
     case "setFileLinkSetting": return message.setting === "openWithSystemApp" ? extensionText : rowTextOf(fileLinkSwitches[message.setting]);
     case "setOrchestrationSetting":
@@ -1334,6 +1342,12 @@ function render(state: SettingsState): void {
   if (pending.learning === state.replyTo) pending.learning = null;
   learningSwitch.setAttribute("aria-checked", String(state.learningEnabled));
   learningSwitch.disabled = pending.learning !== null;
+  if (pending.todo === state.replyTo) pending.todo = null;
+  todoSwitch.setAttribute("aria-checked", String(state.todoEnabled));
+  todoSwitch.disabled = pending.todo !== null;
+  if (pending.editSummary === state.replyTo) pending.editSummary = null;
+  editSummarySwitch.setAttribute("aria-checked", String(state.editSummaryEnabled));
+  editSummarySwitch.disabled = pending.editSummary !== null;
   if (pending.restore === state.replyTo) pending.restore = null;
   if (pending.apiKey === state.replyTo) pending.apiKey = null;
   for (const key of FILE_LINK_BOOLEAN_SETTINGS) {
@@ -1417,6 +1431,20 @@ learningSwitch.addEventListener("click", () => {
   pending.learning = requestId;
   learningSwitch.disabled = true;
   post({ type: "setLearningEnabled", requestId, enabled: !current.learningEnabled });
+});
+todoSwitch.addEventListener("click", () => {
+  if (current === null || pending.todo !== null) return;
+  const requestId = nextRequestId();
+  pending.todo = requestId;
+  todoSwitch.disabled = true;
+  post({ type: "setTodoEnabled", requestId, enabled: !current.todoEnabled });
+});
+editSummarySwitch.addEventListener("click", () => {
+  if (current === null || pending.editSummary !== null) return;
+  const requestId = nextRequestId();
+  pending.editSummary = requestId;
+  editSummarySwitch.disabled = true;
+  post({ type: "setEditSummaryEnabled", requestId, enabled: !current.editSummaryEnabled });
 });
 for (const key of FILE_LINK_BOOLEAN_SETTINGS) {
   const control = fileLinkSwitches[key];

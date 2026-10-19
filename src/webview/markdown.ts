@@ -136,6 +136,12 @@ function appendLinkCopyButton(target: HTMLElement, idleTitle: string, write: () 
   target.appendChild(status);
 }
 
+let todoSplitRenderer: ((item: string, reason: string, tabId: string | undefined) => HTMLElement) | null = null;
+
+export function setTodoSplitRenderer(render: ((item: string, reason: string, tabId: string | undefined) => HTMLElement) | null): void {
+  todoSplitRenderer = render;
+}
+
 export function renderMarkdownInto(container: HTMLElement, src: string, tabId?: string, askContext?: AskRenderContext, options?: { collapseCode?: boolean }): void {
   const collapseCode = options?.collapseCode ?? true;
   const codeReply = tabId !== undefined && askContext !== undefined && askContext.replyId !== "" ? { tabId, replyId: askContext.replyId, offset: askContext.offset ?? 0 } : undefined;
@@ -157,6 +163,12 @@ export function renderMarkdownInto(container: HTMLElement, src: string, tabId?: 
       case "ask": {
         target.appendChild(renderAsk(node.ask, node.offset, askContext, node.rejected === true));
         fencedIndex++;
+        break;
+      }
+      case "todoSplit": {
+        const card = todoSplitRenderer?.(node.item, node.reason, tabId) ?? null;
+        if (card) target.appendChild(card);
+        else renderNode({ type: "code_block", fenced: true, closed: true, lang: "json", value: JSON.stringify({ item: node.item, reason: node.reason }), offset: node.offset }, target);
         break;
       }
       case "heading": {

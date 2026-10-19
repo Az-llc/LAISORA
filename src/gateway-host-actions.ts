@@ -35,6 +35,13 @@ import { isDisplayName } from "./display-name";
 import { extensionContext, output, store } from "./host-context";
 import { ADDITIONAL_MODELS_KEY, CLAUDE_VERSION_ID, additionalClaudeModelIds, recomputeModelRows, modelsMessage } from "./gateway-models";
 import { restoreTabsOnStartupEnabled } from "./session-list-wiring";
+import { TODO_BETA_SETTING } from "./todo-store";
+import { todoBetaEnabled } from "./todo-surface";
+import { EDIT_SUMMARY_SETTING } from "./edit-summary";
+
+export function editSummarySettingEnabled(): boolean {
+  return getLaisoraConfiguration().get<boolean>(EDIT_SUMMARY_SETTING) === true;
+}
 
 export function accentSettings(): AccentSettings {
   const cfg = getLaisoraConfiguration();
@@ -63,6 +70,7 @@ export function userSettingsMessage(): Extract<HostToWebview, { type: "userSetti
     displayName: configuredDisplayName(),
     composerSendKey: normalizeComposerSendKey(getLaisoraConfiguration().get<string>("composer.sendKey")!),
     askQualityCheck: getLaisoraConfiguration().get<boolean>("claude.askQualityCheck") === true,
+    editSummaryEnabled: editSummarySettingEnabled(),
   };
 }
 
@@ -233,6 +241,8 @@ export function settingsStateMessage(): Extract<HostToSettingsPage, { type: "set
     externalModels: cachedExternalModels(),
     orchestrationEnabled: cfg.get<boolean>("orchestration.enabled")! === true,
     learningEnabled: cfg.get<boolean>("learning.enabled")! === true,
+    todoEnabled: todoBetaEnabled(cfg),
+    editSummaryEnabled: editSummarySettingEnabled(),
     orchestrationAgents: readRoster(cfg.get<unknown>("orchestration.agents")),
     orchestrationDefaults: readRoster(cfg.inspect("orchestration.agents")?.defaultValue ?? DEFAULT_ORCHESTRATION_ROSTER),
     conductorPolicy: cfg.get<string>("orchestration.conductorPolicy")!,
@@ -315,6 +325,14 @@ export async function writeCliAutoUpdate(executor: ExecutorId, enabled: boolean)
 
 export async function writeLearningEnabled(enabled: boolean): Promise<SettingWriteFailure | undefined> {
   return updateUserSetting("learning.enabled", enabled);
+}
+
+export async function writeTodoEnabled(enabled: boolean): Promise<SettingWriteFailure | undefined> {
+  return updateUserSetting(TODO_BETA_SETTING, enabled);
+}
+
+export async function writeEditSummaryEnabled(enabled: boolean): Promise<SettingWriteFailure | undefined> {
+  return updateUserSetting(EDIT_SUMMARY_SETTING, enabled);
 }
 
 let normalizedRosterLogged = false;

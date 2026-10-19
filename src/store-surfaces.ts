@@ -21,6 +21,7 @@ import { historyScopeKey, historyTranscriptScopeKey, Session } from "./session";
 import { persistOpenTabs } from "./session-list-wiring";
 import { postSettingsState } from "./settings-panel";
 import { TAB_LIMIT_DEFAULT, resolveTabLimit, scopeMaxForTabs } from "./tab-limits";
+import { noteTodoSessionEnded, offerTodoReopen, postTodoSnapshot, setTodoDrawerFocus } from "./todo-surface";
 
 export const RESTORE_TAIL_EVENT_MAX = 150;
 
@@ -80,8 +81,8 @@ export class SessionStore {
   private readonly surfaces = new Map<vscode.Webview, WebviewSurface>();
   private previousWebview: vscode.Webview | null = null;
 
-  post(msg: HostToWebview): void {
-    for (const webview of this.surfaces.keys()) void this.postTo(webview, msg);
+  post(msg: HostToWebview, except?: vscode.Webview): void {
+    for (const webview of this.surfaces.keys()) if (webview !== except) void this.postTo(webview, msg);
   }
 
   postTo(webview: vscode.Webview | null, msg: HostToWebview): Promise<boolean> {
@@ -294,6 +295,7 @@ export class SessionStore {
     this.cancelRestoreFill(webview);
     surface?.sub.dispose();
     this.surfaces.delete(webview);
+    setTodoDrawerFocus(webview, false);
     if (this.previousWebview === webview) this.previousWebview = null;
     if (this.activeWebview !== webview) return;
     const fallback = this.previousWebview && this.surfaces.has(this.previousWebview)
@@ -351,6 +353,17 @@ export function openNewConversationTab(st: SessionStore, initialize?: (session: 
   return session;
 }
 
+export function reorderSessionTabs(st: SessionStore, order: readonly string[], sender?: vscode.Webview): void {
+  const known = order.filter(tabId => st.sessions.has(tabId));
+  const rest = [...st.sessions.keys()].filter(tabId => !known.includes(tabId));
+  const sessions = [...known, ...rest].map(tabId => st.sessions.get(tabId)!);
+  if (sessions.every((s, index) => [...st.sessions.values()][index] === s)) return;
+  st.sessions.clear();
+  for (const s of sessions) st.sessions.set(s.tabId, s);
+  st.post({ type: "tabOrder", order: sessions.map(s => s.tabId) }, sender);
+  void persistOpenTabs();
+}
+
 export function sessionsForTest(): Session[] {
   return store ? [...store.sessions.values()] : [];
 }
@@ -366,6 +379,7 @@ export async function handleSurfaceMessage(
       st.markReady(sender);
       output.appendLine(`[webview] ${sinceActivation()} ready received`);
       await st.initForReady(sender);
+      postTodoSnapshot(sender);
       const dropped = pendingAttachments.sweep(new Set(st.sessions.keys()));
       if (dropped.length > 0) {
         output.appendLine(`[attachment] released ${dropped.length} orphan slot(s)`);
@@ -391,6 +405,8 @@ export async function handleSurfaceMessage(
     }
     case "closeTab": {
       target!.closed = true;
+      offerTodoReopen(st, target!, sender);
+      noteTodoSessionEnded(target!);
       target!.cancelResumePreparation();
       pendingAttachments.release(msg.tabId);
       handoffDetailSources.delete(target!.tabId);
@@ -403,7 +419,7 @@ export async function handleSurfaceMessage(
       st.sessions.delete(msg.tabId);
       void persistOpenTabs();
       const replacement = st.sessions.size === 0 ? st.createSession() : null;
-      if (replacement) st.post({ type: "tabCreated", tab: replacement.snapshot(), activate: true });
+      if (replacement) st.post({ type: "tabCreated", tab: replacement.snapshot(), activate: true, replacement: true });
       st.post({ type: "tabClosed", tabId: msg.tabId });
       postSettingsState();
       void target!
@@ -427,6 +443,7 @@ export async function handleSurfaceMessage(
       try {
         await s.disposeConversation();
         if (s.closed) break;
+        noteTodoSessionEnded(s);
         if (s.conversation) {
           const orphan: ClaudeConversation = s.conversation;
           s.conversation = null;
