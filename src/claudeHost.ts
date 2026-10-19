@@ -53,7 +53,7 @@ import { ClaudeLiveNormalizer, parseAliases } from "./claude-normalizer";
 import { AGENT_EFFORT_ARGUMENT_CLI_VERSION, agentEffortArgumentSupported, conductorInstruction, delegationEffort, orchestrationExternalTargets, orchestrationAgents, orchestrationVariants, resolveOrchestrationRoster, type OrchestrationRow, type ExternalModels } from "./orchestration-roster";
 import { injectionOf, MAX_AGENT_STARTS, readRosterEvidence, type AgentStartObservation, type InjectedAgentDefinition, type RosterEvidence, type RosterInjection } from "./roster-evidence";
 import { type LearningFacts } from "./learning";
-import { PLACEMENT_LINE } from "./placement-line";
+import { placementOf, type Placement } from "./placement-line";
 import { laisoraDenialMessage } from "./tool-result-signals";
 import { failClosedGuard } from "./guard-evaluation";
 import { isShellTool } from "./learning-signature";
@@ -157,8 +157,8 @@ export function planCompletionDenial(verdict: CompletionVerdict): string | undef
 export const ASK_QUALITY_REWRITE_LIMIT = 2;
 export const RENAME_SESSION_TIMEOUT_MS = 5000;
 
-export function conversationSystemPrompt(fileLinkInstruction: boolean, planInstruction = true, cwd = ""): NonNullable<ClaudeCodeOptions["systemPrompt"]> {
-  return { type: "custom", prompt: [fileLinkInstruction ? FILE_LINK_INSTRUCTION(cwd) : "", planInstruction ? PLAN_INSTRUCTION : "", PLACEMENT_LINE].filter(Boolean).join("\n\n"), snapshot: false };
+export function conversationSystemPrompt(fileLinkInstruction: boolean, planInstruction = true, cwd = "", placementLine: string): NonNullable<ClaudeCodeOptions["systemPrompt"]> {
+  return { type: "custom", prompt: [fileLinkInstruction ? FILE_LINK_INSTRUCTION(cwd) : "", planInstruction ? PLAN_INSTRUCTION : "", placementLine].filter(Boolean).join("\n\n"), snapshot: false };
 }
 
 interface QueryHandle extends AsyncIterable<any> {
@@ -208,6 +208,7 @@ export interface ClaudeHostOptions {
   orchestrationPluginDirectory?: string;
   rosterEvidenceDirectory?: string;
   learningEnabled?: boolean;
+  memoryBlockProjectType?: boolean;
   learningSwitches?: () => Partial<LearningSwitches>;
   learningHoldoutPercent?: () => number;
   learningDetectorCandidate?: { version: number; detect: Detector };
@@ -453,6 +454,7 @@ export class ClaudeConversation {
   private readonly roster: readonly OrchestrationRow[];
   private readonly orchestrationEnabled: boolean;
   private readonly conductorPolicy: string;
+  private readonly placement: Placement;
   private readonly initialOrchestrationSettings: { settings: unknown; deliveredSetHash?: string };
   private delivery?: LearningDelivery;
   private deliverySnapshot?: SectionResult;
@@ -501,6 +503,7 @@ export class ClaudeConversation {
   private orchestrationSettings(options: Partial<ClaudeHostOptions>): unknown {
     return { enabled: options.orchestrationEnabled === true, agents: options.orchestrationAgents ?? [],
       learningEnabled: options.learningEnabled === true,
+      memoryBlockProjectType: options.memoryBlockProjectType === true,
       timeout: options.externalTimeoutMinutes ?? 10,
       policy: options.conductorPolicy ?? "" };
   }
@@ -676,6 +679,7 @@ export class ClaudeConversation {
     this.externalRows = orchestrationExternalTargets(this.roster, opts.externalModels, opts.log);
     this.externalTimeoutMinutes = isExternalTimeout(opts.externalTimeoutMinutes) ? opts.externalTimeoutMinutes : 10;
     this.conductorPolicy = opts.conductorPolicy ?? "";
+    this.placement = placementOf({ learningEnabled: opts.learningEnabled === true, blockProjectType: opts.memoryBlockProjectType === true });
     for (const dropped of resolved.droppedRows) opts.log(dropped);
     if (opts.rosterEvidenceDirectory && opts.resumeSessionId) {
       for (const injection of readRosterEvidence(opts.rosterEvidenceDirectory, opts.resumeSessionId, opts.log).injections)
@@ -900,7 +904,7 @@ ${ctxJson}`
     if (this.opts.planInstruction !== false) {
       options.allowedTools = [...(options.allowedTools ?? []), "TaskCreate", "TaskGet", "TaskUpdate", "TaskList"];
     }
-    options.systemPrompt = conversationSystemPrompt(this.opts.fileLinkInstruction === true, this.opts.planInstruction !== false, this.opts.cwd);
+    options.systemPrompt = conversationSystemPrompt(this.opts.fileLinkInstruction === true, this.opts.planInstruction !== false, this.opts.cwd, this.placement.line);
     const learningT0 = Date.now();
     await this.ingestion?.start();
     const deliveryT0 = Date.now();
@@ -914,7 +918,7 @@ ${ctxJson}`
         path: await prepareOrchestrationPlugin(this.opts.orchestrationPluginDirectory ?? join(tmpdir(), "laisora-agent-plugin"), this.roster, this.opts.externalModels) }];
       const base = this.opts.fileLinkInstruction === true ? FILE_LINK_INSTRUCTION(this.opts.cwd) : "";
       options.systemPrompt = { type: "custom", snapshot: false,
-        prompt: [base, this.opts.planInstruction !== false ? PLAN_INSTRUCTION : "", conductorInstruction(this.roster, this.conductorPolicy, this.externalRows, deliverySection, perCallEffort, this.opts.externalModels)].filter(Boolean).join("\n\n") };
+        prompt: [base, this.opts.planInstruction !== false ? PLAN_INSTRUCTION : "", conductorInstruction(this.roster, this.conductorPolicy, this.externalRows, deliverySection, perCallEffort, this.opts.externalModels, this.placement.line)].filter(Boolean).join("\n\n") };
     }
     if (this.orchestrationEnabled || this.ingestion) {
       const observe: ClaudeCodeSdk.HookCallback = async (input) => {
@@ -1064,8 +1068,8 @@ ${ctxJson}`
             ...[...this.observedAgents.values()].flatMap(agent => [agent.agentType, agent.model].filter((name): name is string => !!name))];
           const models = Object.values(this.opts.externalModels ?? {}).flatMap(list => list.state === "ok" ? list.models : []);
           const listed = models.flatMap(model => [model.id, ...(model.resolvedModel ? [model.resolvedModel] : [])]);
-          const vocabulary = compileVocabulary({ names: [...names, ...listed, ...models.map(model => model.label), ...listed.map(model => claudeModelIdLabel(model))], effortWords: PLACEMENT_EFFORT_WORDS,
-            roleNames: [...DEFAULT_ROLE_NAMES, ...guardRoster.map(row => row.role)], listedModelIds: listed });
+          const vocabulary = this.placement.learningEnabled ? compileVocabulary({ names: [...names, ...listed, ...models.map(model => model.label), ...listed.map(model => claudeModelIdLabel(model))], effortWords: PLACEMENT_EFFORT_WORDS,
+            roleNames: [...DEFAULT_ROLE_NAMES, ...guardRoster.map(row => row.role)], listedModelIds: listed }) : undefined;
           const cwd = input.cwd || this.opts.cwd;
           let decision = judgeShellWrite(input.tool_name, value, claudeConfigDir(), process.platform, cwd, delegate);
           let unreadable = false;
@@ -1084,14 +1088,14 @@ ${ctxJson}`
               ? { destination: protectedDestination(target, claudeConfigDir()) ?? "control", blocked: true, reasons: [], examinedLines: 0, blockedLines: [] }
               : judgeFileWrite(input.tool_name, { ...value, file_path: target }, current, vocabulary, claudeConfigDir());
             memoryDecision = judgeMemoryWrite(input.tool_name, { ...value, file_path: target }, current,
-              delegate ? "delegate" : "conductor", claudeConfigDir());
+              delegate ? "delegate" : "conductor", this.placement.memoryTypes, claudeConfigDir());
           }
           const unchecked = unreadable && decision.skipped === "edit-does-not-apply";
           const destination = memoryDecision?.blocked ? "memory" : decision.destination;
           if ((!memoryDecision?.blocked && !decision.blocked && !unchecked) || !destination) return {};
           await this.queueLearningR33(() => this.measurement?.record({ guardBlocks: 1 }, { tool: input.tool_name, destination: destination === "CLAUDE.md" ? "claude-md" : destination === "AGENTS.md" ? "agents-md" : destination }) ?? Promise.resolve());
           return { hookSpecificOutput: { hookEventName: "PreToolUse", permissionDecision: "deny",
-            permissionDecisionReason: memoryDecision?.blocked ? memoryGuardReason(memoryDecision) : delegate ? DELEGATE_CONTROL_REFUSAL : unchecked ? PLACEMENT_UNREADABLE_REFUSAL : placementGuardReason(destination, settings.enabled) } };
+            permissionDecisionReason: memoryDecision?.blocked ? memoryGuardReason(memoryDecision, this.placement) : delegate ? DELEGATE_CONTROL_REFUSAL : unchecked ? PLACEMENT_UNREADABLE_REFUSAL : placementGuardReason(this.placement) } };
         }, this.opts.log);
       };
       options.hooks = { ...(options.hooks ?? {}), PreToolUse: [{ hooks: [guard] }, ...(options.hooks?.PreToolUse ?? [])] };

@@ -1,4 +1,4 @@
-import { MEMORY_DESTINATION } from "./placement-line";
+import { PLACEMENT_RULE_POINTER } from "./placement-line";
 import { privateTextR06, textHash } from "./learning";
 import { shortItemId, deliverySetHash, type ClaimItem, type DeliveryItem, type ProjectNotice, type RuleState } from "./learning-episodes";
 import { failureLabelText } from "./learning-signature";
@@ -111,7 +111,7 @@ export function claimLine(claim: ClaimItem): string {
 
 export function noticeLine(notice: ProjectNotice): string {
   const head = notice.head ? ` \`${notice.head}\`` : "";
-  return `- ${notice.tool}${head} → ${notice.cls} recurred ${notice.count} times with a working-folder path in the call arguments and was excluded from general learning; permanent project controls → the project's .claude/rules; ${MEMORY_DESTINATION}.`;
+  return `- ${notice.tool}${head} → ${notice.cls} recurred ${notice.count} times with a working-folder path in the call arguments and was excluded from general learning; permanent project controls → the project's .claude/rules; ${PLACEMENT_RULE_POINTER}.`;
 }
 
 export interface SectionInput {

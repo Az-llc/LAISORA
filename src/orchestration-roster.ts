@@ -1,4 +1,3 @@
-import { PLACEMENT_LINE } from "./placement-line";
 import { configurationDefault } from "./configuration-defaults";
 import { EXECUTORS, EXTERNAL_EXECUTORS, CLAUDE_EFFORTS, CODEX_EFFORTS, canonicalExecutorEfforts, isOrchestrationEffort, claudeAgentName,
   executorModelList, isExecutorId, isExternalExecutorId, isExternalModel, rowComplete,
@@ -255,7 +254,7 @@ export function estimateTokens(text: string): number {
   return Math.ceil(asciiChars / 4 + nonAsciiChars / 1.5);
 }
 export const EXTERNAL_CAPABILITIES = "Explorer and reviewer external targets are read-only and return only text. Worker Codex targets may edit files under the chosen working directory, never commit, and cannot run the build; the conductor runs checks and commits.";
-export function conductorInstruction(roster: readonly OrchestrationRow[], policy: string, external = orchestrationExternalTargets(roster), deliverySection = "", perCallEffort = true, models?: ExternalModels): string {
+export function conductorInstruction(roster: readonly OrchestrationRow[], policy: string, external = orchestrationExternalTargets(roster), deliverySection = "", perCallEffort = true, models: ExternalModels | undefined, placementLine: string): string {
   const variants = orchestrationVariants(roster, models);
   const metadata = models?.claude?.state === "ok" ? models.claude.models.find((model) => model.id === "opus") : undefined;
   const [d = "medium", up = "high"] = recommendedClaudeEfforts(metadata, [0, 1]);
@@ -272,7 +271,7 @@ export function conductorInstruction(roster: readonly OrchestrationRow[], policy
   ].join("\n");
   return [
     `<roster>\n${generated}\n</roster>`,
-    `<knowledge_placement>\n${PLACEMENT_LINE}\n</knowledge_placement>`,
+    `<knowledge_placement>\n${placementLine}\n</knowledge_placement>`,
     deliverySection ? `<model_notes>\n${deliverySection}\n</model_notes>` : "",
     policy.trim() ? `<conductor_policy>\n${renderedPolicy}\n</conductor_policy>` : "",
   ].filter(Boolean).join("\n\n");

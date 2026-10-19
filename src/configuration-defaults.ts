@@ -6,3 +6,15 @@ type ConfigurationKey = keyof typeof properties extends `laisora.${infer Key}` ?
 export function configurationDefault<T>(key: ConfigurationKey): T {
   return properties[`laisora.${key}`].default as T;
 }
+
+const CONFIGURATION_KEYS = Object.keys(properties).map((key) => key.slice("laisora.".length)) as ConfigurationKey[];
+
+export type ConfigurationInspect = (key: string) => { defaultValue?: unknown } | undefined;
+
+export function configurationRegistered(inspect: ConfigurationInspect, key: string): boolean {
+  return inspect(key)?.defaultValue !== undefined;
+}
+
+export function windowMissesContributedSettings(inspect: ConfigurationInspect): boolean {
+  return CONFIGURATION_KEYS.some((key) => !configurationRegistered(inspect, key));
+}

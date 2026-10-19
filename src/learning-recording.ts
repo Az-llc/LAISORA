@@ -1,4 +1,4 @@
-import { MEMORY_DESTINATION } from "./placement-line";
+import { PLACEMENT_RULE_POINTER } from "./placement-line";
 import { appendFile, mkdir } from "node:fs/promises";
 import { existsSync, readFileSync, statSync } from "node:fs";
 import { homedir } from "node:os";
@@ -93,7 +93,7 @@ function line(value: unknown, field: string, cap: number, cwd: string): Refusal 
   if (typeof value !== "string" || !value.trim()) return refuse("invalid-value", "R-LRN-12", field);
   const project = projectClaimText(value, cwd);
   if (project === "project") return { ...refuse("project-knowledge", "R-LRN-15", field),
-    destination: `permanent controls: the project's .claude/rules; ${MEMORY_DESTINATION}` };
+    destination: `permanent controls: the project's .claude/rules; ${PLACEMENT_RULE_POINTER}` };
   if (project === "unverifiable") return refuse("project-test-unavailable", "R-LRN-15", field);
   if (privateTextR06(value)) return refuse("private-content", "R-LRN-06", field);
   if (!singleLineR10(value, cap)) return refuse([...value].length > cap ? "text-over-cap" : "invalid-value", "R-LRN-12", field);

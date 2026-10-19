@@ -8,16 +8,13 @@ import { realPathOrNearestSync, resolveNearestRealPathSync, expandHomePath } fro
 export type ProtectedKind = "memory" | "CLAUDE.md" | "AGENTS.md" | "rules";
 export type GuardReason = "cooccurrence" | "model-name" | "shell";
 
-import { MEMORY_ALLOWED_TYPES, MEMORY_DESTINATION } from "./placement-line";
-export { PLACEMENT_LINE, MEMORY_ALLOWED_TYPES } from "./placement-line";
+import type { Placement } from "./placement-line";
+export { placementOf } from "./placement-line";
 
-export const PLACEMENT_REFUSAL = `${PLACEMENT_GUARD_REASON_PREFIX} this write targets persistent instructions. Session-only instructions are not persisted; keep them in this conversation. Record model-specific observations through the learning tool; standing model choices belong in roster or conductor policy settings. Please do not retry by removing or paraphrasing names. Please use Write or Edit for shell writes so the content can be checked.`;
 export const DELEGATE_CONTROL_REFUSAL = `${PLACEMENT_GUARD_REASON_PREFIX} only the conductor changes instruction, settings and hook files; return a proposed change in the reply instead.`;
 export const PLACEMENT_UNREADABLE_REFUSAL = `${PLACEMENT_GUARD_REASON_PREFIX} the current content of this protected file could not be read, so the edit cannot be checked. Retry once the file is readable.`;
-export function placementGuardReason(_kind: ProtectedKind | "control", _learningEnabled: boolean): string { return PLACEMENT_REFUSAL; }
-
-export function placementGuardShellReason(kind: ProtectedKind): string {
-  return placementGuardReason(kind, true);
+export function placementGuardReason(placement: Placement): string {
+  return `${PLACEMENT_GUARD_REASON_PREFIX} this write targets persistent instructions. Session-only instructions are not persisted; keep them in this conversation. ${placement.learningEnabled ? "Record model-specific observations through the learning tool; standing" : "Standing"} model choices belong in roster or conductor policy settings. Please do not retry by removing or paraphrasing names. Please use Write or Edit for shell writes so the content can be checked.`;
 }
 
 export const PLACEMENT_EFFORT_WORDS: readonly string[] = Object.freeze([...new Set<string>([...CLAUDE_EFFORTS, ...CODEX_EFFORTS, ...AGY_EFFORTS])]);
@@ -262,7 +259,7 @@ export interface MemoryDecision {
 
 const MEMORY_METADATA_KEY = "metadata";
 
-function memoryTopicType(content: string): { type?: string; reason?: MemoryReason } {
+function memoryTopicType(content: string, memoryTypes: readonly string[]): { type?: string; reason?: MemoryReason } {
   const lines = splitLines(content.replace(/^\uFEFF/, ""));
   const end = lines.indexOf("---", 1);
   if (lines[0] !== "---" || end < 0) return { reason: "untyped" };
@@ -278,14 +275,14 @@ function memoryTopicType(content: string): { type?: string; reason?: MemoryReaso
   }
   if (!types.length) return { reason: "untyped" };
   const type = types.join(", ");
-  return { type, reason: types.length === 1 && /^[a-z]+$/.test(type) && MEMORY_ALLOWED_TYPES.includes(type) ? undefined : "type" };
+  return { type, reason: types.length === 1 && /^[a-z]+$/.test(type) && memoryTypes.includes(type) ? undefined : "type" };
 }
 
 function readMemoryFile(path: string): string | undefined {
   try { return readFileSync(path, "utf8"); } catch { return undefined; }
 }
 
-export function judgeMemoryWrite(tool: string, input: unknown, current: string | undefined, actor: MemoryActor, configDir: string,
+export function judgeMemoryWrite(tool: string, input: unknown, current: string | undefined, actor: MemoryActor, memoryTypes: readonly string[], configDir: string,
   platform: NodeJS.Platform = process.platform, readFile: (path: string) => string | undefined = readMemoryFile): MemoryDecision {
   const filePath = inputRecord(input).file_path;
   if (typeof filePath !== "string" || protectedDestination(filePath, configDir, platform) !== "memory") return { blocked: false, reasons: [], blockedLines: [] };
@@ -301,7 +298,7 @@ export function judgeMemoryWrite(tool: string, input: unknown, current: string |
   if (typeof canonical !== "string") return { destination, blocked: true, reasons: ["type"], blockedLines: [] };
   const name = path.basename(canonical);
   if (platform === "win32" ? name.toLowerCase() !== "memory.md" : name !== "MEMORY.md") {
-    const verdict = memoryTopicType(after);
+    const verdict = memoryTopicType(after, memoryTypes);
     return { destination, blocked: verdict.reason !== undefined, reasons: verdict.reason ? [verdict.reason] : [], blockedLines: verdict.reason ? splitLines(after).filter(line => line.trim() !== "") : [], type: verdict.type };
   }
   const reasons = new Set<MemoryReason>();
@@ -321,7 +318,7 @@ export function judgeMemoryWrite(tool: string, input: unknown, current: string |
         const content = readFile(realTarget);
         if (content === undefined) reason = "index-target-missing";
         else {
-          const verdict = memoryTopicType(content);
+          const verdict = memoryTopicType(content, memoryTypes);
           reason = verdict.reason;
           if (reason === "type") type ??= verdict.type;
         }
@@ -332,18 +329,19 @@ export function judgeMemoryWrite(tool: string, input: unknown, current: string |
   return { destination, blocked: reasons.size > 0, reasons: [...reasons], blockedLines, ...(type === undefined ? {} : { type }) };
 }
 
-export function memoryGuardReason(decision: MemoryDecision): string {
+export function memoryGuardReason(decision: MemoryDecision, placement: Placement): string {
   const reason = decision.reasons.includes("delegate") ? "only the conductor writes memory; delegates must not write memory" : "this memory write has an invalid topic type or index entry";
-  return `${PLACEMENT_GUARD_REASON_PREFIX} ${reason}. ${MEMORY_DESTINATION}. Topic frontmatter must contain only single-line key: value lines (top level, or indented two spaces under metadata:) with one plain type in [${MEMORY_ALLOWED_TYPES.join(", ")}]; index additions must link to existing, typed topic files in the same directory. Ongoing work state goes to the project's ledger. Do not retry by changing the type.`;
+  return `${PLACEMENT_GUARD_REASON_PREFIX} ${reason}. ${placement.memoryDestination}. Topic frontmatter must contain only single-line key: value lines (top level, or indented two spaces under metadata:) with one plain type in [${placement.memoryTypes.join(", ")}]; index additions must link to existing, typed topic files in the same directory. Do not retry by changing the type.`;
 }
 
-export function judgeFileWrite(tool: string, input: unknown, current: string | undefined, vocabulary: CompiledVocabulary, configDir: string,
+export function judgeFileWrite(tool: string, input: unknown, current: string | undefined, vocabulary: CompiledVocabulary | undefined, configDir: string,
   platform: NodeJS.Platform = process.platform): GuardDecision {
   const filePath = inputRecord(input).file_path;
   const destination = typeof filePath === "string" ? protectedDestination(filePath, configDir, platform) : undefined;
   if (destination === undefined) return { blocked: false, reasons: [], examinedLines: 0, blockedLines: [] };
   const after = resultingContent(tool, input, current);
   if (after === undefined) return { destination, blocked: false, reasons: [], examinedLines: 0, blockedLines: [], skipped: "edit-does-not-apply" };
+  if (!vocabulary) return { destination, blocked: false, reasons: [], examinedLines: 0, blockedLines: [] };
   const lines = addedLines(current, after);
   const reasons = new Set<GuardReason>();
   const blockedLines: string[] = [];

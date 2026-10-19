@@ -15,6 +15,7 @@ import {
   writeAccentSetting,
   writeDisplayName,
   writeLearningEnabled,
+  writeMemoryBlockProjectType,
   writeTodoEnabled,
   writeEditSummaryEnabled,
   writeCliAutoUpdate,
@@ -123,6 +124,9 @@ export async function handleSettingsPageMessage(webview: vscode.Webview, raw: un
       break;
     case "setLearningEnabled":
       writeFailure = await writeLearningEnabled(raw.enabled);
+      break;
+    case "setMemoryBlockProjectType":
+      writeFailure = await writeMemoryBlockProjectType(raw.enabled);
       break;
     case "setTodoEnabled":
       writeFailure = await writeTodoEnabled(raw.enabled);

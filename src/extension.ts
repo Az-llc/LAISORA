@@ -14,6 +14,7 @@ export { normalizeDriveLetter } from "./claude-settings";
 import { TODO_BETA_SETTING } from "./todo-store";
 import { disposeTodoSurface, releaseOwnedTodoConversations, syncTodoSurface, toggleTodoDrawer } from "./todo-surface";
 import { EDIT_SUMMARY_SETTING } from "./edit-summary";
+import { MEMORY_BLOCK_PROJECT_TYPE_SETTING } from "./placement-line";
 import { registerEditDiffProvider } from "./edit-diff-host";
 export { reduceWorkModelSafely, trimEventLog } from "./event-fold";
 export type { EventFoldDraft, FoldEffect, FoldEventResult } from "./event-fold";
@@ -183,7 +184,8 @@ function activateReady(context: vscode.ExtensionContext): void {
   const displayConfigSub = vscode.workspace.onDidChangeConfiguration?.((e) => {
     if (affectsProductConfiguration(e, TODO_BETA_SETTING)) syncTodoSurface();
     if (["enabled", "agents", "externalTimeoutMinutes", "conductorPolicy"]
-      .some((key) => affectsProductConfiguration(e, `orchestration.${key}`))) {
+      .some((key) => affectsProductConfiguration(e, `orchestration.${key}`))
+      || affectsProductConfiguration(e, "learning.enabled") || affectsProductConfiguration(e, MEMORY_BLOCK_PROJECT_TYPE_SETTING)) {
       const cacheTtlSetting = ["enabled", "agents"].some((key) => affectsProductConfiguration(e, `orchestration.${key}`));
       for (const session of store?.sessions.values() ?? []) {
         postOrchestrationView(session);
@@ -200,6 +202,7 @@ function activateReady(context: vscode.ExtensionContext): void {
       affectsProductConfiguration(e, TODO_BETA_SETTING) ||
       affectsProductConfiguration(e, EDIT_SUMMARY_SETTING) ||
       affectsProductConfiguration(e, "learning.enabled") ||
+      affectsProductConfiguration(e, MEMORY_BLOCK_PROJECT_TYPE_SETTING) ||
       Object.values(CLI_AUTO_UPDATE_SETTINGS).some((key) => affectsProductConfiguration(e, key)) ||
       affectsProductConfiguration(e, "history.eventLimit") ||
       affectsProductConfiguration(e, "claude.fileLinkInstruction") ||

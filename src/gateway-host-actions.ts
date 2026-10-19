@@ -1,4 +1,4 @@
-import { configurationDefault } from "./configuration-defaults";
+import { configurationDefault, configurationRegistered, windowMissesContributedSettings } from "./configuration-defaults";
 import { isAccentColor, isAccentSettingValue, type AccentSetting, type AccentSettings } from "./accent";
 import { join } from "node:path";
 import { createHash } from "node:crypto";
@@ -38,6 +38,7 @@ import { restoreTabsOnStartupEnabled } from "./session-list-wiring";
 import { TODO_BETA_SETTING } from "./todo-store";
 import { todoBetaEnabled } from "./todo-surface";
 import { EDIT_SUMMARY_SETTING } from "./edit-summary";
+import { MEMORY_BLOCK_PROJECT_TYPE_SETTING, placementOf, placementSettingsOf } from "./placement-line";
 
 export function editSummarySettingEnabled(): boolean {
   return getLaisoraConfiguration().get<boolean>(EDIT_SUMMARY_SETTING) === true;
@@ -220,7 +221,8 @@ export function projectConductorPreview(policy?: string): { text: string; tokens
   const claudeDetection = externalDetection.claude;
   const text = cfg.get<boolean>("orchestration.enabled")!
     ? conductorInstruction(roster, policy ?? cfg.get<string>("orchestration.conductorPolicy")!, orchestrationExternalTargets(roster, externalModels), profiles,
-      claudeDetection.state === "found" && agentEffortArgumentSupported(claudeDetection.version), externalModels)
+      claudeDetection.state === "found" && agentEffortArgumentSupported(claudeDetection.version), externalModels,
+      placementOf(placementSettingsOf(cfg)).line)
     : l10n.t("The agent roster is disabled, so no instruction is added.");
   return { text, tokens: estimateTokens(text) };
 }
@@ -229,6 +231,7 @@ export function settingsStateMessage(): Extract<HostToSettingsPage, { type: "set
   loadRememberedModelLists();
   const cfg = getLaisoraConfiguration();
   const timeout = cfg.get<number>("orchestration.externalTimeoutMinutes")!;
+  const placementSettings = placementSettingsOf(cfg);
   return {
     type: "settingsState",
     conductorPreview: projectConductorPreview(),
@@ -240,8 +243,10 @@ export function settingsStateMessage(): Extract<HostToSettingsPage, { type: "set
     externalDetection: structuredClone(externalDetection),
     externalModels: cachedExternalModels(),
     orchestrationEnabled: cfg.get<boolean>("orchestration.enabled")! === true,
-    learningEnabled: cfg.get<boolean>("learning.enabled")! === true,
+    learningEnabled: placementSettings.learningEnabled,
+    memoryBlockProjectType: placementSettings.blockProjectType,
     todoEnabled: todoBetaEnabled(cfg),
+    reloadNeeded: settingsReloadNeeded(cfg),
     editSummaryEnabled: editSummarySettingEnabled(),
     orchestrationAgents: readRoster(cfg.get<unknown>("orchestration.agents")),
     orchestrationDefaults: readRoster(cfg.inspect("orchestration.agents")?.defaultValue ?? DEFAULT_ORCHESTRATION_ROSTER),
@@ -271,10 +276,14 @@ function isUnregisteredSetting(key: string, error: unknown): boolean {
   if (UNREGISTERED_SETTING_MESSAGE.test(error instanceof Error ? error.message : String(error))) return true;
   try {
     const cfg = getLaisoraConfiguration();
-    return typeof cfg.inspect === "function" && cfg.inspect(key)?.defaultValue === undefined;
+    return typeof cfg.inspect === "function" && !configurationRegistered((k) => cfg.inspect(k), key);
   } catch {
     return false;
   }
+}
+
+function settingsReloadNeeded(cfg: vscode.WorkspaceConfiguration): boolean {
+  return windowMissesContributedSettings((k) => cfg.inspect(k));
 }
 
 function reportSettingWriteFailure(key: string, error: unknown): SettingWriteFailure {
@@ -325,6 +334,10 @@ export async function writeCliAutoUpdate(executor: ExecutorId, enabled: boolean)
 
 export async function writeLearningEnabled(enabled: boolean): Promise<SettingWriteFailure | undefined> {
   return updateUserSetting("learning.enabled", enabled);
+}
+
+export async function writeMemoryBlockProjectType(enabled: boolean): Promise<SettingWriteFailure | undefined> {
+  return updateUserSetting(MEMORY_BLOCK_PROJECT_TYPE_SETTING, enabled);
 }
 
 export async function writeTodoEnabled(enabled: boolean): Promise<SettingWriteFailure | undefined> {

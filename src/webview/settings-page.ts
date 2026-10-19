@@ -20,6 +20,7 @@ import {
   type HostToSettingsPage,
   type SettingsPageToHost,
   type SettingWriteFailure,
+  type SettingWriteFailureAction,
 } from "../protocol";
 
 declare function acquireVsCodeApi(): { postMessage(message: SettingsPageToHost): void; getState(): { category?: string } | undefined; setState(state: { category: string }): void };
@@ -390,6 +391,8 @@ const chatCard = section(generalCategory, l10n.t("Chat"));
 const learningCard = section(generalCategory, l10n.t("Learning"));
 const learningSwitch = switchButton("setting-learning-enabled");
 const learningText = row(learningCard, l10n.t("Enable learning"), l10n.t("Turning learning off stops delivery in running conversations. Turning it on applies from the next conversation. Recording remains available."), learningSwitch);
+const memoryBlockProjectTypeSwitch = switchButton("setting-memory-block-project-type");
+const memoryBlockProjectTypeText = row(learningCard, l10n.t("Block project-type memory writes"), l10n.t("Stops writes of project-type memory (the state of ongoing work). When off, it can be written, but finished work or changed policies can remain in memory, and Claude may act on them as if they were still correct. Applies from the next conversation you start or resume."), memoryBlockProjectTypeSwitch);
 const todoCard = section(generalCategory, "ToDo");
 const todoSwitch = switchButton("setting-todo-enabled");
 const todoText = row(todoCard, l10n.t("(Beta) Enable ToDo"), l10n.t("The ToDo tab, drawer and cats switch right away. Claude's ToDo tools are available from the next conversation you start or resume."), todoSwitch);
@@ -1252,7 +1255,7 @@ generalCategory.appendChild(footer);
 let current: SettingsState | null = null;
 let requestSerial = 0;
 const nextRequestId = (): number => ++requestSerial;
-const pending: { autoContinue: number | null; restore: number | null; apiKey: number | null; learning: number | null; todo: number | null; editSummary: number | null } = { autoContinue: null, restore: null, apiKey: null, learning: null, todo: null, editSummary: null };
+const pending: { autoContinue: number | null; restore: number | null; apiKey: number | null; learning: number | null; memoryBlockProjectType: number | null; todo: number | null; editSummary: number | null } = { autoContinue: null, restore: null, apiKey: null, learning: null, memoryBlockProjectType: null, todo: null, editSummary: null };
 const pendingAutoUpdate = new Map<ExecutorId, number>();
 const pendingFileLink: Record<FileLinkBooleanSetting, number | null> = {
   fileLinkInstruction: null,
@@ -1282,6 +1285,7 @@ function writeAnchor(message: SettingsPageToHost): HTMLElement | undefined {
     case "setCliAutoUpdate": return detectionControls.find(({ executor }) => executor === message.executor)?.text;
     case "setEventLimit": return eventLimitText;
     case "setLearningEnabled": return learningText;
+    case "setMemoryBlockProjectType": return memoryBlockProjectTypeText;
     case "setTodoEnabled": return todoText;
     case "setEditSummaryEnabled": return editSummaryText;
     case "setApiKeyPolicy": return apiKeyText;
@@ -1301,24 +1305,38 @@ function post(message: SettingsPageToHost): void {
   vscode.postMessage(message);
 }
 
-function renderRowError(anchor: HTMLElement, failure: SettingWriteFailure | undefined): void {
-  rowErrors.get(anchor)?.remove();
-  rowErrors.delete(anchor);
-  if (!failure) return;
+function settingErrorNote(text: string, action: SettingWriteFailureAction): HTMLElement {
   const note = element("div", "settings-row-note settings-row-error");
   note.setAttribute("role", "alert");
   const mark = element("span", "settings-row-error-mark", "✗");
   mark.setAttribute("aria-hidden", "true");
-  const unregistered = failure.kind === "unregistered";
-  const action = element("button", "settings-link settings-row-error-action",
-    unregistered ? l10n.t("Reload window") : l10n.t("Open settings.json"));
-  action.type = "button";
-  action.addEventListener("click", () => post({ type: "settingWriteFailureAction", action: unregistered ? "reloadWindow" : "openSettingsJson" }));
-  note.append(mark, " ", unregistered
-    ? l10n.t("Could not save. Reload the window and try again.")
-    : l10n.t("Could not save: {0}", failure.reason), " ", action);
+  const button = element("button", "settings-link settings-row-error-action",
+    action === "reloadWindow" ? l10n.t("Reload window") : l10n.t("Open settings.json"));
+  button.type = "button";
+  button.addEventListener("click", () => post({ type: "settingWriteFailureAction", action }));
+  note.append(mark, " ", text, " ", button);
+  return note;
+}
+
+function renderRowError(anchor: HTMLElement, failure: SettingWriteFailure | undefined): void {
+  rowErrors.get(anchor)?.remove();
+  rowErrors.delete(anchor);
+  if (!failure) return;
+  const note = failure.kind === "unregistered"
+    ? settingErrorNote(l10n.t("Could not save. Reload the window and try again."), "reloadWindow")
+    : settingErrorNote(l10n.t("Could not save: {0}", failure.reason), "openSettingsJson");
   anchor.appendChild(note);
   rowErrors.set(anchor, note);
+}
+
+let reloadNeededNote: HTMLElement | undefined;
+function renderReloadNeeded(needed: boolean): void {
+  if (needed === (reloadNeededNote !== undefined)) return;
+  reloadNeededNote?.remove();
+  reloadNeededNote = needed
+    ? settingErrorNote(l10n.t("VS Code has not loaded LAISORA's new settings yet, so they cannot be saved. Reload the window."), "reloadWindow")
+    : undefined;
+  if (reloadNeededNote) settingsPageHead.appendChild(reloadNeededNote);
 }
 
 function render(state: SettingsState): void {
@@ -1328,6 +1346,7 @@ function render(state: SettingsState): void {
     requestAnchors.delete(state.replyTo!);
     renderRowError(anchor, state.writeFailure);
   }
+  renderReloadNeeded(state.reloadNeeded);
   renderInitialModel(state);
   renderDisplayName(state);
   if (pendingEventLimit === state.replyTo) pendingEventLimit = null;
@@ -1342,6 +1361,9 @@ function render(state: SettingsState): void {
   if (pending.learning === state.replyTo) pending.learning = null;
   learningSwitch.setAttribute("aria-checked", String(state.learningEnabled));
   learningSwitch.disabled = pending.learning !== null;
+  if (pending.memoryBlockProjectType === state.replyTo) pending.memoryBlockProjectType = null;
+  memoryBlockProjectTypeSwitch.setAttribute("aria-checked", String(state.memoryBlockProjectType));
+  memoryBlockProjectTypeSwitch.disabled = pending.memoryBlockProjectType !== null;
   if (pending.todo === state.replyTo) pending.todo = null;
   todoSwitch.setAttribute("aria-checked", String(state.todoEnabled));
   todoSwitch.disabled = pending.todo !== null;
@@ -1431,6 +1453,13 @@ learningSwitch.addEventListener("click", () => {
   pending.learning = requestId;
   learningSwitch.disabled = true;
   post({ type: "setLearningEnabled", requestId, enabled: !current.learningEnabled });
+});
+memoryBlockProjectTypeSwitch.addEventListener("click", () => {
+  if (current === null || pending.memoryBlockProjectType !== null) return;
+  const requestId = nextRequestId();
+  pending.memoryBlockProjectType = requestId;
+  memoryBlockProjectTypeSwitch.disabled = true;
+  post({ type: "setMemoryBlockProjectType", requestId, enabled: !current.memoryBlockProjectType });
 });
 todoSwitch.addEventListener("click", () => {
   if (current === null || pending.todo !== null) return;

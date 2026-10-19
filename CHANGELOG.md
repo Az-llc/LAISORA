@@ -1,5 +1,16 @@
 # Changelog
 
+## 1.8.1
+
+- **Project memory.** Claude can again save ongoing work state as project-type auto memory, which
+  LAISORA used to refuse in every project. Turn on `laisora.memory.blockProjectType` (off by
+  default) to refuse it as before.
+- **Learning off.** With `laisora.learning.enabled` off, notes that name models or efforts are no
+  longer refused in memory, CLAUDE.md or rules, and Claude is no longer pointed to a learning ledger
+  that is not running.
+- **Settings page.** The settings page warns when it opens in a window that has not registered
+  LAISORA's settings.
+
 ## 1.8.0
 
 - **ToDo (beta).** `laisora.todo.enabled` (off by default) adds a fixed ToDo tab shared by all

@@ -3,6 +3,7 @@ import { join } from "node:path";
 import { randomUUID } from "node:crypto";
 import { getLaisoraConfiguration } from "./claude-settings";
 import { EXPERIMENT_HOLDOUT_PERCENT } from "./learning-experiment";
+import { placementSettingsOf } from "./placement-line";
 import { postSettingsState } from "./settings-panel";
 import { cachedExternalModels } from "./gateway-host-actions";
 import { noteCliUpdateOpportunity } from "./claude-cli-update";
@@ -53,9 +54,11 @@ export function postOrchestrationView(s: Session): void {
     publisher = new OrchestrationViewPublisher(() => {
       if (s.closed || s.conversation !== conv) return undefined;
       const current = getLaisoraConfiguration();
+      const placementSettings = placementSettingsOf(current);
       return orchestrationViewForConversation(conv, {
         orchestrationEnabled: current.get<boolean>("orchestration.enabled")!,
-        learningEnabled: current.get<boolean>("learning.enabled")!,
+        learningEnabled: placementSettings.learningEnabled,
+        memoryBlockProjectType: placementSettings.blockProjectType,
         orchestrationAgents: current.get<unknown>("orchestration.agents"),
         externalTimeoutMinutes: current.get<number>("orchestration.externalTimeoutMinutes")!,
         conductorPolicy: current.get<string>("orchestration.conductorPolicy")!,
@@ -625,7 +628,8 @@ async function ensureConversationInner(s: Session, requestedAt: number): Promise
   s.effectiveModel = launchModel(s);
   s.effectiveEffort = undefined;
 
-  const learningEnabled = cfg.get<boolean>("learning.enabled")! === true;
+  const placementSettings = placementSettingsOf(cfg);
+  const learningEnabled = placementSettings.learningEnabled;
   const learningConfiguredSnapshot = learningEnabled ? await resolveConfiguredEffortSnapshot(cwd, settingSources) : undefined;
   const todoEnabled = todoBetaEnabled(cfg);
   const todoLinkedItem = todoEnabled ? await todoLinkedItemAtStart(s) : undefined;
@@ -656,6 +660,7 @@ async function ensureConversationInner(s: Session, requestedAt: number): Promise
       id => isRunningMainLane(s.workModel, id), admittedLaunches),
     orchestrationEnabled: cfg.get<boolean>("orchestration.enabled")! === true,
     learningEnabled,
+    memoryBlockProjectType: placementSettings.blockProjectType,
     learningSwitches: () => {
       const current = getLaisoraConfiguration();
       return { enabled: current.get<boolean>("learning.enabled")!, automaticAdoption: current.get<boolean>("learning.automaticAdoption", true),

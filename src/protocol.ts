@@ -650,6 +650,7 @@ export type SettingsPageToHost =
   | { type: "setCliAutoUpdate"; requestId: number; executor: ExecutorId; enabled: boolean }
   | { type: "setEventLimit"; requestId: number; value: number }
   | { type: "setLearningEnabled"; requestId: number; enabled: boolean }
+  | { type: "setMemoryBlockProjectType"; requestId: number; enabled: boolean }
   | { type: "setTodoEnabled"; requestId: number; enabled: boolean }
   | { type: "setEditSummaryEnabled"; requestId: number; enabled: boolean }
   | { type: "setOrchestrationSetting"; requestId: number; setting: "enabled" | "agents" | "conductorPolicy" | "externalTimeoutMinutes"; value: unknown }
@@ -680,7 +681,7 @@ export interface SettingsProfileProjection {
 export type HostToSettingsPage =
   | { type: "conductorPreview"; requestId: number; text: string; tokens: number }
   | { type: "recommendedRoster"; revision: string; changes: RecommendedRosterChange[] }
-  | ({ type: "settingsState"; appearance?: AccentSettings; displayName?: string; eventLimit?: number; composerSendKey: ComposerSendKey; apiKeyPolicy: ApiKeyPolicy; restoreTabsOnStartup: boolean; cliAutoUpdate: Record<ExecutorId, boolean>; initialModel?: string; autoContinueAtUsageLimit: boolean; learningEnabled: boolean; todoEnabled: boolean; editSummaryEnabled: boolean; replyTo?: number; writeFailure?: SettingWriteFailure }
+  | ({ type: "settingsState"; appearance?: AccentSettings; displayName?: string; eventLimit?: number; composerSendKey: ComposerSendKey; apiKeyPolicy: ApiKeyPolicy; restoreTabsOnStartup: boolean; cliAutoUpdate: Record<ExecutorId, boolean>; initialModel?: string; autoContinueAtUsageLimit: boolean; learningEnabled: boolean; memoryBlockProjectType: boolean; todoEnabled: boolean; editSummaryEnabled: boolean; reloadNeeded: boolean; replyTo?: number; writeFailure?: SettingWriteFailure }
     & SettingsProfileProjection & Record<FileLinkBooleanSetting, boolean> & { openWithSystemApp: string[] } & { orchestrationEnabled: boolean; orchestrationAgents: OrchestrationSettingRow[]; orchestrationDefaults: OrchestrationSettingRow[]; conductorPolicy: string; conductorPolicyDefault: string; externalTimeoutMinutes: number; externalDetection: Record<ExecutorId, ExternalDetection>; externalModels: ExternalModels });
 
 function isSettingsRequestId(v: unknown): v is number {
@@ -719,7 +720,7 @@ export function isSettingsPageToHost(v: unknown): v is SettingsPageToHost {
     return isSettingsRequestId(m.requestId)
       && (API_KEY_POLICIES as readonly string[]).includes(m.policy as string) && hasOnlyKeys(m, ["type", "requestId", "policy"]);
   }
-  if (t === "setAutoContinueAtUsageLimit" || t === "setRestoreTabsOnStartup" || t === "setLearningEnabled" || t === "setTodoEnabled" || t === "setEditSummaryEnabled") {
+  if (t === "setAutoContinueAtUsageLimit" || t === "setRestoreTabsOnStartup" || t === "setLearningEnabled" || t === "setMemoryBlockProjectType" || t === "setTodoEnabled" || t === "setEditSummaryEnabled") {
     return isSettingsRequestId(m.requestId) && typeof m.enabled === "boolean" && hasOnlyKeys(m, ["type", "requestId", "enabled"]);
   }
   if (t === "setCliAutoUpdate") {
@@ -789,8 +790,8 @@ export function isHostToSettingsPage(v: unknown): v is HostToSettingsPage {
       && (API_KEY_POLICIES as readonly string[]).includes(m.apiKeyPolicy as string)
       && typeof m.restoreTabsOnStartup === "boolean" && isCliAutoUpdate(m.cliAutoUpdate)
       && (m.initialModel === undefined || typeof m.initialModel === "string")
-      && typeof m.autoContinueAtUsageLimit === "boolean" && typeof m.learningEnabled === "boolean" && typeof m.todoEnabled === "boolean"
-      && typeof m.editSummaryEnabled === "boolean"
+      && typeof m.autoContinueAtUsageLimit === "boolean" && typeof m.learningEnabled === "boolean" && typeof m.memoryBlockProjectType === "boolean" && typeof m.todoEnabled === "boolean"
+      && typeof m.editSummaryEnabled === "boolean" && typeof m.reloadNeeded === "boolean"
       && typeof m.orchestrationEnabled === "boolean" && typeof m.conductorPolicy === "string"
       && typeof m.conductorPolicyDefault === "string"
       && isOrchestrationSettingRoster(m.orchestrationAgents) && isOrchestrationSettingRoster(m.orchestrationDefaults)
@@ -799,7 +800,7 @@ export function isHostToSettingsPage(v: unknown): v is HostToSettingsPage {
       && Array.isArray(m.openWithSystemApp) && m.openWithSystemApp.every((item) => typeof item === "string")
       && (m.replyTo === undefined || isSettingsRequestId(m.replyTo))
       && (m.writeFailure === undefined || m.replyTo !== undefined && isSettingWriteFailure(m.writeFailure))
-      && hasOnlyKeys(m, ["type", "initialModel", "appearance", "displayName", "eventLimit", "composerSendKey", "apiKeyPolicy", "restoreTabsOnStartup", "cliAutoUpdate", "autoContinueAtUsageLimit", "learningEnabled", "todoEnabled", "editSummaryEnabled", ...FILE_LINK_SETTINGS, "orchestrationEnabled", "orchestrationAgents", "orchestrationDefaults", "conductorPolicy", "conductorPolicyDefault", "externalTimeoutMinutes", "externalDetection", "externalModels", "replyTo", "writeFailure", "conductorPreview", "recommendedRosterSame"]);
+      && hasOnlyKeys(m, ["type", "initialModel", "appearance", "displayName", "eventLimit", "composerSendKey", "apiKeyPolicy", "restoreTabsOnStartup", "cliAutoUpdate", "autoContinueAtUsageLimit", "learningEnabled", "memoryBlockProjectType", "todoEnabled", "editSummaryEnabled", "reloadNeeded", ...FILE_LINK_SETTINGS, "orchestrationEnabled", "orchestrationAgents", "orchestrationDefaults", "conductorPolicy", "conductorPolicyDefault", "externalTimeoutMinutes", "externalDetection", "externalModels", "replyTo", "writeFailure", "conductorPreview", "recommendedRosterSame"]);
   }
   t satisfies never;
   return false;
