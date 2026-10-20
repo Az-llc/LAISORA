@@ -47,6 +47,7 @@ import {
   NormalizedEvent,
   NormalizedEventBody,
   PermissionModeId,
+  PermissionModeRequest,
   RESUME_PREVIEW_MESSAGE_MAX,
   RestoredAgent,
   ResumeHydrationSnapshotState,
@@ -173,6 +174,7 @@ export class Session {
   titleRefreshed = false;
   titleRefreshing = false;
   permissionMode: PermissionModeId = resolveInitialMode();
+  permissionModeRequest: PermissionModeRequest | undefined;
   commands: SlashCommandInfo[] = [];
   models: ModelInfo[] = [];
   discoveredModels: Pick<ModelInfo, "id" | "label" | "description" | "resolvedModel">[] = [];

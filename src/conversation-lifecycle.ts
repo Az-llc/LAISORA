@@ -1,4 +1,4 @@
-import { applyFallbackModel, fallbackOriginalModel, resolveFallbackByChoice, type EventProvenance, type FallbackRevertOutcome, type NormalizedEventBody } from "./protocol";
+import { applyFallbackModel, fallbackOriginalModel, reportedPermissionMode, resolveFallbackByChoice, type EventProvenance, type FallbackRevertOutcome, type NormalizedEventBody, type PermissionModeId, type PermissionModeRequest } from "./protocol";
 import { join } from "node:path";
 import { randomUUID } from "node:crypto";
 import { getLaisoraConfiguration } from "./claude-settings";
@@ -438,6 +438,66 @@ function settleFallbackRevert(st: SessionStore | null | undefined, s: Session, c
   });
 }
 
+function afterQueuedMessages(): Promise<void> {
+  return new Promise((resolve) => setImmediate(resolve));
+}
+
+function saveChosenPermissionMode(mode: PermissionModeId): void {
+  if (mode !== "bypassPermissions") void extensionContext?.globalState?.update(PERMISSION_MODE_KEY, mode);
+}
+
+function applyReportedPermissionMode(st: SessionStore | null | undefined, s: Session, reported: string): void {
+  const { mode, request, save } = reportedPermissionMode(s.permissionMode, s.permissionModeRequest, reported);
+  s.permissionModeRequest = request;
+  if (save !== undefined) saveChosenPermissionMode(save);
+  if (mode === undefined) return;
+  output.appendLine(`[${s.title}] permissionMode: ${s.permissionMode} → ${mode}（CLI の報告）`);
+  s.permissionMode = mode;
+  st?.post({ type: "modeChanged", tabId: s.tabId, mode });
+}
+
+async function requestPermissionMode(
+  st: SessionStore | null | undefined,
+  s: Session,
+  mode: PermissionModeId,
+  cliMode: PermissionModeId
+): Promise<void> {
+  s.permissionMode = mode;
+  const conv = s.conversation;
+  if (conv === null || conv.isClosed) {
+    if (s.starting === null) {
+      s.permissionModeRequest = undefined;
+      saveChosenPermissionMode(mode);
+    } else {
+      s.permissionModeRequest = { mode, responded: true };
+    }
+    st?.post({ type: "modeChanged", tabId: s.tabId, mode });
+    return;
+  }
+  const request: PermissionModeRequest = { mode, responded: false };
+  s.permissionModeRequest = request;
+  try {
+    await conv.setPermissionMode(mode);
+  } catch (error) {
+    if (s.permissionModeRequest === request) {
+      s.permissionModeRequest = undefined;
+      s.permissionMode = cliMode;
+    }
+    st?.post({ type: "modeChanged", tabId: s.tabId, mode: s.permissionMode });
+    throw error;
+  }
+  await afterQueuedMessages();
+  if (s.permissionModeRequest === request) {
+    if (mode === cliMode) {
+      s.permissionModeRequest = undefined;
+      saveChosenPermissionMode(mode);
+    } else {
+      request.responded = true;
+    }
+  }
+  st?.post({ type: "modeChanged", tabId: s.tabId, mode: s.permissionMode });
+}
+
 function launchModel(s: Session): string | null | undefined {
   const fallback = s.modelFallback;
   if (fallback !== undefined && fallback.resolvedAt === undefined) return fallback.appliedModel;
@@ -558,12 +618,7 @@ export async function handleConversationMessage(
       target!.conversation?.resolveApproval(msg.requestId, msg.behavior, msg.answers);
       break;
     case "setMode":
-      target!.permissionMode = msg.mode;
-      await target!.conversation?.setPermissionMode(msg.mode);
-      if (msg.mode !== "bypassPermissions") {
-        void extensionContext?.globalState?.update(PERMISSION_MODE_KEY, msg.mode);
-      }
-      st.post({ type: "modeChanged", tabId: target!.tabId, mode: msg.mode });
+      await requestPermissionMode(st, target!, msg.mode, target!.permissionMode);
       break;
     case "setEffort": {
       await applyEffortChange(st, target!, msg.effort as NonNullable<Session["effortOverride"]> | null);
@@ -650,13 +705,14 @@ async function ensureConversationInner(s: Session, requestedAt: number): Promise
   if (s.closed || s.logicalGeneration !== logicalGenerationAtStart) {
     throw new Error(l10n.t("The logical session of this tab changed while the conversation was starting (restore or clear)."));
   }
+  const launchPermissionMode = s.permissionMode;
   const conv = new ClaudeConversation({
     cwd,
     knownBackgroundTask: taskId => knownBackgroundTask(s.workModel, s.hydration, taskId),
     resumeSessionId: s.resumeSessionId ?? crashResumeSessionId,
     model: s.effectiveModel ?? undefined,
     effort: s.effortOverride ?? undefined,
-    permissionMode: s.permissionMode,
+    permissionMode: launchPermissionMode,
     settingSources,
     remoteControlAtStartup: cfg.get<boolean>("claude.remoteControlAtStartup")!,
     progressTracking: normalizeProgressTracking(cfg.get<string>("progressTracking")!),
@@ -699,6 +755,10 @@ async function ensureConversationInner(s: Session, requestedAt: number): Promise
     interruptForceKillTimeoutMs: cfg.get<number>("interruptForceKillTimeoutMs")!,
     onEvent: (raw, conversationId, meta) => {
       const own = conversationId === s.expectedConversationId && !s.closed;
+      if (raw.kind === "permission_mode_reported") {
+        if (own) applyReportedPermissionMode(store, s, raw.mode);
+        return;
+      }
       const ev = own ? noteFallbackRevert(s, conv, raw) : raw;
       if (
         ev.kind === "auth_status" &&
@@ -750,6 +810,10 @@ async function ensureConversationInner(s: Session, requestedAt: number): Promise
       throw new Error(l10n.t("The logical session of this tab changed while the conversation was starting (restore or clear)."));
     }
     s.conversation = conv;
+    if (s.permissionMode !== launchPermissionMode) {
+      void requestPermissionMode(store, s, s.permissionMode, launchPermissionMode).catch((e: unknown) =>
+        output.appendLine(`[${s.title}] setPermissionMode 失敗: ${String(e)}`));
+    }
     void flushChosenTitle(s);
     postOrchestrationView(s);
     if (todoLinkedItem) postTodoSnapshot();

@@ -1150,12 +1150,50 @@ export function deriveTimeBuckets(
 
   const childByToolUseId = new Map<string, ChildTranscriptSpan>();
   for (const c of options?.childSpans ?? []) childByToolUseId.set(c.toolUseId, c);
+  // Descendant tools belong to the displayed direct child. Roll up their
+  // intervals, not their elapsed spans: concurrent work must remain a union.
+  const directChildIds = new Set(keyedValues(state.delegations).map(d => d.toolUseId));
+  const nestedParents = new Map<string, string | null>();
+  const addNestedParent = (id: string, parent: string | undefined) => {
+    if (parent === undefined) return;
+    const prior = nestedParents.get(id);
+    nestedParents.set(id, prior === undefined || prior === parent ? parent : null);
+  };
+  for (const t of state.subTools) {
+    if (DELEGATION_TOOL_NAMES.has(t.toolName)) addNestedParent(t.toolUseId, t.agentId);
+  }
+  // A background descendant can emit tools before its launching call finishes.
+  for (const [id, t] of Object.entries(state.openTools)) {
+    if (t.lane === "sub" && DELEGATION_TOOL_NAMES.has(t.toolName)) {
+      addNestedParent(id, t.parentToolUseId ?? undefined);
+    }
+  }
+  const directChildOf = (id: string): string | undefined => {
+    const visited = new Set<string>();
+    while (!directChildIds.has(id)) {
+      if (visited.has(id)) return undefined;
+      visited.add(id);
+      const parent = nestedParents.get(id);
+      if (parent === undefined || parent === null) return undefined;
+      id = parent;
+    }
+    return id;
+  };
+  const directToolCounts = new Map<string, { total: number; failed: number }>();
   const subToolsByAgent = new Map<string, ToolInterval[]>();
   for (const t of state.subTools) {
     if (t.agentId === undefined) continue;
-    const list = subToolsByAgent.get(t.agentId) ?? [];
-    list.push(t);
-    subToolsByAgent.set(t.agentId, list);
+    if (directChildIds.has(t.agentId)) {
+      const counts = directToolCounts.get(t.agentId) ?? { total: 0, failed: 0 };
+      counts.total++;
+      if (t.isError) counts.failed++;
+      directToolCounts.set(t.agentId, counts);
+    }
+    const directId = directChildOf(t.agentId);
+    if (directId === undefined) continue;
+    const tools = subToolsByAgent.get(directId) ?? [];
+    tools.push(t);
+    subToolsByAgent.set(directId, tools);
   }
   const agents: AgentSpanView[] = [];
   for (const d of keyedValues(state.delegations)) {
@@ -1190,6 +1228,7 @@ export function deriveTimeBuckets(
     const open = spanEnd === undefined;
     const resolvedEnd = Math.max(start, spanEnd ?? end);
     const tools = subToolsByAgent.get(toolUseId) ?? [];
+    const counts = directToolCounts.get(toolUseId);
     const toolMs = measureSpans(intersectSpans(unionSpans(tools.map((t) => [t.start, t.end] as Span)), [[start, resolvedEnd]]));
     agents.push({
       toolUseId,
@@ -1202,8 +1241,8 @@ export function deriveTimeBuckets(
       ...(d.subagentType !== undefined ? { subagentType: d.subagentType } : {}),
       ...(d.model !== undefined ? { model: d.model } : {}),
       ...(d.transcriptAgentId !== undefined ? { transcriptAgentId: d.transcriptAgentId } : {}),
-      toolCount: tools.length,
-      failCount: tools.filter((t) => t.isError).length,
+      toolCount: counts?.total ?? 0,
+      failCount: counts?.failed ?? 0,
       toolMs,
       generateMs: Math.max(0, resolvedEnd - start - toolMs),
       endSource: open ? "open" : endSource,

@@ -328,6 +328,7 @@ function* sessionAnalyzer(
   let endedAt: number | null = null;
   const timestamps: number[] = [];
   let outputTokens = 0;
+  const outputByMessage = new Map<string, number>();
   let turn = 0;
   let activeTurnStartedAt: number | null = null;
   const completedTurnDurations: number[] = [];
@@ -368,7 +369,16 @@ function* sessionAnalyzer(
     if (o.type === "assistant") {
       if (!model && typeof o.message?.model === "string") model = o.message.model;
       const u = o.message?.usage;
-      if (u && typeof u.output_tokens === "number") outputTokens += u.output_tokens;
+      if (u && typeof u.output_tokens === "number" && Number.isFinite(u.output_tokens) && u.output_tokens >= 0) {
+        const messageId = typeof o.message?.id === "string" && o.message.id.trim() ? o.message.id : undefined;
+        if (messageId === undefined) outputTokens += u.output_tokens;
+        else {
+          const previous = outputByMessage.get(messageId) ?? 0;
+          const current = Math.max(previous, u.output_tokens);
+          outputTokens += current - previous;
+          outputByMessage.set(messageId, current);
+        }
+      }
       const content = Array.isArray(o.message?.content) ? o.message.content : [];
       const hasToolUse = content.some((b: any) => b?.type === "tool_use");
       normalEnd = !hasToolUse && content.some((b: any) => b?.type === "text" && typeof b.text === "string" && b.text.trim());

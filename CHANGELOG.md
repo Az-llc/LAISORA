@@ -1,5 +1,15 @@
 # Changelog
 
+## 1.9.1
+
+- **Handoff.** The conversation a handoff opens no longer shows the file-edit cards of the
+  conversation it continues.
+- **Permission mode.** The mode in the footer follows the mode Claude Code reports, for example
+  after a model switch leaves auto mode or a plan approval leaves plan mode, and only modes you
+  chose are saved as the next default.
+- ANALYSIS no longer counts some reply tokens twice, and time spent in nested agents is attributed
+  to the agent that started them.
+
 ## 1.9.0
 
 - **Tabs.** Tabs keep their width and scroll instead of sliding under the controls, and a list of

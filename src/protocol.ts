@@ -293,6 +293,7 @@ export type NormalizedEventBody =
     | { kind: "compact_boundary"; trigger: "auto" | "manual"; preTokens?: number; priorGeneration?: true }
     | {
         kind: "tool_call_finished";
+        priorGeneration?: true;
         turnId: string;
         toolUseId: string;
         isError: boolean;
@@ -339,6 +340,7 @@ export type NormalizedEventBody =
         isAutoCompactEnabled: boolean;
       }
     | { kind: "auth_status"; auth: AuthStatus }
+    | { kind: "permission_mode_reported"; mode: string }
     | { kind: "commands_changed"; commands: SlashCommandInfo[] }
     | {
         kind: "background_tasks";
@@ -490,6 +492,29 @@ export const PERMISSION_MODES: PermissionModeId[] = [
   "dontAsk",
   "bypassPermissions",
 ];
+
+export function isPermissionModeId(value: unknown): value is PermissionModeId {
+  return typeof value === "string" && (PERMISSION_MODES as string[]).includes(value);
+}
+
+export interface PermissionModeRequest {
+  mode: PermissionModeId;
+  responded: boolean;
+}
+
+export function reportedPermissionMode(
+  current: PermissionModeId,
+  request: PermissionModeRequest | undefined,
+  reported: string
+): { mode: PermissionModeId | undefined; request: PermissionModeRequest | undefined; save: PermissionModeId | undefined } {
+  if (!isPermissionModeId(reported) || request?.responded === false) return { mode: undefined, request, save: undefined };
+  const applied = request !== undefined && reported === request.mode;
+  return {
+    mode: reported === current ? undefined : reported,
+    request: applied ? undefined : request,
+    save: applied ? reported : undefined,
+  };
+}
 
 export interface SlashCommandInfo {
   name: string;
@@ -3710,10 +3735,7 @@ export function isWebviewToHost(v: unknown): v is WebviewToHost {
       && typeof (v as { focused?: unknown }).focused === "boolean";
   }
   if (t === "setMode") {
-    return (
-      typeof tabId === "string" &&
-      (PERMISSION_MODES as string[]).includes((v as { mode?: unknown }).mode as string)
-    );
+    return typeof tabId === "string" && isPermissionModeId((v as { mode?: unknown }).mode);
   }
   if (t === "setModel") {
     const model = (v as { model?: unknown }).model;
@@ -4362,6 +4384,7 @@ function isPlausibleNormalizedEvent(x: unknown): x is NormalizedEvent {
     }
     if (e.priorGeneration !== undefined && e.priorGeneration !== true) return false;
   }
+  if (e.kind === "tool_call_finished" && e.priorGeneration !== undefined && e.priorGeneration !== true) return false;
   return true;
 }
 
@@ -5039,10 +5062,7 @@ export function isHostToWebview(v: unknown): v is HostToWebview {
     );
   }
   if (t === "modeChanged") {
-    return (
-      typeof tabId === "string" &&
-      (PERMISSION_MODES as string[]).includes((v as { mode?: unknown }).mode as string)
-    );
+    return typeof tabId === "string" && isPermissionModeId((v as { mode?: unknown }).mode);
   }
   if (t === "commands") {
     const commands = (v as { commands?: unknown }).commands;
@@ -5625,7 +5645,7 @@ function isConversationSnapshot(value: unknown): boolean {
     cwd: () => typeof s.cwd === "string",
     turnState: () => s.turnState === "idle" || s.turnState === "running" || s.turnState === "interrupting",
     auth: () => s.auth === null || typeof s.auth === "object",
-    permissionMode: () => (PERMISSION_MODES as string[]).includes(s.permissionMode as string),
+    permissionMode: () => isPermissionModeId(s.permissionMode),
     workModel: () => s.workModel === undefined || isWorkModelPayload(s.workModel),
     planUsage: () => s.planUsage === undefined || isPlanUsage(s.planUsage),
     semanticView: () => s.semanticView === undefined || typeof s.semanticView === "boolean",

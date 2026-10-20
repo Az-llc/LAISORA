@@ -69,7 +69,7 @@ export interface SessionTranscript {
 export type TranscriptMessage = Omit<ConversationMessage, "uuid"> & { uuid?: string };
 
 const REPLAY_MESSAGE_MAX = 80;
-const PRIOR_GENERATION_KINDS: ReadonlySet<NormalizedEventBody["kind"]> = new Set(["compact_boundary", "local_command_output", "user_message", "assistant_text_delta", "model_observed", "tool_call_started"]);
+const PRIOR_GENERATION_KINDS: ReadonlySet<NormalizedEventBody["kind"]> = new Set(["compact_boundary", "local_command_output", "user_message", "assistant_text_delta", "model_observed", "tool_call_started", "tool_call_finished"]);
 const REPLAY_TOOL_MAX = 200;
 const MAX_SUBAGENT_TRANSCRIPT_BYTES = 8 * 1024 * 1024;
 const RESUME_TAIL_MAX_BYTES = 1024 * 1024;

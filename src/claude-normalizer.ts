@@ -418,6 +418,11 @@ export class ClaudeLiveNormalizer {
     return turnId;
   }
 
+  private emitReportedPermissionMode(record: Record<string, unknown>, meta: NormalizedOutMeta | undefined): void {
+    if (record.parent_tool_use_id != null || typeof record.permissionMode !== "string") return;
+    this.emit({ kind: "permission_mode_reported", mode: record.permissionMode }, meta);
+  }
+
   handleMessage(msg: unknown): void {
     if (typeof msg !== "object" || msg === null) {
       this.opts.log(`[unknown message type] ${JSON.stringify(msg)?.slice(0, 200) ?? String(msg)}`);
@@ -471,6 +476,9 @@ export class ClaudeLiveNormalizer {
             runtime,
           };
           this.emit({ kind: "auth_status", auth }, defaultMeta);
+          this.emitReportedPermissionMode(record, defaultMeta);
+        } else if (record.subtype === "status") {
+          this.emitReportedPermissionMode(record, defaultMeta);
         } else if (record.subtype === "permission_denied") {
           this.emit(
             {

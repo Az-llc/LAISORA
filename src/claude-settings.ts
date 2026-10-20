@@ -8,7 +8,7 @@ import { claudeConfigDir } from "./claude-env";
 import { normalizeDisplayName } from "./display-name";
 import { EVENT_LIMIT_DEFAULT, resolveEventLimit } from "./event-limits";
 import { extensionContext, output } from "./host-context";
-import { PERMISSION_MODES, PermissionModeId } from "./protocol";
+import { isPermissionModeId, PermissionModeId } from "./protocol";
 import type { ModelInfo } from "./protocol";
 import type { Session } from "./extension";
 import type * as ClaudeCodeSdk from "@anthropic-ai/claude-agent-sdk" with { "resolution-mode": "import" };
@@ -244,11 +244,9 @@ export const PERMISSION_MODE_KEY = "laisora.permissionMode.v1";
 
 export function resolveInitialMode(): PermissionModeId {
   const saved = extensionContext?.globalState?.get(PERMISSION_MODE_KEY);
-  if (typeof saved === "string" && (PERMISSION_MODES as string[]).includes(saved)) {
-    return saved as PermissionModeId;
-  }
+  if (isPermissionModeId(saved)) return saved;
   const m = readClaudeCodeSettings().defaultMode;
-  if (m && (PERMISSION_MODES as string[]).includes(m)) return m as PermissionModeId;
+  if (isPermissionModeId(m)) return m;
   return "default";
 }
 

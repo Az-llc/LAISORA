@@ -4535,7 +4535,7 @@ export class Tab {
   }
 
   private noteFileEdit(ev: Extract<NormalizedEvent, { kind: "tool_call_finished" }>): void {
-    if (ev.fileEdit === undefined || ev.taskNotification !== undefined) return;
+    if (ev.fileEdit === undefined || ev.taskNotification !== undefined || ev.priorGeneration === true) return;
     const edits = this.turnFileEdits.get(ev.turnId) ?? [];
     if (edits.some((edit) => edit.toolUseId === ev.toolUseId)) return;
     edits.push({ toolUseId: ev.toolUseId, fileEdit: ev.fileEdit, order: [ev.generation, ev.seq] });
