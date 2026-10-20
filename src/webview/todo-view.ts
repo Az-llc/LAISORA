@@ -1,5 +1,6 @@
 import { isComposingKey } from "./composing";
 import * as l10n from "@vscode/l10n";
+import { CLOSE_GLYPH } from "./close-button";
 import type { TodoAskSourceMessageEnvelope, TodoBatchRevert, TodoChangeView, TodoDeletedView, TodoEdit, TodoListItem, TodoLogMessage, TodoLogView, TodoSessionLinkView, TodoSnapshotMessage, TodoTabItem, TodoTemplateView, WebviewToHost } from "../protocol";
 import { TODO_GROUP_COLOR_COUNT, TODO_PRIORITIES, TODO_STATES, TODO_TEMPLATE_NAME_MAX, TODO_TITLE_MAX, todoFinishedIds, todoNameKey, type TodoBatchStep, type TodoState } from "../todo-model";
 import type { TodoApp } from "./todo-app";
@@ -112,6 +113,8 @@ function focusKeyOf(node: Element | null): string | undefined {
   return (node?.closest("[data-focus-key]") as HTMLElement | null)?.dataset.focusKey;
 }
 
+export const TODO_TAB_LABEL = "ToDo";
+
 export class TodoTab {
   readonly tabBtn: HTMLDivElement;
   readonly pane: HTMLElement;
@@ -215,7 +218,7 @@ export class TodoTab {
     this.splitDeclinedNow = new Set(state.splitDeclined);
     this.historySeenAt = state.historySeenAt;
 
-    this.tabBtn = el("div", "tab tab-todo", "ToDo");
+    this.tabBtn = el("div", "tab tab-todo", TODO_TAB_LABEL);
     this.tabCountEl = el("span", "tab-todo-count");
     this.tabFreshEl = el("span", "tab-todo-fresh");
     this.tabFreshEl.hidden = true;
@@ -685,7 +688,7 @@ export class TodoTab {
     this.searchInput.autocomplete = "off";
     this.searchInput.placeholder = l10n.t("Search ToDo");
     this.searchInput.setAttribute("aria-label", l10n.t("Search ToDo, Recently deleted and Claude's moves"));
-    const clear = todoButton("hist-clear", "×", () => { this.searchInput.value = ""; this.setQuery(""); this.searchInput.focus(); }, l10n.t("Clear search"));
+    const clear = todoButton("hist-clear", CLOSE_GLYPH, () => { this.searchInput.value = ""; this.setQuery(""); this.searchInput.focus(); }, l10n.t("Clear search"));
     clear.hidden = true;
     this.searchInput.addEventListener("input", () => { clear.hidden = this.searchInput.value === ""; this.setQuery(this.searchInput.value); });
     this.searchInput.addEventListener("keydown", event => { if (event.key === "Escape" && this.searchInput.value) { event.stopPropagation(); clear.click(); } });
@@ -1089,7 +1092,7 @@ export class TodoTab {
     const conversation: TodoMenuEntry[] = !single ? [] : item.parentId === null
       ? [{ label: todoPlayText(item.talk).label, keys: "Enter", run: () => this.openConversation(id, false) }]
       : [item.talk !== undefined ? { label: l10n.t("Open the child conversation"), run: () => this.openConversation(id, false) }
-        : { label: l10n.t("Split into a child conversation…"), run: () => this.app.splitChild(id) }];
+        : { label: l10n.t("Start the task in a new tab"), run: () => this.app.splitChild(id) }];
     const templates = l10n.t("Template");
     const fields = l10n.t("Properties");
     const actions = l10n.t("Actions");

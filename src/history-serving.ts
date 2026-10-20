@@ -41,6 +41,7 @@ import {
   type SessionFileLookup,
 } from "./session-files";
 import { readConversationMessages, readSessionHistory } from "./session-transcript";
+import { sessionRecordId } from "./session-record";
 import { currentScopeMax, type SessionStore } from "./store-surfaces";
 
 const HISTORY_CHUNK_MIN_ITEMS = 200;
@@ -351,7 +352,7 @@ export async function handleHistoryMessage(
           const lookup: SessionFileLookup =
             session.resumeFilePath !== undefined
               ? { path: session.resumeFilePath, reason: null }
-              : lookupSessionFile(session.resumeSessionId ?? session.auth?.sessionId ?? "");
+              : lookupSessionFile(sessionRecordId(session) ?? "");
           const filePath = lookup.path;
           if (filePath === null) {
             await postConversationHistoryError(
@@ -365,7 +366,7 @@ export async function handleHistoryMessage(
             filePath,
             isInSessionStore,
             undefined,
-            session.resumeSessionId ?? session.auth?.sessionId
+            sessionRecordId(session)
           );
           if (!requestStillValid()) {
             await postConversationHistoryError(
@@ -529,7 +530,10 @@ export async function handleHistoryMessage(
             );
             break;
           }
-          const historyReadError = history.readError ?? history.subagentsReadError;
+          if (history.subagentsReadError !== undefined) {
+            output.appendLine(`[${session.title}] 履歴transcript subagents/ read failed: ${history.subagentsReadError}`);
+          }
+          const historyReadError = history.readError;
           if (historyReadError !== undefined) {
             output.appendLine(`[${session.title}] 履歴transcript読み取り失敗: ${historyReadError}`);
             await postWorklogTranscriptError(

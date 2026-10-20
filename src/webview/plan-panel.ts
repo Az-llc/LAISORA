@@ -1,4 +1,5 @@
 import * as l10n from "@vscode/l10n";
+import { closeGlyphButton } from "./close-button";
 import { truncateToolIntent } from "./status-line";
 import type { OrchestrationView, WorkModelPayload } from "../protocol";
 import { deriveEarlierPlanViews, derivePlanView, planLaneRunning, planStepFolds, planStepSettled, type PlanLane, type PlanStep, type PlanView } from "./plan-view";
@@ -48,7 +49,7 @@ export class PlanPanel {
   readonly waiting = node("span", "plan-bar-waiting");
   private readonly section = node("section", "plan-section");
   private readonly dialog = node("dialog", "plan-drawer");
-  private readonly closeButton = node("button", "plan-drawer-close", "×");
+  private readonly closeButton = closeGlyphButton(node("button", "plan-drawer-close"), l10n.t("Close plan"), l10n.t("Close plan"));
   private readonly barTitle = node("span", "plan-bar-current");
   private readonly barCount = node("span", "plan-bar-count");
   private readonly barNumber = node("span", "plan-bar-number");
@@ -72,7 +73,6 @@ export class PlanPanel {
     this.aside.append(this.you, this.section);
     this.dialog.setAttribute("aria-label", "PLAN");
     this.closeButton.type = "button";
-    this.closeButton.setAttribute("aria-label", l10n.t("Close plan"));
     this.closeButton.onclick = () => this.close();
     this.dialog.append(this.closeButton);
     this.dialog.addEventListener("close", () => {
@@ -144,7 +144,7 @@ function currentStep(view: PlanView): PlanStep | undefined {
 function itemCount(view: PlanView): number { return view.steps.filter(step => step.number !== null).length; }
 function itemNumber(step: PlanStep): string { return step.number === null ? "" : planItemLabel(step.number); }
 
-function renderLane(lane: PlanLane, laneLabel?: PlanLaneLabel): HTMLElement {
+function renderLane(lane: PlanLane, slots: { readonly todo?: HTMLElement } = {}): HTMLElement {
   const row = node("div", "plan-lane");
   row.dataset.laneId = lane.id;
   const name = node("span", "plan-agent", lane.agent);
@@ -154,11 +154,13 @@ function renderLane(lane: PlanLane, laneLabel?: PlanLaneLabel): HTMLElement {
   const text = lane.resumedAt === undefined ? todoAgentText(lane.title) : l10n.t("Resumed {0}: {1}", planClock(lane.resumedAt), todoAgentText(lane.title));
   const title = node("span", "plan-lane-title", truncateToolIntent(text));
   title.title = text;
-  row.append(name, title);
-  const todo = laneLabel?.(lane);
-  if (todo) row.append(todo);
-  row.append(metric);
+  row.append(name, title, metric);
+  if (slots.todo) row.append(slots.todo);
   return row;
+}
+
+function laneSlots(lane: PlanLane, laneLabel?: PlanLaneLabel): { readonly todo?: HTMLElement } {
+  return { todo: laneLabel?.(lane) ?? undefined };
 }
 
 const laneOpenState = new WeakMap<HTMLElement, Set<string>>();
@@ -168,7 +170,6 @@ export function renderPlanSection(section: HTMLElement, view: PlanView, nowStatu
   const noPlan = !view.goal && !view.steps.length;
   const earlierDone = earlier.map(plan => ({ block: plan.block, goal: plan.goal,
     steps: plan.steps.filter(planStepSettled) })).filter(plan => plan.steps.length);
-  section.hidden = nowStatus === undefined && noPlan && !view.now.length && !earlierDone.length;
   const top = node("div", "plan-top");
   const stats = node("span", "plan-stats", `${planDuration(view.elapsed)} · ${view.claude ? "≈" : ""}${planTokens(view.claude?.tokens ?? null)} Claude · ${planTokens(view.external?.tokens ?? null)} ${l10n.t("External")}`);
   stats.title = l10n.t("Cache read: Claude {0} · External {1}", planTokens(view.claude?.cacheRead ?? null), planTokens(view.external?.cacheRead ?? null));
@@ -181,8 +182,8 @@ export function renderPlanSection(section: HTMLElement, view: PlanView, nowStatu
   head.append(top, goal, lede);
   const children: HTMLElement[] = [];
   if (view.partial) lede.append(document.createElement("br"), node("span", "plan-partial", l10n.t("Some earlier plan details are unavailable.")));
-  if (nowStatus !== undefined && noPlan) lede.hidden = !view.partial;
-  if (nowStatus !== undefined && noPlan && !earlierDone.length) children.push(node("p", "plan-none", l10n.t("No planned work")));
+  if (noPlan) lede.hidden = !view.partial;
+  if (noPlan && !earlierDone.length) children.push(node("p", "plan-none", l10n.t("No planned work")));
   const done = view.steps.filter(planStepFolds);
   const doneCount = done.length + earlierDone.reduce((sum, plan) => sum + plan.steps.filter(planStepFolds).length, 0);
   const collapsed = doneCount > 1 && section.dataset.doneOpen !== "true";
@@ -210,7 +211,7 @@ export function renderPlanSection(section: HTMLElement, view: PlanView, nowStatu
   if (view.now.length || nowStatus !== undefined) {
     const now = node("div", "plan-now");
     now.append(node("div", "plan-label", "NOW"));
-    for (const lane of view.now) now.append(renderLane(lane, laneLabel));
+    for (const lane of view.now) now.append(renderLane(lane, laneSlots(lane, laneLabel)));
     if (!view.now.length && nowStatus !== undefined) now.append(node("div", "plan-now-state", nowStatus));
     children.push(now);
   }
@@ -234,7 +235,7 @@ function planGroup(goal: string, items: HTMLElement[]): HTMLElement {
 
 function laneFold(lanes: readonly PlanLane[], openLanes: Set<string>, key: string, laneLabel?: PlanLaneLabel): HTMLElement[] {
   const list = node("div", "plan-lanes");
-  list.append(...lanes.map(lane => renderLane(lane, laneLabel)));
+  list.append(...lanes.map(lane => renderLane(lane, laneSlots(lane, laneLabel))));
   const toggle = node("button", "plan-lane-toggle");
   toggle.type = "button";
   toggle.dataset.foldKey = key;

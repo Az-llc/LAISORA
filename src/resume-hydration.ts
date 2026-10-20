@@ -51,11 +51,13 @@ import {
   type HistoryEvent,
   type ResumeReadSet,
   type SessionTranscript,
+  type TranscriptMessage,
 } from "./session-transcript";
 import {
   Session,
   historyScopeKey,
   isUnusedSession,
+  type StartMeasurement,
 } from "./session";
 import {
   SessionStore,
@@ -240,6 +242,7 @@ export async function openResumedSession(
     activate: boolean;
     inherit?: { model: string | null | undefined; effort: Session["effortOverride"] };
     knownCwd?: string;
+    startMeasurement?: StartMeasurement;
   }
 ): Promise<ResumeOpenOutcome> {
   let tabPosted = false;
@@ -289,6 +292,7 @@ export async function openResumedSession(
       s.modelOverride = req.inherit.model;
       s.effortOverride = req.inherit.effort;
     }
+    if (req.startMeasurement !== undefined) s.startMeasurement = req.startMeasurement;
     s.resumeFilePath = req.filePath;
     s.ownerState = {
       kind: "pinned",
@@ -533,6 +537,7 @@ export function createHydrationDraft(s: Session): EventFoldDraft {
     guardrail: createGuardrailState(),
     liveGuardrailSignalIds: new Set<string>(),
     guardrailLiveSince: undefined,
+    get cliStartedAt() { return s.cliStartedAt; },
     commands: [...s.commands],
     auth: s.auth,
     models: s.models,
@@ -596,10 +601,52 @@ function createHydrationYielder(): () => Promise<void> | undefined {
   };
 }
 
+function restoredRecordUuid(body: NormalizedEventBody): string | undefined {
+  if (body.kind === "assistant_message_uuid") return body.uuid;
+  if (body.kind === "user_message") return body.uuid;
+  return undefined;
+}
+
+export function restoredMessagePlan(
+  messages: readonly TranscriptMessage[],
+  history: { readonly events: readonly HistoryEvent[] }
+): { head: TranscriptMessage[]; after: Map<string, TranscriptMessage[]>; tail: TranscriptMessage[] } {
+  const drawn = new Set<string>();
+  for (const ev of history.events) {
+    const uuid = restoredRecordUuid(ev.body);
+    if (uuid !== undefined && !("priorGeneration" in ev.body && ev.body.priorGeneration === true)) drawn.add(uuid);
+  }
+  const head: TranscriptMessage[] = [];
+  const after = new Map<string, TranscriptMessage[]>();
+  let pending = head;
+  for (const m of messages) {
+    if (m.role !== "system" && m.restoredApproval === undefined && m.uuid !== undefined && drawn.has(m.uuid)) {
+      pending = [];
+      after.set(m.uuid, pending);
+      continue;
+    }
+    pending.push(m);
+  }
+  return { head: drawn.size === 0 ? [] : head, after, tail: drawn.size === 0 ? [...messages] : [] };
+}
+
+function replayedMessageEvent(m: TranscriptMessage): NormalizedEventBody {
+  return {
+    kind: "replayed_message",
+    role: m.role,
+    text: m.text,
+    uuid: m.uuid,
+    ...(m.restoredApproval ? { restoredApproval: m.restoredApproval } : {}),
+    ...(m.imageRefs && m.imageRefs.length > 0 ? { imageRefs: m.imageRefs } : {}),
+    ...(m.model ? { model: m.model } : {}),
+    ...(m.timestamp > 0 ? { recordedAt: m.timestamp } : {}),
+  };
+}
+
 export async function foldHistoryEvents(
   draft: EventFoldDraft,
   history: { events: readonly HistoryEvent[] },
-  visit: (step: FoldEventResult) => "continue" | "stop",
+  visit: (step: FoldEventResult, ev: HistoryEvent) => "continue" | "stop",
   invalidated: () => boolean
 ): Promise<"complete" | "stopped" | "invalidated"> {
   const maybeYield = createHydrationYielder();
@@ -610,7 +657,7 @@ export async function foldHistoryEvents(
       gapBoundaries: ev.gapBoundaries,
       suppressPost: true,
     });
-    if (visit(step) === "stop") return "stopped";
+    if (visit(step, ev) === "stop") return "stopped";
     const pending = maybeYield();
     if (pending) {
       await pending;
@@ -740,11 +787,27 @@ async function runResumeHydrationStages(
     commandsTouched: false,
     liveTurnCompleted: false,
   };
+  const foldIntoDraft = (
+    partial: NormalizedEventBody & { provenance?: EventProvenance }
+  ): void => {
+    applyDraftEffects(
+      foldEventState(draft, partial, undefined, { suppressPost: true }).effects,
+      sink
+    );
+  };
+  const plan = restoredMessagePlan(messages, history);
+  for (const m of plan.head) foldIntoDraft(replayedMessageEvent(m));
   const folded = await foldHistoryEvents(
     draft,
     history,
-    (step) => {
+    (step, ev) => {
       applyDraftEffects(step.effects, sink);
+      const uuid = restoredRecordUuid(ev.body);
+      const following = uuid === undefined ? undefined : plan.after.get(uuid);
+      if (uuid !== undefined && following !== undefined) {
+        plan.after.delete(uuid);
+        for (const m of following) foldIntoDraft(replayedMessageEvent(m));
+      }
       return "continue";
     },
     invalidated
@@ -795,14 +858,6 @@ async function runResumeHydrationStages(
       `${restored.elapsedMs}ms${restored.readError ? ` error=${restored.readError}` : ""}`
   );
 
-  const foldIntoDraft = (
-    partial: NormalizedEventBody & { provenance?: EventProvenance }
-  ): void => {
-    applyDraftEffects(
-      foldEventState(draft, partial, undefined, { suppressPost: true }).effects,
-      sink
-    );
-  };
   if (transcript.readError || history.readError) {
     const err = transcript.readError ?? history.readError;
     const nothingRead = history.events.length === 0 && messages.length === 0;
@@ -837,17 +892,8 @@ async function runResumeHydrationStages(
     .map((m) => m.uuid)
     .filter((u): u is string => typeof u === "string" && u.length > 0);
   const maybeYield = createHydrationYielder();
-  for (const m of messages) {
-    foldIntoDraft({
-      kind: "replayed_message",
-      role: m.role,
-      text: m.text,
-      uuid: m.uuid,
-      ...(m.restoredApproval ? { restoredApproval: m.restoredApproval } : {}),
-      ...(m.imageRefs && m.imageRefs.length > 0 ? { imageRefs: m.imageRefs } : {}),
-      ...(m.model ? { model: m.model } : {}),
-      ...(m.timestamp > 0 ? { recordedAt: m.timestamp } : {}),
-    });
+  for (const m of [...[...plan.after.values()].flat(), ...plan.tail]) {
+    foldIntoDraft(replayedMessageEvent(m));
     const pending = maybeYield();
     if (pending) {
       await pending;

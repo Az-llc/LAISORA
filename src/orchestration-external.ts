@@ -8,7 +8,7 @@ import { homedir } from "node:os";
 import type { PromptBudget } from "./learning-delivery";
 import { delimiter, dirname, isAbsolute, join, relative, resolve } from "node:path";
 import { buildClaudeEnv, claudeConfigDir, envValueOf } from "./claude-env";
-import { isControlPath } from "./placement-guard";
+import { gitInertEnv, isControlPath } from "./placement-guard";
 import { EXTERNAL_CAPABILITIES, externalExecutorName, isExternalRows, isExternalTimeout, type ExternalRow, type ExternalDetection, type ExternalModel, type ExternalModelList } from "./orchestration-roster";
 import type { ApiKeyPolicy } from "./protocol";
 
@@ -530,7 +530,7 @@ export async function resolveExternalCwd(conversationCwd: string, requested: str
 
 async function controlGit(args: string[], cwd: string): Promise<string | undefined> {
   return new Promise((done, reject) => {
-    execFile("git", args, { cwd, shell: false, windowsHide: true, encoding: "utf8", timeout: 5000, maxBuffer: 32 * 1024 * 1024 },
+    execFile("git", args, { cwd, env: gitInertEnv(), shell: false, windowsHide: true, encoding: "utf8", timeout: 5000, maxBuffer: 32 * 1024 * 1024 },
       (error, stdout, stderr) => {
         if (!error) done(stdout);
         else if (error.code === 128 && /not a git repository/i.test(stderr)) done(undefined);

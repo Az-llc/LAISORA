@@ -22,10 +22,11 @@ import { vscode } from "./dom";
 import { formatDuration, clock, dayClock } from "./format";
 import { formatDateTime } from "./l10n";
 import { termSpan, type TermKey } from "./term";
-import { WorkGraph, coverageRows, NO_WORK_SUMMARY_TEXT, type GraphScrollPort } from "./work-graph";
+import { WorkGraph, coverageRows, emptyWorkText, fillProblemCoverage, historyUndetermined, loadingHistoryText, NO_WORK_SUMMARY_TEXT, type GraphScrollPort } from "./work-graph";
 import { ROW_H } from "./row-frame";
 import { AgentInspector } from "./agent-inspector";
 import * as l10n from "@vscode/l10n";
+import { noRecordReason } from "../session-record";
 
 type LlmRunStateMessage = Extract<HostToWebview, { type: "llmAnalysisRunState" }>;
 type LlmRunProgress = NonNullable<LlmRunStateMessage["progress"]>;
@@ -84,11 +85,11 @@ function sameMarks(a: readonly ExecLogMark[] | undefined, b: readonly ExecLogMar
   return a.every((m, i) => m.toolUseId === b[i].toolUseId && m.findingAnchor === b[i].findingAnchor && m.label === b[i].label);
 }
 
-type ChartTone = "c1" | "c2" | "c3" | "c4" | "tool" | "wait" | "unobserved";
+type ChartTone = "c1" | "c2" | "c3" | "c4" | "gen" | "tool" | "sub" | "subwait" | "answer" | "wait" | "unobserved";
 const ANALYSIS_TIME_PARTS: readonly { tone: ChartTone; term: TermKey }[] = [
-  { tone: "c1", term: "LLM generation" }, { tone: "tool", term: "Tool execution" },
-  { tone: "wait", term: "Waiting for subagent" }, { tone: "c3", term: "Waiting for your answer" },
-  { tone: "c4", term: "Waiting for reply" }, { tone: "c2", term: "Subagent" },
+  { tone: "gen", term: "LLM generation" }, { tone: "tool", term: "Tool execution" },
+  { tone: "subwait", term: "Waiting for subagent" }, { tone: "answer", term: "Waiting for your answer" },
+  { tone: "wait", term: "Waiting for reply" }, { tone: "sub", term: "Subagent" },
 ];
 const ROLE_TONES: readonly ChartTone[] = ["c1", "c2", "c3", "c4"];
 
@@ -111,6 +112,8 @@ export class WorkOverview {
   private readonly planHeadings = new Map<string, HTMLElement>();
   private readonly expandedRoles = new Set<string>();
   private errExpanded = false;
+  private hasRecord: () => boolean = () => false;
+  private renderedRecord: boolean | undefined;
   private readonly expandedFindings = new Set<string>();
   private readonly findingsEl: HTMLElement;
   private readonly logHeadEl: HTMLElement;
@@ -409,6 +412,18 @@ export class WorkOverview {
     if (this.mode === "summary") this.render();
   }
 
+  setRecordProbe(probe: () => boolean): void {
+    this.hasRecord = probe;
+  }
+
+  noteRecordChanged(): void {
+    if (this.renderedRecord === this.hasRecord()) return;
+    this.summaryDirty = true;
+    this.l3Dirty = true;
+    if (this.mode === "summary") this.render();
+    if (this.mode === "analysis") this.renderAnalysisPanel();
+  }
+
   setLlmAnalysisEnabled(enabled: boolean | undefined): void {
     if (this.llmAnalysisEnabled === enabled) {
       this.l3El.querySelector('button[role="switch"]')?.removeAttribute("aria-busy");
@@ -546,8 +561,7 @@ export class WorkOverview {
 
   syncVisibility(): void {
     for (const row of Array.from(this.bodyEl.querySelectorAll<HTMLButtonElement>(".earlier-row"))) {
-      const turns: string[] = JSON.parse(row.dataset.turnIds ?? "[]");
-      row.disabled = !turns.some(id => this.conversation?.has(id));
+      row.disabled = this.reachableTurn(JSON.parse(row.dataset.turnIds ?? "[]")) === undefined;
     }
     this.applyMode();
     if (this.execLogMarks !== undefined) this.decorateExecLog(false);
@@ -632,6 +646,7 @@ export class WorkOverview {
       this.execLogMarks,
       semantic?.l3,
       this.llmAnalysisEnabled,
+      this.hasRecord(),
       this.turnRunning,
       this.llmRunning,
       this.llmProgress,
@@ -669,6 +684,7 @@ export class WorkOverview {
 
   private renderL3(): void {
     this.l3Dirty = false;
+    this.renderedRecord = this.hasRecord();
     const l3 = this.activeL3();
     const evidenceNavigation = this.toolEvidence
       ? {
@@ -691,7 +707,8 @@ export class WorkOverview {
       this.turnRunning,
       this.llmRunning,
       evidenceNavigation,
-      this.l3LlmEl
+      this.l3LlmEl,
+      this.hasRecord()
     );
     this.renderLlmRunLine();
     this.renderAnalysisFailureLine();
@@ -1279,6 +1296,8 @@ export class WorkOverview {
     conductor.append(span("orchestration-kind", l10n.t("CONDUCTOR")), span("orchestration-name", l10n.t("Main thread")));
     group.appendChild(conductor);
     const unknown = l10n.t("unknown");
+    const lists: { label?: HTMLElement; rows: HTMLUListElement }[] = [];
+    const filled = new Set<HTMLElement>();
     const list = (title: string, kind: string): HTMLUListElement => {
       const label = document.createElement("h4");
       label.className = "wo-flow-h";
@@ -1289,9 +1308,11 @@ export class WorkOverview {
       rows.setAttribute("aria-label", title);
       if (kind !== "runs") group.appendChild(label);
       group.appendChild(rows);
+      lists.push({ ...(kind !== "runs" ? { label } : {}), rows });
       return rows;
     };
     const row = (rows: HTMLElement, title: string, detail: string, badge: string, numbers = ""): HTMLElement => {
+      filled.add(rows);
       const entry = document.createElement("li");
       entry.className = "orchestration-row";
       const name = span("orchestration-name", "");
@@ -1341,11 +1362,17 @@ export class WorkOverview {
       row(requested, `${member.role} → ${EXECUTORS[member.executor].displayName}`,
         l10n.t("Requested {0} · {1}", member.model ?? unknown, member.effort ?? unknown), l10n.t("EXTERNAL"));
     }
+    for (const { label, rows } of lists) {
+      if (filled.has(rows)) continue;
+      label?.remove();
+      rows.remove();
+    }
   }
 
   private render(): void {
     this.summaryDirty = false;
     this.rootEl.dataset.renderCount = String(++this.summaryRenderCount);
+    this.renderedRecord = this.hasRecord();
     this.coverageEl.textContent = "";
     this.gistResizeObserver?.disconnect();
     this.bodyEl.textContent = "";
@@ -1363,11 +1390,21 @@ export class WorkOverview {
       else this.rootEl.removeAttribute("data-work-revision");
     }
     if (coverage !== undefined) this.renderCoverageRows(coverage, semantic?.timeBucketsCoverage);
+    if (historyUndetermined(coverage)) {
+      this.bodyEl.appendChild(span("wo-empty", emptyWorkText(coverage)));
+      this.bodyEl.appendChild(this.renderPlanYou(undefined, true));
+      return;
+    }
     const view = semantic?.timeBuckets;
     const tasks = payload?.tasks ?? [];
     const hasFlow = view !== undefined && view.blocks.length > 0;
     if (!hasFlow && tasks.length === 0 && (payload === undefined || this.totalToolCount(payload) === 0)) {
       this.bodyEl.appendChild(span("wo-empty", NO_WORK_SUMMARY_TEXT));
+      if (!this.hasRecord()) {
+        const line = div("wo-gist-line");
+        line.append(...this.summaryControls(false));
+        this.bodyEl.appendChild(line);
+      }
       this.bodyEl.appendChild(this.renderPlanYou(view));
       return;
     }
@@ -1444,7 +1481,7 @@ export class WorkOverview {
           ? l10n.t("Summary: {0} — could not be saved (retry)", summary.model)
           : l10n.t("Summary: {0} (saved)", summary.model)
         : l10n.t("First prompt");
-      line.append(source, this.buildSummaryButton(summary !== undefined));
+      line.append(source, ...this.summaryControls(summary !== undefined));
       gist.append(line, text, expand);
       head.appendChild(gist);
     }
@@ -1470,6 +1507,11 @@ export class WorkOverview {
     this.gistResizeObserver.observe(text);
   }
 
+  private summaryControls(hasSummary: boolean): HTMLElement[] {
+    const button = this.buildSummaryButton(hasSummary);
+    return button.dataset.noRecord === "true" ? [button, span("wo-note", noRecordReason())] : [button];
+  }
+
   private buildSummaryButton(hasSummary: boolean): HTMLButtonElement {
     const btn = document.createElement("button");
     btn.type = "button";
@@ -1481,6 +1523,12 @@ export class WorkOverview {
       return btn;
     }
     btn.textContent = hasSummary ? l10n.t("Regenerate") : l10n.t("Summarize");
+    if (!this.hasRecord()) {
+      btn.disabled = true;
+      btn.dataset.noRecord = "true";
+      btn.title = noRecordReason();
+      return btn;
+    }
     const rule = l10n.t("The summary runs on haiku (fast, low cost)");
     btn.title = hasSummary
       ? l10n.t("Regenerates the summary and saves it. Consumes tokens. {0}", rule)
@@ -1660,7 +1708,11 @@ export class WorkOverview {
     return group;
   }
 
-  private renderPlanYou(view: TimeBucketView | undefined): HTMLElement {
+  private reachableTurn(turnIds: readonly string[]): string | undefined {
+    return turnIds.find(id => this.conversation?.has(id));
+  }
+
+  private renderPlanYou(view: TimeBucketView | undefined, undetermined = false): HTMLElement {
     const layout = div("wo-plan-you");
     layout.lang = document.documentElement.lang;
     const left = div("wo-plan-column");
@@ -1671,10 +1723,10 @@ export class WorkOverview {
     const blocks = [...(view?.blocks ?? [])].reverse();
     const heading = document.createElement("h3");
     heading.className = "earlier-label";
-    heading.textContent = l10n.t("EARLIER REQUESTS {0} work blocks", blocks.length);
+    heading.textContent = l10n.t("EARLIER REQUESTS {0} work blocks", undetermined ? UNMEASURED_LABEL : blocks.length);
     earlier.append(heading);
     if (this.payload?.planHistoryTruncated) earlier.append(span("plan-lede earlier-partial", l10n.t("Some earlier work block details are unavailable.")));
-    if (!blocks.length) earlier.append(span("earlier-empty", l10n.t("No earlier work blocks available.")));
+    if (!blocks.length) earlier.append(span("earlier-empty", undetermined ? loadingHistoryText() : l10n.t("No earlier work blocks available.")));
     const shown = this.flowExpanded ? blocks : blocks.slice(0, EARLIER_LIMIT);
     for (const block of shown) {
       const row = document.createElement("button");
@@ -1707,10 +1759,10 @@ export class WorkOverview {
       if (block.running && this.turnRunning) number.classList.add("current");
       row.append(number, title, duration, stats);
       row.onclick = () => {
-        const turn = block.turnIds.find(id => this.conversation?.has(id));
+        const turn = this.reachableTurn(block.turnIds);
         if (turn) this.conversation?.navigate(turn);
       };
-      row.disabled = !block.turnIds.some(id => this.conversation?.has(id));
+      row.disabled = this.reachableTurn(block.turnIds) === undefined;
       earlier.append(row);
     }
     if (!this.flowExpanded && blocks.length > EARLIER_LIMIT) {
@@ -1798,6 +1850,10 @@ export class WorkOverview {
       line.appendChild(span("wl-totals", l10n.t("Tools {0} calls · Failures {1} · Subagents {2}", this.totalToolCount(this.payload), this.totalFailCount(this.payload), agents)));
     }
     this.logSumEl.appendChild(line);
+    const semantic = this.activeSemantic();
+    const coverage = div("wl-coverage");
+    fillProblemCoverage(coverage, semantic?.coverage.base ?? this.payload?.coverage, semantic?.timeBucketsCoverage);
+    if (!coverage.hidden) this.logSumEl.appendChild(coverage);
     const anchored = (this.execLogMarks ?? []).filter((m) => m.findingAnchor !== undefined);
     if (anchored.length > 0) {
       const flags = div("wl-flags");

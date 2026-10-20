@@ -2,7 +2,7 @@
   "name": "laisora",
   "displayName": "LAISORA",
   "description": "%extension.description%",
-  "version": "1.8.1",
+  "version": "1.9.0",
   "publisher": "az-llc",
   "categories": [
     "AI",
@@ -302,7 +302,7 @@
         },
         "laisora.learning.enabled": {
           "type": "boolean",
-          "default": false,
+          "default": true,
           "scope": "application",
           "description": "%config.laisora.learning.enabled.description%"
         },
@@ -507,7 +507,7 @@
     "typecheck": "tsc --noEmit"
   },
   "devDependencies": {
-    "@anthropic-ai/claude-agent-sdk": "^0.3.303",
+    "@anthropic-ai/claude-agent-sdk": "^0.3.304",
     "@types/node": "^24.0.0",
     "@types/vscode": "^1.90.0",
     "@vscode/l10n": "0.0.18",

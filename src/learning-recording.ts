@@ -255,9 +255,7 @@ export class LearningRecorder {
           const replacement = all.find((r): r is ClaimRecord => r.kind === "claim" && r.itemId === accepted.replacement
             && r.conversation === accepted.conversation && r.requestId === accepted.requestId && r.inputHash === accepted.inputHash);
           if (accepted.action === "retract" || replacement) return success(prior.map(r => r.opId), true);
-          if (!accepted.replacementRecord) return refuse("state-unavailable", "R-LRN-45");
-          await this.ledger.append(accepted.replacementRecord);
-          return success([accepted.replacementRecord.opId, accepted.opId], false);
+          return refuse("state-unavailable", "R-LRN-45");
         }
         const targets = learningClaimTargets(context.roster, context.models);
         const claims = qualifyClaims(all, at, (executor, model) => targets.some(target => target.executor === executor && target.model === model), context.roles);
@@ -305,7 +303,6 @@ export class LearningRecorder {
           runs: evidence, ...(replacement ? { replacement: replacement.itemId, replacementRecord: replacement } : {}) };
         if (!decodeLedgerRecord(correction) || replacement && !decodeLedgerRecord(replacement)) return refuse("store-error", "R-LRN-07");
         await this.ledger.append(correction);
-        if (replacement) await this.ledger.append(replacement);
         return success([...(replacement ? [replacement.opId] : []), correction.opId], false);
       }
       if (prior.length) return success(prior.map(r => r.opId), true);

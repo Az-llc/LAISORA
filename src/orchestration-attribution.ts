@@ -4,7 +4,7 @@ import { attributeSubagent, type InjectedAgentDefinition, type RosterEvidence } 
 import { CLAUDE_EFFORTS, claudeModelIdLabel } from "./orchestration-executors";
 import { HUMAN_REJECTED_TOOL_RESULT_RE } from "./tool-result-signals";
 import type { AgentRunRecord } from "./orchestration-external";
-import type { LearningSubject } from "./learning-ingestion";
+import { agentRecipient, type LearningSubject } from "./learning-ingestion";
 
 interface Dispatch { run: string; dispatchId: string; parent: string; key?: string; effort?: string; model?: string; outcome?: "normal" | "stopped"; evidence?: string; background?: boolean; runtime: boolean; segment: number; terminalSegment?: number; taskId?: string }
 interface Pending { record: AgentRunRecord; parent?: string; stopped: boolean }
@@ -13,6 +13,7 @@ export class AgentAttribution {
   private readonly dispatches = new Map<string, Dispatch>();
   private readonly pending = new Map<string, Pending>();
   private readonly segments = new Map<string, number>();
+  private readonly parentlessSegments = new Map<string, number>();
   private readonly tasks = new Map<string, string>();
   private readonly consumed = new Set<string>();
   private readonly finished = new Map<string, LearningSubject>();
@@ -64,7 +65,7 @@ export class AgentAttribution {
   dispatchRef(parent: string): string | undefined { return this.dispatches.get(parent)?.dispatchId; }
   dispatchSubject(parent: string): LearningSubject | undefined {
     const dispatch = this.dispatches.get(parent);
-    return dispatch ? { recipient: `agent:${parent}`, run: dispatch.run, dispatchId: dispatch.dispatchId } : undefined;
+    return dispatch ? { recipient: agentRecipient(parent), run: dispatch.run, dispatchId: dispatch.dispatchId } : undefined;
   }
   result(parent: string, text: string, isError: boolean): Promise<void> {
     return this.serial(async () => {
@@ -124,11 +125,12 @@ export class AgentAttribution {
       const effort = (input.effort as { level?: unknown } | undefined)?.level;
       const segment = (this.segments.get(record.agent_id) ?? 0) + 1;
       this.segments.set(record.agent_id, segment);
+      if (!parent) this.parentlessSegments.set(record.agent_id, (this.parentlessSegments.get(record.agent_id) ?? 0) + 1);
       const enriched: AgentRunRecord = { ...record, agentKey, role: definition?.role ?? "unknown",
         requestedModel: definition?.model ?? "unknown", requestedEffort: (attributed?.perCallEffort && attributed.definition.effort ? dispatch?.effort : undefined) ?? definition?.effort ?? "unknown",
         model: model ?? dispatch?.model ?? (typeof input.model === "string" ? claudeModelIdLabel(input.model) : record.model ?? "unknown"),
         effort: typeof effort === "string" ? effort : record.effort ?? "unknown", segment,
-        runId: segment === 1 ? dispatch?.run ?? randomUUID() : randomUUID(), dispatchId: dispatch?.dispatchId ?? randomUUID(), recipient: parent ? `agent:${parent}` : `agent:${record.agent_id}` };
+        runId: segment === 1 ? dispatch?.run ?? randomUUID() : randomUUID(), dispatchId: dispatch?.dispatchId ?? randomUUID(), recipient: agentRecipient(parent ?? record.agent_id) };
       this.pending.set(`${record.agent_id}:${segment}`, { record: enriched, parent, stopped });
       if (parent) await this.confirm(parent);
     });
@@ -162,7 +164,7 @@ export class AgentAttribution {
       const { record, parent, subject } = this.unrecorded[0];
       await this.append(record);
       this.unrecorded.shift();
-      if (parent && subject) await this.settled(parent, record.agent_id, record, subject);
+      if (subject && (parent || this.parentlessSegments.get(record.agent_id) === 1)) await this.settled(parent ?? agentRecipient(record.agent_id), record.agent_id, record, subject);
     }
   }
   interrupt(): void {

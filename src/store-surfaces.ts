@@ -89,7 +89,7 @@ export class SessionStore {
     if (!webview) return Promise.resolve(false);
     if (this.surfaces.get(webview)?.visible === false) return Promise.resolve(false);
     return Promise.resolve(webview.postMessage(msg)).then((delivered) => {
-      if (delivered && (msg.type === "init" || msg.type === "tabRestored")) {
+      if (delivered && (msg.type === "init" || msg.type === "tabRestored" || msg.type === "tabCleared" || msg.type === "tabCreated")) {
         const tabIds = msg.type === "init" ? msg.tabs.map((tab) => tab.tabId) : [msg.tab.tabId];
         for (const tabId of tabIds) {
           const session = this.sessions.get(tabId);
@@ -405,6 +405,7 @@ export async function handleSurfaceMessage(
     }
     case "closeTab": {
       target!.closed = true;
+      target!.startMeasurement?.abandon();
       offerTodoReopen(st, target!, sender);
       noteTodoSessionEnded(target!);
       target!.cancelResumePreparation();

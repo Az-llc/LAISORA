@@ -1,4 +1,5 @@
 import * as l10n from "@vscode/l10n";
+import { CLOSE_GLYPH } from "./close-button";
 import { isWaitingYouItem, type YouItem, type YouItemsReader } from "./you-items";
 import { bindUserLabel } from "./user-label";
 
@@ -62,7 +63,7 @@ export class YouList {
         link.onclick = () => navigate(item);
         title.append(node("strong", "you-title-text", item.title), link);
         if (dismiss && !item.anchor.approvalRef && item.resolvedAt === undefined) {
-          const remove = node("button", "you-dismiss", "×");
+          const remove = node("button", "you-dismiss", CLOSE_GLYPH);
           remove.type = "button";
           remove.title = l10n.t("Remove from the list");
           remove.setAttribute("aria-label", l10n.t("Remove from the list: {0}", item.title));

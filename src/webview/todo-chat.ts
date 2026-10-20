@@ -1,6 +1,6 @@
 import * as l10n from "@vscode/l10n";
 import { TODO_CHANGES_REQUEST_MAX, type TodoChangeView, type TodoListItem, type TodoStartView, type TodoTurnRevert } from "../protocol";
-import { parseTodoChangeId, TODO_CARD_TOOLS, TODO_CLAUDE_DEPTH_MAX, TODO_TIDY_TOOL, todoCardTree, todoFailureOf, todoWriteResultRef, type TodoCardMark, type TodoCardRow, type TodoRevertBlock, type TodoStartKind, type TodoWriteResultRef } from "../todo-model";
+import { parseTodoChangeId, TODO_CARD_TOOLS, TODO_TIDY_TOOL, todoCardTree, todoWriteResultRef, type TodoCardMark, type TodoCardRow, type TodoRevertBlock, type TodoStartKind, type TodoWriteResultRef } from "../todo-model";
 import { formatDateTime } from "./l10n";
 import { summaryCardShell, summaryFold, summaryStat, type SummaryTone } from "./summary-card";
 import { describeTodoChange, TODO_MEMO_LABELS, TODO_REVERT_BLOCK_TEXT, todoButton, todoEl as el } from "./todo-edit";
@@ -10,7 +10,7 @@ import { todoItemPath } from "./todo-rows";
 type CardCall =
   | { readonly state: "pending"; readonly tidy: boolean }
   | { readonly state: "written"; readonly tidy: boolean; readonly ref: TodoWriteResultRef }
-  | { readonly state: "failed"; readonly tidy: boolean; readonly text: string }
+  | { readonly state: "failed"; readonly tidy: boolean }
   | { readonly state: "unrecorded"; readonly tidy: boolean };
 
 const TODO_CARD_FOLDED_ROWS = 6;
@@ -18,6 +18,7 @@ const cards = new Set<HTMLElement>();
 const cardCalls = new WeakMap<HTMLElement, Map<string, CardCall>>();
 const statusEls = new WeakMap<HTMLElement, HTMLElement>();
 const unfolded = new WeakSet<HTMLElement>();
+const unresolvedRows = new WeakSet<HTMLElement>();
 const views = new Map<string, TodoChangeView>();
 const turnReverts = new Map<string, "ok" | TodoRevertBlock>();
 let viewsRevision = -1;
@@ -65,10 +66,14 @@ export function setTodoToolCardResult(card: HTMLElement, toolUseId: string, resu
   if (!calls || !call) return;
   const ref = isError ? undefined : todoWriteResultRef(result);
   calls.set(toolUseId, ref !== undefined ? { state: "written", tidy: call.tidy, ref }
-    : isError ? { state: "failed", tidy: call.tidy, text: result ?? "" } : { state: "unrecorded", tidy: call.tidy });
-  if (live) cardStatus(card).textContent = isError ? todoCardFailureText(result) : l10n.t("Wrote to ToDo.");
+    : isError ? { state: "failed", tidy: call.tidy } : { state: "unrecorded", tidy: call.tidy });
+  if (live && ref !== undefined) cardStatus(card).textContent = l10n.t("Wrote to ToDo.");
   renderCard(card);
   if (ref) queueRequest([card]);
+}
+
+export function todoCardHidden(states: readonly CardCall["state"][]): boolean {
+  return states.length > 0 && states.every(state => state === "failed");
 }
 
 function cardRefs(card: HTMLElement): TodoWriteResultRef[] {
@@ -117,7 +122,10 @@ export function receiveTodoChanges(message: { readonly requestId: number; readon
 }
 
 export function refreshTodoToolCards(revision: number): void {
-  if (revision === viewsRevision) return;
+  if (revision === viewsRevision) {
+    for (const card of cards) if (unresolvedRows.has(card)) renderCard(card);
+    return;
+  }
   views.clear();
   turnReverts.clear();
   requested = new Set();
@@ -168,38 +176,12 @@ function groupOrderOf(items: readonly TodoListItem[], numberOf: (id: string) => 
   return [...new Set(roots.map(item => item.group!))];
 }
 
-const UNSTABLE_TEXT: Record<string, () => string> = {
-  doing: () => l10n.t("Left it as it is: work on it is in progress."),
-  touched: () => l10n.t("Left it as it is: you changed it recently."),
-  pinned: () => l10n.t("Left it as it is: you moved it recently."),
-  moved: () => l10n.t("Left it as it is: it was moved recently."),
-};
-
-const FAILURE_TEXT: Record<string, () => string> = {
-  "user-item": () => l10n.t("Left your item as it is."),
-  "group-has-user-items": () => l10n.t("Did not delete the group: it holds your items."),
-  "duplicate-title": () => l10n.t("Not added: the same item is already there."),
-  "unknown-group": () => l10n.t("Not written: no group matched."),
-  "near-group": () => l10n.t("Not written: no group matched."),
-  "too-deep": () => l10n.t("Not written: deeper than {0} levels.", TODO_CLAUDE_DEPTH_MAX),
-  "title-repeats": () => l10n.t("Not written: the title did not follow the rules."),
-  "title-state": () => l10n.t("Not written: the title did not follow the rules."),
-  "outside-linked": () => l10n.t("Not marked done: it is outside this conversation's item."),
-  "merge-done": () => l10n.t("Not merged: done items stay."),
-};
-
-export function todoCardFailureText(text: string | undefined): string {
-  const failure = todoFailureOf(text);
-  if (failure?.error === "unstable" && failure.word !== undefined && UNSTABLE_TEXT[failure.word]) return UNSTABLE_TEXT[failure.word]();
-  if (failure?.error.startsWith("store-")) return l10n.t("Could not write to the ToDo list.");
-  const known = failure ? FAILURE_TEXT[failure.error] : undefined;
-  return known ? known() : l10n.t("Failed to write to ToDo.");
-}
-
 function renderCard(card: HTMLElement): void {
   const links = todoLinkHub();
   const calls = [...cardCalls.get(card)?.values() ?? []];
   if (card.isConnected) card.dataset.seen = "1";
+  card.hidden = todoCardHidden(calls.map(call => call.state));
+  if (card.hidden) { card.replaceChildren(); return; }
   if (!links) return;
   const { ids, legacy, waiting, lost } = cardIds(card);
   const changes = ids.flatMap(id => views.get(id) ?? []).filter(change => !change.cascade);
@@ -207,7 +189,9 @@ function renderCard(card: HTMLElement): void {
   const items = links.items();
   const numberOf = (id: string) => links.numberOf(id);
   const rows = todoCardTree(changes, items, groupOrderOf(items, numberOf), id => numberOf(id) || undefined);
-  const tidied = calls.some(call => call.tidy && call.state === "written");
+  if (rows.some(row => row.itemId !== undefined && row.mark !== "-" && (todoItemOf(row.itemId) === undefined || !numberOf(row.itemId)))) unresolvedRows.add(card);
+  else unresolvedRows.delete(card);
+  const tidied = calls.some(call => call.tidy && (call.state === "written" || call.state === "unrecorded"));
   const stat = summaryStat((["-", "+", "~"] as const).flatMap(mark => {
     const count = rows.filter(row => row.mark === mark).length;
     return count ? [{ text: `${CARD_SIGN[mark]}${count}`, tone: CARD_TONE[mark] }] : [];
@@ -224,17 +208,10 @@ function renderCard(card: HTMLElement): void {
   });
   summaryFold(card, overflow, rows.length, unfolded.has(card), expand => { if (expand) unfolded.add(card); else unfolded.delete(card); },
     hidden => l10n.t("⋯ {0} more · Show all", hidden));
-  const failures = new Map<string, string[]>();
-  for (const call of calls) if (call.state === "failed") failures.set(todoCardFailureText(call.text), [...failures.get(todoCardFailureText(call.text)) ?? [], call.text]);
-  for (const [line, raw] of failures) {
-    const node = el("p", "todo-tool-error", line);
-    node.title = raw.filter(Boolean).join("\n");
-    card.append(node);
-  }
   if (calls.some(call => call.state === "pending")) card.append(el("p", "todo-tool-note", l10n.t("Writing to ToDo…")));
   else if (waiting && rows.length === 0) card.append(el("p", "todo-tool-note", l10n.t("Loading…")));
   else if (missing > 0 && !waiting) card.append(el("p", "todo-tool-note", l10n.t("These changes are no longer kept in the ToDo history.")));
-  else if (rows.length === 0 && failures.size === 0) card.append(el("p", "todo-tool-note", l10n.t("No change recorded.")));
+  else if (rows.length === 0) card.append(el("p", "todo-tool-note", l10n.t("No change recorded.")));
   card.append(cardStatus(card));
 }
 
@@ -387,7 +364,7 @@ function fillSplitActs(acts: HTMLElement, itemId: string): void {
   } else if (links.splitDeclined(item.id)) {
     acts.append(el("span", "todo-note", l10n.t("Kept in the parent conversation")));
   } else {
-    acts.append(todoButton("todo-link", l10n.t("Split and open…"), () => links.splitChild(item.id)),
+    acts.append(todoButton("todo-link", l10n.t("Split and open"), () => links.splitChild(item.id)),
       todoButton("todo-link", l10n.t("Keep working in the parent"), () => links.declineSplit(item.id)));
   }
 }

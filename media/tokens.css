@@ -7,9 +7,13 @@
   --l-chart-tool: color-mix(in srgb, var(--vscode-descriptionForeground) 45%, var(--vscode-editor-background));
   --l-chart-unobserved: color-mix(in srgb, var(--vscode-descriptionForeground) 22%, var(--vscode-editor-background));
   --l-chart-wait: color-mix(in srgb, var(--vscode-descriptionForeground) 16%, var(--vscode-editor-background));
+  --l-chart-gen: var(--l-chart-c1);
+  --l-chart-sub: var(--l-chart-c2);
+  --l-chart-answer: var(--l-chart-c4);
   --l-chart-track: color-mix(in srgb, var(--vscode-descriptionForeground) 12%, var(--vscode-editor-background));
   --l-card-border: var(--vscode-contrastBorder, color-mix(in srgb, var(--vscode-foreground) 20%, var(--vscode-editor-background)));
   --l-card-radius: 2px;
+  --l-disabled-opacity: 0.4;
   --l-code: 12px;
   /* Full-width glyphs must be exactly two half-width cells; every family here is a single font covering both scripts. */
   --l-code-font: "UDEV Gothic", "UDEV Gothic NF", "HackGen", "HackGen NF", "PlemolJP", "BIZ UDGothic", "MS Gothic", "Sarasa Mono J", "Noto Sans Mono CJK JP", monospace;
@@ -22,6 +26,12 @@
   --l-row-number: var(--l-label);
   --l-row-title: var(--l-note);
   --l-row-meta: var(--l-label);
+  --l-text-min: min(6ch, 100%);
+  --l-z-sheet: 65;
+  --l-z-drawer: 70;
+  --l-z-modal: 80;
+  --l-z-popover: 90;
+  --l-z-lightbox: 100;
   --l-space-1: 4px;
   --l-space-2: 8px;
   --l-space-3: 12px;

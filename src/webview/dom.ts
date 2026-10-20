@@ -1,5 +1,6 @@
 import * as l10n from "@vscode/l10n";
 import type { WebviewToHost } from "../protocol";
+import { CLOSE_GLYPH } from "./close-button";
 
 type VsCodeWebviewApi = {
   postMessage(msg: WebviewToHost): void;
@@ -48,7 +49,7 @@ app.innerHTML = `
           <div class="hist-search">
             <span class="l-icon l-icon-search" aria-hidden="true"></span>
             <input id="histsearch" type="text" role="combobox" aria-expanded="true" aria-autocomplete="list" aria-controls="histlist" autocomplete="off" spellcheck="false" placeholder="${l10n.t("Search by title")}" aria-label="${l10n.t("Search by title")}" />
-            <button id="histclear" class="hist-clear" type="button" title="${l10n.t("Clear search")}" aria-label="${l10n.t("Clear search")}" hidden>×</button>
+            <button id="histclear" class="hist-clear" type="button" title="${l10n.t("Clear search")}" aria-label="${l10n.t("Clear search")}" hidden>${CLOSE_GLYPH}</button>
           </div>
         </div>
       </header>
@@ -57,7 +58,6 @@ app.innerHTML = `
       <div id="histnotice" class="hist-notice" role="status" hidden></div>
       <footer id="histfoot" class="hist-foot">
         <span id="histprogress" class="hist-progress" role="status"></span>
-        <span class="hist-keys" aria-hidden="true"><span><kbd>↑↓</kbd>${l10n.t("Select")}</span><span><kbd>Enter</kbd>${l10n.t("Open")}</span><span><kbd>F2</kbd>${l10n.t("Rename session")}</span><span><kbd>Del</kbd>${l10n.t("Remove from the list")}</span><span><kbd>Esc</kbd>${l10n.t("Close")}</span></span>
       </footer>
     </div>
   </header>
@@ -66,7 +66,7 @@ app.innerHTML = `
     <span id="findcount" class="find-count">0 / 0</span>
     <button id="findprev" class="find-btn" type="button" title="${l10n.t("Previous (Shift+F3)")}" aria-label="${l10n.t("Previous (Shift+F3)")}">↑</button>
     <button id="findnext" class="find-btn" type="button" title="${l10n.t("Next (F3 / Enter)")}" aria-label="${l10n.t("Next (F3 / Enter)")}">↓</button>
-    <button id="findclose" class="find-btn" type="button" title="${l10n.t("Close (Esc)")}" aria-label="${l10n.t("Close (Esc)")}">×</button>
+    <button id="findclose" class="find-btn" type="button" title="${l10n.t("Close (Esc)")}" aria-label="${l10n.t("Close (Esc)")}">${CLOSE_GLYPH}</button>
   </div>
   <main id="logs" aria-live="polite"></main>
   <footer id="composer">

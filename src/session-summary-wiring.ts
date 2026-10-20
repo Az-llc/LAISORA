@@ -8,6 +8,7 @@ import { normalizeApiKeyPolicy, type NormalizedEventBody } from "./protocol";
 import { buildSessionDigest, buildSummaryPrompt, buildSessionNamePrompt, sanitizeSessionName, generateSessionSummaryViaSdk } from "./session-summary";
 import { isInSessionStore, inspectorSessionFile } from "./session-files";
 import { readSessionHistory } from "./session-transcript";
+import { hasSessionRecord } from "./session-record";
 import type { Session } from "./extension";
 import type { SessionStore } from "./store-surfaces";
 
@@ -134,6 +135,11 @@ export class SessionSummaryWiring {
     try {
       const modelId = "haiku";
 
+      if (!naming && !hasSessionRecord(this.host)) {
+        output.appendLine(`[${this.host.title}] 要約を実行しませんでした: 記録がまだありません`);
+        failure = l10n.t("LAISORA: There is no record to summarize yet.");
+        return;
+      }
       const { userTexts, toolCalls, agentCount, readFailure } = await this.collectSummaryInput();
       if (this.supersededSince(logicalGenerationAtStart)) return;
       if (userTexts.length === 0) {

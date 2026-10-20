@@ -2,7 +2,7 @@ import { programName, segmentProgramIndex, shellSegments, isShellTool, PLACEMENT
 import { CLAUDE_EFFORTS, CODEX_EFFORTS, AGY_EFFORTS } from "./orchestration-executors";
 import { resolve, join, basename, dirname, win32, posix } from "node:path";
 import fs, { readdirSync, statSync, readFileSync } from "node:fs";
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawnSync, type ExecFileSyncOptionsWithStringEncoding } from "node:child_process";
 import { realPathOrNearestSync, resolveNearestRealPathSync, expandHomePath } from "./path-containment";
 
 export type ProtectedKind = "memory" | "CLAUDE.md" | "AGENTS.md" | "rules";
@@ -524,14 +524,43 @@ function recursiveCopyControls(source: string, destination: string, configDir: s
 const CONTROL_PATHSPECS = ["**/CLAUDE.md", "**/CLAUDE.local.md", "**/AGENTS.md", "**/.claude", "**/.claude/settings*.json", "**/.claude/rules/**", "**/.claude/hooks/**", "**/.claude/projects/*/memory/**"]
   .map(path => (process.platform === "win32" ? ":(top,glob,icase)" : ":(top,glob)") + path);
 
+const GIT_INERT_CONFIG: readonly (readonly [string, string])[] = [["core.fsmonitor", "false"], ["core.hooksPath", "/dev/null"]];
+const GIT_INERT_ENV = { GIT_OPTIONAL_LOCKS: "0", GIT_NO_LAZY_FETCH: "1", GIT_ALLOW_PROTOCOL: "" };
+const GIT_FILTER_DRIVER_KEY = /^filter\.(.+)\.(clean|process)$/;
+const GIT_GITLINK_ENTRY = /^160000 [0-9a-f]+ \d\t([\s\S]+)$/;
+const GIT_READ_OPTIONS: ExecFileSyncOptionsWithStringEncoding = { shell: false, windowsHide: true, encoding: "utf8", timeout: 5000, maxBuffer: 32 * 1024 * 1024, stdio: ["ignore", "pipe", "pipe"] };
+const gitEnvByJudgement = new WeakMap<Map<string, boolean>, Map<string, NodeJS.ProcessEnv>>();
+
+export function gitInertEnv(filterDrivers: Iterable<string> = []): NodeJS.ProcessEnv {
+  const entries = [...GIT_INERT_CONFIG, ...[...new Set(filterDrivers)].flatMap(driver =>
+    [[`filter.${driver}.clean`, ""], [`filter.${driver}.process`, ""], [`filter.${driver}.required`, "false"]] as const)];
+  const start = Number(process.env.GIT_CONFIG_COUNT) || 0;
+  const env: NodeJS.ProcessEnv = { ...process.env, ...GIT_INERT_ENV, GIT_CONFIG_COUNT: String(start + entries.length) };
+  entries.forEach(([key, value], i) => { env[`GIT_CONFIG_KEY_${start + i}`] = key; env[`GIT_CONFIG_VALUE_${start + i}`] = value; });
+  return env;
+}
+
+function repositoryGitEnv(cwd: string, cache: Map<string, boolean>): NodeJS.ProcessEnv {
+  let envs = gitEnvByJudgement.get(cache);
+  if (!envs) gitEnvByJudgement.set(cache, envs = new Map());
+  const cached = envs.get(cwd);
+  if (cached) return cached;
+  const keys = spawnSync("git", ["config", "-z", "--name-only", "--get-regexp", GIT_FILTER_DRIVER_KEY.source], { ...GIT_READ_OPTIONS, cwd, env: gitInertEnv() });
+  if (keys.error || (keys.status !== 0 && keys.status !== 1)) throw keys.error ?? Error(String(keys.stderr));
+  const env = gitInertEnv(String(keys.stdout).split("\0").flatMap(key => GIT_FILTER_DRIVER_KEY.exec(key)?.[1] ?? []));
+  envs.set(cwd, env);
+  return env;
+}
+
+function gitReader(cwd: string, cache: Map<string, boolean>): (args: string[]) => string {
+  return args => execFileSync("git", args, { ...GIT_READ_OPTIONS, cwd, env: repositoryGitEnv(cwd, cache) });
+}
+
 function gitControlPaths(cwd: string, paths: readonly string[], configDir: string, cache: Map<string, boolean>, target?: string, stash = false): boolean {
   const key = JSON.stringify([cwd, paths, target, stash]);
   const cached = cache.get(key);
   if (cached !== undefined) return cached;
-  const read = (args: string[]) => execFileSync("git", args, {
-    cwd, shell: false, windowsHide: true, encoding: "utf8", timeout: 5000, maxBuffer: 32 * 1024 * 1024,
-    stdio: ["ignore", "pipe", "pipe"],
-  });
+  const read = gitReader(cwd, cache);
   let blocked: boolean;
   try {
     const tree = read(["rev-parse", "--show-toplevel"]).trim();
@@ -539,17 +568,21 @@ function gitControlPaths(cwd: string, paths: readonly string[], configDir: strin
     const status = !stash && (target === undefined || read(["rev-parse", "--verify", "--end-of-options", target + "^{commit}"]).trim() === read(["rev-parse", "--verify", "HEAD"]).trim());
     let listed: string;
     if (stash) {
-      const args = ["stash", "show", "--name-only", "-z"];
+      const args = ["stash", "show", "--name-only", "-z", "--no-ext-diff", "--no-textconv"];
       try { listed = read([...args, "--include-untracked", target ?? "stash@{0}"]); }
       catch { listed = read([...args, target ?? "stash@{0}"]); }
     } else listed = status
-      ? read(["status", "--porcelain=v1", "-z", "--untracked-files=all", "--", ...specs])
-      : read(["diff", "--name-only", "--no-relative", "-z", "HEAD", target!, "--", ...specs]);
+      ? read(["status", "--porcelain=v1", "-z", "--untracked-files=all", "--ignore-submodules=dirty", "--", ...specs])
+      : read(["diff", "--name-only", "--no-ext-diff", "--no-textconv", "--no-relative", "-z", "HEAD", target!, "--", ...specs]);
     const entries = listed.split("\0").filter(Boolean);
     const files: string[] = [];
     for (let i = 0; i < entries.length; i++) {
       files.push(status ? entries[i].slice(3) : entries[i]);
       if (status && /^[RC]|^.[RC]/.test(entries[i]) && entries[i + 1]) files.push(entries[++i]);
+    }
+    if (status) for (const entry of read(["ls-files", "-s", "-z", "--full-name", "--", ...specs]).split("\0")) {
+      const gitlink = GIT_GITLINK_ENTRY.exec(entry);
+      if (gitlink) files.push(gitlink[1]);
     }
     blocked = files.some(file => isControlPath(resolve(tree, file), configDir));
   } catch (error) {
@@ -566,10 +599,7 @@ function gitListedControls(cwd: string, paths: readonly string[], configDir: str
   if (cached !== undefined) return cached;
   let blocked: boolean;
   try {
-    const listed = execFileSync("git", args, {
-      cwd, shell: false, windowsHide: true, encoding: "utf8", timeout: 5000, maxBuffer: 32 * 1024 * 1024,
-      stdio: ["ignore", "pipe", "pipe"],
-    });
+    const listed = gitReader(cwd, cache)(args);
     blocked = listed.split("\0").filter(Boolean).some(file => !file.endsWith("/") && isControlPath(resolve(cwd, file), configDir));
   } catch (error) { blocked = !/not a git repository/i.test(String((error as { stderr?: unknown }).stderr ?? "")); }
   cache.set(key, blocked);

@@ -7,7 +7,6 @@ import type { PlanUsage, PlanTokenTotal } from "./plan-usage";
 import { isExternalRunTool } from "./orchestration-executors";
 import { isRejectedBeforeRun } from "./tool-result-signals";
 import { conductorStopTarget } from "./tool-intent";
-import * as l10n from "@vscode/l10n";
 
 export type TimeBucket = "generate" | "tool" | "delegation" | "confirm" | "reply";
 export type TimeLane = "main" | "sub";
@@ -23,7 +22,6 @@ export const MAX_TIME_BLOCKS = 500;
 const MAX_STOPPED_TASK_IDS = 256;
 export const MAX_BLOCK_TEXT = 600;
 export const MAX_MODEL_MARKS = 4096;
-export const MAIN_MODEL_TOP_COUNT = 3;
 const TASK_NOTIFICATION_MARKER = "A task-notification fires each time this agent stops";
 
 export function isRequestMessageText(text: string): boolean {
@@ -898,25 +896,6 @@ export interface RequestBlockView {
   metrics?: PlanBlockMetrics;
 }
 
-export interface MainModelTimeEntry {
-  kind: "model" | "other" | "unknown";
-  label: string;
-  model: string | null;
-  foldedModelCount: number | null;
-  generateMs: number;
-  share: number | null;
-  percent: number | null;
-}
-
-export interface MainTimeByModelView {
-  totalMs: number;
-  generateMs: number;
-  models: MainModelTimeEntry[];
-  toolMs: number;
-  toolShare: number | null;
-  toolPercent: number | null;
-}
-
 export interface ConductorModel { model: string; effort?: string }
 export interface MainModelSpan extends ConductorModel { start: number; end: number }
 
@@ -932,7 +911,6 @@ export interface TimeBucketView {
   main: TimeBucketTotals;
   sub: { generateMs: number; toolMs: number; spanMs: number };
   bars: { totalMs: number | null; mainMs: number | null; toolMs: number | null; subMs: number };
-  mainByModel: MainTimeByModelView | null;
   agentCount: number;
   maxParallelAgents: number;
   currentParallel: number;
@@ -970,88 +948,6 @@ function sweepMax(spans: readonly Span[]): number {
     if (cur > max) max = cur;
   }
   return max;
-}
-
-export function deriveMainByModel(
-  turns: readonly TurnSpan[],
-  generate: readonly Span[],
-  toolMs: number,
-  marks: readonly ModelMark[]
-): MainTimeByModelView {
-  const sortedMarks = [...marks].sort((a, b) => a.at - b.at);
-  const byModel = new Map<string, number>();
-  let unknownMs = 0;
-  let covered = -Infinity;
-  let gi = 0;
-  const credit = (model: string | undefined, s0: number, s1: number): void => {
-    const start = Math.max(s0, covered);
-    if (s1 <= start) return;
-    covered = s1;
-    while (gi < generate.length && generate[gi][1] <= start) gi++;
-    let ms = 0;
-    for (let j = gi; j < generate.length && generate[j][0] < s1; j++) {
-      ms += Math.max(0, Math.min(s1, generate[j][1]) - Math.max(start, generate[j][0]));
-    }
-    if (ms <= 0) return;
-    if (model === undefined) unknownMs += ms;
-    else byModel.set(model, (byModel.get(model) ?? 0) + ms);
-  };
-  let mi = 0;
-  let current: string | undefined;
-  for (const t of [...turns].sort((a, b) => a.start - b.start)) {
-    while (mi < sortedMarks.length && sortedMarks[mi].at <= t.start) current = sortedMarks[mi++].model;
-    let cursor = t.start;
-    while (mi < sortedMarks.length && sortedMarks[mi].at <= t.end) {
-      const mark = sortedMarks[mi++];
-      credit(mark.model, cursor, mark.at);
-      cursor = mark.at;
-      current = mark.model;
-    }
-    credit(current, cursor, t.end);
-  }
-  const generateMs = measureSpans(generate);
-  const totalMs = generateMs + toolMs;
-  const ranked = [...byModel].sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]));
-  const models: MainModelTimeEntry[] = ranked.slice(0, MAIN_MODEL_TOP_COUNT).map(([model, ms]) => ({
-    kind: "model",
-    label: model.replace(/^claude-/, ""),
-    model,
-    foldedModelCount: null,
-    generateMs: ms,
-    share: null,
-    percent: null,
-  }));
-  const folded = ranked.slice(MAIN_MODEL_TOP_COUNT);
-  if (folded.length > 0) {
-    models.push({
-      kind: "other",
-      label: l10n.t("Other {0} models", folded.length),
-      model: null,
-      foldedModelCount: folded.length,
-      generateMs: folded.reduce((acc, [, v]) => acc + v, 0),
-      share: null,
-      percent: null,
-    });
-  }
-  if (unknownMs > 0) {
-    models.push({
-      kind: "unknown",
-      label: l10n.t("Model not observed"),
-      model: null,
-      foldedModelCount: null,
-      generateMs: unknownMs,
-      share: null,
-      percent: null,
-    });
-  }
-  if (totalMs <= 0) return { totalMs, generateMs, models, toolMs, toolShare: null, toolPercent: null };
-  const parts = [...models.map((m) => m.generateMs), toolMs];
-  const percents = largestRemainder(parts, totalMs, 100);
-  models.forEach((m, i) => {
-    m.share = m.generateMs / totalMs;
-    m.percent = percents[i];
-  });
-  return { totalMs, generateMs, models, toolMs, toolShare: toolMs / totalMs, toolPercent: percents[parts.length - 1] };
 }
 
 export function largestRemainder(parts: readonly number[], total: number, amount: number): number[] {
@@ -1372,10 +1268,6 @@ export function deriveTimeBuckets(
   const replyMs = measureSpans(replySpans);
   const subOnlyMs = measureSpans(subOnlySpans);
   const mainBarMs = generateMs + toolMs;
-  const mainByModel =
-    inherited || options?.modelMarks === undefined
-      ? null
-      : deriveMainByModel(turnSpansAll, intersectSpans(generateSpans, whole), toolMs, options.modelMarks);
   const subGenerate = agents.reduce((acc, a) => acc + a.generateMs, 0);
   const subTool = agents.reduce((acc, a) => acc + a.toolMs, 0);
   const subSpan = agents.reduce((acc, a) => acc + Math.max(0, a.end - a.start), 0);
@@ -1523,7 +1415,6 @@ export function deriveTimeBuckets(
       subMs: subBarMs,
       totalMs: inherited ? null : mainBarMs + subBarMs,
     },
-    mainByModel,
     agentCount: agents.length,
     maxParallelAgents,
     currentParallel,

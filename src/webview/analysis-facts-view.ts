@@ -2,6 +2,7 @@ import type { AnalysisFactsView } from "../analysis-facts-view";
 import type { L3ReportPayload, LlmFindingReportView } from "../protocol";
 import { renderLlmActionView } from "./llm-action-view";
 import { vscode } from "./dom";
+import { noRecordReason } from "../session-record";
 import * as l10n from "@vscode/l10n";
 
 function makeEl<K extends keyof HTMLElementTagNameMap>(
@@ -21,7 +22,8 @@ function llmRunControl(
   llmAnalysisEnabled: boolean | undefined,
   turnRunning: boolean,
   llmRunning: boolean,
-  llmTargets: AnalysisFactsView["llmTargets"] | undefined
+  llmTargets: AnalysisFactsView["llmTargets"] | undefined,
+  hasRecord: boolean
 ): HTMLElement {
   const box = makeEl("div", "llm-run");
   const btn = document.createElement("button");
@@ -38,6 +40,11 @@ function llmRunControl(
     box.dataset.runState = "disabled";
     btn.disabled = true;
     btn.title = l10n.t("The setting laisora.workLog.llmAnalysis is disabled");
+  } else if (!hasRecord) {
+    box.dataset.runState = "no-record";
+    btn.disabled = true;
+    btn.title = noRecordReason();
+    note = noRecordReason();
   } else if (llmTargets === undefined) {
     box.dataset.runState = "no-facts";
     btn.disabled = true;
@@ -75,7 +82,8 @@ export function renderAnalysisFactsView(
   turnRunning = false,
   llmRunning = false,
   evidenceNavigation?: { has(toolUseId: string): boolean; navigate(toolUseId: string): void },
-  llmContainer: HTMLElement = container
+  llmContainer: HTMLElement = container,
+  hasRecord = false
 ): void {
   container.textContent = "";
   if (llmContainer !== container) llmContainer.textContent = "";
@@ -84,7 +92,7 @@ export function renderAnalysisFactsView(
     const llmSection = makeEl("div", "af-llm-section");
     const entry = makeEl("div", "llm-entry");
     entry.appendChild(
-      llmRunControl(tabId, undefined, llmAnalysisEnabled, turnRunning, llmRunning, undefined)
+      llmRunControl(tabId, undefined, llmAnalysisEnabled, turnRunning, llmRunning, undefined, hasRecord)
     );
     llmSection.appendChild(entry);
     llmContainer.appendChild(llmSection);
@@ -123,7 +131,8 @@ export function renderAnalysisFactsView(
       llmAnalysisEnabled,
       turnRunning,
       llmRunning,
-      facts.llmTargets
+      facts.llmTargets,
+      hasRecord
     )
   );
   llmSection.appendChild(entry);

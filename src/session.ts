@@ -57,6 +57,7 @@ import {
   LlmUnavailableReason,
   type LlmAnalysisRunProgress,
   type HandoffSourceSnapshot,
+  type HandoffContextMeasurement,
   isInternalSlashCommand,
   projectWorkModel,
   UNOBSERVED_TIME,
@@ -95,6 +96,13 @@ const RESUME_DISPLAY_BYPASS_KINDS: ReadonlySet<string> = new Set([
   "auth_status",
   "rate_limit",
 ]);
+
+export interface StartMeasurement {
+  readonly pending: boolean;
+  readonly result: Promise<HandoffContextMeasurement | null | undefined>;
+  measure(conversation: Pick<ClaudeConversation, "initialContextUsage">): Promise<void>;
+  abandon(): void;
+}
 
 export class Session {
   readonly tabId = randomUUID();
@@ -147,6 +155,9 @@ export class Session {
   seq = 0;
   generation = 1;
   conversation: ClaudeConversation | null = null;
+  cliStartedAt?: number;
+  startMeasurement: StartMeasurement | null = null;
+  readonly unsentSends = new Set<() => void>();
   starting: Promise<void> | null = null;
   resumePreparation: { ready: Promise<void>; release: () => void } | null = null;
   closed = false;
@@ -203,6 +214,8 @@ export class Session {
   }
 
   resetLogicalSession(): void {
+    this.startMeasurement?.abandon();
+    this.startMeasurement = null;
     void writeHeldChosenTitle(this);
     this.initialModel = undefined;
     this.todoItemId = undefined;
@@ -254,6 +267,10 @@ export class Session {
     this.semantic.clearTranscriptTimeBucketsTimer();
     this.summaryRunner.resetForLogicalSession();
     this.resumeSessionId = undefined;
+    if (this.auth?.sessionId !== undefined) {
+      const { sessionId: _clearedSessionId, ...auth } = this.auth;
+      this.auth = auth;
+    }
     this.handoffSource = undefined;
     this.resumeFilePath = undefined;
     releaseHistoryWindow(historyScopeKey(this));

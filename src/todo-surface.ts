@@ -3,6 +3,7 @@ import { stat } from "node:fs/promises";
 import { join } from "node:path";
 import { openFileLink } from "./composer-io";
 import { isInSessionStore, lookupSessionFile } from "./session-files";
+import { sessionRecordId } from "./session-record";
 import { RecordTailReader, TodoAskRecordReader, todoWorkTotal, todoWorkTurnReader, type TodoWorkTurns } from "./todo-ask-record";
 import { parseFileLinkTarget } from "./file-link-target";
 import { getLaisoraConfiguration } from "./claude-settings";
@@ -128,13 +129,9 @@ export function todoTemplateViews(document: TodoDocument): TodoTemplateView[] {
   return todoTemplatesOf(document).map(template => ({ id: template.id, name: template.name, title: template.root.title, size: todoTemplateSize(template.root) }));
 }
 
-export function sessionIdOf(s: Pick<Session, "resumeSessionId" | "auth">): string | undefined {
-  return s.resumeSessionId ?? s.auth?.sessionId ?? undefined;
-}
-
 function openTabs(): TodoTabConversation[] {
   return [...(store?.sessions.values() ?? [])].filter(s => !s.closed).map(s => ({
-    tabId: s.tabId, itemId: s.todoItemId, sessionId: sessionIdOf(s), running: (s.conversation?.state ?? "idle") !== "idle",
+    tabId: s.tabId, itemId: s.todoItemId, sessionId: sessionRecordId(s), running: (s.conversation?.state ?? "idle") !== "idle",
   }));
 }
 
@@ -285,7 +282,7 @@ function tabItemView(document: TodoDocument, entry: { tabId: string; itemId: str
 }
 
 function openSessionTitle(sessionId: string): string | undefined {
-  return [...(store?.sessions.values() ?? [])].find(s => !s.closed && sessionIdOf(s) === sessionId)?.title;
+  return [...(store?.sessions.values() ?? [])].find(s => !s.closed && sessionRecordId(s) === sessionId)?.title;
 }
 
 async function todoSnapshotMessage(seq: number): Promise<TodoSnapshotMessage> {
@@ -353,7 +350,7 @@ function refreshOwnedConversations(): void {
   const todoStore = todoBetaEnabled() ? hostTodoStore() : undefined;
   if (!todoStore) return;
   for (const s of store?.sessions.values() ?? []) {
-    const sessionId = sessionIdOf(s);
+    const sessionId = sessionRecordId(s);
     if (!s.closed && sessionId && sessionItems.get(sessionId)) void applyHostTodoOperation(todoStore, { kind: "touchConversation", sessionId, owner: TODO_WINDOW_ID }, "human");
   }
 }
@@ -466,7 +463,6 @@ function detailItem(document: TodoDocument, id: string): TodoDetailItem | null {
   }
   const guesses = guessView(item);
   const totals = descendantTotals(document, item.id);
-  const parent = liveItem(document, item.parentId);
   return {
     id: item.id, parentId: item.parentId, title: item.title, state: item.state,
     ...(item.completion ? { completion: item.completion } : {}), ...(item.group ? { group: item.group } : {}),
@@ -479,7 +475,6 @@ function detailItem(document: TodoDocument, id: string): TodoDetailItem | null {
     ...(item.estimate ? { estimate: item.estimate } : {}), ...(item.tags ? { tags: item.tags } : {}), ...(item.by ? { by: item.by } : {}),
     ...(guesses ? { guesses } : {}), ...(item.startedAt !== undefined ? { startedAt: item.startedAt } : {}), ...(item.doneAt !== undefined ? { doneAt: item.doneAt } : {}),
     conversations, briefs: todoChildBriefs(item).map(brief => ({ at: brief.at, text: brief.brief })),
-    ...(parent ? { splitBrief: todoStartBrief(item, parent, false) } : {}),
     ...(totals ? { totals } : {}),
     ...(item.source ? { source: { sessionId: item.source.sessionId, ...(openSessionTitle(item.source.sessionId) ? { title: openSessionTitle(item.source.sessionId)!.slice(0, RENAME_TITLE_MAX) } : {}) } } : {}),
   };
@@ -529,16 +524,22 @@ async function itemWork(document: TodoDocument, id: string): Promise<TodoWorkVie
 const TODO_WORK_READS = 4;
 
 function todoStartBrief(item: TodoItem, parent: TodoItem | undefined, continued: boolean): string {
+  const confirmFirst = l10n.t("Before doing any work, reply to the user with what you understand the work to be, the information that is missing, and what you will produce if you start as it stands, and wait for the user's answer.");
   if (!parent) {
     return continued
-      ? l10n.t("Continue the ToDo item “{0}” (id {1}) in this new conversation. Read the item and its work memo with the ToDo tool, then carry on from where it stands.", item.title, item.id)
-      : l10n.t("Start the ToDo item “{0}” (id {1}). This is its parent conversation. Read the item with the ToDo tool, then plan the work.", item.title, item.id);
+      ? [l10n.t("Continue the ToDo item “{0}” (id {1}) in this new conversation. First read the item, its memos and its references with the ToDo tool.", item.title, item.id),
+        confirmFirst, l10n.t("After the user answers, carry on from where it stands.")].join(" ")
+      : [l10n.t("Start the ToDo item “{0}” (id {1}). This is its parent conversation. First read the item, its memos and its references with the ToDo tool.", item.title, item.id),
+        confirmFirst, l10n.t("After the user answers, plan the work.")].join(" ");
   }
   const lines: string[] = [];
   const section = (heading: string, body: readonly string[]) => { lines.push(`## ${heading}`, ...body, ""); };
   section(l10n.t("Instructions for this child"), [
     l10n.t("Work on the ToDo sub-item “{0}” (id {1}) in this child conversation.", item.title, item.id),
     ...(item.userMemo.trim() ? [l10n.t("The user's memo on it: {0}", item.userMemo.trim())] : []),
+    l10n.t("First read this item, the parent's work memo and the references below."),
+    confirmFirst,
+    l10n.t("After the user answers, do the work."),
   ]);
   const memoSections = WORK_MEMO_SECTIONS.filter(entry => parent.workMemo[entry]?.text);
   section(l10n.t("Work memo to read"), [
@@ -669,7 +670,7 @@ export function toggleTodoDrawer(): void {
 }
 
 export function offerTodoReopen(st: SessionStore, s: Session, sender: vscode.Webview): void {
-  const sessionId = sessionIdOf(s);
+  const sessionId = sessionRecordId(s);
   if (!sessionId || !todoBetaEnabled() || !sessionItems.get(sessionId)) return;
   const reopen = l10n.t("Reopen");
   void vscode.window.showInformationMessage(l10n.t("LAISORA: Closed the conversation of a ToDo item, “{0}”.", s.title), reopen).then(choice => {
@@ -796,7 +797,7 @@ const liveItem = (document: TodoDocument, id: string | null | undefined) =>
 const sessionItems = new Map<string, string | null>();
 
 export function noteTodoSessionEnded(s: Session): void {
-  const sessionId = sessionIdOf(s);
+  const sessionId = sessionRecordId(s);
   if (!sessionId) return;
   const linked = sessionItems.get(sessionId);
   sessionItems.delete(sessionId);
@@ -805,7 +806,7 @@ export function noteTodoSessionEnded(s: Session): void {
 }
 
 function cachedItemOf(s: Session): string | undefined {
-  const sessionId = sessionIdOf(s);
+  const sessionId = sessionRecordId(s);
   return s.todoItemId ?? (sessionId ? sessionItems.get(sessionId) ?? undefined : undefined);
 }
 
@@ -813,7 +814,7 @@ export async function todoLinkedItemAtStart(s: Session): Promise<TodoLinkedItem 
   try {
     const read = await readTodoDocument("conversation start");
     if (!read) return undefined;
-    const sessionId = sessionIdOf(s);
+    const sessionId = sessionRecordId(s);
     const linked = linkedTodoItem(read.document.items, sessionId);
     if (sessionId) sessionItems.set(sessionId, linked?.id ?? null);
     if (sessionId && linked) void applyHostTodoOperation(read.todoStore, { kind: "touchConversation", sessionId, owner: TODO_WINDOW_ID }, "human");
@@ -849,7 +850,7 @@ export function noteTodoConversationEvent(s: Session, ev: { kind: string; auth?:
   const startedAt = s.todoTurnStartedAt;
   s.todoTurnStartedAt = undefined;
   if (cachedItemOf(s) === undefined) return;
-  const sessionId = sessionIdOf(s);
+  const sessionId = sessionRecordId(s);
   const todoStore = hostTodoStore();
   if (startedAt === undefined || !sessionId || !todoStore) {
     postTodoSnapshot();
@@ -883,7 +884,7 @@ async function openTodoConversationNow(st: SessionStore, msg: Extract<WebviewToH
   const read = await readTodoDocument("open a conversation");
   const item = read ? liveItem(read.document, msg.itemId) : undefined;
   if (!read || !item) return;
-  const tabs = [...st.sessions.values()].filter(s => !s.closed).map(s => ({ tabId: s.tabId, itemId: s.todoItemId, sessionId: sessionIdOf(s), running: false }));
+  const tabs = [...st.sessions.values()].filter(s => !s.closed).map(s => ({ tabId: s.tabId, itemId: s.todoItemId, sessionId: sessionRecordId(s), running: false }));
   const target = todoConversationTarget(read.document.items, item.id, tabs, msg.fresh, { owner: TODO_WINDOW_ID, now: Date.now() });
   if (target.kind === "elsewhere") {
     showOpenElsewhere();
@@ -913,7 +914,7 @@ async function openTodoConversationNow(st: SessionStore, msg: Extract<WebviewToH
     if (!session) return false;
     postTodoSnapshot();
     const parent = liveItem(read.document, item.parentId);
-    const brief = msg.fresh && msg.brief?.trim() ? msg.brief.trim() : todoStartBrief(item, parent, item.conversations !== undefined);
+    const brief = todoStartBrief(item, parent, item.conversations !== undefined);
     await applyHostTodoOperation(read.todoStore, { kind: "recordStart", id: item.id, start: parent ? "child" : item.conversations !== undefined || msg.fresh ? "continue" : "start", brief, tab: todoTabKey(session.tabId) }, "human");
     await sendLaisoraInput(session, { kind: "todo", title: item.title }, brief);
     return true;

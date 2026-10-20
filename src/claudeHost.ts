@@ -73,7 +73,7 @@ import type { TodoStore } from "./todo-store";
 import { claudeModelIdLabel, isExternalRunTool } from "./orchestration-executors";
 import type { CompletionVerdict, NumberedLaunchVerdict, ResumeVerdict } from "./time-buckets";
 import { planItemLabel } from "./plan-steps";
-import { LearningIngestion, delegationInvalidFields, type LearningToolResult, type LearningSubject } from "./learning-ingestion";
+import { LearningIngestion, agentRecipient, delegationInvalidFields, type LearningToolResult, type LearningSubject } from "./learning-ingestion";
 import { AgentAttribution } from "./orchestration-attribution";
 import type { NormalizedOutMeta } from "./claude-normalizer";
 import { askQualityDenial, rejectedAskTitles } from "./markdown-ast";
@@ -129,6 +129,10 @@ export const PLAN_INSTRUCTION = [
   "```laisora-ask\nkind: check\ntitle: Check the result on your machine\nwhy: What I cannot verify here, and why.\nsteps:\n  - do: Open the changed screen.\n    look: Confirm the labels fit without clipping.\n  - do: Resize the window.\n    look: Confirm every action remains reachable.\ndefault: While awaiting the result, I will continue with the independent work.\n```",
   "</format>",
 ].join("\n");
+
+export function interruptDiscardNotice(count: number): string {
+  return l10n.t("Discarded {0} unprocessed messages due to the interrupt", count);
+}
 
 export function planItemDenial(numbers: readonly number[]): string {
   return `Rejected before running: start the description with the number of the PLAN step this delegation serves as shown in the PLAN panel and a space (current steps: ${numbers.map(planItemLabel).join(", ")}), as in "03 Remove model research", then send the same call again.`;
@@ -390,7 +394,7 @@ export class ClaudeConversation {
 
   private async settleTargetResults(parent: string, agentId?: string, subject?: LearningSubject): Promise<void> {
     if (agentId) {
-      const placeholder = `agent:${agentId}`;
+      const placeholder = agentRecipient(agentId);
       const results = this.pendingTargetResults.get(placeholder) ?? [];
       this.pendingTargetResults.delete(placeholder);
       const list = this.pendingTargetResults.get(parent) ?? [];
@@ -1152,7 +1156,7 @@ ${ctxJson}`
       const observeFailure: ClaudeCodeSdk.HookCallback = async input => {
         if (input.hook_event_name === "PreToolUse") {
           const previous = this.hookTools.get(input.tool_use_id);
-          const parent = previous?.parent ?? (input.agent_id ? `agent:${input.agent_id}` : undefined);
+          const parent = previous?.parent ?? (input.agent_id ? agentRecipient(input.agent_id) : undefined);
           this.hookTools.set(input.tool_use_id, { tool: input.tool_name, input: input.tool_input, parent,
             model: previous?.model ?? (input.agent_id ? this.observedAgents.get(input.agent_id)?.model : undefined)
               ?? (parent ? this.attribution.observedModel(parent) : undefined) });
@@ -1161,7 +1165,7 @@ ${ctxJson}`
         } else if (input.hook_event_name === "PostToolUseFailure") {
           const previous = this.hookTools.get(input.tool_use_id);
           this.ingestResult({ toolUseId: input.tool_use_id, tool: input.tool_name, input: input.tool_input,
-            parentToolUseId: previous?.parent ?? (input.agent_id ? `agent:${input.agent_id}` : undefined), observedModel: previous?.model
+            parentToolUseId: previous?.parent ?? (input.agent_id ? agentRecipient(input.agent_id) : undefined), observedModel: previous?.model
               ?? (input.agent_id ? this.observedAgents.get(input.agent_id)?.model : undefined),
             text: input.is_interrupt ? "[Request interrupted by user]" : input.error, isError: true });
         }
@@ -1175,7 +1179,7 @@ ${ctxJson}`
           && output.hookSpecificOutput?.hookEventName === "PreToolUse" && output.hookSpecificOutput.permissionDecision === "deny") {
           const previous = this.hookTools.get(input.tool_use_id);
           this.ingestResult({ toolUseId: input.tool_use_id, tool: input.tool_name, input: input.tool_input,
-            parentToolUseId: previous?.parent ?? (input.agent_id ? `agent:${input.agent_id}` : undefined), text: "", isError: false, hookDenied: true });
+            parentToolUseId: previous?.parent ?? (input.agent_id ? agentRecipient(input.agent_id) : undefined), text: "", isError: false, hookDenied: true });
         }
         return output;
       });
@@ -1366,7 +1370,7 @@ ${ctxJson}`
     if (drained > 0) {
       this.emit({
         kind: "error",
-        message: l10n.t("Discarded {0} unprocessed messages due to the interrupt", drained),
+        message: interruptDiscardNotice(drained),
         fatal: false,
       });
     }

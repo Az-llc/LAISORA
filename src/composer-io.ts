@@ -87,24 +87,15 @@ function createExportSink(lines: string[], userHeading: string): {
   return { push, flush };
 }
 
-function heldEventsForExport(events: readonly NormalizedEvent[], handoff: boolean): NormalizedEvent[] {
-  let replayedFrom: number | undefined;
+function heldEventsForExport(events: readonly NormalizedEvent[]): NormalizedEvent[] {
+  const drawn = new Set<string>();
   for (const ev of events) {
-    if (ev.kind !== "replayed_message") continue;
-    const at = ev.recordedAt ?? ev.timestamp;
-    if (replayedFrom === undefined || at < replayedFrom) replayedFrom = at;
+    if (ev.provenance?.path === "history" && (ev.kind === "assistant_message_uuid" || ev.kind === "user_message") && ev.uuid) drawn.add(ev.uuid);
   }
-  const isHistoryConversation = (ev: NormalizedEvent): boolean =>
-    ev.provenance?.path === "history" &&
-    (ev.kind === "user_message" || ev.kind === "assistant_text_delta" || ev.kind === "tool_call_started");
-  if (replayedFrom === undefined) {
-    return handoff ? events.filter((ev) => !isHistoryConversation(ev)) : [...events];
-  }
-  const covered = replayedFrom;
   return events.filter((ev) => {
-    if (!isHistoryConversation(ev)) return true;
-    if (handoff && ev.timestamp < covered) return false;
-    return !(ev.timestamp >= covered && ev.kind !== "tool_call_started");
+    if (ev.kind === "replayed_message") return ev.uuid === undefined || !drawn.has(ev.uuid);
+    const priorConversation = (ev.kind === "user_message" || ev.kind === "assistant_text_delta" || ev.kind === "tool_call_started") && ev.priorGeneration === true;
+    return !priorConversation;
   });
 }
 
@@ -136,7 +127,7 @@ async function buildExportMarkdown(s: Session): Promise<string> {
     output.appendLine(`[${s.title}] export: falling back to held events (${degraded ?? "empty-record"})`);
     lines.push(l10n.t("- Note: the record could not be read, so only the part held in memory was exported."), "");
     const sink = createExportSink(lines, userHeading);
-    for (const ev of heldEventsForExport(s.events, s.handoffSource !== undefined)) sink.push(ev);
+    for (const ev of heldEventsForExport(s.events)) sink.push(ev);
     sink.flush();
     return lines.join("\n");
   }

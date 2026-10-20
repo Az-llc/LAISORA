@@ -201,7 +201,7 @@ html, body {
 .settings-switch:disabled,
 .settings-segment:disabled,
 .settings-swatch:disabled {
-  opacity: 0.5;
+  opacity: var(--l-disabled-opacity);
   cursor: default;
 }
 
@@ -340,7 +340,7 @@ html, body {
 textarea.settings-input { height: auto; }
 .settings-input::placeholder { color: var(--vscode-input-placeholderForeground, var(--vscode-descriptionForeground)); }
 .settings-input:disabled {
-  opacity: 0.5;
+  opacity: var(--l-disabled-opacity);
 }
 .settings-input:focus-visible {
   outline: 1px solid var(--vscode-focusBorder);
@@ -518,14 +518,14 @@ textarea.settings-input { height: auto; }
 .settings-chip { width: 100%; padding: var(--settings-gap-1); font-size: 12px; }
 .settings-model-field { min-width: 0; display: flex; flex-direction: column; align-items: stretch; gap: 4px; }
 .settings-remove-model { font-size: 18px; }
-.settings-link:disabled { opacity: 0.5; cursor: default; }
+.settings-link:disabled { opacity: var(--l-disabled-opacity); cursor: default; }
 .settings-model-field input, .settings-model-field select { box-sizing: border-box; width: 100%; min-width: 0; max-width: 100%; }
 .settings-chip.settings-unsupported { color: var(--vscode-descriptionForeground); background: var(--vscode-dropdown-background); opacity: 0.5; }
 .settings-role-warning { margin: var(--settings-gap-3) 0 0; }
 .settings-instruction-details { margin-top: var(--settings-gap-4); }
 .settings-instruction-preview { white-space: pre-wrap; overflow-wrap: anywhere; max-height: 320px; overflow-y: auto; }
 .settings-instruction-preview:focus-visible { outline: 1px solid var(--vscode-focusBorder); }
-.settings-disabled { opacity: 0.5; }
+.settings-disabled { opacity: var(--l-disabled-opacity); }
 .settings-disabled :disabled { opacity: 1; }
 .settings-roster-actions { display: flex; flex-wrap: wrap; align-items: baseline; gap: var(--settings-gap-2); margin: var(--settings-gap-4) 0; }
 .settings-role-field { flex: 1; min-width: 140px; max-width: 100%; }

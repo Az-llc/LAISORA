@@ -29,6 +29,7 @@ import {
   sessionTranscriptRef,
 } from "./session-files";
 import { normalizeTitleValue } from "./session-display-title";
+import { sessionRecordId } from "./session-record";
 import type { SessionCandidate } from "./session-list";
 import { SESSION_RESOLVE_BATCH, candidatePathIndex, displayTitleFromSummary, rankSessionCandidates, streamSessionRows } from "./session-list";
 import type { SessionStore } from "./store-surfaces";
@@ -40,7 +41,7 @@ function usedSessionPaths(): Record<string, string> {
   return usedSessions ??= extensionContext?.globalState.get<Record<string, string>>(USED_SESSIONS_KEY, {}) ?? {};
 }
 export function rememberSession(session: Session): void {
-  const id = session.resumeSessionId ?? session.auth?.sessionId;
+  const id = sessionRecordId(session);
   if (!id) return;
   if (!usedSessionPaths()[id]) {
     const ref = sessionTranscriptRef(session);
@@ -76,7 +77,7 @@ function openTabEntries(): PersistedOpenTab[] {
   const seen = new Set<string>();
   for (const s of store?.sessions.values() ?? []) {
     if (s.closed) continue;
-    const sessionId = s.resumeSessionId ?? s.auth?.sessionId;
+    const sessionId = sessionRecordId(s);
     if (!sessionId || seen.has(sessionId)) continue;
     seen.add(sessionId);
     const filePath = s.resumeSessionId && s.resumeFilePath ? s.resumeFilePath : usedSessionPaths()[sessionId];
@@ -530,7 +531,7 @@ async function renameOpenSession(
 
 function openSessionsOf(st: SessionStore, sessionId: string): Session[] {
   return [...st.sessions.values()].filter(s =>
-    !s.closed && (s.resumeSessionId ?? s.auth?.sessionId) === sessionId && sessionTranscriptRef(s)?.sessionId === sessionId);
+    !s.closed && sessionRecordId(s) === sessionId && sessionTranscriptRef(s)?.sessionId === sessionId);
 }
 
 async function renameListedSession(st: SessionStore, msg: Extract<WebviewToHost, { type: "renameSession" }>): Promise<void> {

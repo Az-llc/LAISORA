@@ -10,6 +10,8 @@ import { installKeyOf, LearningConversationKey, LearningLedger, opaqueLearningRe
 import { claudeModelIdLabel } from "./orchestration-executors";
 import { LearningDetector } from "./learning-detector";
 
+export const agentRecipient = (id: string): string => `agent:${id}`;
+
 export interface LearningToolResult {
   toolUseId: string;
   parentToolUseId?: string;
@@ -31,7 +33,7 @@ export interface LearningToolResult {
 export interface LearningSubject { recipient: string; run: string; dispatchId: string; executor?: "claude" | "codex" | "agy"; model?: string; effort?: string; role?: string }
 
 export const DELEGATION_SCHEMA_VERSION = 2;
-export const DELEGATION_SDK_VERSION = "0.3.296";
+export const DELEGATION_SDK_VERSION = "0.3.304";
 const agentString = (value: unknown) => typeof value === "string";
 const agentSchema = {
   description: agentString, prompt: agentString, subagent_type: agentString, name: agentString, team_name: agentString,
@@ -126,7 +128,7 @@ export class LearningIngestion {
       await this.persistPending();
       if (!this.stateReady) await this.restoreState();
       const subject = result.boundaryCode ? undefined : capturedSubject ?? (parent ? this.target(parent) : undefined);
-      const recipient = this.ref("recipient", subject?.recipient ?? (parent ? `agent:${parent}` : "conductor"));
+      const recipient = this.ref("recipient", subject?.recipient ?? (parent ? agentRecipient(parent) : "conductor"));
       const run = this.ref("run", subject?.run ?? (parent ?? this.run));
       const dispatchId = this.ref("dispatch", result.dispatchId ?? subject?.dispatchId ?? (parent ?? this.dispatchId));
       const conversation = this.conversation ?? "unknown";

@@ -7,14 +7,15 @@ import { join } from "node:path";
 
 import { configuredClaudeExecutablePath, inheritedProfile, resolveSessionCwd } from "./claude-settings";
 import { claudeConfigDir } from "./claude-env";
-import { resolveHandoffRuntime } from "./claudeHost";
+import { resolveHandoffRuntime, type ClaudeConversation } from "./claudeHost";
 import { openResumedSession, openSessionById } from "./resume-hydration";
-import type { Session } from "./session";
+import type { Session, StartMeasurement } from "./session";
 import {
   handoffDecisionCounts,
   handoffDecisionLineCount,
   handoffContextUsageKey,
   handoffUnreadableLinesKey,
+  type HandoffContextMeasurement,
   type HandoffContextUsage,
 } from "./handoff-envelope";
 import {
@@ -32,6 +33,7 @@ import {
 import { extensionContext, output } from "./host-context";
 import { normalizeApiKeyPolicy, restoredHandoffRunId, type HostToWebview, type WebviewToHost } from "./protocol";
 import { lookupSessionFile } from "./session-files";
+import { sessionRecordId } from "./session-record";
 import { displayTitleFromSummary } from "./session-list";
 import { sessionSummaryOf } from "./session-list-wiring";
 import type { SessionStore } from "./store-surfaces";
@@ -70,7 +72,7 @@ export async function readHandoffRecords(filePath: string): Promise<HandoffRecor
 async function runHandoff(st: SessionStore, sender: vscode.Webview, target: Session): Promise<void> {
   const runId = randomUUID();
   const profile = inheritedProfile(target);
-  const source = { sessionId: target.resumeSessionId ?? target.auth?.sessionId ?? "", title: target.title };
+  const source = { sessionId: sessionRecordId(target) ?? "", title: target.title };
   const fail = (reason: string, detail?: string, tabId: string = target.tabId): void => {
     st.post({
       type: "handoffStatus",
@@ -205,14 +207,17 @@ async function runHandoff(st: SessionStore, sender: vscode.Webview, target: Sess
         output.appendLine("[handoff] unreadable line count could not be saved: " + String(error)));
     }
     await relinkTodoConversation(source.sessionId, outcome.forkSessionId);
+    const startMeasurement = createStartMeasurement();
     const opened = await openResumedSession(st, {
       sessionId: outcome.forkSessionId,
       filePath: outcome.forkFilePath,
       activate: shouldActivateForkTab(st.activeTabIdOf(sender), target.tabId),
       inherit: profile,
       knownCwd: cwd,
+      startMeasurement,
     });
     if (!opened.tabPosted || opened.session === undefined) {
+      startMeasurement.abandon();
       fail("tab_failed");
       return;
     }
@@ -258,10 +263,9 @@ async function runHandoff(st: SessionStore, sender: vscode.Webview, target: Sess
     st.post({ ...done, tabId: target.tabId });
     st.post({ ...done, tabId: forkSession.tabId });
     const generation = forkSession.logicalGeneration;
-    void settleHandoffContextUsage(forkSession, contextUsage).then(async () => {
-      if (forkSession.logicalGeneration !== generation) return;
+    void settleHandoffContextUsage(startMeasurement, contextUsage).then(async () => {
       if (!target.closed) st.post({ ...done, tabId: target.tabId });
-      if (!forkSession.closed) st.post({ ...done, tabId: forkSession.tabId });
+      if (forkSession.logicalGeneration === generation && !forkSession.closed) st.post({ ...done, tabId: forkSession.tabId });
       const saveFinal = async (): Promise<void> => {
         await handoffPersist().update(contextUsageKey, { ...contextUsage });
       };
@@ -416,7 +420,7 @@ export async function handleHandoffMessage(
           state: "failed",
           reason: "cancelled",
           message: l10n.t("Cancelled"),
-          source: { sessionId: target!.resumeSessionId ?? target!.auth?.sessionId ?? "", title: target!.title },
+          source: { sessionId: sessionRecordId(target!) ?? "", title: target!.title },
         });
       }
       break;
@@ -427,21 +431,46 @@ export async function handleHandoffMessage(
   }
 }
 
-export async function settleHandoffContextUsage(session: Pick<Session, "starting" | "conversation" | "closed" | "expectedConversationId">, usage: HandoffContextUsage): Promise<void> {
+const INITIAL_CONTEXT_USAGE_WAIT_MS = 10_000;
+
+export async function initialContextUsageWithin(
+  conversation: Pick<ClaudeConversation, "initialContextUsage">
+): Promise<HandoffContextMeasurement | null> {
   let timer: ReturnType<typeof setTimeout> | undefined;
   try {
-    usage.after = await Promise.race([
-      (async () => {
-        await session.starting;
-        const conversation = session.conversation;
-        if (session.closed || !conversation || conversation.conversationId !== session.expectedConversationId) return null;
-        return await conversation.initialContextUsage;
-      })(),
-      new Promise<null>((resolve) => { timer = setTimeout(() => resolve(null), 10_000); }),
+    return await Promise.race([
+      conversation.initialContextUsage,
+      new Promise<null>((resolve) => { timer = setTimeout(() => resolve(null), INITIAL_CONTEXT_USAGE_WAIT_MS); }),
     ]);
   } catch {
-    usage.after = null;
+    return null;
   } finally {
     if (timer !== undefined) clearTimeout(timer);
   }
+}
+
+export function createStartMeasurement(): StartMeasurement {
+  let pending = true;
+  let resolve!: (value: HandoffContextMeasurement | null | undefined) => void;
+  const result = new Promise<HandoffContextMeasurement | null | undefined>((r) => { resolve = r; });
+  const settle = (value: HandoffContextMeasurement | null | undefined): void => {
+    if (!pending) return;
+    pending = false;
+    resolve(value);
+  };
+  return {
+    get pending() { return pending; },
+    result,
+    async measure(conversation) {
+      void initialContextUsageWithin(conversation).then(settle);
+      await result;
+    },
+    abandon: () => settle(undefined),
+  };
+}
+
+export async function settleHandoffContextUsage(measurement: StartMeasurement, usage: HandoffContextUsage): Promise<void> {
+  const after = await measurement.result;
+  if (after === undefined) delete usage.after;
+  else usage.after = after;
 }

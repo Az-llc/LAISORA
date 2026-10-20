@@ -2,6 +2,7 @@ import { EXECUTORS, isExternalExecutorId, type ExternalExecutorId } from "./orch
 import type { AgentRunRecord, ExternalRunRecord, TokenUsage } from "./orchestration-external";
 import { orchestrationVariants, type ExternalRow, type OrchestrationRow } from "./orchestration-roster";
 import type { ClaudeConversation, ClaudeHostOptions } from "./claudeHost";
+import type { RosterEvidence } from "./roster-evidence";
 
 export interface OrchestrationView {
   roster: {
@@ -22,6 +23,21 @@ export function orchestrationViewForConversation(conv: ClaudeConversation, curre
     conv.orchestrationRuns.filter((run) => run.kind === "external"), conv.orchestrationPerCallEffort, conv.recordedAgentRoles, conv.orchestrationAgentVariants);
 }
 
+export function orchestrationViewFromStartingRoster(evidence: RosterEvidence): OrchestrationView | undefined {
+  const injection = evidence.injections.at(-1);
+  if (injection === undefined || injection.agents.length === 0) return undefined;
+  const variants = new Map<string, OrchestrationVariantView>();
+  for (const agent of injection.agents) {
+    const variant = variants.get(agent.agentKey) ?? { role: agent.role, agentKey: agent.agentKey, model: agent.model, efforts: [] };
+    if (agent.effort !== null && !variant.efforts.includes(agent.effort)) variant.efforts.push(agent.effort);
+    variant.effort ??= agent.effort ?? undefined;
+    variants.set(agent.agentKey, variant);
+  }
+  return projectOrchestrationView([], [], false, new Map(), new Map(), [], injection.perCallEffort === true, new Map(), [...variants.values()]);
+}
+
+interface OrchestrationVariantView { role: string; agentKey: string; model: string; effort?: string; efforts: string[] }
+
 const USAGE_KEYS = ["input_tokens", "cached_input_tokens", "output_tokens", "reasoning_output_tokens",
   "cache_read_input_tokens", "cache_creation_input_tokens", "total_tokens", "thinking_tokens", "cache_read_tokens"];
 
@@ -40,7 +56,7 @@ export function projectOrchestrationView(
   roster: readonly OrchestrationRow[], external: readonly ExternalRow[], settingsChanged: boolean,
   settings: ReadonlyMap<string, Readonly<{ agentType?: string; model?: string; effort?: string }>>,
   agents: ReadonlyMap<string, AgentRunRecord>, runs: readonly ExternalRunRecord[], perCallEffort = false,
-  recordedRoles: ReadonlyMap<string, string> = new Map(), variants = orchestrationVariants(roster)
+  recordedRoles: ReadonlyMap<string, string> = new Map(), variants: readonly OrchestrationVariantView[] = orchestrationVariants(roster)
 ): OrchestrationView {
   const roleByAgentKey = new Map([...recordedRoles, ...variants.map((variant) => [variant.agentKey, variant.role] as const)]);
   return {

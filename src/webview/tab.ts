@@ -37,6 +37,7 @@ import type { HandoffContextMeasurement, HandoffDecisionCounts, HandoffSourceSna
 import type { HandoffCompactStats, HandoffContextUsage, HandoffDecisionEntry } from "../handoff-envelope";
 import * as l10n from "@vscode/l10n";
 import { inputEl, logsEl, tabbarEl, usagePanelEl, sessionActionsEl, vscode } from "./dom";
+import { closeGlyphButton } from "./close-button";
 import { buildApprovalBody, buildRestoredApprovalCard } from "./approval";
 import { clock, formatDuration, monthDayClock, toolSummary } from "./format";
 import { uiLocale } from "./l10n";
@@ -46,7 +47,8 @@ import { askOtherChoice, askHeading, askOptionContent, rejectRenderedAsks, settl
 import { askQualityCheckEnabled, editSummaryEnabled, onEditSummaryChange } from "./menu";
 import { aggregateTurnEdits, buildEditSummaryCard, type TurnFileEdit } from "./edit-summary-card";
 import { createYouItems, encodeAskDismissal, encodeAskResolution, youAnchor, type AskIdentity, type AskResolutionRecord, type YouItemsReader } from "./you-items";
-import { appendRecordPart, findCommitBoundary, joinRecordTexts, prependRecordParts, recordSeparator, type RecordTextPart } from "../commit-boundary";
+import { findCommitBoundary, joinRecordTexts, prependRecordParts, recordSeparator, type RecordTextPart } from "../commit-boundary";
+import { breaksParagraph, cardHome, compareTurnOrder, editSummaryPlace, labelPendingParts, legacyAskKeys, locateInParts, mergedParagraph, paragraphKey, paragraphText, prependTurnLayout, turnLabelModel, type ModelMark, type TurnItem, type TurnOrder, type TurnParagraph } from "./turn-layout";
 import { isConvRenderableEvent } from "../conv-renderable";
 import {
   applyActivityEvent,
@@ -105,6 +107,15 @@ function writeModelText(span: HTMLElement, text: string): boolean {
 }
 
 type HandoffDetailKind = "messages" | "decisions" | "summary";
+type PastTurns = {
+  readonly frag: DocumentFragment;
+  readonly items: Map<string, TurnItem[]>;
+  readonly touched: Set<string>;
+  readonly slots: Map<string, HTMLElement>;
+  readonly frames: Map<string, HTMLElement>;
+  readonly recordIds: Map<string, string>;
+};
+type PastParagraph = { parts: RecordTextPart[]; base: number; readonly live: boolean; at?: number; order?: TurnOrder };
 
 interface HandoffCardInput {
   source: { sessionId: string; title?: string };
@@ -544,9 +555,11 @@ interface SegmentCard {
 interface AgentCardEntry {
   card: HTMLDetailsElement;
   statusEl: HTMLElement;
+  nameEl: HTMLElement;
   metaEl: HTMLElement;
   chipsEl: HTMLElement;
   childrenEl: HTMLElement;
+  todoEl?: HTMLElement;
 }
 
 interface WorkRowData {
@@ -777,6 +790,13 @@ const ASK_MESSAGE_STATE_MAX = 500;
 const READING_ROW_PROBE_STEP_PX = 8;
 const READING_ROW_PROBE_SPAN_PX = 64;
 const READING_ROW_WIDTH_SLACK_PX = 0.5;
+const USER_SCROLL_GESTURE_MAX_MS = 1000;
+
+interface UserScrollGesture {
+  scrolled: boolean;
+  frame: number | undefined;
+  timer: ReturnType<typeof setTimeout>;
+}
 
 export function persistAskDismissals(tabId: string | null, identities: readonly AskIdentity[]): void {
   if (identities.length === 0) return;
@@ -799,7 +819,7 @@ export function savedMessageAskState(): { dismissed: readonly string[]; resolved
 
 type InsertedTurn = boolean | "laisora";
 
-type EditTurnEnd = { kind: "live" } | { kind: "history"; endedAt: number } | { kind: "after"; el: HTMLElement };
+type EditTurnEnd = { kind: "live" } | { kind: "after"; el: HTMLElement };
 const EDIT_TURN_ENDS_MAX = 512;
 
 export class Tab {
@@ -818,15 +838,15 @@ export class Tab {
 
   private locateAsk(replyId: string, offset: number): { message: string; start: number } | undefined {
     if (this.recordReplyIds.has(replyId)) return { message: replyId, start: 0 };
-    const past = this.pastConvRecords.get(replyId);
-    let joined = "";
-    for (const run of past ?? this.assistantRuns.filter((run) => run.seg.dataset.askSource === replyId)) {
-      joined += recordSeparator(joined);
-      const start = joined.length;
-      joined += run.text;
-      if (offset < joined.length) return offset >= start && run.uuid !== null ? { message: run.uuid, start } : undefined;
+    const past = this.pastParagraphs.get(replyId);
+    if (past !== undefined) {
+      const hit = locateInParts(past.parts, offset - past.base);
+      if (hit !== null) return hit === undefined ? undefined : { message: hit.message, start: hit.start + past.base };
+      if (!past.live) return undefined;
     }
-    return undefined;
+    const runs = this.assistantRuns.filter((run) => run.seg.dataset.askSource === replyId);
+    const seg = runs.length > 0 ? undefined : this.convEl.querySelector<HTMLElement>(`.assistant-seg[data-ask-source="${CSS.escape(replyId)}"]`);
+    return locateInParts(seg ? this.segRuns.get(seg) ?? [] : runs, offset) ?? undefined;
   }
 
   private persistAskDismissals(identities: readonly AskIdentity[]): void {
@@ -878,7 +898,6 @@ export class Tab {
   get youItems(): YouItemsReader { return this.youStore.reader; }
   private askReplyEvents = new Map<string, NormalizedEvent>();
   private askRenderEnds = new WeakMap<HTMLElement, number>();
-  private askReplyParts = new Map<string, number>();
   private askCountersScheduled = false;
 
   private observeYouEvent(ev: NormalizedEvent): void {
@@ -907,6 +926,21 @@ export class Tab {
     updateAskCounters(this.convEl);
   }
 
+  private legacyAskAnchors(container: HTMLElement, replyId: string, anchorId: string): string[] {
+    const prefix = youAnchor(this.tabId, `ask:${replyId}:`);
+    const seg = container.closest<HTMLElement>(".assistant-seg") ?? this.currentAssistantBlock;
+    if (!anchorId.startsWith(prefix) || seg === null) return [];
+    const segs = Array.from(seg.parentElement?.querySelectorAll<HTMLElement>(":scope > .assistant-seg") ?? []);
+    const index = segs.indexOf(seg);
+    if (index < 0) return [];
+    const before = paragraphText(segs.slice(0, index).flatMap((other) => this.segParts(other)));
+    const start = before.length === 0 ? 0 : before.length + recordSeparator(before).length;
+    const position = Number(decodeURIComponent(anchorId.slice(prefix.length)));
+    const paragraph = this.pastParagraphs.get(replyId);
+    const inParagraph = position - (paragraph?.base ?? 0);
+    return legacyAskKeys(replyId, paragraph?.live === true ? position : inParagraph, index, start + inParagraph).map((key) => youAnchor(this.tabId, key));
+  }
+
   private renderReplyMarkdown(container: HTMLElement, text: string, replyId = this.currentAssistantBlock?.dataset.askSource ?? this.currentSegTurnId ?? this.currentTurnId ?? "", offset = 0, at?: number, order?: number, generation?: number): void {
     const event = this.askReplyEvents.get(replyId) ?? this.askReplyEvents.get(this.currentSegTurnId ?? "");
     const ids = new Set<string>();
@@ -915,7 +949,10 @@ export class Tab {
       const state = vscode.getState();
       const message = this.youStore.messageOf(id);
       const byMessage = message === undefined ? undefined : state?.askCheckedMessages?.[message]?.[step];
-      return (byMessage ?? state?.askChecks?.[this.tabId]?.[id]?.[step]) === true;
+      const tabChecks = state?.askChecks?.[this.tabId];
+      const byTab = tabChecks?.[id]?.[step] ?? (tabChecks === undefined ? undefined
+        : this.legacyAskAnchors(container, replyId, id).map((legacy) => tabChecks[legacy]?.[step]).find((value) => value !== undefined));
+      return (byMessage ?? byTab) === true;
     };
     if (container.dataset.askQualityTurn === undefined && askQualityCheckEnabled() && this.replayDone && this.currentTurnId !== null) container.dataset.askQualityTurn = this.currentTurnId;
     renderMarkdownInto(container, text, this.tabId, {
@@ -982,10 +1019,12 @@ export class Tab {
   private viewNavObserver?: ResizeObserver;
   private turnRailResizeObserver?: ResizeObserver;
   private turnRailMutationObserver?: MutationObserver;
-  private convWidthObserver?: ResizeObserver;
+  private convSizeObserver?: ResizeObserver;
+  private convActivationFrame: number | undefined;
   private convWidth: number | undefined;
   private readingAnchor: { row: HTMLElement; point: number; height: number } | undefined;
   private readingAnchorFrame: number | undefined;
+  private userScrollGesture: UserScrollGesture | undefined;
   private changingView = false;
   setWorkViewMode?: (mode: WorkViewMode) => void;
   syncWorkVisibility?: () => void;
@@ -1036,15 +1075,16 @@ export class Tab {
   private pastHeadline: { text: string; turnId: string | null; chunk: number | null } | null = null;
   private pastChunkSerial = 0;
   private atBottom: Record<ViewMode, boolean> = { conv: true, work: true };
+  private bottomTop: Partial<Record<ViewMode, number>> = {};
   private graphHold = false;
   private unappliedCarry: ScrollCarry | undefined;
   private scrollRestored = false;
   private carryAnchor: Partial<Record<ViewMode, RowAnchor>> = {};
-  private carryAwaitsConvBackfill = false;
+  private carryAwaitsBackfill: Record<ViewMode, boolean> = { conv: false, work: false };
   private knownAnchor: Partial<Record<ViewMode, RowAnchor>> = {};
   private anchorMeasuredTop: number | undefined;
   private preservedScroll: { mode: ViewMode; top: number } | undefined;
-  private awaitedConvAnchor: RowAnchor | undefined;
+  private awaitedAnchor: { mode: ViewMode; anchor: RowAnchor } | undefined;
   private currentAssistantTurn: HTMLElement | null = null;
   readonly tabBtn: HTMLElement;
   labelEl!: HTMLElement;
@@ -1082,14 +1122,13 @@ export class Tab {
   rename(title: string): void {
     this.title = title;
     this.labelEl.textContent = title;
-    this.labelEl.title = title;
+    this.paintTabTooltip(title);
     this.sessionHeader.updateTitle(title);
     this.refreshTodo();
   }
 
   private readonly todoToolCards = new Map<string, HTMLElement>();
   private readonly todoTurnCards = new Map<string, HTMLElement>();
-  private readonly pendingTodoCards = new Map<string, HTMLElement[]>();
   private readonly todoHeadEl = document.createElement("div");
   private readonly todoCrumbsEl = document.createElement("nav");
   private readonly todoTabDotEl = document.createElement("span");
@@ -1134,6 +1173,11 @@ export class Tab {
     return rail.getBoundingClientRect().width > 0 ? rail : null;
   }
 
+  private paintTabTooltip(text: string): void {
+    this.labelEl.title = text;
+    this.tabBtn.title = text;
+  }
+
   refreshTodo(): void {
     if (this.tabBtn === undefined) return;
     this.planPanel.refreshTodo();
@@ -1141,66 +1185,188 @@ export class Tab {
     this.todoTabDotEl.hidden = !marks?.color;
     if (marks?.color) this.todoTabDotEl.style.setProperty("--todo-gc", marks.color);
     this.todoChildEl.hidden = !marks?.child;
-    this.labelEl.title = marks?.tooltip ?? this.title;
+    this.paintTabTooltip(marks?.tooltip ?? this.title);
     renderTodoCrumbs(this.todoCrumbsEl, this.tabId);
     if (!this.todoHeadEl.isConnected) this.convEl.insertBefore(this.todoHeadEl, this.convEl.firstChild);
     renderTodoHead(this.todoHeadEl, this.tabId);
     for (const [toolUseId, entry] of this.agentCards) {
       const data = this.rowData.get(toolUseId);
-      if (data) this.paintAgentTodo(entry, data);
+      if (data) this.paintAgentTodo(entry, this.agentTodoLabel(data));
     }
   }
 
-  private paintAgentTodo(entry: AgentCardEntry, data: WorkRowData): void {
-    entry.card.querySelector(":scope > summary > .todo-agent-link")?.remove();
-    if (!todoLinkHub()) return;
+  private agentTodoLabel(data: WorkRowData): HTMLElement | undefined {
+    if (!todoLinkHub()) return undefined;
     const state = this.agentStates.get(data.toolUseId) ?? this.pastAgentStates.get(data.toolUseId);
-    const label = todoAgentLabel(this.tabId, data.summaryText, (state?.status ?? data.status) === "running");
-    if (label) entry.card.querySelector(":scope > summary")?.insertBefore(label, entry.metaEl);
+    return todoAgentLabel(this.tabId, data.summaryText, (state?.status ?? data.status) === "running") ?? undefined;
   }
 
-  private placeTodoToolCard(ev: Extract<NormalizedEvent, { kind: "tool_call_started" }>, pastTurn?: HTMLElement): void {
-    if (ev.parentToolUseId !== null || !isTodoWriteTool(ev.toolName) || this.todoToolCards.has(ev.toolUseId)) return;
-    const turnCard = ev.turnId === null ? undefined : this.todoTurnCards.get(ev.turnId);
-    if (turnCard) {
-      this.todoToolCards.set(ev.toolUseId, turnCard);
-      addTodoToolCall(turnCard, ev.toolUseId, ev.toolName);
-      return;
+  private paintAgentTodo(entry: AgentCardEntry, todo?: HTMLElement): void {
+    entry.todoEl?.remove();
+    entry.todoEl = todo;
+    if (todo) entry.nameEl.after(todo);
+  }
+
+  private placeTodoToolCard(ev: Extract<NormalizedEvent, { kind: "tool_call_started" }>, past?: PastTurns): void {
+    if (ev.parentToolUseId !== null || ev.priorGeneration === true || !isTodoWriteTool(ev.toolName) || this.todoToolCards.has(ev.toolUseId)) return;
+    let card = ev.turnId === null ? undefined : this.todoTurnCards.get(ev.turnId);
+    if (card !== undefined) addTodoToolCall(card, ev.toolUseId, ev.toolName);
+    else {
+      card = todoToolCard(ev.toolUseId, ev.toolName);
+      if (ev.turnId !== null) this.todoTurnCards.set(ev.turnId, card);
     }
-    const card = todoToolCard(ev.toolUseId, ev.toolName);
     this.todoToolCards.set(ev.toolUseId, card);
-    if (ev.turnId !== null) this.todoTurnCards.set(ev.turnId, card);
-    if (pastTurn) { (pastTurn.closest(".block.assistant-turn") ?? pastTurn).appendChild(card); return; }
-    if (ev.provenance?.path !== "history") {
-      const turn = this.currentAssistantTurn?.isConnected && ev.turnId === this.currentTurnId ? this.currentAssistantTurn : this.convTurnBlock(ev.turnId);
-      if (turn) turn.appendChild(card);
-      else this.convEl.appendChild(card);
+    const key = ev.turnId ?? ev.toolUseId;
+    const item: TurnItem = { kind: "card", order: [ev.generation, ev.seq], toolUseId: ev.toolUseId };
+    this.todoCardCalls.set(key, [...(this.todoCardCalls.get(key) ?? []), { toolUseId: ev.toolUseId, order: item.order }]);
+    if (past !== undefined && ev.turnId !== null) {
+      this.pastTurnItem(past, ev.turnId, item);
+      this.applyPendingTodoFinish(ev.toolUseId);
       return;
     }
-    const turn = this.convTurnBlock(ev.turnId);
-    if (turn) { turn.appendChild(card); return; }
-    if (ev.turnId === null) return;
-    this.pendingTodoCards.set(ev.turnId, [...(this.pendingTodoCards.get(ev.turnId) ?? []), card]);
+    if (ev.turnId !== null && !this.turnFirstBreaks.has(ev.turnId)) this.turnFirstBreaks.set(ev.turnId, breaksParagraph(item));
+    if (breaksParagraph(item) && ev.turnId !== null && ev.turnId === this.currentTurnId) this.endAssistantBlock();
+    const anchor = document.createComment("");
+    this.cardAnchors.set(ev.toolUseId, anchor);
+    this.liveTurnFrame(ev.turnId).appendChild(anchor);
+    this.placeTodoCard(card, key);
   }
 
-  private convTurnBlock(turnId: string | null): HTMLElement | null {
-    if (turnId === null) return null;
-    const blocks = this.convEl.querySelectorAll<HTMLElement>(`.block.assistant-turn[data-turn-id="${CSS.escape(turnId)}"]`);
-    return blocks.length ? blocks[blocks.length - 1] : null;
+  private applyPendingTodoFinish(toolUseId: string): void {
+    const finish = this.pendingTodoFinishes.get(toolUseId);
+    if (finish === undefined) return;
+    this.pendingTodoFinishes.delete(toolUseId);
+    this.finishTodoToolCard(finish);
+  }
+
+  private placed(node: Node | undefined): boolean {
+    const root = node?.getRootNode();
+    return root instanceof Document || root instanceof DocumentFragment;
+  }
+
+  private placeTodoCard(card: HTMLElement, key: string): void {
+    if (card.hidden) {
+      this.retractTodoCard(card);
+      this.settleTurnTail(key);
+      return;
+    }
+    const home = cardHome(this.todoCardCalls.get(key) ?? [], (id) => this.todoCallsFailed.has(id) || !this.placed(this.cardAnchors.get(id)));
+    const anchor = home === undefined ? undefined : this.cardAnchors.get(home);
+    if (anchor === undefined) return;
+    if (card.previousSibling !== anchor) {
+      const from = card.parentElement;
+      anchor.after(card);
+      if (from !== null && from !== anchor.parentNode && this.frameEmpty(from)) this.dropFrame(from);
+    }
+    this.settleTurnTail(key);
+  }
+
+  private retractTodoCard(card: HTMLElement): void {
+    const frame = card.parentElement;
+    card.remove();
+    if (frame !== null && this.frameEmpty(frame)) this.dropFrame(frame);
+  }
+
+  private frameEmpty(frame: HTMLElement): boolean {
+    return frame.matches(".block.assistant-turn") && frame.querySelector(":scope > :not(.turn-label)") === null;
+  }
+
+  private dropFrame(frame: HTMLElement): void {
+    frame.remove();
+    for (const [toolUseId, anchor] of this.cardAnchors) if (anchor.parentNode === frame) this.cardAnchors.delete(toolUseId);
+    frame.querySelectorAll<HTMLElement>(":scope > .assistant-seg").forEach((seg) => this.pastParagraphs.delete(seg.dataset.askSource ?? ""));
+    const turnId = frame.dataset.turnId;
+    if (turnId !== undefined && this.turnFrames.get(turnId) === frame) this.turnFrames.delete(turnId);
+    if (turnId !== undefined && this.frameOf(turnId) === undefined && turnId !== this.currentTurnId && !this.suspendedReplies.has(turnId)) {
+      this.turnFirstBreaks.delete(turnId);
+      this.pastTextTurns.delete(turnId);
+    }
+    if (this.currentAssistantTurn === frame) this.currentAssistantTurn = null;
+    if (this.replyFooterAnchor === frame) this.replyFooterAnchor = null;
+  }
+
+  private liveTurnFrame(turnId: string | null): HTMLElement {
+    if (turnId !== null && turnId === this.currentTurnId) return this.ensureLiveAssistantTurn();
+    const frame = this.frameOf(turnId);
+    if (frame !== undefined) return frame;
+    const created = this.createAssistantTurnBlock(turnId);
+    this.convEl.appendChild(created);
+    return created;
+  }
+
+  private frameOf(turnId: string | null): HTMLElement | undefined {
+    if (turnId === null) return undefined;
+    const frame = this.turnFrames.get(turnId);
+    if (frame !== undefined && this.placed(frame)) return frame;
+    this.turnFrames.delete(turnId);
+    return undefined;
+  }
+
+  private frameModel(frame: HTMLElement): string | null {
+    const turnId = frame.dataset.turnId ?? null;
+    const start = (turnId === null ? undefined : this.turnStarts.get(turnId)) ?? this.frameOrders.get(frame) ?? this.eventOrder;
+    return turnLabelModel(this.modelMarks, turnId, start) ?? this.lastObservedModel ?? this.modelKey(this.recordedModel) ?? null;
+  }
+
+  noteModelObservations(events: readonly NormalizedEvent[]): void {
+    for (const ev of events) {
+      if (ev.kind === "turn_started") this.noteTurnStart(ev);
+      else if (ev.kind === "model_observed") this.noteModelMark(ev);
+    }
+  }
+
+  private noteTurnStart(ev: Extract<NormalizedEvent, { kind: "turn_started" }>): void {
+    const order: TurnOrder = [ev.generation, ev.seq];
+    const known = this.turnStarts.get(ev.turnId);
+    if (known === undefined || compareTurnOrder(order, known) < 0) this.turnStarts.set(ev.turnId, order);
+  }
+
+  private noteModelMark(ev: Extract<NormalizedEvent, { kind: "model_observed" }>): void {
+    const model = this.modelKey(ev.model);
+    if (model === undefined) return;
+    const order: TurnOrder = [ev.generation, ev.seq];
+    const at = this.modelMarks.findIndex((mark) => compareTurnOrder(mark.order, order) >= 0);
+    if (at >= 0 && compareTurnOrder(this.modelMarks[at].order, order) === 0) return;
+    this.modelMarks.splice(at < 0 ? this.modelMarks.length : at, 0, { order, model, turnId: ev.turnId });
+    if (this.replayDone && this.pastTurns === null) this.relabelFrames();
+  }
+
+  private relabelFrames(): void {
+    this.convEl.querySelectorAll<HTMLElement>(".block.assistant-turn").forEach((frame) => {
+      const label = frame.querySelector<HTMLElement>(":scope > .turn-label > .turn-label-name");
+      const model = this.frameModels.has(frame) || this.frameOrders.has(frame) ? this.frameModel(frame) : null;
+      if (label === null || model === null || this.frameModels.get(frame) === model) return;
+      this.frameModels.set(frame, model);
+      this.bindModelName(label, model);
+    });
+  }
+
+  private createAssistantTurnBlock(turnId: string | null): HTMLElement {
+    const turn = document.createElement("div");
+    turn.className = "block assistant-turn";
+    if (turnId !== null) {
+      turn.dataset.turnId = turnId;
+      this.turnFrames.set(turnId, turn);
+    }
+    this.frameOrders.set(turn, this.eventOrder);
+    const model = this.frameModel(turn);
+    if (model !== null) this.frameModels.set(turn, model);
+    this.prependTurnLabel(turn, "assistant", model);
+    return turn;
   }
 
   private finishTodoToolCard(ev: Extract<NormalizedEvent, { kind: "tool_call_finished" }>): void {
     const card = ev.taskNotification === undefined ? this.todoToolCards.get(ev.toolUseId) : undefined;
-    if (card) setTodoToolCardResult(card, ev.toolUseId, ev.resultPreview, ev.isError, ev.provenance?.path !== "history");
-  }
-
-  private attachPendingTodoCards(endedTurnId?: string): void {
-    for (const [turnId, pending] of this.pendingTodoCards) {
-      const turn = this.convTurnBlock(turnId);
-      if (!turn && turnId !== endedTurnId) continue;
-      for (const card of pending) (turn ?? this.convEl).appendChild(card);
-      this.pendingTodoCards.delete(turnId);
+    if (!card) {
+      if (ev.taskNotification !== undefined) return;
+      this.pendingTodoFinishes.delete(ev.toolUseId);
+      this.pendingTodoFinishes.set(ev.toolUseId, ev);
+      if (this.pendingTodoFinishes.size > ORPHAN_FINISH_MAX) this.pendingTodoFinishes.delete(this.pendingTodoFinishes.keys().next().value!);
+      return;
     }
+    setTodoToolCardResult(card, ev.toolUseId, ev.resultPreview, ev.isError, ev.provenance?.path !== "history");
+    if (ev.isError) this.todoCallsFailed.add(ev.toolUseId);
+    this.placeTodoCard(card, ev.turnId ?? ev.toolUseId);
   }
 
   showHandoffStatus(msg: HandoffStatusMessage): void {
@@ -1298,8 +1464,7 @@ export class Tab {
     const button = document.createElement("button");
     button.type = "button";
     button.className = "handoff-status-dismiss";
-    button.textContent = l10n.t("Close");
-    button.setAttribute("aria-label", l10n.t("Close"));
+    closeGlyphButton(button);
     this.handoffStatusEl.insertBefore(button, this.handoffStatusIconEl);
     this.handoffDismissEl = button;
     return button;
@@ -1686,7 +1851,7 @@ export class Tab {
   private rafScheduled = false;
   private pendingDeltaTurnId: string | null = null;
   private currentSegTurnId: string | null = null;
-  private topConvSeg: { turnId: string; el: HTMLElement; text: string; records: RecordTextPart[] } | null = null;
+  private pendingDeltaOrder: TurnOrder | null = null;
   private toolCards = new Map<string, HTMLElement>();
   private segmentCards = new Map<string, SegmentCard>();
   private replayMarkerShown = false;
@@ -1697,15 +1862,29 @@ export class Tab {
   private convMessageUuids = new Set<string>();
   private convPrependedTotal = 0;
   private renderedConvEventKeys = new Set<string>();
-  private pastConvTurns = new Map<string, { el: HTMLElement; text: string }>();
-  private pastConvRecords = new Map<string, RecordTextPart[]>();
-  private assistantLeadingRecord: { turnId: string; uuid: string } | null = null;
+  private readonly pastParagraphs = new Map<string, PastParagraph>();
+  private readonly pastTextTurns = new Set<string>();
+  private readonly turnLeadUuids = new Map<string, string>();
+  private readonly turnFirstBreaks = new Map<string, boolean>();
+  private readonly endedTurns = new Set<string>();
+  private readonly historyTurnIds = new Set<string>();
+  private readonly segRuns = new WeakMap<HTMLElement, Tab["assistantRuns"]>();
+  private readonly pendingTodoFinishes = new Map<string, Extract<NormalizedEvent, { kind: "tool_call_finished" }>>();
+  private pastTurns: PastTurns | null = null;
   private pastConvFooters = new Map<string, HTMLElement>();
   private pastTurnCompletedAt = new Map<string, number>();
   private readonly turnFileEdits = new Map<string, (TurnFileEdit & { order: readonly [number, number] })[]>();
   private readonly editSummarySlots = new Map<string, HTMLElement>();
   private readonly editTurnEnds = new Map<string, EditTurnEnd>();
-  private readonly historyTurnStarts = new Map<string, number>();
+  private readonly turnFrames = new Map<string, HTMLElement>();
+  private readonly modelMarks: ModelMark[] = [];
+  private readonly turnStarts = new Map<string, TurnOrder>();
+  private readonly frameOrders = new WeakMap<HTMLElement, TurnOrder>();
+  private readonly frameModels = new WeakMap<HTMLElement, string>();
+  private eventOrder: TurnOrder = [0, 0];
+  private readonly todoCardCalls = new Map<string, { toolUseId: string; order: TurnOrder }[]>();
+  private readonly todoCallsFailed = new Set<string>();
+  private readonly cardAnchors = new Map<string, Comment>();
   private readonly unsubscribeEditSummary = onEditSummaryChange(() => this.refreshEditSummaries());
   private lastPastModel: string | null = null;
   private todoCardEl: HTMLDetailsElement | null = null;
@@ -1824,7 +2003,7 @@ export class Tab {
     this.logEl.appendChild(content);
     logsEl.appendChild(this.logEl);
     this.observeTurnRails();
-    this.observeConvWidth();
+    this.observeConvSize();
 
     this.tabBtn = document.createElement("div");
     this.tabBtn.className = "tab";
@@ -1839,15 +2018,13 @@ export class Tab {
     const label = document.createElement("span");
     label.className = "tab-label";
     label.textContent = title;
-    label.title = title;
     this.labelEl = label;
+    this.paintTabTooltip(title);
     const dot = document.createElement("span");
     dot.className = "tab-dot";
     const close = document.createElement("button");
     close.className = "tab-close";
-    close.textContent = "×";
-    close.title = l10n.t("Close tab");
-    close.setAttribute("aria-label", l10n.t("Close {0}", title));
+    closeGlyphButton(close, l10n.t("Close tab"), l10n.t("Close {0}", title));
     close.onclick = (e) => {
       e.stopPropagation();
       vscode.postMessage({ type: "closeTab", tabId: this.tabId });
@@ -1879,11 +2056,17 @@ export class Tab {
     this.viewNavObserver?.disconnect();
     this.turnRailResizeObserver?.disconnect();
     this.turnRailMutationObserver?.disconnect();
-    this.convWidthObserver?.disconnect();
+    this.convSizeObserver?.disconnect();
     if (this.readingAnchorFrame !== undefined) cancelAnimationFrame(this.readingAnchorFrame);
+    this.endUserScrollGesture();
     this.sessionHeader.mountMenu(null);
     this.logEl.remove();
     this.tabBtn.remove();
+    this.modelMarks.length = 0;
+    this.turnStarts.clear();
+    for (const turnState of [this.turnFrames, this.turnFirstBreaks, this.turnLeadUuids, this.pastParagraphs, this.todoCardCalls,
+      this.cardAnchors, this.pendingTodoFinishes]) turnState.clear();
+    for (const turnSet of [this.endedTurns, this.historyTurnIds, this.pastTextTurns, this.todoCallsFailed]) turnSet.clear();
   }
 
   private observeTurnRails(): void {
@@ -1903,15 +2086,25 @@ export class Tab {
     this.turnRailMutationObserver.observe(this.convEl, { childList: true, subtree: true });
   }
 
-  private observeConvWidth(): void {
+  private observeConvSize(): void {
     if (typeof ResizeObserver === "undefined") return;
-    this.convWidthObserver = new ResizeObserver(entries => {
+    for (const type of ["click", "keydown"]) this.convEl.addEventListener(type, () => this.noteConvActivation(), { capture: true, passive: true });
+    this.convSizeObserver = new ResizeObserver(entries => {
       const size = entries[entries.length - 1]?.borderBoxSize?.[0];
       if (size === undefined) return;
       if (size.inlineSize !== this.convWidth) this.keepReadingOnWidthChange(size.inlineSize);
-      else if (this.scrollRestored) this.measureReadingRow();
+      else if (this.atBottom.conv) {
+        if (this.convActivationFrame === undefined) this.scrollToBottom("conv");
+      } else if (this.scrollRestored) this.measureReadingRow();
     });
-    this.convWidthObserver.observe(this.convEl);
+    this.convSizeObserver.observe(this.convEl);
+  }
+
+  private noteConvActivation(): void {
+    if (this.convActivationFrame !== undefined) cancelAnimationFrame(this.convActivationFrame);
+    this.convActivationFrame = requestAnimationFrame(() => {
+      this.convActivationFrame = requestAnimationFrame(() => { this.convActivationFrame = undefined; });
+    });
   }
 
   private keepReadingOnWidthChange(width: number): void {
@@ -1919,10 +2112,9 @@ export class Tab {
     const previous = this.convWidth;
     this.convWidth = width;
     if (previous === undefined) return;
-    if (activeTabId !== this.tabId || this.viewMode !== "conv" || !this.scrollRestored || this.awaitedConvAnchor !== undefined) return;
+    if (activeTabId !== this.tabId || this.viewMode !== "conv" || !this.scrollRestored || this.awaitedAnchor?.mode === "conv") return;
     if (this.atBottom.conv) {
-      logsEl.scrollTop = logsEl.scrollHeight;
-      this.scrollPos.conv = logsEl.scrollTop;
+      this.placeAtBottom("conv");
       return;
     }
     const reading = this.readingAnchor;
@@ -2317,9 +2509,8 @@ export class Tab {
     this.workView = next;
     const heldNext = this.holdsWorkScroll();
     if (visible) {
-      const gap = logsEl.scrollHeight - logsEl.scrollTop - logsEl.clientHeight;
       this.workViewScrollPos[prev] = logsEl.scrollTop;
-      this.workViewAtBottom[prev] = gap <= SCROLL_BOTTOM_GAP_PX && !heldPrev;
+      this.workViewAtBottom[prev] = this.portAtBottom() && !heldPrev;
       if (prev === "log") this.workViewReturnRow = this.topVisibleToolRow();
     } else {
       this.workViewScrollPos[prev] = this.scrollPos.work;
@@ -2332,9 +2523,12 @@ export class Tab {
         this.scrollPos.work = this.workViewScrollPos[next];
         return;
       }
-      logsEl.scrollTop = toBottom ? logsEl.scrollHeight : this.workViewScrollPos[next];
       this.atBottom.work = toBottom;
-      this.scrollPos.work = logsEl.scrollTop;
+      if (toBottom) this.placeAtBottom("work");
+      else {
+        logsEl.scrollTop = this.workViewScrollPos[next];
+        this.scrollPos.work = logsEl.scrollTop;
+      }
       const row = this.workViewReturnRow;
       if (next === "log" && row !== null && row.isConnected) {
         row.classList.add("wl-back");
@@ -2461,6 +2655,7 @@ export class Tab {
   }
 
   updateStrip(now = Date.now()): void {
+    if (!this.replayDone) return;
     this.syncTabDot();
     const runningTool = [...this.runningMainTools.values()].at(-1);
     const line = deriveStatusLine({
@@ -2577,6 +2772,7 @@ export class Tab {
   }
 
   private scrollToBottom(target: ViewMode = this.viewMode, explicit = false): void {
+    if (!this.replayDone) return;
     if (!explicit && target === "work" && this.holdsWorkScroll()) return;
     if (activeTabId !== this.tabId) {
       if (this.atBottom[target]) this.scrollPos[target] = Number.MAX_SAFE_INTEGER;
@@ -2587,7 +2783,17 @@ export class Tab {
       return;
     }
     if (!this.atBottom[target]) return;
+    this.placeAtBottom(target);
+  }
+
+  placeAtBottom(mode: ViewMode): void {
     logsEl.scrollTop = logsEl.scrollHeight;
+    this.bottomTop[mode] = logsEl.scrollTop;
+    this.scrollPos[mode] = logsEl.scrollTop;
+  }
+
+  portAtBottom(): boolean {
+    return logsEl.scrollHeight - logsEl.scrollTop - logsEl.clientHeight <= SCROLL_BOTTOM_GAP_PX;
   }
 
   private holdsWorkScroll(): boolean {
@@ -2599,23 +2805,44 @@ export class Tab {
   }
 
   noteScroll(): void {
-    if (this.viewMode === "conv" && this.convWidth !== undefined &&
-      Math.abs(this.convEl.getBoundingClientRect().width - this.convWidth) > READING_ROW_WIDTH_SLACK_PX) return;
+    const gesture = this.userScrollGesture;
+    if (gesture !== undefined) gesture.scrolled = true;
+    const userScrolling = gesture !== undefined;
+    const widthPending = this.viewMode === "conv" && this.convWidth !== undefined &&
+      Math.abs(this.convEl.getBoundingClientRect().width - this.convWidth) > READING_ROW_WIDTH_SLACK_PX;
+    if (widthPending && !userScrolling) return;
+    const previousTop = this.scrollPos[this.viewMode];
     this.scrollPos[this.viewMode] = logsEl.scrollTop;
     if (this.preservedScroll?.mode === this.viewMode && logsEl.scrollTop === this.preservedScroll.top) return;
     this.preservedScroll = undefined;
-    const gap = logsEl.scrollHeight - logsEl.scrollTop - logsEl.clientHeight;
-    this.atBottom[this.viewMode] = gap <= SCROLL_BOTTOM_GAP_PX && !(this.viewMode === "work" && this.holdsWorkScroll());
-    if (this.viewMode === "conv" && !this.atBottom.conv) this.scheduleReadingRow();
+    const held = this.viewMode === "work" && this.holdsWorkScroll();
+    const atEnd = this.portAtBottom();
+    const bottomTop = this.bottomTop[this.viewMode];
+    const followed = this.atBottom[this.viewMode] && this.convActivationFrame === undefined && bottomTop !== undefined && logsEl.scrollTop >= Math.max(bottomTop, previousTop);
+    this.atBottom[this.viewMode] = (atEnd || followed) && !held;
+    if (!this.atBottom[this.viewMode]) delete this.bottomTop[this.viewMode];
+    else if (atEnd) this.bottomTop[this.viewMode] = logsEl.scrollTop;
+    else this.scrollToBottom(this.viewMode);
+    if (this.viewMode !== "conv" || this.atBottom.conv) return;
+    if (widthPending) this.measureReadingRow();
+    else this.scheduleReadingRow();
   }
 
   restoreScroll(): void {
     this.syncHeadLayout();
     this.placeSurface(this.viewMode);
-    this.preservedScroll = this.atBottom[this.viewMode] ? undefined : { mode: this.viewMode, top: logsEl.scrollTop };
+    this.preservedScroll = this.atBottom[this.viewMode] && this.viewMode === "conv" ? undefined : { mode: this.viewMode, top: logsEl.scrollTop };
     this.unappliedCarry = undefined;
     this.scrollRestored = true;
     this.keepReadingOnReturn();
+    if (this.viewMode === "work" && this.atBottom.work) requestAnimationFrame(() => this.repinPlacedWorkEnd());
+  }
+
+  private repinPlacedWorkEnd(): void {
+    const placed = this.preservedScroll;
+    if (activeTabId !== this.tabId || this.viewMode !== "work" || !this.atBottom.work || placed?.mode !== "work" || placed.top !== logsEl.scrollTop) return;
+    this.placeAtBottom("work");
+    this.preservedScroll = { mode: "work", top: logsEl.scrollTop };
   }
 
   private placeSurface(mode: ViewMode): void {
@@ -2624,18 +2851,24 @@ export class Tab {
     const usable = anchor !== undefined && !this.atBottom[mode] &&
       !(mode === "work" && (this.workView !== "log" || this.holdsWorkScroll()));
     if (!usable) {
-      logsEl.scrollTop = this.atBottom[mode] ? logsEl.scrollHeight : this.scrollPos[mode];
+      if (this.atBottom[mode]) this.placeAtBottom(mode);
+      else logsEl.scrollTop = this.scrollPos[mode];
       return;
     }
     if (this.alignToAnchor(mode, anchor)) return;
     if (mode === "work") {
       this.placeWorkAtBottomForBackfill();
+      this.awaitBackfilledAnchor("work", anchor);
       return;
     }
     logsEl.scrollTop = 0;
     this.scrollPos.conv = logsEl.scrollTop;
     this.knownAnchor.conv = anchor;
-    if (this.carryAwaitsConvBackfill) this.awaitedConvAnchor = anchor;
+    this.awaitBackfilledAnchor("conv", anchor);
+  }
+
+  private awaitBackfilledAnchor(mode: ViewMode, anchor: RowAnchor): void {
+    if (this.carryAwaitsBackfill[mode]) this.awaitedAnchor = { mode, anchor };
   }
 
   private placeWorkAtBottomForBackfill(): void {
@@ -2763,14 +2996,13 @@ export class Tab {
     if (this.unappliedCarry !== undefined) return this.unappliedCarry;
     const live = activeTabId === this.tabId && this.scrollRestored && (measure || logsEl.scrollTop !== this.anchorMeasuredTop);
     const surface = (mode: ViewMode): ScrollCarrySurface => {
-      const awaited = mode === "conv" ? this.awaitedConvAnchor : undefined;
+      const awaited = this.awaitedAnchor?.mode === mode ? this.awaitedAnchor.anchor : undefined;
       if (live && mode === this.viewMode) {
         const scrollPos = logsEl.scrollTop;
         this.anchorMeasuredTop = scrollPos;
         if (awaited !== undefined) return { atBottom: false, scrollPos, anchor: awaited };
-        const gap = logsEl.scrollHeight - scrollPos - logsEl.clientHeight;
         const atBottom = this.preservedScroll?.mode === mode && scrollPos === this.preservedScroll.top ? this.atBottom[mode]
-          : gap <= SCROLL_BOTTOM_GAP_PX && !(mode === "work" && this.holdsWorkScroll());
+          : this.portAtBottom() && !(mode === "work" && this.holdsWorkScroll());
         const anchor = atBottom ? undefined : this.measureAnchor(mode);
         this.knownAnchor[mode] = anchor;
         return anchor === undefined ? { atBottom, scrollPos } : { atBottom, scrollPos, anchor };
@@ -2788,7 +3020,7 @@ export class Tab {
     };
   }
 
-  applyScrollCarry(carry: ScrollCarry, convBackfill: boolean): void {
+  applyScrollCarry(carry: ScrollCarry, backfill: Record<ViewMode, boolean>): void {
     const held = this.holdsWorkScroll();
     const sameWorkView = carry.workView === this.workView;
     this.workViewScrollPos = { ...carry.workViewScrollPos };
@@ -2804,11 +3036,13 @@ export class Tab {
     this.carryAnchor = {};
     if (!this.atBottom.conv && carry.conv.anchor !== undefined) this.carryAnchor.conv = carry.conv.anchor;
     const workAnchor = sameWorkView && !this.atBottom.work ? carry.work.anchor : undefined;
+    this.carryAwaitsBackfill = { ...backfill };
     if (workAnchor !== undefined) {
-      if (this.anchorRowInDom("work", workAnchor) === null) this.placeWorkAtBottomForBackfill();
-      else this.carryAnchor.work = workAnchor;
+      if (this.anchorRowInDom("work", workAnchor) === null) {
+        this.placeWorkAtBottomForBackfill();
+        this.awaitBackfilledAnchor("work", workAnchor);
+      } else this.carryAnchor.work = workAnchor;
     }
-    this.carryAwaitsConvBackfill = convBackfill;
     this.unappliedCarry = carry;
   }
 
@@ -2817,21 +3051,45 @@ export class Tab {
   }
 
   noteLeavingScroll(): void {
-    this.awaitedConvAnchor = undefined;
+    this.awaitedAnchor = undefined;
     this.knownAnchor[this.viewMode] = this.atBottom[this.viewMode] ? undefined : this.measureAnchor(this.viewMode);
     this.measureReadingRow();
     this.anchorMeasuredTop = undefined;
     this.scrollRestored = false;
   }
 
-  realignScrollAnchor(): void {
-    const anchor = this.awaitedConvAnchor;
-    if (anchor === undefined || activeTabId !== this.tabId || this.viewMode !== "conv") return;
-    if (this.alignToAnchor("conv", anchor)) this.awaitedConvAnchor = undefined;
+  realignScrollAnchor(mode: ViewMode): void {
+    const awaited = this.awaitedAnchor;
+    if (awaited?.mode !== mode || activeTabId !== this.tabId || this.viewMode !== mode || (mode === "work" && this.workView !== "log")) return;
+    if (this.alignToAnchor(mode, awaited.anchor)) this.awaitedAnchor = undefined;
   }
 
-  stopAwaitingScrollAnchor(): void {
-    this.awaitedConvAnchor = undefined;
+  stopAwaitingScrollAnchor(mode?: ViewMode): void {
+    if (mode === undefined || this.awaitedAnchor?.mode === mode) this.awaitedAnchor = undefined;
+  }
+
+  noteUserScrollGesture(): void {
+    this.endUserScrollGesture();
+    const gesture: UserScrollGesture = {
+      scrolled: false,
+      frame: undefined,
+      timer: setTimeout(() => this.endUserScrollGesture(), USER_SCROLL_GESTURE_MAX_MS),
+    };
+    gesture.frame = requestAnimationFrame(() => {
+      gesture.frame = requestAnimationFrame(() => {
+        gesture.frame = undefined;
+        if (!gesture.scrolled) this.endUserScrollGesture();
+      });
+    });
+    this.userScrollGesture = gesture;
+  }
+
+  endUserScrollGesture(): void {
+    const gesture = this.userScrollGesture;
+    if (gesture === undefined) return;
+    this.userScrollGesture = undefined;
+    if (gesture.frame !== undefined) cancelAnimationFrame(gesture.frame);
+    clearTimeout(gesture.timer);
   }
 
   resetReplayArtifacts(): void {
@@ -2843,7 +3101,10 @@ export class Tab {
     this.workViewAtBottom = { ...WORK_VIEW_AT_BOTTOM_INITIAL };
     this.atBottom = { conv: true, work: this.workViewAtBottom[this.workView] };
     this.scrollPos = { conv: 0, work: 0 };
-    if (activeTabId === this.tabId) logsEl.scrollTop = this.atBottom[this.viewMode] ? logsEl.scrollHeight : 0;
+    this.bottomTop = {};
+    if (activeTabId !== this.tabId) return;
+    if (this.atBottom[this.viewMode]) this.placeAtBottom(this.viewMode);
+    else logsEl.scrollTop = 0;
   }
 
   isWorklogAtBottom(): boolean {
@@ -2855,8 +3116,7 @@ export class Tab {
     if (this.workView !== "log") return;
     this.atBottom.work = true;
     if (activeTabId === this.tabId && this.viewMode === "work") {
-      logsEl.scrollTop = logsEl.scrollHeight;
-      this.scrollPos.work = logsEl.scrollTop;
+      this.placeAtBottom("work");
     } else {
       this.scrollPos.work = Number.MAX_SAFE_INTEGER;
     }
@@ -2864,7 +3124,7 @@ export class Tab {
 
   finalizeReplay(stillRunning: boolean): void {
     if (!stillRunning) this.endAssistantTurn();
-    this.placePendingHistoryEditSummaries();
+    this.relabelFrames();
   }
 
   private applyStaled(toolUseIds: readonly string[]): void {
@@ -3053,7 +3313,7 @@ export class Tab {
     const childrenEl = document.createElement("div");
     childrenEl.className = "agent-children";
     card.appendChild(childrenEl);
-    const entry: AgentCardEntry = { card, statusEl: status, metaEl: meta, chipsEl, childrenEl };
+    const entry: AgentCardEntry = { card, statusEl: status, nameEl, metaEl: meta, chipsEl, childrenEl };
     fillChips(chipsEl, data, this.models);
     for (const childId of data.childIds ?? []) {
       const child = this.buildRowDom(childId);
@@ -3087,7 +3347,7 @@ export class Tab {
       setRowChip(data, "model", state.modelMeasured);
       fillChips(entry.chipsEl, data, this.models);
     }
-    this.paintAgentTodo(entry, data);
+    this.paintAgentTodo(entry, this.agentTodoLabel(data));
   }
 
   private renderAgentMeta(toolUseId: string): void {
@@ -3195,34 +3455,51 @@ export class Tab {
 
   private assistantRuns: { uuid: string | null; text: string; seg: HTMLElement; complete?: true }[] = [];
 
-  private liveReplyText: { turnId: string; text: string } | null = null;
-
   private latestReplyFooter: HTMLElement | null = null;
 
   private readonly optimisticFoots = new Map<string, HTMLElement>();
 
-  private appendAssistantSegment(): HTMLElement {
+  private ensureLiveAssistantTurn(): HTMLElement {
     if (!this.currentAssistantTurn || !this.currentAssistantTurn.isConnected) {
-      const turn = document.createElement("div");
-      turn.className = "block assistant-turn";
-      this.prependTurnLabel(turn, "assistant", this.lastObservedModel);
-      if (this.currentTurnId !== null) turn.dataset.turnId = this.currentTurnId;
+      const turnId = this.currentTurnId;
+      const known = this.frameOf(turnId);
+      const pastFooter = turnId === null ? undefined : this.pastConvFooters.get(turnId);
+      if (turnId !== null && known !== undefined && pastFooter !== undefined && known.nextElementSibling === pastFooter && this.lastInConv(pastFooter)) {
+        pastFooter.remove();
+        this.pastConvFooters.delete(turnId);
+      }
+      if (known !== undefined && this.lastInConv(known)) {
+        this.currentAssistantTurn = known;
+        this.replyFooterAnchor = known;
+        return known;
+      }
+      const turn = this.createAssistantTurnBlock(this.currentTurnId);
       this.convEl.appendChild(turn);
       this.currentAssistantTurn = turn;
       this.replyFooterAnchor = turn;
-      if (this.pendingTodoCards.size > 0) this.attachPendingTodoCards();
     }
+    return this.currentAssistantTurn;
+  }
+
+  private lastInConv(el: HTMLElement): boolean {
+    for (let at: HTMLElement | null = el; at !== null && at !== this.convEl; at = at.parentElement) {
+      for (let next = at.nextElementSibling; next !== null; next = next.nextElementSibling) {
+        if (!(next instanceof HTMLElement && next.hidden)) return false;
+      }
+    }
+    return true;
+  }
+
+  private appendAssistantSegment(): HTMLElement {
+    const turn = this.ensureLiveAssistantTurn();
     const seg = document.createElement("div");
     seg.className = "assistant-seg streaming";
-    const key = this.pendingDeltaTurnId ?? this.currentTurnId ?? "";
-    const part = this.askReplyParts.get(key) ?? 0;
-    seg.dataset.askSource = part === 0 ? key : `${key}:part:${part}`;
-    this.askReplyParts.set(key, part + 1);
+    seg.dataset.askSource = paragraphKey(this.pendingDeltaTurnId ?? this.currentTurnId ?? "", this.pendingDeltaOrder ?? [0, 0]);
     const parts = buildSegParts(seg);
     this.segCommittedEl = parts.committed;
     this.segTailEl = parts.tail;
     this.committedLen = 0;
-    this.currentAssistantTurn.appendChild(seg);
+    turn.appendChild(seg);
     return seg;
   }
 
@@ -3231,48 +3508,39 @@ export class Tab {
     const last = this.assistantRuns.at(-1);
     if (last !== undefined && last.uuid === null && last.seg === this.currentAssistantBlock) {
       last.text += text;
-    } else {
-      this.assistantRuns.push({ uuid: null, text, seg: this.currentAssistantBlock });
+      return;
     }
-    this.refreshLiveReplyText();
-  }
-
-  private assistantRunsText(): string {
-    return joinRecordTexts(this.assistantRuns.map((run) => run.text));
-  }
-
-  private refreshLiveReplyText(): void {
-    const holder = this.liveReplyText;
-    if (holder === null || holder.turnId !== this.currentTurnId) return;
-    holder.text = this.assistantRunsText();
+    const run = { uuid: null, text, seg: this.currentAssistantBlock };
+    this.assistantRuns.push(run);
+    const runs = this.segRuns.get(run.seg);
+    if (runs === undefined) this.segRuns.set(run.seg, [run]);
+    else runs.push(run);
   }
 
   private onAssistantMessageUuid(ev: Extract<NormalizedEvent, { kind: "assistant_message_uuid" }>): void {
-    if (ev.provenance?.path === "history") return;
+    if (ev.provenance?.path === "history" && !this.historyTurnIds.has(ev.turnId)) return;
     if (this.withSuspendedReply(ev.turnId, () => this.onAssistantMessageUuid(ev))) return;
     if (!this.replayDone && this.currentTurnId === null && this.assistantRuns.length === 0) {
-      this.assistantLeadingRecord = { turnId: ev.turnId, uuid: ev.uuid };
+      if (!this.turnLeadUuids.has(ev.turnId)) this.turnLeadUuids.set(ev.turnId, ev.uuid);
       return;
     }
     if (ev.turnId !== this.currentTurnId) return;
     this.flushDelta();
-    if (this.assistantRuns.length === 0) this.assistantLeadingRecord = { turnId: ev.turnId, uuid: ev.uuid };
-    const last = this.assistantRuns.at(-1);
-    if (!(last?.complete && last.uuid === ev.uuid)) {
-      let i = this.assistantRuns.length - 1;
-      // Only completed standalone records can intervene before a trailing UUID.
-      while (i >= 0 && this.assistantRuns[i].complete) i--;
-      for (; i >= 0; i--) {
-        if (this.assistantRuns[i].uuid !== null || this.assistantRuns[i].complete) break;
-        this.assistantRuns[i].uuid = ev.uuid;
-      }
-    }
+    if (this.assistantRuns.length === 0 && !this.turnLeadUuids.has(ev.turnId)) this.turnLeadUuids.set(ev.turnId, ev.uuid);
+    labelPendingParts(this.assistantRuns, ev.uuid);
+    if (ev.provenance?.path === "history") this.noteRestoredRecord(this.frameOf(ev.turnId), ev.uuid);
     this.recordAskDismissals(this.youStore.relabel());
     this.syncTodoClosedAsks();
     this.persistAskResolutions();
     this.closeLiveRecord();
     this.liveRecordOpen = this.assistantRuns.some(run => run.uuid === null && !run.complete);
     if (this.replyFinished && !this.liveRecordOpen) this.endAssistantTurn();
+  }
+
+  private noteRestoredRecord(block: HTMLElement | undefined, uuid: string | undefined): void {
+    if (uuid === undefined || uuid.length === 0) return;
+    this.convMessageUuids.add(uuid);
+    if (block !== undefined && block.dataset.msgUuid === undefined) block.dataset.msgUuid = uuid;
   }
 
   private onAssistantRetracted(ev: Extract<NormalizedEvent, { kind: "assistant_retracted" }>, suspended = false): void {
@@ -3296,22 +3564,22 @@ export class Tab {
     if (touched.length === 0) return;
     if (suspended && !kept.some(run => run.uuid === null)) this.liveRecordOpen = false;
     this.assistantRuns = kept;
-    this.refreshLiveReplyText();
     for (const seg of touched) this.rebuildAssistantSegment(seg);
     if (this.tabId === activeTabId) refreshFind();
   }
 
   private rebuildAssistantSegment(seg: HTMLElement): void {
-    const text = joinRecordTexts(this.assistantRuns.filter((run) => run.seg === seg).map((run) => run.text));
+    const runs = this.assistantRuns.filter((run) => run.seg === seg);
+    this.segRuns.set(seg, runs);
+    const text = joinRecordTexts(runs.map((run) => run.text));
     const askSource = seg.dataset.askSource ?? seg.closest<HTMLElement>("[data-turn-id]")?.dataset.turnId;
     if (askSource !== undefined) {
       this.youStore.retain(askSource, 0, Infinity, new Set());
       forgetCodeBlockStates(this.tabId, askSource);
     }
     const open = this.currentAssistantBlock === seg;
-    if (this.topConvSeg !== null && this.topConvSeg.el === seg) this.topConvSeg = null;
     if (this.convCursorEl === seg) this.convCursorEl = null;
-    if (!text.trim()) {
+    if (!text.trim() && this.pastParagraphs.get(askSource ?? "")?.live !== true) {
       const turn = seg.parentElement;
       seg.remove();
       if (open) {
@@ -3321,11 +3589,10 @@ export class Tab {
         this.committedLen = 0;
         this.assistantBuffer = "";
       }
-      if (turn !== null && !turn.querySelector(".assistant-seg")) {
-        if (this.currentAssistantTurn === turn) this.currentAssistantTurn = null;
+      if (turn !== null && !turn.querySelector(":scope > .assistant-seg")) {
         const footer = turn.nextElementSibling;
-        turn.remove();
         if (footer !== null && footer.classList.contains("reply-footer")) footer.remove();
+        if (this.frameEmpty(turn)) this.dropFrame(turn);
         this.refreshLatestReplyFooter();
       }
       return;
@@ -3336,11 +3603,42 @@ export class Tab {
       this.segTailEl = parts.tail;
       this.committedLen = 0;
       this.assistantBuffer = text;
-      this.renderReplyMarkdown(parts.tail, text, seg.dataset.askSource ?? seg.closest<HTMLElement>("[data-turn-id]")?.dataset.turnId);
+      this.renderReplyMarkdown(parts.tail, text, askSource);
+    } else {
+      parts.tail.remove();
+      this.renderReplyMarkdown(parts.committed, text, askSource);
+    }
+    this.renderLivePrefix(seg);
+  }
+
+  private renderLivePrefix(seg: HTMLElement): void {
+    const key = seg.dataset.askSource;
+    const para = key === undefined ? undefined : this.pastParagraphs.get(key);
+    if (key === undefined || para === undefined || !para.live) return;
+    if (this.currentAssistantBlock !== seg) {
+      for (const [turnId, reply] of this.suspendedReplies) {
+        if (reply.currentAssistantBlock === seg && this.withSuspendedReply(turnId, () => this.renderLivePrefix(seg))) return;
+      }
+    }
+    const merged = mergedParagraph(para.parts, this.segRuns.get(seg) ?? []);
+    para.base = -merged.shift;
+    const text = paragraphText(merged.parts);
+    if (this.currentAssistantBlock !== seg || this.segCommittedEl === null || this.segTailEl === null) {
+      this.renderReplyMarkdown(seg, text, key, para.base, para.at, para.order?.[1], para.order?.[0]);
       return;
     }
-    parts.tail.remove();
-    this.renderReplyMarkdown(parts.committed, text, seg.dataset.askSource ?? seg.closest<HTMLElement>("[data-turn-id]")?.dataset.turnId);
+    const boundary = findCommitBoundary(text, 0);
+    this.assistantBuffer = text;
+    this.committedLen = boundary > 0 ? boundary : 0;
+    const block = document.createElement("div");
+    this.renderReplyMarkdown(block, text.slice(0, this.committedLen), key, para.base, para.at, para.order?.[1], para.order?.[0]);
+    this.segCommittedEl.replaceChildren(block);
+    this.renderReplyMarkdown(this.segTailEl, text.slice(this.committedLen), key, this.committedLen + para.base);
+  }
+
+  private segBase(seg: HTMLElement | null): number {
+    const para = this.pastParagraphs.get(seg?.dataset.askSource ?? "");
+    return para?.live === true ? para.base : 0;
   }
 
   flushDelta(): void {
@@ -3358,19 +3656,20 @@ export class Tab {
     }
     this.assistantBuffer += appended;
     this.pendingDeltaText = "";
+    this.pendingDeltaOrder = null;
     this.noteAssistantRun(appended);
     const boundary = findCommitBoundary(this.assistantBuffer, this.committedLen);
     if (boundary > this.committedLen && this.segCommittedEl) {
       const chunk = this.assistantBuffer.slice(this.committedLen, boundary);
       if (chunk.trim()) {
         const block = document.createElement("div");
-        this.renderReplyMarkdown(block, chunk, undefined, this.committedLen);
+        this.renderReplyMarkdown(block, chunk, undefined, this.committedLen + this.segBase(this.currentAssistantBlock));
         this.segCommittedEl.appendChild(block);
       }
       this.committedLen = boundary;
     }
     if (this.segTailEl) {
-      this.renderReplyMarkdown(this.segTailEl, this.assistantBuffer.slice(this.committedLen), undefined, this.committedLen);
+      this.renderReplyMarkdown(this.segTailEl, this.assistantBuffer.slice(this.committedLen), undefined, this.committedLen + this.segBase(this.currentAssistantBlock));
     }
     this.scrollToBottom("conv");
   }
@@ -3482,37 +3781,24 @@ export class Tab {
 
   private endAssistantBlock(keepRecordOpen = false): void {
     this.flushDelta();
-    if (this.currentAssistantBlock) {
+    const seg = this.currentAssistantBlock;
+    if (seg) {
       const text = this.assistantBuffer.trim();
       if (!text) {
-        this.currentAssistantBlock.remove();
+        seg.remove();
       } else {
-        this.currentAssistantBlock.classList.remove("streaming");
-        const first = this.topConvSeg === null || Array.from(this.convEl.querySelectorAll(".assistant-seg"))
-          .find(el => el === this.currentAssistantBlock || el === this.topConvSeg?.el) === this.currentAssistantBlock;
-        if (first && this.currentSegTurnId !== null) {
-          this.topConvSeg = {
-            turnId: this.currentSegTurnId,
-            el: this.currentAssistantBlock,
-            text: this.assistantBuffer,
-            records: [
-              ...(this.assistantLeadingRecord?.turnId === this.currentSegTurnId
-                ? [{ text: "", uuid: this.assistantLeadingRecord.uuid }] : []),
-              ...this.assistantRuns.filter((run) => run.seg === this.currentAssistantBlock),
-            ],
-          };
-        }
+        seg.classList.remove("streaming");
         if (keepRecordOpen) return;
         if (this.segTailEl && this.segCommittedEl) {
           const rest = this.assistantBuffer.slice(this.committedLen);
           if (rest.trim()) {
             const block = document.createElement("div");
-            this.renderReplyMarkdown(block, rest, undefined, this.committedLen);
+            this.renderReplyMarkdown(block, rest, undefined, this.committedLen + this.segBase(seg));
             this.segCommittedEl.appendChild(block);
           }
           this.segTailEl.remove();
         } else {
-          this.renderReplyMarkdown(this.currentAssistantBlock, this.assistantBuffer);
+          this.renderReplyMarkdown(seg, this.assistantBuffer);
         }
       }
     }
@@ -3521,6 +3807,7 @@ export class Tab {
     this.segTailEl = null;
     this.committedLen = 0;
     this.assistantBuffer = "";
+    if (seg?.parentNode) this.renderLivePrefix(seg);
   }
 
   private endAssistantTurnBeforeConvBlock(): void {
@@ -3543,9 +3830,7 @@ export class Tab {
     this.liveRecordOpen = false;
     this.convBlockAfterRecordIn = null;
     this.endAssistantBlock();
-    if (this.currentAssistantTurn && !this.currentAssistantTurn.querySelector(".assistant-seg")) {
-      this.currentAssistantTurn.remove();
-    }
+    if (this.currentAssistantTurn && this.frameEmpty(this.currentAssistantTurn)) this.dropFrame(this.currentAssistantTurn);
     this.currentAssistantTurn = null;
     if (this.tabId === activeTabId) refreshFind();
   }
@@ -3961,6 +4246,7 @@ export class Tab {
   }
 
   handleEvent(ev: NormalizedEvent): void {
+    this.eventOrder = [ev.generation, ev.seq];
     this.observeLogEvent(ev);
     this.observeYouEvent(ev);
     const fallback = foldModelFallback(this.modelFallback, ev, this.models);
@@ -3994,7 +4280,7 @@ export class Tab {
         this.updateStrip();
         break;
       case "turn_started":
-        this.noteHistoryTurnStart(ev);
+        this.noteTurnStart(ev);
         this.onTurnStarted(ev);
         break;
       case "ask_rejected":
@@ -4047,6 +4333,7 @@ export class Tab {
         this.onSubagentInfo(ev);
         break;
       case "model_observed":
+        this.noteModelMark(ev);
         if (isConvRenderableEvent(ev)) this.onModelObserved(ev);
         break;
       case "compact_boundary":
@@ -4075,8 +4362,7 @@ export class Tab {
         break;
     }
     if (ev.kind === "tool_call_started" || ev.kind === "tool_call_finished" || ev.kind === "subagent_info") {
-      const id = ev.kind === "tool_call_finished" ? ev.taskNotification?.toolUseId ?? this.bgTaskIdToToolUseId.get(ev.taskNotification?.agentId ?? "") ?? ev.toolUseId : ev.toolUseId;
-      this.refreshLogRow(id);
+      this.refreshLogRow(ev.kind === "tool_call_finished" ? this.finishedRowId(ev) : ev.toolUseId);
     }
     this.logEventTurn = undefined;
     if (ev.kind !== "assistant_text_delta") this.scheduleLogRefresh();
@@ -4118,7 +4404,6 @@ export class Tab {
       pendingDeltaTurnId: this.pendingDeltaTurnId,
       assistantBuffer: this.assistantBuffer,
       assistantRuns: this.assistantRuns,
-      assistantLeadingRecord: this.assistantLeadingRecord,
       segCommittedEl: this.segCommittedEl,
       segTailEl: this.segTailEl,
       committedLen: this.committedLen,
@@ -4126,7 +4411,6 @@ export class Tab {
       replyFinished: this.replyFinished,
       convBlockAfterRecordIn: this.convBlockAfterRecordIn,
       replyFooterAnchor: this.replyFooterAnchor,
-      liveReplyText: this.liveReplyText,
     };
   }
 
@@ -4189,9 +4473,7 @@ export class Tab {
     this.knownTurnIds.add(turnId);
     this.assistantRuns = [];
     this.replyFinished = false;
-    this.liveReplyText = null;
     this.replyFooterAnchor = null;
-    if (this.assistantLeadingRecord?.turnId !== turnId) this.assistantLeadingRecord = null;
     const headline = cliInserted ? null : this.lastHumanHeadline;
     if (!cliInserted) this.lastHumanHeadline = null;
     this.appendTurnAnchor(turnId, timestamp, headline, cliInserted);
@@ -4204,10 +4486,8 @@ export class Tab {
   }
 
   private onTurnStarted(ev: Extract<NormalizedEvent, { kind: "turn_started" }>): void {
-    if (ev.provenance?.path !== "history") {
-      this.dropLiveEditTurnEnds();
-      this.placePendingHistoryEditSummaries();
-    }
+    if (ev.provenance?.path === "history") this.historyTurnIds.add(ev.turnId);
+    this.dropLiveEditTurnEnds();
     this.clearCancelledHandoffNotice();
     if (this.adoptedTurnIds.has(ev.turnId)) {
       this.applyWork(ev.work);
@@ -4220,7 +4500,6 @@ export class Tab {
     if (this.finishSuspendedReply(ev)) return;
     this.knownTurnIds.add(ev.turnId);
     this.endAssistantTurn();
-    if (this.pendingTodoCards.size > 0) this.attachPendingTodoCards(ev.turnId);
     this.applyWork(ev.work);
     this.runningChildTools.clear();
     this.runningMainTools.clear();
@@ -4235,18 +4514,24 @@ export class Tab {
   }
 
   private appendLiveReplyFooter(ev: Extract<NormalizedEvent, { kind: "turn_completed" }>): void {
-    if (ev.provenance?.path !== "history") {
-      const holder = { turnId: ev.turnId, text: this.assistantRunsText() };
-      if (holder.text.trim().length > 0) {
-        this.liveReplyText = holder;
-        this.appendReplyFooter(ev.timestamp > 0 ? ev.timestamp : undefined, () => {
-          const top = this.topConvSeg?.turnId === holder.turnId ? this.topConvSeg : undefined;
-          const past = this.pastConvTurns.get(holder.turnId);
-          return past !== undefined && top !== undefined ? past.text + holder.text.slice(top.text.length) : holder.text;
-        }, this.replyFooterAnchor);
-        this.scrollToBottom("conv");
-      }
-    }
+    if (this.turnCopyText(ev.turnId).trim().length === 0) return;
+    const turnId = ev.turnId;
+    const frame = this.frameOf(turnId);
+    if (this.replyFooterAnchor === null && frame !== undefined && this.turnFooter(frame) !== null) return;
+    this.appendReplyFooter(ev.timestamp > 0 ? ev.timestamp : undefined, () => this.turnCopyText(turnId), this.replyFooterAnchor ?? frame ?? null);
+    this.scrollToBottom("conv");
+  }
+
+  private turnCopyText(turnId: string): string {
+    const segs = this.convEl.querySelectorAll<HTMLElement>(`.block.assistant-turn[data-turn-id="${CSS.escape(turnId)}"] > .assistant-seg`);
+    return paragraphText(Array.from(segs, (seg) => this.segParts(seg)).flat());
+  }
+
+  private segParts(seg: HTMLElement): RecordTextPart[] {
+    const runs = this.segRuns.get(seg) ?? [];
+    const past = this.pastParagraphs.get(seg.dataset.askSource ?? "");
+    if (past === undefined) return runs;
+    return past.live ? prependRecordParts(past.parts, runs) : past.parts;
   }
 
   private noteFileEdit(ev: Extract<NormalizedEvent, { kind: "tool_call_finished" }>): void {
@@ -4254,22 +4539,77 @@ export class Tab {
     const edits = this.turnFileEdits.get(ev.turnId) ?? [];
     if (edits.some((edit) => edit.toolUseId === ev.toolUseId)) return;
     edits.push({ toolUseId: ev.toolUseId, fileEdit: ev.fileEdit, order: [ev.generation, ev.seq] });
-    edits.sort((a, b) => a.order[0] - b.order[0] || a.order[1] - b.order[1]);
+    edits.sort((a, b) => compareTurnOrder(a.order, b.order));
     this.turnFileEdits.set(ev.turnId, edits);
     this.settleEditSummary(ev.turnId);
   }
 
-  private noteHistoryTurnStart(ev: Extract<NormalizedEvent, { kind: "turn_started" }>): void {
-    if (ev.provenance?.path === "history" && ev.timestamp > 0) this.historyTurnStarts.set(ev.turnId, ev.timestamp);
+  private editSummaryShown(turnId: string): boolean {
+    return (this.turnFileEdits.get(turnId)?.length ?? 0) > 0 && editSummaryEnabled();
   }
 
-  private noteReplayAnchor(at: number | null | undefined, foot: HTMLElement | null): void {
-    if (typeof at === "number" && at > 0 && foot !== null) foot.dataset.editAnchorAt = String(at);
+  private turnFooter(frame: HTMLElement): HTMLElement | null {
+    const next = frame.nextElementSibling;
+    return next instanceof HTMLElement && next.classList.contains("reply-footer") ? next : null;
+  }
+
+  private slotFooter(slot: HTMLElement): HTMLElement | null {
+    let prev = slot.previousElementSibling;
+    while (prev !== null && prev.classList.contains("edit-summary-slot")) prev = prev.previousElementSibling;
+    return prev instanceof HTMLElement && prev.classList.contains("reply-footer") ? prev : null;
+  }
+
+  private fitEditSlot(turnId: string, slot: HTMLElement): void {
+    if (slot.parentNode === null || this.pastTurns !== null) return;
+    const frame = this.frameOf(turnId);
+    const footer = frame !== undefined ? this.turnFooter(frame) : this.slotFooter(slot);
+    const holder = slot.parentElement?.matches(".block.assistant-turn") ? slot.parentElement : null;
+    const place = editSummaryPlace(footer !== null, this.editSummaryShown(turnId));
+    if (place === "after-footer" && footer !== null) {
+      if (this.slotFooter(slot) !== footer) footer.after(slot);
+      if (holder !== null && this.frameEmpty(holder)) this.dropFrame(holder);
+      return;
+    }
+    if (place === "in-frame") {
+      if (frame === undefined) {
+        const created = this.createAssistantTurnBlock(turnId);
+        slot.replaceWith(created);
+        created.appendChild(slot);
+        return;
+      }
+      if (frame.lastElementChild !== slot) frame.appendChild(slot);
+      if (holder !== null && holder !== frame && this.frameEmpty(holder)) this.dropFrame(holder);
+      return;
+    }
+    if (holder !== null && holder.querySelector(":scope > :not(.turn-label):not(.edit-summary-slot)") === null) {
+      holder.replaceWith(slot);
+      this.dropFrame(holder);
+    }
+  }
+
+  private turnMayBeRunning(turnId: string, frame: HTMLElement): boolean {
+    if (this.turnState === "idle" || this.endedTurns.has(turnId)) return false;
+    const frames = this.convEl.querySelectorAll<HTMLElement>(".block.assistant-turn");
+    return frames[frames.length - 1] === frame;
+  }
+
+  private settleTurnTail(turnId: string): void {
+    if (this.pastTurns !== null) return;
+    const frame = this.frameOf(turnId);
+    if (frame !== undefined && this.pastTextTurns.has(turnId) && turnId !== this.currentTurnId && !this.suspendedReplies.has(turnId) &&
+      this.turnFooter(frame) === null && frame.querySelector(":scope > .assistant-seg") !== null && !this.turnMayBeRunning(turnId, frame)) {
+      const footer = this.buildReplyFooter(this.pastTurnCompletedAt.get(turnId), () => this.turnCopyText(turnId));
+      this.pastConvFooters.set(turnId, footer);
+      frame.after(footer);
+    }
+    const slot = this.editSummarySlots.get(turnId);
+    if (slot !== undefined) this.fitEditSlot(turnId, slot);
   }
 
   private renderEditSummarySlot(turnId: string, slot: HTMLElement): void {
     const edits = this.turnFileEdits.get(turnId);
-    if (edits === undefined || edits.length === 0 || !editSummaryEnabled()) {
+    this.fitEditSlot(turnId, slot);
+    if (edits === undefined || !this.editSummaryShown(turnId)) {
       slot.replaceChildren();
       slot.hidden = true;
       return;
@@ -4297,42 +4637,20 @@ export class Tab {
     this.renderEditSummarySlot(turnId, slot);
   }
 
-  private editSummaryAnchors(): { at: number; el: HTMLElement }[] {
-    return Array.from(this.convEl.querySelectorAll<HTMLElement>("[data-edit-anchor-at]"), (el) => ({ at: Number(el.dataset.editAnchorAt), el }));
-  }
-
-  private insertEditSummarySlot(turnId: string, end: EditTurnEnd, slot: HTMLElement, anchors: { at: number; el: HTMLElement }[] | null): boolean {
+  private insertEditSummarySlot(turnId: string, end: EditTurnEnd, slot: HTMLElement): boolean {
     if (end.kind === "after") {
       if (end.el.parentNode === null) return false;
       end.el.after(slot);
       return true;
     }
-    if (end.kind === "live") {
-      const turns = this.convEl.querySelectorAll<HTMLElement>(`.block.assistant-turn[data-turn-id="${CSS.escape(turnId)}"]`);
-      const turn = turns.length > 0 ? turns[turns.length - 1] : null;
-      if (turn === null) {
-        this.convEl.appendChild(slot);
-        return true;
-      }
-      const footer = turn.nextElementSibling;
-      (footer !== null && footer.classList.contains("reply-footer") ? footer : turn).after(slot);
-      return true;
-    }
-    if (anchors === null) return false;
-    const startedAt = this.historyTurnStarts.get(turnId) ?? -Infinity;
-    let anchor: { at: number; el: HTMLElement } | null = null;
-    for (const entry of anchors) {
-      if (entry.at < startedAt || entry.at > end.endedAt) continue;
-      if (anchor === null || entry.at >= anchor.at) anchor = entry;
-    }
-    if (anchor === null) return false;
-    let after: Element = anchor.el;
-    while (after.nextElementSibling !== null && after.nextElementSibling.classList.contains("edit-summary-slot")) after = after.nextElementSibling;
-    after.after(slot);
+    const frame = this.frameOf(turnId);
+    const after = frame === undefined ? null : this.turnFooter(frame) ?? frame;
+    if (after === null) this.convEl.appendChild(slot);
+    else after.after(slot);
     return true;
   }
 
-  private settleEditSummary(turnId: string, anchors: { at: number; el: HTMLElement }[] | null = null): void {
+  private settleEditSummary(turnId: string): void {
     const placed = this.editSummarySlots.get(turnId);
     if (placed !== undefined) {
       this.renderEditSummarySlot(turnId, placed);
@@ -4341,7 +4659,7 @@ export class Tab {
     const end = this.editTurnEnds.get(turnId);
     if (end === undefined || !this.turnFileEdits.has(turnId)) return;
     const slot = this.createEditSummarySlot(turnId);
-    if (this.insertEditSummarySlot(turnId, end, slot, anchors)) this.adoptEditSummarySlot(turnId, slot);
+    if (this.insertEditSummarySlot(turnId, end, slot)) this.adoptEditSummarySlot(turnId, slot);
   }
 
   private endEditTurn(turnId: string, end: EditTurnEnd): void {
@@ -4358,33 +4676,23 @@ export class Tab {
   }
 
   private showEditSummary(ev: Extract<NormalizedEvent, { kind: "turn_completed" | "turn_interrupted" | "turn_failed" }>): void {
-    this.endEditTurn(ev.turnId, ev.provenance?.path === "history" ? { kind: "history", endedAt: ev.timestamp } : { kind: "live" });
-    if (ev.provenance?.path !== "history" && this.editSummarySlots.get(ev.turnId)?.hidden === false) this.scrollToBottom("conv");
+    this.endedTurns.add(ev.turnId);
+    this.endEditTurn(ev.turnId, { kind: "live" });
+    if (this.editSummarySlots.get(ev.turnId)?.hidden === false) this.scrollToBottom("conv");
   }
 
-  private showPastEditSummary(ev: Extract<NormalizedEvent, { kind: "turn_completed" | "turn_interrupted" | "turn_failed" }>, frag: DocumentFragment): void {
-    if (ev.provenance?.path === "history") {
-      this.endEditTurn(ev.turnId, { kind: "history", endedAt: ev.timestamp });
-      return;
-    }
+  private showPastEditSummary(ev: Extract<NormalizedEvent, { kind: "turn_completed" | "turn_interrupted" | "turn_failed" }>, turns: PastTurns): void {
+    this.endedTurns.add(ev.turnId);
     const footer = this.pastConvFooters.get(ev.turnId);
     if (footer !== undefined) {
       this.endEditTurn(ev.turnId, { kind: "after", el: footer });
       return;
     }
-    if (this.editSummarySlots.has(ev.turnId)) return;
+    if (this.editSummarySlots.has(ev.turnId) || turns.slots.has(ev.turnId)) return;
     const slot = this.createEditSummarySlot(ev.turnId);
-    frag.appendChild(slot);
-    this.adoptEditSummarySlot(ev.turnId, slot);
-  }
-
-  private placePendingHistoryEditSummaries(): void {
-    let anchors: { at: number; el: HTMLElement }[] | null = null;
-    for (const [turnId, end] of [...this.editTurnEnds]) {
-      if (end.kind !== "history" || !this.turnFileEdits.has(turnId)) continue;
-      anchors ??= this.editSummaryAnchors();
-      this.settleEditSummary(turnId, anchors);
-    }
+    turns.frag.appendChild(slot);
+    turns.slots.set(ev.turnId, slot);
+    turns.touched.add(ev.turnId);
   }
 
   private refreshEditSummaries(): void {
@@ -4392,7 +4700,6 @@ export class Tab {
       if (slot.parentNode === null) this.editSummarySlots.delete(turnId);
       else this.renderEditSummarySlot(turnId, slot);
     }
-    this.placePendingHistoryEditSummaries();
   }
 
   private onTurnInterrupted(ev: Extract<NormalizedEvent, { kind: "turn_interrupted" }>): void {
@@ -4482,26 +4789,30 @@ export class Tab {
   }
 
   private onAssistantTextDelta(ev: Extract<NormalizedEvent, { kind: "assistant_text_delta" }>): void {
-    if (ev.provenance?.path === "history") return;
+    if (!isConvRenderableEvent(ev)) return;
     if (this.withSuspendedReply(ev.turnId, () => {
       if (this.liveRecordOpen) this.onAssistantTextDelta(ev);
     })) return;
-    if (ev.turnId !== this.currentTurnId && !this.adoptOrphanTurn(ev)) return;
+    if (ev.provenance?.path === "history" ? ev.turnId !== this.currentTurnId || !this.historyTurnIds.has(ev.turnId)
+      : ev.turnId !== this.currentTurnId && !this.adoptOrphanTurn(ev)) return;
     const recordUuid = ev.recordUuid;
     const pendingOrdinary = this.liveRecordOpen;
-    if (recordUuid !== undefined) this.endAssistantBlock();
+    const breaks = breaksParagraph({ kind: "text", order: [ev.generation, ev.seq], at: ev.timestamp, text: ev.text, recordUuid });
+    if (ev.text.length > 0 && !this.turnFirstBreaks.has(ev.turnId)) this.turnFirstBreaks.set(ev.turnId, breaks);
+    if (breaks) this.endAssistantBlock();
     if (ev.text.length > 0) this.liveRecordOpen = true;
+    if (this.pendingDeltaText === "") this.pendingDeltaOrder = [ev.generation, ev.seq];
     this.pendingDeltaText += ev.text;
     this.pendingDeltaTurnId = ev.turnId;
     if (!this.rafScheduled) {
       this.rafScheduled = true;
       requestAnimationFrame(() => this.flushDelta());
     }
-    if (recordUuid !== undefined) {
+    if (breaks) {
       this.flushDelta();
       const run = this.assistantRuns.at(-1);
       if (run !== undefined && run.seg === this.currentAssistantBlock) {
-        run.uuid = recordUuid;
+        run.uuid = recordUuid ?? null;
         run.complete = true;
       }
       this.endAssistantBlock();
@@ -4524,12 +4835,15 @@ export class Tab {
   }
 
   private onUserMessage(ev: Extract<NormalizedEvent, { kind: "user_message" }>): void {
-    if (ev.provenance?.path !== "history" || !this.liveRecordOpen) this.endAssistantTurnBeforeConvBlock();
+    const shown = isConvRenderableEvent(ev) && !(ev.provenance?.path === "history" && this.liveRecordOpen);
+    if (shown) this.endAssistantTurnBeforeConvBlock();
     this.applyWork(ev.work);
     this.noteHumanHeadline(ev.text, ev.turnId);
-    if (ev.provenance?.path === "history") return;
+    if (!shown) return;
+    if (ev.provenance?.path !== "history") this.replaceAcceptedOptimisticBubble();
     const block = this.addBlock("user", ev.text);
     if (ev.turnId !== null) block.dataset.turnId = ev.turnId;
+    if (ev.provenance?.path === "history") this.noteRestoredRecord(block, ev.uuid);
     for (const im of ev.images ?? []) {
       const img = document.createElement("img");
       img.className = "user-image";
@@ -4608,11 +4922,8 @@ export class Tab {
       scheduleImageLoads(this);
     }
     this.observeSessionTime(ev.recordedAt ?? ev.sentAt);
-    if (ev.role === "user") this.noteReplayAnchor(ev.recordedAt ?? ev.sentAt, this.appendUserFoot(block, ev.recordedAt ?? ev.sentAt ?? undefined, ev.text));
-    else if (ev.role === "assistant") {
-      this.appendReplyFooter(ev.recordedAt, () => ev.text);
-      this.noteReplayAnchor(ev.recordedAt, this.latestReplyFooter);
-    }
+    if (ev.role === "user") this.appendUserFoot(block, ev.recordedAt ?? ev.sentAt ?? undefined, ev.text);
+    else if (ev.role === "assistant") this.appendReplyFooter(ev.recordedAt, () => ev.text);
     this.scrollToBottom("conv");
   }
 
@@ -4780,6 +5091,10 @@ export class Tab {
     if (!this.applyToolFinishDom(ev)) this.rememberOrphanFinish(ev);
   }
 
+  private finishedRowId(ev: Extract<NormalizedEvent, { kind: "tool_call_finished" }>): string {
+    return ev.taskNotification?.toolUseId ?? this.bgTaskIdToToolUseId.get(ev.taskNotification?.agentId ?? "") ?? ev.toolUseId;
+  }
+
   private applyToolFinishDom(ev: Extract<NormalizedEvent, { kind: "tool_call_finished" }>): boolean {
     if (ev.backgroundTaskId !== undefined && !ev.isError) {
       this.bgTaskIdToToolUseId.set(ev.backgroundTaskId, ev.toolUseId);
@@ -4788,7 +5103,7 @@ export class Tab {
       this.bgTaskIdToToolUseId.set(ev.asyncLaunchedAgentId, ev.toolUseId);
     }
 
-    const finishedId = ev.taskNotification?.toolUseId ?? this.bgTaskIdToToolUseId.get(ev.taskNotification?.agentId ?? "") ?? ev.toolUseId;
+    const finishedId = this.finishedRowId(ev);
     if (this.rowData.has(finishedId)) {
       const order = [ev.generation, ev.seq, ev.timestamp];
       const previous = this.logFinishOrder.get(finishedId);
@@ -4797,10 +5112,7 @@ export class Tab {
     }
 
     if (ev.taskNotification !== undefined) {
-      const targetId =
-        ev.taskNotification.toolUseId ??
-        this.bgTaskIdToToolUseId.get(ev.taskNotification.agentId) ??
-        ev.toolUseId;
+      const targetId = finishedId;
       const startedAt = this.toolStartTimes.get(targetId);
       this.toolStartTimes.delete(targetId);
       const elapsedMs = startedAt !== undefined ? ev.timestamp - startedAt : 0;
@@ -4986,10 +5298,7 @@ export class Tab {
 
   private rememberOrphanFinish(ev: Extract<NormalizedEvent, { kind: "tool_call_finished" }>): void {
     if (this.orphanFinishes.size >= ORPHAN_FINISH_MAX) return;
-    const key =
-      ev.taskNotification?.toolUseId ??
-      this.bgTaskIdToToolUseId.get(ev.taskNotification?.agentId ?? "") ??
-      ev.toolUseId;
+    const key = this.finishedRowId(ev);
     if (this.orphanFinishes.get(key)?.taskNotification !== undefined && ev.taskNotification === undefined) return;
     this.orphanFinishes.set(key, ev);
   }
@@ -5101,12 +5410,6 @@ export class Tab {
   private onModelObserved(ev: Extract<NormalizedEvent, { kind: "model_observed" }>): void {
     const key = this.modelKey(ev.model);
     if (key === undefined) return;
-    if (ev.turnId !== null) {
-      const label = this.currentAssistantTurn?.dataset.turnId === ev.turnId
-        ? this.currentAssistantTurn.querySelector<HTMLElement>(":scope > .turn-label > .turn-label-name")
-        : this.convEl.querySelector<HTMLElement>(`.block.assistant-turn[data-turn-id="${CSS.escape(ev.turnId)}"] > .turn-label > .turn-label-name`);
-      if (label) this.bindModelName(label, ev.model);
-    }
     if (this.lastObservedModel !== null && this.lastObservedModel !== key) {
       const anchor =
         this.currentAssistantTurn !== null &&
@@ -5405,61 +5708,49 @@ export class Tab {
     let continued = 0;
     let failed = 0;
     const failures: string[] = [];
-    const turns = new Map<string, { el: HTMLElement }>();
-    const records = new Map<string, RecordTextPart[]>();
-    for (const ev of events) {
-      if (ev.kind === "turn_completed" && ev.timestamp > 0) this.pastTurnCompletedAt.set(ev.turnId, ev.timestamp);
-      const key = `${ev.generation}:${ev.seq}`;
-      if (this.renderedConvEventKeys.has(key)) {
-        duplicates++;
-        continue;
-      }
-      if (ev.kind === "tool_call_finished") this.noteFileEdit(ev);
-      else if (ev.kind === "turn_started") this.noteHistoryTurnStart(ev);
-      else if (ev.kind === "turn_completed" || ev.kind === "turn_interrupted" || ev.kind === "turn_failed") this.showPastEditSummary(ev, frag);
-      try {
-        const outcome = this.renderPastConvEvent(ev, frag, turns);
-        if (ev.provenance?.path !== "history" && (ev.kind === "assistant_text_delta" || ev.kind === "assistant_message_uuid")) {
-          const parts = records.get(ev.turnId) ?? [];
-          appendRecordPart(parts, ev.kind === "assistant_text_delta"
-            ? ev.recordUuid === undefined ? { text: ev.text, uuid: null }
-              : { text: ev.text, uuid: ev.recordUuid, complete: true }
-            : { text: "", uuid: ev.uuid });
-          records.set(ev.turnId, parts);
+    const turns: PastTurns = { frag, items: new Map(), touched: new Set(), slots: new Map(), frames: new Map(), recordIds: new Map() };
+    this.flushDelta();
+    this.pastTurns = turns;
+    try {
+      for (const ev of events) {
+        if (ev.kind === "turn_completed" && ev.timestamp > 0) this.pastTurnCompletedAt.set(ev.turnId, ev.timestamp);
+        const key = `${ev.generation}:${ev.seq}`;
+        if (this.renderedConvEventKeys.has(key)) {
+          duplicates++;
+          continue;
         }
-        this.renderedConvEventKeys.add(key);
-        if (outcome === "skipped") skipped++;
-        else if (outcome === "duplicate") duplicates++;
-        else if (outcome === "continued") continued++;
-        else rendered++;
-      } catch (error) {
-        failed++;
-        if (failures.length < 5) failures.push(`${ev.kind}: ${String(error)}`);
+        if (ev.kind === "tool_call_finished") {
+          this.noteFileEdit(ev);
+          turns.touched.add(ev.turnId);
+        } else if (ev.kind === "turn_started") this.noteTurnStart(ev);
+        else if (ev.kind === "turn_completed" || ev.kind === "turn_interrupted" || ev.kind === "turn_failed") this.showPastEditSummary(ev, turns);
+        try {
+          this.eventOrder = [ev.generation, ev.seq];
+        const outcome = this.renderPastConvEvent(ev, frag, turns);
+          this.renderedConvEventKeys.add(key);
+          if (outcome === "skipped") skipped++;
+          else if (outcome === "duplicate") duplicates++;
+          else if (outcome === "continued") continued++;
+          else rendered++;
+        } catch (error) {
+          failed++;
+          if (failures.length < 5) failures.push(`${ev.kind}: ${String(error)}`);
+        }
       }
-    }
-    for (const [turnId, parts] of records) {
-      const top = this.topConvSeg;
-      const carried =
-        this.pastConvTurns.get(turnId) ??
-        (top !== null && top.turnId === turnId ? top : undefined);
-      const joined = prependRecordParts(parts, this.pastConvRecords.get(turnId) ?? (top !== null && carried === top ? top.records : []));
-      this.pastConvRecords.set(turnId, joined);
-      const turn = turns.get(turnId) ?? carried;
-      if (turn === undefined) continue;
-      const merged = joinRecordTexts(joined.map((part) => part.text));
-      this.youStore.retain(turnId, 0, Infinity, new Set());
-      this.pastConvTurns.set(turnId, { el: turn.el, text: merged });
-      this.renderReplyMarkdown(turn.el, merged, turnId);
-    }
-    for (const [turnId, footer] of this.pastConvFooters) {
-      Tab.applyFooterTime(footer, this.pastTurnCompletedAt.get(turnId));
+      for (const [turnId, items] of turns.items) this.settlePastTurn(turnId, items, turns);
+    } finally {
+      this.pastTurns = null;
     }
     this.installConvHistoryHead();
     const body = this.convHistoryBodyEl!;
     body.insertBefore(frag, body.firstChild);
-    this.attachPendingTodoCards();
+    this.relabelFrames();
+    for (const turnId of turns.touched) this.settleTurnTail(turnId);
+    for (const [turnId, slot] of turns.slots) this.adoptEditSummarySlot(turnId, slot);
+    for (const [turnId, footer] of this.pastConvFooters) {
+      Tab.applyFooterTime(footer, this.pastTurnCompletedAt.get(turnId));
+    }
     this.refreshLatestReplyFooter();
-    this.placePendingHistoryEditSummaries();
     this.convPrependedTotal += rendered;
     scheduleImageLoads(this);
     return {
@@ -5476,46 +5767,110 @@ export class Tab {
     });
   }
 
-  private pastConvTurn(turnId: string, frag: DocumentFragment, turns: Map<string, { el: HTMLElement }>): boolean {
-    if (turns.has(turnId)) return false;
-    const carried = this.pastConvTurns.get(turnId);
-    if (carried !== undefined && carried.el.isConnected) {
-      turns.set(turnId, { el: carried.el });
-      return false;
+  private firstFrameOf(turnId: string, turns: PastTurns): HTMLElement | undefined {
+    const cached = turns.frames.get(turnId);
+    if (cached !== undefined && this.placed(cached)) return cached;
+    const known = this.frameOf(turnId);
+    const frame = known === undefined || known.parentNode === turns.frag ? known
+      : this.convEl.querySelector<HTMLElement>(`.block.assistant-turn[data-turn-id="${CSS.escape(turnId)}"]`) ?? known;
+    if (frame !== undefined) turns.frames.set(turnId, frame);
+    return frame;
+  }
+
+  private pastTurnItem(turns: PastTurns, turnId: string, item: TurnItem): boolean {
+    const list = turns.items.get(turnId);
+    if (list === undefined) turns.items.set(turnId, [item]);
+    else list.push(item);
+    turns.touched.add(turnId);
+    if (item.kind === "uuid") return false;
+    let frame = this.firstFrameOf(turnId, turns);
+    if (frame === undefined) {
+      frame = this.createAssistantTurnBlock(turnId);
+      turns.frag.appendChild(frame);
+      turns.frames.set(turnId, frame);
     }
-    const top = this.topConvSeg;
-    if (top !== null && top.turnId === turnId && top.el.isConnected) {
-      turns.set(turnId, { el: top.el });
-      return false;
-    }
-    const turn = document.createElement("div");
-    turn.className = "block assistant-turn";
-    this.prependTurnLabel(turn, "assistant", null);
-    turn.dataset.convPast = "1";
-    turn.dataset.turnId = turnId;
-    const seg = document.createElement("div");
-    seg.className = "assistant-seg";
-    turn.appendChild(seg);
-    frag.appendChild(turn);
-    turns.set(turnId, { el: seg });
-    const footer = this.buildReplyFooter(undefined, () => this.pastConvTurns.get(turnId)?.text ?? "");
-    this.pastConvFooters.set(turnId, footer);
-    frag.appendChild(footer);
+    if (item.kind !== "text" || item.text.length === 0 || frame.dataset.convPast === "1") return false;
+    frame.dataset.convPast = "1";
     return true;
+  }
+
+  private settlePastTurn(turnId: string, items: readonly TurnItem[], turns: PastTurns): void {
+    const frame = this.firstFrameOf(turnId, turns);
+    const head = frame?.querySelector<HTMLElement>(":scope > .assistant-seg") ?? undefined;
+    const join = prependTurnLayout(turnId, items, head !== undefined && this.turnFirstBreaks.get(turnId) === false, this.turnLeadUuids.get(turnId));
+    if (join.leadUuid === undefined) this.turnLeadUuids.delete(turnId);
+    else this.turnLeadUuids.set(turnId, join.leadUuid);
+    const first = items.filter((item) => item.kind === "card" || (item.kind === "text" && item.text.length > 0))
+      .sort((a, b) => compareTurnOrder(a.order, b.order))[0];
+    if (first !== undefined) this.turnFirstBreaks.set(turnId, breaksParagraph(first));
+    if (frame === undefined) return;
+    const label = frame.querySelector(":scope > .turn-label");
+    const ref = label === null ? frame.firstChild : label.nextSibling;
+    for (const slot of join.slots) {
+      if (slot.kind === "card") {
+        const anchor = document.createComment("");
+        this.cardAnchors.set(slot.toolUseId, anchor);
+        frame.insertBefore(anchor, ref);
+        continue;
+      }
+      const seg = document.createElement("div");
+      seg.className = "assistant-seg";
+      seg.dataset.askSource = slot.key;
+      this.pastParagraphs.set(slot.key, { parts: slot.parts, base: 0, live: false, at: slot.at, order: slot.opener });
+      frame.insertBefore(seg, ref);
+      this.renderReplyMarkdown(seg, paragraphText(slot.parts), slot.key, 0, slot.at, slot.opener[1], slot.opener[0]);
+      this.pastTextTurns.add(turnId);
+    }
+    if (join.prefix !== undefined && head !== undefined) {
+      this.mergeIntoHead(head, join.prefix);
+      this.pastTextTurns.add(turnId);
+    }
+    const card = this.todoTurnCards.get(turnId);
+    if (card !== undefined) this.placeTodoCard(card, turnId);
+    const record = turns.recordIds.get(turnId);
+    if (record !== undefined) {
+      delete frame.dataset.msgUuid;
+      this.noteRestoredRecord(frame, record);
+    }
+    if (this.frameEmpty(frame)) this.dropFrame(frame);
+  }
+
+  private mergeIntoHead(seg: HTMLElement, prefix: TurnParagraph): void {
+    const key = seg.dataset.askSource ?? "";
+    const past = this.pastParagraphs.get(key);
+    if (past !== undefined && !past.live) {
+      const merged = mergedParagraph(prefix.parts, past.parts);
+      past.parts = merged.parts;
+      past.base -= merged.shift;
+      past.at = prefix.at;
+      past.order = prefix.opener;
+      this.renderReplyMarkdown(seg, paragraphText(past.parts), key, past.base, past.at, past.order?.[1], past.order?.[0]);
+      return;
+    }
+    const live: PastParagraph = past ?? { parts: [], base: 0, live: true };
+    live.parts = prependRecordParts(prefix.parts, live.parts);
+    live.at = prefix.at;
+    live.order = prefix.opener;
+    this.pastParagraphs.set(key, live);
+    this.renderLivePrefix(seg);
   }
 
   private renderPastConvEvent(
     ev: NormalizedEvent,
     frag: DocumentFragment,
-    turns: Map<string, { el: HTMLElement }>
+    turns: PastTurns
   ): "created" | "duplicate" | "continued" | "skipped" {
     this.observeYouEvent(ev);
     if (ev.kind === "tool_call_started" && ev.turnId !== null && ev.parentToolUseId === null && isTodoWriteTool(ev.toolName)) {
-      const created = this.pastConvTurn(ev.turnId, frag, turns);
-      this.placeTodoToolCard(ev, turns.get(ev.turnId)?.el);
-      return created ? "created" : "skipped";
+      this.placeTodoToolCard(ev, turns);
+      return "skipped";
     }
     if (ev.kind === "tool_call_finished") this.finishTodoToolCard(ev);
+    if (ev.kind === "model_observed") this.noteModelMark(ev);
+    if (ev.kind === "assistant_message_uuid") {
+      this.pastTurnItem(turns, ev.turnId, { kind: "uuid", order: [ev.generation, ev.seq], uuid: ev.uuid });
+      if (ev.provenance?.path === "history" && !turns.recordIds.has(ev.turnId)) turns.recordIds.set(ev.turnId, ev.uuid);
+    }
     if (!isConvRenderableEvent(ev)) return "skipped";
     if (ev.kind === "local_command_output") {
       if (ev.uuid && this.convMessageUuids.has(ev.uuid)) return "duplicate";
@@ -5575,8 +5930,8 @@ export class Tab {
         }
       }
       frag.appendChild(div);
-      if (ev.role === "user") this.noteReplayAnchor(ev.recordedAt ?? ev.sentAt, this.appendUserFoot(div, ev.recordedAt ?? ev.sentAt ?? undefined, ev.text));
-      else if (ev.role === "assistant") this.noteReplayAnchor(ev.recordedAt, frag.appendChild(this.buildReplyFooter(ev.recordedAt, () => ev.text)));
+      if (ev.role === "user") this.appendUserFoot(div, ev.recordedAt ?? ev.sentAt ?? undefined, ev.text);
+      else if (ev.role === "assistant") frag.appendChild(this.buildReplyFooter(ev.recordedAt, () => ev.text));
       return "created";
     }
     if (ev.kind === "user_message") {
@@ -5584,6 +5939,7 @@ export class Tab {
       div.className = "block user";
       div.dataset.convPast = "1";
       if (ev.turnId !== null) div.dataset.turnId = ev.turnId;
+      if (ev.provenance?.path === "history") this.noteRestoredRecord(div, ev.uuid);
       div.textContent = ev.text;
       this.prependTurnLabel(div, "user");
       for (const im of ev.images ?? []) {
@@ -5604,13 +5960,12 @@ export class Tab {
       this.appendUserFoot(div, ev.sentAt ?? (ev.timestamp > 0 ? ev.timestamp : undefined), ev.text);
       return "created";
     }
-    if (ev.kind === "assistant_text_delta") return this.pastConvTurn(ev.turnId, frag, turns) ? "created" : "continued";
+    if (ev.kind === "assistant_text_delta") {
+      return this.pastTurnItem(turns, ev.turnId, { kind: "text", order: [ev.generation, ev.seq], at: ev.timestamp, text: ev.text, recordUuid: ev.recordUuid }) ? "created" : "continued";
+    }
     if (ev.kind === "model_observed") {
-      const turn = ev.turnId === null ? undefined : turns.get(ev.turnId) ?? this.pastConvTurns.get(ev.turnId);
-      const label = turn?.el.closest(".block.assistant-turn")?.querySelector<HTMLElement>(":scope > .turn-label > .turn-label-name");
       const key = this.modelKey(ev.model);
       if (key === undefined) return "skipped";
-      if (label) this.bindModelName(label, key);
       let created = false;
       if (this.lastPastModel !== null && this.lastPastModel !== key) {
         const div = document.createElement("div");
@@ -5699,8 +6054,8 @@ export class Tab {
           }
         }
         frag.appendChild(div);
-        if (m.role === "user") this.noteReplayAnchor(m.timestamp, this.appendUserFoot(div, m.timestamp, m.text));
-        else if (m.role === "assistant") this.noteReplayAnchor(m.timestamp, frag.appendChild(this.buildReplyFooter(m.timestamp, () => m.text)));
+        if (m.role === "user") this.appendUserFoot(div, m.timestamp, m.text);
+        else if (m.role === "assistant") frag.appendChild(this.buildReplyFooter(m.timestamp, () => m.text));
       } catch (error) {
         failed++;
         if (failures.length < 5) failures.push(String(error));
@@ -5712,9 +6067,7 @@ export class Tab {
     this.installConvHistoryHead();
     const body = this.convHistoryBodyEl!;
     body.insertBefore(frag, body.firstChild);
-    this.attachPendingTodoCards();
     this.refreshLatestReplyFooter();
-    this.placePendingHistoryEditSummaries();
     this.convPrependedTotal += rendered + dividersCreated;
     scheduleImageLoads(this);
     return {
@@ -5792,7 +6145,7 @@ export class Tab {
         try {
           this.observeLogEvent(ev);
           outcome = this.renderPastEvent(ev);
-          if (ev.kind === "tool_call_started" || ev.kind === "tool_call_finished" || ev.kind === "subagent_info") this.refreshLogRow(ev.toolUseId);
+          if (ev.kind === "tool_call_started" || ev.kind === "tool_call_finished" || ev.kind === "subagent_info") this.refreshLogRow(ev.kind === "tool_call_finished" ? this.finishedRowId(ev) : ev.toolUseId);
         } catch (error) {
           ctx.failed++;
           if (ctx.failures.length < 5) ctx.failures.push(`${ev.kind}: ${String(error)}`);
@@ -6008,7 +6361,7 @@ export class Tab {
   }
 
   renderOptimisticUserBubble(text: string, clientToken: string, images?: ImageAttachment[]): HTMLElement {
-    this.endAssistantTurn();
+    this.endAssistantTurnBeforeConvBlock();
     const block = this.addBlock("user", text);
     block.dataset.hydrationOptimistic = "true";
     block.dataset.clientToken = clientToken;
@@ -6045,5 +6398,13 @@ export class Tab {
       el.dataset.hydrationAccepted = "true";
       el.dataset.disposition = "accepted-human";
     }
+  }
+
+  private replaceAcceptedOptimisticBubble(): void {
+    const accepted = this.convEl.querySelector<HTMLElement>(
+      `.block.user[data-hydration-optimistic="true"][data-disposition="accepted-human"]`
+    );
+    const clientToken = accepted?.dataset.clientToken;
+    if (clientToken !== undefined) this.removeOptimisticBubble(clientToken);
   }
 }

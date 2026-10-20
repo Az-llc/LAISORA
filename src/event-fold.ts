@@ -21,7 +21,7 @@ import {
   UNOBSERVED_TIME,
 } from "./protocol";
 import { foldSessionFacts, type SessionFactsAccumulator } from "./session-facts";
-import { backgroundAgentDispatch, markEventLogTrimmed, reduceWorkModel, type WorkModelState } from "./work-model";
+import { backgroundAgentDispatch, backgroundTaskLaunchedSince, markEventLogTrimmed, reduceWorkModel, type WorkModelState } from "./work-model";
 import { configuredEventLimit } from "./claude-settings";
 
 export function trimEventLog(events: NormalizedEvent[], max = configuredEventLimit()): NormalizedEvent[] {
@@ -78,6 +78,7 @@ export interface EventFoldDraft {
   guardrail: GuardrailState;
   liveGuardrailSignalIds: Set<string>;
   guardrailLiveSince?: number;
+  readonly cliStartedAt?: number;
   commands: SlashCommandInfo[];
   auth: AuthStatus | null;
   modelFallback?: ModelFallbackState;
@@ -346,7 +347,9 @@ function foldReaders(draft: EventFoldDraft, ev: NormalizedEvent, guardrailOnly: 
         return dispatch === undefined ? undefined : inProgressStepOfDelegation(timeBuckets, dispatch);
       } });
     }
-    if (ev.provenance?.path === "live") {
+    const notification = ev.kind === "tool_call_finished" ? ev.taskNotification : undefined;
+    if (ev.provenance?.path === "live" && (notification === undefined ||
+      backgroundTaskLaunchedSince(previousWorkModel, notification.agentId, draft.cliStartedAt))) {
       for (const id of touchedSignalIds(before, draft.guardrail)) draft.liveGuardrailSignalIds.add(id);
     }
   } catch (error) {

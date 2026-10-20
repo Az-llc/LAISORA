@@ -1,5 +1,5 @@
 import * as l10n from "@vscode/l10n";
-import type { WorkAgentNode, WorkModelPayload } from "../protocol";
+import { flattenAgents, type WorkModelPayload } from "../protocol";
 import { basename, firstLine, type ToolIntentInput } from "../tool-intent";
 import { monthDayClock } from "./format";
 import { CODEX_EFFORTS, AGY_EFFORTS, EXECUTORS, isExternalRunTool } from "../orchestration-executors";
@@ -80,13 +80,10 @@ function agentStarts(model: WorkModelPayload | undefined): Map<string, number> {
   for (const entry of model?.planHistory ?? []) {
     if (entry.kind === "resume") resumes.set(entry.agentId, Math.max(resumes.get(entry.agentId) ?? 0, entry.at));
   }
-  const visit = (agent: WorkAgentNode): void => {
+  for (const agent of flattenAgents(model?.phases ?? [], model?.unlinkedAgents)) {
     const start = resumes.get(agent.agentId) ?? agent.startedAt;
     if (start !== undefined && start > 0) starts.set(agent.toolUseId, start);
-    agent.children.forEach(visit);
-  };
-  for (const phase of model?.phases ?? []) phase.agents.forEach(visit);
-  (model?.unlinkedAgents ?? []).forEach(visit);
+  }
   return starts;
 }
 

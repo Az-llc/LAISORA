@@ -21,8 +21,8 @@ import {
   type SettingsWriteResult,
 } from "./claude-settings";
 import { createBackgroundActivityState } from "./background-activity";
-import { ClaudeConversation } from "./claudeHost";
-import { OrchestrationViewPublisher, orchestrationViewForConversation } from "./orchestration-view";
+import { ClaudeConversation, interruptDiscardNotice } from "./claudeHost";
+import { OrchestrationViewPublisher, orchestrationViewForConversation, orchestrationViewFromStartingRoster } from "./orchestration-view";
 import { orchestrationRunsDirectoryOf } from "./orchestration-external";
 import { orchestrationPluginDirectoryOf } from "./orchestration-plugin";
 import { hostTodoStore, noteTodoConversationEvent, postTodoSnapshot, todoBetaEnabled, todoLinkedItemAtStart } from "./todo-surface";
@@ -48,7 +48,13 @@ const orchestrationPublishers = new WeakMap<ClaudeConversation, OrchestrationVie
 
 export function postOrchestrationView(s: Session): void {
   const conv = s.conversation;
-  if (!conv?.orchestrationActive || s.closed) return;
+  if (s.closed) return;
+  if (conv === null) {
+    const state = orchestrationViewFromStartingRoster(s.semantic.rosterEvidence());
+    if (state !== undefined) store?.post({ type: "orchestrationView", tabId: s.tabId, state });
+    return;
+  }
+  if (!conv.orchestrationActive) return;
   let publisher = orchestrationPublishers.get(conv);
   if (publisher === undefined) {
     publisher = new OrchestrationViewPublisher(() => {
@@ -227,9 +233,11 @@ async function applyEffortChange(
   requested: NonNullable<Session["effortOverride"]> | null
 ): Promise<void> {
   const logicalGeneration = s.logicalGeneration;
-  const persistable = !s.modelsFromLastRun && s.conversation !== null && !s.conversation.isClosed;
   const run = async (): Promise<void> => {
     if (s.closed || s.logicalGeneration !== logicalGeneration) return;
+    while (s.starting) await s.starting;
+    if (s.closed || s.logicalGeneration !== logicalGeneration) return;
+    const persistable = !s.modelsFromLastRun && s.conversation !== null && !s.conversation.isClosed;
     const processGeneration = s.generation;
     const canonicalModel = persistable ? canonicalEffortModel(s) : undefined;
     const conv = s.conversation;
@@ -284,19 +292,7 @@ async function applyEffortChange(
     s.configuredEffortSnapshot = undefined;
     s.configuredEffortGeneration += 1;
     publishConfiguredEffort(st, s);
-    if (conv !== null && !conv.isClosed && s.conversation === conv) {
-      const cfg = getLaisoraConfiguration();
-      const cwd = s.cwd ?? resolveSessionCwd(s);
-      if (cwd !== undefined) {
-        refreshConfiguredEffort(
-          st,
-          s,
-          cwd,
-          cfg.get<Array<"user" | "project" | "local">>("claude.settingSources")!,
-          conv
-        );
-      }
-    }
+    if (conv !== null && !conv.isClosed && s.conversation === conv) refreshEffortFromSettings(st, s, conv);
   };
   const queued = s.profileChangeTail.then(run, run);
   s.profileChangeTail = queued.catch(() => {});
@@ -314,7 +310,8 @@ async function applyModelChange(
   requestedRaw: string | null,
   restore?: FallbackRestore
 ): Promise<FallbackRevertOutcome | "discarded" | "unwanted"> {
-  const persistable = !s.modelsFromLastRun && s.conversation !== null && !s.conversation.isClosed;
+  const started = s.conversation !== null && !s.conversation.isClosed;
+  const persistable = !s.modelsFromLastRun && started;
   const requested =
     requestedRaw === "default" && restore === undefined && s.models.some((m) => m.id === "default") ? null : requestedRaw;
   const logicalGeneration = s.logicalGeneration;
@@ -363,9 +360,12 @@ async function applyModelChange(
     const saved: SettingsWriteResult | null = knownRow && restore === undefined ? updateClaudeCodeSettings({ model: requested }) : null;
     if (conv !== null && s.conversation === conv) s.effectiveModel = requested;
     const label = requested === null ? null : s.models.find((m) => m.id === requested)?.label ?? requested;
+    const shownLabel = label ?? s.models.find((m) => m.id === "default")?.label ?? "default";
     const notice = saved === null
-      ? s.models.length === 0 || !persistable
-        ? l10n.t("LAISORA: Changed model to {0} for this session; it was not saved to settings.json because the model list has not loaded yet.", label ?? s.models.find((m) => m.id === "default")?.label ?? "default")
+      ? !started
+        ? l10n.t("LAISORA: Changed model to {0} for this session; it was not saved to settings.json because Claude Code has not started in this tab yet.", shownLabel)
+        : s.models.length === 0 || !persistable
+        ? l10n.t("LAISORA: Changed model to {0} for this session; it was not saved to settings.json because the model list has not loaded yet.", shownLabel)
         : l10n.t("LAISORA: Changed model to {0} for this session; it was not saved to settings.json because the model is not in the model list.", label ?? "")
       : !saved.ok
         ? label === null
@@ -394,17 +394,7 @@ async function applyModelChange(
       if (restore !== undefined) return "deferred";
       warmup(s);
     } else {
-      const cfg = getLaisoraConfiguration();
-      const cwd = s.cwd ?? resolveSessionCwd(s);
-      if (cwd !== undefined) {
-        refreshConfiguredEffort(
-          st,
-          s,
-          cwd,
-          cfg.get<Array<"user" | "project" | "local">>("claude.settingSources")!,
-          conv
-        );
-      }
+      refreshEffortFromSettings(st, s, conv);
     }
     return "applied";
   };
@@ -501,14 +491,25 @@ export async function handleConversationMessage(
         disposition("rejected");
         break;
       }
+      const images = pendingAttachments.take(target!.tabId);
+      if (images !== undefined) postAttachments(st, target!.tabId);
+      const reject = (): void => {
+        if (images !== undefined && !target!.closed) {
+          pendingAttachments.restore(target!.tabId, images);
+          postAttachments(st, target!.tabId);
+        }
+        disposition("rejected");
+      };
+      target!.unsentSends.add(reject);
       try {
         await ensureConversation(target!);
       } catch (e) {
-        disposition("rejected");
+        if (target!.unsentSends.delete(reject)) reject();
         throw e;
       }
-      if (target!.closed || target!.clearing) {
-        disposition("rejected");
+      if (!target!.unsentSends.delete(reject)) break;
+      if (target!.closed || target!.clearing || target!.conversation === null) {
+        reject();
         break;
       }
       if (!target!.autoTitled) {
@@ -524,19 +525,18 @@ export async function handleConversationMessage(
           }
         }
       }
-      msg.images = pendingAttachments.take(target!.tabId);
-      postAttachments(st, target!.tabId);
+      msg.images = images;
       // One uuid for the live event and the CLI's transcript record, so both name the request alike.
       const messageUuid = randomUUID();
       const sentAt = Date.now();
       if (!isNonHumanCommandInput(msg.text)) {
+        disposition("accepted-human");
         target!.pushEvent(
           { kind: "user_message", turnId: null, text: msg.text, images: msg.images, sentAt, uuid: messageUuid },
           undefined,
           { timestamp: sentAt },
           clientToken
         );
-        disposition("accepted-human");
       } else {
         disposition("accepted-nonhuman");
       }
@@ -546,9 +546,14 @@ export async function handleConversationMessage(
     case "cancelAutoResume":
       target!.conversation?.cancelAutoResume();
       break;
-    case "interrupt":
+    case "interrupt": {
+      const unsent = [...target!.unsentSends].reverse();
+      target!.unsentSends.clear();
+      for (const reject of unsent) reject();
+      if (unsent.length > 0) target!.pushEvent({ kind: "error", message: interruptDiscardNotice(unsent.length), fatal: false });
       await target!.conversation?.interrupt();
       break;
+    }
     case "approvalDecision":
       target!.conversation?.resolveApproval(msg.requestId, msg.behavior, msg.answers);
       break;
@@ -572,11 +577,21 @@ export async function handleConversationMessage(
   }
 }
 
+function crashResumeSessionIdOf(s: Session): string | undefined {
+  return s.conversation?.isClosed && !isUnusedSession(s) ? s.auth?.sessionId ?? undefined : undefined;
+}
+
 export function warmup(s: Session): void {
   if ((s.conversation && !s.conversation.isClosed) || s.closed || s.clearing) return;
   void ensureConversation(s).catch((e: unknown) =>
     output.appendLine(`[${s.title}] ${sinceActivation()} warmup失敗: ${String(e)}`)
   );
+}
+
+function refreshEffortFromSettings(st: SessionStore | null | undefined, s: Session, conv: ClaudeConversation): void {
+  const cwd = !conv.isClosed && s.cwd.length > 0 ? s.cwd : resolveSessionCwd(s);
+  if (cwd === undefined) return;
+  refreshConfiguredEffort(st, s, cwd, getLaisoraConfiguration().get<Array<"user" | "project" | "local">>("claude.settingSources")!, conv);
 }
 
 async function ensureConversation(s: Session): Promise<void> {
@@ -597,7 +612,7 @@ async function ensureConversation(s: Session): Promise<void> {
 async function ensureConversationInner(s: Session, requestedAt: number): Promise<void> {
   const innerT0 = Date.now();
   const logicalGenerationAtStart = s.logicalGeneration;
-  let crashResumeSessionId: string | undefined;
+  const crashResumeSessionId = crashResumeSessionIdOf(s);
   if (s.conversation?.isClosed) {
     s.guardrailRunner.settleConversationLost();
     void s.conversation.dispose();
@@ -607,7 +622,6 @@ async function ensureConversationInner(s: Session, requestedAt: number): Promise
     s.backgroundActivity = createBackgroundActivityState();
     s.guardrail = clearProcessEphemeral(s.guardrail);
     s.lastContextTotalTokens = null;
-    crashResumeSessionId = isUnusedSession(s) ? undefined : s.auth?.sessionId;
   }
   if (s.conversation) return;
 
@@ -724,6 +738,7 @@ async function ensureConversationInner(s: Session, requestedAt: number): Promise
       ? { conversation: conv, requested: s.effectiveModel, listSettled: false }
       : undefined;
     const convStartT0 = Date.now();
+    s.cliStartedAt = convStartT0;
     await conv.start();
     const startedAt = Date.now();
     output.appendLine(
@@ -754,6 +769,8 @@ async function ensureConversationInner(s: Session, requestedAt: number): Promise
       observeLaunchModel(store, s, conv, undefined, models.length > 0);
       if (models.length > 0) noteCliUpdateOpportunity(true);
     });
+    const startMeasurement = s.startMeasurement;
+    if (startMeasurement?.pending) await startMeasurement.measure(conv);
   } catch (e) {
     void conv.dispose();
     throw e;

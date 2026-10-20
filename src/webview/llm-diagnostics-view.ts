@@ -1,4 +1,5 @@
 import * as l10n from "@vscode/l10n";
+import { closeGlyphButton } from "./close-button";
 import type { LlmFindingDiagnosticsPayload } from "../protocol";
 
 function el(tag: string, className: string, text?: string): HTMLElement {
@@ -14,8 +15,7 @@ function headEl(container: HTMLElement, title: string): HTMLElement {
   const close = document.createElement("button");
   close.type = "button";
   close.className = "llmdiag-close";
-  close.textContent = "✕";
-  close.setAttribute("aria-label", l10n.t("Close diagnostics"));
+  closeGlyphButton(close, l10n.t("Close diagnostics"), l10n.t("Close diagnostics"));
   close.onclick = () => {
     container.hidden = true;
   };

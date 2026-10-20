@@ -13,6 +13,7 @@ import { isFileWritingTool } from "./file-writing-tools";
 import {
   formatRefusalMessage,
   extractAssistantTextBlocks,
+  hasNarrationBlock,
   isApiErrorFrame,
   isRefusalErrorProse,
   parseRefusalNotice,
@@ -65,9 +66,10 @@ export interface SessionTranscript {
   claudeCodeVersion?: string;
 }
 
-type TranscriptMessage = Omit<ConversationMessage, "uuid"> & { uuid?: string };
+export type TranscriptMessage = Omit<ConversationMessage, "uuid"> & { uuid?: string };
 
 const REPLAY_MESSAGE_MAX = 80;
+const PRIOR_GENERATION_KINDS: ReadonlySet<NormalizedEventBody["kind"]> = new Set(["compact_boundary", "local_command_output", "user_message", "assistant_text_delta", "model_observed", "tool_call_started"]);
 const REPLAY_TOOL_MAX = 200;
 const MAX_SUBAGENT_TRANSCRIPT_BYTES = 8 * 1024 * 1024;
 const RESUME_TAIL_MAX_BYTES = 1024 * 1024;
@@ -445,7 +447,6 @@ export async function readSessionHistory(
   const rawEvents: RawHistoryItem[] = [];
   const askRejections: (AskRejection & { turnId: string })[] = [];
   const usageSources = new Map<string, number>();
-  const preBoundaryCompacts = new Set<RawHistoryItem>();
   const parentTurns: ParentTurnSpan[] = [];
   const seenToolUseIds = new Set<string>();
   const seenToolResultIds = new Set<string>();
@@ -488,7 +489,7 @@ export async function readSessionHistory(
   let turnOrdinal = 0;
   let currentTurnId: string | null = null;
   let lastTurnActivityTimestamp = 0;
-  let pendingSilentTurn = false;
+  let pendingSilentTurn = true;
   const openPendingSilentTurn = (at: number): void => {
     if (!pendingSilentTurn) return;
     pendingSilentTurn = false;
@@ -598,6 +599,11 @@ export async function readSessionHistory(
 
 
       if (generationSessionId !== undefined && isHandoffGenerationBoundary(obj, generationSessionId)) {
+        if (generationStartAt === undefined) {
+          for (const item of rawEvents) {
+            if (PRIOR_GENERATION_KINDS.has(item.body.kind)) item.body = { ...item.body, priorGeneration: true as const } as typeof item.body;
+          }
+        }
         generationStartAt = recordTime;
       }
 
@@ -618,7 +624,6 @@ export async function readSessionHistory(
             ...(typeof obj.uuid === "string" ? { uuid: obj.uuid } : {}), provenance: { path: "history" } },
           timestamp: recordTime, sourcePriority: 0, fileOrder: parentOrderCounter++,
         };
-        if (generationSessionId !== undefined && generationStartAt === undefined) preBoundaryCompacts.add(item);
         rawEvents.push(item);
         continue;
       }
@@ -787,6 +792,7 @@ export async function readSessionHistory(
       } else if (obj.type === "assistant") {
         openPendingSilentTurn(recordTime);
         const text = extractAssistantRecordText(content, obj.narration_block_indexes);
+        const narration = hasNarrationBlock(content, obj.narration_block_indexes);
         const refusalStop = parseRefusalStop(message);
         const refusalIsErrorProse = refusalStop !== null && isApiErrorFrame(obj);
         const turnId = currentTurnId ?? "replay-turn-1";
@@ -843,6 +849,7 @@ export async function readSessionHistory(
               kind: "assistant_text_delta",
               turnId,
               text,
+              ...(narration ? { recordUuid: typeof obj.uuid === "string" && obj.uuid.length > 0 ? obj.uuid : null } : {}),
               provenance: { path: "history" },
             },
             timestamp: recordTime,
@@ -925,9 +932,6 @@ export async function readSessionHistory(
           sourcePriority: 0,
           fileOrder: parentOrderCounter++,
         };
-        if (generationSessionId !== undefined && generationStartAt === undefined) {
-          preBoundaryCompacts.add(item);
-        }
         rawEvents.push(item);
       } else if (obj.type === "system") {
         const retry = apiRetryEvent(obj, currentTurnId);
@@ -1306,12 +1310,7 @@ export async function readSessionHistory(
 
   const events: HistoryEvent[] = rawEvents.map((item) => {
     const ev: HistoryEvent = {
-      body:
-        generationStartAt !== undefined &&
-        preBoundaryCompacts.has(item) &&
-        (item.body.kind === "compact_boundary" || item.body.kind === "local_command_output")
-          ? { ...item.body, priorGeneration: true as const }
-          : item.body,
+      body: item.body,
       timestamp: item.timestamp,
     };
     if (item.hostArtifacts && item.hostArtifacts.length > 0) {

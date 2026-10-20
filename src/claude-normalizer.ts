@@ -157,6 +157,12 @@ export function extractAssistantTextBlocks(content: unknown, narrationBlockIndex
   });
 }
 
+export function hasNarrationBlock(content: unknown, narrationBlockIndexes?: unknown): boolean {
+  if (!Array.isArray(content)) return false;
+  const texts = extractAssistantTextBlocks(content, narrationBlockIndexes);
+  return content.some((block, index) => typeof block === "object" && block !== null && (block as Record<string, unknown>).type === "thinking" && texts[index].length > 0);
+}
+
 export function extractAssistantText(content: unknown, narrationBlockIndexes?: unknown): string {
   return extractAssistantTextBlocks(content, narrationBlockIndexes).join("");
 }
@@ -732,7 +738,7 @@ export class ClaudeLiveNormalizer {
         }
         const content = Array.isArray(msgObj?.content) ? (msgObj.content as Record<string, unknown>[]) : [];
         const blockTexts = extractAssistantTextBlocks(content, record.narration_block_indexes);
-        const hasNarration = content.some((block, index) => block.type === "thinking" && blockTexts[index].length > 0);
+        const hasNarration = hasNarrationBlock(content, record.narration_block_indexes);
         if (parentToolUseId === null && hasNarration) {
           // CLI records contain one completed block. Defensive combined records use
           // HEAD's text aggregation in content order, before the unchanged tool loop.

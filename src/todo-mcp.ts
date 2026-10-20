@@ -6,7 +6,7 @@ import {
   isClaudeOwnChange, linkedTodoItem, liveChildren, memoStaleSince, parseTodoChangeId, TODO_ADD_MANY_MAX, TODO_CLAUDE_DEPTH_MAX, TODO_ADD_PLACEMENT_BASES, TODO_TIDY_KINDS, TODO_TIDY_STEPS_MAX, type TodoAddNode, todoAgentMarker,
   todoBindableFolder, todoFailureResultText, TODO_STABLE_TOUCH_MS, TODO_STABLE_PIN_MS, TODO_STABLE_REMOVE_MS,
   todoConversationFolder, todoDoneTwin, todoFinishedIds, todoTidySignals, todoFolderGroup, todoGroupsOf, todoItemNumbers, todoItemPath, todoPlaceOf, todoPlaceText, todoWriteResultText, TODO_DUE_PATTERN, TODO_GROUP_MAX, TODO_GUESS_REASON_MAX,
-  TODO_PRIORITIES, TODO_SERVER_NAME, TODO_TOOL_KINDS, todoToolName, type TodoToolKind, TODO_STATES, TODO_TITLE_MAX, TODO_WRITE_TOOLS, WORK_MEMO_SECTIONS, type WorkMemoSection, type TodoDocument, type TodoItem,
+  TODO_PRIORITIES, TODO_SERVER_NAME, TODO_STATE_BRACKETS, TODO_STATE_CHECKBOXES, TODO_STATE_SEPARATORS, TODO_STATE_TRAILING_WORDS, TODO_STATE_WORDS, TODO_TITLE_PARTICLES, todoTitlePlaceOf, todoTitleRepeat, TODO_TOOL_KINDS, todoToolName, type TodoToolKind, TODO_STATES, TODO_TITLE_MAX, TODO_WRITE_TOOLS, WORK_MEMO_SECTIONS, type WorkMemoSection, type TodoDocument, type TodoItem,
   type TodoOperation, type TodoOperationError, type TodoPlacementBasis, type TodoOperationFailure, type TodoOperationResult, type TodoRevertBlock, type TodoTidyStep,
 } from "./todo-model";
 import { TodoStoreError, type TodoStore } from "./todo-store";
@@ -29,7 +29,17 @@ export const TODO_ROOT_SCOPE: RootGateScope = { tools: TODO_WRITE_TOOL_NAMES, de
 const TODO_CHILD_GROUP_NOTE = "The group was not set: a sub-item follows the group of its top-level item. Set the group on the top-level item instead.";
 const TODO_MEMO_STALE_NOTE = "A conversation linked to this item worked after the work memo was last written, so the memo may be out of date; check it against the current state and rewrite the sections that changed.";
 const TODO_CASE_RULES = "A group is one case with its own lifetime (a product, a client case, a household area); words for a kind of list or work (roadmap, bugs, research, ideas) are never groups but top-level items inside the case. The case comes from, in this order: a case word in the request (and the aliases list returns in context), the group of the item this conversation is linked to, what the conversation is about and the folder of the files it read or edited (list's context). With any of these signals, place the item in the most likely case and tell the user in one line in their language with the path the result returns, e.g. \"<path> に入れました。違ったら言ってください\"; do not stop to ask. Use No group only when there is no signal at all. Items the user added themselves are often quick captures to be organized, not a structure to copy. In a conversation about several topics, only sub-tasks of the linked work go under the linked item; other cases go to their own group.";
-const TODO_ITEM_RULES = `A top-level item is a theme or deliverable worth its own conversation, a child is a task one sitting finishes, a grandchild is a step; items are at most ${TODO_CLAUDE_DEPTH_MAX} levels (${TODO_DEPTH_EXAMPLE}) and finer detail goes into the work memo. Titles state the outcome or action, one per item, without the group's or a parent's words or state markers. Reuse an item that already says the same thing instead of adding another. Set due and priority only when the source states them.`;
+const TODO_PATH_READING = "Read each item as one line: group › ancestors › title.";
+const TODO_TITLE_COMPARE = "compared ignoring case, full/half width, spaces, punctuation and symbols";
+const TODO_REPEAT_RULE = `${TODO_PATH_READING} A title adds only what that line does not already say. A title that obviously repeats the line (${TODO_TITLE_COMPARE}, it is its group's name or an ancestor's title, or begins with one followed by a space, punctuation, a symbol or one of ${TODO_TITLE_PARTICLES.join(" ")}) is not refused: the write result lists it under repeats with what to do, and list shows it as the repeatsPlace tidy signal.`;
+const TODO_REPEAT_CHECKED: readonly TodoToolKind[] = ["add", "update", "move", "tidy"];
+const TODO_REPEAT_FIX = "Each item in repeats has a title that its path already says (word = the repeated group name or ancestor title); rename it now (update, or tidy rename for the user's items) so the path reads as one line.";
+const TODO_TITLE_SAME = `the same as another open item's title under the same parent (at the top level, in the same group), ${TODO_TITLE_COMPARE}`;
+const TODO_STATE_MARKERS = `a state marker (case-sensitive): a leading ${TODO_STATE_CHECKBOXES.join(" ")}; ${TODO_STATE_WORDS.join(" ")} between any opening bracket ${TODO_STATE_BRACKETS.map(([open]) => open).join(" ")} and any closing bracket ${TODO_STATE_BRACKETS.map(([, close]) => close).join(" ")} at the start or end; or a trailing ${TODO_STATE_TRAILING_WORDS.join(" ")} after a space or ${TODO_STATE_SEPARATORS.join(" ")}`;
+const TODO_MOVE_TITLE_RULE = `move, update changing a top-level item's group, and tidy move refuse the moved item when its title is ${TODO_TITLE_SAME} at the destination.`;
+const TODO_TITLE_RULE = `${TODO_REPEAT_RULE} Refused with the reason: a title ${TODO_TITLE_SAME}; a title with ${TODO_STATE_MARKERS}; a title longer than ${TODO_TITLE_MAX} characters. ${TODO_MOVE_TITLE_RULE}`;
+const TODO_TIDY_ADD_FOLD = `tidy add puts a node whose title matches an existing sub-item's (open or done, ${TODO_TITLE_COMPARE}) into that sub-item instead of adding it.`;
+const TODO_ITEM_RULES = `A top-level item is a theme or deliverable worth its own conversation, a child is a task one sitting finishes, a grandchild is a step; items are at most ${TODO_CLAUDE_DEPTH_MAX} levels (${TODO_DEPTH_EXAMPLE}) and finer detail goes into the work memo. Titles state the outcome or action, one per item. ${TODO_TITLE_RULE} Reuse an item that already says the same thing instead of adding another. Set due and priority only when the source states them.`;
 const TODO_IMPORT_RULES = "When turning material (a ledger, notes, an image) into items: first check which entries are still open in the source and add only those; build the skeleton first (the container and the themes the source has), and do not invent sub-items the source does not have (leave a leaf and write 分解する in its next section); write the source and how many entries you skipped and why into the parent's work memo. Decisions, questions and facts go into the work memo sections, not into items.";
 
 export interface TodoLinkedItem {
@@ -130,15 +140,15 @@ const TODO_INPUTS = {
 } satisfies Record<TodoToolKind, Record<string, z.ZodType>>;
 
 const TODO_DESCRIPTIONS: Record<TodoToolKind, string> = {
-  list: `Read the TODO list: every group first (display order, open and done counts, empty ones included, the folders bound to it), the conversation context (cwd, the folder of the files this conversation used, the group bound to it, and words learned from the user's corrections with the place they mean), then the open items of the context group as a tree with the numbers the user sees (${TODO_DEPTH_EXAMPLE}); when the conversation has no context group or that group has no open items, the open items of every group, shortened to about ${TODO_LIST_ITEMS_MAX} items with a note, and tidy signals (same titles among siblings, a parent with one child, crowded sibling lists, open items waiting in No group: file them with tidy). Use group, all or done for more. Reading one item also returns its parent id, path, the user's memo, your work memo (with a note when later work may have made it out of date) and the item's references the user attached (links as URL or file path; images as a reference you cannot open). ${TODO_IMPORT_RULES} ${TODO_SCOPE}`,
+  list: `Read the TODO list: every group first (display order, open and done counts, empty ones included, the folders bound to it), the conversation context (cwd, the folder of the files this conversation used, the group bound to it, and words learned from the user's corrections with the place they mean), then the open items of the context group as a tree with the numbers the user sees (${TODO_DEPTH_EXAMPLE}); when the conversation has no context group or that group has no open items, the open items of every group, shortened to about ${TODO_LIST_ITEMS_MAX} items with a note, and tidy signals (same titles among siblings, a parent with one child, crowded sibling lists, titles that repeat their group or an ancestor (repeatsPlace), open items waiting in No group: file them with tidy). ${TODO_PATH_READING} Use group, all or done for more. Reading one item also returns its parent id, path, the user's memo, your work memo (with a note when later work may have made it out of date) and the item's references the user attached (links as URL or file path; images as a reference you cannot open). ${TODO_IMPORT_RULES} ${TODO_SCOPE}`,
   add: `Add an item, or several items with their sub-items through items, to the TODO list; the result gives each item's id and path. When adding more than one item, add them all in one call with items rather than one call per item. ${TODO_CASE_RULES} ${TODO_ITEM_RULES} ${TODO_SCOPE} ${TODO_ROOT_ONLY}`,
-  update: `Change an item's title, due date, start date, priority or group in the TODO list. ${TODO_ROOT_ONLY}`,
-  move: `Move an item under another parent or to the top level of the TODO list; both parents' states are re-evaluated. Giving the same parent without position changes nothing. ${TODO_STABLE_RULE} ${TODO_ROOT_ONLY}`,
+  update: `Change an item's title, due date, start date, priority or group in the TODO list. ${TODO_TITLE_RULE} ${TODO_ROOT_ONLY}`,
+  move: `Move an item under another parent or to the top level of the TODO list; both parents' states are re-evaluated. Giving the same parent without position changes nothing. ${TODO_REPEAT_RULE} ${TODO_MOVE_TITLE_RULE} ${TODO_STABLE_RULE} ${TODO_ROOT_ONLY}`,
   set_state: `Set a TODO item's state (todo, doing, done). Set done directly only items under the item this conversation is linked to; for other finished items use tidy with foldDone. A child that starts makes not-started ancestors doing; when every child is done the parent becomes done, and it reopens when a child reopens unless it was set done directly. ${TODO_ROOT_ONLY}`,
   write_memo: `Rewrite one section of a TODO item's work memo, your own notes for the item (current = where the work stands, next = next steps, decisions = what was decided, open = unresolved points, files = files involved). The previous text goes to the section history. When rewriting more than one section, give them all in one call with sections rather than one call per section. The user's memo on the item is separate and read-only to you. ${TODO_ROOT_ONLY}`,
   delete: `Delete a TODO item together with all its sub-items, only when the user asks for it. They move to the user's recently deleted list, from which the user can restore them, and the user can take the deletion back from the conversation. ${TODO_ROOT_ONLY}`,
   group: `Create, rename, delete or reorder a group (a case). Create only when the request names a case that matches no existing group. Delete only a group that holds no item the user added (it is refused otherwise); its items move to No group. The colour is the user's. Each change shows in the conversation and the user can take it back. ${TODO_ROOT_ONLY}`,
-  tidy: `Tidy the TODO list now, as one change the user sees in the conversation as a before/after tree and can take back in one step: file items into their case and parent (move), rewrite rough titles as outcomes (rename; the original wording is kept), break an item down (add), merge duplicates (merge), fold a single-child parent (flatten) and set finished work done (foldDone). Use it when list shows tidy signals, especially items waiting in No group, and for changes to the user's own items outside this conversation's linked item. ${TODO_STABLE_RULE} Running the same steps again changes nothing; a move to the parent an item already has, with no position, changes nothing. Sub-items with the same title as one in the item that stays are merged into it. Done items are never merged away; a merged item goes to recently deleted. ${TODO_ROOT_ONLY}`,
+  tidy: `Tidy the TODO list now, as one change the user sees in the conversation as a before/after tree and can take back in one step: file items into their case and parent (move), rewrite rough titles as outcomes (rename; the original wording is kept), break an item down (add), merge duplicates (merge), fold a single-child parent (flatten) and set finished work done (foldDone). Use it when list shows tidy signals, especially items waiting in No group, and for changes to the user's own items outside this conversation's linked item. ${TODO_STABLE_RULE} Running the same steps again changes nothing; a move to the parent an item already has, with no position, changes nothing. Sub-items with the same title as one in the item that stays are merged into it. Done items are never merged away; a merged item goes to recently deleted. ${TODO_TITLE_RULE} ${TODO_TIDY_ADD_FOLD} ${TODO_ROOT_ONLY}`,
 };
 
 const OPERATION_ERRORS: Record<Exclude<TodoOperationError, TodoRevertBlock>, string> = {
@@ -154,8 +164,7 @@ const OPERATION_ERRORS: Record<Exclude<TodoOperationError, TodoRevertBlock>, str
   "too-many": `At most ${TODO_ADD_MANY_MAX} items can be added in one call, and a tidy-up has at most ${TODO_TIDY_STEPS_MAX} steps; split them over several calls.`,
   "too-deep": `Items are at most ${TODO_CLAUDE_DEPTH_MAX} levels deep (${TODO_DEPTH_EXAMPLE}); put this detail in the work memo of its parent instead.`,
   "duplicate-title": "An item with the same title is already there; update or reuse it instead of adding another.",
-  "title-repeats": "The title repeats what its group or a parent already says; drop those words from the title.",
-  "title-state": "Titles carry no state markers such as （済） [WIP] or a trailing 完了; set the state with set_state instead.",
+  "title-state": `The title carries ${TODO_STATE_MARKERS}; set the state with set_state instead.`,
   "outside-linked": "Set done directly only items under the item this conversation is linked to; use tidy with foldDone for others.",
   "user-item": "The user added this item; outside this conversation's linked item you change the user's items only through tidy (move, rename, add sub-items, merge, foldDone), which the user sees and can take back.",
   "unknown-group": "No group has that name. Use an existing group, or pass new_group only when the request names a case that matches none.",
@@ -265,7 +274,7 @@ function treeView(view: ListView, input: Record<string, unknown>, context: Recor
     shown: chosen === undefined ? "all groups" : chosen ?? l10n.t("No group"), ...(input.done === true ? {} : { doneHidden: true }),
     items: shownRoots.map(item => itemView(view, item, false, hidden)),
     ...(notes.length ? { note: notes.join(" ") } : {}),
-    ...(signals.sameTitle.length || signals.singleChild.length || signals.crowded.length || waiting ? { signals: { ...signals, ...(waiting ? { noGroup: waiting } : {}) } } : {}),
+    ...(Object.values(signals).some(entries => entries.length) || waiting ? { signals: { ...signals, ...(waiting ? { noGroup: waiting } : {}) } } : {}),
   };
 }
 
@@ -374,7 +383,6 @@ function failureText(failure: TodoOperationFailure, document: TodoDocument | und
     base,
     ...(failure.error === "unknown-group" && document ? [`Existing groups: ${todoGroupsOf(document).map(entry => entry.name).join(", ") || "none"}.`] : []),
     ...(detail?.near?.length ? [`Close existing group: ${detail.near.join(", ")}.`] : []),
-    ...(detail?.word !== undefined && failure.error === "title-repeats" ? [`Repeated words: "${detail.word}".`] : []),
     ...(detail?.itemId !== undefined && view ? [`Existing item: ${view.path(detail.itemId)} (id ${detail.itemId}).`] : []),
   ];
   return parts.join(" ");
@@ -390,18 +398,25 @@ function operationReply(kind: TodoToolKind, result: TodoOperationResult, input: 
     : (kind === "add" || kind === "update") && typeof input.group === "string" && input.group.trim() !== "" && item !== undefined && item.parentId !== null;
   const parentId = typeof input.parent === "string" ? input.parent : null;
   const added = own.flatMap(change => change.field === "item" ? view.live.filter(entry => entry.id === change.itemId && entry.parentId === parentId) : []);
-  const placed = (entry: TodoItem) => {
+  const twinWarning = (entry: TodoItem) => {
     const twin = todoDoneTwin(view.live, entry.id);
-    return { path: view.path(entry.id), ...itemView(view, entry, false), ...(twin ? { warning: `A done item has the same title: ${view.path(twin.id)} (id ${twin.id}).` } : {}) };
+    return twin ? { warning: `A done item has the same title: ${view.path(twin.id)} (id ${twin.id}).` } : {};
   };
+  const placed = (entry: TodoItem) => ({ path: view.path(entry.id), ...itemView(view, entry, false), ...twinWarning(entry) });
+  const repeats = TODO_REPEAT_CHECKED.includes(kind) ? [...new Set(own.map(change => change.itemId))].flatMap(itemId => {
+    const entry = view.live.find(candidate => candidate.id === itemId);
+    const word = entry ? todoTitleRepeat(view.live, todoTitlePlaceOf(entry)) : undefined;
+    return entry && word !== undefined ? [{ id: entry.id, path: view.path(entry.id), word }] : [];
+  }) : [];
+  const repeatPart = repeats.length ? { repeats, repeatNotice: TODO_REPEAT_FIX } : {};
   const body = kind === "tidy" && !result.changed ? { changed: 0, notice: "Nothing changed: every step was already in place." }
     : kind === "tidy" ? { tidy: result.itemId, steps: (input.steps as unknown[]).length, changed: own.length,
-      notice: "Applied as one change. The user sees it on the conversation's ToDo card and can take it all back; tell them in one line what changed." }
-    : many ? { items: added.map(placed) }
-    : kind === "add" && item ? { id: item.id, ...placed(item) }
+      notice: "Applied as one change. The user sees it on the conversation's ToDo card and can take it all back; tell them in one line what changed.", ...repeatPart }
+    : many ? { items: added.map(placed), ...repeatPart }
+    : kind === "add" && item ? { id: item.id, ...placed(item), ...repeatPart }
     : kind === "group" ? { ok: true, groups: todoGroupsOf(result.document).map(entry => entry.name) }
     : kind === "delete" ? { ok: true, id: result.itemId, deleted: result.document.changes.filter(change => parseTodoChangeId(change.id).revision === result.document.revision && change.field === "deletedAt").length }
-    : { ok: true, id: result.itemId, ...(item ? { path: view.path(item.id) } : {}) };
+    : { ok: true, id: result.itemId, ...(item ? { path: view.path(item.id), ...((kind === "update" || kind === "move") ? twinWarning(item) : {}) } : {}), ...repeatPart };
   return reply(todoWriteResultText(result.changed ? result.document.revision : null, groupIgnored ? { ...body, notice: TODO_CHILD_GROUP_NOTE } : body));
 }
 

@@ -1,4 +1,5 @@
 import { isComposingKey } from "./composing";
+import { CLOSE_GLYPH } from "./close-button";
 import { createAccentSettings } from "./accent-settings";
 import { bindUserLabel, setDisplayName } from "./user-label";
 import { DISPLAY_NAME_MAX, displayNameLength, normalizeDisplayName } from "../display-name";
@@ -605,7 +606,7 @@ function renderSystemAppExtensions(state: SettingsState): void {
   extensionChips.replaceChildren();
   for (const extension of state.openWithSystemApp) {
     const chip = element("span", "settings-extension-chip", extension);
-    const remove = element("button", "settings-segment", "×");
+    const remove = element("button", "settings-segment", CLOSE_GLYPH);
     remove.type = "button";
     remove.setAttribute("aria-label", l10n.t("Remove {0}", extension));
     remove.disabled = pendingExtensions !== null;
@@ -1175,7 +1176,7 @@ function renderOrchestration(state: SettingsState): void {
           matrix.appendChild(button);
         }
       }
-      const removeRow = element("button", "settings-link settings-remove-model", "×");
+      const removeRow = element("button", "settings-link settings-remove-model", CLOSE_GLYPH);
       removeRow.id = `roster-${index}-row-${rowIndex}-remove`;
       removeRow.type = "button";
       removeRow.setAttribute("aria-label", l10n.t("Remove this row"));

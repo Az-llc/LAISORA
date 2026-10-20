@@ -20,7 +20,7 @@ import { formatDateTime } from "./l10n";
 import { createLoader } from "./loader";
 import { activeTabId } from "./main";
 import { bindTitleEditor } from "./session-header";
-import { todoHistoryLink } from "./todo-links";
+import { todoHistoryLink, type TodoHistoryLink } from "./todo-links";
 
 let onTodoSessionOpened: ((itemId: string) => void) | null = null;
 
@@ -276,19 +276,12 @@ function openSession(s: SessionListItem): void {
   closeHistPanel();
 }
 
-function buildRow(s: SessionListItem, query: string): HTMLElement {
-  const row = document.createElement("li");
-  row.className = s.hidden ? "hist-row is-hidden" : "hist-row";
-  row.id = `hist-row-${s.sessionId}`;
-  row.setAttribute("role", "option");
-  row.setAttribute("aria-selected", "false");
-  row.setAttribute("aria-keyshortcuts", "Enter F2 Delete");
+export function historyTitleCell(titleText: string, todo: TodoHistoryLink | undefined, query = ""): { readonly cell: HTMLElement; readonly title: HTMLElement } {
   const cell = span("hist-title-cell");
   const title = span("hist-title");
-  title.title = s.title;
-  appendMatches(title, s.title, query);
+  title.title = titleText;
+  appendMatches(title, titleText, query);
   cell.appendChild(title);
-  const todo = todoHistoryLink(s.sessionId);
   if (todo) {
     const line = span("hist-todo");
     if (todo.color) {
@@ -305,6 +298,17 @@ function buildRow(s: SessionListItem, query: string): HTMLElement {
     line.title = todo.parentTitle !== undefined ? `${todo.text}\n${l10n.t("Parent conversation: {0}", todo.parentTitle)}` : todo.text;
     cell.appendChild(line);
   }
+  return { cell, title };
+}
+
+function buildRow(s: SessionListItem, query: string): HTMLElement {
+  const row = document.createElement("li");
+  row.className = s.hidden ? "hist-row is-hidden" : "hist-row";
+  row.id = `hist-row-${s.sessionId}`;
+  row.setAttribute("role", "option");
+  row.setAttribute("aria-selected", "false");
+  row.setAttribute("aria-keyshortcuts", "Enter F2 Delete");
+  const { cell, title } = historyTitleCell(s.title, todoHistoryLink(s.sessionId), query);
   const time = span("hist-time", relativeTime(s.mtime));
   time.title = formatDateTime(s.mtime);
   const meta = span("hist-meta");

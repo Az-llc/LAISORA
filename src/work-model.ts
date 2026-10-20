@@ -1574,7 +1574,7 @@ function finishBackground(
     const request = draftRequest(d, placement.requestIndex);
     if (request) request.failCount++;
   }
-  const elapsedMs = Math.max(0, timestamp - (placement.resumedAt ?? placement.startedAt));
+  const elapsedMs = Math.max(0, timestamp - backgroundRunStart(placement));
   const segment = draftSegment(d, placement.segmentId);
   if (segment && placement.counted) {
     if (placement.stale) segment.staleCount--;
@@ -1737,6 +1737,17 @@ export function backgroundAgentDispatch(state: WorkModelState, taskId: string): 
   const placement = entry?.kind === "agent" ? findToolPlacement(state, entry.toolUseId) : undefined;
   return placement === undefined ? undefined : { description: placement.description, launchedAt: placement.startedAt,
     ...(placement.resumedAt === undefined ? {} : { resumedAt: placement.resumedAt }) };
+}
+
+function backgroundRunStart(placement: WorkTool): number {
+  return placement.resumedAt ?? placement.startedAt;
+}
+
+export function backgroundTaskLaunchedSince(state: WorkModelState, taskId: string, since: number | undefined): boolean {
+  if (since === undefined) return false;
+  const entry = state.backgroundTasks[taskId];
+  const placement = entry === undefined ? undefined : findToolPlacement(state, entry.toolUseId);
+  return placement !== undefined && backgroundRunStart(placement) >= since;
 }
 
 export function markBackgroundUnconfirmed(state: WorkModelState, timestamp: number): WorkModelState {

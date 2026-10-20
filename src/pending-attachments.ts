@@ -60,6 +60,11 @@ export class PendingAttachmentStore {
     return slots.map((s) => ({ mediaType: s.mediaType, data: s.data }));
   }
 
+  restore(tabId: string, images: readonly ImageAttachment[]): void {
+    const restored = images.map((im) => ({ id: `att-${++this.seq}`, mediaType: im.mediaType, data: im.data }));
+    this.byTab.set(tabId, [...restored, ...(this.byTab.get(tabId) ?? [])]);
+  }
+
   release(tabId: string): void {
     this.byTab.delete(tabId);
   }

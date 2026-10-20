@@ -1,4 +1,5 @@
 import * as l10n from "@vscode/l10n";
+import { closeGlyphButton } from "./close-button";
 
 export const COLLAPSE_LINE_LIMIT = 12;
 export const PREVIEW_LINE_COUNT = 8;
@@ -299,9 +300,7 @@ class CodeReader {
     this.close.type = "button";
     this.close.className = "wi-act wi-close";
     this.close.setAttribute("aria-keyshortcuts", "Escape");
-    const kbd = document.createElement("kbd");
-    kbd.textContent = "Esc";
-    this.close.append(l10n.t("Close"), kbd);
+    closeGlyphButton(this.close, l10n.t("Close (Esc)"));
     this.close.addEventListener("click", () => this.hide());
     actions.append(this.copySlot, this.wrap, this.max, this.close);
     line.append(this.label, actions);

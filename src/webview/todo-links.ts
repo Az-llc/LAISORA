@@ -63,11 +63,15 @@ export interface TodoTabMarks {
   readonly tooltip: string;
 }
 
+function tabLinkedItem(links: TodoLinkHub, tabId: string): TodoListItem | undefined {
+  const entry = links.tabItem(tabId);
+  return entry === undefined ? undefined : links.items().find(candidate => candidate.id === entry.itemId);
+}
+
 export function todoTabMarks(tabId: string, title: string, extras: { readonly runningAgents: number }): TodoTabMarks | null {
   const links = todoLinkHub();
   if (!links) return null;
-  const entry = links.tabItem(tabId);
-  const item = entry === undefined ? undefined : links.items().find(candidate => candidate.id === entry.itemId);
+  const item = tabLinkedItem(links, tabId);
   if (!item) {
     const outside = links.deletedTab(tabId) ? l10n.t("ToDo item: deleted item") : l10n.t("Group: outside ToDo");
     return { color: "", child: false, tooltip: [title, outside].join("\n") };
@@ -89,8 +93,7 @@ export function todoTabMarks(tabId: string, title: string, extras: { readonly ru
 export function renderTodoCrumbs(container: HTMLElement, tabId: string): void {
   container.replaceChildren();
   const links = todoLinkHub();
-  const entry = links?.tabItem(tabId);
-  const item = entry === undefined ? undefined : links!.items().find(candidate => candidate.id === entry.itemId);
+  const item = links ? tabLinkedItem(links, tabId) : undefined;
   if (!links || !item) {
     container.hidden = !(links?.deletedTab(tabId) ?? false);
     if (!container.hidden) container.append(el("span", "todo-crumb todo-crumb-deleted", l10n.t("Linked to a deleted ToDo item")));
@@ -130,7 +133,18 @@ export function todoHistoryLink(sessionId: string): TodoHistoryLink | undefined 
   if (!links || !link) return undefined;
   if ("deleted" in link) return { text: l10n.t("Deleted item: {0}", link.deleted), color: "", child: false };
   const item = links.items().find(candidate => candidate.id === link.itemId);
-  if (!item) return undefined;
+  return item ? itemHistoryLink(links, item) : undefined;
+}
+
+export function todoTabHistoryLink(tabId: string): TodoHistoryLink | undefined {
+  const links = todoLinkHub();
+  if (!links) return undefined;
+  const item = tabLinkedItem(links, tabId);
+  if (item) return itemHistoryLink(links, item);
+  return links.deletedTab(tabId) ? { text: l10n.t("Linked to a deleted ToDo item"), color: "", child: false } : undefined;
+}
+
+function itemHistoryLink(links: TodoLinkHub, item: TodoListItem): TodoHistoryLink {
   const root = todoItemPath(links.items(), item.id)[0];
   return { itemId: item.id, text: todoItemLabel(item), color: todoGroupColor(links.groupColorOf(root.group)), child: item.parentId !== null,
     ...(item.parentId !== null ? { parentTitle: parentConversationTitle(links, root) } : {}) };
@@ -168,7 +182,7 @@ export function todoAgentLabel(tabId: string, description: string | undefined, r
   if (item.talk !== undefined) {
     wrap.append(todoButton("todo-link", l10n.t("Open the child conversation"), () => links.openConversation(item.id)));
   } else if (running) {
-    wrap.append(todoButton("todo-link", l10n.t("Split and open…"), () => links.splitChild(item.id), l10n.t("Split this sub-item into its own child conversation")));
+    wrap.append(todoButton("todo-link", l10n.t("Split and open"), () => links.splitChild(item.id), l10n.t("Split this sub-item into its own child conversation")));
   }
   for (const button of Array.from(wrap.querySelectorAll("button"))) button.addEventListener("click", event => { event.stopPropagation(); event.preventDefault(); });
   return wrap;

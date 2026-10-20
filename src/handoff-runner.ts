@@ -18,6 +18,7 @@ import {
 } from "./handoff-accept";
 import {
   buildHandoffEnvelopeV2,
+  handoffContextUsageKey,
   parseCompactMetadata,
   parseHandoffEnvelope,
   type HandoffCompactStats,
@@ -1067,6 +1068,14 @@ export class HandoffRunner {
     const deleted: string[] = [];
     const kept: string[] = [];
     const failed: string[] = [];
+    const removeContextSnapshot = async (entry: PersistedHandoff): Promise<void> => {
+      if (entry.forkSessionId === "") return;
+      try {
+        await deps.persist.update(handoffContextUsageKey(entry.forkSessionId), undefined);
+      } catch (error) {
+        deps.log(`handoff orphan context snapshot removal failed: ${entry.forkSessionId}: ${errorDetail(error)}`);
+      }
+    };
 
     for (const entry of unique) {
       try {
@@ -1075,6 +1084,7 @@ export class HandoffRunner {
         const code = asRecord(error)?.code;
         if (code === "ENOENT") {
           deleted.push(entry.filePath);
+          await removeContextSnapshot(entry);
           continue;
         }
         failed.push(entry.filePath);
@@ -1101,6 +1111,7 @@ export class HandoffRunner {
       try {
         await deps.fs.unlink(entry.filePath);
         deleted.push(entry.filePath);
+        await removeContextSnapshot(entry);
       } catch (error) {
         failed.push(entry.filePath);
         deps.log(`handoff orphan unlink failed: ${entry.forkSessionId}: ${errorDetail(error)}`);

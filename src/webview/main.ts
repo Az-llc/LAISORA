@@ -2,6 +2,7 @@ import { installAccent } from "./accent";
 import { setDisplayName } from "./user-label";
 import { prependPreservingView } from "./history-scroll";
 import * as l10n from "@vscode/l10n";
+import { CLOSE_GLYPH } from "./close-button";
 
 const applyAccent = installAccent();
 
@@ -17,12 +18,14 @@ import type {
   PendingAttachmentInfo,
   PermissionModeId,
   ResumeHydrationPhase,
+  ResumeHydrationSendDisposition as SendDisposition,
   SemanticModelPayload,
   TabSnapshot,
   UsageSnapshot,
   WorkModelPayload,
 } from "../protocol";
 import { ACCOUNT_USAGE_REPLY_WAIT_MS, fallbackChipWarning, IMAGE_MAX_COUNT, isCurrentAccountUsageRow, PROTOCOL_VERSION, RENAME_TITLE_MAX, isHostToWebview, withLocalEventDrop } from "../protocol";
+import { hasSessionRecord, sessionRecordId } from "../session-record";
 import { windowEvents } from "../event-window";
 import { findModelRow, resolveModelDisplayName } from "../model-display-name";
 import type { AnalysisReport } from "../analysis";
@@ -49,7 +52,7 @@ import {
   vscode,
   CONTEXT_CHIP_EMPTY,
 } from "./dom";
-import { applySessionChunk, applySessionHiddenChanged, applySessionListActionFailed, applySessionRenamed, initHistory, openHistPanel, refreshHistList, setHistoryTodoOpened } from "./history";
+import { applySessionChunk, applySessionHiddenChanged, applySessionListActionFailed, applySessionRenamed, historyTitleCell, initHistory, openHistPanel, refreshHistList, setHistoryTodoOpened } from "./history";
 import {
   applyUserSettings,
   closeAuthPicker,
@@ -86,10 +89,10 @@ import { uiLocale } from "./l10n";
 import { isComposingKey } from "./composing";
 import { initTodoApp } from "./todo-app";
 import { TodoDrawer } from "./todo-drawer";
-import { readImageAsBase64 } from "./todo-edit";
-import { TodoTab } from "./todo-view";
+import { openTodoMenu, readImageAsBase64, type TodoMenuEntry, type TodoMenuHandle } from "./todo-edit";
+import { TODO_TAB_LABEL, TodoTab } from "./todo-view";
 import { receiveTodoChanges, refreshTodoSplitCards, refreshTodoToolCards, todoSplitCard } from "./todo-chat";
-import { initTodoLinks } from "./todo-links";
+import { initTodoLinks, todoTabHistoryLink } from "./todo-links";
 import { setTodoSplitRenderer } from "./markdown";
 
 export const MODE_LABELS: Record<PermissionModeId, string> = {
@@ -120,6 +123,13 @@ const hostDroppedAtInstall = new Map<string, number>();
 export let activeTabId: string | null = vscode.getState()?.activeTabId ?? null;
 let activeTabAfterInit: string | null = null;
 const drafts = new Map<string, string>(Object.entries(vscode.getState()?.drafts ?? {}));
+type EditorReference = { path: string; startLine: number; endLine: number };
+const unconfirmedSends = new Map<string, {
+  tabId: string;
+  text: string;
+  finalText: string;
+  context: EditorReference | null;
+}>();
 const forgottenTabIds = new Set<string>();
 const TODO_TAB_KEY = "todo";
 const TAB_DRAG_MIME = "application/x-laisora-tab";
@@ -317,6 +327,9 @@ function initLogsScroll(): void {
       persistState();
     }, SCROLL_PERSIST_DELAY_MS);
   });
+  logsEl.addEventListener("scrollend", () => {
+    if (activeTabId) tabs.get(activeTabId)?.endUserScrollGesture();
+  });
   for (const type of ["wheel", "touchstart"]) {
     logsEl.addEventListener(type, abandonAwaitedScrollAnchor, { passive: true });
   }
@@ -336,7 +349,10 @@ function initLogsScroll(): void {
 const SCROLL_KEYS = new Set(["PageUp", "PageDown", "Home", "End", "ArrowUp", "ArrowDown", " "]);
 
 function abandonAwaitedScrollAnchor(): void {
-  if (activeTabId) tabs.get(activeTabId)?.stopAwaitingScrollAnchor();
+  if (!activeTabId) return;
+  const tab = tabs.get(activeTabId);
+  tab?.stopAwaitingScrollAnchor();
+  tab?.noteUserScrollGesture();
 }
 
 const analysisReports = new Map<string, { filePath: string; report: AnalysisReport }>();
@@ -383,6 +399,7 @@ export function setActiveTab(tabId: string): void {
       t.logEl.classList.toggle("active", id === tabId);
       t.setSessionMenuActive(id === tabId);
     }
+    revealActiveTabButton();
     tabs.get(tabId)!.updateStrip();
     refreshComposer();
     resumeConversationChase(tabId);
@@ -423,6 +440,7 @@ function showTodoTab(): void {
     t.setSessionMenuActive(false);
   }
   todoTab.setShown(true);
+  revealActiveTabButton();
   logsEl.scrollTop = 0;
   persistState();
   refreshChrome();
@@ -862,14 +880,15 @@ function swapKeepingConvView(tabId: string, target: Element, replacement: Node):
     target.replaceWith(replacement);
     return;
   }
+  const tab = tabs.get(tabId);
   withoutScrollAnchoring(() => {
     const portTop = logsEl.getBoundingClientRect().top;
     const nodeTop = target.getBoundingClientRect().top;
-    const atBottom = logsEl.scrollHeight - logsEl.scrollTop - logsEl.clientHeight <= SCROLL_BOTTOM_GAP_PX;
+    const atBottom = tab?.portAtBottom() ?? false;
     const heightBeforeSwap = logsEl.scrollHeight;
     target.replaceWith(replacement);
     const heightAfterSwap = logsEl.scrollHeight;
-    if (atBottom) logsEl.scrollTop = logsEl.scrollHeight;
+    if (atBottom) tab?.placeAtBottom("conv");
     else if (nodeTop < portTop) logsEl.scrollTop += heightAfterSwap - heightBeforeSwap;
   });
 }
@@ -879,14 +898,14 @@ export const SCROLL_BOTTOM_GAP_PX = 24;
 function convStuckToBottom(): boolean {
   const t = activeTab();
   if (t === null || t.viewMode !== "conv") return false;
-  return logsEl.scrollHeight - logsEl.scrollTop - logsEl.clientHeight <= SCROLL_BOTTOM_GAP_PX;
+  return t.portAtBottom();
 }
 
 function restickConv(stuck: boolean): void {
   if (!stuck) return;
   const t = activeTab();
   if (t === null || t.viewMode !== "conv") return;
-  logsEl.scrollTop = logsEl.scrollHeight;
+  t.placeAtBottom("conv");
   t.noteScroll();
 }
 
@@ -1034,7 +1053,7 @@ function refreshFindAfterPrepend(tabId: string): void {
 }
 
 function finishConvChaseProgress(tabId: string): void {
-  tabs.get(tabId)?.stopAwaitingScrollAnchor();
+  tabs.get(tabId)?.stopAwaitingScrollAnchor("conv");
   const coord = resumeCoordinators.get(tabId);
   if (coord) {
     coord.convPager = "exhausted";
@@ -1047,7 +1066,7 @@ function finishConvChaseProgress(tabId: string): void {
 }
 
 function failConvChaseProgress(tabId: string, reason: string, detail?: string): void {
-  tabs.get(tabId)?.stopAwaitingScrollAnchor();
+  tabs.get(tabId)?.stopAwaitingScrollAnchor("conv");
   const coord = resumeCoordinators.get(tabId);
   if (coord) coord.convPager = "failed";
   const pager = convPagers.get(tabId);
@@ -1217,7 +1236,7 @@ function onConvEventChunkResult(
     if (renderNote !== undefined) t.setConvHistoryNote(renderNote);
   }
   refreshFindAfterPrepend(tabId);
-  t.realignScrollAnchor();
+  t.realignScrollAnchor("conv");
   const oldest = page.items[0];
   if (oldest !== undefined) pager.eventAnchor = { generation: oldest.generation, seq: oldest.seq };
   if (page.hasMore && page.nextCursor !== undefined) {
@@ -1317,7 +1336,7 @@ function onConversationHistoryResult(
   const historyNote = [gapNote, renderNote].filter((n): n is string => n !== undefined).join(" ");
   if (historyNote.length > 0) t.setConvHistoryNote(historyNote);
   refreshFindAfterPrepend(tabId);
-  t.realignScrollAnchor();
+  t.realignScrollAnchor("conv");
   const oldest = page.items[0];
   if (oldest !== undefined) pager.anchorUuid = oldest.uuid;
   if (page.hasMore && page.nextCursor !== undefined) {
@@ -1458,6 +1477,7 @@ function showWorklogBackfillProgress(tabId: string, pager: HistoryPager, remaini
 }
 
 function failWorklogBackfill(tabId: string, reason: string): void {
+  tabs.get(tabId)?.stopAwaitingScrollAnchor("work");
   const coord = resumeCoordinators.get(tabId);
   if (coord) coord.workPager = "failed";
   tabs.get(tabId)?.setWorkLoadProgress({
@@ -1479,6 +1499,7 @@ function retryWorklogBackfill(tabId: string): void {
 }
 
 function finishWorklogBackfill(tabId: string): void {
+  tabs.get(tabId)?.stopAwaitingScrollAnchor("work");
   const coord = resumeCoordinators.get(tabId);
   if (coord) {
     coord.workPager = "exhausted";
@@ -1558,20 +1579,18 @@ function worklogBackfillContinues(
 function installHistoryPager(
   tabId: string,
   windowed: { events: NormalizedEvent[]; droppedCount: number; backfilledHead: boolean },
-  noteEl: HTMLElement | undefined
+  noteEl: HTMLElement | undefined,
+  resumeSessionId: string | undefined
 ): void {
   dropHistoryPager(tabId);
   const coord = resumeCoordinators.get(tabId);
-  if (windowed.droppedCount <= 0) {
-    if (coord) coord.workPager = "exhausted";
-    return;
-  }
   const anchor = initialHistoryAnchor(windowed);
-  if (anchor === undefined) {
+  const pager: HistoryPager = { phase: "events", status: "idle", anchor, retried: false, noteEl };
+  if (anchor === undefined || (windowed.droppedCount <= 0 && !armTranscriptBackfill(tabId, pager, resumeSessionId))) {
     if (coord) coord.workPager = "exhausted";
     return;
   }
-  historyPagers.set(tabId, { phase: "events", status: "idle", anchor, retried: false, noteEl });
+  historyPagers.set(tabId, pager);
   if (coord) coord.workPager = "running";
 }
 
@@ -1709,6 +1728,7 @@ function onHistoryChunkResult(
   pager.retried = false;
   const usedCursor = pager.cursor;
   const correct = mayCorrectScroll(tabId);
+  const pinned = worklogPinnedNow(t);
   let result;
   try {
     result = correct
@@ -1716,7 +1736,7 @@ function onHistoryChunkResult(
         const before = logsEl.scrollHeight;
         const r = t.prependPastEvents(page.items);
         const after = logsEl.scrollHeight;
-        logsEl.scrollTop += after - before;
+        logsEl.scrollTop = pinned ? after : logsEl.scrollTop + after - before;
         return r;
       })
       : t.prependPastEvents(page.items);
@@ -1754,6 +1774,7 @@ function onHistoryChunkResult(
         `expected=${result.expectedConnected} (tab=${tabId})`
     );
   }
+  t.realignScrollAnchor("work");
   pager.anchor = resolveContiguousHistoryAnchor(pager.anchor, page.items);
   if (page.hasMore && page.nextCursor !== undefined) {
     const chase = worklogBackfillContinues(tabId, pager, usedCursor, page, page.items.length);
@@ -1768,26 +1789,34 @@ function onHistoryChunkResult(
     failWorklogBackfill(tabId, "stalled");
     return;
   }
-  const host = hostCoverage(tabId);
-  const hostDropped = coverageUnreachableBase(tabId);
-  if (hostDropped > 0 && host?.source === "provider-transcript" && t.resumeSessionId !== undefined) {
-    pager.phase = "transcript";
-    pager.cursor = undefined;
-    pager.backfillTotal = hostDropped;
-    pager.backfillBudget = undefined;
-    pager.lastRemainingOlder = undefined;
-    pager.receivedTranscriptChunk = false;
-    pager.transcriptRemaining = hostDropped;
-    localEventDrops.set(tabId, hostDropped);
-    refreshLocalDropViews(tabId);
-    pager.status = "idle";
-    showWorklogBackfillProgress(tabId, pager, hostDropped);
+  if (armTranscriptBackfill(tabId, pager, t.resumeSessionId)) {
+    showWorklogBackfillProgress(tabId, pager, localEventDrops.get(tabId) ?? 0);
     requestHistoryChunk(tabId);
     return;
   }
   pager.status = "exhausted";
   finishWorklogBackfill(tabId);
   refreshLocalDropViews(tabId);
+}
+
+function worklogPinnedNow(t: Tab): boolean {
+  return t.isWorklogAtBottom() && t.portAtBottom();
+}
+
+function armTranscriptBackfill(tabId: string, pager: HistoryPager, resumeSessionId: string | undefined): boolean {
+  const hostDropped = coverageUnreachableBase(tabId);
+  if (hostDropped <= 0 || hostCoverage(tabId)?.source !== "provider-transcript" || resumeSessionId === undefined) return false;
+  pager.phase = "transcript";
+  pager.cursor = undefined;
+  pager.backfillTotal = hostDropped;
+  pager.backfillBudget = undefined;
+  pager.lastRemainingOlder = undefined;
+  pager.receivedTranscriptChunk = false;
+  pager.transcriptRemaining = hostDropped;
+  localEventDrops.set(tabId, hostDropped);
+  refreshLocalDropViews(tabId);
+  pager.status = "idle";
+  return true;
 }
 
 function onHistoryChunkError(tabId: string, requestId: string, reason: string): void {
@@ -1837,6 +1866,7 @@ function onWorklogTranscriptResult(
   }
   if (page.items.length > 0) pager.receivedTranscriptChunk = true;
   const correct = mayCorrectScroll(tabId);
+  const pinned = worklogPinnedNow(t);
   let result;
   try {
     result = correct
@@ -1844,7 +1874,7 @@ function onWorklogTranscriptResult(
         const before = logsEl.scrollHeight;
         const tpRes = t.prependPastEvents(page.items);
         const afterHeight = logsEl.scrollHeight;
-        logsEl.scrollTop += afterHeight - before;
+        logsEl.scrollTop = pinned ? afterHeight : logsEl.scrollTop + afterHeight - before;
         return tpRes;
       })
       : t.prependPastEvents(page.items);
@@ -1875,6 +1905,7 @@ function onWorklogTranscriptResult(
         `expected=${result.expectedConnected} (tab=${tabId})`
     );
   }
+  t.realignScrollAnchor("work");
   pager.anchor = resolveContiguousHistoryAnchor(pager.anchor, page.items);
   pager.transcriptRemaining = Math.max(0, page.coverage.remainingOlderCount);
   if (page.hasMore && page.nextCursor !== undefined) {
@@ -2062,6 +2093,7 @@ function addTab(snap: TabSnapshot, scrollCarry?: ScrollCarry): Tab {
     model = withLocalEventDrop(snap.state.workModel, windowed.droppedCount);
     t.applyWorkModel(model);
     const events = windowed.events;
+    t.noteModelObservations(snap.state.events);
     for (const ev of events) t.handleEvent(ev);
     t.applyWorkModel(model);
     t.replaceBackgroundActivity(snap.state.backgroundActivity);
@@ -2074,7 +2106,7 @@ function addTab(snap: TabSnapshot, scrollCarry?: ScrollCarry): Tab {
   };
 
   const installPagers = (windowed: ReturnType<typeof windowEvents>, droppedNoticeEl: HTMLElement | undefined): void => {
-    installHistoryPager(snap.tabId, windowed, droppedNoticeEl);
+    installHistoryPager(snap.tabId, windowed, droppedNoticeEl, snap.state.resumeSessionId);
     const keptKeys = new Set(windowed.events.map((e) => `${e.generation}:${e.seq}`));
     const hasDroppedConvEvent =
       snap.state.headOmitted?.hasConvEvent === true ||
@@ -2169,14 +2201,14 @@ function addTab(snap: TabSnapshot, scrollCarry?: ScrollCarry): Tab {
   overview.setVisible(t.viewMode === "work");
   overview.setYou(t.summaryYou.element);
   overview.setPlanUsage(snap.state.planUsage);
+  overview.setRecordProbe(() => hasSessionRecord(t));
   overview.mount();
   overview.update(displayWorkModel(snap.tabId, snap.state.workModel));
   lastSemanticModels.set(snap.tabId, { model: snap.state.semanticModel, view: snap.state.semanticView });
   overview.updateSemantic(displaySemanticModel(snap.tabId, snap.state.semanticModel), snap.state.semanticView);
   overview.setLlmAnalysisEnabled(snap.state.llmAnalysisEnabled);
-  const heldSessionId = [snap.state.resumeSessionId, snap.state.auth?.sessionId].find(
-    (sid) => sid !== undefined && analysisReports.has(sid)
-  );
+  const recordId = sessionRecordId(snap.state);
+  const heldSessionId = recordId !== undefined && analysisReports.has(recordId) ? recordId : undefined;
   if (heldSessionId) {
     const held = analysisReports.get(heldSessionId)!;
     overview.setAnalysis(heldSessionId, held.filePath, held.report);
@@ -2192,7 +2224,7 @@ function addTab(snap: TabSnapshot, scrollCarry?: ScrollCarry): Tab {
     overview.setMode(savedWorkView);
   }
   restoringWorkView = false;
-  if (scrollCarry !== undefined) t.applyScrollCarry(scrollCarry, convPagers.has(snap.tabId));
+  if (scrollCarry !== undefined) t.applyScrollCarry(scrollCarry, { conv: convPagers.has(snap.tabId), work: historyPagers.has(snap.tabId) });
   if (snap.deferred) {
     const preparing = { phase: "preparing" } as const;
     t.setConvLoadProgress(preparing);
@@ -2218,6 +2250,7 @@ function applyTabOrder(order: readonly string[]): void {
 function rebuildTabInPlace(snap: TabSnapshot, preserveScroll: boolean): void {
   const old = tabs.get(snap.tabId);
   if (!old) return;
+  const order = [...tabs.keys()];
   const btnNext = old.tabBtn.nextSibling;
   const logNext = old.logEl.nextSibling;
   const scrollCarry = preserveScroll ? old.captureScrollCarry() : undefined;
@@ -2227,6 +2260,9 @@ function rebuildTabInPlace(snap: TabSnapshot, preserveScroll: boolean): void {
   overviews.delete(snap.tabId);
   const t = addTab(snap, scrollCarry);
   t.carryUnread(unread);
+  const entries = order.map((tabId) => [tabId, tabs.get(tabId)!] as const);
+  tabs.clear();
+  for (const [tabId, tab] of entries) tabs.set(tabId, tab);
   tabbarEl.insertBefore(t.tabBtn, btnNext);
   logsEl.insertBefore(t.logEl, logNext);
   if (activeTabId === snap.tabId) setActiveTab(snap.tabId);
@@ -2354,11 +2390,15 @@ function initMessageBus(): void {
           }
         }
         if (unread && todoTab.enabled) todoTab.render();
+        if (t && msg.events.some((event) => event.kind === "auth_status")) overviews.get(msg.tabId)?.noteRecordChanged();
         if (t) overviews.get(msg.tabId)?.syncVisibility();
         break;
       }
       case "resumeHydrationState": {
+        const sendDisposition = "sendDisposition" in msg ? msg.sendDisposition : undefined;
+        if (sendDisposition !== undefined) settleSendDisposition(msg.tabId, sendDisposition);
         const coord = resumeCoordinators.get(msg.tabId);
+        if (sendDisposition !== undefined && !coord) break;
         if (!coord) {
           console.warn("[drop] resumeHydrationState without coordinator", msg.tabId);
           break;
@@ -2407,16 +2447,6 @@ function initMessageBus(): void {
               t.handleEvent(displayEvent.event);
               overviews.get(msg.tabId)?.syncVisibility();
             }
-          }
-        }
-        const sendDisposition = "sendDisposition" in msg ? msg.sendDisposition : undefined;
-        if (sendDisposition !== undefined) {
-          const t = tabs.get(msg.tabId);
-          const disp = sendDisposition;
-          if (disp.disposition === "rejected" || disp.disposition === "accepted-nonhuman") {
-            t?.removeOptimisticBubble(disp.clientToken);
-          } else if (disp.disposition === "accepted-human") {
-            t?.markOptimisticBubbleAccepted(disp.clientToken);
           }
         }
         break;
@@ -2825,7 +2855,7 @@ function renderAttachments(): void {
       img.alt = l10n.t("Attachment {0}", idx + 1);
       const rm = document.createElement("button");
       rm.className = "attachment-remove";
-      rm.textContent = "×";
+      rm.textContent = CLOSE_GLYPH;
       rm.title = l10n.t("Remove attachment");
       rm.onclick = () => {
         if (!tabId) return;
@@ -3067,9 +3097,102 @@ function initTabbarKeys(): void {
   });
 }
 
-let editorContext: { path: string; startLine: number; endLine: number } | null = null;
+function revealActiveTabButton(): void {
+  const btn = todoTab.shown ? todoTab.tabBtn : activeTab()?.tabBtn;
+  if (!btn?.isConnected) return;
+  const bar = tabbarEl.getBoundingClientRect();
+  const box = btn.getBoundingClientRect();
+  if (box.left < bar.left) tabbarEl.scrollLeft -= bar.left - box.left;
+  else if (box.right > bar.right) tabbarEl.scrollLeft += Math.min(box.right - bar.right, box.left - bar.left);
+}
 
-function ctxLabel(ctx: { path: string; startLine: number; endLine: number }): string {
+const tabListBtn = document.createElement("button");
+let tabListMenu: TodoMenuHandle | null = null;
+let tabOverflowPending = false;
+
+const TAB_STATE_CLASSES = ["running", "needs-approval"] as const;
+
+function tabListRow(t: Tab): HTMLElement {
+  const row = document.createElement("span");
+  row.className = "tab-list-row";
+  const state = document.createElement("span");
+  state.className = "tab-state";
+  for (const name of TAB_STATE_CLASSES) state.classList.toggle(name, t.tabBtn.classList.contains(name));
+  const dot = document.createElement("span");
+  dot.className = "tab-dot";
+  state.append(dot);
+  row.append(state, historyTitleCell(t.title, todoTabHistoryLink(t.tabId)).cell);
+  if (t.unreadCount > 0) {
+    const unread = document.createElement("span");
+    unread.className = "tab-unread";
+    unread.textContent = String(t.unreadCount);
+    row.append(unread);
+  }
+  return row;
+}
+
+function tabListEntries(): TodoMenuEntry[] {
+  const conversations = [...tabs.values()].map((t): TodoMenuEntry => ({
+    label: t.title,
+    checked: t.tabId === activeTabId && !todoTab.shown,
+    render: () => tabListRow(t),
+    run: () => setActiveTab(t.tabId),
+    dismiss: { label: l10n.t("Close {0}", t.title), run: () => vscode.postMessage({ type: "closeTab", tabId: t.tabId }) },
+  }));
+  if (!todoTab.enabled) return conversations;
+  return [...conversations, { label: TODO_TAB_LABEL, checked: todoTab.shown, separator: true, run: () => showTodoTab() }];
+}
+
+function syncTabOverflow(): void {
+  const shown = tabListBtn.hidden ? 0 : tabListBtn.getBoundingClientRect().width;
+  const listOpen = tabListBtn.getAttribute("aria-expanded") === "true";
+  const hide = !listOpen && tabbarEl.scrollWidth <= tabbarEl.clientWidth + shown;
+  if (hide && document.activeElement === tabListBtn) (todoTab.shown ? todoTab.tabBtn : activeTab()?.tabBtn)?.focus();
+  tabListBtn.hidden = hide;
+  tabListMenu?.update(tabListEntries());
+}
+
+function scheduleTabOverflow(): void {
+  if (tabOverflowPending) return;
+  tabOverflowPending = true;
+  setTimeout(() => {
+    tabOverflowPending = false;
+    syncTabOverflow();
+  }, 0);
+}
+
+function initTabbarOverflow(): void {
+  const label = l10n.t("All conversation tabs");
+  tabListBtn.id = "tablistbtn";
+  tabListBtn.type = "button";
+  tabListBtn.hidden = true;
+  tabListBtn.title = label;
+  tabListBtn.setAttribute("aria-label", label);
+  tabListBtn.setAttribute("aria-haspopup", "menu");
+  tabListBtn.setAttribute("aria-expanded", "false");
+  const icon = document.createElement("span");
+  icon.className = "l-icon l-icon-chevron-down";
+  icon.setAttribute("aria-hidden", "true");
+  tabListBtn.append(icon);
+  tabListBtn.addEventListener("click", () => {
+    tabListMenu = openTodoMenu(tabListBtn, tabListEntries(), label, { className: "tab-list-menu", onClose: scheduleTabOverflow });
+  });
+  tabbarEl.after(tabListBtn);
+  tabbarEl.addEventListener("wheel", (e) => {
+    if (e.ctrlKey || e.deltaY === 0 || e.deltaX !== 0 || tabbarEl.scrollWidth <= tabbarEl.clientWidth) return;
+    tabbarEl.scrollLeft += e.deltaY;
+    e.preventDefault();
+  }, { passive: false });
+  new MutationObserver(scheduleTabOverflow).observe(tabbarEl, { childList: true, subtree: true, characterData: true, attributes: true, attributeFilter: ["class", "hidden"] });
+  new ResizeObserver(() => {
+    revealActiveTabButton();
+    scheduleTabOverflow();
+  }).observe(tabbarEl);
+}
+
+let editorContext: EditorReference | null = null;
+
+function ctxLabel(ctx: EditorReference): string {
   const loc = ctx.startLine === ctx.endLine ? `${ctx.path}:${ctx.startLine}` : `${ctx.path}:${ctx.startLine}-${ctx.endLine}`;
   return `📄 ${loc}`;
 }
@@ -3086,7 +3209,7 @@ function renderCtxChip(): void {
     label.title = ctxLabel(editorContext);
     const rm = document.createElement("button");
     rm.className = "ctx-chip-remove";
-    rm.textContent = "×";
+    rm.textContent = CLOSE_GLYPH;
     rm.title = l10n.t("Remove reference");
     rm.setAttribute("aria-label", l10n.t("Remove reference"));
     rm.onclick = () => {
@@ -3229,19 +3352,42 @@ function send(): void {
         }`
       )}\n${text}`
     : text;
+  const context = editorContext;
   editorContext = null;
   renderCtxChip();
-  const coord = activeTabId ? resumeCoordinators.get(activeTabId) : undefined;
-  if (coord && coord.host === "loading") {
-    const clientToken = crypto.randomUUID();
-    const bubble = t?.renderOptimisticUserBubble(finalText, clientToken, images);
-    if (bubble) {
-      coord.convTouched = true;
-    }
-    vscode.postMessage({ type: "send", tabId: activeTabId, text: finalText, clientToken });
+  const coord = resumeCoordinators.get(activeTabId);
+  const clientToken = crypto.randomUUID();
+  const bubble = t?.renderOptimisticUserBubble(finalText, clientToken, images);
+  if (bubble && coord && coord.host === "loading") coord.convTouched = true;
+  unconfirmedSends.set(clientToken, { tabId: activeTabId, text, finalText, context });
+  vscode.postMessage({ type: "send", tabId: activeTabId, text: finalText, clientToken });
+}
+
+function settleSendDisposition(tabId: string, disp: SendDisposition): void {
+  const t = tabs.get(tabId);
+  if (disp.disposition === "rejected" || disp.disposition === "accepted-nonhuman") {
+    t?.removeOptimisticBubble(disp.clientToken);
   } else {
-    vscode.postMessage({ type: "send", tabId: activeTabId, text: finalText });
+    t?.markOptimisticBubbleAccepted(disp.clientToken);
   }
+  const sent = unconfirmedSends.get(disp.clientToken);
+  unconfirmedSends.delete(disp.clientToken);
+  if (disp.disposition !== "rejected" || sent === undefined || !tabs.has(sent.tabId)) return;
+  const chipRestored = sent.context !== null && editorContext === null && activeTabId === sent.tabId;
+  if (chipRestored) {
+    editorContext = sent.context;
+    renderCtxChip();
+  }
+  const text = chipRestored ? sent.text : sent.finalText;
+  if (text === "") return;
+  const current = activeTabId === sent.tabId ? inputEl.value : drafts.get(sent.tabId) ?? "";
+  const restored = current.trim() === "" ? text : `${text}\n${current}`;
+  drafts.set(sent.tabId, restored);
+  if (activeTabId === sent.tabId) {
+    inputEl.value = restored;
+    autosizeComposer();
+  }
+  persistState();
 }
 
 function initTicker(): void {
@@ -3271,6 +3417,7 @@ for (const [name, step] of [
   ["initFindBar", initFindBar],
   ["initSuggest", initSuggest],
   ["initTabbarKeys", initTabbarKeys],
+  ["initTabbarOverflow", initTabbarOverflow],
   ["initTabDrag", initTabDrag],
   ["initHistory", initHistory],
   ["initTicker", initTicker],

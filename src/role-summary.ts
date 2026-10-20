@@ -2,7 +2,7 @@ import * as l10n from "@vscode/l10n";
 import { conductorModelAtEnd, PLAN_UNPLANNED_ROW_KEY, planConductorRunning, splitByConductorModel, planFrame, planItemRowKey, planLive, planNow, planNumberedStep, planRowPeriod, planRowProvisional, planRowsAt, planRowTime, UNMEASURED_LABEL } from "./plan-steps";
 import { attestedExternalRun, type ExternalRunRecord } from "./orchestration-external";
 import { EXECUTORS, isOrchestrationEffort } from "./orchestration-roster";
-import type { WorkAgentNode, WorkPhaseView } from "./protocol";
+import { flattenAgents, type WorkAgentNode, type WorkPhaseView } from "./protocol";
 import { attributeSubagent, type RosterEvidence } from "./roster-evidence";
 import { externalTokens, summarizeMainTokens, type PlanTokenTotal, type PlanUsageAccumulator } from "./plan-usage";
 import { keyedGet, keyedValues, largestRemainder, measureSpans, unionSpans, type ConductorModel, type KeyedLog, type RequestBlockView,
@@ -131,13 +131,6 @@ interface RunDraft extends Omit<RoleRunView, "shade" | "timePercent" | "tokenPer
   role: string | null;
 }
 
-function flattenAgents(nodes: readonly WorkAgentNode[], out: WorkAgentNode[]): void {
-  for (const node of nodes) {
-    out.push(node);
-    flattenAgents(node.children, out);
-  }
-}
-
 function subagentRun(agent: WorkAgentNode, evidence: RosterEvidence, usage?: PlanUsageAccumulator, blockId: string | null = null): RunDraft {
   const attributed = attributeSubagent(evidence, agent);
   const variant = attributed?.definition;
@@ -233,13 +226,11 @@ export function deriveRoleSummary(input: {
   timeBuckets?: TimeBucketView;
   analysisTools?: KeyedLog<AnalysisToolRecord>;
 }): RoleSummaryView {
-  const agents: WorkAgentNode[] = [];
+  const agents = flattenAgents(input.phases, input.unlinkedAgents);
   let rollupAgentCount = 0;
   for (const phase of input.phases) {
     if (phase.kind === "rollup" && (input.generationBoundaryAt === undefined || phase.startedAt >= input.generationBoundaryAt)) rollupAgentCount += phase.agentCount;
-    flattenAgents(phase.agents, agents);
   }
-  flattenAgents(input.unlinkedAgents, agents);
   const currentAgents = agents.filter(a => input.generationBoundaryAt === undefined || a.startedAt !== undefined && a.startedAt >= input.generationBoundaryAt);
   const recoveredCount = currentAgents.filter((a) => a.origin === "restored").length;
   const omittedSubagentCount = Math.max(0, rollupAgentCount - recoveredCount);

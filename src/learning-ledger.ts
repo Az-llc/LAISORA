@@ -331,6 +331,9 @@ export interface LedgerState {
   unavailableConversations: ReadonlySet<string>;
 }
 
+const embeddedReplacement = (record: LedgerV2Record): LedgerV2Record | undefined =>
+  record.kind === "correction" ? record.replacementRecord : undefined;
+
 class LedgerReduction {
   private derived?: LedgerState;
   private mapsShared = false;
@@ -339,7 +342,12 @@ class LedgerReduction {
   static restore(records: readonly LedgerV2Record[], conflicts: readonly string[]): LedgerReduction {
     const conflictIds = new Set(conflicts);
     const acceptedById = new Map(records.map(record => [record.opId, record] as const));
-    return new LedgerReduction(acceptedById, new Map([...acceptedById].filter(([opId]) => !conflictIds.has(opId))), conflictIds);
+    const byId = new Map([...acceptedById].filter(([opId]) => !conflictIds.has(opId)));
+    for (const record of [...byId.values()]) {
+      const replacement = embeddedReplacement(record);
+      if (replacement && !acceptedById.has(replacement.opId) && !conflictIds.has(replacement.opId)) byId.set(replacement.opId, replacement);
+    }
+    return new LedgerReduction(acceptedById, byId, conflictIds);
   }
   get records(): ReadonlyMap<string, LedgerV2Record> { return this.byId; }
   get conflicts(): ReadonlySet<string> { return this.conflictIds; }
@@ -353,6 +361,32 @@ class LedgerReduction {
   add(record: LedgerV2Record): void {
     const prior = this.acceptedById.get(record.opId);
     if (prior && isDeepStrictEqual(prior, record)) return;
+    const embedded = prior ? undefined : this.byId.get(record.opId);
+    if (embedded && isDeepStrictEqual(embedded, record)) {
+      this.copyOnWrite();
+      this.acceptedById.set(record.opId, record);
+      return;
+    }
+    this.copyOnWrite();
+    if (prior || embedded) {
+      this.conflictIds.add(record.opId);
+      this.byId.delete(record.opId);
+      const replacement = prior && embeddedReplacement(prior);
+      if (replacement && !this.acceptedById.has(replacement.opId)) this.byId.delete(replacement.opId);
+      return;
+    }
+    this.acceptedById.set(record.opId, record);
+    this.byId.set(record.opId, record);
+    const replacement = embeddedReplacement(record);
+    if (!replacement) return;
+    const existing = this.byId.get(replacement.opId);
+    if (!existing && !this.conflictIds.has(replacement.opId)) this.byId.set(replacement.opId, replacement);
+    else if (existing && !isDeepStrictEqual(existing, replacement)) {
+      this.conflictIds.add(replacement.opId);
+      this.byId.delete(replacement.opId);
+    }
+  }
+  private copyOnWrite(): void {
     if (this.mapsShared) {
       this.acceptedById = new Map(this.acceptedById);
       this.byId = new Map(this.byId);
@@ -363,13 +397,6 @@ class LedgerReduction {
     }
     this.mapsShared = this.stateShared = false;
     this.derived = undefined;
-    if (prior) {
-      this.conflictIds.add(record.opId);
-      this.byId.delete(record.opId);
-      return;
-    }
-    this.acceptedById.set(record.opId, record);
-    this.byId.set(record.opId, record);
   }
   state(): LedgerState {
     if (!this.derived) {
@@ -675,6 +702,9 @@ export class LearningLedger {
         const prior = this.cursor.reduction.records.get(record.opId);
         if (prior && isDeepStrictEqual(prior, record)) return;
         if (prior || this.cursor.reduction.conflicts.has(record.opId)) throw new Error("learning opId conflict");
+        const replacement = embeddedReplacement(record);
+        const shown = replacement && this.cursor.reduction.records.get(replacement.opId);
+        if (replacement && shown && !isDeepStrictEqual(shown, replacement)) throw new Error("learning opId conflict");
         const encoded = encodeLedgerFrame(record, id => this.cursor.decoder.has(id));
         const reference = JSON.parse(encoded.text.slice(encoded.text.lastIndexOf("\n", encoded.text.length - 2) + 1)) as { c?: unknown; e?: unknown };
         const reused = [reference.c, reference.e].filter((id): id is string => typeof id === "string" && !encoded.contexts.some(context => context.id === id));

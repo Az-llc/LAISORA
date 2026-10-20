@@ -11,6 +11,7 @@ import type {
 import { formatDuration } from "./format";
 import { formatDateTime, uiLocale } from "./l10n";
 import { vscode } from "./dom";
+import { closeGlyphButton } from "./close-button";
 import { failureCount } from "./failure-count";
 import { createLoader } from "./loader";
 import { termSpan, type TermKey } from "./term";
@@ -164,9 +165,7 @@ export class AgentInspector {
     this.closeEl = element("button", "wi-act wi-close");
     this.closeEl.type = "button";
     this.closeEl.setAttribute("aria-keyshortcuts", "Escape");
-    this.closeEl.textContent = "×";
-    this.closeEl.title = l10n.t("Close (Esc)");
-    this.closeEl.setAttribute("aria-label", l10n.t("Close"));
+    closeGlyphButton(this.closeEl, l10n.t("Close (Esc)"));
     this.closeEl.onclick = () => this.close();
     actions.append(this.maxEl, this.closeEl);
     line.append(this.kindEl, actions);

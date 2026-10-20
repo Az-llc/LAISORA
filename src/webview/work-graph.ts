@@ -17,6 +17,18 @@ export function agentLabel(a: { description?: string }): string {
 
 type WorkCoverageView = WorkModelPayload["coverage"];
 
+export function historyUndetermined(coverage: WorkCoverageView | undefined): boolean {
+  return coverage?.hydrationUnconfirmed === "loading";
+}
+
+export function loadingHistoryText(): string {
+  return l10n.t("Loading history…");
+}
+
+export function emptyWorkText(coverage: WorkCoverageView | undefined): string {
+  return historyUndetermined(coverage) ? loadingHistoryText() : NO_WORK_SUMMARY_TEXT;
+}
+
 export interface CoverageBackfillHint {
   backfillPendingCount?: number;
   backfillStalled?: boolean;
@@ -178,6 +190,23 @@ export function graphCoverageRows(coverage: WorkCoverageView & CoverageBackfillH
   return coverageRows(nonzero(normalized), timeBuckets ? nonzero(timeBuckets) : undefined, true);
 }
 
+export function fillProblemCoverage(target: HTMLElement, coverage: (WorkCoverageView & CoverageBackfillHint) | undefined, timeBuckets?: TimeBucketsCoverage): void {
+  target.textContent = "";
+  for (const row of coverage === undefined ? [] : graphCoverageRows(coverage, timeBuckets)) {
+    const el = span("wg-coverage-row", row.text);
+    el.dataset.coverageScope = row.scope;
+    if (row.state !== undefined) el.dataset.state = row.state;
+    if (row.detail !== undefined) el.title = row.detail;
+    target.appendChild(el);
+  }
+  target.hidden = target.childElementCount === 0;
+  if (!target.hidden) {
+    const heading = document.createElement("div");
+    heading.append(span("wg-code", "COV"), span("wg-caption", l10n.t("Coverage scope")));
+    target.prepend(heading);
+  }
+}
+
 const SVG_NS = "http://www.w3.org/2000/svg";
 const LABEL_W = 288;
 const PAD_L = 8;
@@ -239,6 +268,14 @@ export interface GraphScrollPort {
 
 function clampInt(v: number, lo: number, hi: number): number {
   return Math.max(lo, Math.min(hi, v));
+}
+
+function fullyVisibleBand(m: PortMetrics, n: number, rowHeight: number): Band {
+  let i = clampInt(Math.ceil((m.portTop - m.rowsTop - 1) / rowHeight), 0, Math.max(0, n - 1));
+  const fit = Math.floor((m.portBottom - m.rowsTop + 1) / rowHeight);
+  const j = Math.min(n, i + m.rowCount, Math.max(i + 1, fit));
+  if (j - i < MIN_WINDOW_ROWS) i = Math.max(0, j - MIN_WINDOW_ROWS);
+  return { i, j, rowCount: m.rowCount };
 }
 
 type RowKey = string;
@@ -711,25 +748,11 @@ export class WorkGraph {
     const semantic = this.semanticView === false ? undefined : this.semantic;
     if (semantic !== undefined) this.rootEl.dataset.semanticMode = semantic.mode;
     else delete this.rootEl.dataset.semanticMode;
-    this.coverageEl.textContent = "";
     const coverage = semantic?.coverage.base ?? this.payload?.coverage;
-    if (coverage !== undefined) {
-      for (const row of graphCoverageRows(coverage, semantic?.timeBucketsCoverage)) {
-        const el = span("wg-coverage-row", row.text);
-        el.dataset.coverageScope = row.scope;
-        if (row.state !== undefined) el.dataset.state = row.state;
-        if (row.detail !== undefined) el.title = row.detail;
-        this.coverageEl.appendChild(el);
-      }
-    }
-    this.coverageEl.hidden = this.coverageEl.childElementCount === 0;
-    if (!this.coverageEl.hidden) {
-      const heading = document.createElement("div");
-      heading.append(span("wg-code", "COV"), span("wg-caption", l10n.t("Coverage scope")));
-      this.coverageEl.prepend(heading);
-    }
+    fillProblemCoverage(this.coverageEl, coverage, semantic?.timeBucketsCoverage);
     const view = this.activeView();
-    const hasData = view !== undefined && view.firstAt !== null && view.lastAt !== null && (view.blocks.length > 0 || view.agents.length > 0 || view.intervals.length > 0);
+    this.emptyEl.textContent = emptyWorkText(coverage);
+    const hasData = !historyUndetermined(coverage) && view !== undefined && view.firstAt !== null && view.lastAt !== null && (view.blocks.length > 0 || view.agents.length > 0 || view.intervals.length > 0);
     this.emptyEl.hidden = hasData;
     this.headEl.hidden = !hasData;
     this.bodyEl.hidden = !hasData;
@@ -1250,7 +1273,7 @@ export class WorkGraph {
       } else if (row.agent !== undefined) {
         const a = row.agent;
         const aEnd = row.extent[1];
-        addLabels(agentLabel(a), [a.subagentType, a.model].filter(Boolean).join(" · "), formatDuration(aEnd - a.start), agentLabel(a), a.model);
+        addLabels(agentLabel(a), [l10n.t("Subagent"), a.subagentType, a.model].filter(Boolean).join(" · "), formatDuration(aEnd - a.start), agentLabel(a), a.model);
         if (drawBars && !this.hiddenCategories.has("sub")) {
           const x0 = scale.x(Math.max(a.start, range.start));
           const x1 = scale.x(Math.min(aEnd, range.end));
@@ -1584,11 +1607,7 @@ export class WorkGraph {
   }
 
   private bandOf(m: PortMetrics): Band {
-    const n = this.rows.length;
-    let i = clampInt(Math.floor((m.portTop - m.rowsTop + 1) / this.rowHeight), 0, Math.max(0, n - 1));
-    const j = Math.min(n, i + m.rowCount);
-    if (j - i < MIN_WINDOW_ROWS) i = Math.max(0, j - MIN_WINDOW_ROWS);
-    return { i, j, rowCount: m.rowCount };
+    return fullyVisibleBand(m, this.rows.length, this.rowHeight);
   }
 
   private resolveBand(): Band | undefined {

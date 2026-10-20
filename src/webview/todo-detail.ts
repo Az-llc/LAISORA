@@ -15,7 +15,7 @@ import {
   type TodoListItem,
   type WebviewToHost,
 } from "../protocol";
-import { TODO_DOC_LABEL_MAX, TODO_DOC_TARGET_MAX, TODO_ESTIMATE_PATTERN, TODO_IMAGE_EXTENSIONS, TODO_TAGS_MAX, TODO_TITLE_MAX, TODO_WAITING_MAX, type TodoImageMediaType, type TodoState, type WorkMemoSection } from "../todo-model";
+import { TODO_DOC_LABEL_MAX, TODO_DOC_TARGET_MAX, TODO_ESTIMATE_PATTERN, TODO_IMAGE_EXTENSIONS, TODO_TAGS_MAX, TODO_TIME_UNKNOWN, TODO_TITLE_MAX, TODO_WAITING_MAX, type TodoImageMediaType, type TodoState, type WorkMemoSection } from "../todo-model";
 import { formatDateTime } from "./l10n";
 import {
   formatTodoDay,
@@ -30,7 +30,6 @@ import {
   todoChangeRow, todoRevertUnit,
   todoClearNotice,
   todoCloseButton,
-  TODO_CLOSE_GLYPH,
   todoFillNotice,
   todoEl,
   todoDateInput,
@@ -42,6 +41,7 @@ import {
   todoPriorityOptions,
   todoRepeatLabel,
   todoRepeatOptions,
+  TODO_REPLY_WAIT_MS,
   todoSegment,
   todoSelect,
   todoSpan,
@@ -103,6 +103,8 @@ export class TodoDetail {
   private item: TodoDetailItem | null = null;
   private work: TodoWorkView | undefined;
   private loaded = false;
+  private loadFailed = false;
+  private loadTimer: ReturnType<typeof setTimeout> | undefined;
   private revision = -1;
   private order: TodoDetailSection[] = [...TODO_DETAIL_SECTIONS];
   private readonly expanded = new Set<TodoDetailSection>(["fields", "note", "docs", "kids"]);
@@ -176,6 +178,7 @@ export class TodoDetail {
     this.item = null;
     this.work = undefined;
     this.loaded = false;
+    this.loadFailed = false;
     this.revision = -1;
     this.editingTitle = false;
     this.memoDraft = null;
@@ -192,6 +195,7 @@ export class TodoDetail {
     if (this.id === null) return;
     this.id = null;
     this.item = null;
+    clearTimeout(this.loadTimer);
     this.root.hidden = true;
     this.dialog.replaceChildren();
     this.setNotice(null);
@@ -200,7 +204,22 @@ export class TodoDetail {
   }
 
   refresh(): void {
-    if (this.id !== null) this.host.post({ type: "todoDetailRequest", id: this.id });
+    const id = this.id;
+    if (id === null) return;
+    this.host.post({ type: "todoDetailRequest", id });
+    if (this.loaded) return;
+    clearTimeout(this.loadTimer);
+    this.loadTimer = setTimeout(() => {
+      if (this.id !== id || this.loaded) return;
+      this.loadFailed = true;
+      this.render();
+    }, TODO_REPLY_WAIT_MS);
+  }
+
+  private retryLoad(): void {
+    this.loadFailed = false;
+    this.render();
+    this.refresh();
   }
 
   applyWork(message: TodoWorkMessage): void {
@@ -215,6 +234,8 @@ export class TodoDetail {
     this.revision = message.revision;
     this.item = message.item;
     this.loaded = true;
+    this.loadFailed = false;
+    clearTimeout(this.loadTimer);
     if (!this.dragging) this.order = [...message.sectionOrder];
     if (this.dialog.contains(document.activeElement) && isTextEntryTarget(document.activeElement)) {
       this.deferred = true;
@@ -296,7 +317,8 @@ export class TodoDetail {
     const item = this.item;
     if (!item) {
       const head = todoEl("header", "todo-dlg-h");
-      head.append(todoEl("div", "todo-dlg-ht", this.loaded ? l10n.t("This item was deleted or no longer exists.") : l10n.t("Loading…")), this.closeButton());
+      head.append(todoEl("div", "todo-dlg-ht", this.loaded ? l10n.t("This item was deleted or no longer exists.") : this.loadFailed ? l10n.t("The item's details could not be loaded.") : l10n.t("Loading…")),
+        ...(this.loaded || !this.loadFailed ? [] : [todoButton("todo-link", l10n.t("Retry"), () => this.retryLoad())]), this.closeButton());
       this.dialog.replaceChildren(head);
       return;
     }
@@ -311,7 +333,7 @@ export class TodoDetail {
   }
 
   private closeButton(): HTMLButtonElement {
-    return todoCloseButton(() => this.hide(), undefined, TODO_CLOSE_GLYPH);
+    return todoCloseButton(() => this.hide());
   }
 
   private header(item: TodoDetailItem): HTMLElement {
@@ -348,8 +370,21 @@ export class TodoDetail {
     max.setAttribute("aria-pressed", this.maximized ? "true" : "false");
     max.setAttribute("aria-label", l10n.t("Maximise / restore"));
     max.append(todoEl("span", "todo-dlg-max-icon"));
-    head.append(text, more, max, this.closeButton());
+    head.append(text, this.playButton(item), more, max, this.closeButton());
     return head;
+  }
+
+  private playButton(item: TodoDetailItem): HTMLButtonElement {
+    const talk = this.host.items().find(entry => entry.id === item.id)?.talk;
+    const subItem = item.parentId !== null;
+    return todoPlayButton(talk, () => {
+      if (subItem && talk === undefined) {
+        this.host.splitChild(item.id);
+        return;
+      }
+      this.hide();
+      this.host.openConversation(item.id, false);
+    }, subItem);
   }
 
   private summaryEl(item: TodoDetailItem): HTMLElement {
@@ -371,9 +406,6 @@ export class TodoDetail {
     const listed = this.host.items().find(entry => entry.id === item.id);
     const talk = todoTalkMark(listed?.talk, this.host.waiting(item.id));
     if (talk) add(talk);
-    if (item.parentId === null) {
-      add(todoPlayButton(listed?.talk, () => { this.hide(); this.host.openConversation(item.id, false); }));
-    }
     return summary;
   }
 
@@ -385,14 +417,7 @@ export class TodoDetail {
 
   private conversationEntries(item: TodoDetailItem): Array<{ label: string; run: () => void }> {
     const linked = this.host.items().find(entry => entry.id === item.id)?.talk !== undefined;
-    const open = (fresh: boolean) => () => {
-      this.hide();
-      this.host.openConversation(item.id, fresh);
-    };
-    if (item.parentId === null) return linked ? [{ label: l10n.t("Continue in a new conversation"), run: open(true) }] : [];
-    return linked
-      ? [{ label: l10n.t("Open the child conversation"), run: open(false) }, { label: l10n.t("Continue in a new conversation"), run: open(true) }]
-      : [{ label: l10n.t("Split into a child conversation…"), run: () => this.host.splitChild(item.id) }];
+    return linked ? [{ label: l10n.t("Continue in a new conversation"), run: () => { this.hide(); this.host.openConversation(item.id, true); } }] : [];
   }
 
   private toggleMaximized(): void {
@@ -863,7 +888,7 @@ export class TodoDetail {
     const actions = todoEl("div", "todo-viewer-actions");
     actions.append(
       todoButton("todo-text-btn", l10n.t("Open in the editor"), () => this.host.post({ type: "todoOpenDoc", itemId: item.id, docId: doc.id })),
-      todoCloseButton(close, undefined, TODO_CLOSE_GLYPH),
+      todoCloseButton(close),
     );
     bar.append(where, actions);
     const nav = todoEl("div", "todo-viewer-nav");
@@ -1007,10 +1032,12 @@ export class TodoDetail {
   }
 
   private timeRows(item: TodoDetailItem): Array<readonly [string, string]> {
-    const rows: Array<readonly [string, string]> = [[l10n.t("Created"), formatDateTime(item.createdAt)]];
+    const created = item.createdAt !== TODO_TIME_UNKNOWN;
+    const rows: Array<readonly [string, string]> = created ? [[l10n.t("Created"), formatDateTime(item.createdAt)]] : [];
     if (item.startedAt !== undefined) rows.push([l10n.t("Work started"), formatDateTime(item.startedAt)]);
     if (item.doneAt !== undefined) {
-      rows.push([l10n.t("Done"), formatDateTime(item.doneAt)], [l10n.t("Lead time"), todoSpan(item.doneAt - item.createdAt)]);
+      rows.push([l10n.t("Done"), formatDateTime(item.doneAt)]);
+      if (created) rows.push([l10n.t("Lead time"), todoSpan(item.doneAt - item.createdAt)]);
       if (item.startedAt !== undefined) rows.push([l10n.t("Start to done"), todoSpan(item.doneAt - item.startedAt)]);
     }
     const totals = item.totals;

@@ -1,6 +1,7 @@
 import * as l10n from "@vscode/l10n";
 import { TODO_GROUP_MAX, type TodoBatchRevert, type TodoChangeView, type TodoMarkInfo, type TodoDeletedView, type TodoEdit, type TodoEditError, type TodoEditResultMessage, type TodoListItem, type WebviewToHost } from "../protocol";
 import { parseTodoChangeId, type TodoCaptured, type TodoPlacementBasis, TODO_CLAUDE_DEPTH_MAX, TODO_RECENT_CLAUDE_MS, TODO_DELETED_RETENTION_MS, TODO_DOC_TARGET_MAX, TODO_PRIORITIES, TODO_STATES, TODO_TITLE_MAX, WORK_MEMO_SECTIONS, type TodoPriority, type TodoRevertBlock, type TodoState, type WorkMemoSection } from "../todo-model";
+import { closeGlyphButton } from "./close-button";
 import { isComposingKey } from "./composing";
 import { formatDateTime, uiLocale } from "./l10n";
 import { addDaysKey, dateOfKey, localDateKey } from "./todo-rows";
@@ -66,11 +67,8 @@ export function todoButton(className: string, text: string, onPress: () => void,
   return button;
 }
 
-export const TODO_CLOSE_GLYPH = "×";
-
-export function todoCloseButton(onPress: () => void, title = l10n.t("Close (Esc)"), text = l10n.t("Close")): HTMLButtonElement {
-  const button = todoButton("todo-close", text, onPress, title);
-  button.setAttribute("aria-label", l10n.t("Close"));
+export function todoCloseButton(onPress: () => void, title = l10n.t("Close (Esc)")): HTMLButtonElement {
+  const button = closeGlyphButton(todoButton("todo-close", "", onPress), title);
   button.setAttribute("aria-keyshortcuts", "Escape");
   return button;
 }
@@ -182,12 +180,21 @@ export interface TodoMenuEntry {
   readonly section?: string;
   readonly value?: string;
   readonly keys?: string;
+  readonly dismiss?: { readonly label: string; readonly run: () => void };
+  readonly render?: () => Node;
+  readonly separator?: boolean;
+}
+
+export interface TodoMenuHandle {
+  update(entries: readonly TodoMenuEntry[]): void;
 }
 
 export interface TodoMenuOptions {
   readonly filter?: boolean;
   readonly point?: { readonly x: number; readonly y: number };
   readonly title?: string;
+  readonly className?: string;
+  readonly onClose?: () => void;
 }
 
 let closeOpenMenu: (() => void) | null = null;
@@ -206,9 +213,11 @@ export function todoMenuMatches(entries: readonly TodoMenuEntry[], query: string
   return needle ? menuLeaves(entries, "").filter(leaf => leaf.label.toLowerCase().includes(needle)) : [];
 }
 
-export function openTodoMenu(anchor: HTMLElement, entries: readonly TodoMenuEntry[], label: string, options: TodoMenuOptions = {}): void {
+export function openTodoMenu(anchor: HTMLElement, entries: readonly TodoMenuEntry[], label: string, options: TodoMenuOptions = {}): TodoMenuHandle {
   closeOpenMenu?.();
+  const dismissOf = new WeakMap<HTMLButtonElement, NonNullable<TodoMenuEntry["dismiss"]>>();
   const menu = todoEl("div", "todo-popmenu");
+  if (options.className) menu.classList.add(options.className);
   menu.setAttribute("role", "menu");
   menu.setAttribute("aria-label", label);
   const stack: MenuLevel[] = [{ title: label, entries }];
@@ -231,6 +240,7 @@ export function openTodoMenu(anchor: HTMLElement, entries: readonly TodoMenuEntr
     anchor.setAttribute("aria-expanded", "false");
     if (closeOpenMenu === closeThis) closeOpenMenu = null;
     if (refocus && anchor.isConnected) anchor.focus();
+    options.onClose?.();
   };
   const closeThis = () => close(false);
   const outside = (e: PointerEvent) => {
@@ -260,7 +270,11 @@ export function openTodoMenu(anchor: HTMLElement, entries: readonly TodoMenuEntr
   const item = (text: string, entry: TodoMenuEntry) => {
     const button = todoEl("button", `todo-popmenu-item${entry.children ? " has-sub" : ""}`);
     button.type = "button";
-    const name = todoEl("span", "todo-popmenu-label", entry.input ? `${text}…` : text);
+    const name = todoEl("span", "todo-popmenu-label", entry.render ? undefined : entry.input ? `${text}…` : text);
+    if (entry.render) {
+      name.append(entry.render());
+      button.setAttribute("aria-label", text);
+    }
     if (entry.swatch) {
       const dot = todoEl("span", "todo-dot");
       dot.setAttribute("aria-hidden", "true");
@@ -285,7 +299,23 @@ export function openTodoMenu(anchor: HTMLElement, entries: readonly TodoMenuEntr
       e.stopPropagation();
       choose(entry);
     });
-    return button;
+    if (!entry.dismiss) return button;
+    const dismiss = entry.dismiss;
+    dismissOf.set(button, dismiss);
+    if (!entry.keys) button.setAttribute("aria-keyshortcuts", "Delete");
+    const remove = closeGlyphButton(todoEl("button", "todo-popmenu-dismiss"), dismiss.label, dismiss.label);
+    remove.type = "button";
+    remove.tabIndex = -1;
+    remove.setAttribute("aria-hidden", "true");
+    remove.addEventListener("click", (e) => {
+      e.stopPropagation();
+      button.focus();
+      dismiss.run();
+    });
+    const row = todoEl("div", "todo-popmenu-row");
+    row.setAttribute("role", "none");
+    row.append(button, remove);
+    return row;
   };
   const place = () => {
     const rect = options.point ? { left: options.point.x, bottom: options.point.y } : anchor.getBoundingClientRect();
@@ -297,7 +327,7 @@ export function openTodoMenu(anchor: HTMLElement, entries: readonly TodoMenuEntr
     const level = stack[stack.length - 1];
     const query = filter?.value ?? "";
     if (query.trim() && !("input" in level)) {
-      const found = todoMenuMatches(entries, query);
+      const found = todoMenuMatches("entries" in stack[0] ? stack[0].entries : [], query);
       if (found.length === 0) body.append(todoEl("div", "todo-popmenu-empty", l10n.t("No matching command")));
       for (const leaf of found) body.append(item(leaf.label, leaf.entry));
     } else {
@@ -333,6 +363,11 @@ export function openTodoMenu(anchor: HTMLElement, entries: readonly TodoMenuEntr
           body.append(head);
         }
         section = entry.section;
+        if (entry.separator) {
+          const rule = todoEl("div", "todo-popmenu-sep");
+          rule.setAttribute("role", "separator");
+          body.append(rule);
+        }
         body.append(item(entry.label, entry));
       }
     }
@@ -361,6 +396,9 @@ export function openTodoMenu(anchor: HTMLElement, entries: readonly TodoMenuEntr
       e.preventDefault();
       const step = e.key === "ArrowDown" ? 1 : list.length - 1;
       list[index < 0 ? (e.key === "ArrowDown" ? 0 : list.length - 1) : (index + step) % list.length]?.focus();
+    } else if (e.key === "Delete" && !inText && index >= 0 && dismissOf.has(list[index])) {
+      e.preventDefault();
+      dismissOf.get(list[index])!.run();
     } else if (e.key === "ArrowRight" && !inText && index >= 0 && list[index].classList.contains("has-sub")) {
       e.preventDefault();
       list[index].click();
@@ -379,6 +417,16 @@ export function openTodoMenu(anchor: HTMLElement, entries: readonly TodoMenuEntr
   closeOpenMenu = closeThis;
   document.addEventListener("pointerdown", outside, true);
   render(true);
+  return {
+    update: (next) => {
+      if (!menu.isConnected) return;
+      if (next.length === 0) { close(true); return; }
+      const at = buttons().indexOf(document.activeElement as HTMLButtonElement);
+      stack.splice(0, stack.length, { title: label, entries: next });
+      render(false);
+      if (at >= 0) { const list = buttons(); list[Math.min(at, list.length - 1)]?.focus(); }
+    },
+  };
 }
 
 export function todoSegment<T extends string>(label: string, options: ReadonlyArray<readonly [T, string, string?]>, current: T, choose: (value: T) => void): HTMLElement {
@@ -566,14 +614,13 @@ export function todoGuessMark(reason: string): HTMLElement {
   return mark;
 }
 
-export function todoPlayText(talk: "linked" | "running" | undefined): { readonly label: string; readonly title: string } {
-  return talk !== undefined
-    ? { label: l10n.t("▶ Continue"), title: l10n.t("Open the newest conversation of this item") }
-    : { label: l10n.t("▶ Start"), title: l10n.t("Open this item's parent conversation and start") };
+export function todoPlayText(talk: "linked" | "running" | undefined, subItem = false): { readonly label: string; readonly title: string } {
+  if (talk !== undefined) return { label: l10n.t("▶ Continue"), title: l10n.t("Open the newest conversation of this item") };
+  return { label: l10n.t("▶ Start"), title: subItem ? l10n.t("Start this sub-item in its own child conversation") : l10n.t("Open this item's parent conversation and start") };
 }
 
-export function todoPlayButton(talk: "linked" | "running" | undefined, open: () => void): HTMLButtonElement {
-  const text = todoPlayText(talk);
+export function todoPlayButton(talk: "linked" | "running" | undefined, open: () => void, subItem = false): HTMLButtonElement {
+  const text = todoPlayText(talk, subItem);
   return todoButton("todo-play", text.label, open, text.title);
 }
 
@@ -645,7 +692,6 @@ const ERROR_TEXT: Record<TodoEditError, () => string> = {
   "too-many": () => l10n.t("Too many items in one change."),
   "too-deep": () => l10n.t("This would put an item deeper than {0} levels.", TODO_CLAUDE_DEPTH_MAX),
   "duplicate-title": () => l10n.t("An item with the same title is already there."),
-  "title-repeats": () => l10n.t("The title repeats its group or a parent."),
   "title-state": () => l10n.t("Titles do not carry state markers."),
   "outside-linked": () => l10n.t("Claude sets done directly only under the conversation's linked item."),
   "user-item": () => l10n.t("Outside the linked item, Claude changes your items only by a tidy-up you can take back."),
@@ -680,7 +726,7 @@ export const TODO_REVERT_BLOCK_TEXT: Record<Exclude<TodoRevertBlock, "not-target
 
 type TodoEditDone = (ok: boolean, changed: boolean) => void;
 type Pending = { readonly role: "edit" | "revert" | "undo" | "redo"; readonly timer: ReturnType<typeof setTimeout>; done?: TodoEditDone };
-const TODO_REPLY_WAIT_MS = 20_000;
+export const TODO_REPLY_WAIT_MS = 20_000;
 
 export class TodoEditClient {
   private seq = 0;

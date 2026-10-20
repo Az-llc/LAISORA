@@ -38,6 +38,7 @@ import {
 } from "./session-semantic";
 import { SessionStore, tabLimit } from "./store-surfaces";
 import { handoffFs, handoffPersist, readHandoffRecords } from "./handoff-wiring";
+export { createStartMeasurement } from "./handoff-wiring";
 import { personalBaseline, setPersonalBaselineListener } from "./personal-baseline";
 import { PROTOCOL_VERSION } from "./protocol";
 import { openResumedSession as resumePersistedTab, startLoopLagProbe } from "./resume-hydration";
@@ -472,6 +473,7 @@ export async function deactivate(): Promise<void> {
       s.guardrailRunner.clearGuardrailRefreshTimer();
       s.guardrailRunner.clearGuardrailTickTimer();
       s.discardLlmAnalysis();
+      s.startMeasurement?.abandon();
     }
   }
   await Promise.all([

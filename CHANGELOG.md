@@ -1,5 +1,21 @@
 # Changelog
 
+## 1.9.0
+
+- **Tabs.** Tabs keep their width and scroll instead of sliding under the controls, and a list of
+  all tabs opens from the tab bar. A rebuilt tab keeps its place in the tab order.
+- **Learning on by default.** `laisora.learning.enabled` now defaults to on.
+- **Reopened conversations.** A reopened conversation starts Claude when it opens, shows its
+  recorded team before the first send, and draws its history the same way as a live conversation,
+  with each turn labelled by its own model.
+- **ToDo.** Start / Continue sits beside the menu in the item detail, items saved without times now
+  open their detail, and a detail that cannot load offers Retry instead of loading forever.
+- **Git reads.** LAISORA's own git reads no longer run programs configured by the repository they
+  read.
+- Chat keeps following the bottom when content grows; narrow SUMMARY and tab layouts fit without
+  clipping.
+- Claude Agent SDK 0.3.304 (Claude Code CLI 2.1.304).
+
 ## 1.8.1
 
 - **Project memory.** Claude can again save ongoing work state as project-type auto memory, which

@@ -10,6 +10,7 @@ import { buildFindingSessionPrompt } from "./llm-report";
 import { personalBaseline } from "./personal-baseline";
 import type { AttachedFindingView, WebviewToHost } from "./protocol";
 import { findSessionFile, lookupSessionFile } from "./session-files";
+import { noRecordRefusal, sessionRecordId } from "./session-record";
 import { llmAnalysisEnabled } from "./session-semantic";
 import type { Session } from "./extension";
 import { tabLimit, warnTabLimit, type SessionStore } from "./store-surfaces";
@@ -26,13 +27,13 @@ export async function handleAnalysisMessage(
 ): Promise<void> {
   switch (msg.type) {
     case "analyzeCurrent": {
-      const sid = target!.resumeSessionId ?? target!.auth?.sessionId;
-      if (!sid) {
+      const sid = sessionRecordId(target!);
+      if (sid === undefined) {
         void st.postTo(sender, {
           type: "analysisFailed",
           kind: "script",
           tabId: target!.tabId,
-          reason: l10n.t("LAISORA: The session ID is not available yet (analysis is available after the first message is sent)."),
+          reason: noRecordRefusal(),
         });
         break;
       }
@@ -123,7 +124,7 @@ export async function handleAnalysisMessage(
       newSession.autoTitled = true;
       st.post({ type: "tabCreated", tab: newSession.snapshot(), activate: true });
 
-      const sessionId = s.resumeSessionId ?? s.auth?.sessionId;
+      const sessionId = sessionRecordId(s);
       const filePath = s.resumeFilePath ?? (sessionId ? findSessionFile(sessionId) : undefined);
       const sessionRef = [sessionId, filePath].filter(Boolean).join(" / ") || l10n.t("Tab {0} (session not identified)", s.tabId);
       const prompt = buildFindingSessionPrompt({
@@ -173,7 +174,7 @@ export async function handleAnalysisMessage(
       st.post({ type: "tabCreated", tab: newSession.snapshot(), activate: true });
 
       const genLabel = formatGeneratedAtLabel(art.generatedAt);
-      const sessionId = s.resumeSessionId ?? s.auth?.sessionId;
+      const sessionId = sessionRecordId(s);
       const filePath = s.resumeFilePath ?? (sessionId ? findSessionFile(sessionId) : undefined);
       const sessionRef = [sessionId, filePath].filter(Boolean).join(" / ") || l10n.t("Tab {0} (session not identified)", s.tabId);
       const prompt = [

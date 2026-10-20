@@ -237,7 +237,7 @@ export type NormalizedEventBody =
         errorStatus?: number;
         errorType?: string;
       }
-    | { kind: "assistant_text_delta"; turnId: string; text: string; recordUuid?: string | null }
+    | { kind: "assistant_text_delta"; turnId: string; text: string; recordUuid?: string | null; priorGeneration?: true }
     | { kind: "assistant_message_uuid"; turnId: string; uuid: string }
     | { kind: "ask_rejected"; turnId: string; titles: string[] }
     | { kind: "assistant_retracted"; turnId: string | null; uuids: string[] }
@@ -253,6 +253,7 @@ export type NormalizedEventBody =
         images?: ImageAttachment[];
         imageRefs?: ImageRefInfo[];
         sentAt?: number;
+        priorGeneration?: true;
       }
     | {
         kind: "replayed_message";
@@ -267,6 +268,7 @@ export type NormalizedEventBody =
       }
     | {
         kind: "tool_call_started";
+        priorGeneration?: true;
         turnId: string;
         toolUseId: string;
         parentToolUseId: string | null;
@@ -287,7 +289,7 @@ export type NormalizedEventBody =
         progressEmission?: ProgressEmission;
       }
     | { kind: "subagent_info"; turnId: string | null; toolUseId: string; model?: string; agentId?: string }
-    | { kind: "model_observed"; turnId: string | null; model: string }
+    | { kind: "model_observed"; turnId: string | null; model: string; priorGeneration?: true }
     | { kind: "compact_boundary"; trigger: "auto" | "manual"; preTokens?: number; priorGeneration?: true }
     | {
         kind: "tool_call_finished";
@@ -931,7 +933,7 @@ export type WebviewToHost =
   | { type: "todoSectionOrder"; order: TodoDetailSection[] }
   | { type: "todoImageRequest"; name: string }
   | { type: "todoOpenDoc"; itemId: string; docId: string }
-  | { type: "todoOpenConversation"; itemId: string; fresh: boolean; brief?: string }
+  | { type: "todoOpenConversation"; itemId: string; fresh: boolean }
   | { type: "todoAskSourceRequest"; sessionId: string; requestId: number }
   | { type: "todoAskDismiss"; itemId: string; message: string; place: TodoAskPlace }
   | { type: "todoChangesRequest"; requestId: number; ids: string[]; revisions?: number[][] }
@@ -1072,7 +1074,6 @@ export interface TodoDetailItem {
   readonly doneAt?: number;
   readonly conversations: readonly TodoConversationView[];
   readonly briefs: readonly TodoBriefView[];
-  readonly splitBrief?: string;
   readonly totals?: TodoTotalsView;
   readonly source?: TodoSourceView;
 }
@@ -1182,6 +1183,14 @@ export interface WorkAgentNode {
   revision: number;
   origin: WorkAgentOrigin;
   children: WorkAgentNode[];
+}
+
+export function flattenAgents(phases: readonly { agents: readonly WorkAgentNode[] }[], unlinkedAgents: readonly WorkAgentNode[] = []): WorkAgentNode[] {
+  const out: WorkAgentNode[] = [];
+  const visit = (node: WorkAgentNode): void => { out.push(node); node.children.forEach(visit); };
+  for (const phase of phases) phase.agents.forEach(visit);
+  unlinkedAgents.forEach(visit);
+  return out;
 }
 
 export type AgentInspectorSection = "overview" | "tools" | "messages" | "report";
@@ -2899,7 +2908,7 @@ const TAIL_MAIN_NAMES: Record<NonNullable<TimeBucketView["tail"]["main"]>, true>
 
 function isTimeBucketsPayload(v: unknown): boolean {
   if (typeof v !== "object" || v === null || Array.isArray(v)) return false;
-  const { mainByModel: byModel, blocks, agents, backgroundTasks, bars, main, intervals, tail } = v as Record<string, unknown>;
+  const { blocks, agents, backgroundTasks, bars, main, intervals, tail } = v as Record<string, unknown>;
   const checks: { [K in keyof TimeBucketView]-?: () => boolean } = {
     subagentOnlySpans: () => (v as TimeBucketView).subagentOnlySpans === undefined ||
       isArrayOf((v as TimeBucketView).subagentOnlySpans, span => Array.isArray(span) && span.length === 2 &&
@@ -2912,7 +2921,6 @@ function isTimeBucketsPayload(v: unknown): boolean {
     mainModelSpans: () => (v as TimeBucketView).mainModelSpans === undefined || isArrayOf((v as TimeBucketView).mainModelSpans, value =>
       typeof value === "object" && value !== null && isNumber((value as Record<string, unknown>).start) && isNumber((value as Record<string, unknown>).end) &&
       typeof (value as Record<string, unknown>).model === "string" && isOptionalString((value as Record<string, unknown>).effort)),
-    mainByModel: () => byModel === undefined || byModel === null || isMainTimeByModelView(byModel),
     blocks: () => blocks === undefined || isArrayOf(blocks, isTimeRequestBlockView),
     fidelity: () => true,
     inheritedBoundaryCount: () => true,
@@ -3111,32 +3119,6 @@ function isPlanBlockStep(v: unknown): boolean {
   );
 }
 
-function isMainModelTimeEntry(v: unknown): boolean {
-  if (typeof v !== "object" || v === null) return false;
-  const e = v as Record<string, unknown>;
-  return (
-    (e.kind === "model" || e.kind === "other" || e.kind === "unknown") &&
-    typeof e.label === "string" &&
-    isNullableString(e.model) &&
-    isNullableNumber(e.foldedModelCount) &&
-    isNumber(e.generateMs) &&
-    (e.generateMs as number) >= 0 &&
-    isNullableNumber(e.share) &&
-    isNullableNumber(e.percent) &&
-    (e.kind === "model") === (typeof e.model === "string") &&
-    (e.kind === "other") === (typeof e.foldedModelCount === "number")
-  );
-}
-
-function isMainTimeByModelView(v: unknown): boolean {
-  if (typeof v !== "object" || v === null) return false;
-  const b = v as Record<string, unknown>;
-  return (
-    isNumber(b.totalMs) && isNumber(b.generateMs) && isNumber(b.toolMs) &&
-    isNullableNumber(b.toolShare) && isNullableNumber(b.toolPercent) &&
-    isArrayOf(b.models, isMainModelTimeEntry)
-  );
-}
 const isValueSource = (v: unknown): boolean => v === null || v === "measured" || v === "requested";
 
 function isRoleRunView(v: unknown): boolean {
@@ -3700,8 +3682,7 @@ export function isWebviewToHost(v: unknown): v is WebviewToHost {
   }
   if (t === "todoOpenConversation") {
     const m = v as Record<string, unknown>;
-    return hasOnlyKeys(m, ["type", "itemId", "fresh", "brief"]) && isTodoId(m.itemId) && typeof m.fresh === "boolean"
-      && (m.brief === undefined || (m.fresh === true && typeof m.brief === "string" && m.brief.trim().length > 0 && m.brief.length <= TODO_BRIEF_MAX));
+    return hasOnlyKeys(m, ["type", "itemId", "fresh"]) && isTodoId(m.itemId) && typeof m.fresh === "boolean";
   }
   if (t === "todoAskSourceRequest") {
     const m = v as Record<string, unknown>;
@@ -4661,11 +4642,11 @@ function isTodoDetailItem(value: unknown): value is TodoDetailItem {
   const item = value as Record<string, unknown>;
   const memo = item.workMemo;
   return hasOnlyKeys(item, ["id", "parentId", "title", "state", "completion", "group", "due", "start", "priority", "userMemo", "workMemo", "docs", "createdAt", "updatedAt", "changes", "memoStaleSince",
-    "waiting", "repeat", "estimate", "tags", "by", "guesses", "startedAt", "doneAt", "conversations", "briefs", "splitBrief", "totals", "source"])
+    "waiting", "repeat", "estimate", "tags", "by", "guesses", "startedAt", "doneAt", "conversations", "briefs", "totals", "source"])
     && (item.source === undefined || (typeof item.source === "object" && item.source !== null && hasOnlyKeys(item.source as Record<string, unknown>, ["sessionId", "title"])
       && isTodoSessionId((item.source as Record<string, unknown>).sessionId) && isOptionalText((item.source as Record<string, unknown>).title, RENAME_TITLE_MAX)))
     && Array.isArray(item.docs) && item.docs.every(isTodoDocView)
-    && isOptionalText(item.waiting, TODO_WAITING_MAX) && isOptionalText(item.tags, TODO_TAGS_MAX) && isOptionalText(item.splitBrief, TODO_BRIEF_MAX)
+    && isOptionalText(item.waiting, TODO_WAITING_MAX) && isOptionalText(item.tags, TODO_TAGS_MAX)
     && (item.repeat === undefined || (typeof item.repeat === "string" && TODO_REPEAT_PATTERN.test(item.repeat)))
     && (item.estimate === undefined || (typeof item.estimate === "string" && TODO_ESTIMATE_PATTERN.test(item.estimate)))
     && (item.by === undefined || item.by === "claude")

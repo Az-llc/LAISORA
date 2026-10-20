@@ -32,6 +32,7 @@ import {
   type SemanticModelPayload,
   type TimeBucketsCoverage,
   type WorkModelPayload,
+  flattenAgents,
   projectWorkModel,
 } from "./protocol";
 import { deriveSemanticModel, type SemanticModel } from "./semantic-model";
@@ -292,12 +293,11 @@ export class SessionSemantic {
       const runningWork = [...liveIds].some(runnable);
       const context = planContextOf(block, time.lastAt ?? block.start, state.turnActive && !waiting ||
         this.host.streamOpen() && runningWork);
-      const agentLanes = (agent: (typeof model.phases)[number]["agents"][number]): { toolUseId: string; start: number | null }[] =>
-        [...agent.toolUseId === undefined ? [] : [{ toolUseId: agent.toolUseId, start: agent.startedAt ?? null }], ...agent.children.flatMap(agentLanes)];
       const tools = this.host.sessionFacts.analysisTools;
       // Work posts stay cheap (B5-PLAN-cheap), so only this conversation's external runs, the ones the panel shows
       // (src/orchestration-view.ts#orchestrationViewForConversation), get a placement.
-      const lanes = [...model.phases.flatMap(phase => phase.agents.flatMap(agentLanes)), ...(model.unlinkedAgents ?? []).flatMap(agentLanes),
+      const lanes = [...flattenAgents(model.phases, model.unlinkedAgents).flatMap(agent =>
+          agent.toolUseId === undefined ? [] : [{ toolUseId: agent.toolUseId, start: agent.startedAt ?? null }]),
         ...(model.planTools ?? []).map(tool => ({ toolUseId: tool.id, start: tool.startedAt })),
         ...externalOf(this.host.conversation).flatMap(run => run.toolUseId === undefined ? [] : [{ toolUseId: run.toolUseId, start: externalRunStart(run, tools) }])];
       const placementOf = derivePlanPlacements(time, tools, lanes);
@@ -438,6 +438,10 @@ export class SessionSemantic {
         });
         payload = { ...payload, l3: deriveL3Payload(analysisModel, analysisEvidence, divergenceReport, facts, learning),
           execLogFindings: deriveExecLogFindings(analysisEvidence.execLogMarks.marks) };
+        if (current !== undefined) {
+          const { firstPromptText: _priorGenerationPrompt, ...rest } = payload;
+          payload = analysisModel.firstPromptText === undefined ? rest : { ...rest, firstPromptText: analysisModel.firstPromptText };
+        }
       } catch (error) {
         derivationError = { stage: "metrics", detail: String(error) };
         output.appendLine(`[${this.host.title}] L3 derivation failed: ${derivationError.detail}`);

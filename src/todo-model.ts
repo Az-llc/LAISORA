@@ -388,7 +388,7 @@ export const TODO_REVERT_BLOCKS = ["not-target", "unrevertible", "reverted", "go
 export type TodoRevertBlock = typeof TODO_REVERT_BLOCKS[number];
 
 export const TODO_OPERATION_ERRORS = ["not-found", "deleted", "invalid-parent", "cycle", "empty-title", "title-too-long", "author-not-allowed", "group-exists", "invalid-name", "too-many",
-  "too-deep", "duplicate-title", "title-repeats", "title-state", "outside-linked", "user-item", "unknown-group", "near-group", "merge-done", "not-single-child", "unstable", "group-has-user-items", ...TODO_REVERT_BLOCKS] as const;
+  "too-deep", "duplicate-title", "title-state", "outside-linked", "user-item", "unknown-group", "near-group", "merge-done", "not-single-child", "unstable", "group-has-user-items", ...TODO_REVERT_BLOCKS] as const;
 export type TodoOperationError = typeof TODO_OPERATION_ERRORS[number];
 
 export interface TodoOperationDetail {
@@ -713,6 +713,7 @@ export function todoNameKey(name: string): string {
 }
 
 const TODO_NEAR_KEY_MIN = 2;
+const nearKeyLongEnough = (key: string) => [...key].length >= TODO_NEAR_KEY_MIN;
 
 export function todoNearGroups(groups: readonly Pick<TodoGroup, "name">[], name: string, except?: string): string[] {
   const key = todoNameKey(name);
@@ -722,7 +723,7 @@ export function todoNearGroups(groups: readonly Pick<TodoGroup, "name">[], name:
     const other = todoNameKey(group.name);
     if (other === key || nameWords(group.name).includes(key) || nameWords(name).includes(other)) return true;
     const [short, long] = other.length <= key.length ? [other, key] : [key, other];
-    return short.length >= TODO_NEAR_KEY_MIN && long.includes(short);
+    return nearKeyLongEnough(short) && long.includes(short);
   }).map(group => group.name);
 }
 
@@ -735,8 +736,16 @@ function claudeGroupProblem(groups: readonly TodoGroup[], name: string, newGroup
   return newGroup ? undefined : { ok: false, error: "unknown-group", detail: { word: name } };
 }
 
-const TODO_STATE_WORD = "(?:済み?|完了|WIP|TODO|DONE|進行中|未着手|対応中)";
-const TODO_TITLE_STATE = new RegExp(`^(?:\\[[ xX]\\]|[【\\[(（]${TODO_STATE_WORD}[】\\])）])|[【\\[(（]${TODO_STATE_WORD}[】\\])）]$|[\\s:：/・\\-](?:済み?|完了)$`, "u");
+export const TODO_STATE_CHECKBOXES = ["[ ]", "[x]", "[X]"] as const;
+export const TODO_STATE_WORDS = ["済", "済み", "完了", "WIP", "TODO", "DONE", "進行中", "未着手", "対応中"] as const;
+export const TODO_STATE_BRACKETS = [["【", "】"], ["[", "]"], ["(", ")"], ["（", "）"]] as const;
+export const TODO_STATE_TRAILING_WORDS = ["済", "済み", "完了"] as const;
+export const TODO_STATE_SEPARATORS = [":", "：", "/", "・", "-"] as const;
+const regexAlt = (words: readonly string[]) => `(?:${words.map(word => word.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")).join("|")})`;
+const regexClass = (chars: readonly string[]) => `[${chars.map(char => char.replace(/[\]\\^-]/g, "\\$&")).join("")}]`;
+const TODO_STATE_BRACKETED = `${regexClass(TODO_STATE_BRACKETS.map(([open]) => open))}${regexAlt(TODO_STATE_WORDS)}${regexClass(TODO_STATE_BRACKETS.map(([, close]) => close))}`;
+const TODO_TITLE_STATE = new RegExp(`^(?:${regexAlt(TODO_STATE_CHECKBOXES)}|${TODO_STATE_BRACKETED})|${TODO_STATE_BRACKETED}$|[\\s${regexClass(TODO_STATE_SEPARATORS).slice(1, -1)}]${regexAlt(TODO_STATE_TRAILING_WORDS)}$`, "u");
+export const TODO_TITLE_PARTICLES = ["の", "を", "に", "で", "が", "は", "と", "へ", "や", "も", "から", "まで"] as const;
 
 export interface TodoTitlePlace {
   readonly title: string;
@@ -750,16 +759,35 @@ export function todoTitleProblem(items: readonly TodoItem[], place: TodoTitlePla
   return todoPlaceProblem(items, place);
 }
 
-export function todoPlaceProblem(items: readonly TodoItem[], place: TodoTitlePlace): TodoOperationFailure | undefined {
-  const key = todoNameKey(place.title.trim());
+function titlePlaceHeads(items: readonly TodoItem[], place: TodoTitlePlace): { readonly group: string | null; readonly heads: readonly string[] } {
   const ancestors = place.parentId === null ? [] : todoItemPath(items, place.parentId);
   const group = place.parentId === null ? place.group ?? null : ancestors[0]?.group ?? null;
-  for (const prefix of [...(group !== null ? [group] : []), ...ancestors.map(entry => entry.title)]) {
-    const head = todoNameKey(prefix);
-    if (head.length >= TODO_NEAR_KEY_MIN && key.length > head.length && key.startsWith(head)) return { ok: false, error: "title-repeats", detail: { word: prefix } };
-  }
-  return duplicateProblem(items, { ...place, group });
+  return { group, heads: [...(group !== null ? [group] : []), ...ancestors.map(entry => entry.title)] };
 }
+
+export function todoPlaceProblem(items: readonly TodoItem[], place: TodoTitlePlace): TodoOperationFailure | undefined {
+  return duplicateProblem(items, { ...place, group: titlePlaceHeads(items, place).group });
+}
+
+export function todoTitleRepeat(items: readonly TodoItem[], place: TodoTitlePlace): string | undefined {
+  const title = place.title.trim();
+  return titlePlaceHeads(items, place).heads.find(head => todoTitleBeginsWith(title, head));
+}
+
+export function todoTitleBeginsWith(title: string, head: string): boolean {
+  const headKey = todoNameKey(head);
+  if (!nearKeyLongEnough(headKey) || !todoNameKey(title).startsWith(headKey)) return false;
+  let end = 0;
+  for (const char of title) {
+    end += char.length;
+    if (todoNameKey(title.slice(0, end)) !== headKey) continue;
+    const rest = title.slice(end);
+    if (rest === "" || /^[\s\p{P}\p{S}]/u.test(rest) || TODO_TITLE_PARTICLES.some(particle => rest.startsWith(particle))) return true;
+  }
+  return false;
+}
+
+export const todoTitlePlaceOf = (item: Pick<TodoItem, "id" | "title" | "parentId" | "group">): TodoTitlePlace => ({ title: item.title, parentId: item.parentId, group: item.group ?? null, self: item.id });
 
 function duplicateProblem(items: readonly TodoItem[], place: TodoTitlePlace): TodoOperationFailure | undefined {
   const key = todoNameKey(place.title);
@@ -774,7 +802,7 @@ function sameTitled(items: readonly TodoItem[], place: TodoTitlePlace, key: stri
 
 export function todoDoneTwin(items: readonly TodoItem[], id: string): TodoItem | undefined {
   const item = items.find(entry => entry.id === id);
-  return item ? sameTitled(items, { title: item.title, parentId: item.parentId, group: item.group ?? null, self: item.id }, todoNameKey(item.title)).find(entry => entry.state === "done") : undefined;
+  return item ? sameTitled(items, todoTitlePlaceOf(item), todoNameKey(item.title)).find(entry => entry.state === "done") : undefined;
 }
 
 export const TODO_CROWDED_SIBLINGS = 8;
@@ -783,10 +811,11 @@ export interface TodoTidySignals {
   readonly sameTitle: string[][];
   readonly singleChild: string[];
   readonly crowded: string[];
+  readonly repeatsPlace: string[];
 }
 
 export function todoTidySignals(items: readonly TodoItem[], roots: readonly TodoItem[], owner: string): TodoTidySignals {
-  const signals: TodoTidySignals = { sameTitle: [], singleChild: [], crowded: [] };
+  const signals: TodoTidySignals = { sameTitle: [], singleChild: [], crowded: [], repeatsPlace: [] };
   const look = (siblings: readonly TodoItem[], owner: string) => {
     const byKey = new Map<string, string[]>();
     for (const entry of siblings) byKey.set(todoNameKey(entry.title), [...byKey.get(todoNameKey(entry.title)) ?? [], entry.id]);
@@ -794,6 +823,7 @@ export function todoTidySignals(items: readonly TodoItem[], roots: readonly Todo
     if (siblings.length >= TODO_CROWDED_SIBLINGS) signals.crowded.push(owner);
     for (const entry of siblings) {
       const kids = liveChildren(items, entry.id);
+      if (todoTitleRepeat(items, todoTitlePlaceOf(entry)) !== undefined) signals.repeatsPlace.push(entry.id);
       if (kids.length === 1) signals.singleChild.push(entry.id);
       if (kids.length) look(kids, entry.id);
     }
@@ -2331,7 +2361,25 @@ export function parseTodoDocument(text: string, onDroppedDocs?: (count: number) 
     : undefined;
   const templates = Array.isArray(rawTemplates) ? rawTemplates.filter(isTodoTemplate) : undefined;
   const tidy = Array.isArray(rawTidy) ? rawTidy.filter(isTodoTidyRecord).map(record => ({ id: record.id, at: record.at, steps: record.steps, revision: record.revision })) : undefined;
-  return { ...rest, items, ...(groups ? { groups } : {}), ...(templates ? { templates } : {}), ...(tidy?.length ? { tidy } : {}), ...(unboundFolders.length ? { unboundFolders } : {}) } as TodoDocument;
+  const changeTimes = new Map<string, number[]>();
+  for (const change of value.changes as unknown[]) {
+    if (!isRecord(change) || typeof change.itemId !== "string" || !isStoredTime(change.at)) continue;
+    changeTimes.set(change.itemId, [...(changeTimes.get(change.itemId) ?? []), change.at]);
+  }
+  return { ...rest, items: items.map(item => withItemTimes(item, changeTimes.get(item.id) ?? [])), ...(groups ? { groups } : {}), ...(templates ? { templates } : {}), ...(tidy?.length ? { tidy } : {}), ...(unboundFolders.length ? { unboundFolders } : {}) } as TodoDocument;
+}
+
+export const TODO_TIME_UNKNOWN = 0;
+const isStoredTime = (value: unknown): value is number => typeof value === "number" && Number.isFinite(value) && value >= 0;
+
+function withItemTimes(item: TodoItem, changeTimes: readonly number[]): TodoItem {
+  if (isStoredTime(item.createdAt) && isStoredTime(item.updatedAt)) return item;
+  const memo = Object.values(item.workMemo).flatMap(section => [section?.at, ...(Array.isArray(section?.history) ? section.history.map(entry => entry?.at) : [])]);
+  const known = [item.createdAt, item.updatedAt, item.captured?.at, item.placement?.at, item.pinnedAt, item.startedAt, item.doneAt, item.deletedAt, ...memo,
+    ...(item.docs ?? []).map(doc => doc.at), ...(item.conversations ?? []).map(link => link.at), ...(item.starts ?? []).map(start => start.at), ...changeTimes].filter(isStoredTime);
+  const createdAt = isStoredTime(item.createdAt) ? item.createdAt : known.length ? Math.min(...known) : TODO_TIME_UNKNOWN;
+  const updatedAt = isStoredTime(item.updatedAt) ? item.updatedAt : Math.max(createdAt, ...known);
+  return { ...item, createdAt, updatedAt };
 }
 
 function isTodoStart(value: unknown): value is TodoStart {
@@ -2530,15 +2578,4 @@ export function todoBindableFolder(folder: string, scope: TodoFolderScope): bool
 
 export function todoFailureResultText(error: string, message: string, word?: string): string {
   return JSON.stringify({ error, ...(word !== undefined ? { word } : {}), message });
-}
-
-export function todoFailureOf(text: string | undefined): { readonly error: string; readonly word?: string } | undefined {
-  const trimmed = text?.trimStart() ?? "";
-  if (!trimmed.startsWith("{\"error\":")) return undefined;
-  try {
-    const value = JSON.parse(trimmed) as unknown;
-    return isRecord(value) && typeof value.error === "string" ? { error: value.error, ...(typeof value.word === "string" ? { word: value.word } : {}) } : undefined;
-  } catch {
-    return undefined;
-  }
 }

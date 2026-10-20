@@ -1,6 +1,6 @@
 {
   "config.laisora.claude.initialModel.description": "Model for new and resumed conversations (a model chosen in a tab wins). Empty means Off (Claude's normal settings). Running conversations are unchanged.",
-  "config.laisora.learning.enabled.description": "Deliver learned rules, provide the learning record tool, and record deliveries and model changes in laisora-learning, with or without orchestration. Applies at the next conversation process start. Disabled by default; when disabled, learning records are not read or written.",
+  "config.laisora.learning.enabled.description": "Deliver learned rules, provide the learning record tool, and record deliveries and model changes in laisora-learning, with or without orchestration. Applies at the next conversation process start. Enabled by default; when disabled, learning records are not read or written.",
   "config.laisora.memory.blockProjectType.description": "Stops writes of project-type memory (the state of ongoing work). When off, it can be written, but finished work or changed policies can remain in memory, and Claude may act on them as if they were still correct. Applies from the next conversation you start or resume.",
   "extension.description": "Focus on conversations with AI agents, review their work, and turn work logs into improvements inside VS Code.",
   "capabilities.untrustedWorkspaces": "Trust this workspace before running Claude Code.",

@@ -1,6 +1,5 @@
 import * as l10n from "@vscode/l10n";
 import type { HostToWebview, TodoListItem, WebviewToHost } from "../protocol";
-import { TodoBriefSheet } from "./todo-brief";
 import { TodoDetail, type TodoGroupPlaces } from "./todo-detail";
 import { isTextEntryTarget, TODO_NOTICE_MS, TodoEditClient } from "./todo-edit";
 
@@ -22,7 +21,6 @@ export type TodoAppMessage = Extract<HostToWebview, { type: "todoEditResult" | "
 export class TodoApp {
   readonly edits: TodoEditClient;
   readonly detail: TodoDetail;
-  readonly brief: TodoBriefSheet;
   extras: TodoAppExtras = { waiting: () => false, groups: () => [], groupPlaces: () => ({ folders: [], aliases: [] }) };
   private readonly listeners = new Set<(notice: string | null) => void>();
   private noticeTimer: ReturnType<typeof setTimeout> | undefined;
@@ -42,9 +40,8 @@ export class TodoApp {
       groups: () => this.extras.groups(),
       groupPlaces: group => this.extras.groupPlaces(group),
     });
-    this.brief = new TodoBriefSheet(post);
     this.listeners.add(notice => this.detail.setNotice(notice));
-    mount.append(this.detail.root, this.brief.root);
+    mount.append(this.detail.root);
     document.addEventListener("keydown", (e) => this.onKeydown(e));
   }
 
@@ -64,7 +61,7 @@ export class TodoApp {
       return;
     }
     this.detail.hide();
-    this.brief.open(id);
+    this.openConversation(id, false);
   }
 
   open(id: string): boolean {
@@ -75,10 +72,7 @@ export class TodoApp {
 
   receive(message: TodoAppMessage): void {
     if (message.type === "todoEditResult") this.edits.receive(message);
-    else if (message.type === "todoDetail") {
-      if (this.brief.waitingFor === message.id) this.brief.apply(message);
-      this.detail.apply(message);
-    }
+    else if (message.type === "todoDetail") this.detail.apply(message);
     else if (message.type === "todoWork") this.detail.applyWork(message);
     else this.detail.applyImage(message);
   }

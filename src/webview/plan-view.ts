@@ -1,5 +1,5 @@
 import { toolIntentLabel } from "./status-line";
-import type { OrchestrationView, PlanContext, WorkAgentNode, WorkModelPayload } from "../protocol";
+import { flattenAgents, type OrchestrationView, type PlanContext, type WorkAgentNode, type WorkModelPayload } from "../protocol";
 import { externalTokens, type PlanTokenTotal } from "../plan-usage";
 import type { TaskStatus, WorkStatus } from "../work-model";
 import { planItemNumber, planSpansMs, planStepKey, transitionPlanStep, type PlanSpan } from "../plan-steps";
@@ -116,10 +116,8 @@ export function derivePlanView(model: WorkModelPayload | undefined, orchestratio
   const shownEarlier = new Set((context?.blockId === latest?.blockId ? model?.earlierPlans ?? [] : []).flatMap(earlier =>
     (earlier.placements ?? []).filter(placement => earlier.steps?.some(step => step.key === placement.stepKey && planStepSettled(step)))
       .map(placement => placement.toolUseId)));
-  const nodes = new Map<string, WorkAgentNode>();
-  const index = (agent: WorkAgentNode): void => { nodes.set(agent.agentId, agent); agent.children.forEach(index); };
-  for (const phase of model?.phases ?? []) phase.agents.forEach(index);
-  (model?.unlinkedAgents ?? []).forEach(index);
+  const agents = flattenAgents(model?.phases ?? [], model?.unlinkedAgents);
+  const nodes = new Map(agents.map(agent => [agent.agentId, agent]));
   const segmentEnd = (agentId: string, position: number): { status: WorkStatus; endedAt?: number } => {
     const next = resumes.get(agentId)![position + 1];
     const node = nodes.get(agentId);
@@ -189,10 +187,8 @@ export function derivePlanView(model: WorkModelPayload | undefined, orchestratio
         (placed ?? view.now).push(segment);
       });
     }
-    for (const child of agent.children) visit(child);
   };
-  for (const phase of model?.phases ?? []) for (const agent of phase.agents) visit(agent);
-  for (const agent of model?.unlinkedAgents ?? []) visit(agent);
+  agents.forEach(visit);
   for (const agent of orchestration?.agents ?? []) {
     const tokens = externalTokens(agent.usage);
     attach({ id: `agent:${agent.agentId}`, agent: agent.role ?? agent.agentType ?? "Claude", title: agent.model ?? "",

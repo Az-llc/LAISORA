@@ -8,6 +8,7 @@ import type { Session } from "./extension";
 import { output } from "./host-context";
 import { SESSION_ID_RE, type ImageAttachment, type SessionImageRef } from "./protocol";
 import { formatCustomTitleRecord } from "./session-display-title";
+import { sessionRecordId } from "./session-record";
 import { extractHumanUserPrompt } from "./session-transcript";
 
 export function isInSessionStore(filePath: string): boolean {
@@ -35,7 +36,7 @@ export function inspectorSessionFile(session: Session): string | null {
 }
 
 export function sessionIdForOutput(session: Session): string {
-  return session.resumeSessionId ?? session.auth?.sessionId ?? "(未取得)";
+  return sessionRecordId(session) ?? "(未取得)";
 }
 
 export function sessionTranscriptRef(session: Session): { sessionId: string; file: string } | null {
