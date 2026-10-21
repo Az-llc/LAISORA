@@ -89,14 +89,13 @@ export function projectPlanUsage(state: PlanUsageAccumulator | undefined, blocks
 
 export interface MainTokenTotal extends PlanTokenTotal { messageCount: number; unmeasuredMessageCount: number; partial: boolean }
 
-export function summarizeMainTokens(state: PlanUsageAccumulator | undefined, generationBoundaryAt?: number): MainTokenTotal | null {
+export function summarizeMainTokens(state: PlanUsageAccumulator | undefined): MainTokenTotal | null {
   let tokens = 0;
   let cacheRead = 0;
   let outputTokens: number | undefined;
   let messageCount = 0;
   let unmeasuredMessageCount = 0;
-  for (const { at, usage } of state?.values() ?? []) {
-    if (generationBoundaryAt !== undefined && at < generationBoundaryAt) continue;
+  for (const { usage } of state?.values() ?? []) {
     if (usage.inputTokens === undefined && usage.cacheCreationInputTokens === undefined && usage.outputTokens === undefined) {
       unmeasuredMessageCount++;
       continue;

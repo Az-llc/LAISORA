@@ -1,4 +1,5 @@
-import { ASK_FENCE_INFO } from "./markdown-ast";
+import { AskAnswerTitles, askAnswerBody, askAnswerChoices, askAnswerParts, askOptionLetter, otherReplyAsksBack } from "./ask-parser";
+import { ASK_FENCE_INFO, askBlocksIn } from "./markdown-ast";
 
 export const TODO_STATES = ["todo", "doing", "done"] as const;
 export type TodoState = typeof TODO_STATES[number];
@@ -135,9 +136,21 @@ export interface TodoItem {
   readonly pendingStart?: TodoStartClaim;
   readonly dismissedAsks?: readonly string[];
   readonly asksClosedInTodo?: readonly string[];
+  readonly decisionLog?: readonly TodoDecision[];
   readonly createdAt: number;
   readonly updatedAt: number;
   readonly deletedAt?: number;
+}
+
+export interface TodoDecision {
+  readonly at: number;
+  readonly from: "card" | "memo";
+  readonly title?: string;
+  readonly label?: string;
+  readonly text?: string;
+  readonly sessionId?: string;
+  readonly message?: string;
+  readonly carriedFrom?: string;
 }
 
 export const TODO_CAPTURE_VIA = ["user", "claude", "import"] as const;
@@ -301,6 +314,8 @@ export interface TodoDocument {
   readonly templates?: readonly TodoTemplate[];
   readonly tidy?: readonly TodoTidyRecord[];
   readonly unboundFolders?: readonly string[];
+  readonly decisionsMigrated?: true;
+  readonly [TODO_HELD]?: TodoHeld;
 }
 
 export type TodoGuessReasons = { dueReason?: string; priorityReason?: string };
@@ -367,13 +382,17 @@ export type TodoOperation =
   | { kind: "relinkConversation"; from: string; to: string }
   | { kind: "noteConversationWork"; sessionId: string; at: number }
   | { kind: "dismissAsk"; id: string; message: string; place: TodoAskPlace }
+  | { kind: "recordDecisions"; sessionId: string; decisions: readonly TodoDecision[] }
+  | { kind: "migrateDecisions" }
   | { kind: "revert"; mode: "undo"; revision: number }
   | { kind: "revert"; mode: "claude"; changeId: string }
   | { kind: "revert"; mode: "claude"; changeIds: readonly string[] }
   | { kind: "revert"; mode: "claude"; revisions: readonly number[] };
 
+type TodoDecisionOperation = Extract<TodoOperation, { kind: "recordDecisions" | "migrateDecisions" }>;
+
 type TodoStepOperation =
-  | Exclude<TodoOperation, { kind: "revert" } | { kind: "acknowledge" } | TodoTidyOperation>
+  | Exclude<TodoOperation, { kind: "revert" } | { kind: "acknowledge" } | TodoDecisionOperation | TodoTidyOperation>
   | { kind: "tidyStep"; step: TodoTidyStep }
   | { kind: "setGroupBindings"; group: string; folders: readonly TodoGroupFolder[]; aliases: readonly TodoGroupAlias[] }
   | { kind: "setExactState"; id: string; state: TodoState; completion?: TodoCompletion; startedAt?: number | null }
@@ -468,8 +487,11 @@ function withNewGroup(groups: readonly TodoGroup[], name: string, log: ChangeLog
 }
 
 function isGroupFolders(value: unknown): value is TodoGroupFolder[] {
-  return Array.isArray(value) && value.every(entry => isRecord(entry) && typeof entry.path === "string" && entry.path.length > 0 && entry.path.length <= TODO_DOC_TARGET_MAX
-    && (entry.change === undefined || typeof entry.change === "string"));
+  return Array.isArray(value) && value.every(isTodoGroupFolder);
+}
+
+function isGroupBindings(value: unknown): value is Record<string, unknown> & Pick<TodoBindings, "folders" | "aliases"> {
+  return isRecord(value) && isGroupFolders(value.folders) && Array.isArray(value.aliases) && value.aliases.every(isTodoGroupAlias);
 }
 
 function isGroupRecord(value: unknown): value is TodoGroupRecord {
@@ -478,7 +500,7 @@ function isGroupRecord(value: unknown): value is TodoGroupRecord {
 }
 
 function isTodoTemplate(value: unknown): value is TodoTemplate {
-  return isRecord(value) && typeof value.id === "string" && value.id.length > 0 && typeof value.name === "string" && typeof value.at === "number" && isTemplateNode(value.root, 0);
+  return isRecord(value) && isTodoId(value.id) && typeof value.name === "string" && typeof value.at === "number" && isTemplateNode(value.root, 0);
 }
 
 function isTemplateNode(value: unknown, depth: number): value is TodoTemplateNode {
@@ -617,7 +639,6 @@ function renameGroupOnItems(items: TodoItem[], from: string, to: string, now: nu
     return { ...entry, group: to, updatedAt: now };
   });
 }
-const validGroupName = (name: string) => name.length > 0 && name.length <= TODO_GROUP_MAX;
 
 function templateTree(items: readonly TodoItem[], id: string, budget: { left: number }): TodoTemplateNode {
   budget.left--;
@@ -944,11 +965,6 @@ function sameBindings(a: Pick<TodoBindings, "folders" | "aliases">, b: Pick<Todo
     && a.aliases.length === b.aliases.length && a.aliases.every((alias, index) => alias.words === b.aliases[index].words && alias.parentId === b.aliases[index].parentId);
 }
 
-function isGroupAliases(value: unknown): value is TodoGroupAlias[] {
-  return Array.isArray(value) && value.every(entry => isRecord(entry) && typeof entry.words === "string" && entry.words.length > 0 && entry.words.length <= TODO_GROUP_MAX
-    && (entry.parentId === undefined || typeof entry.parentId === "string") && (entry.change === undefined || typeof entry.change === "string"));
-}
-
 function withFolders(group: TodoGroup, folders: readonly TodoGroupFolder[]): TodoGroup {
   const { folders: _old, ...rest } = group;
   return folders.length ? { ...rest, folders } : rest;
@@ -1005,7 +1021,7 @@ function forgetLearned(groups: readonly TodoGroup[], unbound: readonly string[],
       if (blocked.length !== was.length || blocked.some((path, index) => path !== was[index])) log(change.itemId, "unboundFolders", was, blocked, { cascade: true });
       continue;
     }
-    if (change.field !== "groupBindings" || typeof before?.group !== "string" || !isGroupFolders(before.folders) || !isGroupAliases(before.aliases) || !isGroupFolders(after?.folders) || !isGroupAliases(after?.aliases)) continue;
+    if (change.field !== "groupBindings" || typeof before?.group !== "string" || !isGroupBindings(before) || !isGroupBindings(after)) continue;
     const index = next.findIndex(entry => entry.name === before.group);
     if (index < 0) continue;
     const group = next[index];
@@ -1151,7 +1167,7 @@ function step(items: TodoItem[], operation: TodoStepOperation, author: TodoAutho
     }
     case "groupCreate": {
       const name = groupName(operation.name);
-      if (!validGroupName(name)) return { ok: false, error: "invalid-name" };
+      if (!isTodoGroupName(name)) return { ok: false, error: "invalid-name" };
       if (meta.groups.some(group => group.name === name)) return { ok: false, error: "group-exists" };
       const near = author === "claude" ? todoNearGroups(meta.groups, name) : [];
       if (near.length) return { ok: false, error: "near-group", detail: { near, word: name } };
@@ -1214,7 +1230,7 @@ function step(items: TodoItem[], operation: TodoStepOperation, author: TodoAutho
         return setGroups(groups);
       }
       const to = groupName(operation.to);
-      if (!validGroupName(to)) return { ok: false, error: "invalid-name" };
+      if (!isTodoGroupName(to)) return { ok: false, error: "invalid-name" };
       if (to === operation.name) return unchanged("");
       if (meta.groups.some(group => group.name === to)) return { ok: false, error: "group-exists" };
       const near = author === "claude" ? todoNearGroups(meta.groups, to, operation.name) : [];
@@ -1438,7 +1454,8 @@ function step(items: TodoItem[], operation: TodoStepOperation, author: TodoAutho
         return kept !== undefined && placed.parentId === null ? { ...placed, group: kept } : placed;
       });
       if (parentId !== item.parentId) log(item.id, "position", { parentId: item.parentId }, { parentId });
-      return { ok: true, items: next, itemId: item.id, reevaluate: [parentId] };
+      const restored = new Set([...ids].filter(id => items.find(entry => entry.id === id)?.deletedAt === item.deletedAt));
+      return { ok: true, items: next.map(entry => withoutCarriedDecisions(entry, restored)), itemId: item.id, reevaluate: [parentId] };
     }
     case "linkConversation": {
       const item = find(operation.id);
@@ -1590,6 +1607,8 @@ function step(items: TodoItem[], operation: TodoStepOperation, author: TodoAutho
         const failed = take(sub(current, { kind: "writeWorkMemo", id: into.id, section, text: carried(current.find(entry => entry.id === into.id)!.workMemo[section]?.text ?? "", text) }));
         if (failed) return failed;
       }
+      const decisionLog = withCarriedDecisions(current.find(entry => entry.id === into.id)!.decisionLog, source.decisionLog ?? [], source.id);
+      if (decisionLog) current = current.map(entry => entry.id === into.id ? { ...entry, decisionLog } : entry);
       if (source.userMemo.trim()) {
         const before = current.find(entry => entry.id === into.id)!.userMemo;
         const after = carried(before, source.userMemo);
@@ -1669,13 +1688,356 @@ function isTodoTidyRecord(value: unknown): value is TodoTidyRecord {
     && Array.isArray(value.steps) && value.steps.every(isTodoTidyStep) && Number.isSafeInteger(value.revision);
 }
 
+export const TODO_ID_MAX = 64;
+export const TODO_MEMO_TEXT_MAX = 100_000;
+export const isTodoTime = (value: unknown): value is number => typeof value === "number" && Number.isFinite(value) && value >= 0;
+export const isTodoId = (value: unknown): value is string => typeof value === "string" && value.length > 0 && value.length <= TODO_ID_MAX;
+export const isTodoSessionId = (value: unknown): value is string => typeof value === "string" && /^[0-9A-Za-z_-]{1,100}$/.test(value);
+export const isTodoDate = (value: unknown): value is string => typeof value === "string" && TODO_DUE_PATTERN.test(value);
+export const isTodoGroupName = (value: unknown): value is string => typeof value === "string" && value.trim().length > 0 && value.length <= TODO_GROUP_MAX;
+const isTextUpTo = (max: number) => (value: unknown): value is string => typeof value === "string" && value.length <= max;
+export const isTodoFolderPath = (value: unknown): value is string => typeof value === "string" && value.length > 0 && value.length <= TODO_DOC_TARGET_MAX;
+export const isTodoDocLabel = isTextUpTo(TODO_DOC_LABEL_MAX);
+export const isTodoImageName = (value: unknown): value is string => typeof value === "string" && TODO_IMAGE_FILE.test(value);
+export const isTodoMemoText = (value: unknown): value is string => typeof value === "string";
+export const isTodoGuessReason = isTextUpTo(TODO_GUESS_REASON_MAX);
+export const isTodoBriefText = isTextUpTo(TODO_BRIEF_MAX);
+const isMemoVersionNumber = (value: unknown): value is number => typeof value === "number" && Number.isFinite(value);
+
+export function isTodoCaptured(value: unknown): value is TodoCaptured {
+  return isRecord(value) && typeof value.text === "string" && isTodoTime(value.at) && (TODO_CAPTURE_VIA as readonly unknown[]).includes(value.via);
+}
+
+export function isTodoDecision(value: unknown): value is TodoDecision {
+  if (!isRecord(value) || !isTodoTime(value.at) || (value.carriedFrom !== undefined && !isTodoId(value.carriedFrom))) return false;
+  const text = (entry: unknown) => entry === undefined || typeof entry === "string";
+  if (value.from === "memo") return typeof value.text === "string";
+  return value.from === "card" && typeof value.title === "string" && value.title.length > 0 && isTodoSessionId(value.sessionId)
+    && typeof value.message === "string" && value.message.length > 0 && text(value.label) && text(value.text);
+}
+
+export function isTodoMemoEntry(value: unknown): value is Pick<TodoMemoVersion, "text" | "at"> {
+  return isRecord(value) && isTodoMemoText(value.text) && isTodoTime(value.at);
+}
+
+function isTodoMemoVersion(value: unknown): value is TodoMemoVersion {
+  return isTodoMemoEntry(value) && isMemoVersionNumber((value as Record<string, unknown>).version);
+}
+
+function isTodoGuesses(value: unknown): value is TodoGuesses {
+  const guess = (entry: unknown) => entry === undefined || (isRecord(entry) && typeof entry.value === "string" && isTodoGuessReason(entry.reason));
+  return isRecord(value) && guess(value.due) && guess(value.priority);
+}
+
+function isTodoStart(value: unknown): value is TodoStart {
+  const text = (entry: unknown) => entry === undefined || typeof entry === "string";
+  return isRecord(value) && isTodoTime(value.at) && (TODO_START_KINDS as readonly unknown[]).includes(value.kind) && isTodoBriefText(value.brief)
+    && text(value.sessionId) && text(value.tab) && (value.current === undefined || isTodoMemoText(value.current)) && (value.next === undefined || isTodoMemoText(value.next))
+    && (value.stale === undefined || value.stale === true);
+}
+
+function isTodoPlace(value: unknown): value is TodoPlace {
+  return isRecord(value) && (value.group === null || isTodoGroupName(value.group)) && Array.isArray(value.steps)
+    && value.steps.every(entry => isRecord(entry) && typeof entry.number === "string" && typeof entry.title === "string");
+}
+
+type TodoFieldShape = (value: unknown, item?: Readonly<Record<string, unknown>>) => boolean;
+type TodoListShape = TodoFieldShape & { readonly entry: TodoFieldShape };
+const eachOf = (entry: TodoFieldShape): TodoListShape => Object.assign((value: unknown, item?: Readonly<Record<string, unknown>>) => Array.isArray(value) && value.every(each => entry(each, item)), { entry });
+
+const TODO_ITEM_SHAPE_TABLE = {
+  id: isTodoId,
+  parentId: (value: unknown) => value === null || isTodoId(value),
+  title: (value: unknown) => typeof value === "string",
+  state: (value: unknown) => (TODO_STATES as readonly unknown[]).includes(value),
+  userMemo: (value: unknown) => typeof value === "string",
+  workMemo: (value: unknown) => isRecord(value) && !Array.isArray(value),
+  completion: (value: unknown) => value === "auto" || value === "manual",
+  group: isTodoGroupName,
+  due: isTodoDate,
+  start: isTodoDate,
+  priority: (value: unknown) => (TODO_PRIORITIES as readonly unknown[]).includes(value),
+  waiting: isTextUpTo(TODO_WAITING_MAX),
+  repeat: (value: unknown) => typeof value === "string" && TODO_REPEAT_PATTERN.test(value),
+  estimate: (value: unknown) => typeof value === "string" && TODO_ESTIMATE_PATTERN.test(value),
+  tags: isTextUpTo(TODO_TAGS_MAX),
+  by: (value: unknown) => value === "claude",
+  guesses: isTodoGuesses,
+  captured: isTodoCaptured,
+  startedAt: isTodoTime,
+  doneAt: isTodoTime,
+  deletedAt: isTodoTime,
+  pinnedAt: isTodoTime,
+  source: (value: unknown) => isRecord(value) && isTodoSessionId(value.sessionId),
+  placement: (value: unknown) => isRecord(value) && (TODO_PLACEMENT_BASES as readonly unknown[]).includes(value.basis) && isTodoTime(value.at) && (value.from === undefined || isTodoPlace(value.from)),
+  placedFrom: isTodoFolderPath,
+  caseWords: isTodoGroupName,
+  pendingStart: isTodoStartClaim,
+  docs: eachOf(isTodoDoc),
+  conversations: eachOf(isTodoConversationLink),
+  starts: eachOf(isTodoStart),
+  dismissedAsks: eachOf(isTodoAskIdentity),
+  asksClosedInTodo: eachOf((value, item) => typeof value === "string" && Array.isArray(item?.dismissedAsks) && item.dismissedAsks.includes(value)),
+  decisionLog: eachOf(isTodoDecision),
+} satisfies Partial<Record<keyof TodoItem, TodoFieldShape>>;
+export const TODO_ITEM_SHAPES: { readonly [Field in keyof typeof TODO_ITEM_SHAPE_TABLE]: TodoFieldShape } = TODO_ITEM_SHAPE_TABLE;
+const TODO_ITEM_REQUIRED = ["id", "parentId", "title", "state", "userMemo", "workMemo"] as const satisfies readonly (keyof typeof TODO_ITEM_SHAPES)[];
+const TODO_ROOT_FIELDS = ["group"] as const satisfies readonly (keyof typeof TODO_ITEM_SHAPES)[];
+
+export function todoItemFieldValid(item: Readonly<Record<string, unknown>>, field: keyof typeof TODO_ITEM_SHAPES): boolean {
+  return (item[field] === undefined && !(TODO_ITEM_REQUIRED as readonly string[]).includes(field)) || TODO_ITEM_SHAPES[field](item[field], item);
+}
+
+function isReadableTodoItem(value: unknown): value is Record<string, unknown> {
+  return isRecord(value) && typeof value.id === "string" && (value.parentId === null || typeof value.parentId === "string")
+    && TODO_ITEM_SHAPES.title(value.title) && TODO_ITEM_SHAPES.state(value.state) && TODO_ITEM_SHAPES.userMemo(value.userMemo) && isRecord(value.workMemo);
+}
+
+export function isTodoGroupAlias(value: unknown): value is TodoGroupAlias {
+  return isRecord(value) && isTodoGroupName(value.words)
+    && (value.parentId === undefined || isTodoId(value.parentId)) && (value.change === undefined || typeof value.change === "string")
+    && (value.basis === undefined || (TODO_PLACEMENT_BASES as readonly unknown[]).includes(value.basis));
+}
+
+function isTodoGroupFolder(value: unknown): value is TodoGroupFolder {
+  return isRecord(value) && isTodoFolderPath(value.path) && (value.change === undefined || typeof value.change === "string");
+}
+
+export const TODO_CHANGE_FIELDS: readonly string[] = ["item", ...TODO_TEXT_FIELDS, "state", "position", "deletedAt", "docs", "docLabel", "groups", "groupBindings", "unboundFolders", "templates", ...WORK_MEMO_SECTIONS.map(section => `workMemo.${section}`)];
+
+export function isTodoChangeRecord(value: unknown): value is TodoChange {
+  return isRecord(value) && isTodoId(value.id) && isTodoTime(value.at) && (value.author === "human" || value.author === "claude")
+    && (value.itemId === "" || isTodoId(value.itemId)) && typeof value.field === "string" && TODO_CHANGE_FIELDS.includes(value.field)
+    && (value.cascade === undefined || value.cascade === true) && (value.acknowledged === undefined || value.acknowledged === true)
+    && (value.basis === undefined || (TODO_PLACEMENT_BASES as readonly unknown[]).includes(value.basis));
+}
+
+export const TODO_HELD: unique symbol = Symbol("todoHeld");
+export interface TodoHeldEntry { readonly index: number; readonly value: unknown; readonly after?: number }
+export type TodoHeldList = { readonly whole: unknown } | { readonly entries: readonly TodoHeldEntry[] };
+type TodoHeldMemo = { readonly section: unknown } | { readonly at?: unknown; readonly version?: unknown; readonly history?: TodoHeldList };
+export interface TodoHeldItem {
+  readonly fields: Readonly<Record<string, unknown>>;
+  readonly shown: Readonly<Record<string, unknown>>;
+  readonly lists: Readonly<Record<string, TodoHeldList>>;
+  readonly memo: Readonly<Partial<Record<WorkMemoSection, TodoHeldMemo>>>;
+}
+export interface TodoHeldGroup { readonly color?: unknown; readonly folders?: TodoHeldList; readonly aliases?: TodoHeldList }
+const TODO_HELD_DOCUMENT_LISTS = ["items", "changes", "groups", "templates", "tidy", "unboundFolders"] as const;
+export interface TodoHeld {
+  readonly perItem: ReadonlyMap<string, TodoHeldItem>;
+  readonly perGroup: ReadonlyMap<string, TodoHeldGroup>;
+  readonly lists: Readonly<Partial<Record<typeof TODO_HELD_DOCUMENT_LISTS[number], TodoHeldList>>>;
+}
+type TodoHeldItemDraft = { fields: Record<string, unknown>; shown: Record<string, unknown>; lists: Record<string, TodoHeldList>; memo: Partial<Record<WorkMemoSection, TodoHeldMemo>> };
+
+function splitHeld(value: unknown, valid: (entry: unknown, kept: readonly unknown[]) => boolean): { readonly kept?: unknown[]; readonly held?: TodoHeldList } {
+  if (value === undefined) return {};
+  if (!Array.isArray(value)) return { held: { whole: value } };
+  const kept: unknown[] = [], entries: TodoHeldEntry[] = [];
+  for (const entry of value) if (valid(entry, kept)) kept.push(entry); else entries.push({ index: kept.length, value: entry });
+  return { kept, ...(entries.length ? { held: { entries } } : {}) };
+}
+
+function withHeld(current: readonly unknown[] | undefined, held: TodoHeldList | undefined): unknown {
+  if (!held) return current;
+  if ("whole" in held) return current === undefined || current.length === 0 ? held.whole : current;
+  const list = current ?? [];
+  const out: unknown[] = [];
+  let next = 0;
+  for (let index = 0; index <= list.length; index++) {
+    while (next < held.entries.length && (index === list.length || held.entries[next].index <= index)) out.push(held.entries[next++].value);
+    if (index < list.length) out.push(list[index]);
+  }
+  return out;
+}
+
+const heldSize = (held: TodoHeldList | undefined) => held === undefined ? 0 : "whole" in held ? 1 : held.entries.length;
+
+function keptHeldEntries(held: TodoHeldList | undefined, keep: (value: unknown) => boolean): TodoHeldList | undefined {
+  if (!held || "whole" in held) return held;
+  const entries = held.entries.filter(entry => keep(entry.value));
+  return entries.length ? { entries } : undefined;
+}
+
+function renamedHeldEntries(held: TodoHeldList | undefined, from: string, to: string): TodoHeldList | undefined {
+  if (!held || "whole" in held) return held;
+  return { entries: held.entries.map(entry => isRecord(entry.value) && entry.value.name === from ? { ...entry, value: { ...entry.value, name: to } } : entry) };
+}
+
+const atListEnd = (held: TodoHeldList | undefined): TodoHeldList | undefined => held && "entries" in held ? { entries: held.entries.map(entry => ({ ...entry, index: Infinity })) } : held;
+
+function splitMemoHistory(value: unknown): { readonly kept: unknown[]; readonly held?: TodoHeldList } {
+  if (!Array.isArray(value)) return { kept: [], held: { whole: value } };
+  const kept: TodoMemoVersion[] = [], entries: TodoHeldEntry[] = [];
+  for (const entry of value) {
+    if (isTodoMemoVersion(entry)) kept.push(entry);
+    else entries.push({ index: kept.length, value: entry, ...(kept.length ? { after: kept[kept.length - 1].version } : {}) });
+  }
+  return { kept, ...(entries.length ? { held: { entries } } : {}) };
+}
+
+function memoHistoryWithHeld(current: readonly TodoMemoVersion[], held: TodoHeldList): unknown {
+  if ("whole" in held) return withHeld(current, held);
+  const placed = new Set<TodoHeldEntry>();
+  const out: unknown[] = held.entries.filter(entry => entry.after === undefined).map(entry => entry.value);
+  for (const version of current) {
+    out.push(version);
+    for (const entry of held.entries) if (entry.after === version.version && !placed.has(entry)) { placed.add(entry); out.push(entry.value); }
+  }
+  return out.slice(-TODO_MEMO_HISTORY_LIMIT);
+}
+
+const TODO_SHOWN_FOR_HELD: Readonly<Record<string, (raw: unknown, timeOf: (raw: unknown) => number) => unknown>> = { parentId: () => null, deletedAt: (raw, timeOf) => timeOf(raw) };
+
+const shownGroupColor = (raw: unknown) => 1 + [...JSON.stringify(raw) ?? ""].reduce((sum, char) => sum + char.charCodeAt(0), 0) % TODO_GROUP_COLOR_COUNT;
+
+function heldItemSize(held: TodoHeldItemDraft): number {
+  const memo = Object.values(held.memo).reduce((sum, entry) => sum + ("section" in entry ? 1 : Number("at" in entry) + Number("version" in entry) + heldSize(entry.history)), 0);
+  return Object.keys(held.fields).length + Object.values(held.lists).reduce((sum, list) => sum + heldSize(list), 0) + memo;
+}
+
+function holdInvalid(item: Record<string, unknown>, held: TodoHeldItemDraft, timeOf: (raw: unknown) => number): Record<string, unknown> {
+  const draft: Record<string, unknown> = { ...item };
+  for (const [field, shape] of Object.entries(TODO_ITEM_SHAPES) as [string, TodoFieldShape & Partial<TodoListShape>][]) {
+    if (draft[field] === undefined) continue;
+    const entry = shape.entry;
+    if (entry) {
+      const { kept, held: list } = splitHeld(draft[field], value => entry(value, draft));
+      if (!list) continue;
+      held.lists[field] = list;
+      if (kept?.length) draft[field] = kept; else delete draft[field];
+    } else if (!shape(draft[field], draft)) {
+      held.fields[field] = draft[field];
+      if (field in TODO_SHOWN_FOR_HELD) draft[field] = held.shown[field] = TODO_SHOWN_FOR_HELD[field](draft[field], timeOf); else delete draft[field];
+    }
+  }
+  if (draft.parentId !== null) for (const field of TODO_ROOT_FIELDS) { delete draft[field]; delete held.fields[field]; }
+  const memo: Record<string, unknown> = { ...(draft.workMemo ?? {}) as Record<string, unknown> };
+  for (const section of WORK_MEMO_SECTIONS) {
+    const raw = memo[section];
+    if (raw === undefined) continue;
+    if (!isRecord(raw) || Array.isArray(raw) || !isTodoMemoText(raw.text)) { held.memo[section] = { section: raw }; delete memo[section]; continue; }
+    const shown: Record<string, unknown> = { ...raw };
+    const aside: { at?: unknown; version?: unknown; history?: TodoHeldList } = {};
+    const history = splitMemoHistory(raw.history);
+    shown.history = history.kept;
+    if (!isTodoTime(raw.at)) { aside.at = raw.at; shown.at = TODO_TIME_UNKNOWN; }
+    if (!isMemoVersionNumber(raw.version)) { aside.version = raw.version; shown.version = Math.max(0, ...history.kept.map(entry => (entry as TodoMemoVersion).version)) + 1; }
+    if (history.held) aside.history = history.held;
+    if (Object.keys(aside).length) held.memo[section] = aside;
+    memo[section] = shown;
+  }
+  return { ...draft, workMemo: memo };
+}
+
+function restoreHeldItem(item: TodoItem, held: TodoHeldItem): Record<string, unknown> {
+  const out: Record<string, unknown> = { ...item };
+  for (const [field, value] of Object.entries(held.fields)) if (field !== "workMemo" && out[field] === held.shown[field]) out[field] = value;
+  for (const [field, list] of Object.entries(held.lists)) out[field] = withHeld(out[field] as unknown[] | undefined, list);
+  const memo: Record<string, unknown> = { ...item.workMemo };
+  for (const [section, entry] of Object.entries(held.memo) as [WorkMemoSection, TodoHeldMemo][]) {
+    const current = memo[section];
+    if ("section" in entry) {
+      if (current === undefined) memo[section] = entry.section;
+      continue;
+    }
+    if (!isRecord(current)) continue;
+    const restored: Record<string, unknown> = { ...current };
+    for (const key of ["at", "version"] as const) if (key in entry) restored[key] = entry[key];
+    if (entry.history) restored.history = memoHistoryWithHeld(current.history as TodoMemoVersion[], entry.history);
+    memo[section] = restored;
+  }
+  out.workMemo = "workMemo" in held.fields ? Object.keys(memo).length ? { ...held.fields.workMemo as object, ...memo } : held.fields.workMemo : memo;
+  return out;
+}
+
+const HELD_WITH_FIELD: Readonly<Record<string, readonly string[]>> = { state: ["state", "startedAt", "doneAt", "completion"], position: ["position", "parentId"] };
+
+function withoutChangedHeld(held: TodoHeld, changes: readonly Pick<TodoChange, "itemId" | "field" | "before" | "after">[], before: readonly TodoItem[], after: readonly TodoItem[]): TodoHeld {
+  const perItem = new Map(held.perItem), perGroup = new Map(held.perGroup);
+  let heldGroups = held.lists.groups;
+  for (const change of changes) {
+    if (change.field === "groups") {
+      const from = isRecord(change.before) ? change.before.name : undefined, to = isRecord(change.after) ? change.after.name : undefined;
+      if (typeof from !== "string") continue;
+      const entry = perGroup.get(from);
+      if (typeof to === "string" && from !== to) {
+        if (entry) { perGroup.delete(from); perGroup.set(to, entry); }
+        heldGroups = renamedHeldEntries(heldGroups, from, to);
+      } else if (entry && "color" in entry && isRecord(change.before) && isRecord(change.after) && change.before.color !== change.after.color) {
+        const { color: _color, ...rest } = entry;
+        perGroup.set(from, rest);
+      }
+      continue;
+    }
+    const entry = perItem.get(change.itemId);
+    if (!entry) continue;
+    const fields = { ...entry.fields }, memo = { ...entry.memo };
+    for (const field of HELD_WITH_FIELD[change.field] ?? [change.field]) delete fields[field];
+    if (change.field === "position" && isRecord(change.after) && change.after.parentId !== null) for (const field of TODO_ROOT_FIELDS) delete fields[field];
+    const section = memoField(change.field);
+    const aside = section ? memo[section] : undefined;
+    if (section) delete memo[section];
+    if (section && aside && "history" in aside && aside.history && "entries" in aside.history) memo[section] = { history: aside.history };
+    perItem.set(change.itemId, { ...entry, fields, memo });
+  }
+  const was = new Map<string, Record<string, unknown>>(before.map(item => [item.id, item as unknown as Record<string, unknown>]));
+  const now = new Map<string, Record<string, unknown>>(after.map(item => [item.id, item as unknown as Record<string, unknown>]));
+  for (const [id, entry] of perItem) {
+    const changed = Object.keys(entry.fields).filter(field => field !== "workMemo" && was.get(id)?.[field] !== now.get(id)?.[field]);
+    if (changed.length === 0) continue;
+    const fields = { ...entry.fields };
+    for (const field of changed) delete fields[field];
+    perItem.set(id, { ...entry, fields });
+  }
+  return { ...held, perItem, perGroup, lists: { ...held.lists, groups: heldGroups } };
+}
+
+function writtenHeldLists(document: Pick<TodoDocument, "items" | "groups">, held: TodoHeld): TodoHeld["lists"] {
+  const ids = new Set(document.items.map(item => item.id)), names = new Set((document.groups ?? []).map(group => group.name));
+  return { ...held.lists,
+    items: keptHeldEntries(held.lists.items, value => !(isRecord(value) && isTodoId(value.id)) || ids.has(value.id)),
+    groups: keptHeldEntries(held.lists.groups, value => !(isRecord(value) && isTodoGroupName(value.name)) || names.has(value.name)) };
+}
+
+export function todoDocumentJson(document: TodoDocument): string {
+  const held = document[TODO_HELD];
+  if (!held) return JSON.stringify(document);
+  const items = document.items.map(item => {
+    const entry = held.perItem.get(item.id);
+    return entry ? restoreHeldItem(item, entry) : item;
+  });
+  const groups = document.groups?.map(group => {
+    const entry = held.perGroup.get(group.name);
+    if (!entry) return group;
+    return { ...group, ...("color" in entry ? { color: entry.color } : {}), ...(entry.folders ? { folders: withHeld(group.folders, entry.folders) } : {}),
+      ...(entry.aliases ? { aliases: withHeld(group.aliases, entry.aliases) } : {}) };
+  });
+  const current: Record<typeof TODO_HELD_DOCUMENT_LISTS[number], readonly unknown[] | undefined> = { items, changes: document.changes, groups, templates: document.templates, tidy: document.tidy, unboundFolders: document.unboundFolders };
+  const out: Record<string, unknown> = { ...document };
+  const lists = writtenHeldLists(document, held);
+  for (const key of TODO_HELD_DOCUMENT_LISTS) {
+    const merged = withHeld(current[key], lists[key]);
+    if (merged !== undefined) out[key] = merged;
+  }
+  return JSON.stringify(out);
+}
+
+function imageNamesIn(value: unknown, names: string[] = []): string[] {
+  if (typeof value === "string") { if (isTodoImageName(value)) names.push(value); }
+  else if (Array.isArray(value)) for (const entry of value) imageNamesIn(entry, names);
+  else if (isRecord(value)) for (const entry of Object.values(value)) imageNamesIn(entry, names);
+  return names;
+}
+
+export function isTodoDocFields(value: Record<string, unknown>): boolean {
+  return isTodoId(value.id) && (TODO_DOC_KINDS as readonly unknown[]).includes(value.kind) && isTodoFolderPath(value.target)
+    && (value.label === undefined || isTodoDocLabel(value.label)) && (value.kind !== "image" || isTodoImageName(value.target)) && isTodoTime(value.at);
+}
+
 export function isTodoDoc(value: unknown): value is TodoDoc {
-  if (!isRecord(value)) return false;
-  return typeof value.id === "string" && value.id.length > 0 && (TODO_DOC_KINDS as readonly unknown[]).includes(value.kind)
-    && typeof value.target === "string" && value.target.length > 0 && value.target.length <= TODO_DOC_TARGET_MAX
-    && (value.label === undefined || (typeof value.label === "string" && value.label.length <= TODO_DOC_LABEL_MAX))
-    && (value.kind !== "image" || (TODO_IMAGE_FILE.test(value.target) && typeof value.mediaType === "string" && value.mediaType in TODO_IMAGE_EXTENSIONS))
-    && typeof value.at === "number";
+  return isRecord(value) && isTodoDocFields(value) && (value.kind !== "image" || (typeof value.mediaType === "string" && value.mediaType in TODO_IMAGE_EXTENSIONS));
 }
 
 export interface TodoImageRef {
@@ -1683,16 +2045,26 @@ export interface TodoImageRef {
   readonly deletedAt?: number;
 }
 
-export function todoImageRefs(document: Pick<TodoDocument, "items" | "changes">): TodoImageRef[] {
+export function todoImageRefs(document: Pick<TodoDocument, "items" | "changes" | "groups" | typeof TODO_HELD>): TodoImageRef[] {
   const refs: TodoImageRef[] = [];
-  const byId = new Map(document.items.map(item => [item.id, item]));
-  const add = (doc: unknown, item: TodoItem) => {
-    if (isTodoDoc(doc) && doc.kind === "image") refs.push({ name: doc.target, ...(item.deletedAt !== undefined ? { deletedAt: item.deletedAt } : {}) });
+  const held = document[TODO_HELD];
+  const lists = held ? writtenHeldLists(document, held) : undefined;
+  const heldOf = (list: TodoHeldList | undefined) => list && "entries" in list ? list.entries.map(entry => entry.value) : [];
+  const heldItems = heldOf(lists?.items).filter(isRecord);
+  const owners = new Map<string, number | undefined>(document.items.map(item => [item.id, item.deletedAt]));
+  for (const item of heldItems) if (typeof item.id === "string" && !owners.has(item.id)) owners.set(item.id, undefined);
+  const add = (names: readonly string[], deletedAt: number | undefined) => {
+    for (const name of names) refs.push({ name, ...(deletedAt !== undefined ? { deletedAt } : {}) });
   };
-  for (const item of document.items) for (const doc of item.docs ?? []) add(doc, item);
-  for (const change of document.changes) {
-    const item = byId.get(change.itemId);
-    if (change.field === "docs" && item) { add(change.before, item); add(change.after, item); }
+  for (const item of document.items) {
+    for (const doc of item.docs ?? []) if (doc.kind === "image") add([doc.target], item.deletedAt);
+    const aside = held?.perItem.get(item.id);
+    if (aside) add(imageNamesIn([aside.fields, aside.lists]), item.deletedAt);
+  }
+  for (const item of heldItems) add(imageNamesIn(item), undefined);
+  for (const change of [...document.changes, ...heldOf(lists?.changes)]) {
+    if (!isRecord(change) || typeof change.itemId !== "string" || !owners.has(change.itemId)) continue;
+    if (change.field === "docs" || !isTodoChangeRecord(change)) add(imageNamesIn([change.before, change.after]), owners.get(change.itemId));
   }
   return refs;
 }
@@ -1764,11 +2136,9 @@ export function memoStaleSince(item: Pick<TodoItem, "workMemo" | "conversations"
   return after.length ? Math.min(...after) : undefined;
 }
 
-const finiteOrAbsent = (value: unknown) => value === undefined || (typeof value === "number" && Number.isFinite(value));
-
 function isTodoConversationLink(value: unknown): value is TodoConversationLink {
-  return isRecord(value) && typeof value.sessionId === "string" && value.sessionId.length > 0 && typeof value.at === "number" && Number.isFinite(value.at)
-    && finiteOrAbsent(value.workedAt) && finiteOrAbsent(value.seenAt) && (value.owner === undefined || typeof value.owner === "string")
+  return isRecord(value) && isTodoSessionId(value.sessionId) && isTodoTime(value.at)
+    && (value.workedAt === undefined || isTodoTime(value.workedAt)) && (value.seenAt === undefined || isTodoTime(value.seenAt)) && (value.owner === undefined || typeof value.owner === "string")
     && (value.via === undefined || value.via === "handoff");
 }
 
@@ -1777,7 +2147,7 @@ export function isTodoAskIdentity(value: unknown): value is string {
 }
 
 function isTodoStartClaim(value: unknown): value is TodoStartClaim {
-  return isRecord(value) && typeof value.owner === "string" && typeof value.token === "string" && typeof value.at === "number" && Number.isFinite(value.at);
+  return isRecord(value) && typeof value.owner === "string" && typeof value.token === "string" && isTodoTime(value.at);
 }
 
 export type TodoConversationTarget =
@@ -1876,6 +2246,10 @@ export function todoSessionLinks(items: readonly TodoItem[]): TodoSessionLink[] 
   return links;
 }
 
+export function todoLinkedSessions(items: readonly TodoItem[]): Set<string> {
+  return new Set(items.filter(item => item.deletedAt === undefined).flatMap(item => (item.conversations ?? []).map(link => link.sessionId)));
+}
+
 export function todoRecordAskSources(items: readonly TodoItem[]): Array<{ itemId: string; link: TodoConversationLink }> {
   const sources: Array<{ itemId: string; link: TodoConversationLink }> = [];
   const seen = new Set<string>();
@@ -1924,7 +2298,7 @@ function inverseOperation(change: TodoChange): TodoStepOperation | undefined {
     return to || current ? { kind: "setGroupEntry", current, to } : undefined;
   }
   if (change.field === "groupBindings") {
-    return before && typeof before.group === "string" && isGroupFolders(before.folders) && isGroupAliases(before.aliases)
+    return before && typeof before.group === "string" && isGroupBindings(before)
       ? { kind: "setGroupBindings", group: before.group, folders: before.folders, aliases: before.aliases } : undefined;
   }
   if (change.field === "templates") {
@@ -1965,7 +2339,7 @@ function matchesMetaAfter(meta: StepMeta, change: TodoChange): boolean {
   if (change.field === "groupBindings") {
     const after = isRecord(change.after) ? change.after : undefined;
     const group = meta.groups.find(entry => entry.name === after?.group);
-    return group !== undefined && isGroupFolders(after?.folders) && isGroupAliases(after?.aliases) && sameBindings(bindingsOf(group), { folders: after.folders, aliases: after.aliases });
+    return group !== undefined && isGroupBindings(after) && sameBindings(bindingsOf(group), after);
   }
   if (change.field === "groups") {
     const after = isGroupRecord(change.after) ? change.after : null;
@@ -2183,6 +2557,8 @@ export function applyTodoOperation(document: TodoDocument, operation: TodoOperat
     return { ok: true, itemId: "", changed: true, document: { ...document, version: TODO_DOCUMENT_VERSION, revision: document.revision + 1, items, groups: meta.groups, changes: acknowledged } };
   }
 
+  if (operation.kind === "recordDecisions" || operation.kind === "migrateDecisions") return applyDecisionOperation(document, items, operation);
+
   const proposals = document.tidy ?? [];
   let tidy: readonly TodoTidyRecord[] | undefined;
   let reverted: ReadonlySet<string> | undefined;
@@ -2292,8 +2668,77 @@ export function applyTodoOperation(document: TodoDocument, operation: TodoOperat
     templates: meta.templates,
     ...(tidy ? { tidy } : {}),
     ...(unbound.length ? { unboundFolders: unbound } : {}),
-    changes: [...kept.reduce(markUnrevertible, document.changes), ...logged].slice(-TODO_CHANGE_LOG_LIMIT),
+    ...changeLogWith(document, kept.reduce(markUnrevertible, document.changes), logged, items, cascaded.items),
   } };
+}
+
+function withMemoDecisions(item: TodoItem): TodoItem {
+  const memo = item.workMemo.decisions;
+  if (item.decisionLog !== undefined || !memo?.text.trim()) return item;
+  return { ...item, decisionLog: [{ at: memo.at, from: "memo", text: memo.text }] };
+}
+
+export const todoDecisionKey = (entry: TodoDecision): string => JSON.stringify(entry.from === "card" ? ["card", entry.message, entry.title] : ["memo", entry.at, entry.text]);
+
+function withCarriedDecisions(log: readonly TodoDecision[] | undefined, from: readonly TodoDecision[], sourceId: string): readonly TodoDecision[] | undefined {
+  const keys = new Set((log ?? []).map(todoDecisionKey));
+  const added = from.filter(entry => !keys.has(todoDecisionKey(entry)) && keys.add(todoDecisionKey(entry))).map(entry => ({ ...entry, carriedFrom: sourceId }));
+  return added.length ? [...(log ?? []), ...added] : undefined;
+}
+
+function withoutCarriedDecisions(item: TodoItem, restored: ReadonlySet<string>): TodoItem {
+  if (!item.decisionLog?.some(entry => entry.carriedFrom !== undefined && restored.has(entry.carriedFrom))) return item;
+  const { decisionLog, ...rest } = item;
+  const kept = decisionLog.filter(entry => entry.carriedFrom === undefined || !restored.has(entry.carriedFrom));
+  return kept.length ? { ...rest, decisionLog: kept } : rest;
+}
+
+export const todoDecisionGroupKey = (entry: TodoDecision): string | undefined => entry.from === "card" ? JSON.stringify([entry.title, entry.sessionId]) : undefined;
+
+export function todoDecisionsAppended(log: readonly TodoDecision[], decisions: readonly TodoDecision[]): readonly TodoDecision[] {
+  let next = log;
+  for (const decision of decisions) {
+    if (decision.from !== "card" || next.some(entry => todoDecisionKey(entry) === todoDecisionKey(decision))) continue;
+    const group = todoDecisionGroupKey(decision);
+    const previous = next.filter(entry => entry.carriedFrom === undefined && todoDecisionGroupKey(entry) === group && entry.at <= decision.at)
+      .reduce<TodoDecision | undefined>((latest, entry) => latest === undefined || entry.at >= latest.at ? entry : latest, undefined);
+    if (previous && previous.label === decision.label && previous.text === decision.text) continue;
+    next = [...next, decision];
+  }
+  return next;
+}
+
+export function todoDecisionsToMigrate(document: Pick<TodoDocument, "items" | "decisionsMigrated">): boolean {
+  return document.decisionsMigrated !== true && document.items.some(item => withMemoDecisions(item) !== item);
+}
+
+function applyDecisionOperation(document: TodoDocument, items: readonly TodoItem[], operation: TodoDecisionOperation): TodoOperationResult {
+  const migrating = document.decisionsMigrated !== true;
+  const seeded = migrating ? items.map(withMemoDecisions) : items;
+  let next: readonly TodoItem[] = seeded;
+  let itemId = "";
+  if (operation.kind === "recordDecisions") {
+    const item = linkedTodoItem(next, operation.sessionId);
+    const linkedAt = item?.conversations?.find(link => link.sessionId === operation.sessionId)?.at;
+    if (item && linkedAt !== undefined) {
+      itemId = item.id;
+      const current = item.decisionLog ?? [];
+      const log = todoDecisionsAppended(current, operation.decisions.filter(decision => decision.sessionId === operation.sessionId && decision.at >= linkedAt));
+      if (log !== current) next = next.map(entry => entry.id === item.id ? { ...entry, decisionLog: log } : entry);
+    }
+  }
+  const recorded = next !== seeded;
+  const migrated = seeded.some((entry, index) => entry !== items[index]);
+  if (!recorded && !migrated) return { ok: true, document, itemId, changed: false };
+  return { ok: true, itemId, changed: true, document: { ...document, version: TODO_DOCUMENT_VERSION, revision: document.revision + 1, items: next, decisionsMigrated: true } };
+}
+
+function changeLogWith(document: TodoDocument, previous: readonly TodoChange[], logged: readonly TodoChange[], before: readonly TodoItem[], after: readonly TodoItem[]): Pick<TodoDocument, "changes" | typeof TODO_HELD> {
+  const held = document[TODO_HELD];
+  if (!held) return { changes: [...previous, ...logged].slice(-TODO_CHANGE_LOG_LIMIT) };
+  const log = splitHeld([...withHeld(previous, held.lists.changes) as unknown[], ...logged].slice(-TODO_CHANGE_LOG_LIMIT), isTodoChangeRecord);
+  const next = withoutChangedHeld(held, logged, before, after);
+  return { changes: (log.kept ?? []) as TodoChange[], [TODO_HELD]: { ...next, lists: { ...next.lists, changes: log.held } } };
 }
 
 function markUnrevertible(changes: readonly TodoChange[], kept: MemoKept): readonly TodoChange[] {
@@ -2308,84 +2753,82 @@ export function pruneDeletedItems(items: readonly TodoItem[], now: number): Todo
   return items.filter(item => item.deletedAt === undefined || now - item.deletedAt < TODO_DELETED_RETENTION_MS);
 }
 
-export function parseTodoDocument(text: string, onDroppedDocs?: (count: number) => void, onDroppedLinks?: (count: number) => void): TodoDocument {
-  const value = JSON.parse(text) as Partial<TodoDocument> | null;
-  if (!value || value.version !== TODO_DOCUMENT_VERSION || !Number.isSafeInteger(value.revision) || !Array.isArray(value.items) || !Array.isArray(value.changes)
+export function parseTodoDocument(text: string, onHeld?: (count: number) => void): TodoDocument {
+  const value = JSON.parse(text) as unknown;
+  if (!isRecord(value) || value.version !== TODO_DOCUMENT_VERSION || !Number.isSafeInteger(value.revision) || !Array.isArray(value.items) || !Array.isArray(value.changes)
     || !Array.isArray(value.writes) || !value.writes.every(entry => typeof entry === "string")) {
     throw new Error("unrecognized TODO document");
   }
-  for (const item of value.items) {
-    if (!item || typeof item.id !== "string" || (item.parentId !== null && typeof item.parentId !== "string") || typeof item.title !== "string"
-      || !TODO_STATES.includes(item.state) || typeof item.userMemo !== "string" || !item.workMemo || typeof item.workMemo !== "object") {
-      throw new Error("unrecognized TODO item");
-    }
-  }
-  let dropped = 0;
-  let droppedLinks = 0;
-  const items = value.items.map(item => {
-    if (item.conversations !== undefined) {
-      const links = Array.isArray(item.conversations) ? item.conversations.filter(isTodoConversationLink) : [];
-      const lost = Array.isArray(item.conversations) ? item.conversations.length - links.length : 1;
-      if (lost > 0) { droppedLinks += lost; item = withLinks(item, links); }
-    }
-    if (item.pendingStart !== undefined && !isTodoStartClaim(item.pendingStart)) { droppedLinks++; item = withoutClaim(item); }
-    item = withKnownExtras(item);
-    if (item.parentId !== null && item.group !== undefined) { const { group: _group, ...rest } = item; item = rest; }
-    if (item.dismissedAsks !== undefined && !(Array.isArray(item.dismissedAsks) && item.dismissedAsks.every(isTodoAskIdentity))) {
-      droppedLinks++;
-      const { dismissedAsks: _dropped, asksClosedInTodo: _closed, ...rest } = item;
-      item = rest;
-    }
-    if (item.asksClosedInTodo !== undefined && !(Array.isArray(item.asksClosedInTodo) && item.asksClosedInTodo.every((message: unknown) => typeof message === "string" && item.dismissedAsks?.includes(message) === true))) {
-      droppedLinks++;
-      const { asksClosedInTodo: _dropped, ...rest } = item;
-      item = rest;
-    }
-    if (item.docs === undefined) return item;
-    const docs = Array.isArray(item.docs) ? item.docs.filter(isTodoDoc) : [];
-    const lost = Array.isArray(item.docs) ? item.docs.length - docs.length : 1;
-    if (lost === 0) return item;
-    dropped += lost;
-    return { ...item, docs };
+  if (!value.items.every(isReadableTodoItem)) throw new Error("unrecognized TODO item");
+  const ids = new Set<string>();
+  const itemSplit = splitHeld(value.items, raw => {
+    const item = raw as Record<string, unknown>;
+    if (!isTodoId(item.id) || ids.has(item.id)) return false;
+    ids.add(item.id);
+    return true;
   });
-  if (dropped > 0) onDroppedDocs?.(dropped);
-  if (droppedLinks > 0) onDroppedLinks?.(droppedLinks);
-  const { groups: rawGroups, templates: rawTemplates, tidy: rawTidy, unboundFolders: rawUnbound, ...rest } = value;
-  const unboundFolders = Array.isArray(rawUnbound) ? rawUnbound.filter((path): path is string => typeof path === "string" && path.length > 0) : [];
-  const groups = Array.isArray(rawGroups)
-    ? rawGroups.filter((group, index, all): group is TodoGroup => isRecord(group) && typeof group.name === "string" && validGroupName(group.name) && validColor(group.color)
-      && all.findIndex(other => isRecord(other) && other.name === group.name) === index)
-      .map(group => ({ name: group.name, color: group.color, ...(isGroupFolders(group.folders) && group.folders.length ? { folders: group.folders.map(folder => ({ path: folder.path, ...(folder.change ? { change: folder.change } : {}) })) } : {}),
-        ...(isGroupAliases(group.aliases) && group.aliases.length ? { aliases: group.aliases.map(alias => ({ words: alias.words, ...(alias.parentId ? { parentId: alias.parentId } : {}), ...(alias.change ? { change: alias.change } : {}),
-          ...((TODO_PLACEMENT_BASES as readonly unknown[]).includes(alias.basis) ? { basis: alias.basis } : {}) })) } : {}) }))
-    : undefined;
-  const templates = Array.isArray(rawTemplates) ? rawTemplates.filter(isTodoTemplate) : undefined;
-  const tidy = Array.isArray(rawTidy) ? rawTidy.filter(isTodoTidyRecord).map(record => ({ id: record.id, at: record.at, steps: record.steps, revision: record.revision })) : undefined;
+  let heldTotal = heldSize(itemSplit.held);
+  const now = Date.now(), shownTimes = new Map<string, number>();
+  const timeOf = (raw: unknown) => {
+    const key = JSON.stringify(raw) ?? "";
+    if (!shownTimes.has(key)) shownTimes.set(key, now - shownTimes.size);
+    return shownTimes.get(key)!;
+  };
+  const perItem = new Map<string, TodoHeldItem>();
+  const items = (itemSplit.kept ?? []).map(raw => {
+    const held: TodoHeldItemDraft = { fields: {}, shown: {}, lists: {}, memo: {} };
+    const item = withKnownExtras(holdInvalid(raw as Record<string, unknown>, held, timeOf) as unknown as TodoItem, held);
+    const size = heldItemSize(held);
+    if (size > 0) { heldTotal += size; perItem.set(item.id, held); }
+    return item;
+  });
+  const perGroup = new Map<string, TodoHeldGroup>();
+  const groupSplit = splitHeld(value.groups, (group, kept) => isRecord(group) && isTodoGroupName(group.name) && !kept.some(other => (other as TodoGroup).name === group.name));
+  const groups: TodoGroup[] | undefined = groupSplit.kept ? [] : undefined;
+  for (const raw of groupSplit.kept ?? []) {
+    const group = raw as Record<string, unknown> & Pick<TodoGroup, "name">;
+    const folders = splitHeld(group.folders, isTodoGroupFolder), aliases = splitHeld(group.aliases, isTodoGroupAlias);
+    const color = validColor(group.color) ? group.color : shownGroupColor(group.color);
+    if (folders.held || aliases.held || color !== group.color) {
+      perGroup.set(group.name, { ...(color !== group.color ? { color: group.color } : {}), ...(folders.held ? { folders: folders.held } : {}), ...(aliases.held ? { aliases: aliases.held } : {}) });
+      heldTotal += Number(color !== group.color) + heldSize(folders.held) + heldSize(aliases.held);
+    }
+    const keptFolders = (folders.kept ?? []) as TodoGroupFolder[], keptAliases = (aliases.kept ?? []) as TodoGroupAlias[];
+    groups!.push({ name: group.name, color, ...(keptFolders.length ? { folders: keptFolders.map(folder => ({ path: folder.path, ...(folder.change ? { change: folder.change } : {}) })) } : {}),
+      ...(keptAliases.length ? { aliases: keptAliases.map(alias => ({ words: alias.words, ...(alias.parentId ? { parentId: alias.parentId } : {}), ...(alias.change ? { change: alias.change } : {}),
+        ...(alias.basis ? { basis: alias.basis } : {}) })) } : {}) });
+  }
+  const changes = splitHeld(value.changes, isTodoChangeRecord);
+  const templates = splitHeld(value.templates, isTodoTemplate);
+  const tidy = splitHeld(value.tidy, isTodoTidyRecord);
+  const unboundFolders = splitHeld(value.unboundFolders, isTodoFolderPath);
+  const lists = { items: atListEnd(itemSplit.held), changes: changes.held, groups: atListEnd(groupSplit.held), templates: templates.held, tidy: tidy.held, unboundFolders: unboundFolders.held };
+  heldTotal += heldSize(changes.held) + heldSize(groupSplit.held) + heldSize(templates.held) + heldSize(tidy.held) + heldSize(unboundFolders.held);
+  if (heldTotal > 0) onHeld?.(heldTotal);
   const changeTimes = new Map<string, number[]>();
-  for (const change of value.changes as unknown[]) {
-    if (!isRecord(change) || typeof change.itemId !== "string" || !isStoredTime(change.at)) continue;
+  for (const change of value.changes) {
+    if (!isRecord(change) || typeof change.itemId !== "string" || !isTodoTime(change.at)) continue;
     changeTimes.set(change.itemId, [...(changeTimes.get(change.itemId) ?? []), change.at]);
   }
-  return { ...rest, items: items.map(item => withItemTimes(item, changeTimes.get(item.id) ?? [])), ...(groups ? { groups } : {}), ...(templates ? { templates } : {}), ...(tidy?.length ? { tidy } : {}), ...(unboundFolders.length ? { unboundFolders } : {}) } as TodoDocument;
+  const keptTidy = (tidy.kept ?? []) as TodoTidyRecord[], keptUnbound = (unboundFolders.kept ?? []) as string[];
+  const { items: _items, changes: _changes, groups: _groups, templates: _templates, tidy: _tidy, unboundFolders: _unbound, ...rest } = value;
+  return { ...rest, items: items.map(item => withItemTimes(item, changeTimes.get(item.id) ?? [], Object.values(perItem.get(item.id)?.shown ?? {}))), changes: changes.kept as TodoChange[], ...(groups ? { groups } : {}),
+    ...(templates.kept ? { templates: templates.kept as TodoTemplate[] } : {}),
+    ...(keptTidy.length ? { tidy: keptTidy.map(record => ({ id: record.id, at: record.at, steps: record.steps, revision: record.revision })) } : {}),
+    ...(keptUnbound.length ? { unboundFolders: keptUnbound } : {}),
+    ...(heldTotal > 0 ? { [TODO_HELD]: { perItem, perGroup, lists: Object.fromEntries(Object.entries(lists).filter(([, list]) => list !== undefined)) } } : {}) } as unknown as TodoDocument;
 }
 
 export const TODO_TIME_UNKNOWN = 0;
-const isStoredTime = (value: unknown): value is number => typeof value === "number" && Number.isFinite(value) && value >= 0;
 
-function withItemTimes(item: TodoItem, changeTimes: readonly number[]): TodoItem {
-  if (isStoredTime(item.createdAt) && isStoredTime(item.updatedAt)) return item;
+function withItemTimes(item: TodoItem, changeTimes: readonly number[], shown: readonly unknown[]): TodoItem {
+  if (isTodoTime(item.createdAt) && isTodoTime(item.updatedAt)) return item;
   const memo = Object.values(item.workMemo).flatMap(section => [section?.at, ...(Array.isArray(section?.history) ? section.history.map(entry => entry?.at) : [])]);
   const known = [item.createdAt, item.updatedAt, item.captured?.at, item.placement?.at, item.pinnedAt, item.startedAt, item.doneAt, item.deletedAt, ...memo,
-    ...(item.docs ?? []).map(doc => doc.at), ...(item.conversations ?? []).map(link => link.at), ...(item.starts ?? []).map(start => start.at), ...changeTimes].filter(isStoredTime);
-  const createdAt = isStoredTime(item.createdAt) ? item.createdAt : known.length ? Math.min(...known) : TODO_TIME_UNKNOWN;
-  const updatedAt = isStoredTime(item.updatedAt) ? item.updatedAt : Math.max(createdAt, ...known);
+    ...(item.docs ?? []).map(doc => doc.at), ...(item.conversations ?? []).map(link => link.at), ...(item.starts ?? []).map(start => start.at), ...changeTimes].filter(time => isTodoTime(time) && time !== TODO_TIME_UNKNOWN && !shown.includes(time));
+  const createdAt = isTodoTime(item.createdAt) ? item.createdAt : known.length ? Math.min(...known) : TODO_TIME_UNKNOWN;
+  const updatedAt = isTodoTime(item.updatedAt) ? item.updatedAt : Math.max(createdAt, ...known);
   return { ...item, createdAt, updatedAt };
-}
-
-function isTodoStart(value: unknown): value is TodoStart {
-  const text = (entry: unknown) => entry === undefined || typeof entry === "string";
-  return isRecord(value) && typeof value.at === "number" && (TODO_START_KINDS as readonly unknown[]).includes(value.kind) && typeof value.brief === "string"
-    && text(value.sessionId) && text(value.tab) && text(value.current) && text(value.next) && (value.stale === undefined || value.stale === true);
 }
 
 function trimStarts(starts: readonly TodoStart[]): TodoStart[] {
@@ -2395,24 +2838,18 @@ function trimStarts(starts: readonly TodoStart[]): TodoStart[] {
   return starts.filter(start => kept.has(start));
 }
 
-function withKnownExtras(item: TodoItem): TodoItem {
+function withKnownExtras(item: TodoItem, held: TodoHeldItemDraft): TodoItem {
   const draft: Record<string, unknown> = { ...item };
-  for (const field of ["waiting", "repeat", "estimate", "tags"] as const) if (draft[field] !== undefined && typeof draft[field] !== "string") delete draft[field];
-  for (const field of ["startedAt", "doneAt"] as const) if (!finiteOrAbsent(draft[field])) delete draft[field];
-  if (draft.by !== undefined && draft.by !== "claude") delete draft.by;
-  if (draft.starts !== undefined && !(Array.isArray(draft.starts) && draft.starts.every(isTodoStart))) delete draft.starts;
-  if (Array.isArray(draft.briefs)) {
+  if (draft.briefs !== undefined) {
+    const briefs: unknown[] = Array.isArray(draft.briefs) ? draft.briefs : [draft.briefs];
     const starts = (draft.starts ?? []) as TodoStart[];
-    const legacy = draft.briefs.filter(brief => isRecord(brief) && typeof brief.at === "number" && typeof brief.text === "string" && !starts.some(start => start.kind === "child" && start.brief === brief.text))
-      .map(brief => ({ at: brief.at as number, kind: "child" as const, brief: brief.text as string }));
+    const asStart = (brief: unknown) => isRecord(brief) ? { at: brief.at, kind: "child" as const, brief: brief.text } : undefined;
+    const invalid = briefs.filter(brief => !isTodoStart(asStart(brief)));
+    if (invalid.length) held.fields.briefs = Array.isArray(draft.briefs) ? invalid : draft.briefs;
+    const legacy = briefs.flatMap(brief => { const start = asStart(brief); return isTodoStart(start) && !starts.some(entry => entry.kind === "child" && entry.brief === start.brief) ? [start] : []; });
     if (legacy.length) draft.starts = trimStarts([...starts, ...legacy].sort((a, b) => a.at - b.at));
   }
   delete draft.briefs;
-  if (draft.caseWords !== undefined && !(typeof draft.caseWords === "string" && draft.caseWords.length > 0 && draft.caseWords.length <= TODO_GROUP_MAX)) delete draft.caseWords;
-  if (draft.placedFrom !== undefined && !(typeof draft.placedFrom === "string" && draft.placedFrom.length > 0 && draft.placedFrom.length <= TODO_DOC_TARGET_MAX)) delete draft.placedFrom;
-  if (draft.source !== undefined && !(isRecord(draft.source) && typeof draft.source.sessionId === "string" && draft.source.sessionId.length > 0)) delete draft.source;
-  const isGuess = (guess: unknown) => guess === undefined || (isRecord(guess) && typeof guess.value === "string" && typeof guess.reason === "string");
-  if (draft.guesses !== undefined && !(isRecord(draft.guesses) && isGuess(draft.guesses.due) && isGuess(draft.guesses.priority))) delete draft.guesses;
   return draft as unknown as TodoItem;
 }
 
@@ -2431,6 +2868,80 @@ export function todoAskSourceMessages(messages: readonly TodoRecordMessage[]): A
     .slice(-TODO_ASK_SOURCE_MESSAGES_MAX).map(m => ({ uuid: m.uuid, role: m.role, text: m.text, timestamp: m.timestamp }));
 }
 
+function todoAskAnswer(choice: string, labels: readonly string[], otherChoice: string): Pick<TodoDecision, "label" | "text"> | undefined {
+  if (otherReplyAsksBack(choice, otherChoice)) return undefined;
+  const parts = askAnswerParts(choice);
+  const label = parts === undefined ? undefined : labels.find((_, index) => askOptionLetter(index) === parts.choice);
+  if (parts === undefined || (parts.choice !== otherChoice && label === undefined)) {
+    const text = askAnswerBody(choice).trim();
+    const letter = parts === undefined ? labels.find((_, index) => askOptionLetter(index) === text) : undefined;
+    return letter !== undefined ? { label: letter } : text ? { text } : undefined;
+  }
+  const answer = parts.answer.trim();
+  if (parts.choice !== otherChoice && label !== undefined && answer.startsWith(label)) {
+    const notes = answer.slice(label.length).trim();
+    return { label, ...(notes ? { text: notes } : {}) };
+  }
+  return answer ? { text: answer } : undefined;
+}
+
+export interface TodoAskDecisionTracker {
+  add(messages: readonly TodoRecordMessage[]): void;
+  decisions(): readonly TodoDecision[];
+  asks(): TodoDecisionAsk[];
+}
+
+export type TodoDecisionAsk = readonly [title: string, labels: readonly string[]];
+
+export function todoAskDecisionTracker(sessionId: string, otherChoice: string, known: readonly TodoDecisionAsk[] = []): TodoAskDecisionTracker {
+  const asks = new Map<string, readonly string[]>(known);
+  let titles: AskAnswerTitles | undefined;
+  const seen = new Set<string>();
+  const out: TodoDecision[] = [];
+  return {
+    add(messages) {
+      for (const message of messages) {
+        if (message.uuid.length === 0 || seen.has(message.uuid)) continue;
+        seen.add(message.uuid);
+        if (message.role === "assistant") {
+          for (const ask of askBlocksIn(message.text)) {
+            if (ask.kind !== "decide") continue;
+            asks.delete(ask.title);
+            asks.set(ask.title, ask.options.map(option => option.label));
+            titles = undefined;
+          }
+          continue;
+        }
+        if (message.role !== "user" || !isTodoTime(message.timestamp)) continue;
+        for (const [title, labels] of asks) {
+          titles ??= new AskAnswerTitles(asks.keys());
+          const answer = askAnswerChoices(title, message.text, titles).map(choice => todoAskAnswer(choice, labels, otherChoice)).find(entry => entry !== undefined);
+          if (answer) out.push({ at: message.timestamp, from: "card", title, ...answer, sessionId, message: message.uuid });
+        }
+      }
+    },
+    decisions: () => out,
+    asks: () => [...asks],
+  };
+}
+
+export interface TodoDecisionGroup {
+  readonly key: string;
+  readonly latest: TodoDecision;
+  readonly earlier: readonly TodoDecision[];
+}
+
+export function todoDecisionGroups(log: readonly TodoDecision[]): TodoDecisionGroup[] {
+  const groups = new Map<string, Array<{ entry: TodoDecision; index: number }>>();
+  log.forEach((entry, index) => {
+    const key = todoDecisionGroupKey(entry) ?? `m:${index}`;
+    groups.set(key, [...(groups.get(key) ?? []), { entry, index }]);
+  });
+  return [...groups].map(([key, entries]) => {
+    const sorted = [...entries].sort((a, b) => b.entry.at - a.entry.at || b.index - a.index).map(({ entry }) => entry);
+    return { key, latest: sorted[0], earlier: sorted.slice(1) };
+  }).sort((a, b) => b.latest.at - a.latest.at);
+}
 
 export interface TodoChangePlace {
   readonly group: string | null;

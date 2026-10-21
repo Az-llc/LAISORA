@@ -14,7 +14,8 @@ export { normalizeDriveLetter } from "./claude-settings";
 import { TODO_BETA_SETTING } from "./todo-store";
 import { disposeTodoSurface, releaseOwnedTodoConversations, syncTodoSurface, toggleTodoDrawer } from "./todo-surface";
 import { EDIT_SUMMARY_SETTING } from "./edit-summary";
-import { MEMORY_BLOCK_PROJECT_TYPE_SETTING } from "./placement-line";
+import { GUARD_ENABLED_SETTING, MEMORY_BLOCK_PROJECT_TYPE_SETTING } from "./placement-line";
+import { removeRetiredBaselineCache, removeRetiredLearningStore } from "./retired-storage";
 import { registerEditDiffProvider } from "./edit-diff-host";
 export { reduceWorkModelSafely, trimEventLog } from "./event-fold";
 export type { EventFoldDraft, FoldEffect, FoldEventResult } from "./event-fold";
@@ -39,9 +40,8 @@ import {
 import { SessionStore, tabLimit } from "./store-surfaces";
 import { handoffFs, handoffPersist, readHandoffRecords } from "./handoff-wiring";
 export { createStartMeasurement } from "./handoff-wiring";
-import { personalBaseline, setPersonalBaselineListener } from "./personal-baseline";
 import { PROTOCOL_VERSION } from "./protocol";
-import { openResumedSession as resumePersistedTab, startLoopLagProbe } from "./resume-hydration";
+import { hostCpuMs, openResumedSession as resumePersistedTab, startLoopLagProbe } from "./resume-hydration";
 import { lookupSessionFile } from "./session-files";
 import {
   disposeAccountUsage,
@@ -84,6 +84,8 @@ function ensureInitialTabs(st: SessionStore): void {
 
 async function restorePersistedTabs(st: SessionStore, entries: PersistedOpenTab[]): Promise<void> {
   const lagProbe = startLoopLagProbe();
+  const restoreT0 = Date.now();
+  const restoreCpu0 = hostCpuMs();
   const notices: string[] = [];
   const started: Array<{ label: string; sessionId: string; outcome: ReturnType<typeof resumePersistedTab> }> = [];
   let skippedByLimit = 0;
@@ -140,7 +142,35 @@ async function restorePersistedTabs(st: SessionStore, entries: PersistedOpenTab[
     `[restore] ${sinceActivation()} restored ${restored}/${entries.length} tab(s)` +
       ` (loop lag max ${lagProbe.maxLagMs()}ms total ${lagProbe.blockedMs()}ms)`
   );
+  output.appendLine(
+    `[restore] host cpu (whole extension host) ${hostCpuMs() - restoreCpu0}ms over wall ${Date.now() - restoreT0}ms`
+  );
   void persistOpenTabs();
+}
+
+function localIsoTime(at: number): string {
+  const d = new Date(at);
+  const pad = (n: number, width = 2): string => String(Math.abs(n)).padStart(width, "0");
+  const offset = -d.getTimezoneOffset();
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}` +
+    `.${pad(d.getMilliseconds(), 3)}${offset >= 0 ? "+" : "-"}${pad(Math.trunc(offset / 60))}:${pad(offset % 60)}`;
+}
+
+const STARTUP_LOOP_LAG_SECONDS = 30;
+function sampleStartupLoopLag(activatedAt: number): void {
+  const maxPerSecond: number[] = new Array<number>(STARTUP_LOOP_LAG_SECONDS).fill(0);
+  const probe = startLoopLagProbe((lag, at) => {
+    const second = Math.floor((at - activatedAt) / 1000);
+    if (second < STARTUP_LOOP_LAG_SECONDS && lag > maxPerSecond[second]) maxPerSecond[second] = lag;
+  });
+  const timer = setTimeout(() => {
+    probe.stop();
+    output.appendLine(
+      `[startup] ${sinceActivation()} loop lag max/s t+0..${STARTUP_LOOP_LAG_SECONDS - 1}s: ${maxPerSecond.join(",")}` +
+        ` (total ${probe.blockedMs()}ms)`
+    );
+  }, STARTUP_LOOP_LAG_SECONDS * 1000);
+  timer.unref?.();
 }
 
 export function activate(context: vscode.ExtensionContext): void {
@@ -149,29 +179,20 @@ export function activate(context: vscode.ExtensionContext): void {
 
 function activateReady(context: vscode.ExtensionContext): void {
   initHostL10n();
-  setActivationT0(Date.now());
+  const activatedAt = Date.now();
+  setActivationT0(activatedAt);
   setExtensionContext(context);
-  setPersonalBaselineListener(() => {
-    if (!semanticViewEnabled()) return;
-    for (const s of store?.sessions.values() ?? []) s.semantic.scheduleSemanticModelPost();
-  });
-  void personalBaseline();
   setOutput(vscode.window.createOutputChannel("LAISORA"));
-  context.subscriptions.push(output);
-  output.appendLine(`[startup] ${sinceActivation()} activate`);
+  output.appendLine(`[startup] ${sinceActivation()} activate at ${localIsoTime(activatedAt)}`);
+  sampleStartupLoopLag(activatedAt);
   void HandoffRunner.sweepOrphans(
     { fs: handoffFs, persist: handoffPersist(), readRecords: readHandoffRecords, log: (line) => output.appendLine(line) },
     claudeProjectsDir()
   ).catch((e) => output.appendLine(`[startup] handoff の孤児回収に失敗: ${String(e)}`));
+  void removeRetiredLearningStore(context.globalStorageUri?.fsPath, (line) => output.appendLine(line));
+  void removeRetiredBaselineCache(context.globalState, (line) => output.appendLine(line));
   scheduleCliUpdates(context);
   syncTodoSurface();
-  context.subscriptions.push({
-    dispose: () => {
-      void artifactServer?.dispose();
-      setArtifactServer(null);
-      disposeTodoSurface();
-    },
-  });
   const readOnlyFiles = registerReadOnlyFileProvider();
   if (readOnlyFiles) context.subscriptions.push(readOnlyFiles);
   const editDiffs = registerEditDiffProvider();
@@ -186,7 +207,7 @@ function activateReady(context: vscode.ExtensionContext): void {
     if (affectsProductConfiguration(e, TODO_BETA_SETTING)) syncTodoSurface();
     if (["enabled", "agents", "externalTimeoutMinutes", "conductorPolicy"]
       .some((key) => affectsProductConfiguration(e, `orchestration.${key}`))
-      || affectsProductConfiguration(e, "learning.enabled") || affectsProductConfiguration(e, MEMORY_BLOCK_PROJECT_TYPE_SETTING)) {
+      || affectsProductConfiguration(e, GUARD_ENABLED_SETTING) || affectsProductConfiguration(e, MEMORY_BLOCK_PROJECT_TYPE_SETTING)) {
       const cacheTtlSetting = ["enabled", "agents"].some((key) => affectsProductConfiguration(e, `orchestration.${key}`));
       for (const session of store?.sessions.values() ?? []) {
         postOrchestrationView(session);
@@ -202,7 +223,7 @@ function activateReady(context: vscode.ExtensionContext): void {
       affectsProductConfiguration(e, "restoreTabsOnStartup") ||
       affectsProductConfiguration(e, TODO_BETA_SETTING) ||
       affectsProductConfiguration(e, EDIT_SUMMARY_SETTING) ||
-      affectsProductConfiguration(e, "learning.enabled") ||
+      affectsProductConfiguration(e, GUARD_ENABLED_SETTING) ||
       affectsProductConfiguration(e, MEMORY_BLOCK_PROJECT_TYPE_SETTING) ||
       Object.values(CLI_AUTO_UPDATE_SETTINGS).some((key) => affectsProductConfiguration(e, key)) ||
       affectsProductConfiguration(e, "history.eventLimit") ||
@@ -464,8 +485,17 @@ function buildHtml(context: vscode.ExtensionContext, webview: vscode.Webview): s
 }
 
 export async function deactivate(): Promise<void> {
+  try {
+    await settleForShutdown();
+  } finally {
+    output?.dispose();
+  }
+}
+
+async function settleForShutdown(): Promise<void> {
   if (store) await Promise.all([...store.sessions.values()].map((s) => writeHeldChosenTitle(s)));
   disposeAccountUsage();
+  disposeTodoSurface();
   await releaseOwnedTodoConversations();
   if (store) {
     for (const s of store.sessions.values()) {

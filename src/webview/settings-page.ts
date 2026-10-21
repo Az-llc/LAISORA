@@ -389,11 +389,11 @@ const renderAccent = createAccentSettings(accentCard, (setting, value) => {
   return requestId;
 }, { row, rowNote });
 const chatCard = section(generalCategory, l10n.t("Chat"));
-const learningCard = section(generalCategory, l10n.t("Learning"));
-const learningSwitch = switchButton("setting-learning-enabled");
-const learningText = row(learningCard, l10n.t("Enable learning"), l10n.t("Turning learning off stops delivery in running conversations. Turning it on applies from the next conversation. Recording remains available."), learningSwitch);
+const guardCard = section(generalCategory, l10n.t("Instruction and memory protection"));
+const guardSwitch = switchButton("setting-guard-enabled");
+const guardText = row(guardCard, l10n.t("Protect instruction files and memory"), l10n.t("Tells Claude where knowledge belongs, refuses notes about specific models in CLAUDE.md, rules and memory, keeps subagents from changing instruction, settings and hook files, and checks memory writes. Turn off to let Claude Code write these files as it normally does. Applies from the next conversation you start or resume."), guardSwitch);
 const memoryBlockProjectTypeSwitch = switchButton("setting-memory-block-project-type");
-const memoryBlockProjectTypeText = row(learningCard, l10n.t("Block project-type memory writes"), l10n.t("Stops writes of project-type memory (the state of ongoing work). When off, it can be written, but finished work or changed policies can remain in memory, and Claude may act on them as if they were still correct. Applies from the next conversation you start or resume."), memoryBlockProjectTypeSwitch);
+const memoryBlockProjectTypeText = row(guardCard, l10n.t("Block project-type memory writes"), l10n.t("Stops writes of project-type memory (the state of ongoing work). When off, it can be written, but finished work or changed policies can remain in memory, and Claude may act on them as if they were still correct. Applies from the next conversation you start or resume."), memoryBlockProjectTypeSwitch);
 const todoCard = section(generalCategory, "ToDo");
 const todoSwitch = switchButton("setting-todo-enabled");
 const todoText = row(todoCard, l10n.t("(Beta) Enable ToDo"), l10n.t("The ToDo tab, drawer and cats switch right away. Claude's ToDo tools are available from the next conversation you start or resume."), todoSwitch);
@@ -839,7 +839,7 @@ instructionPreview.id = "setting-conductor-preview";
 instructionPreview.tabIndex = 0;
 const instructionTokens = element("p", "settings-muted");
 instructionTokens.id = "setting-conductor-tokens";
-instructionDetails.append(element("summary", "", l10n.t("Review what the conductor receives")), element("p", "settings-muted", l10n.t("This preview omits learned rules that depend on the conversation. Changes apply at the next normal connection start.")), instructionTokens, instructionPreview);
+instructionDetails.append(element("summary", "", l10n.t("Review what the conductor receives")), element("p", "settings-muted", l10n.t("Changes apply at the next normal connection start.")), instructionTokens, instructionPreview);
 rosterCategory.append(policyCard, instructionDetails);
 const externalBlock = element("section", "settings-section settings-environment");
 externalBlock.id = "orchestration-environment";
@@ -1256,7 +1256,7 @@ generalCategory.appendChild(footer);
 let current: SettingsState | null = null;
 let requestSerial = 0;
 const nextRequestId = (): number => ++requestSerial;
-const pending: { autoContinue: number | null; restore: number | null; apiKey: number | null; learning: number | null; memoryBlockProjectType: number | null; todo: number | null; editSummary: number | null } = { autoContinue: null, restore: null, apiKey: null, learning: null, memoryBlockProjectType: null, todo: null, editSummary: null };
+const pending: { autoContinue: number | null; restore: number | null; apiKey: number | null; guard: number | null; memoryBlockProjectType: number | null; todo: number | null; editSummary: number | null } = { autoContinue: null, restore: null, apiKey: null, guard: null, memoryBlockProjectType: null, todo: null, editSummary: null };
 const pendingAutoUpdate = new Map<ExecutorId, number>();
 const pendingFileLink: Record<FileLinkBooleanSetting, number | null> = {
   fileLinkInstruction: null,
@@ -1285,7 +1285,7 @@ function writeAnchor(message: SettingsPageToHost): HTMLElement | undefined {
     case "setRestoreTabsOnStartup": return restoreText;
     case "setCliAutoUpdate": return detectionControls.find(({ executor }) => executor === message.executor)?.text;
     case "setEventLimit": return eventLimitText;
-    case "setLearningEnabled": return learningText;
+    case "setGuardEnabled": return guardText;
     case "setMemoryBlockProjectType": return memoryBlockProjectTypeText;
     case "setTodoEnabled": return todoText;
     case "setEditSummaryEnabled": return editSummaryText;
@@ -1359,12 +1359,12 @@ function render(state: SettingsState): void {
   autoContinueSwitch.disabled = pending.autoContinue !== null;
   renderSystemAppExtensions(state);
   renderOrchestration(state);
-  if (pending.learning === state.replyTo) pending.learning = null;
-  learningSwitch.setAttribute("aria-checked", String(state.learningEnabled));
-  learningSwitch.disabled = pending.learning !== null;
+  if (pending.guard === state.replyTo) pending.guard = null;
+  guardSwitch.setAttribute("aria-checked", String(state.guardEnabled));
+  guardSwitch.disabled = pending.guard !== null;
   if (pending.memoryBlockProjectType === state.replyTo) pending.memoryBlockProjectType = null;
   memoryBlockProjectTypeSwitch.setAttribute("aria-checked", String(state.memoryBlockProjectType));
-  memoryBlockProjectTypeSwitch.disabled = pending.memoryBlockProjectType !== null;
+  memoryBlockProjectTypeSwitch.disabled = pending.memoryBlockProjectType !== null || !state.guardEnabled;
   if (pending.todo === state.replyTo) pending.todo = null;
   todoSwitch.setAttribute("aria-checked", String(state.todoEnabled));
   todoSwitch.disabled = pending.todo !== null;
@@ -1448,12 +1448,12 @@ for (const { executor, autoUpdate } of detectionControls) {
     post({ type: "setCliAutoUpdate", requestId, executor, enabled: !current.cliAutoUpdate[executor] });
   });
 }
-learningSwitch.addEventListener("click", () => {
-  if (current === null || pending.learning !== null) return;
+guardSwitch.addEventListener("click", () => {
+  if (current === null || pending.guard !== null) return;
   const requestId = nextRequestId();
-  pending.learning = requestId;
-  learningSwitch.disabled = true;
-  post({ type: "setLearningEnabled", requestId, enabled: !current.learningEnabled });
+  pending.guard = requestId;
+  guardSwitch.disabled = true;
+  post({ type: "setGuardEnabled", requestId, enabled: !current.guardEnabled });
 });
 memoryBlockProjectTypeSwitch.addEventListener("click", () => {
   if (current === null || pending.memoryBlockProjectType !== null) return;

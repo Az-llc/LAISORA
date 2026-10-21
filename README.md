@@ -67,9 +67,9 @@ Approve or deny tool requests in CHAT. Send additional instructions during a tur
 
 The agent roster on the LAISORA settings page lets you configure worker, explorer, and reviewer roles, with model and effort per row (`laisora.orchestration.enabled`, `laisora.orchestration.agents`). Codex and Antigravity are optional external executors when their CLIs are installed. Roster changes apply from the next session.
 
-### Keep lessons for later work
+### Keep instruction files and memory current
 
-The learning ledger is on by default (`laisora.learning.enabled`). While it is on, the main agent can record model-specific lessons, and active rules are passed to later sessions. Records stay on your machine; text containing absolute paths or credentials is refused. Learning works with or without the agent roster, and setting changes apply from the next session.
+LAISORA tells Claude where knowledge belongs and refuses writes that would leave CLAUDE.md, rules or auto memory stale: notes about specific models, subagent changes to instruction, settings and hook files, and memory topics of the wrong type. Turn this off on the settings page (`laisora.guard.enabled`) to let Claude Code write these files as it normally does; the change applies from the next session.
 
 ### Carry long work forward
 
@@ -102,7 +102,7 @@ The main interface supports English and Japanese; some diagnostic messages remai
 
 ## LAISORA settings
 
-The send shortcut, tab restore, API key handling, file links, agent roster, and learning switch are on the LAISORA settings page (**Settings** in the ☰ menu of a conversation, or **LAISORA: Open Settings**). For other settings, such as the tab limit, default working directory, and work-log analysis, search for `laisora.*` in VS Code Settings. Extension preferences and UI state are saved in VS Code.
+The send shortcut, tab restore, API key handling, file links, agent roster, and instruction and memory protection are on the LAISORA settings page (**Settings** in the ☰ menu of a conversation, or **LAISORA: Open Settings**). For other settings, such as the tab limit, default working directory, and work-log analysis, search for `laisora.*` in VS Code Settings. Extension preferences and UI state are saved in VS Code.
 
 ## SDK-specific setup and behavior
 

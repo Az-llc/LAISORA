@@ -2,7 +2,7 @@ import { randomBytes } from "node:crypto";
 import { mkdirSync, watch } from "node:fs";
 import { link, mkdir, open, readdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
-import { applyTodoOperation, emptyTodoDocument, parseTodoDocument, pruneDeletedItems, liveImageNames, TODO_IMAGE_EXTENSIONS, TODO_IMAGE_FILE, todoImageRefs, type TodoAuthor, type TodoImageRef, type TodoImageMediaType, type TodoDocument, type TodoOperation, type TodoOperationResult } from "./todo-model";
+import { applyTodoOperation, emptyTodoDocument, parseTodoDocument, todoDocumentJson, pruneDeletedItems, liveImageNames, TODO_IMAGE_EXTENSIONS, TODO_IMAGE_FILE, todoImageRefs, type TodoAuthor, type TodoImageRef, type TodoImageMediaType, type TodoDocument, type TodoOperation, type TodoOperationResult } from "./todo-model";
 
 export const TODO_KEPT_REVISIONS = 20;
 export const TODO_WRITE_WINDOW = 200;
@@ -46,8 +46,7 @@ function processAlive(pid: number): boolean {
 
 export class TodoStore {
   private readonly corruptLogged = new Set<number>();
-  private readonly droppedDocsLogged = new Set<number>();
-  private readonly droppedLinksLogged = new Set<number>();
+  private readonly heldLogged = new Set<number>();
   private readonly imageRefs = new Map<number, readonly TodoImageRef[]>();
 
   constructor(readonly directory: string, private readonly log: (message: string) => void = () => {}) {}
@@ -134,11 +133,8 @@ export class TodoStore {
         }
         try {
           return { ...parseTodoDocument(text, count => {
-            if (!this.droppedDocsLogged.has(revision)) this.log(`[todo] ${todoRevisionFile(revision)}: ${count} unreadable reference(s) left out`);
-            this.droppedDocsLogged.add(revision);
-          }, count => {
-            if (!this.droppedLinksLogged.has(revision)) this.log(`[todo] ${todoRevisionFile(revision)}: ${count} unreadable conversation link(s) left out`);
-            this.droppedLinksLogged.add(revision);
+            if (!this.heldLogged.has(revision)) this.log(`[todo] ${todoRevisionFile(revision)}: ${count} unreadable value(s) kept in the file and left out of the view`);
+            this.heldLogged.add(revision);
           }), revision: revisions[0] };
         }
         catch {
@@ -157,7 +153,7 @@ export class TodoStore {
       await retryTransient(async () => {
         const handle = await open(temp, "w");
         try {
-          await handle.writeFile(JSON.stringify(document));
+          await handle.writeFile(todoDocumentJson(document));
           await handle.sync();
         } finally { await handle.close(); }
       });

@@ -1,9 +1,10 @@
-import type { NormalizedEvent, TimeBucketsCoverage } from "./protocol";
+import { displayedAncestorUsageGap, type NormalizedEvent, type TimeBucketsCoverage } from "./protocol";
 import type { RosterSource } from "./roster-evidence";
-import { readSessionHistory, readSubagentAgents, type HistoryEvent } from "./session-transcript";
+import { readSessionHistory, readSubagentAgents, type HistoryEvent, type SessionHistoryRead, type SubagentRestore } from "./session-transcript";
 import {
   attachTimeBucketRequestNumbers,
   createTimeBucketState,
+  currentGenerationRecords,
   deriveTimeBuckets,
   foldTimeBuckets,
   pushModelMark,
@@ -44,7 +45,7 @@ export function timeBucketsFromHistory(
   let markedInTurn = false;
   let usage: PlanUsageAccumulator | undefined;
   let seq = 0;
-  for (const e of events) {
+  for (const e of currentGenerationRecords(events)) {
     const body = e.body;
     if (body.kind === "turn_started") markedInTurn = false;
     if (body.kind === "model_observed") {
@@ -112,11 +113,20 @@ export async function readTranscriptTimeBucketsWithCoverage(
   const history = await readSessionHistory(file, isAllowedPath, generationSessionId === undefined ? undefined : { generationSessionId });
   const sessionReadError = history.readError ?? history.subagentsReadError;
   if (sessionReadError !== undefined) return { view: undefined, coverage: { sessionReadError }, rosterSources: history.rosterSources };
-  const restored = await readSubagentAgents(file, isAllowedPath);
+  return transcriptTimeBucketsOf(history, await readSubagentAgents(file, isAllowedPath), ids);
+}
+
+export function transcriptTimeBucketsOf(
+  history: SessionHistoryRead,
+  restored: SubagentRestore,
+  ids: TranscriptIds
+): TranscriptTimeBucketsRead {
+  const ancestorUsageReadError = displayedAncestorUsageGap(history.coverage);
+  const subagentCoverage = subagentReadCoverage(restored);
   return {
     view: timeBucketsFromHistory(history.events, childSpansOf(restored.agents), ids),
     rosterSources: history.rosterSources,
-    coverage: subagentReadCoverage(restored),
+    coverage: ancestorUsageReadError === undefined ? subagentCoverage : { ...subagentCoverage, ancestorUsageReadError },
   };
 }
 

@@ -38,6 +38,7 @@ import {
   isInSessionStore,
   lookupSessionFile,
   sessionIdForOutput,
+  sessionTranscriptLookup,
   type SessionFileLookup,
 } from "./session-files";
 import { readConversationMessages, readSessionHistory } from "./session-transcript";
@@ -502,14 +503,10 @@ export async function handleHistoryMessage(
             );
             break;
           }
-          const lookup: SessionFileLookup =
-            session.resumeFilePath !== undefined
-              ? { path: session.resumeFilePath, reason: null }
-              : lookupSessionFile(session.resumeSessionId ?? "");
-          const filePath = lookup.path;
-          if (filePath === null) {
+          const { ref, lookup } = sessionTranscriptLookup(session);
+          if (ref === null) {
             output.appendLine(
-              `[${session.title}] worklogTranscript: ${lookup.reason} session=${sessionIdForOutput(session)}` +
+              `[${session.title}] worklogTranscript: ${lookup.reason ?? "no_session_id"} session=${sessionIdForOutput(session)}` +
                 (lookup.reason === "scan_failed" ? ` — ${lookup.detail}` : "")
             );
             await postWorklogTranscriptError(
@@ -517,13 +514,13 @@ export async function handleHistoryMessage(
             );
             break;
           }
-          if (!isInSessionStore(filePath)) {
+          if (!isInSessionStore(ref.file)) {
             await postWorklogTranscriptError(
               st, sender, session, msg.requestId, generation, "history-unavailable"
             );
             break;
           }
-          const history = await readSessionHistory(filePath, isInSessionStore);
+          const history = await readSessionHistory(ref.file, isInSessionStore, { generationSessionId: ref.sessionId });
           if (!requestStillValid()) {
             await postWorklogTranscriptError(
               st, sender, session, msg.requestId, generation, "stale-request"
@@ -532,6 +529,9 @@ export async function handleHistoryMessage(
           }
           if (history.subagentsReadError !== undefined) {
             output.appendLine(`[${session.title}] 履歴transcript subagents/ read failed: ${history.subagentsReadError}`);
+          }
+          if (history.coverage.ancestorUsageReadError !== undefined) {
+            output.appendLine(`[${session.title}] 履歴transcript earlier-conversation record read failed (child usage not counted): ${history.coverage.ancestorUsageReadError}`);
           }
           const historyReadError = history.readError;
           if (historyReadError !== undefined) {

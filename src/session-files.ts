@@ -21,11 +21,13 @@ export function isInSessionStore(filePath: string): boolean {
   return pathIsInside(root, target);
 }
 
-export function inspectorSessionFileLookup(session: Session): SessionFileLookup {
+export type SessionRecordLookup = SessionFileLookup | { path: null; reason: "resume_pair_mismatch" };
+
+export function inspectorSessionFileLookup(session: Session): SessionRecordLookup {
   if (session.resumeSessionId && session.resumeFilePath) {
     return basename(session.resumeFilePath).toLowerCase() === `${session.resumeSessionId}.jsonl`.toLowerCase()
       ? { path: session.resumeFilePath, reason: null }
-      : { path: null, reason: "not_found" };
+      : { path: null, reason: "resume_pair_mismatch" };
   }
   const sessionId = session.auth?.sessionId;
   return sessionId ? lookupSessionFile(sessionId) : { path: null, reason: "not_found" };
@@ -39,12 +41,15 @@ export function sessionIdForOutput(session: Session): string {
   return sessionRecordId(session) ?? "(未取得)";
 }
 
-export function sessionTranscriptRef(session: Session): { sessionId: string; file: string } | null {
-  const file = inspectorSessionFile(session);
-  if (file === null) return null;
+export function sessionTranscriptLookup(session: Session): { ref: { sessionId: string; file: string } | null; lookup: SessionRecordLookup } {
+  const lookup = inspectorSessionFileLookup(session);
   const sessionId =
     session.resumeSessionId && session.resumeFilePath ? session.resumeSessionId : session.auth?.sessionId;
-  return sessionId ? { sessionId, file } : null;
+  return { ref: lookup.path !== null && sessionId ? { sessionId, file: lookup.path } : null, lookup };
+}
+
+export function sessionTranscriptRef(session: Session): { sessionId: string; file: string } | null {
+  return sessionTranscriptLookup(session).ref;
 }
 
 function assertSessionRecordOf(realFile: string, sessionId: string): void {

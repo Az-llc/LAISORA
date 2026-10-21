@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { ACTION_DESTINATIONS, ACTION_KINDS, analysisActionDestinations } from "./llm-action-policy";
+import { ACTION_DESTINATIONS, ACTION_KINDS, ANALYSIS_ACTION_DESTINATIONS } from "./llm-action-policy";
 import type { CitationAliasTable } from "./llm-citation-alias";
 import type { LlmAnalysisInput, NumericFactTable } from "./llm-analysis-input";
 import {
@@ -25,7 +25,6 @@ import type { LlmAnalysisOutputLanguage } from "./llm-analysis-prompt";
 export interface LlmAnalysisRequest {
   promptVersion: string;
   outputLanguage: LlmAnalysisOutputLanguage;
-  learningEnabled: boolean;
   modelId: string;
   prompt: string;
   signal: AbortSignal;
@@ -271,9 +270,9 @@ export function valueSpecToJsonSchema(spec: ValueSpec): Record<string, unknown> 
   }
 }
 
-export function llmFindingsJsonSchema(learningEnabled = true): Record<string, unknown> {
+export function llmFindingsJsonSchema(): Record<string, unknown> {
   const actionFields = ACTION_FIELDS.map(field => field.key === "destination"
-    ? { ...field, spec: { t: "enum" as const, values: analysisActionDestinations(learningEnabled) } }
+    ? { ...field, spec: { t: "enum" as const, values: ANALYSIS_ACTION_DESTINATIONS } }
     : field);
   const findingFields = ACTION_FINDING_FIELDS.map(field => field.key === "action"
     ? { ...field, spec: { t: "object" as const, fields: actionFields } }
@@ -329,7 +328,6 @@ export interface LlmFindingCacheKey {
   inputVersion: string;
   promptVersion: string;
   outputLanguage: LlmAnalysisOutputLanguage;
-  learningEnabled: boolean;
   contentHash: string;
 }
 
@@ -349,7 +347,6 @@ export function llmFindingCacheKeyString(key: LlmFindingCacheKey): string {
     key.inputVersion,
     key.promptVersion,
     key.outputLanguage,
-    key.learningEnabled !== false,
     key.contentHash,
   ]);
 }
@@ -513,7 +510,6 @@ export interface LlmAnalysisRunInput {
   input: LlmAnalysisInput;
   promptVersion: string;
   outputLanguage: LlmAnalysisOutputLanguage;
-  learningEnabled: boolean;
   model: FindingVerificationModel;
   analysis: { semanticHash: string };
   provenance: LlmAnalysisProvenanceInput;
@@ -607,7 +603,6 @@ export async function runLlmAnalysis(input: LlmAnalysisRunInput): Promise<LlmAna
     inputVersion: input.input.version,
     promptVersion: input.promptVersion,
     outputLanguage: input.outputLanguage,
-    learningEnabled: input.learningEnabled,
     contentHash,
   };
 
@@ -737,7 +732,6 @@ export async function runLlmAnalysis(input: LlmAnalysisRunInput): Promise<LlmAna
         const generation = client.generate({
           promptVersion: input.promptVersion,
           outputLanguage: input.outputLanguage,
-          learningEnabled: input.learningEnabled,
           modelId: client.modelId,
           prompt: slice.text,
           signal: callController.signal,
@@ -917,7 +911,6 @@ export async function runLlmAnalysis(input: LlmAnalysisRunInput): Promise<LlmAna
         const generation = client.generate({
           promptVersion: input.promptVersion,
           outputLanguage: input.outputLanguage,
-          learningEnabled: input.learningEnabled,
           modelId: client.modelId,
           prompt: mergePromptText,
           signal: mergeCallController.signal,

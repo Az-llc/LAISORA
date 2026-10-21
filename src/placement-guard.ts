@@ -1,4 +1,4 @@
-import { programName, segmentProgramIndex, shellSegments, isShellTool, PLACEMENT_GUARD_REASON_PREFIX } from "./learning-signature";
+import { programName, segmentProgramIndex, shellSegments, isShellTool } from "./shell-tools";
 import { CLAUDE_EFFORTS, CODEX_EFFORTS, AGY_EFFORTS } from "./orchestration-executors";
 import { resolve, join, basename, dirname, win32, posix } from "node:path";
 import fs, { readdirSync, statSync, readFileSync } from "node:fs";
@@ -8,18 +8,21 @@ import { realPathOrNearestSync, resolveNearestRealPathSync, expandHomePath } fro
 export type ProtectedKind = "memory" | "CLAUDE.md" | "AGENTS.md" | "rules";
 export type GuardReason = "cooccurrence" | "model-name" | "shell";
 
-import type { Placement } from "./placement-line";
+import { MODEL_NOTES_RULE, type Placement } from "./placement-line";
 export { placementOf } from "./placement-line";
 
+export const PLACEMENT_GUARD_REASON_PREFIX = "LAISORA placement guard:";
 export const DELEGATE_CONTROL_REFUSAL = `${PLACEMENT_GUARD_REASON_PREFIX} only the conductor changes instruction, settings and hook files; return a proposed change in the reply instead.`;
 export const PLACEMENT_UNREADABLE_REFUSAL = `${PLACEMENT_GUARD_REASON_PREFIX} the current content of this protected file could not be read, so the edit cannot be checked. Retry once the file is readable.`;
-export function placementGuardReason(placement: Placement): string {
-  return `${PLACEMENT_GUARD_REASON_PREFIX} this write targets persistent instructions. Session-only instructions are not persisted; keep them in this conversation. ${placement.learningEnabled ? "Record model-specific observations through the learning tool; standing" : "Standing"} model choices belong in roster or conductor policy settings. Please do not retry by removing or paraphrasing names. Please use Write or Edit for shell writes so the content can be checked.`;
-}
+export const PLACEMENT_GUARD_REFUSAL = `${PLACEMENT_GUARD_REASON_PREFIX} this write targets persistent instructions. Session-only instructions are not persisted; keep them in this conversation. ${MODEL_NOTES_RULE}; standing model choices belong in roster or conductor policy settings. Please do not retry by removing or paraphrasing names. Please use Write or Edit for shell writes so the content can be checked.`;
 
 export const PLACEMENT_EFFORT_WORDS: readonly string[] = Object.freeze([...new Set<string>([...CLAUDE_EFFORTS, ...CODEX_EFFORTS, ...AGY_EFFORTS])]);
-export const DEFAULT_ROLE_NAMES: readonly string[] = Object.freeze(["worker", "explorer", "reviewer"]);
+const STRENGTH_CLAIM_RE = /得意|苦手|(?<![A-Za-z0-9_])(?:good|better|best|bad|worse|worst|strong|weak) at(?![A-Za-z0-9_])/i;
 const CLAUDE_ALIASES = ["opus", "sonnet", "haiku", "fable"];
+const PRODUCT_TERMS_RE = /(?<![A-Za-z0-9_])(?:claude\s+code|claude(?:\.local)?\.md)(?![A-Za-z0-9_])/gi;
+const BARE_ALIAS_RE = new RegExp(`(?<![A-Za-z0-9_-])(?:${CLAUDE_ALIASES.join("|")})(?![A-Za-z0-9_-]|\\s?\\d)`, "gi");
+const CAPITALISED_ALIAS_RE = new RegExp(`(?<![A-Za-z0-9_-])(?:${CLAUDE_ALIASES.map(alias => alias[0].toUpperCase() + alias.slice(1)).join("|")})(?![A-Za-z0-9_-])`, "g");
+const MODEL_WORD_RE = /(?<![A-Za-z])models?(?![A-Za-z])|モデル/i;
 const MODEL_NAME_PATTERNS: readonly RegExp[] = [
   new RegExp(`(?<![A-Za-z0-9_])(?:${CLAUDE_ALIASES.join("|")})(?![A-Za-z0-9_])`, "i"),
   /(?<![A-Za-z0-9_])(?:claude|opus|sonnet|haiku|fable|gemini|gpt)[- ]?\d+(?:\.\d+)*/i,
@@ -29,7 +32,6 @@ const MODEL_NAME_PATTERNS: readonly RegExp[] = [
 export interface PlacementVocabulary {
   readonly names: readonly string[];
   readonly effortWords: readonly string[];
-  readonly roleNames: readonly string[];
   readonly listedModelIds: readonly string[];
 }
 
@@ -49,7 +51,7 @@ export interface CompiledVocabulary {
 }
 
 export function compileVocabulary(vocabulary: PlacementVocabulary): CompiledVocabulary {
-  return { names: wordPattern(vocabulary.names, WORD_BEFORE + PATH_SEGMENT_BEFORE), qualifiers: wordPattern([...vocabulary.effortWords, ...vocabulary.roleNames]), listed: wordPattern(vocabulary.listedModelIds) };
+  return { names: wordPattern(vocabulary.names, WORD_BEFORE + PATH_SEGMENT_BEFORE), qualifiers: wordPattern(vocabulary.effortWords), listed: wordPattern(vocabulary.listedModelIds) };
 }
 
 export interface LineVerdict {
@@ -57,9 +59,15 @@ export interface LineVerdict {
   readonly modelName: boolean;
 }
 
+function modelContext(text: string): boolean {
+  return MODEL_WORD_RE.test(text) || new Set(text.match(CAPITALISED_ALIAS_RE) ?? []).size >= 2;
+}
+
 export function lineVerdict(line: string, vocabulary: CompiledVocabulary): LineVerdict {
-  const cooccurrence = !!vocabulary.names?.test(line) && (!!vocabulary.qualifiers?.test(line) || /実装|レビュー|委任|分担|得意/.test(line));
-  const modelName = MODEL_NAME_PATTERNS.some((re) => re.test(line)) || !!vocabulary.listed?.test(line);
+  const products = line.replace(PRODUCT_TERMS_RE, " ");
+  const text = modelContext(products) ? products : products.replace(BARE_ALIAS_RE, " ");
+  const cooccurrence = !!vocabulary.names?.test(text) && (!!vocabulary.qualifiers?.test(text) || STRENGTH_CLAIM_RE.test(text));
+  const modelName = MODEL_NAME_PATTERNS.some((re) => re.test(text)) || !!vocabulary.listed?.test(text);
   return { cooccurrence, modelName };
 }
 
@@ -568,12 +576,12 @@ function gitControlPaths(cwd: string, paths: readonly string[], configDir: strin
     const status = !stash && (target === undefined || read(["rev-parse", "--verify", "--end-of-options", target + "^{commit}"]).trim() === read(["rev-parse", "--verify", "HEAD"]).trim());
     let listed: string;
     if (stash) {
-      const args = ["stash", "show", "--name-only", "-z", "--no-ext-diff", "--no-textconv"];
+      const args = ["stash", "show", "--name-only", "-z", "--no-renames", "--no-ext-diff", "--no-textconv", "--ignore-submodules=none"];
       try { listed = read([...args, "--include-untracked", target ?? "stash@{0}"]); }
       catch { listed = read([...args, target ?? "stash@{0}"]); }
     } else listed = status
-      ? read(["status", "--porcelain=v1", "-z", "--untracked-files=all", "--ignore-submodules=dirty", "--", ...specs])
-      : read(["diff", "--name-only", "--no-ext-diff", "--no-textconv", "--no-relative", "-z", "HEAD", target!, "--", ...specs]);
+      ? read(["status", "--porcelain=v1", "-z", "--no-renames", "--untracked-files=all", "--ignore-submodules=dirty", "--", ...specs])
+      : read(["diff", "--name-only", "--no-renames", "--no-ext-diff", "--no-textconv", "--no-relative", "--ignore-submodules=none", "-z", "HEAD", target!, "--", ...specs]);
     const entries = listed.split("\0").filter(Boolean);
     const files: string[] = [];
     for (let i = 0; i < entries.length; i++) {
@@ -606,6 +614,125 @@ function gitListedControls(cwd: string, paths: readonly string[], configDir: str
   return blocked;
 }
 
+const SHELL_CONDITION_WORDS = new Set(["if", "then", "else", "elif", "elseif", "do", "!"]);
+const STASH_ROUND_TRIP_GIT = new Set(["stash", "status", "diff", "log", "show", "rev-parse", "ls-files"]);
+const STASH_ROUND_TRIP_ACTIONS = new Set(["push", "save", "pop", "apply", "list", "show", "drop"]);
+const STASH_ROUND_TRIP_WRAPPERS = new Set(["env", "command", "builtin", "exec", "eval", "source", ".", "bash", "sh", "zsh", "dash", "ksh", "fish", "cmd", "pwsh", "powershell",
+  "xargs", "sudo", "nohup", "time", "timeout", "watch", "parallel", "find", "for", "while", "until", "foreach", "foreach-object", "%", "alias", "function", "invoke-expression", "iex", "start-process"]);
+const STASH_ROUND_TRIP_UNCLASSIFIED = /--autostash|reflog|update-ref|--config-env|--git-dir|--work-tree|--namespace|GIT_[A-Z_]+|\$\(|`|<\(|>\(/i;
+const STASH_PUSH_PROVABLE_FLAGS = new Set(["-q", "--quiet", "-u", "--include-untracked", "-k", "--keep-index", "--no-keep-index"]);
+const GIT_WORD = /(?:^|[\s'"(;&|])git(?:\.exe)?(?:[\s'")]|$)/i;
+type StashTrail = { pushed: number; consumed: number; tainted: boolean };
+const stashTrailsByJudgement = new WeakMap<Map<string, boolean>, Map<string, StashTrail>>();
+
+function guardProgramIndex(segment: { readonly words: readonly string[] }): number {
+  let index = segmentProgramIndex(segment);
+  while (index < segment.words.length && SHELL_CONDITION_WORDS.has(segment.words[index].toLowerCase())) {
+    index++;
+    if (segment.words[index] === "$?" && ["if", "elseif", "elif"].includes(segment.words[index - 1].toLowerCase())) index++;
+  }
+  return index;
+}
+
+function stashAction(tail: readonly string[]): string {
+  return tail[0] === undefined || tail[0].startsWith("-") ? "push" : tail[0];
+}
+
+function stashPushAll(options: readonly string[]): boolean {
+  return options.some(word => /^--al?l?$/.test(word) || /^-[a-zA-Z]*a/.test(word));
+}
+
+function stashActive(cache: Map<string, boolean>): boolean {
+  return [...stashTrailsByJudgement.get(cache)?.values() ?? []].some(trail => trail.pushed + trail.consumed > 0 || trail.tainted);
+}
+
+function stashRoundTripClassified(command: string, parsedCommand: string): boolean {
+  if (STASH_ROUND_TRIP_UNCLASSIFIED.test(command)) return false;
+  for (const segment of shellSegments(parsedCommand, true)) {
+    const words = segment.words, index = guardProgramIndex(segment);
+    if (index >= words.length) continue;
+    const program = programName(words[index]);
+    if (program !== "git") {
+      if (STASH_ROUND_TRIP_WRAPPERS.has(program) || words.some(word => GIT_WORD.test(word))) return false;
+      continue;
+    }
+    const args = words.slice(index + 1);
+    let sub = 0;
+    while (sub < args.length && args[sub].startsWith("-")) {
+      if (args[sub] !== "-C") return false;
+      sub += 2;
+    }
+    if (!STASH_ROUND_TRIP_GIT.has(args[sub])) return false;
+    if (args[sub] === "stash" && !STASH_ROUND_TRIP_ACTIONS.has(stashAction(args.slice(sub + 1)))) return false;
+  }
+  return true;
+}
+
+function stashTrail(cwd: string, cache: Map<string, boolean>): StashTrail | undefined {
+  let trails = stashTrailsByJudgement.get(cache);
+  if (!trails) stashTrailsByJudgement.set(cache, trails = new Map());
+  let repository: string;
+  try { repository = resolve(cwd, gitReader(cwd, cache)(["rev-parse", "--path-format=absolute", "--git-common-dir"]).trim()); }
+  catch { return undefined; }
+  let trail = trails.get(repository);
+  if (!trail) trails.set(repository, trail = { pushed: 0, consumed: 0, tainted: false });
+  return trail;
+}
+
+function stashEntries(cwd: string, cache: Map<string, boolean>): number {
+  const read = gitReader(cwd, cache);
+  try { read(["rev-parse", "--verify", "--quiet", "refs/stash"]); }
+  catch (error) {
+    if ((error as { status?: unknown }).status === 1) return 0;
+    throw error;
+  }
+  const count = Number(read(["rev-list", "--walk-reflogs", "--count", "refs/stash"]).trim());
+  if (!Number.isInteger(count) || count < 0) throw Error("unreadable stash count");
+  return count;
+}
+
+function stashChangesControls(cwd: string, stash: string, configDir: string, cache: Map<string, boolean>, roundTrip: boolean): boolean {
+  if (!stashActive(cache)) return gitControlPaths(cwd, [], configDir, cache, stash, true);
+  const index = /^(?:stash@\{(\d+)\}|(\d+))$/.exec(stash);
+  const trail = roundTrip && index ? stashTrail(cwd, cache) : undefined;
+  if (!index || !trail || trail.tainted) return true;
+  const selected = Number(index[1] ?? index[2]);
+  if (selected >= trail.pushed - trail.consumed) return true;
+  try {
+    const entries = stashEntries(cwd, cache);
+    for (let original = Math.max(0, selected - trail.pushed); original <= selected + trail.consumed && original < entries; original++)
+      if (gitControlPaths(cwd, [], configDir, cache, `stash@{${original}}`, true)) return true;
+    return false;
+  } catch { return true; }
+}
+
+function stashPushProvable(cwd: string, tail: readonly string[], options: readonly string[], paths: readonly string[], cache: Map<string, boolean>): boolean {
+  const flags = options.slice(["push", "save"].includes(tail[0]) ? 1 : 0);
+  for (let i = 0; i < flags.length; i++) {
+    if (["-m", "--message"].includes(flags[i])) { i++; continue; }
+    if (flags[i].startsWith("--message=") || !flags[i].startsWith("-") && tail[0] === "save") continue;
+    if (!STASH_PUSH_PROVABLE_FLAGS.has(flags[i])) return false;
+  }
+  const untracked = flags.some(word => word === "-u" || word === "--include-untracked");
+  try {
+    return gitReader(cwd, cache)(["status", "--porcelain=v1", "-z", "--no-renames", untracked ? "--untracked-files=all" : "--untracked-files=no",
+      "--ignore-submodules=dirty", "--", ...paths]).split("\0").some(Boolean);
+  } catch { return false; }
+}
+
+function recordStashTrail(cwd: string, sub: string, tail: readonly string[], options: readonly string[], paths: readonly string[], cache: Map<string, boolean>): void {
+  if (sub !== "stash") return;
+  const action = stashAction(tail);
+  if (!["push", "save", "store", "pop", "drop", "clear", "branch"].includes(action)) return;
+  const trail = stashTrail(cwd, cache);
+  if (!trail) return;
+  if (action === "store") trail.tainted = true;
+  else if (action === "push" || action === "save") {
+    if (trail.pushed + trail.consumed === 0 && !trail.tainted && stashPushProvable(cwd, tail, options, paths, cache)) trail.pushed++;
+    else trail.tainted = true;
+  } else trail.consumed++;
+}
+
 function patchControls(files: readonly string[], cwd: string, configDir: string, strip = 1, directory = ""): boolean {
   if (!files.length) return true;
   try {
@@ -635,7 +762,7 @@ function patchControls(files: readonly string[], cwd: string, configDir: string,
   } catch { return true; }
 }
 
-export function shellProtectedWrite(command: string, configDir: string, platform: NodeJS.Platform = process.platform, cwd = process.cwd(), includeControl = false, gitCache = new Map<string, boolean>()): ProtectedKind | "control" | undefined {
+export function shellProtectedWrite(command: string, configDir: string, platform: NodeJS.Platform = process.platform, cwd = process.cwd(), includeControl = false, gitCache = new Map<string, boolean>(), nested = false): ProtectedKind | "control" | undefined {
   let base = cwd;
   const kindOf = (word: string | undefined): ProtectedKind | "control" | undefined => {
     if (word === undefined) return undefined;
@@ -744,7 +871,7 @@ export function shellProtectedWrite(command: string, configDir: string, platform
     return undefined;
   };
   const inlineKind = (program: string, script: string): ProtectedKind | "control" | undefined => {
-    if (program === "pwsh" || program === "powershell") return shellProtectedWrite(script, configDir, platform, base, includeControl, gitCache);
+    if (program === "pwsh" || program === "powershell") return shellProtectedWrite(script, configDir, platform, base, includeControl, gitCache, true);
     const patterns = program === "node" ? [
       /\bfs(?:\.promises)?\.(?:writeFile(?:Sync)?|appendFile(?:Sync)?|createWriteStream)\s*\(\s*(['"])(.*?)\1/g,
     ] : [
@@ -759,10 +886,11 @@ export function shellProtectedWrite(command: string, configDir: string, platform
   };
   const parsedCommand = includeControl ? command.replace(/@\{[^{}\s;&|<>]+\}|\{[^{}\s;&|<>]*,[^{}\s;&|<>]*\}/g,
     (literal, offset: number) => executablePosition(command, offset) ? literal.replace(/[{}]/g, (brace: string) => "'" + brace + "'") : literal) : command;
+  const stashRoundTrip = includeControl && !nested && stashRoundTripClassified(command, parsedCommand);
   for (const segment of shellSegments(parsedCommand, true)) {
     const words = segment.words;
     for (let i = 0; i < words.length - 1; i++) if (segment.operators?.includes(i) && REDIRECT_RE.test(words[i])) { const kind = kindOf(words[i + 1]); if (kind) return kind; }
-    const index = segmentProgramIndex(segment);
+    const index = guardProgramIndex(segment);
     if (index >= words.length) continue;
     const program = POWERSHELL_CMDLET_ALIASES[programName(words[index])] ?? programName(words[index]);
     const args = words.slice(index + 1);
@@ -843,7 +971,7 @@ export function shellProtectedWrite(command: string, configDir: string, platform
       const run = args.findIndex(word => /^\/{1,2}[ck]$/i.test(word));
       if (run >= 0) {
         const rest = args.slice(run + 1);
-        const kind = shellProtectedWrite(rest.length === 1 ? rest[0] : rest.map(word => /\s/.test(word) ? `"${word}"` : word).join(" "), configDir, platform, base, includeControl, gitCache);
+        const kind = shellProtectedWrite(rest.length === 1 ? rest[0] : rest.map(word => /\s/.test(word) ? `"${word}"` : word).join(" "), configDir, platform, base, includeControl, gitCache, true);
         if (kind) return kind;
       }
     }
@@ -926,9 +1054,13 @@ export function shellProtectedWrite(command: string, configDir: string, platform
           }
         }
         else if (sub === "stash" && ["pop", "apply"].includes(tail[0])) {
+          if (dash >= 0) return "control";
           const stash = positional([]).slice(1)[0] ?? "stash@{0}";
-          if (gitControlPaths(base, [], configDir, gitCache, stash, true)) return "control";
-        } else if (sub === "stash" && !["list", "show", "drop", "clear", "create", "store"].includes(tail[0])) paths = dash >= 0 ? tail.slice(dash + 1) : [];
+          if (stashChangesControls(base, stash, configDir, gitCache, stashRoundTrip)) return "control";
+        } else if (sub === "stash" && !["list", "show", "drop", "clear", "create", "store"].includes(tail[0])) {
+          if (["push", "save"].includes(stashAction(tail)) && stashPushAll(options)) return "control";
+          paths = dash >= 0 ? tail.slice(dash + 1) : [];
+        }
         else if (["merge", "rebase", "cherry-pick", "revert", "pull"].includes(sub)) {
           refs = positional(["-m", "--mainline", "-s", "--strategy", "-X", "--strategy-option", "--onto"]);
           if (sub === "rebase" && value(["--onto"])) refs.unshift(value(["--onto"])!);
@@ -942,7 +1074,7 @@ export function shellProtectedWrite(command: string, configDir: string, platform
           }
         }
         if (["checkout", "reset"].includes(sub) && refs.length) {
-          if (GLOB_CHARACTERS.test(refs[0]) || existingPath(refs[0])) { paths = [...refs, ...(paths ?? [])]; refs = []; }
+          if (dash < 0 && !refs[0].includes("@{") && (GLOB_CHARACTERS.test(refs[0]) || existingPath(refs[0]))) { paths = [...refs, ...(paths ?? [])]; refs = []; }
           else if (refs.length > 1) { paths = [...refs.slice(1), ...(paths ?? [])]; refs = refs.slice(0, 1); }
         }
         if (["checkout", "reset"].includes(sub) && paths?.some(path => GLOB_CHARACTERS.test(path))) {
@@ -951,9 +1083,11 @@ export function shellProtectedWrite(command: string, configDir: string, platform
           paths = paths.filter(path => !GLOB_CHARACTERS.test(path));
           if (!paths.length) { base = previousBase; continue; }
         }
+        if (refs.some(ref => /stash/i.test(ref)) && stashActive(gitCache)) return "control";
         for (const ref of refs) if (gitControlPaths(base, paths ?? [], configDir, gitCache, ref)) return "control";
         if (!refs.length && paths && gitControlPaths(base, paths, configDir, gitCache)) return "control";
         if (sub === "reset" && options.includes("--hard") && refs.length && gitControlPaths(base, paths ?? [], configDir, gitCache)) return "control";
+        recordStashTrail(base, sub, tail, options, paths ?? [], gitCache);
       }
       if (!includeControl && sub === "restore") {
         const paths = gitArgs.slice(gitArgs.indexOf("restore") + 1).filter((word, i, list) => !word.startsWith("-") && !(i > 0 && ["--source", "-s"].includes(list[i - 1])));

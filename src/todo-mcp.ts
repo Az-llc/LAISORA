@@ -1,11 +1,11 @@
 import { z } from "zod";
 import * as l10n from "@vscode/l10n";
 import type * as Sdk from "@anthropic-ai/claude-agent-sdk" with { "resolution-mode": "import" };
-import type { LearningRootGate, RootGateScope } from "./learning-mcp";
+import type { RootGate, RootGateScope } from "./root-gate";
 import {
   isClaudeOwnChange, linkedTodoItem, liveChildren, memoStaleSince, parseTodoChangeId, TODO_ADD_MANY_MAX, TODO_CLAUDE_DEPTH_MAX, TODO_ADD_PLACEMENT_BASES, TODO_TIDY_KINDS, TODO_TIDY_STEPS_MAX, type TodoAddNode, todoAgentMarker,
   todoBindableFolder, todoFailureResultText, TODO_STABLE_TOUCH_MS, TODO_STABLE_PIN_MS, TODO_STABLE_REMOVE_MS,
-  todoConversationFolder, todoDoneTwin, todoFinishedIds, todoTidySignals, todoFolderGroup, todoGroupsOf, todoItemNumbers, todoItemPath, todoPlaceOf, todoPlaceText, todoWriteResultText, TODO_DUE_PATTERN, TODO_GROUP_MAX, TODO_GUESS_REASON_MAX,
+  todoConversationFolder, todoDoneTwin, todoFinishedIds, todoTidySignals, todoFolderGroup, todoGroupsOf, todoItemNumbers, todoItemPath, todoPlaceOf, todoPlaceText, todoWriteResultText, TODO_DUE_PATTERN, TODO_GROUP_MAX, TODO_GUESS_REASON_MAX, TODO_MEMO_TEXT_MAX,
   TODO_PRIORITIES, TODO_SERVER_NAME, TODO_STATE_BRACKETS, TODO_STATE_CHECKBOXES, TODO_STATE_SEPARATORS, TODO_STATE_TRAILING_WORDS, TODO_STATE_WORDS, TODO_TITLE_PARTICLES, todoTitlePlaceOf, todoTitleRepeat, TODO_TOOL_KINDS, todoToolName, type TodoToolKind, TODO_STATES, TODO_TITLE_MAX, TODO_WRITE_TOOLS, WORK_MEMO_SECTIONS, type WorkMemoSection, type TodoDocument, type TodoItem,
   type TodoOperation, type TodoOperationError, type TodoPlacementBasis, type TodoOperationFailure, type TodoOperationResult, type TodoRevertBlock, type TodoTidyStep,
 } from "./todo-model";
@@ -85,6 +85,7 @@ export function todoLinkedInstruction(item: TodoLinkedItem): string {
 
 const id = z.string().min(1).describe("Item id as shown by list.");
 const title = z.string().min(1).max(TODO_TITLE_MAX);
+const memoText = z.string().max(TODO_MEMO_TEXT_MAX, `A work memo section holds at most ${TODO_MEMO_TEXT_MAX} characters; keep the memo to what the next conversation needs.`);
 const due = z.string().regex(TODO_DUE_PATTERN).describe("Due date, YYYY-MM-DD.");
 const group = z.string().min(1).max(TODO_GROUP_MAX).describe("Name of an existing group (the case); sub-items follow the group of their top-level item.");
 const newGroup = z.literal(true).describe("Create the group named in group because the request names a case that matches no existing group. A name close to an existing group is refused even with this.");
@@ -129,8 +130,8 @@ const TODO_INPUTS = {
   move: { id, parent: id.nullable().describe("New parent item id; null = top level."), position, requested: TODO_REQUESTED },
   set_state: { id, state: z.enum(TODO_STATES) },
   write_memo: { id, section: z.enum(WORK_MEMO_SECTIONS).optional().describe("The one section to rewrite; omit when sections is given."),
-    text: z.string().optional().describe("Full new text of that section; replaces the current text."),
-    sections: z.object(Object.fromEntries(WORK_MEMO_SECTIONS.map(section => [section, z.string().optional()]))).strict().optional()
+    text: memoText.optional().describe("Full new text of that section; replaces the current text."),
+    sections: z.object(Object.fromEntries(WORK_MEMO_SECTIONS.map(section => [section, memoText.optional()]))).strict().optional()
       .describe("Several sections to rewrite in this one call, each with its full new text; instead of section and text.") },
   delete: { id },
   group: { action: z.enum(["create", "rename", "delete", "move"]), name: group.describe("The group to act on (create: the new name)."),
@@ -430,7 +431,7 @@ function inputError(kind: TodoToolKind, input: Record<string, unknown>): string 
   }
 }
 
-export function createTodoMcpServer(sdk: Pick<typeof Sdk, "createSdkMcpServer" | "tool">, store: TodoStore, gate: LearningRootGate, log: (message: string) => void,
+export function createTodoMcpServer(sdk: Pick<typeof Sdk, "createSdkMcpServer" | "tool">, store: TodoStore, gate: RootGate, log: (message: string) => void,
   sessionOf: () => string | undefined = () => undefined, contextOf: () => TodoConversationContext | undefined = () => undefined) {
   const run = async (body: () => Promise<Reply>): Promise<Reply> => {
     try { return await body(); }

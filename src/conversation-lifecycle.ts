@@ -1,11 +1,8 @@
-import { applyFallbackModel, fallbackOriginalModel, reportedPermissionMode, resolveFallbackByChoice, type EventProvenance, type FallbackRevertOutcome, type NormalizedEventBody, type PermissionModeId, type PermissionModeRequest } from "./protocol";
-import { join } from "node:path";
+import { applyFallbackModel, fallbackCoalesces, fallbackOriginalModel, fallbackTurnKey, fallbackUnresolved, reportedPermissionMode, resolveFallbackByChoice, type EventProvenance, type FallbackRevertOutcome, type NormalizedEventBody, type PermissionModeId, type PermissionModeRequest } from "./protocol";
 import { randomUUID } from "node:crypto";
 import { getLaisoraConfiguration } from "./claude-settings";
-import { EXPERIMENT_HOLDOUT_PERCENT } from "./learning-experiment";
 import { placementSettingsOf } from "./placement-line";
-import { postSettingsState } from "./settings-panel";
-import { cachedExternalModels } from "./gateway-host-actions";
+import { cachedExternalModels, noteRunningExecutorVersion } from "./gateway-host-actions";
 import { noteCliUpdateOpportunity } from "./claude-cli-update";
 
 import {
@@ -63,7 +60,7 @@ export function postOrchestrationView(s: Session): void {
       const placementSettings = placementSettingsOf(current);
       return orchestrationViewForConversation(conv, {
         orchestrationEnabled: current.get<boolean>("orchestration.enabled")!,
-        learningEnabled: placementSettings.learningEnabled,
+        guardEnabled: placementSettings.guardEnabled,
         memoryBlockProjectType: placementSettings.blockProjectType,
         orchestrationAgents: current.get<unknown>("orchestration.agents"),
         externalTimeoutMinutes: current.get<number>("orchestration.externalTimeoutMinutes")!,
@@ -156,7 +153,7 @@ function observeLaunchModel(st: SessionStore | null | undefined, s: Session, con
   if (listSettled) check.listSettled = true;
   if (check.observed === undefined || !check.listSettled || s.conversation !== conv) return;
   s.launchModelCheck = undefined;
-  if (s.modelFallback !== undefined && s.modelFallback.resolvedAt === undefined) return;
+  if (fallbackUnresolved(s.modelFallback)) return;
   const requested = launchModelResolved(check.requested, s.models);
   const observed = launchModelResolved(check.observed, s.models);
   if (requested === undefined || observed === undefined || requested === observed) return;
@@ -347,6 +344,7 @@ async function applyModelChange(
       }
       const targetState = profileTargetState(s, logicalGeneration, processGeneration, conv);
       if (targetState === "discard") return "discarded";
+      if (restore !== undefined && !restore.stillWanted()) return "unwanted";
       if (targetState === "restarted") {
         if (restore === undefined) reportProfileRestart(s, "model");
         return "failed";
@@ -374,21 +372,21 @@ async function applyModelChange(
         : label === null
           ? l10n.t("LAISORA: Reset the model to the default (removed model from settings.json).")
           : l10n.t("LAISORA: Changed model to {0} (saved to settings.json).", label);
-    const openFallback = s.modelFallback?.resolvedAt === undefined ? s.modelFallback : undefined;
+    const openFallback = fallbackUnresolved(s.modelFallback) ? s.modelFallback : undefined;
     s.modelFallback = resolveFallbackByChoice(s.modelFallback, requested, Date.now(), s.models);
     if (restore === undefined && (s.modelFallback?.autoRevert === "applied" || s.modelFallback?.autoRevert === "deferred")) {
       s.modelFallback = { ...s.modelFallback, autoRevert: "chosen" };
-    }
-    if (restore === undefined) st.post({ type: "modelChanged", tabId: s.tabId, model: requested, notice, applied: true });
-    if (restore === undefined && openFallback !== undefined) {
-      s.pushEvent({ kind: "model_fallback_revert", turnId: openFallback.notice.turnId,
-        originalModel: fallbackOriginalModel(openFallback), outcome: "chosen" });
     }
     s.configuredEffortSnapshot = undefined;
     s.appliedModel = undefined;
     s.appliedEffort = undefined;
     s.configuredEffortGeneration += 1;
     publishConfiguredEffort(st, s);
+    if (restore === undefined) st.post({ type: "modelChanged", tabId: s.tabId, model: requested, notice, applied: true });
+    if (restore === undefined && openFallback !== undefined) {
+      s.pushEvent({ kind: "model_fallback_revert", turnId: openFallback.notice.turnId, fallbackKey: fallbackTurnKey(openFallback.notice),
+        originalModel: fallbackOriginalModel(openFallback), outcome: "chosen" });
+    }
     output.appendLine(`[${s.title}] setModel: ${requested ?? "(既定)"} を適用`);
     if (conv === null || conv.isClosed) {
       if (restore !== undefined) return "deferred";
@@ -410,7 +408,7 @@ type LiveEventBody = NormalizedEventBody & { provenance?: EventProvenance };
 function noteFallbackRevert(s: Session, conv: ClaudeConversation, ev: LiveEventBody): LiveEventBody {
   if (ev.kind !== "model_refusal_fallback" || ev.scope !== "session") return ev;
   const pending = s.fallbackRevert;
-  if (pending?.conversation !== conv || pending.turnId !== ev.turnId || s.modelFallback?.resolvedAt !== undefined) {
+  if (pending?.conversation !== conv || !fallbackCoalesces(s.modelFallback, ev)) {
     s.fallbackRevert = { conversation: conv, turnId: ev.turnId, originalModel: ev.originalModel, priorOverride: s.modelOverride };
   }
   return { ...ev, autoRevert: "pending" };
@@ -425,8 +423,10 @@ function settleFallbackRevert(st: SessionStore | null | undefined, s: Session, c
   const stillWanted = (): boolean => s.modelFallback !== undefined && s.modelFallback.notice === notice &&
     s.modelFallback.resolvedAt === undefined;
   if (!stillWanted()) return;
+  const fallbackKey = notice !== undefined ? fallbackTurnKey(notice) : undefined;
   const record = (outcome: FallbackRevertOutcome): void =>
-    s.pushEvent({ kind: "model_fallback_revert", turnId: pending.turnId, originalModel: pending.originalModel, outcome });
+    s.pushEvent({ kind: "model_fallback_revert", turnId: pending.turnId, ...(fallbackKey !== undefined ? { fallbackKey } : {}),
+      originalModel: pending.originalModel, outcome });
   if (!st) {
     record("failed");
     return;
@@ -500,7 +500,7 @@ async function requestPermissionMode(
 
 function launchModel(s: Session): string | null | undefined {
   const fallback = s.modelFallback;
-  if (fallback !== undefined && fallback.resolvedAt === undefined) return fallback.appliedModel;
+  if (fallbackUnresolved(fallback)) return fallback.appliedModel;
   if (typeof s.modelOverride === "string") return s.modelOverride;
   if (fallback !== undefined && (fallback.autoRevert === "applied" || fallback.autoRevert === "deferred")) return fallback.appliedModel;
   return s.initialModel ?? undefined;
@@ -586,13 +586,12 @@ export async function handleConversationMessage(
         }
       }
       msg.images = images;
-      // One uuid for the live event and the CLI's transcript record, so both name the request alike.
       const messageUuid = randomUUID();
       const sentAt = Date.now();
       if (!isNonHumanCommandInput(msg.text)) {
         disposition("accepted-human");
         target!.pushEvent(
-          { kind: "user_message", turnId: null, text: msg.text, images: msg.images, sentAt, uuid: messageUuid },
+          { kind: "user_message", turnId: null, text: msg.text, images: msg.images, sentAt, uuid: messageUuid, provenance: { path: "live" } },
           undefined,
           { timestamp: sentAt },
           clientToken
@@ -636,9 +635,28 @@ function crashResumeSessionIdOf(s: Session): string | undefined {
   return s.conversation?.isClosed && !isUnusedSession(s) ? s.auth?.sessionId ?? undefined : undefined;
 }
 
-export function warmup(s: Session): void {
-  if ((s.conversation && !s.conversation.isClosed) || s.closed || s.clearing) return;
-  void ensureConversation(s).catch((e: unknown) =>
+const pendingCliStarts = new WeakMap<Session, { started: Promise<void>; resolve: () => void }>();
+
+export function cliStartOf(s: Session): Promise<void> {
+  if (s.conversation && !s.conversation.isClosed) return Promise.resolve();
+  let pending = pendingCliStarts.get(s);
+  if (pending === undefined) {
+    let resolve!: () => void;
+    const started = new Promise<void>((r) => { resolve = r; });
+    pending = { started, resolve };
+    pendingCliStarts.set(s, pending);
+  }
+  return pending.started;
+}
+
+function noteCliStarted(s: Session): void {
+  pendingCliStarts.get(s)?.resolve();
+  pendingCliStarts.delete(s);
+}
+
+export function warmup(s: Session): Promise<void> {
+  if ((s.conversation && !s.conversation.isClosed) || s.closed || s.clearing) return Promise.resolve();
+  return ensureConversation(s).catch((e: unknown) =>
     output.appendLine(`[${s.title}] ${sinceActivation()} warmup失敗: ${String(e)}`)
   );
 }
@@ -698,8 +716,6 @@ async function ensureConversationInner(s: Session, requestedAt: number): Promise
   s.effectiveEffort = undefined;
 
   const placementSettings = placementSettingsOf(cfg);
-  const learningEnabled = placementSettings.learningEnabled;
-  const learningConfiguredSnapshot = learningEnabled ? await resolveConfiguredEffortSnapshot(cwd, settingSources) : undefined;
   const todoEnabled = todoBetaEnabled(cfg);
   const todoLinkedItem = todoEnabled ? await todoLinkedItemAtStart(s) : undefined;
   if (s.closed || s.logicalGeneration !== logicalGenerationAtStart) {
@@ -729,18 +745,8 @@ async function ensureConversationInner(s: Session, requestedAt: number): Promise
     planCompletionVerdict: (toolName, input, toolUseId, admittedLaunches) => completionVerdict(s.evidenceIndex.timeBuckets, toolName, input, toolUseId,
       id => isRunningMainLane(s.workModel, id), admittedLaunches),
     orchestrationEnabled: cfg.get<boolean>("orchestration.enabled")! === true,
-    learningEnabled,
+    guardEnabled: placementSettings.guardEnabled,
     memoryBlockProjectType: placementSettings.blockProjectType,
-    learningSwitches: () => {
-      const current = getLaisoraConfiguration();
-      return { enabled: current.get<boolean>("learning.enabled")!, automaticAdoption: current.get<boolean>("learning.automaticAdoption", true),
-        targetInjection: current.get<boolean>("learning.targetInjection", true), observationDelivery: current.get<boolean>("learning.observationDelivery", true),
-        publicDelivery: current.get<boolean>("learning.publicDelivery", true), experiment: current.get<boolean>("learning.experiment", true),
-        guard: current.get<boolean>("learning.guard", true) };
-    },
-    learningHoldoutPercent: () => getLaisoraConfiguration().get<number>("learning.holdoutPercent", EXPERIMENT_HOLDOUT_PERCENT),
-    learningDirectory: extensionContext?.globalStorageUri?.fsPath ? join(extensionContext.globalStorageUri.fsPath, "laisora-learning") : undefined,
-    configuredResolvedModel: learningConfiguredSnapshot?.resolvedModel,
     orchestrationAgents: cfg.get<unknown>("orchestration.agents"),
     externalModels: cachedExternalModels(),
     externalTimeoutMinutes: cfg.get<number>("orchestration.externalTimeoutMinutes")!,
@@ -748,10 +754,10 @@ async function ensureConversationInner(s: Session, requestedAt: number): Promise
     orchestrationPluginDirectory: orchestrationPluginDirectoryOf(extensionContext?.globalStorageUri?.fsPath),
     rosterEvidenceDirectory: store?.rosterEvidenceDirectory,
     conductorPolicy: cfg.get<string>("orchestration.conductorPolicy")!,
-    onLearningRecorded: postSettingsState,
     onOrchestrationChanged: () => {
       if (s.conversation === conv) postOrchestrationView(s);
     },
+    onCliVersion: (version) => noteRunningExecutorVersion("claude", version),
     interruptForceKillTimeoutMs: cfg.get<number>("interruptForceKillTimeoutMs")!,
     onEvent: (raw, conversationId, meta) => {
       const own = conversationId === s.expectedConversationId && !s.closed;
@@ -801,15 +807,18 @@ async function ensureConversationInner(s: Session, requestedAt: number): Promise
     s.cliStartedAt = convStartT0;
     await conv.start();
     const startedAt = Date.now();
+    const startBreakdown = conv.startBreakdown();
     output.appendLine(
       `[${s.title}] ${sinceActivation()} CLI 起動: ${startedAt - requestedAt}ms` +
-        `（待ち ${innerT0 - requestedAt}ms / 設定 ${convStartT0 - innerT0}ms / start ${startedAt - convStartT0}ms）`
+        `（待ち ${innerT0 - requestedAt}ms / 設定 ${convStartT0 - innerT0}ms / start ${startedAt - convStartT0}ms` +
+        `${startBreakdown === undefined ? "" : ` = ${startBreakdown}`}）`
     );
     if (s.closed || s.logicalGeneration !== logicalGenerationAtStart) {
       void conv.dispose();
       throw new Error(l10n.t("The logical session of this tab changed while the conversation was starting (restore or clear)."));
     }
     s.conversation = conv;
+    noteCliStarted(s);
     if (s.permissionMode !== launchPermissionMode) {
       void requestPermissionMode(store, s, s.permissionMode, launchPermissionMode).catch((e: unknown) =>
         output.appendLine(`[${s.title}] setPermissionMode 失敗: ${String(e)}`));

@@ -99,7 +99,6 @@ export async function handleWebviewMessage(
       case "runHostAction":
         await runHostActionMessage(msg);
         break;
-      case "analyzeCurrent":
       case "llmAnalysisRequest":
       case "suggestSessionName":
       case "summarizeSession":
@@ -148,6 +147,5 @@ export async function handleWebviewMessage(
         fatal: false,
       });
     }
-    void st.postTo(sender, { type: "analysisFailed", kind: "script", ...("tabId" in msg ? { tabId: msg.tabId } : {}) });
   }
 }

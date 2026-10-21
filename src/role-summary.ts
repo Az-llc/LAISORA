@@ -229,7 +229,7 @@ export function deriveRoleSummary(input: {
   const agents = flattenAgents(input.phases, input.unlinkedAgents);
   let rollupAgentCount = 0;
   for (const phase of input.phases) {
-    if (phase.kind === "rollup" && (input.generationBoundaryAt === undefined || phase.startedAt >= input.generationBoundaryAt)) rollupAgentCount += phase.agentCount;
+    if (phase.kind === "rollup") rollupAgentCount += phase.agentCount;
   }
   const currentAgents = agents.filter(a => input.generationBoundaryAt === undefined || a.startedAt !== undefined && a.startedAt >= input.generationBoundaryAt);
   const recoveredCount = currentAgents.filter((a) => a.origin === "restored").length;

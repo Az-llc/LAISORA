@@ -5,7 +5,6 @@ import { appendFile, mkdir, open, readFile, readdir, lstat, readlink, rm, stat, 
 import { EXTERNAL_RUN_MARKER_HEARTBEAT_MS, externalRunMarkerFresh } from "./cli-update-policy";
 import { createHash } from "node:crypto";
 import { homedir } from "node:os";
-import type { PromptBudget } from "./learning-delivery";
 import { delimiter, dirname, isAbsolute, join, relative, resolve } from "node:path";
 import { buildClaudeEnv, claudeConfigDir, envValueOf } from "./claude-env";
 import { gitInertEnv, isControlPath } from "./placement-guard";
@@ -17,10 +16,8 @@ export type { ExternalRow } from "./orchestration-roster";
 import { EXECUTORS, EXTERNAL_EXECUTORS, isExternalExecutorId, isExternalModel, tokenUsage, type TokenUsage, type ExecutorProbe } from "./orchestration-executors";
 export { tokenUsage, parseAgyModels, parseCodexModels } from "./orchestration-executors";
 export type { TokenUsage } from "./orchestration-executors";
-export const LEARNING_ADDITION_CODE_POINT_CAP = 2000;
 export const WINDOWS_COMMAND_LINE_UTF16_LIMIT = 32767;
-export const DISPATCH_BUDGET_EXCEEDED = "R-LRN-35: task prompt exceeds executor dispatch budget";
-export const DISPATCH_INTERNAL_ERROR = "R-LRN-35: internal error while preparing the task prompt; the call was not sent";
+export const EXTERNAL_COMMAND_LINE_EXCEEDED = "R-ORC-12: task prompt exceeds the executor command-line limit";
 export interface ExternalRunRecord {
   readonly kind: "external";
   readonly toolUseId?: string;
@@ -90,8 +87,6 @@ export interface AgentRunRecord {
 export type OrchestrationRunRecord = ExternalRunRecord | AgentRunRecord;
 export type ExternalSpawn = (executable: string, args: string[], options: SpawnOptions) => ChildProcess;
 export interface ExternalDependencies {
-  preparePrompt?: (prompt: string, packaging: string, budget: PromptBudget) => string | Promise<string>;
-  onAccepted?: () => Promise<void> | undefined;
   spawn?: ExternalSpawn;
   worktrees?: (cwd: string) => Promise<string[]>;
   commonDir?: (dir: string) => Promise<string | undefined>;
@@ -197,15 +192,6 @@ export async function readRunRecords(directory: string, select: (raw: Record<str
 export async function readSessionExternalRuns(directory: string, sessionId: string): Promise<SessionExternalRuns> {
   const result = await readRunRecords(directory, raw => raw.sessionId === sessionId && raw.kind !== "agent");
   return { ...result, runs: result.runs.filter((run): run is ExternalRunRecord => run.kind === "external") };
-}
-
-export async function readConversationRuns(directory: string | undefined, conversation: string, live: readonly OrchestrationRunRecord[]): Promise<OrchestrationRunRecord[]> {
-  const stored = directory ? await readRunRecords(directory, raw => raw.conversation === conversation) : undefined;
-  if (stored?.readError) throw new Error("R-ORC-14: could not read orchestration runs");
-  return [...(stored?.runs ?? []), ...live.flatMap(raw => {
-    const run = decodeExternalRunRecord(raw) ?? decodeAgentRunRecord(raw);
-    return run?.conversation === conversation ? [run] : [];
-  })];
 }
 
 export function resolveExternalExecutable(executor: ExternalRow["executor"], env = process.env, platform = process.platform): string | undefined {
@@ -341,7 +327,6 @@ async function capture(executable: string, args: string[], cwd: string | undefin
       const launch = externalLaunch(executable, args, env);
       child = (deps.spawn ?? spawn)(launch.executable, launch.args, { cwd, env: launch.env, shell: false, windowsHide: true,
         detached: process.platform !== "win32", stdio: ["ignore", "pipe", "pipe"] });
-      child.once("spawn", () => { void deps.onAccepted?.(); });
     } catch (error) { captureSpawnCode(error); finish(null, "failed", runFailureReason("R-ORC-13: external executor launch failed", error)); return; }
     child.stdout?.setEncoding("utf8");
     child.stdout?.on("data", (data) => { output = (output + data.toString()).slice(0, maxOutput); });
@@ -943,8 +928,8 @@ export async function runExternal(...args: Parameters<typeof runExternalUntracke
   const stopMarker = await startMarker(`${RUN_MARKER_PREFIX}${process.pid}-${++externalRunSerial}`);
   try {
     const waitResult = await waitForExecutorUpdate(row.executor, deps.signal, started + totalMs);
-    if (waitResult === "stopped") return externalRunOutcome(row, started, { outcome: "stopped", answer: EXTERNAL_STOPPED }, { accepted: false });
-    if (waitResult === "timeout") return externalRunOutcome(row, started, { outcome: "timeout", answer: EXTERNAL_UPDATE_WAIT_TIMEOUT }, { accepted: false });
+    if (waitResult === "stopped") return externalRunOutcome(row, started, { outcome: "stopped", answer: EXTERNAL_STOPPED }, {});
+    if (waitResult === "timeout") return externalRunOutcome(row, started, { outcome: "timeout", answer: EXTERNAL_UPDATE_WAIT_TIMEOUT }, {});
     const waited = Date.now() - started;
     activeExternalRuns++;
     try {
@@ -962,8 +947,6 @@ async function runExternalUntracked(row: ExternalRow, input: ExternalInput, opti
   let parsed: ReturnType<typeof parseExternalOutput> = { outcome: "failed", answer: "R-ORC-13: external executor not found." };
   let args: string[];
   let cwd: string | undefined;
-  let accepted = false;
-  let acceptance: Promise<void> = Promise.resolve();
   let attestation: CodexAttestation | undefined;
   let executable: string | undefined;
   let snapshot: Awaited<ReturnType<typeof snapshotControlFiles>> | undefined;
@@ -979,23 +962,18 @@ async function runExternalUntracked(row: ExternalRow, input: ExternalInput, opti
   if (deps.signal?.aborted) { parsed = { outcome: "stopped", answer: EXTERNAL_STOPPED }; return completedRun(); }
   try {
     executable = (deps.resolve ?? resolveExternalExecutable)(row.executor);
-    if (!executable) return { ...completedRun(), boundaryCode: "target_unavailable" as const };
+    if (!executable) return completedRun();
     const base = externalPrompt(row.executor, input, row.role);
     const env = buildClaudeEnv(process.env, options.apiKeyPolicy).env;
     const commandLineUsage = (prompt: string) => {
       const launch = externalLaunch(executable!, externalArgv(row, cwd!, options.timeoutMinutes, prompt), env);
       return windowsCommandLineUnits(launch.executable, launch.args);
     };
-    const budget: PromptBudget = { adapter: `${row.executor}-createprocess-utf16-v1`, learningAdditionCap: LEARNING_ADDITION_CODE_POINT_CAP,
-      commandLineLimit: WINDOWS_COMMAND_LINE_UTF16_LIMIT, commandLineUsage };
-    if (commandLineUsage(base) > budget.commandLineLimit!) throw new Error(DISPATCH_BUDGET_EXCEEDED);
-    const prompt = await deps.preparePrompt?.(base, JSON.stringify(externalArgv(row, cwd, options.timeoutMinutes, "")), budget) ?? base;
-    if (commandLineUsage(prompt) > budget.commandLineLimit!) throw new Error(DISPATCH_BUDGET_EXCEEDED);
-    args = externalArgv(row, cwd, options.timeoutMinutes, prompt);
+    if (commandLineUsage(base) > WINDOWS_COMMAND_LINE_UTF16_LIMIT) throw new Error(EXTERNAL_COMMAND_LINE_EXCEEDED);
+    args = externalArgv(row, cwd, options.timeoutMinutes, base);
   } catch (error) {
-    parsed = { outcome: "failed", answer: error instanceof Error && error.message.startsWith("R-LRN-35:")
-      ? DISPATCH_BUDGET_EXCEEDED : error instanceof Error && [
-        "R-ORC-12: files must be absolute paths", "R-ORC-12: invalid executor settings", "R-ORC-12: unsupported executable shim",
+    parsed = { outcome: "failed", answer: error instanceof Error && [
+        EXTERNAL_COMMAND_LINE_EXCEEDED, "R-ORC-12: files must be absolute paths", "R-ORC-12: invalid executor settings", "R-ORC-12: unsupported executable shim",
       ].includes(error.message) ? error.message : runFailureReason("R-ORC-12: invalid external executor input or settings.", error) };
     return completedRun();
   }
@@ -1004,18 +982,12 @@ async function runExternalUntracked(row: ExternalRow, input: ExternalInput, opti
     if (executable) {
       snapshot = await snapshotControlFiles(cwd, resolve(options.configDir ?? claudeConfigDir()));
       const result = await capture(executable, args, cwd, buildClaudeEnv(process.env, options.apiKeyPolicy).env,
-        deps.timeoutMs ?? options.timeoutMinutes * 60_000, { ...deps, onAccepted: () => {
-          accepted = true;
-          acceptance = Promise.resolve(deps.onAccepted?.());
-          void acceptance.catch(() => undefined);
-          return acceptance;
-        } });
-      await acceptance;
+        deps.timeoutMs ?? options.timeoutMinutes * 60_000, deps);
       if (row.executor === "codex") attestation = await observeCodexSession(result.output, started, Date.now(), deps.codexHome);
       parsed = result.status === "timeout" ? { outcome: "timeout", answer: result.reason ?? "External executor timed out." }
         : result.status === "stopped" ? { outcome: "stopped", answer: result.reason ?? "External executor stopped." }
         : result.reason ? { outcome: "failed", answer: result.reason } : parseExternalOutput(row.executor, result.output, result.code);
-    } else return { ...completedRun(), boundaryCode: "target_unavailable" as const };
+    } else return completedRun();
   } catch (error) {
     parsed = { outcome: "failed", answer: runFailureReason("R-ORC-13: external executor failed.", error) };
   } finally {
@@ -1025,18 +997,18 @@ async function runExternalUntracked(row: ExternalRow, input: ExternalInput, opti
   }
   return completedRun();
   function completedRun() {
-    return externalRunOutcome(row, started, parsed, { cwd, attestation, controlWarning, accepted });
+    return externalRunOutcome(row, started, parsed, { cwd, attestation, controlWarning });
   }
 }
 
 function externalRunOutcome(row: ExternalRow, started: number, parsed: ReturnType<typeof parseExternalOutput>,
-  extra: { cwd?: string; attestation?: CodexAttestation; controlWarning?: string; accepted: boolean }) {
-  const { cwd, attestation, controlWarning, accepted } = extra;
+  extra: { cwd?: string; attestation?: CodexAttestation; controlWarning?: string }) {
+  const { cwd, attestation, controlWarning } = extra;
   const ended = Date.now();
   const record: ExternalRunRecord = Object.freeze({ kind: "external", ...(cwd ? { cwd } : {}), role: row.role, executor: row.executor, ...(row.model ? { model: row.model } : {}),
     requestedModel: row.model || "unknown", requestedEffort: row.effort ?? "none", observedModel: attestation?.model ?? "unknown", observedEffort: attestation?.effort ?? "unknown",
     ...(attestation ? { attestation } : {}),
     ...(row.effort === undefined ? {} : { effort: row.effort }), startedAt: new Date(started).toISOString(), endedAt: new Date(ended).toISOString(), durationMs: ended - started,
     outcome: parsed.outcome, reason: parsed.outcome === "ok" ? undefined : parsed.answer, usage: parsed.usage });
-  return { record, accepted, result: { isError: parsed.outcome !== "ok", content: [{ type: "text" as const, text: parsed.answer + (controlWarning ? `\n${controlWarning}` : "") }] } };
+  return { record, result: { isError: parsed.outcome !== "ok", content: [{ type: "text" as const, text: parsed.answer + (controlWarning ? `\n${controlWarning}` : "") }] } };
 }

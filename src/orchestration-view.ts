@@ -20,7 +20,7 @@ export function orchestrationViewForConversation(conv: ClaudeConversation, curre
   if (!conv.orchestrationActive) return undefined;
   return projectOrchestrationView(conv.orchestrationRoster, conv.orchestrationExternalRoster,
     conv.orchestrationSettingsChanged(current), conv.observedAgentSettings, conv.observedAgentRuns,
-    conv.orchestrationRuns.filter((run) => run.kind === "external"), conv.orchestrationPerCallEffort, conv.recordedAgentRoles, conv.orchestrationAgentVariants);
+    conv.orchestrationRuns.filter((run) => run.kind === "external"), true, conv.recordedAgentRoles, conv.orchestrationAgentVariants);
 }
 
 export function orchestrationViewFromStartingRoster(evidence: RosterEvidence): OrchestrationView | undefined {

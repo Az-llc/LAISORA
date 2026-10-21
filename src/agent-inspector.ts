@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { join } from "node:path";
-import { pathIsInside, realPath, type RealPath } from "./path-containment";
+import { fileIdentityKey, pathIsInside, realPath, sameFileIdentity, type FileIdentity, type RealPath } from "./path-containment";
 export { pathIsInside, realPathOrNearestSync } from "./path-containment";
 import { open, readFile, readdir, stat } from "node:fs/promises";
 import type {
@@ -128,8 +128,7 @@ export async function readAgentInspectorPage(
     .catch(notFoundOrReadFailed("transcript-unavailable"));
   if (!fileStat.isFile()) throw new AgentInspectorReadError("transcript-unavailable");
   const fingerprint = { size: fileStat.size, mtimeMs: fileStat.mtimeMs };
-  const cacheKey = [transcriptPath, fileStat.size, fileStat.mtimeMs, fileStat.ctimeMs, fileStat.dev, fileStat.ino]
-    .join("\u0000");
+  const cacheKey = [transcriptPath, fileIdentityKey(fileStat)].join("\u0000");
 
   let index = 0;
   const cursorToken = request.cursor;
@@ -344,7 +343,7 @@ async function locateAgent(
 
 async function readTranscriptSample(
   realPath: string,
-  expected: { size: number; mtimeMs: number; ctimeMs: number; dev: number; ino: number },
+  expected: FileIdentity,
   key: string,
   readBudget: number
 ): Promise<CachedTranscript> {
@@ -357,7 +356,7 @@ async function readTranscriptSample(
   const truncatedReasons: AgentInspectorTruncatedReason[] = [];
   try {
     const opened = await handle.stat();
-    if (!sameFileFingerprint(opened, expected)) throw new AgentInspectorReadError("read-failed");
+    if (!sameFileIdentity(opened, expected)) throw new AgentInspectorReadError("read-failed");
     if (expected.size <= readBudget) {
       const buffer = Buffer.alloc(expected.size);
       const read = expected.size > 0 ? await handle.read(buffer, 0, expected.size, 0) : { bytesRead: 0 };
@@ -386,7 +385,7 @@ async function readTranscriptSample(
       truncatedReasons.push("read-limit");
     }
     const finished = await handle.stat();
-    if (!sameFileFingerprint(finished, expected)) throw new AgentInspectorReadError("read-failed");
+    if (!sameFileIdentity(finished, expected)) throw new AgentInspectorReadError("read-failed");
   } catch {
     throw new AgentInspectorReadError("read-failed");
   } finally {
@@ -625,14 +624,6 @@ function isHighSurrogate(code: number): boolean {
 
 function isLowSurrogate(code: number): boolean {
   return code >= 0xdc00 && code <= 0xdfff;
-}
-
-function sameFileFingerprint(
-  actual: { size: number; mtimeMs: number; ctimeMs: number; dev: number; ino: number },
-  expected: { size: number; mtimeMs: number; ctimeMs: number; dev: number; ino: number }
-): boolean {
-  return actual.size === expected.size && actual.mtimeMs === expected.mtimeMs &&
-    actual.ctimeMs === expected.ctimeMs && actual.dev === expected.dev && actual.ino === expected.ino;
 }
 
 function clipUtf8(value: string, maxBytes: number): string {

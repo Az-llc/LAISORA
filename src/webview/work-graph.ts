@@ -1,7 +1,7 @@
 import * as l10n from "@vscode/l10n";
 import { ROW_H } from "./row-frame";
 import { planConductorRunning, planFrame, planLive, planMemberEnd, planNow, planRowIndexAt, planRowPeriod, planRowProvisional, planSpansMs, UNMEASURED_LABEL, type PlanFrameMembers, type PlanRowPeriod, type PlanSpan } from "../plan-steps";
-import type { SemanticModelPayload, TimeBucketsCoverage, WorkAgentNode, WorkModelPayload } from "../protocol";
+import { displayedAncestorUsageGap, type SemanticModelPayload, type TimeBucketsCoverage, type WorkAgentNode, type WorkModelPayload } from "../protocol";
 import type { AgentSpanView, BackgroundTaskSpanView, ConductorModel, PlanBlockStepView, RequestBlockView, TimeBucket, TimeBucketInterval, TimeBucketView } from "../time-buckets";
 import type { AgentInspector, InspectorAxis } from "./agent-inspector";
 import { failureCount } from "./failure-count";
@@ -88,6 +88,11 @@ export function coverageRows(coverage: WorkCoverageView & CoverageBackfillHint, 
   if (coverage.hierarchyIncomplete === true) {
     summaryCauseExplained = true;
     summaryGaps.push(l10n.t("Could not fully read the subagent list, so the unread work is not included in the totals"));
+  }
+  const ancestorUsageGap = timeBuckets?.ancestorUsageReadError ?? displayedAncestorUsageGap(coverage);
+  if (ancestorUsageGap !== undefined) {
+    summaryGaps.push(l10n.t("Could not fully read the earlier conversation's records, so child token usage recorded there is not included in the totals"));
+    reasons.push(ancestorUsageGap);
   }
   if (coverage.reducerErrorCount !== undefined) {
     summaryCauseExplained = true;

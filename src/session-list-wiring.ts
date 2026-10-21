@@ -9,8 +9,8 @@ import { homedir } from "node:os";
 import { AccountUsageFetcher, rateLimitsViaUsageCommand } from "./account-usage";
 import { claudeConfigDir, claudeProjectsDir } from "./claude-env";
 import { configuredClaudeExecutablePath, getLaisoraConfiguration, resolveSessionCwd } from "./claude-settings";
-import { resolveClaudeCodeStartup } from "./claudeCliResolver";
-import { sdkClaudeCodeVersion, type ClaudeConversation } from "./claudeHost";
+import { resolveClaudeCodeExecutable } from "./claudeCliResolver";
+import type { ClaudeConversation } from "./claudeHost";
 import type { Session } from "./extension";
 import { extensionContext, output, sinceActivation, store } from "./host-context";
 import {
@@ -28,6 +28,7 @@ import {
   resolveSessionImage,
   sessionTranscriptRef,
 } from "./session-files";
+import { IN_FLIGHT_KEY, isHandoffForkInFlight } from "./handoff-runner";
 import { normalizeTitleValue } from "./session-display-title";
 import { sessionRecordId } from "./session-record";
 import type { SessionCandidate } from "./session-list";
@@ -138,6 +139,9 @@ export function readPersistedOpenTabs(): PersistedOpenTab[] {
   }
   return entries.sort((a, b) => a.order - b.order);
 }
+export function handoffForkInFlight(sessionId: string, now: number): boolean {
+  return isHandoffForkInFlight(extensionContext?.globalState?.get<unknown>(IN_FLIGHT_KEY), sessionId, now);
+}
 const HIDDEN_SESSIONS_KEY = "history.hiddenSessions";
 export function hiddenSessionIds(): Set<string> {
   const raw = extensionContext?.globalState.get<unknown>(HIDDEN_SESSIONS_KEY, []);
@@ -217,6 +221,15 @@ export async function sessionSummaryOf(sessionId: string): Promise<string | unde
   return typeof info?.summary === "string" ? info.summary : undefined;
 }
 
+export async function sessionDisplayTitleOf(sessionId: string): Promise<string | undefined> {
+  const summary = await sessionSummaryOf(sessionId);
+  return summary === undefined ? undefined : displayTitleFromSummary(summary, sessionId);
+}
+
+export function holdsChosenTitle(session: Session): boolean {
+  return session.unpersistedChosenTitle !== null;
+}
+
 export async function refreshTabTitle(session: Session): Promise<void> {
   const sessionId = session.auth?.sessionId;
   const generation = session.logicalGeneration;
@@ -227,7 +240,7 @@ export async function refreshTabTitle(session: Session): Promise<void> {
     if (summary === undefined) return;
     if (session.logicalGeneration !== generation || session.closed) return;
     session.titleRefreshed = true;
-    if (session.unpersistedChosenTitle !== null) return;
+    if (holdsChosenTitle(session)) return;
     const title = displayTitleFromSummary(summary, sessionId);
     if (title === session.title) return;
     session.title = title;
@@ -314,7 +327,7 @@ async function listPastSessions(
   }
   const scanDoneT = Date.now();
   const candidates = continuation ? entries : rankSessionCandidates(entries).filter(c =>
-    options.showHidden === true || !hidden.has(c.sessionId));
+    (options.showHidden === true || !hidden.has(c.sessionId)) && !handoffForkInFlight(c.sessionId, scanDoneT));
   const token = continuation?.token ?? requestId;
   const knownIds = continuation?.knownIds ?? new Set(Object.keys(known));
   const origins = continuation?.origins ?? new Map<string, "claude" | "unknown" | "failed">();
@@ -617,7 +630,7 @@ export async function handleSessionFileMessage(
             apiKeyPolicy,
             signal,
             resolveExecutablePath: async () =>
-              (await resolveClaudeCodeStartup(configuredClaudeExecutablePath(cfg), sdkClaudeCodeVersion())).executable.path,
+              (await resolveClaudeCodeExecutable(configuredClaudeExecutablePath(cfg))).path,
           }),
       });
       if (snapshot) void st.postTo(sender, { type: "accountUsage", replyTo: msg.requestId, ...snapshot });

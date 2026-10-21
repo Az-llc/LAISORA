@@ -2,7 +2,7 @@ import { UsageLimitResume, SDK_AUTO_CONTINUE_SETTINGS } from "./usage-limit-resu
 import { readClaudeCodeSettings, onAutoContinueSettingChange } from "./claude-code-settings";
 import { modelLabelWithVersion } from "./model-display-name";
 export { modelLabelWithVersion } from "./model-display-name";
-import { readConversationRuns, appendRunRecord, DISPATCH_BUDGET_EXCEEDED, DISPATCH_INTERNAL_ERROR, externalDescription, isExternalTimeout, observeAgentRun, runExternal, runFailureReason, type ExternalRow, type OrchestrationRunRecord, type AgentRunRecord } from "./orchestration-external";
+import { appendRunRecord, externalDescription, isExternalTimeout, observeAgentRun, runExternal, runFailureReason, type ExternalRow, type OrchestrationRunRecord, type AgentRunRecord } from "./orchestration-external";
 
 import { randomUUID } from "node:crypto";
 import { isDeepStrictEqual } from "node:util";
@@ -34,7 +34,7 @@ import type {
   UsageSnapshot,
 } from "./protocol";
 import { summarizeToolInput, type ApiKeyPolicy } from "./protocol";
-import { resolveClaudeCodeStartup } from "./claudeCliResolver";
+import { resolveClaudeCodeExecutable } from "./claudeCliResolver";
 import {
   buildClaudeEnv,
   claudeConfigDir,
@@ -49,31 +49,21 @@ import type { ProgressTrackingMode } from "./progress-protocol";
 import { PROGRESS_WIRE_TOOL_NAME } from "./artifact-access";
 import { FILE_WRITING_TOOLS } from "./file-writing-tools";
 import { z } from "zod";
-import { ClaudeLiveNormalizer, parseAliases } from "./claude-normalizer";
-import { AGENT_EFFORT_ARGUMENT_CLI_VERSION, agentEffortArgumentSupported, conductorInstruction, delegationEffort, orchestrationExternalTargets, orchestrationAgents, orchestrationVariants, resolveOrchestrationRoster, type OrchestrationRow, type ExternalModels } from "./orchestration-roster";
+import { ClaudeLiveNormalizer, parseAliases, type RawToolResult } from "./claude-normalizer";
+import { conductorInstruction, orchestrationExternalTargets, orchestrationVariants, resolveOrchestrationRoster, type OrchestrationRow, type ExternalModels } from "./orchestration-roster";
 import { injectionOf, MAX_AGENT_STARTS, readRosterEvidence, type AgentStartObservation, type InjectedAgentDefinition, type RosterEvidence, type RosterInjection } from "./roster-evidence";
-import { type LearningFacts } from "./learning";
 import { placementOf, type Placement } from "./placement-line";
 import { laisoraDenialMessage } from "./tool-result-signals";
 import { failClosedGuard } from "./guard-evaluation";
-import { isShellTool } from "./learning-signature";
-import { compileVocabulary, PLACEMENT_EFFORT_WORDS, DEFAULT_ROLE_NAMES, placementPath, protectedDestination, isControlFile, DELEGATE_CONTROL_REFUSAL, judgeFileWrite, judgeMemoryWrite, memoryGuardReason, type MemoryDecision, judgeShellWrite, placementGuardReason, PLACEMENT_UNREADABLE_REFUSAL } from "./placement-guard";
-import { assignLearningExperiment, EXPERIMENT_HOLDOUT_PERCENT } from "./learning-experiment";
-import { LearningMeasurement, learningCandidateMatches } from "./learning-measurement";
-import { deliveredLearningItems, qualifyClaims } from "./learning-episodes";
-import type { Detector } from "./learning-detector";
-import { LearningDelivery, learningRoster, sectionFromLedger, readMeasuredRuns, DEFAULT_LEARNING_SWITCHES, type LearningSwitches, type PromptBudget } from "./learning-delivery";
-import type { SectionResult } from "./learning-section";
-import { resolveClaudeProfileModel } from "./orchestration-profiles";
-import { LearningRecorder, type LearningRecordResult as LearningResult, type LearningToolKind } from "./learning-recording";
-import { createLearningMcpServer, LearningRootGate, LEARNING_INSTRUCTION } from "./learning-mcp";
+import { isShellTool } from "./shell-tools";
+import { compileVocabulary, PLACEMENT_EFFORT_WORDS, placementPath, protectedDestination, isControlFile, DELEGATE_CONTROL_REFUSAL, judgeFileWrite, judgeMemoryWrite, memoryGuardReason, type MemoryDecision, judgeShellWrite, PLACEMENT_GUARD_REFUSAL, PLACEMENT_UNREADABLE_REFUSAL } from "./placement-guard";
+import { RootGate } from "./root-gate";
 import { laisoraInputLine, markLaisoraInput, type LaisoraInput } from "./laisora-input";
 import { createTodoMcpServer, TODO_ROOT_SCOPE, TODO_SERVER_NAME, TODO_TOOL_NAMES, todoLinkedInstruction, todoWorkspaceRoots, type TodoLinkedItem } from "./todo-mcp";
 import type { TodoStore } from "./todo-store";
 import { claudeModelIdLabel, isExternalRunTool } from "./orchestration-executors";
 import type { CompletionVerdict, NumberedLaunchVerdict, ResumeVerdict } from "./time-buckets";
-import { planItemLabel } from "./plan-steps";
-import { LearningIngestion, agentRecipient, delegationInvalidFields, type LearningToolResult, type LearningSubject } from "./learning-ingestion";
+import { planItemLabel, type PlanStepUpdate } from "./plan-steps";
 import { AgentAttribution } from "./orchestration-attribution";
 import type { NormalizedOutMeta } from "./claude-normalizer";
 import { askQualityDenial, rejectedAskTitles } from "./markdown-ast";
@@ -116,7 +106,7 @@ export const PLAN_INSTRUCTION = [
   "For such work, use TaskCreate before starting: one task per step, subject as the step title, and activeForm set. Mark the first task in_progress before the first other tool call. A question, a conversation, a confirmation or feedback on earlier work is not a work instruction: answer it without a laisora-plan block or new tasks.",
   "Use TaskUpdate to mark each step in_progress when starting and completed when done. Add new steps at the end with TaskCreate.",
   "Put an action that waits for the user's approval (such as merging or publishing) in its own step, separate from work you can finish yourself, and do not mark it in_progress until the user answers.",
-  "While TaskCreate steps exist, start the description of every Agent call and external run with the number of the step it serves exactly as the PLAN panel shows it (the task id, zero-padded to at least two digits) followed by a space, as in \"03 Remove model research\". A delegation without a valid step number is rejected before it runs.",
+  "While TaskCreate steps exist, start the description of every Agent call and external run with the number of the step it serves exactly as the PLAN panel shows it (the task id, zero-padded to at least two digits) followed by a space, as in \"03 Remove model research\". A delegation without a valid step number, or for a step that is not in progress, is rejected before it runs: mark the step in_progress with TaskUpdate before the delegation, either in an earlier message or earlier in the same message.",
   "When you need the user's decision or a real-machine check, do not bury it in prose. Write a ```laisora-ask block (format below) at the point you ask.",
   "Before asking, check earlier decisions (ledger, contracts, earlier answers here) instead of re-asking, and investigate first if the current state is unknown.",
   "In every decision (laisora-ask or AskUserQuestion): why = what you observed (facts, numbers, sources) + the exact question + why the user, not you, must decide; never restate the title. effect = the concrete change to the user's screen, operation or work; never restate the label. pros/cons = compared with the other options, including effects on other features and operations. Give technical reasons, not history; explain terms the user may not share. For LAISORA's own behaviour, state the current behaviour and its technical reason from contracts or facts, or 理由の記録なし.",
@@ -134,22 +124,35 @@ export function interruptDiscardNotice(count: number): string {
   return l10n.t("Discarded {0} unprocessed messages due to the interrupt", count);
 }
 
+const planStepList = (numbers: readonly number[]): string => `current steps: ${numbers.map(planItemLabel).join(", ")}`;
+
 export function planItemDenial(numbers: readonly number[]): string {
-  return `Rejected before running: start the description with the number of the PLAN step this delegation serves as shown in the PLAN panel and a space (current steps: ${numbers.map(planItemLabel).join(", ")}), as in "03 Remove model research", then send the same call again.`;
+  return `Rejected before running: start the description with the number of the PLAN step this delegation serves as shown in the PLAN panel and a space (${planStepList(numbers)}), as in "03 Remove model research", then send the same call again.`;
 }
 
-export function planItemNotInProgressDenial(number: number): string {
-  return `Rejected before running: PLAN step ${planItemLabel(number)} is not in progress. Mark ${planItemLabel(number)} in progress first (TaskUpdate with status in_progress, or TodoWrite), then send the same call again.`;
+export function planUnknownItemDenial(number: number, numbers: readonly number[], todoNextNumber?: number): string {
+  const added = todoNextNumber === undefined ? "" : ` (a new TodoWrite item becomes step ${planItemLabel(todoNextNumber)})`;
+  return `Rejected before running: ${planItemLabel(number)} is not a step of the current PLAN (${planStepList(numbers)}). Use the number of the step this delegation serves; if no step fits, add the step${added}, mark it in_progress, then use its number.`;
+}
+
+function planStepInProgressFix(step: PlanStepUpdate): string {
+  const update = step.tool === "TaskUpdate" ? `TaskUpdate ${JSON.stringify({ taskId: step.taskId, status: "in_progress" })}`
+    : `a TodoWrite that sets the item ${JSON.stringify(step.title)} (step ${planItemLabel(step.number)}) to in_progress and keeps the other items`;
+  return `In one message, send ${update} first and then this same call; the call then runs.`;
+}
+
+export function planItemNotInProgressDenial(step: PlanStepUpdate): string {
+  return `Rejected before running: PLAN step ${planItemLabel(step.number)} is not in progress. ${planStepInProgressFix(step)}`;
 }
 
 export function planLaunchDenial(verdict: NumberedLaunchVerdict): string | undefined {
-  return verdict.kind === "allow" ? undefined : verdict.kind === "unnumbered" ? planItemDenial(verdict.numbers) : planItemNotInProgressDenial(verdict.number);
+  return verdict.kind === "allow" ? undefined : verdict.kind === "unnumbered" ? planItemDenial(verdict.numbers)
+    : verdict.kind === "unknown-step" ? planUnknownItemDenial(verdict.number, verdict.numbers, verdict.todoNextNumber) : planItemNotInProgressDenial(verdict);
 }
 
 export function planResumeDenial(verdict: ResumeVerdict): string | undefined {
   if (verdict.kind === "allow") return undefined;
-  const step = planItemLabel(verdict.number);
-  return `Rejected before running: this message would resume an agent placed on PLAN step ${step}, which is completed. Mark ${step} in progress again first (TaskUpdate with status in_progress, or TodoWrite), then send the same call again.`;
+  return `Rejected before running: this message would resume an agent placed on PLAN step ${planItemLabel(verdict.number)}, which is completed. ${planStepInProgressFix(verdict)}`;
 }
 
 export function planCompletionDenial(verdict: CompletionVerdict): string | undefined {
@@ -174,7 +177,7 @@ interface QueryHandle extends AsyncIterable<any> {
   getSettings?(): Promise<unknown>;
   renameSession?(title: string, sessionId?: string): Promise<void>;
   supportedModels(): Promise<Array<{ model?: string; id?: string; value?: string; resolvedModel?: string; displayName?: string; description?: string; supportsEffort?: boolean; supportedEffortLevels?: string[] }>>;
-  initializationResult(): Promise<unknown>;
+  initializationResult(): Promise<{ claude_code_version?: string } | undefined>;
   usage_EXPERIMENTAL_MAY_CHANGE_DO_NOT_RELY_ON_THIS_API_YET?(opts?: { skipBehaviors?: boolean }): Promise<unknown>;
   getContextUsage(): Promise<{
     percentage: number;
@@ -211,17 +214,11 @@ export interface ClaudeHostOptions {
   orchestrationRunsDirectory?: string;
   orchestrationPluginDirectory?: string;
   rosterEvidenceDirectory?: string;
-  learningEnabled?: boolean;
+  guardEnabled?: boolean;
   memoryBlockProjectType?: boolean;
-  learningSwitches?: () => Partial<LearningSwitches>;
-  learningHoldoutPercent?: () => number;
-  learningDetectorCandidate?: { version: number; detect: Detector };
-  learningPromptBudget?: (executor: string, model: string) => PromptBudget;
-  learningDirectory?: string;
-  configuredResolvedModel?: string;
   conductorPolicy?: string;
   onOrchestrationChanged?: () => void;
-  onLearningRecorded?: () => void;
+  onCliVersion?: (version: string) => void;
   interruptForceKillTimeoutMs: number;
   testInterruptHang?: boolean;
   progressTracking?: ProgressTrackingMode;
@@ -346,68 +343,16 @@ export async function resolveHandoffRuntime(
     typeof ClaudeCodeSdk,
     "forkSession" | "query"
   >;
-  const startup = await resolveClaudeCodeStartup(configuredExecutablePath, sdkClaudeCodeVersion());
+  const executable = await resolveClaudeCodeExecutable(configuredExecutablePath);
   const { env } = buildClaudeEnv(process.env, apiKeyPolicy);
-  return { sdk, claudeExecutablePath: startup.executable.path, env };
+  return { sdk, claudeExecutablePath: executable.path, env };
 }
 
 export class ClaudeConversation {
-  private ingestion?: LearningIngestion;
-  private recordingModel?: string;
   private attribution: AgentAttribution;
-  private readonly pendingTargetResults = new Map<string, LearningToolResult[]>();
-  private readonly targetFailures = new Set<string>();
   private readonly externalToolUses: Array<{ id: string; input: Record<string, unknown> }> = [];
-  private readonly handledExternalCalls = new Set<string>();
-  private readonly hookTools = new Map<string, { tool: string; input: unknown; parent?: string; model?: string }>();
-  get durableConversationKey(): string | undefined { return this.ingestion?.conversation; }
-  private ingestResult(result: LearningToolResult): void {
-    if (this.handledExternalCalls.has(result.toolUseId)) return;
-    if (result.parentToolUseId && !result.observedModel) result = { ...result,
-      observedModel: this.hookTools.get(result.toolUseId)?.model ?? this.attribution.observedModel(result.parentToolUseId) ?? "unknown" };
-    if (["Agent", "Task", "mcp__laisora_external__run"].includes(result.tool)) {
-      const fields = delegationInvalidFields(result.tool, result.input);
-      const rejected = result.isError && !this.attribution.hasRuntime(result.toolUseId)
-        && /(?:input validation failed|invalid (?:input|arguments|parameters)|validation error|InputValidationError)/i.test(result.text) && fields.length > 0;
-      if (rejected) {
-        void this.ingestion?.result({ ...result, parentToolUseId: undefined, observedModel: this.recordingModel ?? "unknown", boundaryCode: "delegation_invalid", fields,
-          dispatchId: this.attribution.dispatchRef(result.toolUseId) });
-        return;
-      }
-    }
-    if (["Agent", "Task"].includes(result.tool)) {
-      if (!result.executorFailure) void this.attribution.result(result.toolUseId, result.text, result.isError);
-      if (!result.isError && !result.executorFailure || result.hookDenied) {
-        if (result.hookDenied) void this.ingestion?.result(result);
-        return;
-      }
-      if (this.targetFailures.has(result.toolUseId)) return;
-      result = { ...result, parentToolUseId: result.toolUseId, observedModel: this.attribution.observedModel(result.toolUseId),
-        dispatchId: this.attribution.dispatchRef(result.toolUseId) };
-    } else if (result.parentToolUseId && result.isError) this.targetFailures.add(result.parentToolUseId);
-    if (result.parentToolUseId && !this.attribution.subject(result.parentToolUseId)) {
-      const list = this.pendingTargetResults.get(result.parentToolUseId) ?? [];
-      list.push(result);
-      this.pendingTargetResults.set(result.parentToolUseId, list);
-    } else void this.ingestion?.result(result);
-  }
-
-  private async settleTargetResults(parent: string, agentId?: string, subject?: LearningSubject): Promise<void> {
-    if (agentId) {
-      const placeholder = agentRecipient(agentId);
-      const results = this.pendingTargetResults.get(placeholder) ?? [];
-      this.pendingTargetResults.delete(placeholder);
-      const list = this.pendingTargetResults.get(parent) ?? [];
-      list.push(...results.map(result => ({ ...result, parentToolUseId: parent })));
-      this.pendingTargetResults.set(parent, list);
-    }
-    const results = this.pendingTargetResults.get(parent) ?? [];
-    this.pendingTargetResults.delete(parent);
-    if (results.some(result => result.isError && !["Agent", "Task"].includes(result.tool))) this.targetFailures.add(parent);
-    for (const result of results) {
-      if (["Agent", "Task"].includes(result.tool) && this.targetFailures.has(parent)) continue;
-      await this.ingestion?.result(subject && !result.subject ? { ...result, subject } : result);
-    }
+  private observeToolResult(result: RawToolResult): void {
+    if (["Agent", "Task"].includes(result.tool)) void this.attribution.result(result.toolUseId, result.text, result.isError);
   }
   private readonly externalRows: readonly ExternalRow[];
   private readonly activeExternalRuns = new Set<Promise<unknown>>();
@@ -417,32 +362,13 @@ export class ClaudeConversation {
   get orchestrationRuns(): readonly OrchestrationRunRecord[] { return Object.freeze([...this.runs]); }
   get observedAgentRuns(): ReadonlyMap<string, AgentRunRecord> { return new Map(this.agentRuns); }
   private async recordRun(unstamped: OrchestrationRunRecord): Promise<OrchestrationRunRecord> {
-    let learningFailure: string | undefined;
-    try { await this.delivery?.run(unstamped); }
-    catch (error) { learningFailure = runFailureReason("R-LRN-07: could not record the run in the learning ledger", error); }
-    if (learningFailure) unstamped = { ...unstamped, reason: [unstamped.reason, learningFailure].filter(Boolean).join("; ") } as OrchestrationRunRecord;
-    const sessionId = this.learningSessionRef ?? this.opts.resumeSessionId;
+    const sessionId = this.authSessionId ?? this.opts.resumeSessionId;
     const runId = unstamped.runId ?? randomUUID();
     const dispatchId = unstamped.dispatchId ?? randomUUID();
-    let record: OrchestrationRunRecord = Object.freeze({ ...unstamped,
-      runId: this.ingestion?.ref("run", runId) ?? runId,
-      dispatchId: this.ingestion?.ref("dispatch", dispatchId) ?? dispatchId,
-      recipient: this.ingestion?.ref("recipient", unstamped.recipient ?? `external:${runId}`) ?? unstamped.recipient ?? `external:${runId}`,
-      conversation: this.durableConversationKey ?? "unknown", ...(sessionId ? { sessionId } : {}) });
+    let record: OrchestrationRunRecord = Object.freeze({ ...unstamped, runId, dispatchId,
+      recipient: unstamped.recipient ?? `external:${runId}`, ...(sessionId ? { sessionId } : {}) });
     const index = this.runs.length;
     this.runs.push(record);
-    if (record.kind === "external") {
-      const external = record;
-      await this.queueLearningR33(async () => {
-        const usage = external.usage;
-        const input = usage?.input_tokens;
-        const promptTokens = typeof input !== "number" ? null : external.executor === "codex" ? input
-          : typeof usage?.cache_read_input_tokens === "number" && typeof usage?.cache_creation_input_tokens === "number"
-            ? input + usage.cache_read_input_tokens + usage.cache_creation_input_tokens : null;
-        await this.measurement?.record({ externalRuns: 1, promptTokens, externalInputTokens: input ?? null },
-          { executor: external.executor, model: external.observedModel ?? "unknown", role: external.role }, `external-usage:${runId}`);
-      });
-    }
     if (this.opts.orchestrationRunsDirectory) {
       try { await appendRunRecord(this.opts.orchestrationRunsDirectory, record); }
       catch (error) {
@@ -459,135 +385,30 @@ export class ClaudeConversation {
   private readonly orchestrationEnabled: boolean;
   private readonly conductorPolicy: string;
   private readonly placement: Placement;
-  private readonly initialOrchestrationSettings: { settings: unknown; deliveredSetHash?: string };
-  private delivery?: LearningDelivery;
-  private deliverySnapshot?: SectionResult;
-  private recorder?: LearningRecorder;
-  private learningSessionRef?: string;
-  private learningGate?: LearningRootGate;
-  private todoGate?: LearningRootGate;
+  private readonly initialOrchestrationSettings: { settings: unknown };
+  private authSessionId?: string;
+  private todoGate?: RootGate;
   private todoFiles: readonly string[] = [];
-  private measurement?: LearningMeasurement;
-  private handlingResult = false;
-  private learningObservation: Promise<void> = Promise.resolve();
   private readonly observedAgents = new Map<string, Readonly<{ agentType?: string; model?: string; effort?: string }>>();
 
   get orchestrationRoster(): readonly OrchestrationRow[] { return this.roster; }
-  private perCallEffort = false;
-  get orchestrationPerCallEffort(): boolean { return this.perCallEffort; }
   get orchestrationActive(): boolean { return this.orchestrationEnabled; }
   get orchestrationAgentVariants() { return orchestrationVariants(this.roster, this.opts.externalModels); }
 
   get orchestrationExternalRoster(): readonly ExternalRow[] { return this.externalRows; }
 
-  get learningFacts(): LearningFacts | undefined {
-    if (!this.ingestion?.ready) return undefined;
-    const state = this.ingestion.ledger.state, records = [...state.records.values()];
-    const model = this.recordingModel ?? resolveClaudeProfileModel(this.opts.model, this.opts.externalModels, this.opts.configuredResolvedModel);
-    const qualifications = { active: 0, quarantined: 0, reviewDue: 0, retiredHuman: 0, retiredConductor: 0, candidate: 0, rejected: 0, imported: 0 };
-    for (const rule of state.rules.values()) if (rule.key.bind === "conductor" && rule.key.model === (model && claudeModelIdLabel(model))) {
-      if (rule.active) qualifications.active++; else qualifications.candidate++;
-    }
-    const current = records.filter(record => record.conversation === this.ingestion!.conversation);
-    const mismatch = current.some(record => record.kind === "exposure" && record.route === "conductor" && record.outcome === "model-mismatch");
-    const delivery = current.find(record => record.kind === "delivery");
-    const claims = current.filter(record => record.kind === "claim" && record.source === "observation");
-    return { ledgerVersion: 2, coverage: !model ? "model-unknown" : !this.learningSessionRef ? "session-unknown" : "observed",
-      delivered: { count: delivery?.kind === "delivery" ? deliveredLearningItems(records, delivery).filter(item => item.type === "rule").length : 0,
-        setHash: delivery?.kind === "delivery" ? delivery.setHash : "", outcome: mismatch ? "model-mismatch" : delivery?.kind === "delivery" ? delivery.outcome : "none" },
-      observations: claims.length, evidenced: claims.filter(record => record.kind === "claim" && record.evidence.creditedRunIds.length).length,
-      recurrences: current.filter(record => record.kind === "episode" && record.status === "counted").length,
-      qualifications, generalQualifications: { ...qualifications, active: 0, candidate: 0 } };
-  }
-  private effectiveLearningSwitches(): LearningSwitches {
-    const switches = { ...DEFAULT_LEARNING_SWITCHES, enabled: this.opts.learningEnabled === true, ...this.opts.learningSwitches?.() };
-    if (this.opts.learningHoldoutPercent?.() === 0) switches.experiment = false;
-    return switches;
-  }
   private orchestrationSettings(options: Partial<ClaudeHostOptions>): unknown {
     return { enabled: options.orchestrationEnabled === true, agents: options.orchestrationAgents ?? [],
-      learningEnabled: options.learningEnabled === true,
+      guardEnabled: options.guardEnabled !== false,
       memoryBlockProjectType: options.memoryBlockProjectType === true,
       timeout: options.externalTimeoutMinutes ?? 10,
       policy: options.conductorPolicy ?? "" };
   }
 
   orchestrationSettingsChanged(options: Partial<ClaudeHostOptions>): boolean {
-    return !isDeepStrictEqual(this.initialOrchestrationSettings, {
-      settings: this.orchestrationSettings(options), deliveredSetHash: this.initialOrchestrationSettings.deliveredSetHash,
-    });
+    return !isDeepStrictEqual(this.initialOrchestrationSettings, { settings: this.orchestrationSettings(options) });
   }
 
-  private async prepareLearningDeliveryR31(): Promise<string> {
-    this.opts.log(`R-LRN-42: learning components ${JSON.stringify(this.effectiveLearningSwitches())}`);
-    const ingestion = this.ingestion;
-    if (!ingestion) return "";
-    this.delivery = new LearningDelivery(ingestion, () => this.effectiveLearningSwitches(), this.opts.log);
-    if (!ingestion.ready || !this.durableConversationKey) return "";
-    try {
-      const candidate = this.opts.learningDetectorCandidate;
-      if (candidate) ingestion.detector.adopt(candidate.version, candidate.detect);
-      this.measurement = new LearningMeasurement(ingestion);
-      await this.measurement.control(this.effectiveLearningSwitches());
-      const model = resolveClaudeProfileModel(this.opts.model, this.opts.externalModels, this.opts.configuredResolvedModel);
-      const runs = await readMeasuredRuns(this.opts.orchestrationRunsDirectory, this.opts.log);
-      const state = ingestion.ledger.state;
-      const candidates = sectionFromLedger(state.records.values(), state.rules.values(), this.roster, this.opts.externalModels,
-        model ? claudeModelIdLabel(model) : "unknown", ingestion.projectRef, this.durableConversationKey, new Date().toISOString(), runs, this.effectiveLearningSwitches());
-      const assignment = await assignLearningExperiment(ingestion.ledger, this.durableConversationKey, this.effectiveLearningSwitches(), candidates.items.map(item => item.id),
-        ingestion.detector.version, this.opts.learningHoldoutPercent?.() ?? EXPERIMENT_HOLDOUT_PERCENT);
-      if (!assignment) return "";
-      await this.measurement.record({ relevantOpportunities: 0, candidateOpportunities: 0, toolCalls: 0, toolResults: 0, turns: 0, turnStarts: 0, usageResults: 0,
-        promptTokens: 0, researchTokens: 0, researchCost: 0 }, {}, `start:${ingestion.conductorSubject.run}`);
-      const assignedState = ingestion.ledger.state;
-      this.deliverySnapshot = sectionFromLedger(assignedState.records.values(), assignedState.rules.values(), this.roster, this.opts.externalModels,
-        model ? claudeModelIdLabel(model) : "unknown", ingestion.projectRef, this.durableConversationKey, new Date().toISOString(), runs, this.effectiveLearningSwitches());
-      this.initialOrchestrationSettings.deliveredSetHash = this.deliverySnapshot.setHash;
-      if (this.deliverySnapshot.dropped) this.opts.log(`R-LRN-05: learning section budget withheld ${this.deliverySnapshot.dropped} items`);
-      return this.deliverySnapshot.text;
-    } catch (error) {
-      this.opts.log(runFailureReason("R-LRN-07: could not prepare learning delivery", error));
-      return "";
-    }
-  }
-  private async recordLearningR12(input: unknown, rootVerified: boolean, kind: LearningToolKind): Promise<LearningResult> {
-    if (!rootVerified) return { ok: false, code: "caller-unverified", requirement: "R-LRN-12" };
-    if (!this.ingestion) return { ok: false, code: rootVerified ? "state-unavailable" : "caller-unverified", requirement: "R-LRN-12" };
-    await this.ingestion.flush();
-    this.recorder ??= new LearningRecorder(this.ingestion.ledger);
-    return this.recorder.record(kind, input, { rootVerified, ready: this.ingestion.ready, conversation: this.ingestion.conversation,
-      session: this.ingestion.sessionRef, project: this.ingestion.projectRef, conductorModel: this.recordingModel ?? "unknown", cwd: this.opts.cwd,
-      models: this.opts.externalModels, roster: this.roster, targets: learningRoster(this.roster, this.opts.externalModels),
-      roles: new Set(this.roster.filter(row => row.enabled).map(row => row.role)), runs: [],
-      loadRuns: () => readConversationRuns(this.opts.orchestrationRunsDirectory, this.ingestion!.conversation ?? "unknown", this.orchestrationRuns),
-      ref: (domain, value) => this.ingestion!.ref(domain, value) });
-  }
-  private readonly learningGapScope = randomUUID();
-  private learningGaps = 0;
-  private learningGapsRecorded = 0;
-  private queueLearningR33(action: () => Promise<void>): Promise<void> {
-    this.learningObservation = this.learningObservation.then(() => this.recordLearningGaps()).then(action).catch(error => {
-      this.learningGaps++;
-      this.opts.log(runFailureReason("R-LRN-07: could not append learning receipt", error));
-    });
-    return this.learningObservation;
-  }
-  private async recordLearningGaps(): Promise<void> {
-    if (this.learningGaps === this.learningGapsRecorded || !this.ingestion || !this.measurement) return;
-    if (!this.ingestion.ledger.consistent) await this.ingestion.ledger.reload();
-    if (!this.ingestion.ledger.consistent) return;
-    const gaps = this.learningGaps;
-    await this.measurement.record({ measurementGap: gaps - this.learningGapsRecorded }, {},
-      `measurement-gap:${this.ingestion.conversation}:${this.learningGapScope}:${gaps}`);
-    this.learningGapsRecorded = gaps;
-  }
-  private observeLearningModelR30(model: string): Promise<void> {
-    this.recordingModel = model;
-    return this.queueLearningR33(async () => {
-      const observed = claudeModelIdLabel(model);
-      await this.delivery?.observed(this.ingestion!.conductorSubject.dispatchId, observed, "unknown", ["conductor:model_observed"]);
-    });
-  }
   get observedAgentSettings(): ReadonlyMap<string, Readonly<{ agentType?: string; model?: string; effort?: string }>> {
     return new Map(this.observedAgents);
   }
@@ -660,6 +481,8 @@ export class ClaudeConversation {
   private interruptTimer: ReturnType<typeof setTimeout> | null = null;
   private agentDefs: Map<string, AgentDefInfo> | null = null;
   private cliCapabilities: string[] | null = null;
+  private startMarks: { begin: number; sdkLoaded: number; resolved: number; optionsBuilt: number; queried: number } | null = null;
+  private firstMessageLogged = false;
 
   constructor(private readonly opts: ClaudeHostOptions) {
     this.usageLimitResume = new UsageLimitResume({
@@ -676,41 +499,32 @@ export class ClaudeConversation {
     this.unsubscribeAutoContinue = onAutoContinueSettingChange(() => {
       if (readClaudeCodeSettings(true).autoContinueAtUsageLimit === false) this.cancelAutoResume();
     });
-    this.initialOrchestrationSettings = { settings: structuredClone(this.orchestrationSettings(opts)), deliveredSetHash: undefined };
+    this.initialOrchestrationSettings = { settings: structuredClone(this.orchestrationSettings(opts)) };
     this.orchestrationEnabled = opts.orchestrationEnabled === true;
     const resolved = resolveOrchestrationRoster(this.orchestrationEnabled ? opts.orchestrationAgents : []);
     this.roster = resolved.roster;
     this.externalRows = orchestrationExternalTargets(this.roster, opts.externalModels, opts.log);
     this.externalTimeoutMinutes = isExternalTimeout(opts.externalTimeoutMinutes) ? opts.externalTimeoutMinutes : 10;
     this.conductorPolicy = opts.conductorPolicy ?? "";
-    this.placement = placementOf({ learningEnabled: opts.learningEnabled === true, blockProjectType: opts.memoryBlockProjectType === true });
+    this.placement = placementOf({ guardEnabled: opts.guardEnabled !== false, blockProjectType: opts.memoryBlockProjectType === true });
     for (const dropped of resolved.droppedRows) opts.log(dropped);
     if (opts.rosterEvidenceDirectory && opts.resumeSessionId) {
       for (const injection of readRosterEvidence(opts.rosterEvidenceDirectory, opts.resumeSessionId, opts.log).injections)
         for (const agent of injection.agents) this.recordedAgents.set(agent.agentKey, agent);
     }
     this.attribution = new AgentAttribution(() => this.rosterEvidence, record => this.recordRun(record),
-      async (parent, agentId, record, subject) => {
-        await this.settleTargetResults(parent, agentId, subject);
-        const tool = this.hookTools.get(parent);
-        if (record.outcome === "normal" && tool) await this.ingestion?.result({ toolUseId: parent, tool: tool.tool, input: tool.input,
-          text: "", isError: false, subject, at: record.confirmedAt });
-      }, opts.log, agentKey => agentKey === undefined ? undefined : this.recordedAgents.get(agentKey));
-    if (opts.learningDirectory) this.ingestion = new LearningIngestion(opts.learningDirectory, opts.cwd, opts.log,
-      () => this.recordingModel,
-      parent => this.attribution.subject(parent), opts.resumeSessionId);
+      opts.log, agentKey => agentKey === undefined ? undefined : this.recordedAgents.get(agentKey));
     this.normalizer = new ClaudeLiveNormalizer({
       cwd: this.opts.cwd,
       knownBackgroundTask: this.opts.knownBackgroundTask,
       log: this.opts.log,
       loadAgentDef: (subagentType: string) => this.loadAgentDef(subagentType),
       emit: (body, meta) => this.emit(body, meta),
-      onRawToolUse: (id, tool, input, parent) => {
-        this.hookTools.set(id, { tool, input, parent, model: parent ? this.attribution.observedModel(parent) : this.recordingModel });
+      onRawToolUse: (id, tool, input) => {
         if (tool === "Agent" || tool === "Task") this.attribution.dispatch(id, input);
         if (tool === "mcp__laisora_external__run") this.externalToolUses.push({ id, input });
       },
-      onRawToolResult: result => this.ingestResult(result),
+      onRawToolResult: result => this.observeToolResult(result),
       onTurnEnd: () => {
         if (this.interruptTimer) {
           clearTimeout(this.interruptTimer);
@@ -741,23 +555,22 @@ export class ClaudeConversation {
     return this.agentDefs.get(subagentType);
   }
 
+  startBreakdown(): string | undefined {
+    const m = this.startMarks;
+    if (m === null) return undefined;
+    return `sdk ${m.sdkLoaded - m.begin}ms / resolve ${m.resolved - m.sdkLoaded}ms / options ${m.optionsBuilt - m.resolved}ms / query ${m.queried - m.optionsBuilt}ms`;
+  }
+
   async start(): Promise<void> {
+    const begin = Date.now();
     const sdk = require("@anthropic-ai/claude-agent-sdk") as Pick<
       typeof ClaudeCodeSdk,
       "query" | "USAGE_LIMIT_ERROR_PREFIXES" | "createSdkMcpServer" | "tool"
     >;
-    const startup = await resolveClaudeCodeStartup(this.opts.claudeCodeExecutablePath, __LAISORA_SDK_CLAUDE_CODE_VERSION__);
-    const resolvedExecutable = startup.executable;
+    const sdkLoaded = Date.now();
+    const resolvedExecutable = await resolveClaudeCodeExecutable(this.opts.claudeCodeExecutablePath);
+    const resolved = Date.now();
     this.opts.log(`Claude Code executable resolved from ${resolvedExecutable.source}: ${resolvedExecutable.path}` + (resolvedExecutable.shimPath ? ` (npm shim: ${resolvedExecutable.shimPath})` : ""));
-    const version = startup.version;
-    this.opts.log(`Claude Code CLI version: ${version.cliVersion ?? "unavailable"}; SDK expected: ${__LAISORA_SDK_CLAUDE_CODE_VERSION__ ?? "unknown"}`);
-    if (version.warning) this.opts.log(`[warning] ${version.warning}`);
-    const perCallEffort = this.perCallEffort = agentEffortArgumentSupported(version.cliVersion);
-    if (this.orchestrationEnabled && !perCallEffort) {
-      this.opts.log(`[warning] ${version.cliVersion
-        ? l10n.t("Claude Code CLI {0} cannot set effort per delegation, so agents run at their default effort. Update Claude Code to {1} or later.", version.cliVersion, AGENT_EFFORT_ARGUMENT_CLI_VERSION)
-        : l10n.t("The Claude Code CLI version is unknown, so agents run at their default effort. Update Claude Code to {0} or later.", AGENT_EFFORT_ARGUMENT_CLI_VERSION)}`);
-    }
     this.normalizer.setUsageLimitPrefixes([...sdk.USAGE_LIMIT_ERROR_PREFIXES]);
 
     const { env, removed } = buildClaudeEnv(process.env, this.opts.apiKeyPolicy,
@@ -820,7 +633,7 @@ ${ctxJson}`
         expiresAt: null,
         questions,
       });
-      const rootGate = [self.learningGate, self.todoGate].find(gate => gate?.scope.tools.includes(toolName));
+      const rootGate = self.todoGate?.scope.tools.includes(toolName) ? self.todoGate : undefined;
       const rootCall = ctx.toolUseID;
       rootGate?.hold(rootCall);
       const pendingDecision = self.opts.onApprovalRequest({ requestId, toolName, toolUseId: ctx.toolUseID, rawInputJson });
@@ -909,22 +722,15 @@ ${ctxJson}`
       options.allowedTools = [...(options.allowedTools ?? []), "TaskCreate", "TaskGet", "TaskUpdate", "TaskList"];
     }
     options.systemPrompt = conversationSystemPrompt(this.opts.fileLinkInstruction === true, this.opts.planInstruction !== false, this.opts.cwd, this.placement.line);
-    const learningT0 = Date.now();
-    await this.ingestion?.start();
-    const deliveryT0 = Date.now();
-    const deliverySection = await this.prepareLearningDeliveryR31();
-    if (this.ingestion) {
-      this.opts.log(`learning 準備: ${Date.now() - learningT0}ms（restore ${deliveryT0 - learningT0}ms / delivery ${Date.now() - deliveryT0}ms）`);
-    }
-    this.rosterInjections.push(injectionOf(this.orchestrationEnabled ? orchestrationVariants(this.roster, this.opts.externalModels) : [], Date.now(), this.perCallEffort));
+    this.rosterInjections.push(injectionOf(this.orchestrationEnabled ? orchestrationVariants(this.roster, this.opts.externalModels) : [], Date.now(), true));
     if (this.orchestrationEnabled) {
       options.plugins = [...(options.plugins ?? []), { type: "local",
         path: await prepareOrchestrationPlugin(this.opts.orchestrationPluginDirectory ?? join(tmpdir(), "laisora-agent-plugin"), this.roster, this.opts.externalModels) }];
       const base = this.opts.fileLinkInstruction === true ? FILE_LINK_INSTRUCTION(this.opts.cwd) : "";
       options.systemPrompt = { type: "custom", snapshot: false,
-        prompt: [base, this.opts.planInstruction !== false ? PLAN_INSTRUCTION : "", conductorInstruction(this.roster, this.conductorPolicy, this.externalRows, deliverySection, perCallEffort, this.opts.externalModels, this.placement.line)].filter(Boolean).join("\n\n") };
+        prompt: [base, this.opts.planInstruction !== false ? PLAN_INSTRUCTION : "", conductorInstruction(this.roster, this.conductorPolicy, this.externalRows, this.opts.externalModels, this.placement.line)].filter(Boolean).join("\n\n") };
     }
-    if (this.orchestrationEnabled || this.ingestion) {
+    if (this.orchestrationEnabled) {
       const observe: ClaudeCodeSdk.HookCallback = async (input) => {
         this.observeAgentSettings(input);
         this.observeAgentStart(input);
@@ -965,21 +771,10 @@ ${ctxJson}`
             const suppliedId = (extra as { _meta?: Record<string, unknown> } | undefined)?._meta?.["claudecode/toolUseId"];
             const toolUse = this.externalToolUses.find(entry => typeof suppliedId === "string" ? entry.id === suppliedId : isDeepStrictEqual(entry.input, input));
             if (toolUse) this.externalToolUses.splice(this.externalToolUses.indexOf(toolUse), 1);
-            if (toolUse) this.handledExternalCalls.add(toolUse.id);
             const runId = randomUUID(), dispatchId = randomUUID(), recipient = `external:${runId}`;
-            const subject = { recipient, run: runId, dispatchId, executor: row.executor, model: row.model, effort: row.effort ?? "none", role: row.role };
             const run = await runExternal(row, input, { cwd: this.opts.cwd, configDir: claudeConfigDir(), timeoutMinutes: this.externalTimeoutMinutes, apiKeyPolicy: this.opts.apiKeyPolicy }, {
               signal: controller.signal,
-              preparePrompt: (prompt, packaging, budget) => this.delivery?.target(subject, prompt, packaging, this.opts.learningPromptBudget?.(row.executor, row.model) ?? budget) ?? prompt,
-              onAccepted: () => this.queueLearningR33(() => this.delivery?.accept(dispatchId) ?? Promise.resolve()),
             });
-            if (!("accepted" in run) || !run.accepted) await this.queueLearningR33(() => this.delivery?.observed(dispatchId, "unknown", "unknown", [], true) ?? Promise.resolve());
-            const boundaryCode = "boundaryCode" in run ? run.boundaryCode : undefined;
-            await this.ingestion?.result({ toolUseId: toolUse?.id ?? dispatchId, dispatchId,
-              tool: "mcp__laisora_external__run", input, text: run.record.reason ?? "", isError: false,
-              executorFailure: run.record.outcome !== "ok", ...(run.record.outcome !== "ok" ? { executorOutcome: run.record.outcome } : {}),
-              ...(boundaryCode ? { boundaryCode } : { subject: { recipient, run: runId, dispatchId, executor: row.executor,
-                model: run.record.observedModel, effort: run.record.observedEffort, role: row.role } }) });
             const record = await this.recordRun({ ...run.record, runId, dispatchId, recipient,
               ...(toolUse ? { toolUseId: toolUse.id } : typeof suppliedId === "string" ? { toolUseId: suppliedId } : {}) });
             const result = record.outcome !== "ok" && record.reason !== run.record.reason
@@ -996,25 +791,16 @@ ${ctxJson}`
         })],
       }) };
     }
-    if (this.opts.learningEnabled === true) {
-      const prompt = options.systemPrompt as { type: "custom"; snapshot: false; prompt: string };
-      options.systemPrompt = { ...prompt, prompt: [prompt.prompt, !this.orchestrationEnabled ? deliverySection : "", LEARNING_INSTRUCTION].filter(Boolean).join("\n\n") };
-    }
-    const addRootGate = (gate: LearningRootGate) => {
+    const addRootGate = (gate: RootGate) => {
       const gated = { matcher: gate.scope.tools.join("|"), hooks: [gate.hook] };
       options.hooks = { ...(options.hooks ?? {}),
         PreToolUse: [...(options.hooks?.PreToolUse ?? []), gated],
         PermissionDenied: [...(options.hooks?.PermissionDenied ?? []), gated],
         PostToolUseFailure: [...(options.hooks?.PostToolUseFailure ?? []), gated] };
     };
-    if (this.ingestion || this.opts.learningEnabled === true) {
-      const gate = this.learningGate = new LearningRootGate(undefined, this.opts.log);
-      options.mcpServers = { ...(options.mcpServers ?? {}), laisora_learning: createLearningMcpServer(sdk, gate, (input, root, kind) => this.recordLearningR12(input, root, kind)) };
-      addRootGate(gate);
-    }
     if (this.opts.todoStore) {
-      const gate = this.todoGate = new LearningRootGate(undefined, this.opts.log, TODO_ROOT_SCOPE);
-      options.mcpServers = { ...(options.mcpServers ?? {}), [TODO_SERVER_NAME]: createTodoMcpServer(sdk, this.opts.todoStore, gate, this.opts.log, () => this.learningSessionRef ?? this.opts.resumeSessionId,
+      const gate = this.todoGate = new RootGate(undefined, this.opts.log, TODO_ROOT_SCOPE);
+      options.mcpServers = { ...(options.mcpServers ?? {}), [TODO_SERVER_NAME]: createTodoMcpServer(sdk, this.opts.todoStore, gate, this.opts.log, () => this.authSessionId ?? this.opts.resumeSessionId,
         () => ({ cwd: this.opts.cwd, files: this.todoFiles, roots: todoWorkspaceRoots(), home: homedir() })) };
       options.allowedTools = [...(options.allowedTools ?? []), ...TODO_TOOL_NAMES];
       addRootGate(gate);
@@ -1030,41 +816,12 @@ ${ctxJson}`
         options.systemPrompt = { ...prompt, prompt: [prompt.prompt, todoLinkedInstruction(this.opts.todoLinkedItem)].filter(Boolean).join("\n\n") };
       }
     }
-    {
+    if (this.placement.guardEnabled) {
       const guard: ClaudeCodeSdk.HookCallback = async input => {
         if (input.hook_event_name !== "PreToolUse") return {};
-        let settings: LearningSwitches | undefined;
-        let settingsError: unknown;
-        try { settings = this.effectiveLearningSwitches(); } catch (error) { settingsError = error; }
-        await this.queueLearningR33(async () => {
-          if (!settings) throw settingsError;
-          await this.measurement?.control(settings);
-          const variants = orchestrationVariants(this.roster, this.opts.externalModels), value = input.tool_input as Record<string, unknown>;
-          const agent = input.agent_id ? this.observedAgents.get(input.agent_id) : undefined;
-          const variant = variants.find(entry => entry.agentKey === agent?.agentType) ?? this.recordedAgents.get(agent?.agentType ?? "");
-          const model = input.agent_id ? agent?.model ?? variant?.model : this.recordingModel ?? this.opts.model;
-          const resolved = resolveClaudeProfileModel(model, this.opts.externalModels, input.agent_id ? undefined : this.opts.configuredResolvedModel);
-          const subject = { recipient: input.agent_id ?? "conductor", run: "unknown", dispatchId: input.tool_use_id, executor: "claude" as const,
-            model: resolved ? claudeModelIdLabel(resolved) : "unknown", effort: agent?.effort ?? variant?.effort ?? "none", role: input.agent_id ? variant?.role ?? "unknown" : "conductor" };
-          const targetVariant = ["Agent", "Task"].includes(input.tool_name) ? variants.find(entry => entry.agentKey === value.subagent_type) : undefined;
-          const external = input.tool_name === "mcp__laisora_external__run" ? this.externalRows.find(entry => entry.target === value.target) : undefined;
-          const targetModel = targetVariant ? resolveClaudeProfileModel(targetVariant.model, this.opts.externalModels) : undefined;
-          const target = external ? { ...subject, executor: external.executor, model: external.model, effort: external.effort ?? "none", role: external.role }
-            : targetVariant ? { ...subject, model: targetModel ? claudeModelIdLabel(targetModel) : "unknown", effort: delegationEffort(targetVariant, value.effort, this.perCallEffort) ?? "none", role: targetVariant.role } : undefined;
-          const state = this.ingestion?.ledger.state;
-          const claims = state && target ? qualifyClaims([...state.records.values()], new Date().toISOString(), (executor, model) => executor === target.executor && model === target.model,
-            new Set([target.role])) : [];
-          const matches = learningCandidateMatches(state?.rules.values() ?? [], claims, input.tool_name, input.tool_input, subject, target);
-          await this.measurement?.record({ toolCalls: 1, relevantOpportunities: matches.length ? 1 : 0, candidateOpportunities: matches.length },
-            { tool: input.tool_name, role: input.agent_id ? "target" : "conductor", toolUse: this.ingestion?.ref("tool-use", input.tool_use_id) ?? "unknown",
-              ...Object.fromEntries(matches.map((id, index) => [`candidate${index}`, id])) }, `tool:${input.tool_use_id}`);
-          if (input.tool_name === "mcp__laisora_external__run") await this.measurement?.record({ externalDispatches: 1 }, { executor: "unknown", role: "target" }, `external-tokens:${input.tool_use_id}`);
-        });
         const delegate = typeof input.agent_id === "string" && input.agent_id.length > 0;
-        if (settings && !settings.guard && !delegate) return {};
         if (!([...FILE_WRITING_TOOLS, ...(delegate ? ["NotebookEdit"] : [])] as string[]).includes(input.tool_name) && !isShellTool(input.tool_name)) return {};
         return failClosedGuard(async () => {
-          if (!settings) throw settingsError;
           const value = input.tool_input as Record<string, unknown>;
           const guardRoster = resolveOrchestrationRoster(this.opts.orchestrationAgents).roster;
           const names = ["claude", "Claude", "codex", "Codex", "agy", "Antigravity", ...orchestrationVariants(guardRoster).map(variant => variant.agentKey),
@@ -1072,8 +829,8 @@ ${ctxJson}`
             ...[...this.observedAgents.values()].flatMap(agent => [agent.agentType, agent.model].filter((name): name is string => !!name))];
           const models = Object.values(this.opts.externalModels ?? {}).flatMap(list => list.state === "ok" ? list.models : []);
           const listed = models.flatMap(model => [model.id, ...(model.resolvedModel ? [model.resolvedModel] : [])]);
-          const vocabulary = this.placement.learningEnabled ? compileVocabulary({ names: [...names, ...listed, ...models.map(model => model.label), ...listed.map(model => claudeModelIdLabel(model))], effortWords: PLACEMENT_EFFORT_WORDS,
-            roleNames: [...DEFAULT_ROLE_NAMES, ...guardRoster.map(row => row.role)], listedModelIds: listed }) : undefined;
+          const vocabulary = compileVocabulary({ names: [...names, ...listed, ...models.map(model => model.label), ...listed.map(model => claudeModelIdLabel(model))], effortWords: PLACEMENT_EFFORT_WORDS,
+            listedModelIds: listed });
           const cwd = input.cwd || this.opts.cwd;
           let decision = judgeShellWrite(input.tool_name, value, claudeConfigDir(), process.platform, cwd, delegate);
           let unreadable = false;
@@ -1097,9 +854,8 @@ ${ctxJson}`
           const unchecked = unreadable && decision.skipped === "edit-does-not-apply";
           const destination = memoryDecision?.blocked ? "memory" : decision.destination;
           if ((!memoryDecision?.blocked && !decision.blocked && !unchecked) || !destination) return {};
-          await this.queueLearningR33(() => this.measurement?.record({ guardBlocks: 1 }, { tool: input.tool_name, destination: destination === "CLAUDE.md" ? "claude-md" : destination === "AGENTS.md" ? "agents-md" : destination }) ?? Promise.resolve());
           return { hookSpecificOutput: { hookEventName: "PreToolUse", permissionDecision: "deny",
-            permissionDecisionReason: memoryDecision?.blocked ? memoryGuardReason(memoryDecision, this.placement) : delegate ? DELEGATE_CONTROL_REFUSAL : unchecked ? PLACEMENT_UNREADABLE_REFUSAL : placementGuardReason(this.placement) } };
+            permissionDecisionReason: memoryDecision?.blocked ? memoryGuardReason(memoryDecision, this.placement) : delegate ? DELEGATE_CONTROL_REFUSAL : unchecked ? PLACEMENT_UNREADABLE_REFUSAL : PLACEMENT_GUARD_REFUSAL } };
         }, this.opts.log);
       };
       options.hooks = { ...(options.hooks ?? {}), PreToolUse: [{ hooks: [guard] }, ...(options.hooks?.PreToolUse ?? [])] };
@@ -1128,8 +884,9 @@ ${ctxJson}`
           return {};
         }, this.opts.log);
       };
-      const [first, ...rest] = options.hooks?.PreToolUse ?? [];
-      options.hooks = { ...(options.hooks ?? {}), PreToolUse: [...(first ? [first] : []), { hooks: [planItemGuard] }, ...rest] };
+      const placed = options.hooks?.PreToolUse ?? [];
+      const afterGuard = this.placement.guardEnabled ? 1 : 0;
+      options.hooks = { ...(options.hooks ?? {}), PreToolUse: [...placed.slice(0, afterGuard), { hooks: [planItemGuard] }, ...placed.slice(afterGuard)] };
     }
     if (planInstruction && this.opts.askQualityCheck === true) {
       let rewrites = 0;
@@ -1152,76 +909,38 @@ ${ctxJson}`
       };
       options.hooks = { ...(options.hooks ?? {}), Stop: [...(options.hooks?.Stop ?? []), { hooks: [askQualityGate] }] };
     }
-    if (this.ingestion) {
-      const observeFailure: ClaudeCodeSdk.HookCallback = async input => {
-        if (input.hook_event_name === "PreToolUse") {
-          const previous = this.hookTools.get(input.tool_use_id);
-          const parent = previous?.parent ?? (input.agent_id ? agentRecipient(input.agent_id) : undefined);
-          this.hookTools.set(input.tool_use_id, { tool: input.tool_name, input: input.tool_input, parent,
-            model: previous?.model ?? (input.agent_id ? this.observedAgents.get(input.agent_id)?.model : undefined)
-              ?? (parent ? this.attribution.observedModel(parent) : undefined) });
-          if (input.tool_name === "Agent" || input.tool_name === "Task") this.attribution.dispatch(input.tool_use_id, input.tool_input as Record<string, unknown>);
-          if (input.tool_name === "mcp__laisora_external__run" && !this.externalToolUses.some(entry => entry.id === input.tool_use_id)) this.externalToolUses.push({ id: input.tool_use_id, input: input.tool_input as Record<string, unknown> });
-        } else if (input.hook_event_name === "PostToolUseFailure") {
-          const previous = this.hookTools.get(input.tool_use_id);
-          this.ingestResult({ toolUseId: input.tool_use_id, tool: input.tool_name, input: input.tool_input,
-            parentToolUseId: previous?.parent ?? (input.agent_id ? agentRecipient(input.agent_id) : undefined), observedModel: previous?.model
-              ?? (input.agent_id ? this.observedAgents.get(input.agent_id)?.model : undefined),
-            text: input.is_interrupt ? "[Request interrupted by user]" : input.error, isError: true });
-        }
+    if (this.orchestrationEnabled) {
+      const observeDispatch: ClaudeCodeSdk.HookCallback = async input => {
+        if (input.hook_event_name !== "PreToolUse") return {};
+        if (input.tool_name === "Agent" || input.tool_name === "Task") this.attribution.dispatch(input.tool_use_id, input.tool_input as Record<string, unknown>);
+        if (input.tool_name === "mcp__laisora_external__run" && !this.externalToolUses.some(entry => entry.id === input.tool_use_id)) this.externalToolUses.push({ id: input.tool_use_id, input: input.tool_input as Record<string, unknown> });
         return {};
       };
-      options.hooks = { ...(options.hooks ?? {}), PreToolUse: [...(options.hooks?.PreToolUse ?? []), { hooks: [observeFailure] }],
-        PostToolUseFailure: [...(options.hooks?.PostToolUseFailure ?? []), { hooks: [observeFailure] }] };
-      for (const matcher of options.hooks.PreToolUse ?? []) matcher.hooks = matcher.hooks.map(hook => async (input, id, context) => {
-        const output = await hook(input, id, context);
-        if (input.hook_event_name === "PreToolUse" && "hookSpecificOutput" in output
-          && output.hookSpecificOutput?.hookEventName === "PreToolUse" && output.hookSpecificOutput.permissionDecision === "deny") {
-          const previous = this.hookTools.get(input.tool_use_id);
-          this.ingestResult({ toolUseId: input.tool_use_id, tool: input.tool_name, input: input.tool_input,
-            parentToolUseId: previous?.parent ?? (input.agent_id ? agentRecipient(input.agent_id) : undefined), text: "", isError: false, hookDenied: true });
-        }
-        return output;
-      });
+      options.hooks = { ...(options.hooks ?? {}), PreToolUse: [...(options.hooks?.PreToolUse ?? []), { hooks: [observeDispatch] }] };
     }
-    if (this.delivery) {
-      const agentDefinitions = orchestrationAgents(this.roster, this.opts.externalModels);
-      const inject: ClaudeCodeSdk.HookCallback = async input => {
-        if (input.hook_event_name !== "PreToolUse" || !["Agent", "Task"].includes(input.tool_name)) return {};
-        const value = input.tool_input as Record<string, unknown>;
-        if (typeof value.prompt !== "string") return {};
-        this.attribution.dispatch(input.tool_use_id, value);
-        const identity = this.attribution.dispatchSubject(input.tool_use_id);
-        const variant = orchestrationVariants(this.roster, this.opts.externalModels).find(entry => entry.agentKey === value.subagent_type);
-        if (!identity || !variant) return {};
-        const model = resolveClaudeProfileModel(variant.model, this.opts.externalModels);
-        if (!model) return {};
-        const subject = { ...identity, executor: "claude" as const, model: claudeModelIdLabel(model), effort: delegationEffort(variant, value.effort, this.perCallEffort) ?? "none", role: variant.role };
-        const packaging = JSON.stringify({ ...value, prompt: "", system: options.systemPrompt, agent: agentDefinitions[variant.agentKey] });
-        try {
-          const prompt = await this.delivery!.target(subject, value.prompt, packaging, this.opts.learningPromptBudget?.("claude", subject.model));
-          return { hookSpecificOutput: { hookEventName: "PreToolUse", updatedInput: { ...value, prompt } } };
-        } catch (error) {
-          const reason = error instanceof Error && error.message === DISPATCH_BUDGET_EXCEEDED ? DISPATCH_BUDGET_EXCEEDED : runFailureReason(DISPATCH_INTERNAL_ERROR, error);
-          return { hookSpecificOutput: { hookEventName: "PreToolUse", permissionDecision: "deny", permissionDecisionReason: reason } };
-        }
-      };
-      const previous = options.hooks?.PreToolUse ?? [];
+    const preToolUse = options.hooks?.PreToolUse ?? [];
+    if (preToolUse.length) {
       options.hooks = { ...(options.hooks ?? {}), PreToolUse: [{ hooks: [async (input, id, context) => {
-        let result: Awaited<ReturnType<ClaudeCodeSdk.HookCallback>> = {};
-        for (const matcher of previous) {
+        type PreToolUseSpecific = Extract<NonNullable<ClaudeCodeSdk.SyncHookJSONOutput["hookSpecificOutput"]>, { hookEventName: "PreToolUse" }>;
+        let rest: ClaudeCodeSdk.SyncHookJSONOutput = {};
+        let specific: PreToolUseSpecific | undefined;
+        for (const matcher of preToolUse) {
           if (matcher.matcher && !new RegExp(matcher.matcher).test((input as { tool_name?: string }).tool_name ?? "")) continue;
           for (const hook of matcher.hooks) {
             const output = await hook(input, id, context);
-            if ("hookSpecificOutput" in output && output.hookSpecificOutput?.hookEventName === "PreToolUse") {
-              result = output;
-              if (output.hookSpecificOutput.permissionDecision === "deny") return output;
-              if (output.hookSpecificOutput.updatedInput) input = { ...input, tool_input: output.hookSpecificOutput.updatedInput } as typeof input;
+            if ("async" in output) continue;
+            const { hookSpecificOutput, ...fields } = output;
+            const next = hookSpecificOutput?.hookEventName === "PreToolUse" ? hookSpecificOutput : undefined;
+            if (next?.permissionDecision === "deny") return output;
+            rest = { ...rest, ...fields };
+            if (next) {
+              const updatedInput = next.updatedInput ?? specific?.updatedInput;
+              specific = { ...specific, ...next, ...(updatedInput ? { updatedInput } : {}) };
+              if (next.updatedInput) input = { ...input, tool_input: next.updatedInput } as typeof input;
             }
           }
         }
-        const injected = await inject(input, id, context);
-        return Object.keys(injected).length ? injected : result;
+        return specific ? { ...rest, hookSpecificOutput: specific } : rest;
       }] }] };
     }
     if (this.opts.model) options.model = this.opts.model;
@@ -1232,15 +951,24 @@ ${ctxJson}`
     }
 
     this.inputGen = this.inputGenerator();
+    const optionsBuilt = Date.now();
     this.q = sdk.query({
       prompt: this.inputGen as unknown as AsyncIterable<Parameters<typeof sdk.query>[0]["prompt"] extends AsyncIterable<infer Message> ? Message : never>,
       options,
     }) as QueryHandle;
-
-    if (this.deliverySnapshot?.text && this.delivery) {
-      const model = resolveClaudeProfileModel(this.opts.model, this.opts.externalModels, this.opts.configuredResolvedModel);
-      await this.queueLearningR33(() => this.delivery!.conductor(this.deliverySnapshot!, (options.systemPrompt as { prompt: string }).prompt, model ? claudeModelIdLabel(model) : "unknown"));
+    const queried = Date.now();
+    this.startMarks = { begin, sdkLoaded, resolved, optionsBuilt, queried };
+    if (typeof this.q.initializationResult === "function") {
+      Promise.resolve(this.q.initializationResult()).then(
+        (init) => {
+          const cliVersion = init?.claude_code_version;
+          this.opts.log(`CLI init response: ${Date.now() - queried}ms after query(); Claude Code CLI version: ${cliVersion ?? "unavailable"}; SDK expected: ${sdkClaudeCodeVersion() ?? "unknown"}`);
+          if (cliVersion) this.opts.onCliVersion?.(cliVersion);
+        },
+        () => undefined
+      );
     }
+
     this.emit({ kind: "conversation_opened", cwd: this.opts.cwd, model: this.opts.model });
     void this.requestContextUsage(true);
     this.runLoopDone = this.runLoop();
@@ -1451,6 +1179,10 @@ ${ctxJson}`
     if (!this.q) return;
     try {
       for await (const msg of this.q) {
+        if (!this.firstMessageLogged && this.startMarks !== null) {
+          this.firstMessageLogged = true;
+          this.opts.log(`CLI first message: ${Date.now() - this.startMarks.queried}ms after query() (${(msg as { type?: string }).type ?? "?"})`);
+        }
         this.handleMessage(msg);
       }
       if (this.normalizer.turnState !== "idle") {
@@ -1480,39 +1212,20 @@ ${ctxJson}`
     } finally {
       await Promise.allSettled([...this.activeExternalRuns]);
       await this.attribution.close();
-      for (const parent of this.pendingTargetResults.keys()) await this.settleTargetResults(parent);
-      await this.ingestion?.flush();
-      await this.queueLearningR33(async () => {});
-      await this.delivery?.end();
-      await this.ingestion?.end();
     }
   }
 
   private handleMessage(msg: any): void {
-    if (msg?.type === "result") {
-      const session = msg.session_id ?? this.learningSessionRef ?? this.opts.resumeSessionId ?? this.conversationId;
-      const identity = msg.uuid ?? this.normalizer.currentTurnId ?? randomUUID();
-      const completesTurn = this.normalizer.currentTurnId !== null;
-      void this.queueLearningR33(() => this.measurement?.cumulativeUsage(msg, session, session === this.opts.resumeSessionId, identity, completesTurn) ?? Promise.resolve());
-    }
     if (msg?.type === "system" && msg?.subtype === "task_started" && msg.task_type === "local_agent"
-      && typeof msg.tool_use_id === "string" && typeof msg.task_id === "string"
-      && this.attribution.started(msg.tool_use_id, msg.task_id, msg.is_backgrounded)) this.targetFailures.delete(msg.tool_use_id);
+      && typeof msg.tool_use_id === "string" && typeof msg.task_id === "string") this.attribution.started(msg.tool_use_id, msg.task_id, msg.is_backgrounded);
     if (msg?.type === "system" && msg?.subtype === "task_updated" && typeof msg.task_id === "string") void this.attribution.updated(msg.task_id, msg.patch?.is_backgrounded);
     if (msg?.type === "system" && msg?.subtype === "task_notification") {
       const parent = typeof msg.tool_use_id === "string" ? msg.tool_use_id
         : typeof msg.task_id === "string" ? this.attribution.parentOfTask(msg.task_id) : undefined;
-      if (parent) void this.attribution.notification(parent, msg.status, msg.task_id, msg.uuid, () => {
-        const tool = this.hookTools.get(parent);
-        if (msg.status === "failed" && tool && ["Agent", "Task"].includes(tool.tool)) this.ingestResult({
-          toolUseId: parent, tool: tool.tool, input: tool.input, text: typeof msg.summary === "string" ? msg.summary : "",
-          isError: false, executorFailure: true, executorOutcome: "failed" });
-      });
+      if (parent) void this.attribution.notification(parent, msg.status, msg.task_id, msg.uuid);
     }
     if (msg?.type === "assistant" && typeof msg.parent_tool_use_id === "string" && typeof msg.message?.model === "string") {
       this.attribution.model(msg.parent_tool_use_id, msg.message.model);
-      const dispatch = this.attribution.dispatchRef(msg.parent_tool_use_id);
-      if (dispatch) void this.queueLearningR33(() => this.delivery?.observed(dispatch, claudeModelIdLabel(msg.message.model), "unknown", ["claude:assistant:model"]) ?? Promise.resolve());
     }
     if (msg?.type === "assistant" && msg.parent_tool_use_id == null && Array.isArray(msg.message?.content)) {
       const text = msg.message.content.filter((block: any) => block?.type === "text" && typeof block.text === "string").map((block: any) => block.text).join("");
@@ -1522,9 +1235,7 @@ ${ctxJson}`
     if (msg?.type === "system" && msg?.subtype === "init" && Array.isArray(msg.capabilities)) {
       this.cliCapabilities = msg.capabilities.filter((c: unknown): c is string => typeof c === "string");
     }
-    this.handlingResult = msg?.type === "result";
-    try { this.normalizer.handleMessage(msg); }
-    finally { this.handlingResult = false; }
+    this.normalizer.handleMessage(msg);
   }
 
   private emit(
@@ -1535,26 +1246,7 @@ ${ctxJson}`
       this.invalidateHandoffContextUsage();
     }
     if (ev.kind === "turn_started") this.turnAssistantText = [];
-    if (ev.kind === "turn_started") void this.queueLearningR33(() => this.measurement?.record({ turnStarts: 1 }, {}, `turn-start:${ev.turnId}`) ?? Promise.resolve());
-    if (ev.kind === "turn_completed" || ev.kind === "turn_failed" || ev.kind === "turn_interrupted") {
-      const missingUsage = !this.handlingResult;
-      void this.queueLearningR33(async () => {
-        await this.measurement?.control(this.effectiveLearningSwitches());
-        await this.measurement?.record({ turns: 1, ...(missingUsage ? { promptTokens: null } : {}) },
-          { model: this.recordingModel ? claudeModelIdLabel(this.recordingModel) : "unknown", role: "conductor", executor: "claude" }, `turn:${ev.turnId}`);
-      });
-    }
-    if (ev.kind === "model_observed") { this.recordingModel = ev.model; void this.observeLearningModelR30(ev.model); }
-    if (ev.kind === "auth_status" && ev.auth?.sessionId) {
-      this.learningSessionRef = ev.auth.sessionId;
-      if (ev.auth.model) this.recordingModel = ev.auth.model;
-      const session = ev.auth.sessionId;
-      void this.queueLearningR33(async () => {
-        await this.ingestion?.bind(session);
-        if (this.recordingModel) await this.delivery?.observed(this.ingestion!.conductorSubject.dispatchId,
-          claudeModelIdLabel(this.recordingModel), "unknown", ["conductor:model_observed"]);
-      });
-    }
+    if (ev.kind === "auth_status" && ev.auth?.sessionId) this.authSessionId = ev.auth.sessionId;
     this.opts.onEvent(ev, this.conversationId, meta);
     this.usageLimitResume.observe(ev);
     if (ev.kind === "conversation_closed") {
@@ -1571,7 +1263,6 @@ ${ctxJson}`
     }
     this.closed = true;
     this.resolveInitialContextUsage(null);
-    this.learningGate?.clear();
     this.todoGate?.clear();
     if (this.interruptTimer) {
       clearTimeout(this.interruptTimer);
@@ -1596,13 +1287,7 @@ ${ctxJson}`
       ]);
     }
     await Promise.allSettled([...this.activeExternalRuns]);
-    await this.learningObservation;
     await this.attribution.close();
-    for (const parent of this.pendingTargetResults.keys()) await this.settleTargetResults(parent);
-    await this.ingestion?.flush();
-    await this.queueLearningR33(async () => {});
-    await this.delivery?.end();
-    await this.ingestion?.end();
   }
 
   rearmRootModelObservation(): void {
@@ -1639,7 +1324,6 @@ ${ctxJson}`
       const applied = typeof settings === "object" && settings !== null ? (settings as { applied?: unknown }).applied : undefined;
       if (typeof applied !== "object" || applied === null) return undefined;
       const { model, effort } = applied as { model?: unknown; effort?: unknown };
-      if (typeof model === "string" && model.trim()) await this.observeLearningModelR30(model.trim());
       return {
         ...(typeof model === "string" && model.trim().length > 0 ? { model: model.trim() } : {}),
         ...(effort === null || effort === "low" || effort === "medium" || effort === "high" || effort === "xhigh" || effort === "max"

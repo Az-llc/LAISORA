@@ -7,9 +7,10 @@ import { basename, dirname, win32 } from "node:path";
 import { createBackgroundActivityState } from "./background-activity";
 import { ClaudeConversation } from "./claudeHost";
 import { registerConversationHistory, releaseConversationHistory } from "./conversation-history";
-import { refreshFallbackAppliedModel, warmup } from "./conversation-lifecycle";
+import { cliStartOf, refreshFallbackAppliedModel, warmup } from "./conversation-lifecycle";
 import { createEvidenceIndex, evidenceIndexHash } from "./evidence-index";
 import {
+  adoptFallbackModel,
   foldEventState,
   type EventFoldDraft,
   type EventMeta,
@@ -29,6 +30,7 @@ import {
   HandoffContextUsage,
   HostToWebview,
   isHandoffContextMeasurement,
+  isObservedTime,
   NormalizedEventBody,
   ResumeHydrationPhase,
   ResumePreviewMessage,
@@ -40,16 +42,22 @@ import { initialSessionFacts } from "./session-facts";
 import { isInSessionStore, lookupSessionFile } from "./session-files";
 import { foldTitleRecords, splitCompleteLines } from "./session-display-title";
 import { displayTitleFromSummary } from "./session-list";
-import { rememberSession, refreshTabTitle, sessionSummaryOf } from "./session-list-wiring";
+import { handoffForkInFlight, holdsChosenTitle, rememberSession, refreshTabTitle, sessionDisplayTitleOf, sessionSummaryOf } from "./session-list-wiring";
+import { currentGenerationRecords } from "./time-buckets";
 import {
   captureResumeReadSet,
+  claimParentParseTurn,
+  parentRecordSource,
   readConversationMessages,
   readResumePreviewTail,
   readSessionHistory,
   readSessionTranscript,
   readSubagentAgents,
   type HistoryEvent,
+  type ParentParseClaim,
+  type ParentRecordSource,
   type ResumeReadSet,
+  type SessionHistoryRead,
   type SessionTranscript,
   type TranscriptMessage,
 } from "./session-transcript";
@@ -193,6 +201,8 @@ export interface ResumeHydration {
   acceptedSinceBuffering: number;
   liveCommitCursor: number;
   liveTitleCandidate?: string;
+  summary: Promise<string | undefined>;
+  titleAtResolve?: ResumeTitleState;
   workPostDirty: boolean;
   semanticPostDirty: boolean;
   persistencePosts: Map<string, Extract<HostToWebview, { type: "analysisPersistenceState" }>>;
@@ -251,6 +261,11 @@ export async function openResumedSession(
     void vscode.window.showWarningMessage(l10n.t("LAISORA: Logs outside the session store cannot be restored."));
     return { tabPosted, session: undefined };
   }
+  if (handoffForkInFlight(req.sessionId, Date.now())) {
+    output.appendLine(`[drop] resume of a fork whose handoff is still running: ${req.sessionId}`);
+    void vscode.window.showWarningMessage(l10n.t("LAISORA: This conversation is still being handed off. Open it after the handoff finishes."));
+    return { tabPosted, session: undefined };
+  }
   const inFlight = [...st.sessions.values()].find(
     (t) => t.resuming && t.resumeSessionId === req.sessionId
   );
@@ -267,11 +282,14 @@ export async function openResumedSession(
   const s = canReuse ? reuse! : st.createSession();
   const resumeT0 = Date.now();
   s.resuming = true;
+  const parseClaim = claimParentParseTurn(req.activate ? RESUME_FOREGROUND_PARSE_RESERVE_MS : 0);
   let hydration: ResumeHydration | null = null;
   let preparation: ReturnType<Session["beginResumePreparation"]> | undefined;
   let resumeGeneration = s.logicalGeneration;
   let readSetT0 = resumeT0;
   let captureDoneT = resumeT0;
+  let readSetCpu0 = 0;
+  let captureDoneCpu = 0;
   let detached: ClaudeConversation | null = null;
   const lagProbe = startLoopLagProbe();
   try {
@@ -307,6 +325,7 @@ export async function openResumedSession(
         .disposeDetachedConversation(detached)
         .catch((e) => output.appendLine(`[${s.title}] 旧 CLI の破棄に失敗: ${String(e)}`));
     }
+    const titleRequest = requestResumeTitle(s, req.sessionId);
     let readSet: ResumeReadSet | undefined;
     let recordedModel: string | undefined;
     let recordedCwd = knownCwdMatchingStore(req.knownCwd, req.filePath);
@@ -315,6 +334,7 @@ export async function openResumedSession(
     }
     try {
       readSetT0 = Date.now();
+      readSetCpu0 = hostCpuMs();
       readSet = await captureResumeReadSet(req.filePath);
       recordedModel = readSet.recordedModel;
       if (recordedCwd === undefined) {
@@ -329,6 +349,7 @@ export async function openResumedSession(
       output.appendLine(`[${s.title}] resume read-set / cwd 捕捉に失敗: ${String(error)}`);
     }
     captureDoneT = Date.now();
+    captureDoneCpu = hostCpuMs();
     if (s.closed || st.sessions.get(s.tabId) !== s || s.logicalGeneration !== resumeGeneration || s.resumePreparation !== preparation) {
       s.resuming = false;
       return { tabPosted, session: undefined };
@@ -350,6 +371,7 @@ export async function openResumedSession(
       liveSeqBase: s.seq,
       acceptedSinceBuffering: 0,
       liveCommitCursor: 0,
+      summary: titleRequest.pending,
       workPostDirty: false,
       semanticPostDirty: false,
       persistencePosts: new Map(),
@@ -362,18 +384,21 @@ export async function openResumedSession(
         : { type: "tabCreated", tab: s.resumePreviewSnapshot(hydration), activate: req.activate }
     );
     tabPosted = !canReuse;
+    trackResumeTitle(st, s, hydration, titleRequest);
     output.appendLine(
       `[${s.title}] resume phase1 描画: ${Date.now() - resumeT0}ms` +
         `（準備 ${readSetT0 - resumeT0}ms / read-set ${captureDoneT - readSetT0}ms）`
     );
     let previewMessages: ResumePreviewMessage[] = [];
     const previewT0 = Date.now();
+    const previewCpu0 = hostCpuMs();
     try {
       previewMessages = await readResumePreviewTail(req.filePath, req.sessionId);
     } catch (error) {
       output.appendLine(`[${s.title}] resume preview 取得に失敗: ${String(error)}`);
     }
     const previewDoneT = Date.now();
+    const previewCpuMs = hostCpuMs() - previewCpu0;
     if (s.closed || st.sessions.get(s.tabId) !== s || s.logicalGeneration !== resumeGeneration || s.resumePreparation !== preparation) {
       if (s.hydration === hydration) s.hydration = null;
       s.resuming = false;
@@ -382,10 +407,13 @@ export async function openResumedSession(
     hydration.previewMessages = previewMessages;
     let transcript: SessionTranscript | undefined;
     let transcriptMs: number | undefined;
-    if (s.recordedModel === undefined) {
+    let transcriptCpuMs = 0;
+    if (s.recordedModel === undefined && readSet?.recordedModelSettled !== true) {
       const transcriptT0 = Date.now();
+      const transcriptCpu0 = hostCpuMs();
       transcript = await readSessionTranscript(req.filePath, isInSessionStore, readSet, req.sessionId);
       transcriptMs = Date.now() - transcriptT0;
+      transcriptCpuMs = hostCpuMs() - transcriptCpu0;
       if (s.closed || st.sessions.get(s.tabId) !== s || s.hydration !== hydration || s.logicalGeneration !== hydration.logicalGeneration) {
         output.appendLine(`[${s.title}] resume aborted: the session changed while reading the recorded model`);
         if (s.hydration === hydration) s.finalizeHydrationFailure(hydration, "cancelled", false);
@@ -405,15 +433,21 @@ export async function openResumedSession(
     }
     output.appendLine(
       `[${s.title}] resume phase1: ${previewDoneT - resumeT0}ms` +
-        `（準備 ${readSetT0 - resumeT0}ms / read-set ${captureDoneT - readSetT0}ms` +
-        ` / preview ${previewDoneT - previewT0}ms` +
-        (transcriptMs === undefined ? "" : ` / transcript ${transcriptMs}ms`) +
+        `（準備 ${readSetT0 - resumeT0}ms / read-set ${captureDoneT - readSetT0}ms (cpu ${captureDoneCpu - readSetCpu0}ms)` +
+        ` / preview ${previewDoneT - previewT0}ms (cpu ${previewCpuMs}ms)` +
+        (transcriptMs === undefined ? "" : ` / transcript ${transcriptMs}ms (cpu ${transcriptCpuMs}ms)`) +
         ` / loop lag 最大 ${lagProbe.maxLagMs()}ms）`
     );
     lagProbe.stop();
-    if (hydration.arrivalTimestamp !== undefined) s.finishResumePreparation(preparation);
-    warmup(s);
-    await runResumeHydration(st, s, hydration, transcript, resumeT0);
+    const timed = hydration.arrivalTimestamp !== undefined;
+    if (timed) s.finishResumePreparation(preparation);
+    const pendingPreparation = preparation;
+    const cliStart = cliStartOf(s);
+    const cliFirst: CliFirst = {
+      started: Promise.race([cliStart, warmup(s)]),
+      ...(timed ? {} : { releaseAfterReads: () => s.finishResumePreparation(pendingPreparation) }),
+    };
+    await runResumeHydration(st, s, hydration, transcript, resumeT0, cliFirst, parseClaim);
   } catch (e) {
     output.appendLine(`[${s.title}] resume 失敗: ${String(e)}`);
     if (hydration === null || s.hydration === null) {
@@ -426,6 +460,7 @@ export async function openResumedSession(
       );
     }
   } finally {
+    parseClaim.drop();
     if (preparation !== undefined) s.finishResumePreparation(preparation);
     lagProbe.stop();
   }
@@ -459,6 +494,7 @@ export async function handleResumeMessage(
       h.logicalGeneration = s.logicalGeneration;
       h.liveSeqBase = s.seq;
       h.acceptedSinceBuffering = 0;
+      trackResumeTitle(st, s, h, requestResumeTitle(s, h.sessionId));
       s.resuming = true;
       st.post({ type: "resumeHydrationState", tabId: s.tabId, phase: "loading" });
       try {
@@ -565,11 +601,8 @@ function commitHydrationDraft(s: Session, draft: EventFoldDraft, commandsTouched
   s.liveGuardrailSignalIds = draft.liveGuardrailSignalIds;
   s.guardrailLiveSince = draft.guardrailLiveSince;
   s.auth = draft.auth;
+  adoptFallbackModel(s, s.modelFallback, draft.modelFallback);
   s.modelFallback = draft.modelFallback;
-  if (draft.modelFallback) {
-    s.appliedModel = draft.modelFallback.appliedModel;
-    s.effectiveModel = draft.modelFallback.appliedModel;
-  }
   s.lastContextTotalTokens = draft.lastContextTotalTokens;
   if (commandsTouched) s.commands = draft.commands;
   s.liveDelegationAgentIds = draft.liveDelegationAgentIds;
@@ -650,7 +683,7 @@ export async function foldHistoryEvents(
   invalidated: () => boolean
 ): Promise<"complete" | "stopped" | "invalidated"> {
   const maybeYield = createHydrationYielder();
-  for (const ev of history.events) {
+  for (const ev of currentGenerationRecords(history.events)) {
     const step = foldEventState(draft, ev.body, undefined, {
       timestamp: ev.timestamp,
       hostArtifacts: ev.hostArtifacts,
@@ -697,16 +730,111 @@ function replayJournalInto(
   return dropped;
 }
 
+interface CliFirst {
+  started: Promise<void>;
+  releaseAfterReads?: () => void;
+}
+
+const RESUME_CLI_FIRST_WAIT_MS = 3000;
+const RESUME_FOREGROUND_PARSE_RESERVE_MS = RESUME_CLI_FIRST_WAIT_MS + 2000;
+const resumeCliStarts = new Map<Promise<void>, number>();
+
+async function afterResumeCliStarts(own: Promise<void>): Promise<"started" | "timeout"> {
+  let ownSettled = false;
+  const ownUntil = Date.now() + RESUME_CLI_FIRST_WAIT_MS;
+  resumeCliStarts.set(own, ownUntil);
+  void own.then(() => {
+    ownSettled = true;
+    resumeCliStarts.delete(own);
+  });
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    for (;;) {
+      const now = Date.now();
+      for (const [start, until] of resumeCliStarts) if (until <= now) resumeCliStarts.delete(start);
+      if (resumeCliStarts.size === 0 || now >= ownUntil) break;
+      const nearest = Math.min(ownUntil, ...resumeCliStarts.values());
+      await Promise.race([
+        Promise.allSettled(resumeCliStarts.keys()),
+        new Promise<void>((resolve) => { timer = setTimeout(resolve, nearest - now); }),
+      ]);
+      clearTimeout(timer);
+    }
+  } finally {
+    clearTimeout(timer);
+  }
+  return ownSettled ? "started" : "timeout";
+}
+
+function lastObservedTime(events: readonly HistoryEvent[]): number | undefined {
+  for (let i = events.length - 1; i >= 0; i--) {
+    if (isObservedTime(events[i].timestamp)) return events[i].timestamp;
+  }
+  return undefined;
+}
+
+function adoptResumeTitle(s: Session, summary: string, sessionId: string): void {
+  s.title = displayTitleFromSummary(summary, sessionId);
+  s.autoTitled = true;
+}
+
+interface ResumeTitleState {
+  title: string;
+  autoTitled: boolean;
+}
+
+interface ResumeTitleRequest {
+  pending: Promise<string | undefined>;
+  issued: ResumeTitleState;
+  issuedWhileHeld: boolean;
+}
+
+function titleStateOf(s: Session): ResumeTitleState {
+  return { title: s.title, autoTitled: s.autoTitled };
+}
+
+function requestResumeTitle(s: Session, sessionId: string): ResumeTitleRequest {
+  return {
+    pending: sessionSummaryOf(sessionId).catch((error: unknown) => {
+      output.appendLine(`[${s.title}] resume title lookup failed: ${String(error)}`);
+      return undefined;
+    }),
+    issued: titleStateOf(s),
+    issuedWhileHeld: holdsChosenTitle(s),
+  };
+}
+
+function trackResumeTitle(st: SessionStore, s: Session, h: ResumeHydration, request: ResumeTitleRequest): void {
+  const { pending, issued, issuedWhileHeld } = request;
+  h.summary = pending;
+  h.titleAtResolve = undefined;
+  void pending.then((summary) => {
+    if (h.summary !== pending || issuedWhileHeld || s.title !== issued.title || s.autoTitled !== issued.autoTitled) return;
+    h.titleAtResolve = issued;
+    try {
+      if (summary === undefined || s.closed || st.sessions.get(s.tabId) !== s || s.hydration !== h) return;
+      if (s.logicalGeneration !== h.logicalGeneration || holdsChosenTitle(s)) return;
+      adoptResumeTitle(s, summary, h.sessionId);
+      h.titleAtResolve = titleStateOf(s);
+      st.post({ type: "tabRenamed", tabId: s.tabId, title: s.title });
+    } catch (error) {
+      output.appendLine(`[${s.title}] resume early title failed: ${String(error)}`);
+    }
+  });
+}
+
 async function runResumeHydration(
   st: SessionStore,
   s: Session,
   h: ResumeHydration,
   capturedTranscript?: SessionTranscript,
-  startedAt = Date.now()
+  startedAt = Date.now(),
+  cliFirst?: CliFirst,
+  parseClaim?: ParentParseClaim
 ): Promise<void> {
   const lagProbe = startLoopLagProbe();
   try {
-    await runResumeHydrationStages(st, s, h, capturedTranscript, startedAt, lagProbe);
+    await runResumeHydrationStages(st, s, h, capturedTranscript, startedAt, lagProbe, cliFirst, parseClaim);
   } finally {
     lagProbe.stop();
   }
@@ -718,14 +846,19 @@ async function runResumeHydrationStages(
   h: ResumeHydration,
   capturedTranscript: SessionTranscript | undefined,
   startedAt: number,
-  lagProbe: LoopLagProbe
+  lagProbe: LoopLagProbe,
+  cliFirst: CliFirst | undefined,
+  parseClaim: ParentParseClaim | undefined
 ): Promise<void> {
   const stages: string[] = [];
   let stageT0 = Date.now();
+  let stageCpu0 = hostCpuMs();
   const stage = (name: string): void => {
     const now = Date.now();
-    stages.push(`${name} ${now - stageT0}ms`);
+    const cpu = hostCpuMs();
+    stages.push(`${name} ${now - stageT0}ms (cpu ${cpu - stageCpu0}ms)`);
     stageT0 = now;
+    stageCpu0 = cpu;
   };
   const invalidated = (): boolean =>
     s.closed ||
@@ -740,14 +873,44 @@ async function runResumeHydrationStages(
     }
     s.finalizeHydrationFailure(h, "cancelled", !s.closed && st.sessions.get(s.tabId) === s);
   };
-  const historyOpts = {
-    ...(h.readSet === undefined ? {} : { resumeReadSet: h.readSet }),
-    generationSessionId: h.sessionId,
+  const yieldToCli = async (started: Promise<void>): Promise<boolean> => {
+    stage(`cli(${await afterResumeCliStarts(started)})`);
+    if (!invalidated()) return true;
+    abort("CLI の起動を待つ間にセッションが変化しました");
+    return false;
   };
 
-  const transcript = capturedTranscript ?? await readSessionTranscript(h.filePath, isInSessionStore, h.readSet, h.sessionId);
-  if (capturedTranscript === undefined) stage("transcript");
-  if (invalidated()) return abort("読み取り中にセッションが変化しました");
+  if (cliFirst !== undefined && cliFirst.releaseAfterReads === undefined && !await yieldToCli(cliFirst.started)) return;
+  let parentRecords: ParentRecordSource | undefined;
+  let transcript: SessionTranscript;
+  let history: SessionHistoryRead;
+  let conversation: Awaited<ReturnType<typeof readConversationMessages>>;
+  try {
+    const turn = await parentRecordSource(h.filePath, h.readSet, parseClaim);
+    parentRecords = turn.source;
+    if (h.readSet !== undefined) stage("parse-turn");
+    if (turn.timedOut) {
+      output.appendLine(`[${s.title}] resume shared parse turn not reached after ${turn.waitedMs}ms; reading unshared`);
+    }
+    if (invalidated()) return abort("読み取りの順番待ちの間にセッションが変化しました");
+    transcript = capturedTranscript ?? await readSessionTranscript(h.filePath, isInSessionStore, h.readSet, h.sessionId, parentRecords);
+    if (capturedTranscript === undefined) stage("transcript");
+    if (invalidated()) return abort("読み取り中にセッションが変化しました");
+    history = await readSessionHistory(h.filePath, isInSessionStore, {
+      ...(h.readSet === undefined ? {} : { resumeReadSet: h.readSet }),
+      generationSessionId: h.sessionId,
+      parentRecords,
+    });
+    stage("history");
+    if (invalidated()) return abort("履歴読み取り中にセッションが変化しました");
+    conversation = await readConversationMessages(h.filePath, isInSessionStore, h.readSet, h.sessionId, parentRecords);
+    stage("conversation");
+    if (invalidated()) return abort("会話履歴読み取り中にセッションが変化しました");
+  } finally {
+    // Ends this tab's turn in parentRecordSource; this async frame stays alive through the fold.
+    parentRecords?.release();
+  }
+
   const { title, messages } = transcript;
   s.recordedModel = transcript.recordedModel ?? s.recordedModel;
   if (transcript.readError) {
@@ -758,25 +921,43 @@ async function runResumeHydrationStages(
   ) {
     output.appendLine(
       `[${s.title}] resume transcript incomplete: malformed=${transcript.malformedLineCount} ` +
-        `omittedMessages=${transcript.coverage.omittedMessageCount ?? 0} ` +
-        `omittedTools=${transcript.coverage.omittedToolCount ?? 0}`
+        `omittedMessages=${transcript.coverage.omittedMessageCount ?? 0}`
     );
   }
-  const resolvedTitle = (await sessionSummaryOf(h.sessionId)) ?? title;
+  const resolvedTitle = (await h.summary) ?? title;
   stage("title");
   if (invalidated()) return abort("タイトル解決中にセッションが変化しました");
-  const titleAtResolve = s.title;
-  const autoTitledAtResolve = s.autoTitled;
 
-  const history = await readSessionHistory(h.filePath, isInSessionStore, historyOpts);
-  stage("history");
-  if (invalidated()) return abort("履歴読み取り中にセッションが変化しました");
   if (history.readError) {
     output.appendLine(`[${s.title}] resume history read failed: ${history.readError}`);
   } else if (history.subagentsReadError) {
     output.appendLine(`[${s.title}] resume history subagents/ read failed: ${history.subagentsReadError}`);
   } else if (history.coverage.summary !== "complete" || history.coverage.details !== "complete") {
     output.appendLine(`[${s.title}] resume history incomplete: malformed=${history.malformedLineCount}`);
+  }
+  if (history.coverage.ancestorUsageReadError !== undefined) {
+    output.appendLine(
+      `[${s.title}] resume history earlier-conversation record read failed (child usage not counted, ` +
+        `reachesGeneration=${history.coverage.ancestorUsageReachesGeneration === true}): ${history.coverage.ancestorUsageReadError}`
+    );
+  }
+
+  const restored = await readSubagentAgents(h.filePath, isInSessionStore);
+  stage("subagents");
+  if (invalidated()) return abort("階層読み取り中にセッションが変化しました");
+  output.appendLine(
+    `[${s.title}] resume subagents: meta=${restored.metaCount} malformed=${restored.malformedMetaCount} ` +
+      `transcripts=${restored.transcriptsRead} readFailed=${restored.transcriptReadFailureCount} ` +
+      `omitted=${restored.omittedTranscriptCount} bytes=${restored.bytesRead} ` +
+      `${restored.elapsedMs}ms${restored.readError ? ` error=${restored.readError}` : ""}`
+  );
+
+  if (cliFirst?.releaseAfterReads !== undefined) {
+    h.arrivalTimestamp ??= lastObservedTime(history.events);
+    if (h.arrivalTimestamp !== undefined) {
+      cliFirst.releaseAfterReads();
+      if (!await yieldToCli(cliFirst.started)) return;
+    }
   }
 
   const draft = createHydrationDraft(s);
@@ -830,6 +1011,10 @@ async function runResumeHydrationStages(
         ? { omittedToolCount: history.coverage.omittedToolCount }
         : {}),
       ...(history.coverage.hierarchyIncomplete ? { hierarchyIncomplete: true as const } : {}),
+      ...(history.coverage.ancestorUsageReadError !== undefined
+        ? { ancestorUsageReadError: history.coverage.ancestorUsageReadError }
+        : {}),
+      ...(history.coverage.ancestorUsageReachesGeneration ? { ancestorUsageReachesGeneration: true as const } : {}),
       ...(history.coverage.historyReadError !== undefined
         ? { historyReadError: history.coverage.historyReadError }
         : {}),
@@ -842,21 +1027,12 @@ async function runResumeHydrationStages(
   draft.evidenceIndex = { ...draft.evidenceIndex, hash: evidenceIndexHash(draft.evidenceIndex) };
   stage("evidence");
 
-  const restored = await readSubagentAgents(h.filePath, isInSessionStore);
-  stage("subagents");
-  if (invalidated()) return abort("階層読み取り中にセッションが変化しました");
   draft.workModel = markSubagentGaps(draft.workModel, {
     unreadableAgentCount:
       restored.malformedMetaCount + restored.transcriptReadFailureCount + restored.omittedTranscriptCount,
     hierarchyIncomplete: restored.readError !== undefined || restored.malformedMetaCount > 0,
   });
   draft.workModel = markBackgroundUnconfirmed(draft.workModel, draft.lastEventTimestamp ?? Date.now());
-  output.appendLine(
-    `[${s.title}] resume subagents: meta=${restored.metaCount} malformed=${restored.malformedMetaCount} ` +
-      `transcripts=${restored.transcriptsRead} readFailed=${restored.transcriptReadFailureCount} ` +
-      `omitted=${restored.omittedTranscriptCount} bytes=${restored.bytesRead} ` +
-      `${restored.elapsedMs}ms${restored.readError ? ` error=${restored.readError}` : ""}`
-  );
 
   if (transcript.readError || history.readError) {
     const err = transcript.readError ?? history.readError;
@@ -902,21 +1078,16 @@ async function runResumeHydrationStages(
   }
   stage("replay");
 
-  const conversation = await readConversationMessages(h.filePath, isInSessionStore, h.readSet, h.sessionId);
-  stage("conversation");
-  if (invalidated()) return abort("会話履歴読み取り中にセッションが変化しました");
-
   if (conversation.handoffEnvelope?.snapshot.forkSessionId === h.sessionId) {
     const sourceId = conversation.handoffEnvelope.snapshot.sourceSessionId;
-    const existingSource = [...st.sessions.values()].find(
-      (other) => !other.closed && (other.resumeSessionId === sourceId || other.auth?.sessionId === sourceId)
-    );
+    const sourceTitle = await sessionDisplayTitleOf(sourceId);
+    if (invalidated()) return abort("引き継ぎ元の題名の読み取り中にセッションが変化しました");
     const restoredContextUsage = restoredHandoffContextUsage(extensionContext?.globalState.get(handoffContextUsageKey(h.sessionId)));
     const unreadableLineCount = restoredHandoffUnreadableLineCount(extensionContext?.globalState.get(handoffUnreadableLinesKey(h.sessionId)));
     const decisions = conversation.handoffEnvelope.decisions;
     s.handoffSource = {
       sessionId: sourceId,
-      ...(existingSource?.title ? { title: existingSource.title } : {}),
+      ...(sourceTitle !== undefined ? { title: sourceTitle } : {}),
       ...(conversation.handoffEnvelope.snapshot.compact !== undefined
         ? { compact: conversation.handoffEnvelope.snapshot.compact }
         : {}),
@@ -965,10 +1136,15 @@ async function runResumeHydrationStages(
     releaseConversationHistory(historyScopeKey(s));
     output.appendLine(`[${s.title}] 会話履歴の登録に失敗: ${String(error)}`);
   }
-  if (s.title === titleAtResolve && s.autoTitled === autoTitledAtResolve) {
+  const titleAtResolve = h.titleAtResolve;
+  if (
+    titleAtResolve !== undefined &&
+    s.title === titleAtResolve.title &&
+    s.autoTitled === titleAtResolve.autoTitled &&
+    !holdsChosenTitle(s)
+  ) {
     if (resolvedTitle) {
-      s.title = displayTitleFromSummary(resolvedTitle, h.sessionId);
-      s.autoTitled = true;
+      adoptResumeTitle(s, resolvedTitle, h.sessionId);
     } else if (h.liveTitleCandidate) {
       s.title = displayTitleFromSummary(h.liveTitleCandidate, s.tabId);
       s.autoTitled = true;
@@ -992,6 +1168,7 @@ async function runResumeHydrationStages(
   if (sink.resolveOwner !== null) {
     s.analysisStore.resolveOwnerFromAuthStatus(sink.resolveOwner.sessionId, sink.resolveOwner.logicalGeneration);
   }
+  s.semantic.seedTranscriptTimeBuckets(h.filePath, h.sessionId, history, restored);
   s.semantic.scheduleTranscriptTimeBuckets();
   if (sink.liveTurnCompleted && !s.titleRefreshed && !s.titleRefreshing && !s.closed) {
     s.titleRefreshing = true;
@@ -1005,7 +1182,7 @@ export interface LoopLagProbe {
   blockedMs: () => number;
   stop: () => void;
 }
-export function startLoopLagProbe(): LoopLagProbe {
+export function startLoopLagProbe(onTick?: (lagMs: number, at: number) => void): LoopLagProbe {
   let maxLag = 0;
   let blocked = 0;
   let last = Date.now();
@@ -1015,7 +1192,13 @@ export function startLoopLagProbe(): LoopLagProbe {
     if (lag > maxLag) maxLag = lag;
     if (lag > RESUME_LOOP_LAG_TICK_MS) blocked += lag;
     last = now;
+    onTick?.(lag, now);
   }, RESUME_LOOP_LAG_TICK_MS);
   timer.unref?.();
   return { maxLagMs: () => maxLag, blockedMs: () => blocked, stop: () => clearInterval(timer) };
+}
+
+export function hostCpuMs(): number {
+  const used = process.cpuUsage();
+  return Math.round((used.user + used.system) / 1000);
 }

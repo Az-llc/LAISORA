@@ -1,8 +1,8 @@
-import { isObservedTime, type NormalizedEvent } from "./protocol";
+import { isObservedTime, type NormalizedEvent, type NormalizedEventBody } from "./protocol";
 import { redactAbsolutePaths } from "./path-redaction";
 import { isPureCommandWrapper, INJECTED_TAG_RE, STEER_TAG_RE } from "./human-input-vocabulary";
 import { isBookkeepingTool, foldPlanDeclarationText, parseTaskIntentFromRawInput, taskCreateKeyFromResult, type TaskIntent, type PlanTextState } from "./work-model";
-import { planItemNumber, planItemNumberOf, planNumberedStep, planStepActiveSpans, planStepKey, transitionPlanStep, type PlanSpan, type PlanStepTiming, type PlanStepTransition } from "./plan-steps";
+import { planItemNumber, planItemNumberOf, planNumberedStep, planStepActiveSpans, planStepKey, planStepTaskKey, TASK_KEY_PREFIX, TASK_PENDING_KEY_PREFIX, transitionPlanStep, type PlanSpan, type PlanStepTiming, type PlanStepTransition, type PlanStepUpdate } from "./plan-steps";
 import type { PlanUsage, PlanTokenTotal } from "./plan-usage";
 import { isExternalRunTool } from "./orchestration-executors";
 import { isRejectedBeforeRun } from "./tool-result-signals";
@@ -209,8 +209,6 @@ export interface RequestBlockRecord {
 export interface TimeBucketState {
   modelMarks?: ModelMark[];
   generationBoundaryAt?: number;
-  // Blocks of earlier generations; only keeps block IDs unique across a handoff.
-  earlierBlockCount?: number;
   fidelity: TimeFidelity;
   inheritedBoundaryCount: number;
   firstAt?: number;
@@ -218,7 +216,7 @@ export interface TimeBucketState {
   turnSpans: AppendList<TurnSpan>;
   openTurn?: TurnOrigin & { turnId: string; startedAt: number };
   openTools: Record<string, { at: number; toolName: string; lane: TimeLane; parentToolUseId: string | null; turnId: string; messageId?: string; description?: string;
-    taskIntent?: TaskIntent; stopTarget?: string }>;
+    taskIntent?: TaskIntent; stopTarget?: string; staleAt?: number }>;
   // The assistant message of the latest main-lane call (src/time-buckets.ts#withMessagePlanCalls).
   mainMessageId?: string;
   // Task ids a successful conductor TaskStop ended, until their notification or a resume (src/time-buckets.ts#laneRunning).
@@ -348,7 +346,7 @@ function isLiveEvent(event: NormalizedEvent): boolean {
 const POSITIONAL_LIVE_BLOCK_PREFIX = "block:live:";
 
 function positionalBlockId(state: TimeBucketState, live: boolean): string {
-  return `${live ? POSITIONAL_LIVE_BLOCK_PREFIX : "block:"}${(state.earlierBlockCount ?? 0) + state.blocks.length + state.droppedBlockCount + 1}`;
+  return `${live ? POSITIONAL_LIVE_BLOCK_PREFIX : "block:"}${state.blocks.length + state.droppedBlockCount + 1}`;
 }
 
 function isPositionalLiveBlockId(blockId: string): boolean {
@@ -483,6 +481,14 @@ function staleOpenBackground(
   return n;
 }
 
+function staleOpenMainCalls(state: TimeBucketState, n: TimeBucketState, ts: number): TimeBucketState {
+  const stamped = Object.entries(state.openTools).map(([id, tool]) =>
+    [id, tool.lane === "main" && tool.staleAt === undefined ? { ...tool, staleAt: Math.max(tool.at, ts) } : tool] as const);
+  if (stamped.every(([id, tool]) => tool === state.openTools[id])) return n;
+  n.openTools = Object.fromEntries(stamped);
+  return n;
+}
+
 function putDelegation(n: TimeBucketState, from: KeyedLog<DelegationSpan>, d: DelegationSpan): void {
   const before = keyedGet(from, d.toolUseId);
   n.delegations = keyedSet(from, d.toolUseId, d);
@@ -513,6 +519,50 @@ function unsettledBackgroundOfTask(state: TimeBucketState, taskId: string): Back
     if (b.notifiedEndedAt === undefined && b.staleAt === undefined) return b;
   }
   return undefined;
+}
+
+export function compactBoundaryTime(body: NormalizedEventBody, timestamp: number): number | undefined {
+  return body.kind === "compact_boundary" && isObservedTime(timestamp) ? timestamp : undefined;
+}
+
+export function generationBoundaryTime(body: NormalizedEventBody, timestamp: number): number | undefined {
+  return body.kind === "compact_boundary" && body.priorGeneration === true ? compactBoundaryTime(body, timestamp) : undefined;
+}
+
+function currentGenerationSlice<T>(events: readonly T[], bodyOf: (event: T) => NormalizedEventBody & { timestamp?: number },
+  timeOf: (event: T) => number): { events: readonly T[]; bounded: boolean } {
+  let boundaryAt: number | undefined;
+  let start = 0;
+  events.forEach((event, i) => {
+    const at = generationBoundaryTime(bodyOf(event), timeOf(event));
+    if (at !== undefined && at !== boundaryAt) {
+      boundaryAt = at;
+      start = i;
+    }
+  });
+  if (start === 0) return { events, bounded: boundaryAt !== undefined };
+  const earlierTurns = new Set<string>();
+  for (let i = 0; i < start; i++) {
+    const body = bodyOf(events[i]);
+    if (body.kind === "turn_started") earlierTurns.add(body.turnId);
+  }
+  let ownTurnStarted = false;
+  return { events: events.slice(start).filter(event => {
+    const body = bodyOf(event);
+    if (body.kind === "turn_started" && !earlierTurns.has(body.turnId)) ownTurnStarted = true;
+    const turnId = (body as { turnId?: unknown }).turnId;
+    return ownTurnStarted || typeof turnId !== "string" || !earlierTurns.has(turnId);
+  }), bounded: true };
+}
+
+export function currentGenerationEvents<T extends NormalizedEventBody & { timestamp: number }>(
+  events: readonly T[]
+): { events: readonly T[]; bounded: boolean } {
+  return currentGenerationSlice(events, event => event, event => event.timestamp);
+}
+
+export function currentGenerationRecords<T extends { body: NormalizedEventBody; timestamp: number }>(events: readonly T[]): readonly T[] {
+  return currentGenerationSlice(events, event => event.body, event => event.timestamp).events;
 }
 
 export function foldTimeBuckets(state: TimeBucketState, event: NormalizedEvent, options?: Parameters<typeof deriveTimeBuckets>[1]): TimeBucketState {
@@ -551,11 +601,9 @@ export function foldTimeBuckets(state: TimeBucketState, event: NormalizedEvent, 
       return next;
     }
     case "compact_boundary": {
-      if (event.priorGeneration !== true || ts === undefined) return next;
-      return { ...createTimeBucketState(), generationBoundaryAt: ts, fidelity: state.fidelity, inheritedBoundaryCount: state.inheritedBoundaryCount,
-        droppedBlockCount: state.droppedBlockCount, earlierBlockCount: (state.earlierBlockCount ?? 0) + next.blocks.length,
-        ...(state.request === undefined ? {} : { request: state.request }),
-        requestNumbers: state.requestNumbers, ...(state.numberedRequests === undefined ? {} : { numberedRequests: state.numberedRequests }) };
+      const boundaryAt = generationBoundaryTime(event, event.timestamp);
+      if (boundaryAt === undefined) return next;
+      return { ...createTimeBucketState(), generationBoundaryAt: boundaryAt, fidelity: state.fidelity, inheritedBoundaryCount: state.inheritedBoundaryCount };
     }
     case "background_tasks": {
       const alive = new Set(event.tasks.filter((t) => t.ambient !== true).map((t) => t.id));
@@ -580,6 +628,8 @@ export function foldTimeBuckets(state: TimeBucketState, event: NormalizedEvent, 
         n.fidelity = "inherited";
       }
       if (ts === undefined) return n;
+      const priorEnd = state.openTurn === undefined ? state.turnSpans.buffer[state.turnSpans.size - 1]?.end : undefined;
+      state = staleOpenMainCalls(state, n, Math.min(ts, priorEnd ?? ts));
       if (state.openTurn !== undefined) {
         n.turnSpans = appendItem(state.turnSpans, { ...state.openTurn, start: state.openTurn.startedAt, end: Math.max(state.openTurn.startedAt, ts) });
       }
@@ -590,11 +640,13 @@ export function foldTimeBuckets(state: TimeBucketState, event: NormalizedEvent, 
     }
     case "conversation_closed": {
       if (ts === undefined) return next;
+      if (isLiveEvent(event)) state = staleOpenMainCalls(state, touch(), ts);
       return staleOpenBackground(state, touch(), ts, () => true);
     }
     case "turn_completed":
     case "turn_interrupted":
     case "turn_failed": {
+      if (ts !== undefined && isLiveEvent(event)) state = staleOpenMainCalls(state, touch(), ts);
       if (ts !== undefined && event.kind !== "turn_completed") {
         state = staleOpenBackground(state, touch(), ts, () => true);
       }
@@ -861,7 +913,7 @@ export interface AgentSpanView {
   failCount: number;
   toolMs: number;
   generateMs: number;
-  endSource: "child-transcript" | "child-tools" | "ack" | "open" | "notification";
+  endSource: "child-transcript" | "child-tools" | "ack" | "open" | "notification" | "stale";
 }
 
 export interface RequestBlockView {
@@ -1130,20 +1182,19 @@ export function deriveTimeBuckets(
 
   const confirmSpans = state.mainTools.filter((t) => HUMAN_INPUT_WAIT_TOOLS.has(t.toolName)).map((t) => [t.start, t.end] as Span);
   const allMainToolSpans = state.mainTools.map((t) => [t.start, t.end] as Span);
-  for (const open of Object.values(state.openTools)) {
-    if (open.lane !== "main" || lastAt === null) continue;
-    const span: Span = [open.at, Math.max(open.at, end)];
-    allMainToolSpans.push(span);
-    if (HUMAN_INPUT_WAIT_TOOLS.has(open.toolName)) confirmSpans.push(span);
+  const openMainCalls = lastAt === null ? [] : Object.values(state.openTools).filter((open) => open.lane === "main")
+    .map((open) => ({ toolName: open.toolName, span: [open.at, Math.max(open.at, open.staleAt ?? end)] as Span }));
+  for (const open of openMainCalls) {
+    allMainToolSpans.push(open.span);
+    if (HUMAN_INPUT_WAIT_TOOLS.has(open.toolName)) confirmSpans.push(open.span);
   }
   const confirmUnion = unionSpans(confirmSpans);
   const callUnion = subtractSpans(unionSpans(allMainToolSpans), confirmUnion);
   const nonDelegationToolSpans = state.mainTools
     .filter((t) => t.rejectedBeforeRun || !isSubagentWaitTool(t.toolName))
     .map((t) => [t.start, t.end] as Span);
-  for (const open of Object.values(state.openTools)) {
-    if (open.lane !== "main" || lastAt === null || isSubagentWaitTool(open.toolName)) continue;
-    nonDelegationToolSpans.push([open.at, Math.max(open.at, end)]);
+  for (const open of openMainCalls) {
+    if (!isSubagentWaitTool(open.toolName)) nonDelegationToolSpans.push(open.span);
   }
   const toolUnion = subtractSpans(unionSpans(nonDelegationToolSpans), confirmUnion);
   const subagentWaitUnion = subtractSpans(callUnion, toolUnion);
@@ -1207,7 +1258,11 @@ export function deriveTimeBuckets(
     const claimableRunning =
       options?.streamOpen !== false &&
       (liveGateIds === undefined || (d.transcriptAgentId !== undefined && liveGateIds.has(d.transcriptAgentId)));
-    if (d.isBackground && d.notifiedEndedAt === undefined && claimableRunning) {
+    const staleAt = d.ackEndedAt === undefined ? state.openTools[toolUseId]?.staleAt : undefined;
+    if (staleAt !== undefined && child?.endedAt === undefined && d.lastChildAt === undefined) {
+      spanEnd = staleAt;
+      endSource = "stale";
+    } else if (staleAt === undefined && d.isBackground && d.notifiedEndedAt === undefined && claimableRunning) {
       if (child?.startedAt !== undefined) start = child.startedAt;
       spanEnd = undefined;
       endSource = "open";
@@ -1411,7 +1466,7 @@ export function deriveTimeBuckets(
   }
 
   const maxParallelAgents = sweepMax(agentSpans);
-  const openMainTools = Object.values(state.openTools).filter((o) => o.lane === "main");
+  const openMainTools = Object.values(state.openTools).filter((o) => o.lane === "main" && o.staleAt === undefined);
   const confirmOpen = openMainTools.some((o) => HUMAN_INPUT_WAIT_TOOLS.has(o.toolName));
   const turnParallel = state.openTurn !== undefined && !confirmOpen ? 1 : 0;
   const currentParallel = turnParallel + agents.filter((a) => a.open).length + backgroundTasks.filter((t) => t.open).length;
@@ -1507,13 +1562,11 @@ export function planItemKeys(block: RequestBlockRecord): string[] {
   return block.seenSteps ?? (block.steps ?? []).map(step => step.key);
 }
 
-export type NumberedLaunchVerdict = { kind: "allow" } | { kind: "unnumbered"; numbers: number[] } | { kind: "not-in-progress"; number: number };
-export type ResumeVerdict = { kind: "allow" } | { kind: "step-completed"; number: number };
+export type NumberedLaunchVerdict = { kind: "allow" } | { kind: "unnumbered"; numbers: number[] } | { kind: "unknown-step"; number: number; numbers: number[]; todoNextNumber?: number }
+  | ({ kind: "not-in-progress" } & PlanStepUpdate);
+export type ResumeVerdict = { kind: "allow" } | ({ kind: "step-completed" } & PlanStepUpdate);
 export type CompletionVerdict = { kind: "allow" } | { kind: "running-lanes"; steps: { number: number; lanes: string[] }[] };
 
-// Plan-tool calls observed in the same assistant message, in any order, count with the status they send, folded by the
-// same rule as their results. The current assistant message is the one that issued the latest main-lane call; a plan call left open
-// by a cut stream or an earlier message is not folded. `except` is the call being judged, whose own start may already be open.
 function withMessagePlanCalls(state: TimeBucketState, except?: string): TimeBucketState {
   const current = state.mainMessageId;
   return Object.entries(state.openTools).reduce((next, [toolUseId, tool]) => toolUseId !== except && tool.lane === "main" && tool.taskIntent !== undefined
@@ -1521,8 +1574,19 @@ function withMessagePlanCalls(state: TimeBucketState, except?: string): TimeBuck
     ? applyPlanTask(next, tool.taskIntent, tool.at, tool.turnId, "", { live: true, toolUseId }) : next, state);
 }
 
-// While a PLAN has items, a delegation or external run may run only for an item the conductor itself marked in progress;
-// the Host never changes item state for a launch.
+function inProgressUpdate(state: TimeBucketState, blockIndex: number, number: number, step: { key: string; taskKey: string | undefined; title: string }): PlanStepUpdate | undefined {
+  const { key, taskKey } = step;
+  const block = state.blocks[blockIndex];
+  if (taskKey === undefined || !taskKey.startsWith(TASK_KEY_PREFIX)) {
+    return blockIndex === state.blocks.length - 1 && block.kind === "plan" && block.closedAt === undefined ? { number, tool: "TodoWrite", title: step.title } : undefined;
+  }
+  if (taskKey.startsWith(TASK_PENDING_KEY_PREFIX)) return undefined;
+  const reopened = applyPlanTask(state, { kind: "update", taskKey, status: "in_progress" }, state.lastAt ?? 0, state.openTurn?.turnId ?? "", "",
+    { live: true, toolUseId: "" });
+  return reopened.blocks[blockIndex].steps?.find(value => value.key === key)?.status === "in_progress"
+    ? { number, tool: "TaskUpdate", taskId: taskKey.slice(TASK_KEY_PREFIX.length) } : undefined;
+}
+
 export function numberedLaunchVerdict(state: TimeBucketState, description: string | undefined): NumberedLaunchVerdict {
   const planned = withMessagePlanCalls(state);
   const block = currentWorkBlock(planned);
@@ -1531,10 +1595,17 @@ export function numberedLaunchVerdict(state: TimeBucketState, description: strin
   if (listed.length === 0) return { kind: "allow" };
   const number = planItemNumberOf(description);
   if (number === undefined) return { kind: "unnumbered", numbers: listed };
-  const found = planNumberedStep(planned.blocks, number, planned.lastAt ?? Number.POSITIVE_INFINITY);
-  if (found !== undefined && !found.step.removed && found.step.status === "in_progress") return { kind: "allow" };
   const keys = planItemKeys(block);
-  return found !== undefined || keys.some(key => planItemNumber(keys, key) === number) ? { kind: "not-in-progress", number } : { kind: "unnumbered", numbers: listed };
+  const todoPlan = keys.length > 0 && keys.every(key => planStepTaskKey(key) === undefined);
+  const unknown: NumberedLaunchVerdict = { kind: "unknown-step", number, numbers: listed, ...(todoPlan ? { todoNextNumber: keys.length + 1 } : {}) };
+  const notInProgress = (update: PlanStepUpdate | undefined): NumberedLaunchVerdict => update === undefined ? { kind: "allow" } : { kind: "not-in-progress", ...update };
+  const found = planNumberedStep(planned.blocks, number, planned.lastAt ?? Number.POSITIVE_INFINITY);
+  if (found !== undefined) {
+    if (found.step.removed) return unknown;
+    return found.step.status === "in_progress" ? { kind: "allow" } : notInProgress(inProgressUpdate(planned, found.blockIndex, number, found.step));
+  }
+  const seen = keys.find(key => planItemNumber(keys, key) === number);
+  return seen === undefined ? unknown : notInProgress(inProgressUpdate(planned, planned.blocks.length - 1, number, { key: seen, taskKey: planStepTaskKey(seen), title: seen }));
 }
 
 function launchStep(blocks: readonly RequestBlockRecord[], selections: readonly { at: number; selected: SelectedItem[] }[],
@@ -1583,20 +1654,9 @@ export function resumeVerdict(state: TimeBucketState, to: string, namedToolUseId
   if (resumed === undefined || laneRunning(state, running, resumed.toolUseId, agentId)) return { kind: "allow" };
   const planned = withMessagePlanCalls(state, toolUseId);
   const placed = launchPlacedStep(planned, responseSelections(planned.blocks, turnSpansUntil(planned, Number.POSITIVE_INFINITY)), resumed.description, resumed.startedAt);
-  return placed !== undefined && isCompletedStep(placed.step) && reopenable(planned, placed.blockIndex, placed.step)
-    ? { kind: "step-completed", number: placed.step.number } : { kind: "allow" };
-}
-
-// A resume is denied only onto an item the denial's instruction can set back in progress, else the agent could never be
-// resumed: TodoWrite reaches only its own items in the open PLAN block; TaskUpdate reaches a task item through
-// applyPlanTask's own lookup, but not one whose TaskCreate result gave no id (the pending key), since no id can be sent.
-function reopenable(state: TimeBucketState, blockIndex: number, step: PlanBlockStepRecord): boolean {
-  const block = state.blocks[blockIndex];
-  if (!step.taskKey.startsWith("task:")) return blockIndex === state.blocks.length - 1 && block.kind === "plan" && block.closedAt === undefined;
-  if (step.taskKey.startsWith(taskCreateKeyFromResult("", ""))) return false;
-  const reopened = applyPlanTask(state, { kind: "update", taskKey: step.taskKey, status: "in_progress" }, state.lastAt ?? 0, state.openTurn?.turnId ?? "", "",
-    { live: true, toolUseId: "" });
-  return reopened.blocks[blockIndex].steps?.find(value => value.key === step.key)?.status === "in_progress";
+  const update = placed !== undefined && isCompletedStep(placed.step)
+    ? inProgressUpdate(planned, placed.blockIndex, placed.step.number, placed.step) : undefined;
+  return update === undefined ? { kind: "allow" } : { kind: "step-completed", ...update };
 }
 
 // A launch that has not returned yet counts only once its PreToolUse let it run (`admitted`, the hook's own decisions);

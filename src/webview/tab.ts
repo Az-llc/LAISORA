@@ -5,7 +5,7 @@ import { onTodoAsksClosedInTodo, todoAsksClosedInTodo } from "./todo-asks";
 import { addTodoToolCall, isTodoWriteTool, renderTodoHead, setTodoToolCardResult, todoToolCard } from "./todo-chat";
 import { renderTodoCrumbs, todoAgentLabel, todoAgentText, todoLinkHub, todoTabMarks } from "./todo-links";
 import { PlanPanel } from "./plan-panel";
-import { applyFallbackModel, fallbackNoticeOriginal, foldModelFallback, resolveFallbackByChoice } from "../protocol";
+import { applyFallbackModel, fallbackNoticeOriginal, fallbackNoticeOutcome, foldModelFallback, resolveFallbackByChoice } from "../protocol";
 import type { ModelFallbackState } from "../protocol";
 import { YouList } from "./you-list";
 import { bindUserLabel, onUserLabelChange } from "./user-label";
@@ -43,13 +43,14 @@ import { clock, formatDuration, monthDayClock, toolSummary } from "./format";
 import { uiLocale } from "./l10n";
 import { createCopyButton, renderMarkdownInto } from "./markdown";
 import { forgetCodeBlockStates } from "./markdown-codeblock";
-import { askOtherChoice, askHeading, askOptionContent, rejectRenderedAsks, settleUncheckedAsks, updateAskCounters } from "./ask-view";
+import { askHeading, askOptionContent, rejectRenderedAsks, settleUncheckedAsks, updateAskCounters } from "./ask-view";
+import { askOtherChoice } from "../ask-parser";
 import { askQualityCheckEnabled, editSummaryEnabled, onEditSummaryChange } from "./menu";
 import { aggregateTurnEdits, buildEditSummaryCard, type TurnFileEdit } from "./edit-summary-card";
 import { createYouItems, encodeAskDismissal, encodeAskResolution, youAnchor, type AskIdentity, type AskResolutionRecord, type YouItemsReader } from "./you-items";
 import { findCommitBoundary, joinRecordTexts, prependRecordParts, recordSeparator, type RecordTextPart } from "../commit-boundary";
 import { breaksParagraph, cardHome, compareTurnOrder, editSummaryPlace, labelPendingParts, legacyAskKeys, locateInParts, mergedParagraph, paragraphKey, paragraphText, prependTurnLayout, turnLabelModel, type ModelMark, type TurnItem, type TurnOrder, type TurnParagraph } from "./turn-layout";
-import { isConvRenderableEvent } from "../conv-renderable";
+import { isConvRenderableEvent, permissionDeniedTarget } from "../conv-renderable";
 import {
   applyActivityEvent,
   backgroundActivityFromSnapshot,
@@ -740,6 +741,7 @@ export function isScrollCarry(v: unknown): v is ScrollCarry {
 }
 
 const ORPHAN_FINISH_MAX = 512;
+const FINISHED_CALL_MAX = 4096;
 
 export type LoadProgressState =
   | { phase: "preparing" }
@@ -1756,14 +1758,12 @@ export class Tab {
 
   private fallbackStatusText(ev: Extract<NormalizedEvent, { kind: "model_refusal_fallback" }>): string | undefined {
     if (ev.scope === "local") return undefined;
+    const outcome = fallbackNoticeOutcome(this.modelFallback, ev);
+    if (outcome === "resolved") return undefined;
     const original = this.modelLabel(fallbackNoticeOriginal(this.modelFallback, ev));
-    const notice = this.modelFallback?.notice;
-    const state = notice?.conversationId === ev.conversationId && notice?.generation === ev.generation && notice?.seq === ev.seq
-      ? this.modelFallback : undefined;
-    if (state?.resolvedAt !== undefined) return undefined;
-    return (state?.autoRevert ?? ev.autoRevert) === "pending" && state?.reopenedAt === undefined
-      ? l10n.t("{0} will be restored automatically when this turn ends.", original)
-      : l10n.t("Could not restore the original model {0}. Please switch the model manually.", original);
+    return outcome === "failed" ? l10n.t("Could not restore the original model {0}. Please switch the model manually.", original)
+      : outcome === "pending" ? l10n.t("{0} will be restored automatically when this turn ends.", original)
+        : l10n.t("The original model was {0}. Switch the model manually if needed.", original);
   }
 
   private fallbackRevertText(ev: Extract<NormalizedEvent, { kind: "model_fallback_revert" }>): string {
@@ -1937,6 +1937,8 @@ export class Tab {
   private readonly logDirty = new Set<string>();
   private readonly logToolRequests = new Map<string, string>();
   private readonly logFinishOrder = new Map<string, number[]>();
+  private readonly denialRows = new Map<string, HTMLElement[]>();
+  private readonly finishedCalls = new Map<string, boolean>();
   private readonly logRunningLabels = new Map<string, (now: number) => void>();
   private readonly logRequestMeta = new Map<string, NonNullable<WorkModelPayload["requests"]>[number]>();
   private logLatestRequest: string | undefined;
@@ -5077,6 +5079,7 @@ export class Tab {
   }
 
   private onToolCallFinished(ev: Extract<NormalizedEvent, { kind: "tool_call_finished" }>, activityChanged: boolean): void {
+    this.settleDenialRows(ev);
     this.runningChildTools.delete(ev.toolUseId);
     this.finishTodoToolCard(ev);
     const mainToolFinished = this.runningMainTools.delete(ev.toolUseId);
@@ -5436,7 +5439,47 @@ export class Tab {
   }
 
   private onPermissionDenied(ev: Extract<NormalizedEvent, { kind: "permission_denied" }>): void {
-    this.addBlock("error", permissionDeniedText(ev));
+    const target = this.permissionDeniedTargetOf(ev);
+    if (target === null) return;
+    this.noteDenialRow(ev.toolUseId, this.addBlock("error", permissionDeniedText(ev), false, target));
+  }
+
+  private permissionDeniedTargetOf(ev: Extract<NormalizedEvent, { kind: "permission_denied" }>): "conv" | "work" | null {
+    const id = ev.toolUseId;
+    return permissionDeniedTarget(ev, id !== undefined && (this.finishedCalls.get(id) === true || this.rowData.get(id)?.status === "done"));
+  }
+
+  private noteDenialRow(toolUseId: string | undefined, row: HTMLElement): void {
+    if (toolUseId === undefined || this.finishedCalls.has(toolUseId)) return;
+    this.rememberCall(this.denialRows, toolUseId, [...(this.denialRows.get(toolUseId) ?? []), row]);
+  }
+
+  private rememberCall<V>(calls: Map<string, V>, toolUseId: string, value: V): void {
+    calls.delete(toolUseId);
+    calls.set(toolUseId, value);
+    if (calls.size > FINISHED_CALL_MAX) calls.delete(calls.keys().next().value!);
+  }
+
+  private settleDenialRows(ev: Extract<NormalizedEvent, { kind: "tool_call_finished" }>): void {
+    this.rememberCall(this.finishedCalls, ev.toolUseId, this.finishedCalls.get(ev.toolUseId) === true || !ev.isError);
+    const rows = this.denialRows.get(ev.toolUseId);
+    if (rows === undefined) return;
+    this.denialRows.delete(ev.toolUseId);
+    if (ev.isError) return;
+    for (const row of rows) this.dropDenialRow(row);
+    this.scheduleLogRefresh();
+  }
+
+  private dropDenialRow(row: HTMLElement): void {
+    if (row.parentNode === null) return;
+    const requestId = row.dataset.logRequestId;
+    if (requestId !== undefined) {
+      this.logRequests.get(requestId)?.members.delete(row);
+      this.logDirty.add(requestId);
+    }
+    if (row.dataset.convPast === "1") this.convPrependedTotal--;
+    else if (row.classList.contains("hll-past")) this.pastRenderedTotal--;
+    row.remove();
   }
 
   private onApprovalRequest(ev: Extract<NormalizedEvent, { kind: "approval_request" }>): void {
@@ -5865,13 +5908,26 @@ export class Tab {
       this.placeTodoToolCard(ev, turns);
       return "skipped";
     }
-    if (ev.kind === "tool_call_finished") this.finishTodoToolCard(ev);
+    if (ev.kind === "tool_call_finished") {
+      this.settleDenialRows(ev);
+      this.finishTodoToolCard(ev);
+    }
     if (ev.kind === "model_observed") this.noteModelMark(ev);
     if (ev.kind === "assistant_message_uuid") {
       this.pastTurnItem(turns, ev.turnId, { kind: "uuid", order: [ev.generation, ev.seq], uuid: ev.uuid });
       if (ev.provenance?.path === "history" && !turns.recordIds.has(ev.turnId)) turns.recordIds.set(ev.turnId, ev.uuid);
     }
     if (!isConvRenderableEvent(ev)) return "skipped";
+    if (ev.kind === "permission_denied") {
+      if (this.permissionDeniedTargetOf(ev) !== "conv") return "skipped";
+      const div = document.createElement("div");
+      div.className = "block error";
+      div.dataset.convPast = "1";
+      div.textContent = permissionDeniedText(ev);
+      frag.append(div);
+      this.noteDenialRow(ev.toolUseId, div);
+      return "created";
+    }
     if (ev.kind === "local_command_output") {
       if (ev.uuid && this.convMessageUuids.has(ev.uuid)) return "duplicate";
       const div = document.createElement("div");
@@ -6192,6 +6248,7 @@ export class Tab {
       case "tool_call_started":
         return this.renderPastToolStarted(ev);
       case "tool_call_finished": {
+        this.settleDenialRows(ev);
         if (this.applyToolFinishDom(ev)) return "applied";
         this.rememberOrphanFinish(ev);
         return "skipped";
@@ -6216,11 +6273,10 @@ export class Tab {
         }
         return "skipped";
       }
-      case "permission_denied":
-        return this.renderPastPlainRow(
-          permissionDeniedText(ev),
-          "error"
-        );
+      case "permission_denied": {
+        if (this.permissionDeniedTargetOf(ev) !== "work") return "skipped";
+        return this.renderPastPlainRow(permissionDeniedText(ev), "error", (row) => this.noteDenialRow(ev.toolUseId, row));
+      }
       case "model_refusal_fallback":
         return this.renderPastPlainRow(() => this.fallbackLogText(ev), "system");
       case "model_fallback_revert":
@@ -6279,12 +6335,13 @@ export class Tab {
     return "created";
   }
 
-  private renderPastPlainRow(text: string | (() => string), cls: string): PastRenderOutcome {
+  private renderPastPlainRow(text: string | (() => string), cls: string, onRow?: (row: HTMLElement) => void): PastRenderOutcome {
     const div = document.createElement("div");
     div.className = `block ${cls} hll-past`;
     if (typeof text === "string") div.textContent = text;
     else this.bindModelText(div, text);
     this.insertWork(this.pastRender!.frag, div);
+    onRow?.(div);
     return "created";
   }
 

@@ -13,10 +13,8 @@ import type {
   TimeBucketsCoverage,
   WorkModelPayload,
 } from "../protocol";
-import type { AnalysisReport } from "../analysis";
 import type { TimeBucketView } from "../time-buckets";
 import type { ExecLogFindingView, ExecLogMark, FailureKindView, FailureSummaryView } from "../exec-log-marks";
-import { renderAnalysisView } from "./analysis-view";
 import { renderAnalysisFactsView } from "./analysis-facts-view";
 import { vscode } from "./dom";
 import { formatDuration, clock, dayClock } from "./format";
@@ -119,8 +117,6 @@ export class WorkOverview {
   private readonly logHeadEl: HTMLElement;
   private readonly logSumEl: HTMLElement;
   private readonly l3El: HTMLElement;
-  private readonly referenceHeadEl: HTMLElement;
-  private readonly referenceEl: HTMLElement;
   private readonly graph: WorkGraph;
   private readonly inspector: AgentInspector;
   private mode: WorkViewMode = "summary";
@@ -128,7 +124,6 @@ export class WorkOverview {
   private payload: WorkModelPayload | undefined;
   private semanticPayload: SemanticModelPayload | undefined;
   private semanticView: boolean | undefined;
-  private hasReferenceReport = false;
   private llmAnalysisEnabled: boolean | undefined;
   private turnRunning = false;
   private analysisSub: AnalysisSubtab = "script";
@@ -206,11 +201,6 @@ export class WorkOverview {
     this.findingsEl = div("wa-findings");
     this.l3El = div("l3-view");
     this.l3LlmEl = div("l3-view l3-view-llm");
-    this.referenceHeadEl = span("l3-reference-head", l10n.t("Reference: statistical analysis ("));
-    this.referenceHeadEl.append(termSpan("Baseline"), document.createTextNode(l10n.t(" comparison)")));
-    this.referenceEl = div("l3-reference");
-    this.referenceEl.appendChild(span("wo-empty", l10n.t("Statistical analysis has not been run yet.")));
-    this.syncReferenceVisibility();
     this.subSwitchEl = document.createElement("div");
     this.subSwitchEl.className = "wa-tabs";
     this.subSwitchEl.setAttribute("role", "tablist");
@@ -229,7 +219,7 @@ export class WorkOverview {
     this.llmEl.setAttribute("aria-labelledby", this.subTabs.ai.id);
     this.subSwitchEl.append(this.subTabs.script, this.subTabs.ai);
     this.scriptEl.append(this.findingsEl, this.l3El);
-    this.llmEl.append(this.l3LlmEl, this.referenceHeadEl, this.referenceEl);
+    this.llmEl.append(this.l3LlmEl);
     this.analysisEl.append(this.measuredEl, this.subSwitchEl, this.scriptEl, this.llmEl);
     this.applyAnalysisSub();
 
@@ -444,21 +434,6 @@ export class WorkOverview {
     }
   }
 
-  setAnalysis(sessionId: string, filePath: string, report: AnalysisReport): void {
-    this.hasReferenceReport = true;
-    this.analysisEl.dataset.sessionId = sessionId;
-    this.analysisFailure = undefined;
-    this.renderAnalysisFailureLine();
-    renderAnalysisView(this.referenceEl, sessionId, filePath, report);
-    this.syncReferenceVisibility();
-  }
-
-  showAnalysis(sessionId: string, filePath: string, report: AnalysisReport): void {
-    this.setAnalysis(sessionId, filePath, report);
-    this.setAnalysisSub("ai");
-    this.setMode("analysis");
-  }
-
   setYou(element: HTMLElement): void { this.youSection.replaceChildren(element); }
 
   setPlanUsage(usage: PlanUsage | undefined): void {
@@ -513,7 +488,6 @@ export class WorkOverview {
     this.semanticPayload = model;
     this.semanticView = semanticView;
     this.summaryDirty = true;
-    this.syncReferenceVisibility();
     this.execLogFindings = active?.execLogFindings;
     this.execLogFindingsEmptyLabel = active?.execLogFindingsEmptyLabel;
     this.setExecLogMarks(active?.execLogMarks);
@@ -620,12 +594,6 @@ export class WorkOverview {
     return (this.semanticView === false ? undefined : this.semanticPayload)?.l3;
   }
 
-  private syncReferenceVisibility(): void {
-    const hasL3 = this.activeL3() !== undefined;
-    this.referenceHeadEl.hidden = !hasL3 || !this.hasReferenceReport;
-    this.referenceEl.hidden = hasL3 && !this.hasReferenceReport;
-  }
-
   private renderAnalysisPanel(): void {
     this.renderMeasured();
     this.renderFindings();
@@ -712,7 +680,6 @@ export class WorkOverview {
     );
     this.renderLlmRunLine();
     this.renderAnalysisFailureLine();
-    this.syncReferenceVisibility();
   }
 
   private activeSemantic(): SemanticModelPayload | undefined {

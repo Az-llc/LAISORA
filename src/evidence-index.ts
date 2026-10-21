@@ -4,7 +4,7 @@ import { progressSubjectKey } from "./progress-protocol";
 import type { HostArtifactAccess } from "./artifact-access";
 import { PROGRESS_WIRE_TOOL_NAME } from "./artifact-access";
 import type { TaskIntent, TaskStatus } from "./work-model";
-import { CLAUDE_VOCABULARY, taskCreateKeyFromResult, createWorkModelState, reduceWorkModel, type WorkModelState } from "./work-model";
+import { CLAUDE_VOCABULARY, taskCreateKeyFromResult } from "./work-model";
 import { isPureCommandWrapper } from "./human-input-vocabulary";
 import { redactAbsolutePaths } from "./path-redaction";
 import { isRejectedBeforeRun } from "./tool-result-signals";
@@ -18,7 +18,7 @@ export const MAX_ARTIFACT_ACCESSES = 5000;
 export const MAX_EFFECT_GAPS = 5000;
 export const MAX_PENDING_INTENTS = 256;
 export const MAX_HUMAN_MESSAGE_TIMES = 500;
-export const IDLE_GAP_MS = 5 * 60_000;
+const IDLE_GAP_MS = 5 * 60_000;
 export const MAX_LONG_GAPS = 500;
 const MAX_OPEN_SIDECHAIN_TOOLS = 1000;
 
@@ -116,7 +116,6 @@ export interface GapScanState {
 }
 
 export interface SemanticEvidenceIndex {
-  currentGeneration?: { workModel: WorkModelState; evidence: SemanticEvidenceIndex; toolCalls: number };
   bindings: TaskIdentityBinding[];
   todoTransitions: TodoTransition[];
   transitionSummaries: TaskTransitionSummary[];
@@ -470,24 +469,6 @@ function foldGapScan(
 }
 
 export function foldEvidence(
-  index: SemanticEvidenceIndex,
-  event: NormalizedEvent,
-  hostArtifacts?: HostArtifactAccess[],
-  gapBoundaries?: readonly number[],
-  timeOptions?: Parameters<typeof foldTimeBuckets>[2]
-): SemanticEvidenceIndex {
-  const folded = foldEvidenceState(index, event, hostArtifacts, gapBoundaries, timeOptions);
-  const boundary = folded.timeBuckets.generationBoundaryAt;
-  if (boundary === undefined) return folded;
-  const previous = boundary === index.timeBuckets.generationBoundaryAt ? index.currentGeneration : undefined;
-  return { ...folded, currentGeneration: {
-    workModel: reduceWorkModel(previous?.workModel ?? createWorkModelState(), event),
-    evidence: foldEvidenceState(previous?.evidence ?? createEvidenceIndex(), event, hostArtifacts, gapBoundaries, timeOptions),
-    toolCalls: (previous?.toolCalls ?? 0) + (event.kind === "tool_call_started" ? 1 : 0),
-  } };
-}
-
-function foldEvidenceState(
   index: SemanticEvidenceIndex,
   event: NormalizedEvent,
   hostArtifacts?: HostArtifactAccess[],

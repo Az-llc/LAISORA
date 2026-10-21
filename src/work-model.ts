@@ -6,6 +6,7 @@ import { isRejectedBeforeRun } from "./tool-result-signals";
 import { isPureCommandWrapper } from "./human-input-vocabulary";
 import { parseMarkdown } from "./markdown-ast";
 import { appendRecordPart, findCommitBoundary, joinRecordTexts, type RecordTextPart } from "./commit-boundary";
+import { TASK_KEY_PREFIX, TASK_PENDING_KEY_PREFIX } from "./plan-steps";
 
 export const MAX_PHASES = 256;
 
@@ -36,6 +37,8 @@ export interface WorkCoverage {
   omittedTranscriptCount?: number;
   depthLimitedAgentCount?: number;
   hierarchyIncomplete?: true;
+  ancestorUsageReadError?: string;
+  ancestorUsageReachesGeneration?: true;
   reducerErrorCount?: number;
   hydrationUnconfirmed?: "loading" | "failed";
   historyReadError?: string;
@@ -203,7 +206,6 @@ export interface WorkModelState {
   requestOffset?: number;
   requestByTurn?: Record<string, number>;
   requestHeadline?: { turnId: string | null; text: string };
-  planBoundaryAt?: number;
   planHistory?: PlanHistoryEntry[];
   planHistoryTruncated?: boolean;
   planHistoryLostThrough?: number;
@@ -927,7 +929,7 @@ export function parseTaskIntentFromRawInput(
     if (taskId === undefined) return undefined;
     return {
       kind: "update",
-      taskKey: `task:${taskId}`,
+      taskKey: `${TASK_KEY_PREFIX}${taskId}`,
       subject: readString(input, "subject"),
       activeForm: readString(input, "activeForm"),
       status: readTaskStatus(input.status),
@@ -984,7 +986,7 @@ function applyTodoIntent(
 
 export function taskCreateKeyFromResult(intentToolUseId: string, resultPreview: string): string {
   const match = TASK_CREATE_ID_RE.exec(resultPreview) ?? TASK_CREATE_JSON_ID_RE.exec(resultPreview);
-  return match ? `task:${match[1]}` : `task:pending:${intentToolUseId}`;
+  return match ? `${TASK_KEY_PREFIX}${match[1]}` : `${TASK_PENDING_KEY_PREFIX}${intentToolUseId}`;
 }
 
 function applyCreateIntent(d: Draft, intent: Extract<TaskIntent, { kind: "create" }>, resultPreview: string): void {
@@ -1007,7 +1009,7 @@ function applyUpdateIntent(d: Draft, intent: Extract<TaskIntent, { kind: "update
   const existing = known;
   if (!existing) {
     if (intent.status !== undefined && intent.status !== "in_progress") releaseOmittedActiveTask(d);
-    const fallbackName = intent.taskKey.startsWith("task:") ? intent.taskKey.slice("task:".length) : intent.taskKey;
+    const fallbackName = intent.taskKey.startsWith(TASK_KEY_PREFIX) ? intent.taskKey.slice(TASK_KEY_PREFIX.length) : intent.taskKey;
     upsertTask(
       d,
       intent.taskKey,
@@ -1936,8 +1938,7 @@ function handleSubagentInfo(d: Draft, e: Extract<NormalizedEvent, { kind: "subag
 function recordPlanHistory(d: Draft, entry: PlanHistoryEntry): void {
   const history = [...(d.next.planHistory ?? []), entry];
   while (history.length > MAX_TASKS) {
-    const earlier = history.findIndex(row => row.kind !== "user" && row.at < (d.next.planBoundaryAt ?? Number.NEGATIVE_INFINITY));
-    const [lost] = history.splice(earlier < 0 ? 0 : earlier, 1);
+    const [lost] = history.splice(0, 1);
     d.next.planHistoryTruncated = true;
     d.next.planHistoryLostThrough = Math.max(d.next.planHistoryLostThrough ?? Number.NEGATIVE_INFINITY, lost.at);
   }
@@ -2026,10 +2027,6 @@ function applySignal(d: Draft, signal: WorkSignal): void {
       }
       if (isRequestMessageText(signal.text)) recordPlanHistory(d, { kind: "user", at: signal.timestamp });
       closeSegment(d, signal.timestamp);
-      return;
-    case "compact_boundary":
-      if (signal.priorGeneration !== true) return;
-      d.next.planBoundaryAt = signal.timestamp;
       return;
     default:
       return;

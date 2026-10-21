@@ -1,4 +1,4 @@
-import { foldModelFallback } from "./protocol";
+import { fallbackTakesOverModel, foldModelFallback, stampFallbackTurnOriginal } from "./protocol";
 import type { ModelFallbackState, ModelInfo } from "./protocol";
 import type { ClaudeConversation } from "./claudeHost";
 import type { HostArtifactAccess } from "./artifact-access";
@@ -127,6 +127,13 @@ export function stampEventMeta<M extends EventMeta>(partial: { kind: string; pro
   return at === undefined ? undefined : { ...meta, timestamp: at } as M & { timestamp: number };
 }
 
+export function adoptFallbackModel(target: { appliedModel?: string; effectiveModel?: string | null },
+  previous: ModelFallbackState | undefined, next: ModelFallbackState | undefined): void {
+  if (next === undefined || !fallbackTakesOverModel(previous, next)) return;
+  target.appliedModel = next.appliedModel;
+  target.effectiveModel = next.appliedModel;
+}
+
 export function foldEventState(
   draft: EventFoldDraft,
   partial: NormalizedEventBody & { provenance?: EventProvenance },
@@ -204,20 +211,17 @@ export function foldEventState(
   }
   if (isObservedTime(meta?.timestamp) || partial.provenance?.path === "live") draft.lastEventTimestamp = Math.max(draft.lastEventTimestamp ?? at, at);
   draft.seq += 1;
-  const ev = {
+  const previousFallback = draft.modelFallback;
+  const ev = stampFallbackTurnOriginal(previousFallback, {
     ...partial,
     backendId: "claude",
     conversationId: conversationId ?? draft.conversation?.conversationId ?? "pending",
     generation: draft.generation,
     seq: draft.seq,
     timestamp: at,
-  } as NormalizedEvent;
-  const previousFallback = draft.modelFallback;
+  } as NormalizedEvent);
   draft.modelFallback = foldModelFallback(previousFallback, ev, draft.models);
-  if (draft.modelFallback && draft.modelFallback !== previousFallback && draft.modelFallback.resolvedAt === undefined) {
-    draft.appliedModel = draft.modelFallback.appliedModel;
-    draft.effectiveModel = draft.modelFallback.appliedModel;
-  }
+  adoptFallbackModel(draft, previousFallback, draft.modelFallback);
   if (ev.kind === "auth_status") {
     draft.auth = ev.auth;
     if (ev.auth?.sessionId) {

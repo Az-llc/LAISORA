@@ -27,6 +27,7 @@ export interface TodoDrawerSource {
 
 export interface TodoDrawerPlace {
   rail(tabId: string): HTMLElement | null;
+  readonly composer: HTMLElement;
   showInTodoTab(itemId: string | undefined): void;
 }
 
@@ -62,6 +63,8 @@ export class TodoDrawer {
   private readonly cycle = { running: -1, waiting: -1 };
   private hiddenRail: HTMLElement | null = null;
   private readonly onResize = () => this.place();
+  private readonly composerResize = new ResizeObserver(this.onResize);
+  private readonly headEl: HTMLElement;
   private readonly marksEl: HTMLElement;
   private readonly listEl: HTMLElement;
   private readonly rows: TodoRowRenderer;
@@ -100,7 +103,7 @@ export class TodoDrawer {
         this.setOpen(false, true);
       }
     });
-    const head = el("header", "todo-drawer-head");
+    const head = this.headEl = el("header", "todo-drawer-head");
     const close = todoCloseButton(() => this.setOpen(false, true), l10n.t("Close the drawer (Esc)"));
     const toTab = todoButton("todo-text-btn todo-drawer-totab", l10n.t("To the ToDo tab"), () => {
       const scope = todoDrawerScope(this.linkedItemId(), this.tabId === null ? undefined : this.scopes.get(this.tabId));
@@ -205,18 +208,27 @@ export class TodoDrawer {
     const rail = this.openNow && this.tabId !== null ? this.where.rail(this.tabId) : null;
     if (this.hiddenRail && this.hiddenRail !== rail) { this.hiddenRail.style.visibility = ""; this.hiddenRail = null; }
     this.root.classList.toggle("in-rail", rail !== null);
+    const composer = this.where.composer;
+    const composerTop = composer.getClientRects().length === 0 ? window.innerHeight : composer.getBoundingClientRect().top;
+    this.root.style.bottom = `${Math.max(window.innerHeight - composerTop, 0)}px`;
+    const overlayTop = todoOverlayTop();
     if (!rail) {
-      for (const prop of ["left", "width", "height"]) this.root.style.removeProperty(prop);
-      this.root.style.top = `${todoOverlayTop()}px`;
+      for (const prop of ["left", "width"]) this.root.style.removeProperty(prop);
+      this.root.style.top = `${overlayTop}px`;
       return;
     }
     const rect = rail.getBoundingClientRect();
     this.root.style.left = `${rect.left}px`;
-    this.root.style.top = `${Math.max(rect.top, 0)}px`;
+    this.root.style.top = `${Math.max(overlayTop, Math.min(rect.top, composerTop - this.minHeight()))}px`;
     this.root.style.width = `${rect.width}px`;
-    this.root.style.height = `${Math.max(window.innerHeight - Math.max(rect.top, 0), 0)}px`;
     rail.style.visibility = "hidden";
     this.hiddenRail = rail;
+  }
+
+  private minHeight(): number {
+    const row = this.listEl.querySelector(".todo-row") ?? this.listEl.firstElementChild;
+    const bottom = row ? row.getBoundingClientRect().bottom + this.listEl.scrollTop : this.listEl.getBoundingClientRect().top;
+    return bottom - this.headEl.getBoundingClientRect().top;
   }
 
   private setOpen(open: boolean, refocus: boolean): void {
@@ -226,10 +238,12 @@ export class TodoDrawer {
     this.place();
     if (this.openNow) {
       window.addEventListener("resize", this.onResize);
+      this.composerResize.observe(this.where.composer);
       this.render();
       queueMicrotask(() => (this.listEl.querySelector<HTMLElement>("[data-focus-key]") ?? this.root.querySelector<HTMLElement>("button"))?.focus());
     } else {
       window.removeEventListener("resize", this.onResize);
+      this.composerResize.disconnect();
       if (refocus) this.button.focus();
     }
   }
@@ -300,10 +314,8 @@ export class TodoDrawer {
         todoButton("todo-link", l10n.t("Mark all as checked"), () => this.source.edit({ kind: "acknowledge", changeIds: marks }), l10n.t("Clear the “changed by Claude” marks and keep the changes")));
     }
     this.listEl.replaceChildren();
-    if (view.total === 0) {
-      this.listEl.append(el("p", "todo-note", l10n.t("No ToDo items yet. Add them in the ToDo tab or ask Claude in a conversation.")));
-      return;
-    }
-    for (const section of view.sections) this.listEl.append(this.rows.sectionEl(section, view.headed && scope === undefined));
+    if (view.total === 0) this.listEl.append(el("p", "todo-note", l10n.t("No ToDo items yet. Add them in the ToDo tab or ask Claude in a conversation.")));
+    else for (const section of view.sections) this.listEl.append(this.rows.sectionEl(section, view.headed && scope === undefined));
+    this.place();
   }
 }

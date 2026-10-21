@@ -453,7 +453,6 @@ export async function handleSurfaceMessage(
         s.resetLogicalSession();
         s.resumeSessionId = undefined;
         void persistOpenTabs();
-        s.autoTitled = false;
         st.post({ type: "tabCleared", tab: s.snapshot() });
         s.pushEvent({
           kind: "conversation_closed",

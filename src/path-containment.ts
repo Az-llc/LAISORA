@@ -46,3 +46,23 @@ export function realPathOrNearestSync(target: string): RealPath | null {
   const result = resolveNearestRealPathSync(target);
   return "path" in result ? result.path : null;
 }
+
+export interface FileIdentity {
+  size: number;
+  mtimeMs: number;
+  ctimeMs: number;
+  dev: number;
+  ino: number;
+}
+
+export function fileIdentityOf(stats: FileIdentity): FileIdentity {
+  return { size: stats.size, mtimeMs: stats.mtimeMs, ctimeMs: stats.ctimeMs, dev: stats.dev, ino: stats.ino };
+}
+
+export function fileIdentityKey(identity: FileIdentity): string {
+  return [identity.size, identity.mtimeMs, identity.ctimeMs, identity.dev, identity.ino].join("\u0000");
+}
+
+export function sameFileIdentity(actual: FileIdentity, expected: FileIdentity): boolean {
+  return fileIdentityKey(actual) === fileIdentityKey(expected);
+}

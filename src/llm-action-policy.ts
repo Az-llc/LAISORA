@@ -54,18 +54,10 @@ export function isActionKindCompatible(destination: ActionDestination, kind: Act
   return allowed !== undefined && allowed.includes(kind);
 }
 
-export function analysisActionDestinations(learningEnabled: boolean): readonly ActionDestination[] {
-  return learningEnabled ? ACTION_DESTINATIONS : ACTION_DESTINATIONS.filter(destination => destination !== "runtime_rule");
-}
+export const ANALYSIS_ACTION_DESTINATIONS: readonly ActionDestination[] = ACTION_DESTINATIONS.filter(destination => destination !== "runtime_rule");
 
-export function renderAnalysisDestinationPrompt(prompt: string, learningEnabled: boolean): string {
-  if (learningEnabled) return prompt;
-  return prompt.split("\n").filter(line => !line.startsWith("- runtime_rule"))
-    .join("\n");
-}
-
-export function renderDestinationActionKindsSection(learningEnabled = true): string {
-  return analysisActionDestinations(learningEnabled).map(
+export function renderDestinationActionKindsSection(): string {
+  return ANALYSIS_ACTION_DESTINATIONS.map(
     (dest) => `- ${dest}: ${DESTINATION_ACTION_KINDS[dest].join(", ")}`
   ).join("\n");
 }
@@ -110,10 +102,7 @@ export const ACTION_KIND_LABELS: Record<ActionKind, string> = {
 };
 
 export const ACTION_DESTINATION_NORMS = {
-  forLearning(learningEnabled: boolean): string {
-    return learningEnabled ? this.text : l10n.t("Choose the improvement destination by its purpose: mechanism changes tools, infrastructure, or automated checks; memory records project facts; skill changes skill instructions or workflows; rules defines durable behavioral constraints; claude_md supplies project entry information, basic commands, and links to authoritative sources. File placement is decided during improvement. Resolved cases remain useful material, not instructions to repeat completed fixes.");
-  },
   get text(): string {
-    return l10n.t("Choose the improvement destination by its purpose: mechanism changes tools, infrastructure, or automated checks; runtime_rule records evidenced model-specific usage only in LAISORA's learning ledger through observe; memory records project facts; skill changes skill instructions or workflows; rules defines durable behavioral constraints; claude_md supplies project entry information, basic commands, and links to authoritative sources. File placement is decided during improvement. Resolved cases remain useful material, not instructions to repeat completed fixes.");
+    return l10n.t("Choose the improvement destination by its purpose: mechanism changes tools, infrastructure, or automated checks; memory records project facts; skill changes skill instructions or workflows; rules defines durable behavioral constraints; claude_md supplies project entry information, basic commands, and links to authoritative sources. File placement is decided during improvement. Resolved cases remain useful material, not instructions to repeat completed fixes.");
   },
 };

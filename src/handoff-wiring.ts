@@ -34,8 +34,7 @@ import { extensionContext, output } from "./host-context";
 import { normalizeApiKeyPolicy, restoredHandoffRunId, type HostToWebview, type WebviewToHost } from "./protocol";
 import { lookupSessionFile } from "./session-files";
 import { sessionRecordId } from "./session-record";
-import { displayTitleFromSummary } from "./session-list";
-import { sessionSummaryOf } from "./session-list-wiring";
+import { sessionDisplayTitleOf } from "./session-list-wiring";
 import type { SessionStore } from "./store-surfaces";
 import { relinkTodoConversation, todoHandoffMemo } from "./todo-surface";
 
@@ -173,10 +172,8 @@ async function runHandoff(st: SessionStore, sender: vscode.Webview, target: Sess
       },
     });
     reservation.runner = runner;
-    let sourceTitle = target.title;
     try {
-      const summary = await sessionSummaryOf(source.sessionId);
-      if (summary !== undefined) sourceTitle = displayTitleFromSummary(summary, source.sessionId);
+      source.title = (await sessionDisplayTitleOf(source.sessionId)) ?? source.title;
     } catch (error) {
       output.appendLine(`[${target.title}] handoff source title unresolved; using tab title: ${String(error)}`);
     }
@@ -187,7 +184,7 @@ async function runHandoff(st: SessionStore, sender: vscode.Webview, target: Sess
     const workMemo = await todoHandoffMemo(source.sessionId);
     const outcome: HandoffOutcome = await runner.run({
       sourceSessionId: source.sessionId,
-      sourceTitle,
+      sourceTitle: source.title,
       runId,
       sourceBusy: busy,
       ...(workMemo !== undefined ? { workMemo } : {}),
@@ -226,7 +223,7 @@ async function runHandoff(st: SessionStore, sender: vscode.Webview, target: Sess
     forkSession.handoffSource = {
       contextUsage,
       sessionId: source.sessionId,
-      title: sourceTitle,
+      title: source.title,
       ...(outcome.compact !== undefined ? { compact: outcome.compact } : {}),
       utteranceCount: outcome.utteranceCount,
       ...(outcome.unreadableLineCount > 0 ? { unreadableLineCount: outcome.unreadableLineCount } : {}),

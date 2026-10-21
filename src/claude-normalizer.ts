@@ -11,17 +11,16 @@ import type {
   UsageSnapshot,
 } from "./protocol";
 import { captureToolIntentInput } from "./tool-intent";
-import { assistantUsageFromRaw, summarizeToolInput } from "./protocol";
+import { assistantUsageFromRaw, isSyntheticModel, summarizeToolInput } from "./protocol";
 import type { HostArtifactAccess } from "./artifact-access";
 import { extractResumeSignals, extractStage0ToolFields, isResumeSignalToolName } from "./tool-observation";
 import { redactAbsolutePaths, redactOptional } from "./path-redaction";
 import { countFileEdit, singleToolUseResult } from "./edit-summary";
 import { AUTO_MODE_UNEVALUATED } from "./tool-result-signals";
-import type { LearningToolResult } from "./learning-ingestion";
 
 export function localizeLocalCommandReply(record: Record<string, unknown>, text: string): string {
   const message = record.message as Record<string, unknown> | undefined;
-  if (message?.model !== "<synthetic>" || !record.local_command_source) return text;
+  if (!isSyntheticModel(message?.model) || !record.local_command_source) return text;
   const match = /^Set effort level to (low|medium|high|xhigh|max) \(this session only\): (.+)$/.exec(text);
   if (!match) return text;
   let description = match[2] === "Quick, straightforward implementation with minimal overhead"
@@ -65,8 +64,15 @@ export interface ClaudeLiveNormalizerOptions {
   usageLimitPrefixes?: string[];
   onDelegateUsageLimitStop?: (agentId: string) => void;
   knownBackgroundTask?: (taskId: string) => "agent" | "tool" | "unconfirmed" | undefined;
-  onRawToolUse?: (toolUseId: string, tool: string, input: Record<string, unknown>, parent?: string) => void;
-  onRawToolResult?: (result: LearningToolResult) => void;
+  onRawToolUse?: (toolUseId: string, tool: string, input: Record<string, unknown>) => void;
+  onRawToolResult?: (result: RawToolResult) => void;
+}
+
+export interface RawToolResult {
+  toolUseId: string;
+  tool: string;
+  text: string;
+  isError: boolean;
 }
 
 export const DELEGATE_API_ERROR_MARKER = "Agent terminated early due to an API error: ";
@@ -128,14 +134,24 @@ function signatureBytesField(bytes: Uint8Array, wanted: number): Uint8Array | un
   return found;
 }
 
+const STRICT_BASE64_RE = /^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}(?:==)?|[A-Za-z0-9+/]{3}=?)?$/;
+const NARRATION_KIND = Buffer.from("narration");
+
+// Buffer's base64 decoder skips characters that atob rejects; only strings both accept identically take the Buffer path.
+function signatureBytes(signature: string): Uint8Array {
+  return STRICT_BASE64_RE.test(signature)
+    ? Buffer.from(signature, "base64")
+    : Uint8Array.from(atob(signature), char => char.charCodeAt(0));
+}
+
 function isNarrationSignature(signature: unknown): boolean {
   if (typeof signature !== "string") return false;
   try {
-    const bytes = Uint8Array.from(atob(signature), char => char.charCodeAt(0));
+    const bytes = signatureBytes(signature);
     const envelope = signatureBytesField(bytes, 2);
     const metadata = envelope && signatureBytesField(envelope, 1);
     const kind = metadata && signatureBytesField(metadata, 8);
-    return kind !== undefined && Buffer.from(kind).equals(Buffer.from("narration"));
+    return kind !== undefined && NARRATION_KIND.equals(kind);
   } catch {
     return false;
   }
@@ -306,7 +322,7 @@ export class ClaudeLiveNormalizer {
   private lastAssistantError: string | null = null;
   private refusalWithoutFallback: RefusalStop | null = null;
   private refusalNoticeEmitted = false;
-  private unlabeledAssistantText = false;
+  private unlabeledAssistantTextTurnId: string | null = null;
   // Record identity, independent of ordinary-text reconciliation and turn resets.
   private emittedNarrationUuids = new Set<string>();
   private lastRootModel: string | null = null;
@@ -325,7 +341,7 @@ export class ClaudeLiveNormalizer {
   private activeRootAssistantTextEvidence: AssistantTextEvidenceState | null = null;
   private assistantTextEvidence = new Map<string, AssistantTextEvidenceState>();
   private resumeSignalToolNames = new Map<string, string>();
-  private learningTools = new Map<string, { tool: string; input: unknown }>();
+  private rawToolUses = new Map<string, { tool: string; parentToolUseId: string | null }>();
   private emittedAssistantUsageMessageIds = new Set<string>();
   private rootAssistantUsage: ReturnType<typeof assistantUsageFromRaw> = {};
   droppedTaskNotificationCount = 0;
@@ -358,7 +374,7 @@ export class ClaudeLiveNormalizer {
     this.lastAssistantError = null;
     this.refusalWithoutFallback = null;
     this.refusalNoticeEmitted = false;
-    this.unlabeledAssistantText = false;
+    this.unlabeledAssistantTextTurnId = null;
     if (meta?.timestamp !== undefined && !(this.lastObservedTimestamp !== undefined && this.lastObservedTimestamp > meta.timestamp)) {
       this.lastObservedTimestamp = meta.timestamp;
     }
@@ -392,7 +408,7 @@ export class ClaudeLiveNormalizer {
     this.lastAssistantError = null;
     this.refusalWithoutFallback = null;
     this.refusalNoticeEmitted = false;
-    this.unlabeledAssistantText = false;
+    this.unlabeledAssistantTextTurnId = null;
     this.lastCompletedTurnId = kind === "turn_completed" ? turnId : null;
     this.lastCompletedAssistantTextEvidence = kind === "turn_completed" ? completedEvidence : null;
 
@@ -485,6 +501,10 @@ export class ClaudeLiveNormalizer {
               kind: "permission_denied",
               turnId: this.currentTurnId,
               toolName: typeof record.tool_name === "string" ? record.tool_name : "unknown",
+              ...(typeof record.tool_use_id === "string" ? { toolUseId: record.tool_use_id } : {}),
+              ...(typeof record.agent_id === "string" ||
+                (typeof record.tool_use_id === "string" && typeof this.rawToolUses.get(record.tool_use_id)?.parentToolUseId === "string")
+                ? { inDelegate: true as const } : {}),
               ...(record.decision_reason_type === "classifier" && typeof record.decision_reason === "string" && (
                 record.decision_reason === "Classifier unavailable" ||
                 record.decision_reason === "Auto mode unavailable — stopped after repeated responses with no safety verdict" ||
@@ -714,7 +734,7 @@ export class ClaudeLiveNormalizer {
         if (
           parentToolUseId === null &&
           typeof msgObj?.model === "string" &&
-          !msgObj.model.startsWith("<") &&
+          !isSyntheticModel(msgObj.model) &&
           msgObj.model !== this.lastRootModel
         ) {
           this.lastRootModel = msgObj.model;
@@ -730,7 +750,7 @@ export class ClaudeLiveNormalizer {
         if (
           typeof parentToolUseId === "string" &&
           typeof msgObj?.model === "string" &&
-          !msgObj.model.startsWith("<") &&
+          !isSyntheticModel(msgObj.model) &&
           !this.subagentModelReported.has(parentToolUseId)
         ) {
           this.subagentModelReported.add(parentToolUseId);
@@ -754,11 +774,11 @@ export class ClaudeLiveNormalizer {
           if ((uuid === null || !this.emittedNarrationUuids.has(uuid)) &&
               !(parseRefusalStop(msgObj) !== null && isApiErrorFrame(record))) {
             const turnId = this.currentTurnId ?? this.lastCompletedTurnId ?? this.startTurn(undefined, defaultMeta);
-            const unlabeledText = this.unlabeledAssistantText;
+            const unlabeledText = this.unlabeledAssistantTextTurnId;
             if (uuid !== null) this.emittedNarrationUuids.add(uuid);
             this.emit({ kind: "assistant_text_delta", turnId, text: localizeLocalCommandReply(record, blockTexts.join("")), recordUuid: uuid }, defaultMeta);
             if (uuid !== null) this.emit({ kind: "assistant_message_uuid", turnId, uuid }, defaultMeta);
-            this.unlabeledAssistantText = unlabeledText;
+            this.unlabeledAssistantTextTurnId = unlabeledText;
           }
           this.emitRetraction(parseSupersedes(record), defaultMeta);
         } else if (parentToolUseId === null) {
@@ -851,10 +871,11 @@ export class ClaudeLiveNormalizer {
           }
           this.emitRetraction(parseSupersedes(record), defaultMeta);
           const wireUuid = parseWireUuid(record);
-          if (wireUuid !== null && this.unlabeledAssistantText && this.currentTurnId !== null && !foreignFinalWithoutText) {
-            this.unlabeledAssistantText = false;
+          const unlabeledTurnId = this.unlabeledAssistantTextTurnId;
+          if (wireUuid !== null && unlabeledTurnId !== null && !foreignFinalWithoutText) {
+            this.unlabeledAssistantTextTurnId = null;
             this.emit(
-              { kind: "assistant_message_uuid", turnId: this.currentTurnId, uuid: wireUuid },
+              { kind: "assistant_message_uuid", turnId: this.currentTurnId ?? unlabeledTurnId, uuid: wireUuid },
               defaultMeta
             );
           }
@@ -877,8 +898,8 @@ export class ClaudeLiveNormalizer {
             const id = typeof block.id === "string" ? block.id : "";
             const tool = typeof block.name === "string" ? block.name : "unknown";
             if (id) {
-              this.learningTools.set(id, { tool, input: block.input });
-              this.opts.onRawToolUse?.(id, tool, typeof block.input === "object" && block.input !== null ? block.input as Record<string, unknown> : {}, parentToolUseId ?? undefined);
+              this.rawToolUses.set(id, { tool, parentToolUseId });
+              this.opts.onRawToolUse?.(id, tool, typeof block.input === "object" && block.input !== null ? block.input as Record<string, unknown> : {});
             }
           }
           if (block.type === "tool_use" && attributedTurnId) {
@@ -973,15 +994,13 @@ export class ClaudeLiveNormalizer {
                   ? block.content
                   : "";
               const toolUseId = typeof block.tool_use_id === "string" ? block.tool_use_id : "";
-              const tool = this.learningTools.get(toolUseId);
+              const tool = this.rawToolUses.get(toolUseId);
               const resumeSignalToolName = this.resumeSignalToolNames.get(toolUseId);
               const extractedResumeSignals = extractResumeSignals(resumeSignalToolName, text);
               if (!(resumeSignalToolName?.startsWith("mcp__") && extractedResumeSignals?.backgroundTaskId)) {
-                this.opts.onRawToolResult?.({ toolUseId, tool: tool?.tool ?? "unknown", input: tool?.input,
-                  parentToolUseId: resultParentToolUseId ?? undefined, text, isError: block.is_error === true,
-                  ...(ts !== undefined ? { at: new Date(ts).toISOString() } : {}) });
+                this.opts.onRawToolResult?.({ toolUseId, tool: tool?.tool ?? "unknown", text, isError: block.is_error === true });
               }
-              this.learningTools.delete(toolUseId);
+              this.rawToolUses.delete(toolUseId);
               const fileEdit = resultParentToolUseId === null && block.is_error !== true && tool
                 ? countFileEdit(tool.tool, singleToolUseResult(content, record.tool_use_result), this.sessionCwd ?? this.opts.cwd)
                 : undefined;
@@ -1119,6 +1138,9 @@ export class ClaudeLiveNormalizer {
         }
         break;
       }
+
+      case "command_lifecycle":
+        break;
 
       default:
         this.opts.log(`[unknown message type] ${JSON.stringify(msg).slice(0, 500)}`);
@@ -1266,7 +1288,7 @@ export class ClaudeLiveNormalizer {
     meta?: NormalizedOutMeta
   ): void {
     const provenance: EventProvenance = body.provenance ?? { path: "live" };
-    if (body.kind === "assistant_text_delta") this.unlabeledAssistantText = true;
+    if (body.kind === "assistant_text_delta") this.unlabeledAssistantTextTurnId = body.turnId;
     let outMeta = meta;
     if (this.pendingGapBoundaries.length > 0) {
       outMeta = { ...(meta ?? {}), gapBoundaries: this.pendingGapBoundaries };

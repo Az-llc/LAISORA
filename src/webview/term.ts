@@ -41,18 +41,6 @@ export const TERM_NOTES = {
     label: l10n.t("Waiting for subagent"),
     note: l10n.t("Time the main LLM waited for the result of a subagent it started with the Agent tool or of an external agent, while no other tool was running"),
   },
-  "Baseline": {
-    label: l10n.t("Baseline"),
-    note: l10n.t("The set of past sessions used for comparison"),
-  },
-  "exposure n": {
-    label: l10n.t("exposure n"),
-    note: l10n.t("Number of baseline sessions in which the metric could be measured"),
-  },
-  "nonzero n": {
-    label: l10n.t("nonzero n"),
-    note: l10n.t("Number of baseline sessions in which the metric was not 0"),
-  },
 } satisfies Record<string, { label: string; note: string }>;
 
 export type TermKey = keyof typeof TERM_NOTES;

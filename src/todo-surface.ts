@@ -4,7 +4,7 @@ import { join } from "node:path";
 import { openFileLink } from "./composer-io";
 import { isInSessionStore, lookupSessionFile } from "./session-files";
 import { sessionRecordId } from "./session-record";
-import { RecordTailReader, TodoAskRecordReader, todoWorkTotal, todoWorkTurnReader, type TodoWorkTurns } from "./todo-ask-record";
+import { RecordTailReader, TodoAskRecordReader, TodoDecisionRecorder, todoWorkTotal, todoWorkTurnReader, type TodoWorkTurns } from "./todo-ask-record";
 import { parseFileLinkTarget } from "./file-link-target";
 import { getLaisoraConfiguration } from "./claude-settings";
 import { extensionContext, output, store } from "./host-context";
@@ -35,6 +35,7 @@ import {
   type WebviewToHost,
 } from "./protocol";
 import * as l10n from "@vscode/l10n";
+import { askOtherChoice } from "./ask-parser";
 import { randomUUID } from "node:crypto";
 import { sendLaisoraInput } from "./conversation-lifecycle";
 import { handoffWorkMemoOf, type HandoffWorkMemo } from "./handoff-envelope";
@@ -43,7 +44,7 @@ import { normalizeTitleValue } from "./session-display-title";
 import { displayTitleFromSummary } from "./session-list";
 import type { Session } from "./session";
 import { openNewConversationTab, type SessionStore } from "./store-surfaces";
-import { TODO_ACKNOWLEDGE_MAX, todoChangeReverted, todoMarkChanges, todoItemNumbers, todoItemPath, todoParentPlace, todoPlaceText, todoRevertUnitBlock, type TodoChangePlace, type TodoRevertBlock, isClaudeOwnChange, TODO_RECENT_CLAUDE_MS, linkedTodoItem, parseTodoChangeId, memoStaleSince, newestConversation, todoChildBriefs, todoScopeIds, todoSessionLinks, todoStartOf, todoTabStart, revertBlock, runClaimedStart, singleFlight, TODO_CONVERSATION_SEEN_REFRESH_MS, todoConversationTarget, todoGroupsOf, todoTemplatesOf, todoTemplateSize, TODO_BRIEF_MAX, TODO_DELETED_RETENTION_MS, TODO_DOC_TARGET_MAX, TODO_IMAGE_EXTENSIONS, conversationLiveElsewhere, todoAskDismissals, todoAsksClosedInTodo, todoRecordAskSources, todoTabLinks, type TodoConversationLink, type TodoTabConversation, type TodoDoc, type TodoImageMediaType, WORK_MEMO_SECTIONS, type TodoChange, type TodoDocument, type TodoItem, type TodoMemoSection, type TodoOperation } from "./todo-model";
+import { TODO_ACKNOWLEDGE_MAX, isTodoGroupName, todoChangeReverted, todoMarkChanges, todoItemNumbers, todoItemPath, todoParentPlace, todoPlaceText, todoRevertUnitBlock, type TodoChangePlace, type TodoRevertBlock, isClaudeOwnChange, TODO_RECENT_CLAUDE_MS, linkedTodoItem, parseTodoChangeId, memoStaleSince, newestConversation, todoChildBriefs, todoScopeIds, todoSessionLinks, todoStartOf, todoTabStart, revertBlock, runClaimedStart, singleFlight, TODO_CONVERSATION_SEEN_REFRESH_MS, todoConversationTarget, todoGroupsOf, todoTemplatesOf, todoTemplateSize, TODO_BRIEF_MAX, TODO_DELETED_RETENTION_MS, TODO_DOC_TARGET_MAX, TODO_IMAGE_EXTENSIONS, conversationLiveElsewhere, todoAskDismissals, todoAsksClosedInTodo, todoDecisionsToMigrate, todoLinkedSessions, todoRecordAskSources, todoTabLinks, type TodoConversationLink, type TodoTabConversation, type TodoDoc, type TodoImageMediaType, WORK_MEMO_SECTIONS, type TodoChange, type TodoDocument, type TodoItem, type TodoMemoSection, type TodoOperation } from "./todo-model";
 import { setTodoWorkspaceRoots, type TodoLinkedItem } from "./todo-mcp";
 import { sharedTodoStore, TODO_BETA_SETTING, TodoStoreError, type TodoStore } from "./todo-store";
 
@@ -119,7 +120,7 @@ export function todoListItems(document: TodoDocument, running: ReadonlySet<strin
         });
         return { id: change.id, ids: unit.map(entry => entry.id), at: change.at, parts };
       }) } : {}),
-      ...(item.captured && item.captured.text !== item.title ? { captured: item.captured } : {}),
+      ...(item.captured && item.captured.text !== item.title ? { captured: { text: item.captured.text, at: item.captured.at, via: item.captured.via } } : {}),
       ...(running.has(item.id) ? { talk: "running" as const } : newestConversation(item) ? { talk: "linked" as const } : {}),
     };
   });
@@ -144,6 +145,30 @@ const askSourceCache = new Map<string, { key: string; size: number; endedAt: num
 const askSourceReads = new Map<string, Promise<{ endedAt: number; messages: TodoAskSourceMessage[] } | undefined>>();
 const askSourceReaders = new Map<string, TodoAskRecordReader>();
 const askSourceShown = new Map<string, { key: string; at: number }>();
+const TODO_DECISION_CURSOR_PREFIX = "laisora.todo.decisionCursor.";
+
+const decisionRecorder = new TodoDecisionRecorder({
+  enabled: () => todoBetaEnabled() && hostTodoStore() !== undefined,
+  otherChoice: askOtherChoice,
+  saved: sessionId => extensionContext?.globalState.get<unknown>(`${TODO_DECISION_CURSOR_PREFIX}${sessionId}`),
+  save: (sessionId, value) => {
+    Promise.resolve(extensionContext?.globalState.update(`${TODO_DECISION_CURSOR_PREFIX}${sessionId}`, value))
+      .catch(error => output.appendLine(`[todo] could not save where the decision records were read up to: ${String(error)}`));
+  },
+  knownPath: sessionId => askSourcePaths.get(sessionId),
+  rememberPath: (sessionId, path) => {
+    if (path === undefined) askSourcePaths.delete(sessionId);
+    else askSourcePaths.set(sessionId, path);
+  },
+  lookup: lookupSessionFile,
+  inStore: isInSessionStore,
+  record: async (sessionId, decisions) => {
+    const todoStore = hostTodoStore();
+    const document = todoStore ? await applyHostTodoOperation(todoStore, { kind: "recordDecisions", sessionId, decisions }, "human") : undefined;
+    return !document ? "failed" : linkedTodoItem(document.items, sessionId) ? "recorded" : "unlinked";
+  },
+  log: line => output.appendLine(line),
+});
 let askSourceLaterTimer: ReturnType<typeof setTimeout> | undefined;
 let askSourceSessions = new Set<string>();
 
@@ -194,11 +219,12 @@ function askSourceWhere(link: TodoConversationLink, tabs: readonly TodoTabConver
 const workReaders = new Map<string, RecordTailReader<TodoWorkTurns>>();
 
 function sweepRecordReaders(document: TodoDocument, askSessions: ReadonlySet<string>): void {
-  const linked = new Set(document.items.filter(item => item.deletedAt === undefined).flatMap(item => (item.conversations ?? []).map(link => link.sessionId)));
+  const linked = todoLinkedSessions(document.items);
   const keep: ReadonlyArray<readonly [Map<string, unknown>, ReadonlySet<string>]> = [
     [askSourcePaths, new Set([...askSessions, ...linked])], [askSourceMissing, new Set([...askSessions, ...linked])], [askSourceCache, askSessions], [askSourceReaders, askSessions], [askSourceShown, askSessions], [workReaders, linked],
   ];
   for (const [cache, sessions] of keep) for (const sessionId of cache.keys()) if (!sessions.has(sessionId)) cache.delete(sessionId);
+  decisionRecorder.keepOnly(linked);
 }
 
 async function askSourceRefs(document: TodoDocument, tabs: readonly TodoTabConversation[]): Promise<TodoAskSourceRef[]> {
@@ -247,6 +273,19 @@ function readAskSource(sessionId: string, file: { path: string; key: string; siz
     askSourceReads.set(id, pending);
   }
   return pending;
+}
+
+async function prepareDecisionRecords(): Promise<void> {
+  const read = await readTodoDocument("decision records");
+  if (!read) return;
+  if (todoDecisionsToMigrate(read.document)) await applyHostTodoOperation(read.todoStore, { kind: "migrateDecisions" }, "human");
+  const linked = todoLinkedSessions(read.document.items);
+  for (const key of extensionContext?.globalState.keys() ?? []) {
+    if (key.startsWith(TODO_DECISION_CURSOR_PREFIX) && !linked.has(key.slice(TODO_DECISION_CURSOR_PREFIX.length))) {
+      Promise.resolve(extensionContext?.globalState.update(key, undefined)).catch(error => output.appendLine(`[todo] could not drop a decision read position: ${String(error)}`));
+    }
+  }
+  await decisionRecorder.sweep([...linked]);
 }
 
 async function askSourceMessage(sessionId: string, requestId: number): Promise<TodoAskSourceMessageEnvelope> {
@@ -324,6 +363,7 @@ export function syncTodoSurface(): void {
   }
   setTodoWorkspaceRoots(() => (vscode.workspace.workspaceFolders ?? []).map(folder => folder.uri.fsPath));
   if (!todoWatch) {
+    void prepareDecisionRecords();
     try {
       todoWatch = hostTodoStore()?.watch(revision => {
         output.appendLine(`[todo] store changed (revision ${revision})`);
@@ -342,6 +382,7 @@ export function disposeTodoSurface(): void {
   todoWatch = undefined;
   if (ownerTimer !== undefined) clearInterval(ownerTimer);
   ownerTimer = undefined;
+  decisionRecorder.dispose();
 }
 
 let ownerTimer: ReturnType<typeof setInterval> | undefined;
@@ -401,8 +442,10 @@ function numbersOf(document: TodoDocument): Map<string, string> {
   return numbers;
 }
 
+const placeGroup = (group: unknown): string | null => isTodoGroupName(group) ? group : null;
+
 function changePlace(document: TodoDocument, parentId: string | null, group: string | null): TodoChangePlace {
-  if (parentId === null) return { group, path: [] };
+  if (parentId === null) return { group: placeGroup(group), path: [] };
   const path = todoItemPath(document.items, parentId);
   return { group: path[0]?.group ?? null, path: path.map(step => ({ id: step.id, title: step.title })) };
 }
@@ -423,7 +466,7 @@ function changePlaces(document: TodoDocument, item: TodoItem | undefined, change
       const from = parentOf(before), to = parentOf(after);
       return from === undefined || to === undefined ? {} : { from: changePlace(document, from, groupOf(before, typeof before?.group === "string" ? before.group : rootGroup)), to: changePlace(document, to, groupOf(after, rootGroup)) };
     }
-    case "group": return { from: { group: typeof change.before === "string" ? change.before : null, path: [] }, to: { group: typeof change.after === "string" ? change.after : null, path: [] } };
+    case "group": return { from: { group: placeGroup(change.before), path: [] }, to: { group: placeGroup(change.after), path: [] } };
     case "deletedAt": return change.after !== null ? { from: changePlace(document, item.parentId, item.group ?? null) } : { to: changePlace(document, item.parentId, item.group ?? null) };
   }
   return { to: changePlace(document, item.parentId, item.group ?? null) };
@@ -475,6 +518,7 @@ function detailItem(document: TodoDocument, id: string): TodoDetailItem | null {
     ...(item.estimate ? { estimate: item.estimate } : {}), ...(item.tags ? { tags: item.tags } : {}), ...(item.by ? { by: item.by } : {}),
     ...(guesses ? { guesses } : {}), ...(item.startedAt !== undefined ? { startedAt: item.startedAt } : {}), ...(item.doneAt !== undefined ? { doneAt: item.doneAt } : {}),
     conversations, briefs: todoChildBriefs(item).map(brief => ({ at: brief.at, text: brief.brief })),
+    ...(item.decisionLog?.length ? { decisionLog: item.decisionLog } : {}),
     ...(totals ? { totals } : {}),
     ...(item.source ? { source: { sessionId: item.source.sessionId, ...(openSessionTitle(item.source.sessionId) ? { title: openSessionTitle(item.source.sessionId)!.slice(0, RENAME_TITLE_MAX) } : {}) } } : {}),
   };
@@ -801,6 +845,7 @@ export function noteTodoSessionEnded(s: Session): void {
   if (!sessionId) return;
   const linked = sessionItems.get(sessionId);
   sessionItems.delete(sessionId);
+  decisionRecorder.ended(sessionId);
   const todoStore = linked ? hostTodoStore() : undefined;
   if (todoStore) void applyHostTodoOperation(todoStore, { kind: "releaseConversation", sessionId, owner: TODO_WINDOW_ID }, "human");
 }
@@ -851,6 +896,7 @@ export function noteTodoConversationEvent(s: Session, ev: { kind: string; auth?:
   s.todoTurnStartedAt = undefined;
   if (cachedItemOf(s) === undefined) return;
   const sessionId = sessionRecordId(s);
+  if (sessionId) void decisionRecorder.turnEnded(sessionId);
   const todoStore = hostTodoStore();
   if (startedAt === undefined || !sessionId || !todoStore) {
     postTodoSnapshot();

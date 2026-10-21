@@ -108,20 +108,6 @@ export function renderAnalysisFactsView(
     container.appendChild(covEl);
   }
 
-  if (facts.learning) {
-    const learning = makeEl("section", "af-learning wa-fsec");
-    learning.dataset.state = facts.learning.state;
-    if (facts.learning.empty === true) learning.dataset.empty = "true";
-    const head = makeEl("div", "wa-code");
-    head.id = `af-learning-h-${tabId}`;
-    head.append(makeEl("b", undefined, "LEARN"), makeEl("span", "wa-code-s", l10n.t("Learning record")));
-    learning.setAttribute("aria-labelledby", head.id);
-    learning.appendChild(head);
-    if (facts.learning.note) learning.appendChild(makeEl("div", "af-learning-note", facts.learning.note));
-    for (const line of facts.learning.lines) learning.appendChild(makeEl("div", "af-learning-line", line));
-    container.appendChild(learning);
-  }
-
   const llmSection = makeEl("div", "af-llm-section");
   const entry = makeEl("div", "llm-entry");
   entry.appendChild(

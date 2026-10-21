@@ -3,7 +3,6 @@ import * as vscode from "vscode";
 import * as l10n from "@vscode/l10n";
 
 import type * as ClaudeCodeSdk from "@anthropic-ai/claude-agent-sdk" with { "resolution-mode": "import" };
-import { sdkClaudeCodeVersion } from "./claudeHost";
 import { configuredClaudeExecutablePath, resolveSessionCwd } from "./claude-settings";
 import { output } from "./host-context";
 import {
@@ -21,7 +20,7 @@ import {
 } from "./llm-analysis-input";
 import { LLM_ANALYSIS_PROMPT_VERSION, llmAnalysisOutputLanguage } from "./llm-analysis-prompt";
 import { createSdkLlmAnalysisClient } from "./llm-analysis-sdk-client";
-import { normalizeApiKeyPolicy } from "./protocol";
+import { displayedAncestorUsageGap, normalizeApiKeyPolicy } from "./protocol";
 import { asFindingVerificationModelFromPayload } from "./llm-finding-verify";
 import { loadContextFiles } from "./llm-context-files";
 import {
@@ -32,8 +31,9 @@ import {
 import type { EffortLevel, PersistedAnalysisArtifact } from "./analysis-persistence";
 import { formatPersistenceLabel } from "./analysis-persistence";
 import { derivationFailureLabel, llmAnalysisEnabled, llmDiagnosticsAudience, semanticViewEnabled } from "./session-semantic";
-import { isInSessionStore, inspectorSessionFile } from "./session-files";
+import { isInSessionStore, sessionTranscriptRef } from "./session-files";
 import { readSessionHistory } from "./session-transcript";
+import { currentGenerationEvents } from "./time-buckets";
 import type { Session } from "./extension";
 import type { SessionStore } from "./store-surfaces";
 
@@ -47,6 +47,7 @@ interface AnalysisExecutionProfile {
 interface AnalysisHistoryRead {
   readFailed: boolean;
   malformedLineCount: number;
+  ancestorUsageUnread: boolean;
 }
 
 function createLlmClientForSession(
@@ -62,7 +63,6 @@ function createLlmClientForSession(
     effort: profile.effectiveEffort,
     cwd,
     claudeCodeExecutablePath: configuredClaudeExecutablePath(cfg),
-    sdkClaudeCodeVersion: sdkClaudeCodeVersion(),
     apiKeyPolicy: normalizeApiKeyPolicy(cfg.get<string>("claude.apiKeyPolicy")!),
   });
 }
@@ -139,6 +139,7 @@ export class SessionLlm {
       ...(c.unreadableAgentCount ? { unreadableAgentCount: c.unreadableAgentCount } : {}),
       ...(c.omittedTranscriptCount ? { omittedTranscriptCount: c.omittedTranscriptCount } : {}),
       ...(c.hierarchyIncomplete ? { hierarchyIncomplete: true as const } : {}),
+      ...(historyRead.ancestorUsageUnread ? { ancestorUsageUnread: true as const } : {}),
       ...(historyRead.readFailed ? { historyReadFailed: true as const } : {}),
       ...(historyRead.malformedLineCount ? { historyMalformedLineCount: historyRead.malformedLineCount } : {}),
       ...(c.evidenceFoldErrorCount ? { evidenceFoldErrorCount: c.evidenceFoldErrorCount } : {}),
@@ -149,27 +150,38 @@ export class SessionLlm {
   private async collectAnalysisEvents(): Promise<{
     events: readonly LlmAnalysisInputEvent[];
     sessionHeadMissing: boolean;
+    currentGenerationOnly: boolean;
     historyRead: AnalysisHistoryRead;
   }> {
     const c = this.host.workModel.coverage;
+    const indexBounded = this.host.evidenceIndex.timeBuckets.generationBoundaryAt !== undefined;
+    const currentInput = <T extends LlmAnalysisInputEvent>(events: readonly T[]) => {
+      const current = currentGenerationEvents(events);
+      return { events: current.events, currentGenerationOnly: indexBounded || current.bounded };
+    };
     const heldRead: AnalysisHistoryRead = {
       readFailed: c.historyReadError !== undefined,
       malformedLineCount: c.historyMalformedLineCount ?? 0,
+      ancestorUsageUnread: displayedAncestorUsageGap(c) !== undefined,
     };
     if ((c.droppedEventCount ?? 0) === 0) {
-      return { events: this.host.events, sessionHeadMissing: false, historyRead: heldRead };
+      return { ...currentInput(this.host.events), sessionHeadMissing: false, historyRead: heldRead };
     }
-    const file = inspectorSessionFile(this.host);
+    const ref = sessionTranscriptRef(this.host);
     let failure = "セッションの記録ファイルを特定できません";
-    if (file !== null) {
+    if (ref !== null) {
       try {
-        const history = await readSessionHistory(file, isInSessionStore);
+        const history = await readSessionHistory(ref.file, isInSessionStore, { generationSessionId: ref.sessionId });
         const readError = history.readError ?? history.subagentsReadError;
         if (readError === undefined && history.events.length > 0) {
           return {
-            events: history.events.map((h) => ({ ...h.body, timestamp: h.timestamp })),
+            ...currentInput(history.events.map((h) => ({ ...h.body, timestamp: h.timestamp }))),
             sessionHeadMissing: false,
-            historyRead: { readFailed: false, malformedLineCount: history.malformedLineCount },
+            historyRead: {
+              readFailed: false,
+              malformedLineCount: history.malformedLineCount,
+              ancestorUsageUnread: displayedAncestorUsageGap(history.coverage) !== undefined,
+            },
           };
         }
         failure = readError ?? "記録が空";
@@ -178,7 +190,7 @@ export class SessionLlm {
       }
     }
     output.appendLine(`[${this.host.title}] LLM分析: JSONL を読めないため、保持中のイベント列（先頭切り詰めあり）で代用します: ${failure}`);
-    return { events: this.host.events, sessionHeadMissing: true, historyRead: heldRead };
+    return { ...currentInput(this.host.events), sessionHeadMissing: true, historyRead: heldRead };
   }
 
   private reportLlmProgress(
@@ -288,6 +300,7 @@ export class SessionLlm {
           guardrailSignals,
           contextFiles,
           sessionHeadMissing: analysisEvents.sessionHeadMissing,
+          currentGenerationOnly: analysisEvents.currentGenerationOnly,
           transcriptGaps: this.transcriptGapSummary(analysisEvents.historyRead),
         });
       } catch (error) {
@@ -299,7 +312,6 @@ export class SessionLlm {
       } else {
         outcome = await runLlmAnalysis({
           enabled: true,
-          learningEnabled: getLaisoraConfiguration().get<boolean>("learning.enabled")! === true,
           client: createLlmClientForSession(this.host, profile),
           cache: this.host.llmCache,
           input,

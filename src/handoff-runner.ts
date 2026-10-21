@@ -162,6 +162,14 @@ export const COMPACT_HEARTBEAT_GRACE_MS = 120_000;
 
 export const HANDOFF_LEASE_MS = COMPACT_HEARTBEAT_GRACE_MS * 2;
 
+const HANDOFF_TITLE_MARK = "⇢";
+
+export function handoffForkTitle(sourceTitle: string): string {
+  let rest = sourceTitle.trimStart();
+  while (rest.startsWith(HANDOFF_TITLE_MARK)) rest = rest.slice(HANDOFF_TITLE_MARK.length).trimStart();
+  return `${HANDOFF_TITLE_MARK} ${rest}`;
+}
+
 const OWNER_ID = randomUUID();
 
 declare const __LAISORA_SDK_CLAUDE_CODE_VERSION__: string | undefined;
@@ -238,6 +246,11 @@ function persistedEntries(value: unknown): PersistedHandoff[] {
       typeof record.phase === "string"
     );
   });
+}
+
+export function isHandoffForkInFlight(persisted: unknown, sessionId: string, now: number): boolean {
+  return persistedEntries(persisted).some((entry) =>
+    entry.forkSessionId === sessionId && typeof entry.leaseUntil === "number" && entry.leaseUntil > now);
 }
 
 function isWithinProjects(filePath: string, projectsRoot: string): boolean {
@@ -805,7 +818,7 @@ export class HandoffRunner {
       this.transition("forking");
       try {
         const fork = await this.deps.sdk.forkSession(input.sourceSessionId, {
-          title: `⇢ ${input.sourceTitle}`,
+          title: handoffForkTitle(input.sourceTitle),
         });
         forkSessionId = fork.sessionId;
       } catch (error) {

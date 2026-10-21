@@ -270,7 +270,6 @@ export function buildFindingEvidenceLine(evidence: Array<PersistedEvidenceChip |
 }
 
 export interface FindingSessionPromptInput {
-  learningEnabled?: boolean;
   analysisSdk?: AnalysisSdk;
   sessionRef: string;
   models: string[] | null;
@@ -300,7 +299,7 @@ export function buildFindingSessionPrompt(input: FindingSessionPromptInput): str
     l10n.t("Improvement direction: {0}", stepsStr),
     l10n.t("Destination: {0}", destinationStr),
     l10n.t("Evidence: {0}", evidenceStr),
-    input.learningEnabled === false ? ACTION_DESTINATION_NORMS.forLearning(false) : ACTION_DESTINATION_NORMS.text,
+    ACTION_DESTINATION_NORMS.text,
     l10n.t("Consult the official documentation and best practices for your model environment, and address the cause using an appropriate approach. Go beyond a one-off workaround and aim to prevent recurrence within an appropriate scope."),
   ].join("\n");
 }

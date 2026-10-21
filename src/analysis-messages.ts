@@ -2,70 +2,24 @@ import * as l10n from "@vscode/l10n";
 import { getLaisoraConfiguration } from "./claude-settings";
 import * as vscode from "vscode";
 
-import { analyzeSessionFile } from "./analysis";
 import { warmup } from "./conversation-lifecycle";
 import { formatGeneratedAtLabel, type PersistedActionFinding } from "./analysis-persistence";
 import { output } from "./host-context";
 import { buildFindingSessionPrompt } from "./llm-report";
-import { personalBaseline } from "./personal-baseline";
 import type { AttachedFindingView, WebviewToHost } from "./protocol";
-import { findSessionFile, lookupSessionFile } from "./session-files";
-import { noRecordRefusal, sessionRecordId } from "./session-record";
+import { findSessionFile } from "./session-files";
+import { sessionRecordId } from "./session-record";
 import { llmAnalysisEnabled } from "./session-semantic";
 import type { Session } from "./extension";
 import { tabLimit, warnTabLimit, type SessionStore } from "./store-surfaces";
 
-function hostDisplayLocale(): string {
-  return String(vscode.env?.language ?? "").toLowerCase().startsWith("ja") ? "ja-JP" : "en-US";
-}
-
 export async function handleAnalysisMessage(
   st: SessionStore,
-  msg: Extract<WebviewToHost, { type: "analyzeCurrent" | "llmAnalysisRequest" | "summarizeSession" | "suggestSessionName" | "setLlmAnalysisEnabled" | "startFindingSession" | "prepareHistoricalDraft" | "selectAnalysisArtifact" }>,
+  msg: Extract<WebviewToHost, { type: "llmAnalysisRequest" | "summarizeSession" | "suggestSessionName" | "setLlmAnalysisEnabled" | "startFindingSession" | "prepareHistoricalDraft" | "selectAnalysisArtifact" }>,
   sender: vscode.Webview,
   target: Session | undefined
 ): Promise<void> {
   switch (msg.type) {
-    case "analyzeCurrent": {
-      const sid = sessionRecordId(target!);
-      if (sid === undefined) {
-        void st.postTo(sender, {
-          type: "analysisFailed",
-          kind: "script",
-          tabId: target!.tabId,
-          reason: noRecordRefusal(),
-        });
-        break;
-      }
-      const found = lookupSessionFile(sid);
-      if (found.path === null) {
-        output.appendLine(
-          `[analysis] ${found.reason} session=${sid}` + (found.reason === "scan_failed" ? ` — ${found.detail}` : "")
-        );
-        void st.postTo(sender, {
-          type: "analysisFailed",
-          kind: "script",
-          tabId: target!.tabId,
-          reason:
-            found.reason === "scan_failed"
-              ? l10n.t(
-                  "LAISORA: Could not determine whether the session log exists (check sync and permissions): {0}",
-                  found.detail
-                )
-              : l10n.t("LAISORA: The session log has not been written yet (wait briefly and try again)."),
-        });
-        break;
-      }
-      const path = found.path;
-      const { baseline, scan } = await personalBaseline(path);
-      void st.postTo(sender, {
-        type: "analysis",
-        sessionId: sid,
-        filePath: path,
-        report: analyzeSessionFile(path, baseline, scan, hostDisplayLocale()),
-      });
-      break;
-    }
     case "llmAnalysisRequest":
       await target!.llmRunner.requestLlmAnalysis();
       break;
@@ -128,7 +82,6 @@ export async function handleAnalysisMessage(
       const filePath = s.resumeFilePath ?? (sessionId ? findSessionFile(sessionId) : undefined);
       const sessionRef = [sessionId, filePath].filter(Boolean).join(" / ") || l10n.t("Tab {0} (session not identified)", s.tabId);
       const prompt = buildFindingSessionPrompt({
-        learningEnabled: getLaisoraConfiguration().get<boolean>("learning.enabled")! === true,
         analysisSdk: art?.analysisSdk,
         sessionRef,
         models: models ?? null,
@@ -183,7 +136,6 @@ export async function handleAnalysisMessage(
         "",
         l10n.t("When improving, check how it relates to the current target and use only the material that still applies."),
         buildFindingSessionPrompt({
-          learningEnabled: getLaisoraConfiguration().get<boolean>("learning.enabled")! === true,
           analysisSdk: art.analysisSdk,
           sessionRef,
           models: art.executedModels,

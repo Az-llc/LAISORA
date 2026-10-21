@@ -1,5 +1,5 @@
 import type { NormalizedEvent, RestoredApprovalCard } from "../protocol";
-import { askTextFeatures, bigramSimilarity, normalizeAskText, type AskBlock, type AskTextFeatures } from "../ask-parser";
+import { AskAnswerTitles, askAnswerChoices, askTextFeatures, bigramSimilarity, normalizeAskText, otherReplyAsksBack, type AskBlock, type AskTextFeatures } from "../ask-parser";
 
 export interface YouItem {
   readonly id: string;
@@ -47,13 +47,6 @@ function isAfter(earlier: Ordered, later: Ordered): boolean {
   return earlier.order !== undefined && later.order !== undefined && earlier.generation === later.generation
     ? later.order > earlier.order
     : earlier.at > 0 && later.at > earlier.at;
-}
-
-function choicesAfter(title: string, text: string): string[] {
-  const prefix = `${title} → `;
-  const choices: string[] = [];
-  for (let at = text.indexOf(prefix); at >= 0; at = text.indexOf(prefix, at + prefix.length)) choices.push(text.slice(at + prefix.length));
-  return choices;
 }
 
 export const DECIDE_TITLE_SIMILARITY_MIN = 0.9;
@@ -146,19 +139,12 @@ export interface SavedAskDismissals {
   readonly resolvedMessages?: Iterable<string>;
 }
 
-export const OTHER_REPLY_QUESTION_PATTERN = /[？?]$|分からない|わからない|詳しく|詳細|どういう|なぜ/u;
-
-export function otherReplyAsksBack(choice: string, otherChoice: string): boolean {
-  if (!choice.startsWith(`${otherChoice}:`)) return false;
-  const rest = choice.slice(otherChoice.length + 1);
-  const nextAnswer = rest.search(/\r?\n[^\r\n]* → /);
-  return OTHER_REPLY_QUESTION_PATTERN.test((nextAnswer < 0 ? rest : rest.slice(0, nextAnswer)).trim());
-}
-
 export function createYouItems(tabId: string, saved: SavedAskDismissals = {}, locate?: LocateAsk, otherChoice?: string) {
   const isDetailRequest = (choice: string): boolean => otherChoice !== undefined && otherReplyAsksBack(choice, otherChoice);
-  const answers = (item: YouItem, text: string): boolean => item.kind !== "decide" || choicesAfter(item.title, text).some((choice) => !isDetailRequest(choice));
-  const requestsDetail = (item: YouItem, text: string): boolean => item.kind === "decide" && choicesAfter(item.title, text).some(isDetailRequest);
+  let titleIndex: AskAnswerTitles | undefined;
+  const answerTitles = (): AskAnswerTitles => titleIndex ??= new AskAnswerTitles([...asks.values()].flatMap((ask) => ask.kind === "decide" ? [ask.title] : []));
+  const answers = (item: YouItem, text: string): boolean => item.kind !== "decide" || askAnswerChoices(item.title, text, answerTitles()).some((choice) => !isDetailRequest(choice));
+  const requestsDetail = (item: YouItem, text: string): boolean => item.kind === "decide" && askAnswerChoices(item.title, text, answerTitles()).some(isDetailRequest);
   const items = new Map<string, YouItem>();
   const asks = new Map<string, YouItem>();
   const positions = new Map<string, AskPosition>();
@@ -320,6 +306,7 @@ export function createYouItems(tabId: string, saved: SavedAskDismissals = {}, lo
     unlink(id);
     anchors.delete(asks.get(id)!.anchor.id);
     asks.delete(id);
+    titleIndex = undefined;
     items.delete(id);
     completedChecks.delete(id);
     contents.delete(id);
@@ -422,6 +409,7 @@ export function createYouItems(tabId: string, saved: SavedAskDismissals = {}, lo
         ...(ask.kind === "decide" ? { options: ask.options.map((o) => ({ label: o.label, description: o.effect })) } : { steps: ask.steps }),
       };
       asks.set(id, item);
+      titleIndex = undefined;
       anchors.set(item.anchor.id, id);
       contents.set(id, content);
       features.set(id, askFeatures(ask));

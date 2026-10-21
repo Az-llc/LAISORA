@@ -6,7 +6,6 @@ import { output } from "./host-context";
 import { isSettingsPageToHost, type SettingWriteFailure } from "./protocol";
 import {
   settingsStateMessage,
-  loadSettingsProfiles,
   projectConductorPreview,
   recommendedRosterMessage,
   applyRecommendedRoster,
@@ -14,7 +13,7 @@ import {
   writeApiKeyPolicy,
   writeAccentSetting,
   writeDisplayName,
-  writeLearningEnabled,
+  writeGuardEnabled,
   writeMemoryBlockProjectType,
   writeTodoEnabled,
   writeEditSummaryEnabled,
@@ -61,7 +60,7 @@ export function openSettingsPanel(context: vscode.ExtensionContext, detect?: Par
 
 export function postSettingsState(): void {
   const panel = settingsPanel;
-  if (panel) void loadSettingsProfiles().then(() => { if (settingsPanel === panel) void panel.webview.postMessage(settingsStateMessage()); });
+  if (panel) void panel.webview.postMessage(settingsStateMessage());
 }
 
 export async function handleSettingsPageMessage(webview: vscode.Webview, raw: unknown, detect?: Parameters<typeof refreshExternalDetection>[0]): Promise<void> {
@@ -72,7 +71,6 @@ export async function handleSettingsPageMessage(webview: vscode.Webview, raw: un
   let writeFailure: SettingWriteFailure | undefined;
   switch (raw.type) {
     case "previewConductorInstruction":
-      await loadSettingsProfiles();
       void webview.postMessage({ type: "conductorPreview", requestId: raw.requestId, ...projectConductorPreview(raw.policy) });
       return;
     case "openVsCodeSettings":
@@ -122,8 +120,8 @@ export async function handleSettingsPageMessage(webview: vscode.Webview, raw: un
     case "setCliAutoUpdate":
       writeFailure = await writeCliAutoUpdate(raw.executor, raw.enabled);
       break;
-    case "setLearningEnabled":
-      writeFailure = await writeLearningEnabled(raw.enabled);
+    case "setGuardEnabled":
+      writeFailure = await writeGuardEnabled(raw.enabled);
       break;
     case "setMemoryBlockProjectType":
       writeFailure = await writeMemoryBlockProjectType(raw.enabled);
@@ -151,12 +149,10 @@ export async function handleSettingsPageMessage(webview: vscode.Webview, raw: un
       if (settingsPanel?.webview === webview) void webview.postMessage(settingsStateMessage());
     });
     void webview.postMessage(settingsStateMessage());
-    void pending.then(async () => {
-      await loadSettingsProfiles();
+    void pending.then(() => {
       if (settingsPanel?.webview === webview) void webview.postMessage(settingsStateMessage());
     });
   }
-  await loadSettingsProfiles();
   const reply = settingsStateMessage();
   if (settingsPanel?.webview !== webview) return;
   if ("requestId" in raw) {

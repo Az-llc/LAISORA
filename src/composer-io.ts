@@ -49,15 +49,21 @@ function createExportSink(lines: string[], userHeading: string): {
     if (assistantBuf.trim()) lines.push("## Assistant", "", assistantBuf.trim(), "");
     assistantParts.length = 0;
   };
+  const userBody = (text: string, imageCount: number): string => {
+    const parts = text.trim() === "" ? [] : [text];
+    for (let i = 0; i < imageCount; i++) parts.push(`[${l10n.t("Attached image")}]`);
+    return parts.join("\n\n");
+  };
   const push = (ev: NormalizedEventBody): void => {
     switch (ev.kind) {
       case "user_message":
         flush();
-        lines.push(userHeading, "", ev.text, "");
+        lines.push(userHeading, "", userBody(ev.text, (ev.images?.length ?? 0) + (ev.imageRefs?.length ?? 0)), "");
         break;
       case "replayed_message":
         flush();
-        lines.push(ev.role === "user" ? userHeading : "## Assistant", "", ev.text, "");
+        if (ev.role === "user") lines.push(userHeading, "", userBody(ev.text, ev.imageRefs?.length ?? 0), "");
+        else lines.push("## Assistant", "", ev.text, "");
         break;
       case "assistant_text_delta":
         appendRecordPart(assistantParts, { text: ev.text, uuid: null });
@@ -134,13 +140,7 @@ async function buildExportMarkdown(s: Session): Promise<string> {
   lines.push("");
   const sink = createExportSink(lines, userHeading);
   const from = history.generationStartAt;
-  let recordEnd = 0;
-  const tail = {
-    turnId: undefined as string | undefined,
-    text: "",
-    userTexts: new Set<string>(),
-    toolUseIds: new Set<string>(),
-  };
+  const recordToolUseIds = new Set<string>();
   const recordNotices = new Set<string>();
   const draft = createHydrationDraft(s);
   await foldHistoryEvents(
@@ -150,62 +150,44 @@ async function buildExportMarkdown(s: Session): Promise<string> {
       const ev = step.normalizedEvent;
       if (ev === null) return "continue";
       if (from !== undefined && ev.timestamp < from) return "continue";
-      if (ev.timestamp > recordEnd) recordEnd = ev.timestamp;
       if (ev.kind === "error") recordNotices.add(ev.message);
-      if (ev.kind === "turn_started") {
-        tail.turnId = ev.turnId;
-        tail.text = "";
-        tail.userTexts.clear();
-        tail.toolUseIds.clear();
-      } else if ((ev as { turnId?: unknown }).turnId === tail.turnId) {
-        if (ev.kind === "assistant_text_delta") tail.text += ev.text;
-        else if (ev.kind === "user_message") tail.userTexts.add(ev.text);
-        else if (ev.kind === "tool_call_started") tail.toolUseIds.add(ev.toolUseId);
-      }
+      if (ev.kind === "tool_call_started") recordToolUseIds.add(ev.toolUseId);
       sink.push(ev);
       return "continue";
     },
     () => false
   );
-  const openTurnId = openLiveTurnId(s.events);
-  let openTurnText = "";
+  const pushLive = (ev: NormalizedEvent): void => {
+    if (ev.kind === "user_message" && ev.uuid !== undefined && history.sentUserUuids.has(ev.uuid)) return;
+    if (ev.kind === "error" && recordNotices.has(ev.message)) return;
+    if (ev.kind === "tool_call_started" && recordToolUseIds.has(ev.toolUseId)) return;
+    sink.push(ev);
+  };
+  let awaitingUuid: NormalizedEvent[] = [];
+  const releaseAwaiting = (dropText: boolean): void => {
+    for (const held of awaitingUuid) if (!(dropText && held.kind === "assistant_text_delta")) pushLive(held);
+    awaitingUuid = [];
+  };
   for (const ev of s.events) {
     if (ev.provenance?.path !== "live") continue;
-    const turnId = (ev as { turnId?: unknown }).turnId;
-    if (typeof turnId !== "string") {
-      if (ev.kind === "error" && recordNotices.has(ev.message)) continue;
-      sink.push(ev);
+    if (ev.kind === "assistant_message_uuid") {
+      const recorded = history.recordAssistantUuids.has(ev.uuid);
+      releaseAwaiting(recorded);
+      if (!recorded) pushLive(ev);
       continue;
     }
-    if (openTurnId === undefined || turnId !== openTurnId) {
-      if (ev.timestamp <= recordEnd) continue;
-      sink.push(ev);
+    const closesAwaiting = ev.kind === "user_message" || ev.kind === "tool_call_started" ||
+      ev.kind === "turn_completed" || ev.kind === "turn_interrupted" || ev.kind === "turn_failed";
+    if (closesAwaiting) releaseAwaiting(false);
+    else if (awaitingUuid.length > 0 || ev.kind === "assistant_text_delta") {
+      awaitingUuid.push(ev);
       continue;
     }
-    if (ev.kind === "assistant_text_delta") {
-      openTurnText += ev.text;
-      if (tail.text.startsWith(openTurnText)) continue;
-      sink.push(ev);
-      continue;
-    }
-    if (ev.kind === "user_message" && tail.userTexts.has(ev.text)) continue;
-    if (ev.kind === "tool_call_started" && tail.toolUseIds.has(ev.toolUseId)) continue;
-    sink.push(ev);
+    pushLive(ev);
   }
+  releaseAwaiting(false);
   sink.flush();
   return lines.join("\n");
-}
-
-function openLiveTurnId(events: readonly NormalizedEvent[]): string | undefined {
-  let open: string | undefined;
-  for (const ev of events) {
-    if (ev.provenance?.path !== "live") continue;
-    if (ev.kind === "turn_started") open = ev.turnId;
-    else if (ev.kind === "turn_completed" || ev.kind === "turn_interrupted" || ev.kind === "turn_failed") {
-      if (ev.turnId === open) open = undefined;
-    }
-  }
-  return open;
 }
 
 let fileCache: { at: number; paths: string[] } | null = null;

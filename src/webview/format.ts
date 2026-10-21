@@ -21,11 +21,6 @@ export function formatDuration(ms: number): string {
   return `${m}m${rem}s`;
 }
 
-export function formatTokenCount(n: number): string {
-  if (n >= 1000) return `${(n / 1000).toFixed(1)}k tok`;
-  return `${n} tok`;
-}
-
 export function clock(ms: number): string {
   const d = new Date(ms);
   return `${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}`;

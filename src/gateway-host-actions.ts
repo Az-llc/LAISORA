@@ -1,18 +1,13 @@
 import { configurationDefault, configurationRegistered, windowMissesContributedSettings } from "./configuration-defaults";
 import { isAccentColor, isAccentSettingValue, type AccentSetting, type AccentSettings } from "./accent";
-import { join } from "node:path";
 import { createHash } from "node:crypto";
 import { redactAbsolutePaths } from "./path-redaction";
-import { LearningLedger } from "./learning-ledger";
-import { sectionFromLedger, readMeasuredRuns } from "./learning-delivery";
-import type { MeasuredRun } from "./learning-section";
-import { resolveClaudeProfileModel } from "./orchestration-profiles";
-import { agentEffortArgumentSupported, conductorInstruction, estimateTokens, resolveOrchestrationRoster, orchestrationExternalTargets } from "./orchestration-roster";
+import { conductorInstruction, estimateTokens, resolveOrchestrationRoster, orchestrationExternalTargets } from "./orchestration-roster";
 import { homedir } from "node:os";
 import { listClaudeModels, detectClaudeExecutor, relabelRememberedClaudeModels } from "./orchestration-claude";
 import { EXECUTORS, executorMap, type ExecutorId } from "./orchestration-executors";
 import { systemAppExtensions } from "./file-link-open-mode";
-import { CLI_AUTO_UPDATE_SETTINGS, cliAutoUpdateEnabled } from "./cli-update-policy";
+import { CLI_AUTO_UPDATE_SETTINGS, cliAutoUpdateEnabled, compareSemVer, parseSemVer } from "./cli-update-policy";
 import { detectExternalExecutor, listExternalModels } from "./orchestration-external";
 import { externalExecutorName, isExternalModels, isExternalTimeout, type ExternalDetection, type ExternalModels, type ExternalModelsState } from "./orchestration-roster";
 import { DEFAULT_ORCHESTRATION_ROSTER, buildRecommendedClaudeRoster, isOrchestrationSettingRoster, orchestrationSettingRows, recommendedOrchestrationRoster, recommendedRosterChanges, type OrchestrationSettingRow } from "./orchestration-roster";
@@ -38,7 +33,7 @@ import { restoreTabsOnStartupEnabled } from "./session-list-wiring";
 import { TODO_BETA_SETTING } from "./todo-store";
 import { todoBetaEnabled } from "./todo-surface";
 import { EDIT_SUMMARY_SETTING } from "./edit-summary";
-import { MEMORY_BLOCK_PROJECT_TYPE_SETTING, placementOf, placementSettingsOf } from "./placement-line";
+import { GUARD_ENABLED_SETTING, MEMORY_BLOCK_PROJECT_TYPE_SETTING, placementOf, placementSettingsOf } from "./placement-line";
 
 export function editSummarySettingEnabled(): boolean {
   return getLaisoraConfiguration().get<boolean>(EDIT_SUMMARY_SETTING) === true;
@@ -86,6 +81,7 @@ const FILE_LINK_SETTING_KEYS: Record<FileLinkSetting, string> = {
 };
 
 let externalDetection: Record<ExecutorId, ExternalDetection> = executorMap(() => ({ state: "checking" }));
+const knownVersions: Partial<Record<ExecutorId, string>> = {};
 let detectionPending: Promise<void> | undefined;
 const detectionListeners = new Set<() => void>();
 let externalModels: ExternalModels = executorMap(() => ({ state: "checking" }));
@@ -119,13 +115,18 @@ export function cachedExternalModels(): ExternalModels {
   loadRememberedModelLists();
   return structuredClone(externalModels);
 }
-export function detectedExecutorVersion(id: ExecutorId): string | undefined {
-  const detected = externalDetection[id];
-  return detected.state === "found" ? detected.version : undefined;
+export function knownExecutorVersion(id: ExecutorId): string | undefined {
+  return knownVersions[id];
 }
 export function noteExecutorVersion(id: ExecutorId, version: string): void {
+  knownVersions[id] = version;
   const detected = externalDetection[id];
   if (detected.state === "found") externalDetection[id] = { state: "found", path: detected.path, version };
+}
+export function noteRunningExecutorVersion(id: ExecutorId, version: string): void {
+  const known = parseSemVer(knownVersions[id]), running = parseSemVer(version);
+  if (known && running && compareSemVer(running, known) < 0) return;
+  noteExecutorVersion(id, version);
 }
 
 let detectorOverride: typeof detectExternalExecutor | undefined;
@@ -160,6 +161,7 @@ export function refreshExternalDetection(detect = detectorOverride ?? detectExte
       const reason = detected.state === "failed" ? detected.reason : detected.state === "found" ? detected.versionNote : undefined;
       if (reason) output.appendLine(`R-ORC-20: ${externalExecutorName(executor)} detection ${reason} elapsed=${Date.now() - started}ms`);
       externalDetection[executor] = detected;
+      if (detected.state === "found" && detected.version) knownVersions[executor] = detected.version;
       for (const listener of detectionListeners) listener();
       let list: ExternalModelsState;
       try {
@@ -195,33 +197,11 @@ export function configuredSystemAppExtensions(): string[] {
     () => output.appendLine(l10n.t("R-CNV-20: Invalid or blocked extensions in the default app setting were ignored.")));
 }
 
-let settingsLedger: LearningLedger | undefined;
-let settingsMeasuredRuns: MeasuredRun[] = [];
-export async function loadSettingsProfiles(): Promise<void> {
-  const directory = extensionContext?.globalStorageUri?.fsPath;
-  if (!directory) { settingsLedger = undefined; settingsMeasuredRuns = []; return; }
-  try {
-    if (settingsLedger?.directory !== join(directory, "laisora-learning")) settingsLedger = new LearningLedger(join(directory, "laisora-learning"));
-    await settingsLedger.refresh();
-    settingsMeasuredRuns = await readMeasuredRuns(join(directory, "orchestration"), line => output.appendLine(line));
-  } catch { settingsLedger = undefined; settingsMeasuredRuns = []; output.appendLine("R-LRN-07: settings ledger unavailable"); }
-}
-function settingsLearningState() { return settingsLedger?.state; }
-
 export function projectConductorPreview(policy?: string): { text: string; tokens: number } {
   const cfg = getLaisoraConfiguration();
   const roster = resolveOrchestrationRoster(cfg.get<unknown>("orchestration.agents")).roster;
-  const state = settingsLearningState();
-  const conductorModel = resolveClaudeProfileModel("opus", externalModels) ?? "unknown";
-  const profiles = state ? sectionFromLedger(state.records.values(), state.rules.values(), roster, externalModels, conductorModel,
-    "unknown", "preview", new Date().toISOString(), settingsMeasuredRuns, {
-      enabled: cfg.get<boolean>("learning.enabled")!, automaticAdoption: cfg.get<boolean>("learning.automaticAdoption", true),
-      targetInjection: cfg.get<boolean>("learning.targetInjection", true), observationDelivery: cfg.get<boolean>("learning.observationDelivery", true), publicDelivery: cfg.get<boolean>("learning.publicDelivery", true), experiment: cfg.get<boolean>("learning.experiment", true), guard: cfg.get<boolean>("learning.guard", true),
-    }).text : "";
-  const claudeDetection = externalDetection.claude;
   const text = cfg.get<boolean>("orchestration.enabled")!
-    ? conductorInstruction(roster, policy ?? cfg.get<string>("orchestration.conductorPolicy")!, orchestrationExternalTargets(roster, externalModels), profiles,
-      claudeDetection.state === "found" && agentEffortArgumentSupported(claudeDetection.version), externalModels,
+    ? conductorInstruction(roster, policy ?? cfg.get<string>("orchestration.conductorPolicy")!, orchestrationExternalTargets(roster, externalModels), externalModels,
       placementOf(placementSettingsOf(cfg)).line)
     : l10n.t("The agent roster is disabled, so no instruction is added.");
   return { text, tokens: estimateTokens(text) };
@@ -243,7 +223,7 @@ export function settingsStateMessage(): Extract<HostToSettingsPage, { type: "set
     externalDetection: structuredClone(externalDetection),
     externalModels: cachedExternalModels(),
     orchestrationEnabled: cfg.get<boolean>("orchestration.enabled")! === true,
-    learningEnabled: placementSettings.learningEnabled,
+    guardEnabled: placementSettings.guardEnabled,
     memoryBlockProjectType: placementSettings.blockProjectType,
     todoEnabled: todoBetaEnabled(cfg),
     reloadNeeded: settingsReloadNeeded(cfg),
@@ -332,8 +312,8 @@ export async function writeCliAutoUpdate(executor: ExecutorId, enabled: boolean)
   return updateUserSetting(CLI_AUTO_UPDATE_SETTINGS[executor], enabled);
 }
 
-export async function writeLearningEnabled(enabled: boolean): Promise<SettingWriteFailure | undefined> {
-  return updateUserSetting("learning.enabled", enabled);
+export async function writeGuardEnabled(enabled: boolean): Promise<SettingWriteFailure | undefined> {
+  return updateUserSetting(GUARD_ENABLED_SETTING, enabled);
 }
 
 export async function writeMemoryBlockProjectType(enabled: boolean): Promise<SettingWriteFailure | undefined> {

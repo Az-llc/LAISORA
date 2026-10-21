@@ -9,9 +9,8 @@ import { configuredClaudeExecutablePath, getLaisoraConfiguration } from "./claud
 import {
   checkClaudeCodeVersion,
   decideClaudeCliUpdate,
-  forgetClaudeCodeStartup,
   nativeClaudeUpdateTarget,
-  resolveClaudeCodeStartup,
+  resolveClaudeCodeExecutable,
 } from "./claudeCliResolver";
 import {
   CLI_UPDATE_INTERVAL_MS,
@@ -30,8 +29,7 @@ import {
   type CliUpdateMoment,
   type CliUpdateSkip,
 } from "./cli-update-policy";
-import { sdkClaudeCodeVersion } from "./claudeHost";
-import { detectedExecutorVersion, noteExecutorVersion } from "./gateway-host-actions";
+import { knownExecutorVersion, noteExecutorVersion } from "./gateway-host-actions";
 import { output, store } from "./host-context";
 import { EXECUTORS, type ExecutorId, type ExternalExecutorId } from "./orchestration-executors";
 import { detectExternalExecutor, externalRunActive, externalRunActiveAnywhere, holdExternalRunsDuring, markExternalExecutorUpdating, resolveExternalExecutable, setExternalRunMarkerDirectory } from "./orchestration-external";
@@ -57,7 +55,6 @@ interface UpdateTarget {
   env: NodeJS.ProcessEnv;
   knownVersion?: string;
   readVersion(): Promise<string | undefined>;
-  afterVersionChange?(): void;
 }
 
 let updateContext: vscode.ExtensionContext | undefined;
@@ -214,8 +211,8 @@ function apiKeyPolicy(): ApiKeyPolicy {
 }
 
 async function claudeUpdateTarget(): Promise<UpdateTarget | CliUpdateSkip> {
-  const startup = await resolveClaudeCodeStartup(configuredClaudeExecutablePath(getLaisoraConfiguration()), sdkClaudeCodeVersion());
-  const executable = await nativeClaudeUpdateTarget(startup.executable.path);
+  const resolved = await resolveClaudeCodeExecutable(configuredClaudeExecutablePath(getLaisoraConfiguration()));
+  const executable = await nativeClaudeUpdateTarget(resolved.path);
   const childEnv = buildClaudeEnv(process.env, apiKeyPolicy()).env;
   const settings = await Promise.all([...claudeSettingsFiles(), managedSettingsFile()].map(readJson));
   const inputs = {
@@ -230,9 +227,8 @@ async function claudeUpdateTarget(): Promise<UpdateTarget | CliUpdateSkip> {
   return {
     executable,
     env: windowsStandardEnv(childEnv, process.platform),
-    knownVersion: startup.version.cliVersion,
-    readVersion: async () => (await checkClaudeCodeVersion(executable)).cliVersion,
-    afterVersionChange: forgetClaudeCodeStartup,
+    knownVersion: knownExecutorVersion("claude"),
+    readVersion: () => checkClaudeCodeVersion(executable),
   };
 }
 
@@ -244,7 +240,7 @@ function externalUpdateTarget(id: ExternalExecutorId): UpdateTarget | CliUpdateS
   return {
     executable,
     env: windowsStandardEnv(buildClaudeEnv(process.env, policy).env, process.platform),
-    knownVersion: detectedExecutorVersion(id),
+    knownVersion: knownExecutorVersion(id),
     readVersion: async () => {
       const detected = await detectExternalExecutor(id, policy, { resolve: () => executable });
       return detected.state === "found" ? detected.version : undefined;
@@ -324,7 +320,6 @@ async function updateCli(context: vscode.ExtensionContext, id: ExecutorId): Prom
   const from = updatedFromVersion(before, after, ok, target.knownVersion);
   const to = cliVersionNumber(after);
   if (!from || !to || !after) return;
-  target.afterVersionChange?.();
   noteExecutorVersion(id, after);
   postSettingsState();
   await showCliUpdatedNotice(id, from, to);

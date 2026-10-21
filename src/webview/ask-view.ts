@@ -1,9 +1,7 @@
 import * as l10n from "@vscode/l10n";
-import { askQualityIssues, type AskBlock, type AskOption } from "../ask-parser";
+import { askAnswerLine, askOptionLetter, askOtherChoice, askQualityIssues, type AskBlock, type AskOption } from "../ask-parser";
 import { bindUserLabel } from "./user-label";
 import { isRejectedAsk } from "../markdown-ast";
-
-export const askOtherChoice = (): string => l10n.t("Other");
 
 function part<K extends keyof HTMLElementTagNameMap>(tag: K, cls: string, text?: string): HTMLElementTagNameMap[K] {
   const el = document.createElement(tag);
@@ -25,21 +23,15 @@ export function askHeading(kind: "decide" | "check", title: string, counter: str
 }
 
 export function askOptionContent(index: number, label: string, effect?: string, option?: AskOption): HTMLElement[] {
-  let letter = "";
-  for (let n = index + 1; n > 0; n = Math.floor((n - 1) / 26)) letter = String.fromCharCode(65 + (n - 1) % 26) + letter;
   const name = part("span", "ask-option-label", label);
   if (option?.recommended) name.append(part("span", "ask-recommended", l10n.t("Recommended")));
-  const out: HTMLElement[] = [part("span", "ask-letter", letter), name];
+  const out: HTMLElement[] = [part("span", "ask-letter", askOptionLetter(index)), name];
   if (effect) out.push(part("span", "ask-effect", effect));
   if (option) {
     out.push(part("span", "ask-detail", l10n.t("Benefit: {0}", option.pros)));
     out.push(part("span", "ask-detail", l10n.t("Drawback: {0}", option.cons)));
   }
   return out;
-}
-
-export function askAnswerLine(title: string, choice: string, answer: string): string {
-  return `${title} → ${choice}: ${answer}`;
 }
 
 export interface AskRenderContext {

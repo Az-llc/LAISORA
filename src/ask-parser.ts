@@ -1,3 +1,5 @@
+import * as l10n from "@vscode/l10n";
+
 export interface AskOption {
   label: string;
   effect: string;
@@ -15,6 +17,81 @@ export type AskBlock = { title: string; why: string; default: string; details?: 
   | { kind: "decide"; options: AskOption[] }
   | { kind: "check"; steps: AskStep[] }
 );
+
+export const askOtherChoice = (): string => l10n.t("Other");
+
+export function askOptionLetter(index: number): string {
+  let letter = "";
+  for (let n = index + 1; n > 0; n = Math.floor((n - 1) / 26)) letter = String.fromCharCode(65 + (n - 1) % 26) + letter;
+  return letter;
+}
+
+const ASK_ANSWER_ARROW = " → ";
+const ASK_ANSWER_COLON = ":";
+const ASK_ANSWER_NEXT_LINE = new RegExp(`\\r?\\n[^\\r\\n]*${ASK_ANSWER_ARROW}`);
+export const ASK_ANSWER_TITLE_JOINED = /[\p{L}\p{N}]/u;
+const ASK_ANSWER_COLONS = `${ASK_ANSWER_COLON}：`;
+const ASK_ANSWER_HEAD = new RegExp(`^([^\\r\\n${ASK_ANSWER_COLONS}]*)[${ASK_ANSWER_COLONS}][ \\t]?`);
+
+function titleStartsAt(text: string, title: string, at: number): boolean {
+  if (at < 0 || !text.startsWith(askAnswerPrefix(title), at)) return false;
+  const before = [...text.slice(Math.max(0, at - 2), at)].at(-1);
+  return before === undefined || !ASK_ANSWER_TITLE_JOINED.test(before);
+}
+
+export function askAnswerPrefix(title: string): string {
+  return `${title}${ASK_ANSWER_ARROW}`;
+}
+
+export function askAnswerLine(title: string, choice: string, answer: string): string {
+  return `${askAnswerPrefix(title)}${choice}${ASK_ANSWER_COLON} ${answer}`;
+}
+
+export class AskAnswerTitles {
+  private readonly titles: readonly string[];
+  private readonly longer = new Map<string, readonly string[]>();
+
+  constructor(titles: Iterable<string>) {
+    this.titles = [...new Set(titles)];
+  }
+
+  longerThan(title: string): readonly string[] {
+    let found = this.longer.get(title);
+    if (found === undefined) this.longer.set(title, found = this.titles.filter(other => other.length > title.length && other.endsWith(title)));
+    return found;
+  }
+}
+
+const NO_OTHER_TITLES = new AskAnswerTitles([]);
+
+export function askAnswerChoices(title: string, text: string, titles: AskAnswerTitles = NO_OTHER_TITLES): string[] {
+  const prefix = askAnswerPrefix(title);
+  const longer = titles.longerThan(title);
+  const choices: string[] = [];
+  for (let at = text.indexOf(prefix); at >= 0; at = text.indexOf(prefix, at + 1)) {
+    if (!titleStartsAt(text, title, at) || longer.some(other => titleStartsAt(text, other, at - (other.length - title.length)))) continue;
+    choices.push(text.slice(at + prefix.length));
+  }
+  return choices;
+}
+
+export function askAnswerBody(choice: string): string {
+  const next = choice.search(ASK_ANSWER_NEXT_LINE);
+  return next < 0 ? choice : choice.slice(0, next);
+}
+
+export function askAnswerParts(choice: string): { readonly choice: string; readonly answer: string } | undefined {
+  const body = askAnswerBody(choice);
+  const head = ASK_ANSWER_HEAD.exec(body);
+  return head ? { choice: head[1], answer: body.slice(head[0].length) } : undefined;
+}
+
+export const OTHER_REPLY_QUESTION_PATTERN = /[？?]$|分からない|わからない|詳しく|詳細|どういう|なぜ/u;
+
+export function otherReplyAsksBack(choice: string, otherChoice: string): boolean {
+  const parts = askAnswerParts(choice);
+  return parts?.choice === otherChoice && OTHER_REPLY_QUESTION_PATTERN.test(parts.answer.trim());
+}
 
 function scalar(raw: string, multiline = false): string | null {
   const value = raw.trim();

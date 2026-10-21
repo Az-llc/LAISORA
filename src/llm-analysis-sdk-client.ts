@@ -3,7 +3,7 @@ import type * as ClaudeCodeSdk from "@anthropic-ai/claude-agent-sdk" with { "res
 import type { LlmAnalysisClient, LlmAnalysisGenerateResult, LlmAnalysisRequest } from "./llm-analysis-client";
 import { llmFindingsJsonSchema } from "./llm-analysis-client";
 import { llmAnalysisSystemPrompt } from "./llm-analysis-prompt";
-import { resolveClaudeCodeStartup } from "./claudeCliResolver";
+import { resolveClaudeCodeExecutable } from "./claudeCliResolver";
 import { buildClaudeEnv, describeSdkErrorResult } from "./claude-env";
 import type { ApiKeyPolicy } from "./protocol";
 
@@ -17,7 +17,6 @@ export interface SdkLlmAnalysisClientOptions {
   effort?: string;
   cwd: string;
   claudeCodeExecutablePath?: string;
-  sdkClaudeCodeVersion?: string;
   apiKeyPolicy?: ApiKeyPolicy;
   deps?: Partial<SdkLlmAnalysisClientDeps>;
 }
@@ -26,12 +25,8 @@ function defaultLoadSdk(): Pick<typeof ClaudeCodeSdk, "query"> {
   return require("@anthropic-ai/claude-agent-sdk") as Pick<typeof ClaudeCodeSdk, "query">;
 }
 
-async function defaultResolveExecutablePath(
-  configuredPath: string | undefined,
-  sdkVersion: string | undefined
-): Promise<string | undefined> {
-  const startup = await resolveClaudeCodeStartup(configuredPath, sdkVersion);
-  return startup.executable.path;
+async function defaultResolveExecutablePath(configuredPath: string | undefined): Promise<string | undefined> {
+  return (await resolveClaudeCodeExecutable(configuredPath)).path;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -43,7 +38,6 @@ class SdkLlmAnalysisClient implements LlmAnalysisClient {
   readonly effort: string | undefined;
   private readonly cwd: string;
   private readonly claudeCodeExecutablePath: string | undefined;
-  private readonly sdkClaudeCodeVersion: string | undefined;
   private readonly apiKeyPolicy: ApiKeyPolicy | undefined;
   private readonly deps: Partial<SdkLlmAnalysisClientDeps> | undefined;
 
@@ -58,7 +52,6 @@ class SdkLlmAnalysisClient implements LlmAnalysisClient {
     this.effort = options.effort;
     this.cwd = options.cwd;
     this.claudeCodeExecutablePath = options.claudeCodeExecutablePath;
-    this.sdkClaudeCodeVersion = options.sdkClaudeCodeVersion;
     this.apiKeyPolicy = options.apiKeyPolicy;
     this.deps = options.deps;
   }
@@ -70,7 +63,7 @@ class SdkLlmAnalysisClient implements LlmAnalysisClient {
     const resolveExecutablePath =
       this.deps?.resolveExecutablePath ??
       ((): Promise<string | undefined> =>
-        defaultResolveExecutablePath(this.claudeCodeExecutablePath, this.sdkClaudeCodeVersion));
+        defaultResolveExecutablePath(this.claudeCodeExecutablePath));
 
     const abortController = new AbortController();
     const onAbort = (): void => {
@@ -99,11 +92,11 @@ class SdkLlmAnalysisClient implements LlmAnalysisClient {
         env: buildClaudeEnv(process.env, this.apiKeyPolicy).env,
         outputFormat: {
           type: "json_schema",
-          schema: llmFindingsJsonSchema(request.learningEnabled),
+          schema: llmFindingsJsonSchema(),
         },
         abortController,
         settingSources: [],
-        systemPrompt: llmAnalysisSystemPrompt(request.outputLanguage, request.learningEnabled),
+        systemPrompt: llmAnalysisSystemPrompt(request.outputLanguage),
       };
       if (this.modelId.length > 0) {
         options.model = this.modelId;

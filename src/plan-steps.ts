@@ -323,11 +323,19 @@ function planConductorWork(view: Pick<TimeBucketView, "blocks" | "intervals">, r
 
 export function normalizePlanContent(value: string): string { return value.normalize("NFKC").trim().replace(/\s+/g, " "); }
 
+export const TASK_KEY_PREFIX = "task:";
+export const TASK_PENDING_KEY_PREFIX = `${TASK_KEY_PREFIX}pending:`;
+const TASK_STEP_KEY_HEAD = "task\n";
+
 export function planStepKey(entry: { source?: "tasks" }, item: { taskKey: string; description: string }): string {
-  return (entry.source === "tasks" || item.taskKey.startsWith("task:")) ? `task\n${item.taskKey}` : normalizePlanContent(item.description);
+  return (entry.source === "tasks" || item.taskKey.startsWith(TASK_KEY_PREFIX)) ? `${TASK_STEP_KEY_HEAD}${item.taskKey}` : normalizePlanContent(item.description);
 }
 
-const TASK_STEP_KEY_RE = /^task\ntask:(\d+)$/;
+export function planStepTaskKey(key: string): string | undefined {
+  return key.startsWith(TASK_STEP_KEY_HEAD) ? key.slice(TASK_STEP_KEY_HEAD.length) : undefined;
+}
+
+const TASK_STEP_KEY_RE = new RegExp(`^${TASK_STEP_KEY_HEAD}${TASK_KEY_PREFIX}(\\d+)$`);
 const ITEM_NUMBER_PREFIX_RE = /^(\d{2,}) /;
 
 export function planContextOf(block: { blockId: string; text: string; start: number; goal?: string; steps?: ReadonlyArray<PlanStepTiming & { number: number; activeSpans?: PlanSpan[] }>;
@@ -344,6 +352,8 @@ export function planItemNumber(seen: string[], key: string): number {
   const id = TASK_STEP_KEY_RE.exec(key)?.[1];
   return id !== undefined ? Number(id) : seen.indexOf(key) + 1;
 }
+
+export type PlanStepUpdate = { number: number; tool: "TodoWrite"; title: string } | { number: number; tool: "TaskUpdate"; taskId: string };
 
 export function planItemNumberOf(description: string | undefined): number | undefined {
   const digits = description === undefined ? undefined : ITEM_NUMBER_PREFIX_RE.exec(description)?.[1];

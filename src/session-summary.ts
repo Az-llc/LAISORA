@@ -2,7 +2,7 @@ import type { Options as ClaudeCodeOptions } from "@anthropic-ai/claude-agent-sd
 import type * as ClaudeCodeSdk from "@anthropic-ai/claude-agent-sdk" with { "resolution-mode": "import" };
 import { buildClaudeEnv, describeSdkErrorResult } from "./claude-env";
 import { RENAME_TITLE_MAX, type ApiKeyPolicy } from "./protocol";
-import { resolveClaudeCodeStartup } from "./claudeCliResolver";
+import { resolveClaudeCodeExecutable } from "./claudeCliResolver";
 import * as l10n from "@vscode/l10n";
 
 export function buildSummaryPrompt(digest: string): string {
@@ -56,7 +56,6 @@ export interface GenerateSessionSummaryOptions {
   prompt: string;
   signal: AbortSignal;
   pathToClaudeCodeExecutable?: string;
-  sdkClaudeCodeVersion?: string;
   resolveExecutablePath?: () => Promise<string | undefined>;
   loadSdk?: () => Pick<typeof ClaudeCodeSdk, "query">;
 }
@@ -77,7 +76,7 @@ export async function generateSessionSummaryViaSdk(
   const resolveExecutablePath =
     opts.resolveExecutablePath ??
     (async (): Promise<string | undefined> =>
-      (await resolveClaudeCodeStartup(opts.pathToClaudeCodeExecutable, opts.sdkClaudeCodeVersion)).executable.path);
+      (await resolveClaudeCodeExecutable(opts.pathToClaudeCodeExecutable)).path);
   const pathToClaudeCodeExecutable = await resolveExecutablePath();
   if (opts.signal.aborted) return {};
   const abortController = new AbortController();

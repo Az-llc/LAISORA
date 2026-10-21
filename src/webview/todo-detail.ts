@@ -15,7 +15,8 @@ import {
   type TodoListItem,
   type WebviewToHost,
 } from "../protocol";
-import { TODO_DOC_LABEL_MAX, TODO_DOC_TARGET_MAX, TODO_ESTIMATE_PATTERN, TODO_IMAGE_EXTENSIONS, TODO_TAGS_MAX, TODO_TIME_UNKNOWN, TODO_TITLE_MAX, TODO_WAITING_MAX, type TodoImageMediaType, type TodoState, type WorkMemoSection } from "../todo-model";
+import { TODO_DOC_LABEL_MAX, TODO_DOC_TARGET_MAX, TODO_ESTIMATE_PATTERN, TODO_IMAGE_EXTENSIONS, TODO_TAGS_MAX, TODO_TIME_UNKNOWN, TODO_TITLE_MAX, TODO_WAITING_MAX, todoDecisionGroups, type TodoDecision, type TodoImageMediaType, type TodoState, type WorkMemoSection } from "../todo-model";
+import { askAnswerPrefix } from "../ask-parser";
 import { formatDateTime } from "./l10n";
 import {
   formatTodoDay,
@@ -715,6 +716,35 @@ export class TodoDetail {
     return wrap;
   }
 
+  private decisionsEl(log: readonly TodoDecision[]): HTMLElement {
+    const list = todoEl("ol", "todo-change-list");
+    for (const group of todoDecisionGroups(log)) {
+      if (group.earlier.length === 0) {
+        list.append(this.decisionRow(group.latest));
+        continue;
+      }
+      const key = `d:${group.key}`;
+      const open = this.openTexts.has(key);
+      const toggle = todoButton("todo-link todo-change-revert", open ? l10n.t("Hide earlier decisions") : l10n.t("Earlier decisions ({0})", group.earlier.length), () => {
+        if (!this.openTexts.delete(key)) this.openTexts.add(key);
+        this.render();
+      });
+      toggle.setAttribute("aria-expanded", open ? "true" : "false");
+      list.append(this.decisionRow(group.latest, toggle));
+      if (open) for (const entry of group.earlier) list.append(this.decisionRow(entry));
+    }
+    return list;
+  }
+
+  private decisionRow(entry: TodoDecision, toggle?: HTMLElement): HTMLElement {
+    const row = todoEl("li", "todo-change");
+    const what = entry.from === "memo" ? l10n.t("From the work memo") : `${askAnswerPrefix(entry.title ?? "")}${entry.label ?? entry.text ?? ""}`;
+    row.append(todoEl("span", "todo-change-at", entry.at === TODO_TIME_UNKNOWN ? "" : formatDateTime(entry.at)), todoEl("span", "todo-change-what", what), ...(toggle ? [toggle] : []));
+    const detail = entry.from === "memo" || entry.label !== undefined ? entry.text : undefined;
+    if (detail) row.append(todoEl("pre", "todo-hist-text", detail));
+    return row;
+  }
+
   private staleNote(since: number): HTMLElement {
     return todoEl("p", "todo-stale", l10n.t("Its conversation worked after this memo was written ({0}), so it may be out of date until Claude updates it.", formatDateTime(since)));
   }
@@ -984,6 +1014,7 @@ export class TodoDetail {
 
   private infoBody(item: TodoDetailItem): HTMLElement {
     const { grid, field } = this.fieldGrid();
+    if (item.decisionLog?.length) field(TODO_MEMO_LABELS.decisions(), this.decisionsEl(item.decisionLog));
     if (item.parentId === null) {
       field(l10n.t("Group"), todoGroupSelect(item.group, this.host.groups(), group => this.edit({ kind: "update", id: item.id, group })));
     } else {

@@ -1,5 +1,5 @@
-import { ClaudeConversation, sdkClaudeCodeVersion, type ClaudeHostOptions } from "./claudeHost";
-import { resolveClaudeCodeStartup } from "./claudeCliResolver";
+import { ClaudeConversation, type ClaudeHostOptions } from "./claudeHost";
+import { checkClaudeCodeVersion, resolveClaudeCodeExecutable } from "./claudeCliResolver";
 import { runFailureReason } from "./orchestration-external";
 import { resolveModelDisplayName } from "./model-display-name";
 import { claudeModelIdLabel, isOrchestrationEffort, type ExternalModel, type ExternalModelsState, type ExternalDetection } from "./orchestration-executors";
@@ -112,8 +112,9 @@ export async function listClaudeModels(cwd: string, log: (message: string) => vo
 
 export async function detectClaudeExecutor(configuredPath?: string): Promise<ExternalDetection> {
   try {
-    const startup = await resolveClaudeCodeStartup(configuredPath, sdkClaudeCodeVersion());
-    return { state: "found", path: startup.executable.path, version: startup.version.cliVersion, ...(startup.version.cliVersion ? {} : { versionNote: "version-unavailable" }) };
+    const executable = await resolveClaudeCodeExecutable(configuredPath);
+    const version = await checkClaudeCodeVersion(executable.path);
+    return { state: "found", path: executable.path, version, ...(version ? {} : { versionNote: "version-unavailable" }) };
   } catch (error) {
     if ((error as { code?: unknown })?.code === "CLAUDE_CLI_NOT_FOUND") return { state: "notInstalled" };
     throw error;

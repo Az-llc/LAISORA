@@ -24,11 +24,10 @@ import type {
   UsageSnapshot,
   WorkModelPayload,
 } from "../protocol";
-import { ACCOUNT_USAGE_REPLY_WAIT_MS, fallbackChipWarning, IMAGE_MAX_COUNT, isCurrentAccountUsageRow, PROTOCOL_VERSION, RENAME_TITLE_MAX, isHostToWebview, withLocalEventDrop } from "../protocol";
-import { hasSessionRecord, sessionRecordId } from "../session-record";
-import { windowEvents } from "../event-window";
+import { ACCOUNT_USAGE_REPLY_WAIT_MS, fallbackUnresolved, IMAGE_MAX_COUNT, isCurrentAccountUsageRow, PROTOCOL_VERSION, RENAME_TITLE_MAX, isHostToWebview, withLocalEventDrop } from "../protocol";
+import { hasSessionRecord } from "../session-record";
+import { followsDirectly, historyAnchorIndex, windowEvents } from "../event-window";
 import { findModelRow, resolveModelDisplayName } from "../model-display-name";
-import type { AnalysisReport } from "../analysis";
 import {
   actionBtn,
   attachBtn,
@@ -180,6 +179,7 @@ const todoTab = new TodoTab(vscode.getState()?.todo, {
 }, todoApp);
 const todoDrawer = new TodoDrawer(todoTab, {
   rail: (tabId) => tabs.get(tabId)?.rightRail() ?? null,
+  composer: document.getElementById("composer")!,
   showInTodoTab: (itemId) => {
     showTodoTab();
     if (itemId !== undefined) todoApp.open(itemId);
@@ -355,7 +355,6 @@ function abandonAwaitedScrollAnchor(): void {
   tab?.noteUserScrollGesture();
 }
 
-const analysisReports = new Map<string, { filePath: string; report: AnalysisReport }>();
 export function refreshComposer(): void {
   inputEl.placeholder = composerPlaceholder();
   refreshChrome();
@@ -466,37 +465,11 @@ export function findTabBySessionId(sessionId: string): Tab | undefined {
   return undefined;
 }
 
-function analysisTargetTab(sessionId: string): string | null {
-  for (const [id, t] of tabs) {
-    if (t.auth?.sessionId === sessionId || t.resumeSessionId === sessionId) return id;
-  }
-  if (activeTabId && tabs.has(activeTabId)) return activeTabId;
-  return tabs.keys().next().value ?? null;
-}
-
-function showAnalysis(sessionId: string, filePath: string, report: AnalysisReport): void {
-  analysisReports.set(sessionId, { filePath, report });
-  const tabId = analysisTargetTab(sessionId);
-  if (!tabId) return;
-  setActiveTab(tabId);
-  const tab = tabs.get(tabId);
-  tab?.withViewChange(() => {
-    overviews.get(tabId)?.showAnalysis(sessionId, filePath, report);
-    tab.selectPane("analysis");
-  });
-}
-
 function showAnalysisFailure(msg: Extract<HostToWebview, { type: "analysisFailed" }>): void {
-  if (msg.reason === undefined) return;
-  const tabId = msg.tabId ?? activeTabId;
-  if (!tabId || !tabs.has(tabId)) return;
-  if (msg.kind === "script") {
-    setActiveTab(tabId);
-  }
-  const tab = tabs.get(tabId)!;
+  const tab = tabs.get(msg.tabId);
+  if (!tab) return;
   tab.withViewChange(() => {
-    overviews.get(tabId)?.showAnalysisFailure(msg.reason!);
-    if (msg.kind === "script") tab.selectPane("analysis");
+    overviews.get(msg.tabId)?.showAnalysisFailure(msg.reason);
   });
 }
 
@@ -565,10 +538,11 @@ function renderMode(t: Tab | null): void {
 
 export function displayModelName(t: Tab | null): string | undefined {
   const rows = t?.models ?? [];
-  if (t?.modelFallback && t.modelFallback.resolvedAt === undefined) return resolveModelDisplayName(rows, t.modelFallback.appliedModel);
+  if (fallbackUnresolved(t?.modelFallback)) return resolveModelDisplayName(rows, t.modelFallback.appliedModel);
   const override = t?.modelOverride;
   if (override) return resolveModelDisplayName(rows, override);
-  const raw = override === null ? "default" : (t?.auth?.model ?? t?.appliedModel ?? t?.recordedModel ?? t?.configModel)?.trim();
+  if (override === null) return resolveModelDisplayName(rows, findModelRow(rows, "default") ? "default" : t?.appliedModel ?? t?.auth?.model);
+  const raw = (t?.auth?.model ?? t?.appliedModel ?? t?.recordedModel ?? t?.configModel)?.trim();
   if (!raw) return undefined;
   if (raw === "default" && !findModelRow(rows, raw)) return undefined;
   return resolveModelDisplayName(rows, raw);
@@ -581,18 +555,16 @@ export function renderAuth(t: Tab | null): void {
       : t?.configEffort ? l10n.t("{0} (configured)", t.configEffort)
         : t?.defaultEffort ? l10n.t("{0} (default)", t.defaultEffort)
           : t?.appliedEffort === null ? l10n.t("Not used") : t?.appliedEffort ?? l10n.t("Unconfirmed"));
-  const modelName = displayModelName(t);
-  const fallback = t !== null && fallbackChipWarning(t.modelFallback);
+  const model = displayModelName(t) || l10n.t("Model unconfirmed");
+  const fallback = t !== null && fallbackUnresolved(t.modelFallback);
 
   if (!auth) {
-    const model = modelName || l10n.t("Model unconfirmed");
     authEl.textContent = `${model} / effort: ${effort}`;
     authEl.className = fallback ? "chip model-fallback-warning" : "chip";
     authEl.setAttribute("title", `${model} / effort: ${effort}`);
     return;
   }
 
-  const model = modelName ?? auth.model ?? "?";
   authEl.textContent =
     auth.billingRealm === "subscription"
       ? `${model} / effort: ${effort}`
@@ -1086,7 +1058,7 @@ function failConvChaseProgress(tabId: string, reason: string, detail?: string): 
 function installConvPager(
   t: Tab,
   tabId: string,
-  windowed: { events: NormalizedEvent[]; droppedCount: number; backfilledHead: boolean },
+  windowed: { events: NormalizedEvent[]; droppedCount: number },
   hasDroppedConvEvent: boolean
 ): void {
   dropConvPager(tabId);
@@ -1578,7 +1550,7 @@ function worklogBackfillContinues(
 
 function installHistoryPager(
   tabId: string,
-  windowed: { events: NormalizedEvent[]; droppedCount: number; backfilledHead: boolean },
+  windowed: { events: NormalizedEvent[]; droppedCount: number },
   noteEl: HTMLElement | undefined,
   resumeSessionId: string | undefined
 ): void {
@@ -1979,10 +1951,9 @@ function requestHistoryChunk(tabId: string): void {
 }
 
 function initialHistoryAnchor(
-  windowed: { events: NormalizedEvent[]; backfilledHead: boolean }
+  windowed: { events: NormalizedEvent[] }
 ): { generation: number; seq: number } | undefined {
-  const at = windowed.backfilledHead ? 1 : 0;
-  const ev = windowed.events[at];
+  const ev = windowed.events[historyAnchorIndex(windowed.events)];
   if (ev === undefined) return undefined;
   return { generation: ev.generation, seq: ev.seq };
 }
@@ -1994,7 +1965,7 @@ function resolveContiguousHistoryAnchor(
   if (items.length === 0) return currentAnchor;
   if (currentAnchor !== undefined) {
     const tail = items[items.length - 1];
-    if (tail.generation !== currentAnchor.generation || tail.seq + 1 !== currentAnchor.seq) {
+    if (!followsDirectly(tail, currentAnchor)) {
       return currentAnchor;
     }
   }
@@ -2002,7 +1973,7 @@ function resolveContiguousHistoryAnchor(
   for (let i = items.length - 2; i >= 0; i--) {
     const cur = items[i];
     const next = items[i + 1];
-    if (cur.generation === next.generation && cur.seq + 1 === next.seq) {
+    if (followsDirectly(cur, next)) {
       oldestIndex = i;
     } else {
       break;
@@ -2046,7 +2017,6 @@ function withHeadOmitted(
   return {
     events: windowed.events,
     droppedCount: windowed.droppedCount + headOmitted.count,
-    backfilledHead: windowed.backfilledHead || headOmitted.backfilledHead,
   };
 }
 
@@ -2207,12 +2177,6 @@ function addTab(snap: TabSnapshot, scrollCarry?: ScrollCarry): Tab {
   lastSemanticModels.set(snap.tabId, { model: snap.state.semanticModel, view: snap.state.semanticView });
   overview.updateSemantic(displaySemanticModel(snap.tabId, snap.state.semanticModel), snap.state.semanticView);
   overview.setLlmAnalysisEnabled(snap.state.llmAnalysisEnabled);
-  const recordId = sessionRecordId(snap.state);
-  const heldSessionId = recordId !== undefined && analysisReports.has(recordId) ? recordId : undefined;
-  if (heldSessionId) {
-    const held = analysisReports.get(heldSessionId)!;
-    overview.setAnalysis(heldSessionId, held.filePath, held.report);
-  }
   overviews.set(snap.tabId, overview);
   overview.setActive(t.isActive());
   overview.setLlmRunning(snap.state.llmAnalysisRunning === true, snap.state.llmAnalysisProgress);
@@ -2722,10 +2686,6 @@ function initMessageBus(): void {
       }
       case "analysisFailed": {
         showAnalysisFailure(msg);
-        break;
-      }
-      case "analysis": {
-        showAnalysis(msg.sessionId, msg.filePath, msg.report as AnalysisReport);
         break;
       }
       case "composerPrefill": {

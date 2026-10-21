@@ -16,7 +16,6 @@ import {
 } from "./background-activity";
 import { resolveInitialMode, type ConfiguredEffort, type ConfiguredEffortSnapshot } from "./claude-settings";
 import { ClaudeConversation } from "./claudeHost";
-import type { LearningFacts } from "./learning";
 import { isConvRenderableEvent } from "./conv-renderable";
 import { releaseConversationHistory } from "./conversation-history";
 import { createEvidenceIndex, type SemanticEvidenceIndex } from "./evidence-index";
@@ -121,7 +120,6 @@ export class Session {
   readonly llmRunner: SessionLlm;
   readonly summaryRunner: SessionSummaryWiring;
   sessionFacts: SessionFactsAccumulator = initialSessionFacts();
-  readonly learningFacts?: () => LearningFacts | undefined = () => this.conversation?.learningFacts;
   liveDelegationAgentIds = new Set<string>();
   liveDelegationRev = 0;
   backgroundActivity: BackgroundActivityState = createBackgroundActivityState();
@@ -228,6 +226,7 @@ export class Session {
     this.expectedConversationId = null;
     this.titleRefreshed = false;
     this.titleRefreshing = false;
+    this.autoTitled = false;
     this.generation += 1;
     this.logicalGeneration += 1;
     this.ownerState = { kind: "unresolved" };
@@ -769,7 +768,6 @@ export class Session {
         headOmitted: {
           count: tail.droppedCount,
           hasConvEvent,
-          backfilledHead: tail.backfilledHead,
         },
         events: tail.events,
       },

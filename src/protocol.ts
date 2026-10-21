@@ -17,7 +17,7 @@ import { FILE_LINK_TARGET_MAX_LEN } from "./file-link-target";
 export { FILE_LINK_TARGET_MAX_LEN } from "./file-link-target";
 import { findToolPlacement, findWorkSegment, phaseStateOf, runningMainPlacement } from "./work-model";
 import { BACKGROUND_ACTIVITY_LIST_MAX, type BackgroundActivitySnapshot } from "./background-activity";
-import { isTodoAskIdentity, TODO_OPERATION_ERRORS, TODO_PLACEMENT_BASES, TODO_REVERT_BLOCKS, type TodoPlacementBasis, type TodoChangePlace, TODO_CAPTURE_VIA, type TodoCaptured, TODO_ASK_PLACES, type TodoAskPlace, TODO_ASK_SOURCE_MESSAGES_MAX, TODO_BATCH_MAX, type TodoBatchStep, TODO_DOC_KINDS, TODO_DOC_LABEL_MAX, TODO_DOC_TARGET_MAX, TODO_DUE_PATTERN, TODO_GROUP_COLOR_COUNT, TODO_GROUP_MAX, TODO_WAITING_MAX, TODO_TAGS_MAX, TODO_ESTIMATE_PATTERN, TODO_REPEAT_PATTERN, TODO_TEMPLATE_NAME_MAX, TODO_BRIEF_MAX, TODO_ACKNOWLEDGE_MAX, TODO_GUESS_REASON_MAX, TODO_IMAGE_EXTENSIONS, TODO_IMAGE_FILE, TODO_PRIORITIES, TODO_STATES, TODO_TITLE_MAX, TODO_TEXT_FIELDS, WORK_MEMO_SECTIONS, TODO_START_KINDS, type TodoStartKind, type TodoAuthor, type TodoCompletion, type TodoDocKind, type TodoImageMediaType, type TodoOperationError, type TodoPriority, type TodoRevertBlock, type TodoState, type WorkMemoSection } from "./todo-model";
+import { isTodoAskIdentity, isTodoTime, isTodoDocLabel, isTodoImageName, isTodoGroupName, isTodoFolderPath, TODO_ITEM_SHAPES, TODO_CHANGE_FIELDS, isTodoChangeRecord, isTodoGroupAlias, isTodoBriefText, isTodoDocFields, isTodoGuessReason, isTodoId, isTodoMemoEntry, isTodoMemoText, isTodoSessionId, todoItemFieldValid, TODO_OPERATION_ERRORS, TODO_REVERT_BLOCKS, type TodoPlacementBasis, type TodoChangePlace, type TodoCaptured, TODO_ASK_PLACES, type TodoAskPlace, TODO_ASK_SOURCE_MESSAGES_MAX, TODO_BATCH_MAX, type TodoBatchStep, TODO_GROUP_COLOR_COUNT, TODO_TEMPLATE_NAME_MAX, TODO_ACKNOWLEDGE_MAX, TODO_IMAGE_EXTENSIONS, TODO_TITLE_MAX, WORK_MEMO_SECTIONS, TODO_START_KINDS, type TodoStartKind, type TodoAuthor, type TodoCompletion, type TodoDocKind, type TodoImageMediaType, type TodoOperationError, type TodoPriority, type TodoRevertBlock, type TodoState, type WorkMemoSection, type TodoDecision } from "./todo-model";
 export { BACKGROUND_ACTIVITY_LIST_MAX } from "./background-activity";
 export type { BackgroundActivitySnapshot } from "./background-activity";
 import type {
@@ -107,12 +107,45 @@ export interface ModelRefusalFallback {
   refusedUserMessageUuid: string | null;
   message: string;
   autoRevert?: FallbackAutoRevertStart;
+  turnOriginalModel?: string;
 }
 
 export const FALLBACK_AUTO_REVERT_STARTS = ["pending", "off"] as const;
 export type FallbackAutoRevertStart = (typeof FALLBACK_AUTO_REVERT_STARTS)[number];
 export const FALLBACK_REVERT_OUTCOMES = ["applied", "deferred", "failed", "chosen"] as const;
 export type FallbackRevertOutcome = (typeof FALLBACK_REVERT_OUTCOMES)[number];
+export const FALLBACK_NOTICE_OUTCOMES = ["pending", "resolved", "failed", "unknown"] as const;
+export type FallbackNoticeOutcome = (typeof FALLBACK_NOTICE_OUTCOMES)[number];
+
+function turnIdKey(turnId: string): string {
+  return JSON.stringify(turnId);
+}
+
+export function fallbackTurnKey(notice: Extract<NormalizedEvent, { kind: "model_refusal_fallback" }>): string {
+  return notice.turnId !== null ? turnIdKey(notice.turnId) : `notice:${fallbackNoticeKey(notice)}`;
+}
+
+function fallbackRowKey(row: Extract<NormalizedEvent, { kind: "model_fallback_revert" }>): string | undefined {
+  return row.fallbackKey ?? (row.turnId !== null ? turnIdKey(row.turnId) : undefined);
+}
+
+export function fallbackCoalesces(state: ModelFallbackState | undefined, notice: Pick<ModelRefusalFallback, "turnId">): boolean {
+  return notice.turnId !== null && state !== undefined && state.resolvedAt === undefined &&
+    fallbackTurnKey(state.notice) === turnIdKey(notice.turnId);
+}
+
+function fallbackIsLive(state: ModelFallbackState): boolean {
+  return state.notice.provenance?.path === "live";
+}
+
+function withTurnOutcome(state: ModelFallbackState, outcome: FallbackNoticeOutcome): ModelFallbackState {
+  return { ...state, turnOutcomes: { ...state.turnOutcomes, [fallbackTurnKey(state.notice)]: outcome } };
+}
+
+export function fallbackNoticeOutcome(state: ModelFallbackState | undefined,
+  notice: Extract<NormalizedEvent, { kind: "model_refusal_fallback" }>): FallbackNoticeOutcome {
+  return state?.turnOutcomes?.[fallbackTurnKey(notice)] ?? "unknown";
+}
 
 export function sameModel(a: string | null | undefined, b: string | null | undefined, models: readonly ModelInfo[] = []): boolean {
   if (!a || !b) return false;
@@ -124,12 +157,12 @@ export function applyFallbackModel(state: ModelFallbackState | undefined, model:
   at: number, models: readonly ModelInfo[] = []): ModelFallbackState | undefined {
   if (!state || !model) return state;
   if (state.resolvedAt === undefined && sameModel(model, fallbackOriginalModel(state), models)) {
-    return { ...state, appliedModel: model, resolvedAt: at };
+    return withTurnOutcome({ ...state, appliedModel: model, resolvedAt: at }, "resolved");
   }
   if (state.resolvedAt !== undefined && sameModel(model, state.notice.fallbackModel, models) &&
     !sameModel(model, state.appliedModel, models)) {
     const { resolvedAt: _resolvedAt, autoRevert: _autoRevert, ...open } = state;
-    return { ...open, appliedModel: model, reopenedAt: at };
+    return withTurnOutcome({ ...open, appliedModel: model, reopenedAt: at }, "failed");
   }
   return model === state.appliedModel ? state : { ...state, appliedModel: model };
 }
@@ -139,30 +172,53 @@ export function resolveFallbackByChoice(state: ModelFallbackState | undefined, m
   if (!state) return state;
   const appliedModel = model === null ? models.find(row => row.id === "default")?.resolvedModel || state.appliedModel
     : model || state.appliedModel;
-  return { ...state, appliedModel, resolvedAt: state.resolvedAt ?? at };
+  const resolved = { ...state, appliedModel, resolvedAt: state.resolvedAt ?? at };
+  return fallbackIsLive(state) ? withTurnOutcome(resolved, "resolved") : resolved;
 }
 
 export function fallbackOriginalModel(state: ModelFallbackState): string {
   return state.turnOriginalModel ?? state.notice.originalModel;
 }
 
+function fallbackStateOf(state: ModelFallbackState | undefined,
+  notice: Extract<NormalizedEvent, { kind: "model_refusal_fallback" }>): ModelFallbackState | undefined {
+  return state !== undefined && fallbackNoticeKey(state.notice) === fallbackNoticeKey(notice) ? state : undefined;
+}
+
+function fallbackNoticeKey(notice: Pick<NormalizedEvent, "conversationId" | "generation" | "seq">): string {
+  return `${notice.conversationId}|${notice.generation}|${notice.seq}`;
+}
+
 export function fallbackNoticeOriginal(state: ModelFallbackState | undefined,
   notice: Extract<NormalizedEvent, { kind: "model_refusal_fallback" }>): string {
-  return state !== undefined && state.notice.conversationId === notice.conversationId &&
-    state.notice.generation === notice.generation && state.notice.seq === notice.seq
-    ? fallbackOriginalModel(state) : notice.originalModel;
+  const own = fallbackStateOf(state, notice);
+  return notice.turnOriginalModel ?? (own !== undefined ? fallbackOriginalModel(own) : notice.originalModel);
+}
+
+function coalescedTurnOriginal(state: ModelFallbackState | undefined, notice: ModelRefusalFallback): string | undefined {
+  return fallbackCoalesces(state, notice) ? fallbackOriginalModel(state!) : undefined;
+}
+
+export function stampFallbackTurnOriginal(state: ModelFallbackState | undefined, event: NormalizedEvent): NormalizedEvent {
+  if (event.kind !== "model_refusal_fallback" || event.scope !== "session") return event;
+  const turnOriginalModel = coalescedTurnOriginal(state, event);
+  return turnOriginalModel === undefined ? event : { ...event, turnOriginalModel };
 }
 
 export function foldModelFallback(state: ModelFallbackState | undefined, event: NormalizedEvent,
   models: readonly ModelInfo[] = []): ModelFallbackState | undefined {
   if (event.kind === "model_refusal_fallback" && event.scope === "session") {
-    const coalesced = state !== undefined && state.resolvedAt === undefined && state.notice.turnId === event.turnId;
+    const turnOriginalModel = event.turnOriginalModel ?? coalescedTurnOriginal(state, event);
+    const turnKey = fallbackTurnKey(event);
+    const earlier = Object.fromEntries(Object.entries(state?.turnOutcomes ?? {})
+      .map(([key, outcome]) => [key, key !== turnKey && outcome === "pending" ? "unknown" : outcome]));
+    const outcome: FallbackNoticeOutcome = event.autoRevert === "pending" ? "pending" : event.autoRevert === "off" ? "failed" : "unknown";
     return { notice: event, appliedModel: event.fallbackModel, ...(event.autoRevert ? { autoRevert: event.autoRevert } : {}),
-      ...(coalesced ? { turnOriginalModel: fallbackOriginalModel(state) } : {}) };
+      ...(turnOriginalModel !== undefined ? { turnOriginalModel } : {}), turnOutcomes: { ...earlier, [turnKey]: outcome } };
   }
   if (event.kind === "model_fallback_revert") {
-    if (!state || state.notice.turnId !== event.turnId) return state;
-    if (event.outcome === "failed") return { ...state, autoRevert: event.outcome };
+    if (!state || fallbackTurnKey(state.notice) !== fallbackRowKey(event)) return state;
+    if (event.outcome === "failed") return withTurnOutcome({ ...state, autoRevert: event.outcome }, "failed");
     const resolved = resolveFallbackByChoice(state, event.outcome === "chosen" ? undefined : event.originalModel, event.timestamp)!;
     return { ...resolved, autoRevert: event.outcome };
   }
@@ -171,8 +227,14 @@ export function foldModelFallback(state: ModelFallbackState | undefined, event: 
   return state;
 }
 
-export function fallbackChipWarning(state: ModelFallbackState | undefined): boolean {
-  return state !== undefined && state.resolvedAt === undefined;
+export type UnresolvedFallbackState = ModelFallbackState & { resolvedAt?: undefined };
+
+export function fallbackUnresolved(state: ModelFallbackState | undefined): state is UnresolvedFallbackState {
+  return state !== undefined && state.resolvedAt === undefined && fallbackIsLive(state);
+}
+
+export function fallbackTakesOverModel(previous: ModelFallbackState | undefined, next: ModelFallbackState | undefined): boolean {
+  return next !== previous && fallbackUnresolved(next);
 }
 
 export interface ModelFallbackState {
@@ -182,6 +244,7 @@ export interface ModelFallbackState {
   reopenedAt?: number;
   turnOriginalModel?: string;
   autoRevert?: FallbackAutoRevertStart | FallbackRevertOutcome;
+  turnOutcomes?: Record<string, FallbackNoticeOutcome>;
 }
 
 export interface FileEdit {
@@ -206,6 +269,10 @@ export function requiresTimestamp(kind: string): boolean {
 }
 
 export const UNOBSERVED_TIME = 0;
+
+export function isSyntheticModel(model: unknown): boolean {
+  return typeof model === "string" && model.startsWith("<");
+}
 
 export function isObservedTime(at: number | undefined): at is number {
   return typeof at === "number" && Number.isFinite(at) && at > UNOBSERVED_TIME;
@@ -243,7 +310,7 @@ export type NormalizedEventBody =
     | { kind: "assistant_retracted"; turnId: string | null; uuids: string[] }
     | { kind: "local_command_output"; text: string; uuid?: string; priorGeneration?: true }
     | ({ kind: "model_refusal_fallback" } & ModelRefusalFallback)
-    | { kind: "model_fallback_revert"; turnId: string | null; originalModel: string; outcome: FallbackRevertOutcome }
+    | { kind: "model_fallback_revert"; turnId: string | null; fallbackKey?: string; originalModel: string; outcome: FallbackRevertOutcome }
     | {
         kind: "user_message";
         turnId: string | null;
@@ -322,7 +389,7 @@ export type NormalizedEventBody =
         resolvedBy: string;
         answers?: Record<string, string>;
       }
-    | { kind: "permission_denied"; turnId: string | null; toolName: string; reason: string; classifierUnavailable?: boolean }
+    | { kind: "permission_denied"; turnId: string | null; toolName: string; toolUseId?: string; inDelegate?: true; reason: string; classifierUnavailable?: boolean }
     | { kind: "usage_update"; scope: "turn" | "conversation"; turnId: string | null; usage: UsageSnapshot }
     | {
         kind: "assistant_usage";
@@ -676,7 +743,7 @@ export type SettingsPageToHost =
   | { type: "setRestoreTabsOnStartup"; requestId: number; enabled: boolean }
   | { type: "setCliAutoUpdate"; requestId: number; executor: ExecutorId; enabled: boolean }
   | { type: "setEventLimit"; requestId: number; value: number }
-  | { type: "setLearningEnabled"; requestId: number; enabled: boolean }
+  | { type: "setGuardEnabled"; requestId: number; enabled: boolean }
   | { type: "setMemoryBlockProjectType"; requestId: number; enabled: boolean }
   | { type: "setTodoEnabled"; requestId: number; enabled: boolean }
   | { type: "setEditSummaryEnabled"; requestId: number; enabled: boolean }
@@ -708,7 +775,7 @@ export interface SettingsProfileProjection {
 export type HostToSettingsPage =
   | { type: "conductorPreview"; requestId: number; text: string; tokens: number }
   | { type: "recommendedRoster"; revision: string; changes: RecommendedRosterChange[] }
-  | ({ type: "settingsState"; appearance?: AccentSettings; displayName?: string; eventLimit?: number; composerSendKey: ComposerSendKey; apiKeyPolicy: ApiKeyPolicy; restoreTabsOnStartup: boolean; cliAutoUpdate: Record<ExecutorId, boolean>; initialModel?: string; autoContinueAtUsageLimit: boolean; learningEnabled: boolean; memoryBlockProjectType: boolean; todoEnabled: boolean; editSummaryEnabled: boolean; reloadNeeded: boolean; replyTo?: number; writeFailure?: SettingWriteFailure }
+  | ({ type: "settingsState"; appearance?: AccentSettings; displayName?: string; eventLimit?: number; composerSendKey: ComposerSendKey; apiKeyPolicy: ApiKeyPolicy; restoreTabsOnStartup: boolean; cliAutoUpdate: Record<ExecutorId, boolean>; initialModel?: string; autoContinueAtUsageLimit: boolean; guardEnabled: boolean; memoryBlockProjectType: boolean; todoEnabled: boolean; editSummaryEnabled: boolean; reloadNeeded: boolean; replyTo?: number; writeFailure?: SettingWriteFailure }
     & SettingsProfileProjection & Record<FileLinkBooleanSetting, boolean> & { openWithSystemApp: string[] } & { orchestrationEnabled: boolean; orchestrationAgents: OrchestrationSettingRow[]; orchestrationDefaults: OrchestrationSettingRow[]; conductorPolicy: string; conductorPolicyDefault: string; externalTimeoutMinutes: number; externalDetection: Record<ExecutorId, ExternalDetection>; externalModels: ExternalModels });
 
 function isSettingsRequestId(v: unknown): v is number {
@@ -747,7 +814,7 @@ export function isSettingsPageToHost(v: unknown): v is SettingsPageToHost {
     return isSettingsRequestId(m.requestId)
       && (API_KEY_POLICIES as readonly string[]).includes(m.policy as string) && hasOnlyKeys(m, ["type", "requestId", "policy"]);
   }
-  if (t === "setAutoContinueAtUsageLimit" || t === "setRestoreTabsOnStartup" || t === "setLearningEnabled" || t === "setMemoryBlockProjectType" || t === "setTodoEnabled" || t === "setEditSummaryEnabled") {
+  if (t === "setAutoContinueAtUsageLimit" || t === "setRestoreTabsOnStartup" || t === "setGuardEnabled" || t === "setMemoryBlockProjectType" || t === "setTodoEnabled" || t === "setEditSummaryEnabled") {
     return isSettingsRequestId(m.requestId) && typeof m.enabled === "boolean" && hasOnlyKeys(m, ["type", "requestId", "enabled"]);
   }
   if (t === "setCliAutoUpdate") {
@@ -817,7 +884,7 @@ export function isHostToSettingsPage(v: unknown): v is HostToSettingsPage {
       && (API_KEY_POLICIES as readonly string[]).includes(m.apiKeyPolicy as string)
       && typeof m.restoreTabsOnStartup === "boolean" && isCliAutoUpdate(m.cliAutoUpdate)
       && (m.initialModel === undefined || typeof m.initialModel === "string")
-      && typeof m.autoContinueAtUsageLimit === "boolean" && typeof m.learningEnabled === "boolean" && typeof m.memoryBlockProjectType === "boolean" && typeof m.todoEnabled === "boolean"
+      && typeof m.autoContinueAtUsageLimit === "boolean" && typeof m.guardEnabled === "boolean" && typeof m.memoryBlockProjectType === "boolean" && typeof m.todoEnabled === "boolean"
       && typeof m.editSummaryEnabled === "boolean" && typeof m.reloadNeeded === "boolean"
       && typeof m.orchestrationEnabled === "boolean" && typeof m.conductorPolicy === "string"
       && typeof m.conductorPolicyDefault === "string"
@@ -827,7 +894,7 @@ export function isHostToSettingsPage(v: unknown): v is HostToSettingsPage {
       && Array.isArray(m.openWithSystemApp) && m.openWithSystemApp.every((item) => typeof item === "string")
       && (m.replyTo === undefined || isSettingsRequestId(m.replyTo))
       && (m.writeFailure === undefined || m.replyTo !== undefined && isSettingWriteFailure(m.writeFailure))
-      && hasOnlyKeys(m, ["type", "initialModel", "appearance", "displayName", "eventLimit", "composerSendKey", "apiKeyPolicy", "restoreTabsOnStartup", "cliAutoUpdate", "autoContinueAtUsageLimit", "learningEnabled", "memoryBlockProjectType", "todoEnabled", "editSummaryEnabled", "reloadNeeded", ...FILE_LINK_SETTINGS, "orchestrationEnabled", "orchestrationAgents", "orchestrationDefaults", "conductorPolicy", "conductorPolicyDefault", "externalTimeoutMinutes", "externalDetection", "externalModels", "replyTo", "writeFailure", "conductorPreview", "recommendedRosterSame"]);
+      && hasOnlyKeys(m, ["type", "initialModel", "appearance", "displayName", "eventLimit", "composerSendKey", "apiKeyPolicy", "restoreTabsOnStartup", "cliAutoUpdate", "autoContinueAtUsageLimit", "guardEnabled", "memoryBlockProjectType", "todoEnabled", "editSummaryEnabled", "reloadNeeded", ...FILE_LINK_SETTINGS, "orchestrationEnabled", "orchestrationAgents", "orchestrationDefaults", "conductorPolicy", "conductorPolicyDefault", "externalTimeoutMinutes", "externalDetection", "externalModels", "replyTo", "writeFailure", "conductorPreview", "recommendedRosterSame"]);
   }
   t satisfies never;
   return false;
@@ -868,7 +935,6 @@ export type WebviewToHost =
   | { type: "listSessions"; source?: "laisora" | "claude"; cursor?: string; showHidden?: boolean }
   | { type: "renameSession"; sessionId: string; filePath: string; title: string; requestId?: string }
   | { type: "setSessionHidden"; sessionId: string; hidden: boolean }
-  | { type: "analyzeCurrent"; tabId: string }
   | { type: "summarizeSession"; tabId: string }
   | { type: "suggestSessionName"; tabId: string }
   | { type: "openThemePicker" }
@@ -967,7 +1033,6 @@ export type WebviewToHost =
 
 export const TODO_USER_MEMO_MAX = 20_000;
 export { TODO_GROUP_MAX } from "./todo-model";
-const TODO_ID_MAX = 64;
 export const TODO_DETAIL_SECTIONS = ["fields", "note", "docs", "kids", "now", "memo", "info", "hist"] as const;
 export const TODO_DETAIL_SECTIONS_PREVIOUS_DEFAULTS: readonly (readonly TodoDetailSection[])[] = [
   ["note", "now", "memo", "docs", "kids", "fields", "hist"],
@@ -977,7 +1042,7 @@ export const TODO_DETAIL_SECTIONS_PREVIOUS_DEFAULTS: readonly (readonly TodoDeta
 export type TodoDetailSection = typeof TODO_DETAIL_SECTIONS[number];
 export const TODO_LOG_VIEWS = ["claude", "deleted"] as const;
 export type TodoLogView = typeof TODO_LOG_VIEWS[number];
-export const TODO_CHANGE_FIELDS: readonly string[] = ["item", ...TODO_TEXT_FIELDS, "state", "position", "deletedAt", "docs", "docLabel", "groups", "groupBindings", "unboundFolders", "templates", ...WORK_MEMO_SECTIONS.map(section => `workMemo.${section}`)];
+export { TODO_CHANGE_FIELDS } from "./todo-model";
 const TODO_EDIT_ERRORS: readonly TodoEditError[] = [...TODO_OPERATION_ERRORS, "invalid-doc", "link-too-long", "rejected", "disabled", "store"];
 
 export type TodoEdit =
@@ -1101,6 +1166,7 @@ export interface TodoDetailItem {
   readonly briefs: readonly TodoBriefView[];
   readonly totals?: TodoTotalsView;
   readonly source?: TodoSourceView;
+  readonly decisionLog?: readonly TodoDecision[];
 }
 
 export interface TodoSourceView {
@@ -1625,6 +1691,11 @@ export interface TimeBucketsCoverage {
   transcriptReadFailureCount?: number;
   omittedTranscriptCount?: number;
   malformedMetaCount?: number;
+  ancestorUsageReadError?: string;
+}
+
+export function displayedAncestorUsageGap(coverage: { ancestorUsageReadError?: string; ancestorUsageReachesGeneration?: true }): string | undefined {
+  return coverage.ancestorUsageReachesGeneration === true ? coverage.ancestorUsageReadError : undefined;
 }
 
 export function isTimeBucketsCoverage(v: unknown): v is TimeBucketsCoverage {
@@ -1633,6 +1704,7 @@ export function isTimeBucketsCoverage(v: unknown): v is TimeBucketsCoverage {
   return (
     isOptionalString(c.sessionReadError) &&
     isOptionalString(c.subagentReadError) &&
+    isOptionalString(c.ancestorUsageReadError) &&
     (c.transcriptReadFailureCount === undefined || isNumber(c.transcriptReadFailureCount)) &&
     (c.omittedTranscriptCount === undefined || isNumber(c.omittedTranscriptCount)) &&
     (c.malformedMetaCount === undefined || isNumber(c.malformedMetaCount))
@@ -2067,6 +2139,8 @@ function isWorkCoverage(v: unknown): v is WorkCoverage {
     (c.unreadableAgentCount === undefined || isNumber(c.unreadableAgentCount)) &&
     (c.depthLimitedAgentCount === undefined || isNumber(c.depthLimitedAgentCount)) &&
     (c.hierarchyIncomplete === undefined || c.hierarchyIncomplete === true) &&
+    isOptionalString(c.ancestorUsageReadError) &&
+    (c.ancestorUsageReachesGeneration === undefined || c.ancestorUsageReachesGeneration === true) &&
     (c.reducerErrorCount === undefined || isNumber(c.reducerErrorCount)) &&
     (c.hydrationUnconfirmed === undefined || COVERAGE_HYDRATION_UNCONFIRMED.includes(c.hydrationUnconfirmed as string)) &&
     isOptionalString(c.historyReadError) &&
@@ -2833,31 +2907,15 @@ export function isLlmFindingDiagnosticsPayload(v: unknown): v is LlmFindingDiagn
   );
 }
 
-function isAnalysisLearningRANL20(v: unknown): boolean {
-  if (typeof v !== "object" || v === null || Array.isArray(v)) return false;
-  const learning = v as Record<string, unknown>;
-  return (
-    (learning.state === "unobserved" || learning.state === "observed") &&
-    typeof learning.note === "string" &&
-    Array.isArray(learning.lines) &&
-    learning.lines.every(line => typeof line === "string") &&
-    (learning.empty === undefined || learning.empty === true) &&
-    hasOnlyKeys(learning, ["state", "note", "lines", "empty"]) &&
-    (learning.state === "unobserved" ? (learning.note as string).length > 0 && (learning.lines as unknown[]).length === 0 : (learning.lines as unknown[]).length > 0) &&
-    (learning.empty === undefined || (learning.empty === true && learning.state === "observed" && (learning.lines as unknown[]).length === 1))
-  );
-}
-
 function isAnalysisFactsView(v: unknown): boolean {
   if (typeof v !== "object" || v === null || Array.isArray(v)) return false;
   const f = v as Record<string, unknown>;
   const checks: { [K in keyof AnalysisFactsView]-?: () => boolean } = {
     llmTargets: () => isAnalysisLlmTargets(f.llmTargets),
     coverageNote: () => isOptionalString(f.coverageNote),
-    learning: () => f.learning === undefined || isAnalysisLearningRANL20(f.learning),
   };
   return Object.values(checks).every(check => check()) &&
-    (hasOnlyKeys(f, ["llmTargets", "coverageNote", "learning"]));
+    (hasOnlyKeys(f, ["llmTargets", "coverageNote"]));
 }
 
 export function isL3ReportPayload(v: unknown): v is L3ReportPayload {
@@ -3394,8 +3452,7 @@ export type HostToWebview =
   | { type: "sessionRenamed"; sessionId: string; title: string; requestId?: string }
   | { type: "sessionHiddenChanged"; sessionId: string; hidden: boolean }
   | { type: "sessionListActionFailed"; sessionId: string; action: SessionListAction; reason: string; requestId?: string }
-  | { type: "analysis"; sessionId: string; filePath: string; report: unknown }
-  | { type: "analysisFailed"; kind: "script" | "action"; tabId?: string; reason?: string }
+  | { type: "analysisFailed"; kind: "action"; tabId: string; reason: string }
   | { type: "composerPrefill"; tabId: string; text: string }
   | { type: "editorContext"; path: string; startLine: number; endLine: number }
   | { type: "workModel"; tabId: string; model: WorkModelPayload }
@@ -3657,7 +3714,7 @@ export interface ConversationSnapshot {
   sessionSummary?: { text: string; model: string };
   sessionSummaryRunning?: boolean;
   llmDiagnostics?: boolean;
-  headOmitted?: { count: number; hasConvEvent: boolean; backfilledHead: boolean };
+  headOmitted?: { count: number; hasConvEvent: boolean };
   backgroundActivity?: BackgroundActivitySnapshot;
   autoResumeAt?: number | null;
   events: NormalizedEvent[];
@@ -3791,7 +3848,6 @@ export function isWebviewToHost(v: unknown): v is WebviewToHost {
     const title = (v as { title?: unknown }).title;
     return typeof tabId === "string" && typeof title === "string" && title.trim().length > 0 && title.length <= RENAME_TITLE_MAX;
   }
-  if (t === "analyzeCurrent") return typeof tabId === "string";
   if (t === "suggestSessionName") return typeof tabId === "string" &&
     Object.keys(v).every(key => key === "type" || key === "tabId");
   if (t === "summarizeSession") return typeof tabId === "string";
@@ -4354,10 +4410,12 @@ function isPlausibleNormalizedEvent(x: unknown): x is NormalizedEvent {
       (e.category !== null && typeof e.category !== "string") ||
       (e.explanation !== null && typeof e.explanation !== "string") ||
       (e.refusedUserMessageUuid !== null && typeof e.refusedUserMessageUuid !== "string") || typeof e.message !== "string" ||
-      (e.autoRevert !== undefined && !(FALLBACK_AUTO_REVERT_STARTS as readonly unknown[]).includes(e.autoRevert))) return false;
+      (e.autoRevert !== undefined && !(FALLBACK_AUTO_REVERT_STARTS as readonly unknown[]).includes(e.autoRevert)) ||
+      (e.turnOriginalModel !== undefined && typeof e.turnOriginalModel !== "string")) return false;
   }
   if (e.kind === "model_fallback_revert") {
-    if ((e.turnId !== null && typeof e.turnId !== "string") || typeof e.originalModel !== "string" ||
+    if ((e.turnId !== null && typeof e.turnId !== "string") || (e.fallbackKey !== undefined && typeof e.fallbackKey !== "string") ||
+      typeof e.originalModel !== "string" ||
       !(FALLBACK_REVERT_OUTCOMES as readonly unknown[]).includes(e.outcome)) return false;
   }
   if (e.kind === "user_message") {
@@ -4400,12 +4458,10 @@ function isToolUseIdRef(value: unknown): value is string {
 function isTodoGroupColor(value: unknown): value is TodoGroupColor {
   if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
   const group = value as Record<string, unknown>;
-  return hasOnlyKeys(group, ["name", "color", "folders", "aliases"]) && typeof group.name === "string" && group.name.length > 0
-    && (group.aliases === undefined || (Array.isArray(group.aliases) && group.aliases.every(alias => typeof alias === "object" && alias !== null
-      && hasOnlyKeys(alias as Record<string, unknown>, ["words", "parentId"]) && isTodoGroup((alias as { words?: unknown }).words)
-      && ((alias as { parentId?: unknown }).parentId === undefined || isTodoId((alias as { parentId?: unknown }).parentId)))))
+  return hasOnlyKeys(group, ["name", "color", "folders", "aliases"]) && isTodoGroupName(group.name)
+    && (group.aliases === undefined || (Array.isArray(group.aliases) && group.aliases.every(alias => isTodoGroupAlias(alias) && hasOnlyKeys(alias as unknown as Record<string, unknown>, ["words", "parentId"]))))
     && typeof group.color === "number" && Number.isSafeInteger(group.color) && group.color >= 1 && group.color <= TODO_GROUP_COLOR_COUNT
-    && (group.folders === undefined || (Array.isArray(group.folders) && group.folders.every(path => typeof path === "string" && path.length > 0 && path.length <= TODO_DOC_TARGET_MAX)));
+    && (group.folders === undefined || (Array.isArray(group.folders) && group.folders.every(isTodoFolderPath)));
 }
 
 function isRevisionGroups(value: unknown): value is number[][] {
@@ -4430,41 +4486,34 @@ function isTodoBatchRevert(value: unknown): value is TodoBatchRevert {
 function isTodoChangePlace(value: unknown): value is TodoChangePlace {
   if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
   const place = value as Record<string, unknown>;
-  return hasOnlyKeys(place, ["group", "path"]) && (place.group === null || (typeof place.group === "string" && place.group.length > 0))
+  return hasOnlyKeys(place, ["group", "path"]) && (place.group === null || isTodoGroupName(place.group))
     && Array.isArray(place.path) && place.path.length <= TODO_CHANGES_REQUEST_MAX && place.path.every(step => typeof step === "object" && step !== null
       && hasOnlyKeys(step as Record<string, unknown>, ["id", "title"]) && isTodoId((step as { id?: unknown }).id) && typeof (step as { title?: unknown }).title === "string");
-}
-
-function isTodoCaptured(value: unknown): value is TodoCaptured {
-  if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
-  const captured = value as Record<string, unknown>;
-  return hasOnlyKeys(captured, ["text", "at", "via"]) && typeof captured.text === "string" && isTime(captured.at) && (TODO_CAPTURE_VIA as readonly unknown[]).includes(captured.via);
 }
 
 function isTodoListItem(value: unknown): value is TodoListItem {
   if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
   const item = value as Record<string, unknown>;
   return hasOnlyKeys(item, ["id", "parentId", "title", "state", "completion", "group", "due", "start", "priority", "waiting", "by", "guess", "marks", "markInfo", "captured", "talk"])
-    && typeof item.id === "string" && item.id.length > 0
+    && TODO_LIST_ITEM_FIELDS.every(field => todoItemFieldValid(item, field))
     && (item.talk === undefined || (TODO_TALKS as readonly unknown[]).includes(item.talk))
-    && (item.parentId === null || (typeof item.parentId === "string" && item.parentId.length > 0))
-    && typeof item.title === "string"
-    && (TODO_STATES as readonly unknown[]).includes(item.state)
-    && (item.completion === undefined || item.completion === "auto" || item.completion === "manual")
-    && (item.group === undefined || (typeof item.group === "string" && item.group.length > 0))
-    && (item.due === undefined || (typeof item.due === "string" && TODO_DUE_PATTERN.test(item.due)))
-    && (item.start === undefined || isTodoDate(item.start))
-    && (item.priority === undefined || (TODO_PRIORITIES as readonly unknown[]).includes(item.priority))
-    && (item.waiting === undefined || typeof item.waiting === "string")
-    && (item.by === undefined || item.by === "claude")
     && (item.guess === undefined || isTodoGuessView(item.guess))
     && (item.marks === undefined || (Array.isArray(item.marks) && item.marks.length <= TODO_ACKNOWLEDGE_MAX && item.marks.every(isTodoId)))
     && (item.markInfo === undefined || (Array.isArray(item.markInfo) && item.markInfo.length <= TODO_ACKNOWLEDGE_MAX
       && item.markInfo.every(info => typeof info === "object" && info !== null && hasOnlyKeys(info as Record<string, unknown>, ["id", "ids", "at", "parts"])
-        && isTodoId((info as { id?: unknown }).id) && isTime((info as { at?: unknown }).at)
+        && isTodoId((info as { id?: unknown }).id) && isTodoTime((info as { at?: unknown }).at)
         && Array.isArray((info as { ids?: unknown }).ids) && (info as { ids: unknown[] }).ids.length > 0 && (info as { ids: unknown[] }).ids.length <= TODO_CHANGES_REQUEST_MAX && (info as { ids: unknown[] }).ids.every(isTodoId)
         && Array.isArray((info as { parts?: unknown }).parts) && (info as { parts: unknown[] }).parts.length <= TODO_CHANGES_REQUEST_MAX && (info as { parts: unknown[] }).parts.every(isTodoMarkPart))))
-    && (item.captured === undefined || isTodoCaptured(item.captured));
+    && (item.captured === undefined || hasOnlyKeys(item.captured as Record<string, unknown>, ["text", "at", "via"]));
+}
+
+const TODO_LIST_ITEM_FIELDS = ["id", "parentId", "title", "state", "completion", "group", "due", "start", "priority", "waiting", "by", "captured"] as const;
+const TODO_DETAIL_ITEM_FIELDS = [...TODO_LIST_ITEM_FIELDS, "userMemo", "repeat", "estimate", "tags", "startedAt", "doneAt", "decisionLog"] as const;
+const TODO_DELETED_ITEM_FIELDS = ["id", "title", "group", "deletedAt"] as const;
+const TODO_EDIT_ITEM_FIELDS = ["due", "start", "priority", "state", "waiting", "tags", "repeat", "estimate"] as const;
+
+function isTodoEditFields(edit: Record<string, unknown>, clearable: boolean): boolean {
+  return TODO_EDIT_ITEM_FIELDS.every(field => edit[field] === undefined || (clearable && field !== "state" && edit[field] === null) || TODO_ITEM_SHAPES[field](edit[field], edit));
 }
 
 function isTodoMarkPart(value: unknown): boolean {
@@ -4477,7 +4526,7 @@ function isTodoMarkPart(value: unknown): boolean {
 function isTodoGuessView(value: unknown): boolean {
   if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
   const guess = value as Record<string, unknown>;
-  return hasOnlyKeys(guess, ["due", "priority"]) && (guess.due === undefined || typeof guess.due === "string") && (guess.priority === undefined || typeof guess.priority === "string");
+  return hasOnlyKeys(guess, ["due", "priority"]) && (guess.due === undefined || isTodoGuessReason(guess.due)) && (guess.priority === undefined || isTodoGuessReason(guess.priority));
 }
 
 function isTodoTemplateView(value: unknown): boolean {
@@ -4488,24 +4537,20 @@ function isTodoTemplateView(value: unknown): boolean {
 
 const isOptionalText = (value: unknown, max: number) => value === undefined || value === null || (typeof value === "string" && value.length <= max);
 
-const isTodoId = (value: unknown): value is string => typeof value === "string" && value.length > 0 && value.length <= TODO_ID_MAX;
-
 function isTodoTabItem(value: unknown): value is TodoTabItem {
   if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
   const entry = value as Record<string, unknown>;
   return hasOnlyKeys(entry, ["tabId", "itemId", "start", "decisions", "splits"]) && typeof entry.tabId === "string" && entry.tabId.length > 0 && entry.tabId.length <= TAB_ID_MAX && isTodoId(entry.itemId)
-    && (entry.start === undefined || isTodoStartView(entry.start)) && isOptionalText(entry.decisions, TODO_MEMO_TEXT_MAX)
+    && (entry.start === undefined || isTodoStartView(entry.start)) && (entry.decisions === undefined || isTodoMemoText(entry.decisions))
     && (entry.splits === undefined || (Array.isArray(entry.splits) && entry.splits.every(split => typeof split === "object" && split !== null
-      && hasOnlyKeys(split as Record<string, unknown>, ["itemId", "at"]) && isTodoId((split as Record<string, unknown>).itemId) && isTime((split as Record<string, unknown>).at))));
+      && hasOnlyKeys(split as Record<string, unknown>, ["itemId", "at"]) && isTodoId((split as Record<string, unknown>).itemId) && isTodoTime((split as Record<string, unknown>).at))));
 }
-
-const TODO_MEMO_TEXT_MAX = 100_000;
 
 function isTodoStartView(value: unknown): value is TodoStartView {
   if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
   const start = value as Record<string, unknown>;
-  return hasOnlyKeys(start, ["at", "kind", "brief", "current", "next", "stale"]) && isTime(start.at) && (TODO_START_KINDS as readonly unknown[]).includes(start.kind)
-    && typeof start.brief === "string" && start.brief.length <= TODO_BRIEF_MAX && isOptionalText(start.current, TODO_MEMO_TEXT_MAX) && isOptionalText(start.next, TODO_MEMO_TEXT_MAX)
+  return hasOnlyKeys(start, ["at", "kind", "brief", "current", "next", "stale"]) && isTodoTime(start.at) && (TODO_START_KINDS as readonly unknown[]).includes(start.kind)
+    && isTodoBriefText(start.brief) && (start.current === undefined || isTodoMemoText(start.current)) && (start.next === undefined || isTodoMemoText(start.next))
     && (start.stale === undefined || start.stale === true);
 }
 
@@ -4515,8 +4560,6 @@ function isTodoSessionLinkView(value: unknown): value is TodoSessionLinkView {
   if (!isTodoSessionId(link.sessionId)) return false;
   return "deleted" in link ? hasOnlyKeys(link, ["sessionId", "deleted"]) && typeof link.deleted === "string" : hasOnlyKeys(link, ["sessionId", "itemId"]) && isTodoId(link.itemId);
 }
-
-const isTodoSessionId = (value: unknown): value is string => typeof value === "string" && /^[0-9A-Za-z_-]{1,100}$/.test(value);
 
 function isTodoAskSourceRef(value: unknown): value is TodoAskSourceRef {
   if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
@@ -4531,24 +4574,17 @@ function isTodoAskSourceMessage(value: unknown): value is TodoAskSourceMessage {
   const m = value as Record<string, unknown>;
   return hasOnlyKeys(m, ["uuid", "role", "text", "timestamp"]) && (m.role === "user" || m.role === "assistant") && isConversationHistoryMessage(m);
 }
-const isTodoDate = (value: unknown) => typeof value === "string" && TODO_DUE_PATTERN.test(value);
 const isRevision = (value: unknown) => typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
-const isTime = (value: unknown) => typeof value === "number" && Number.isFinite(value) && value >= 0;
-const isTodoGroup = (value: unknown) => typeof value === "string" && value.trim().length > 0 && value.length <= TODO_GROUP_MAX;
 const isTodoTitle = (value: unknown) => typeof value === "string" && value.trim().length > 0 && value.length <= TODO_TITLE_MAX;
 const isTodoSectionOrder = (value: unknown) => Array.isArray(value) && value.length === TODO_DETAIL_SECTIONS.length
   && TODO_DETAIL_SECTIONS.every(section => value.includes(section));
 
-const isTodoDocLabel = (value: unknown) => typeof value === "string" && value.length <= TODO_DOC_LABEL_MAX;
 const isTodoImageMediaType = (value: unknown): value is TodoImageMediaType => typeof value === "string" && value in TODO_IMAGE_EXTENSIONS;
-const isTodoImageName = (value: unknown): value is string => typeof value === "string" && TODO_IMAGE_FILE.test(value);
 
 function isTodoDocView(value: unknown): value is TodoDocView {
   if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
   const doc = value as Record<string, unknown>;
-  return hasOnlyKeys(doc, ["id", "kind", "target", "label", "at"]) && isTodoId(doc.id) && (TODO_DOC_KINDS as readonly unknown[]).includes(doc.kind)
-    && typeof doc.target === "string" && doc.target.length > 0 && doc.target.length <= TODO_DOC_TARGET_MAX
-    && (doc.kind !== "image" || isTodoImageName(doc.target)) && (doc.label === undefined || isTodoDocLabel(doc.label)) && isTime(doc.at);
+  return hasOnlyKeys(doc, ["id", "kind", "target", "label", "at"]) && isTodoDocFields(doc);
 }
 
 function isTodoEdit(value: unknown): value is TodoEdit {
@@ -4557,33 +4593,21 @@ function isTodoEdit(value: unknown): value is TodoEdit {
   switch (edit.kind) {
     case "add":
       return hasOnlyKeys(edit, ["kind", "parentId", "title", "group", "due", "start", "priority", "state", "userMemo", "position", "templateId", "waiting", "repeat", "estimate", "tags"])
-        && isOptionalText(edit.waiting, TODO_WAITING_MAX) && isOptionalText(edit.tags, TODO_TAGS_MAX) && edit.waiting !== null && edit.tags !== null
-        && (edit.repeat === undefined || (typeof edit.repeat === "string" && TODO_REPEAT_PATTERN.test(edit.repeat)))
-        && (edit.estimate === undefined || (typeof edit.estimate === "string" && TODO_ESTIMATE_PATTERN.test(edit.estimate)))
+        && isTodoEditFields(edit, false)
         && (edit.parentId === null || isTodoId(edit.parentId)) && isTodoTitle(edit.title)
         && (edit.templateId === undefined || isTodoId(edit.templateId))
-        && (edit.group === undefined || isTodoGroup(edit.group))
-        && (edit.due === undefined || isTodoDate(edit.due))
-        && (edit.start === undefined || isTodoDate(edit.start))
-        && (edit.priority === undefined || (TODO_PRIORITIES as readonly unknown[]).includes(edit.priority))
-        && (edit.state === undefined || (TODO_STATES as readonly unknown[]).includes(edit.state))
+        && (edit.group === undefined || isTodoGroupName(edit.group))
         && (edit.userMemo === undefined || (typeof edit.userMemo === "string" && edit.userMemo.length <= TODO_USER_MEMO_MAX))
         && (edit.position === undefined || isRevision(edit.position));
     case "update":
       return hasOnlyKeys(edit, ["kind", "id", "title", "group", "due", "start", "priority", "userMemo", "state", "waiting", "repeat", "estimate", "tags"]) && isTodoId(edit.id)
         && Object.keys(edit).length > 2
-        && isOptionalText(edit.waiting, TODO_WAITING_MAX) && isOptionalText(edit.tags, TODO_TAGS_MAX)
-        && (edit.repeat === undefined || edit.repeat === null || (typeof edit.repeat === "string" && TODO_REPEAT_PATTERN.test(edit.repeat)))
-        && (edit.estimate === undefined || edit.estimate === null || (typeof edit.estimate === "string" && TODO_ESTIMATE_PATTERN.test(edit.estimate)))
-        && (edit.state === undefined || (TODO_STATES as readonly unknown[]).includes(edit.state))
+        && isTodoEditFields(edit, true)
         && (edit.title === undefined || isTodoTitle(edit.title))
-        && (edit.group === undefined || edit.group === null || isTodoGroup(edit.group))
-        && (edit.due === undefined || edit.due === null || isTodoDate(edit.due))
-        && (edit.start === undefined || edit.start === null || isTodoDate(edit.start))
-        && (edit.priority === undefined || edit.priority === null || (TODO_PRIORITIES as readonly unknown[]).includes(edit.priority))
+        && (edit.group === undefined || edit.group === null || isTodoGroupName(edit.group))
         && (edit.userMemo === undefined || (typeof edit.userMemo === "string" && edit.userMemo.length <= TODO_USER_MEMO_MAX));
     case "setState":
-      return hasOnlyKeys(edit, ["kind", "id", "state"]) && isTodoId(edit.id) && (TODO_STATES as readonly unknown[]).includes(edit.state);
+      return hasOnlyKeys(edit, ["kind", "id", "state"]) && isTodoId(edit.id) && TODO_ITEM_SHAPES.state(edit.state);
     case "move":
       return hasOnlyKeys(edit, ["kind", "id", "parentId", "position", "before"]) && isTodoId(edit.id) && (edit.parentId === null || isTodoId(edit.parentId))
         && (edit.position === undefined || isRevision(edit.position)) && (edit.before === undefined || edit.before === null || isTodoId(edit.before))
@@ -4604,7 +4628,7 @@ function isTodoEdit(value: unknown): value is TodoEdit {
           && edit.revisions.every(revision => isRevision(revision) && (revision as number) > 0) && new Set(edit.revisions).size === edit.revisions.length);
     case "addLink":
       return hasOnlyKeys(edit, ["kind", "id", "target", "label"]) && isTodoId(edit.id)
-        && typeof edit.target === "string" && edit.target.trim().length > 0 && edit.target.length <= TODO_DOC_TARGET_MAX && !edit.target.includes("\0")
+        && isTodoFolderPath(edit.target) && edit.target.trim().length > 0 && !edit.target.includes("\0")
         && (edit.label === undefined || isTodoDocLabel(edit.label));
     case "addImage":
       return hasOnlyKeys(edit, ["kind", "id", "mediaType", "data", "label"]) && isTodoId(edit.id) && isTodoImageMediaType(edit.mediaType)
@@ -4614,19 +4638,19 @@ function isTodoEdit(value: unknown): value is TodoEdit {
       return hasOnlyKeys(edit, ["kind", "id", "docId"]) && isTodoId(edit.id) && isTodoId(edit.docId);
     case "groupCreate":
     case "groupDelete":
-      return hasOnlyKeys(edit, ["kind", "name"]) && isTodoGroup(edit.name);
+      return hasOnlyKeys(edit, ["kind", "name"]) && isTodoGroupName(edit.name);
     case "groupRename":
-      return hasOnlyKeys(edit, ["kind", "name", "to"]) && isTodoGroup(edit.name) && isTodoGroup(edit.to);
+      return hasOnlyKeys(edit, ["kind", "name", "to"]) && isTodoGroupName(edit.name) && isTodoGroupName(edit.to);
     case "groupColor":
-      return hasOnlyKeys(edit, ["kind", "name", "color"]) && isTodoGroup(edit.name)
+      return hasOnlyKeys(edit, ["kind", "name", "color"]) && isTodoGroupName(edit.name)
         && typeof edit.color === "number" && Number.isSafeInteger(edit.color) && edit.color >= 1 && edit.color <= TODO_GROUP_COLOR_COUNT;
     case "groupMove":
-      return hasOnlyKeys(edit, ["kind", "name", "direction"]) && isTodoGroup(edit.name) && (edit.direction === 1 || edit.direction === -1);
+      return hasOnlyKeys(edit, ["kind", "name", "direction"]) && isTodoGroupName(edit.name) && (edit.direction === 1 || edit.direction === -1);
     case "groupFolderRemove":
     case "groupFolderAdd":
-      return hasOnlyKeys(edit, ["kind", "name", "path"]) && isTodoGroup(edit.name) && typeof edit.path === "string" && edit.path.length > 0 && edit.path.length <= TODO_DOC_TARGET_MAX;
+      return hasOnlyKeys(edit, ["kind", "name", "path"]) && isTodoGroupName(edit.name) && isTodoFolderPath(edit.path);
     case "groupAliasRemove":
-      return hasOnlyKeys(edit, ["kind", "name", "words"]) && isTodoGroup(edit.name) && isTodoGroup(edit.words);
+      return hasOnlyKeys(edit, ["kind", "name", "words"]) && isTodoGroupName(edit.name) && isTodoGroupName(edit.words);
     case "templateSave":
       return hasOnlyKeys(edit, ["kind", "id", "name"]) && isTodoId(edit.id)
         && typeof edit.name === "string" && edit.name.trim().length > 0 && edit.name.length <= TODO_TEMPLATE_NAME_MAX;
@@ -4644,20 +4668,13 @@ function isTodoChangeView(value: unknown): value is TodoChangeView {
   const change = value as Record<string, unknown>;
   return hasOnlyKeys(change, ["id", "at", "author", "itemId", "itemTitle", "field", "before", "after", "cascade", "revert", "acknowledged", "basis", "from", "to"])
     && (change.from === undefined || isTodoChangePlace(change.from)) && (change.to === undefined || isTodoChangePlace(change.to))
-    && (change.basis === undefined || (TODO_PLACEMENT_BASES as readonly unknown[]).includes(change.basis))
-    && isTodoId(change.id) && isTime(change.at) && (change.author === "human" || change.author === "claude")
-    && (change.itemId === "" || isTodoId(change.itemId)) && typeof change.itemTitle === "string"
-    && (change.acknowledged === undefined || change.acknowledged === true)
-    && typeof change.field === "string" && TODO_CHANGE_FIELDS.includes(change.field)
+    && isTodoChangeRecord(change) && typeof change.itemTitle === "string"
     && (change.before === null || typeof change.before === "string") && (change.after === null || typeof change.after === "string")
-    && (change.cascade === undefined || change.cascade === true)
     && (change.revert === undefined || change.revert === "ok" || (TODO_REVERT_BLOCKS as readonly unknown[]).includes(change.revert));
 }
 
-function isTodoMemoEntry(section: string, entry: unknown): boolean {
-  if (!(WORK_MEMO_SECTIONS as readonly string[]).includes(section) || typeof entry !== "object" || entry === null || Array.isArray(entry)) return false;
-  const memo = entry as Record<string, unknown>;
-  return hasOnlyKeys(memo, ["text", "at"]) && typeof memo.text === "string" && isTime(memo.at);
+function isTodoMemoEntryView(section: string, entry: unknown): boolean {
+  return (WORK_MEMO_SECTIONS as readonly string[]).includes(section) && isTodoMemoEntry(entry) && hasOnlyKeys(entry as Record<string, unknown>, ["text", "at"]);
 }
 
 function isTodoDetailItem(value: unknown): value is TodoDetailItem {
@@ -4665,30 +4682,21 @@ function isTodoDetailItem(value: unknown): value is TodoDetailItem {
   const item = value as Record<string, unknown>;
   const memo = item.workMemo;
   return hasOnlyKeys(item, ["id", "parentId", "title", "state", "completion", "group", "due", "start", "priority", "userMemo", "workMemo", "docs", "createdAt", "updatedAt", "changes", "memoStaleSince",
-    "waiting", "repeat", "estimate", "tags", "by", "guesses", "startedAt", "doneAt", "conversations", "briefs", "totals", "source"])
+    "waiting", "repeat", "estimate", "tags", "by", "guesses", "startedAt", "doneAt", "conversations", "briefs", "totals", "source", "decisionLog"])
     && (item.source === undefined || (typeof item.source === "object" && item.source !== null && hasOnlyKeys(item.source as Record<string, unknown>, ["sessionId", "title"])
       && isTodoSessionId((item.source as Record<string, unknown>).sessionId) && isOptionalText((item.source as Record<string, unknown>).title, RENAME_TITLE_MAX)))
     && Array.isArray(item.docs) && item.docs.every(isTodoDocView)
-    && isOptionalText(item.waiting, TODO_WAITING_MAX) && isOptionalText(item.tags, TODO_TAGS_MAX)
-    && (item.repeat === undefined || (typeof item.repeat === "string" && TODO_REPEAT_PATTERN.test(item.repeat)))
-    && (item.estimate === undefined || (typeof item.estimate === "string" && TODO_ESTIMATE_PATTERN.test(item.estimate)))
-    && (item.by === undefined || item.by === "claude")
-    && (item.guesses === undefined || (isTodoGuessView(item.guesses) && Object.values(item.guesses as object).every(reason => typeof reason === "string" && reason.length <= TODO_GUESS_REASON_MAX)))
-    && (item.startedAt === undefined || isTime(item.startedAt)) && (item.doneAt === undefined || isTime(item.doneAt))
+    && TODO_DETAIL_ITEM_FIELDS.every(field => todoItemFieldValid(item, field))
+    && (item.guesses === undefined || isTodoGuessView(item.guesses))
     && Array.isArray(item.conversations) && item.conversations.every(entry => typeof entry === "object" && entry !== null
-      && hasOnlyKeys(entry as Record<string, unknown>, ["at", "handoffs"]) && isTime((entry as Record<string, unknown>).at) && isRevision((entry as Record<string, unknown>).handoffs))
+      && hasOnlyKeys(entry as Record<string, unknown>, ["at", "handoffs"]) && isTodoTime((entry as Record<string, unknown>).at) && isRevision((entry as Record<string, unknown>).handoffs))
     && Array.isArray(item.briefs) && item.briefs.every(entry => typeof entry === "object" && entry !== null
-      && hasOnlyKeys(entry as Record<string, unknown>, ["at", "text"]) && isTime((entry as Record<string, unknown>).at) && isOptionalText((entry as Record<string, unknown>).text, TODO_BRIEF_MAX))
+      && hasOnlyKeys(entry as Record<string, unknown>, ["at", "text"]) && isTodoTime((entry as Record<string, unknown>).at) && isTodoBriefText((entry as Record<string, unknown>).text))
     && (item.totals === undefined || isTodoTotalsView(item.totals))
-    && (item.memoStaleSince === undefined || isTime(item.memoStaleSince))
-    && isTodoListItem({ id: item.id, parentId: item.parentId, title: item.title, state: item.state, group: item.group, due: item.due })
-    && (item.completion === undefined || item.completion === "auto" || item.completion === "manual")
-    && (item.start === undefined || isTodoDate(item.start))
-    && (item.priority === undefined || (TODO_PRIORITIES as readonly unknown[]).includes(item.priority))
-    && typeof item.userMemo === "string"
+    && (item.memoStaleSince === undefined || isTodoTime(item.memoStaleSince))
     && typeof memo === "object" && memo !== null && !Array.isArray(memo)
-    && Object.entries(memo).every(([section, entry]) => isTodoMemoEntry(section, entry))
-    && isTime(item.createdAt) && isTime(item.updatedAt)
+    && Object.entries(memo).every(([section, entry]) => isTodoMemoEntryView(section, entry))
+    && isTodoTime(item.createdAt) && isTodoTime(item.updatedAt)
     && Array.isArray(item.changes) && item.changes.every(isTodoChangeView);
 }
 
@@ -4702,15 +4710,14 @@ function isTodoTotalsView(value: unknown): boolean {
   if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
   const totals = value as Record<string, unknown>;
   return hasOnlyKeys(totals, ["kids", "done", "firstStartedAt", "lastDoneAt"]) && isRevision(totals.kids) && isRevision(totals.done)
-    && (totals.firstStartedAt === undefined || isTime(totals.firstStartedAt)) && (totals.lastDoneAt === undefined || isTime(totals.lastDoneAt));
+    && (totals.firstStartedAt === undefined || isTodoTime(totals.firstStartedAt)) && (totals.lastDoneAt === undefined || isTodoTime(totals.lastDoneAt));
 }
 
 function isTodoDeletedView(value: unknown): value is TodoDeletedView {
   if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
   const item = value as Record<string, unknown>;
-  return hasOnlyKeys(item, ["id", "title", "group", "deletedAt", "expiresAt", "descendants"]) && isTodoId(item.id) && typeof item.title === "string"
-    && (item.group === undefined || (typeof item.group === "string" && item.group.length > 0))
-    && isTime(item.deletedAt) && isTime(item.expiresAt) && isRevision(item.descendants);
+  return hasOnlyKeys(item, ["id", "title", "group", "deletedAt", "expiresAt", "descendants"]) && TODO_DELETED_ITEM_FIELDS.every(field => todoItemFieldValid(item, field))
+    && item.deletedAt !== undefined && isTodoTime(item.expiresAt) && isRevision(item.descendants);
 }
 
 function isResumePreviewMessage(value: unknown): value is ResumePreviewMessage {
@@ -4784,13 +4791,12 @@ function isResumeHydrationStateMessage(value: Record<string, unknown>): boolean 
 
 function isHeadOmitted(v: unknown): boolean {
   if (typeof v !== "object" || v === null) return false;
-  const h = v as { count?: unknown; hasConvEvent?: unknown; backfilledHead?: unknown };
+  const h = v as { count?: unknown; hasConvEvent?: unknown };
   return (
     typeof h.count === "number" &&
     Number.isInteger(h.count) &&
     h.count > 0 &&
-    typeof h.hasConvEvent === "boolean" &&
-    typeof h.backfilledHead === "boolean"
+    typeof h.hasConvEvent === "boolean"
   );
 }
 
@@ -5191,20 +5197,13 @@ export function isHostToWebview(v: unknown): v is HostToWebview {
   if (t === "composerPrefill") {
     return typeof tabId === "string" && typeof (v as { text?: unknown }).text === "string" && (v as { text: string }).text.length <= 20_000;
   }
-  if (t === "analysis") {
-    return (
-      typeof (v as { sessionId?: unknown }).sessionId === "string" &&
-      typeof (v as { filePath?: unknown }).filePath === "string"
-    );
-  }
   if (t === "analysisFailed") {
     const m = v as Record<string, unknown>;
     const allowed = new Set(["type", "kind", "tabId", "reason"]);
     if (!Object.keys(m).every((key) => allowed.has(key))) return false;
-    if (m.kind !== "script" && m.kind !== "action") return false;
-    if (tabId !== undefined && (typeof tabId !== "string" || tabId.length === 0 || tabId.length > TAB_ID_MAX)) return false;
-    if (m.reason !== undefined && (typeof m.reason !== "string" || m.reason.length === 0)) return false;
-    return m.kind === "script" || (typeof tabId === "string" && typeof m.reason === "string");
+    if (m.kind !== "action") return false;
+    if (typeof tabId !== "string" || tabId.length === 0 || tabId.length > TAB_ID_MAX) return false;
+    return typeof m.reason === "string" && m.reason.length > 0;
   }
   if (t === "editorContext") {
     return (
@@ -5238,7 +5237,7 @@ export function isHostToWebview(v: unknown): v is HostToWebview {
     if (m.enabled !== true) return false;
     if (m.unreadable !== undefined) return m.unreadable === true && hasOnlyKeys(m, ["type", "seq", "enabled", "unreadable"]);
     return hasOnlyKeys(m, ["type", "seq", "enabled", "revision", "items", "groups", "templates", "tabItems", "askSources", "askDismissals", "askClosedInTodo", "deletedTabs", "sessions", "claudeRecent"])
-      && Array.isArray(m.claudeRecent) && m.claudeRecent.length <= TODO_ACKNOWLEDGE_MAX && m.claudeRecent.every(isTime)
+      && Array.isArray(m.claudeRecent) && m.claudeRecent.length <= TODO_ACKNOWLEDGE_MAX && m.claudeRecent.every(isTodoTime)
       && Array.isArray(m.deletedTabs) && m.deletedTabs.every(id => typeof id === "string" && id.length > 0)
       && Array.isArray(m.sessions) && m.sessions.every(isTodoSessionLinkView)
       && typeof m.revision === "number" && Number.isSafeInteger(m.revision) && m.revision >= 0
@@ -5263,7 +5262,7 @@ export function isHostToWebview(v: unknown): v is HostToWebview {
     if (!isTodoSessionId(m.sessionId) || !isRevision(m.requestId)) return false;
     if (m.key === null) return hasOnlyKeys(m, ["type", "sessionId", "requestId", "key"]);
     return hasOnlyKeys(m, ["type", "sessionId", "requestId", "key", "endedAt", "messages"]) && typeof m.key === "string" && m.key.length > 0 && m.key.length <= 100
-      && isTime(m.endedAt) && Array.isArray(m.messages) && m.messages.length <= TODO_ASK_SOURCE_MESSAGES_MAX && m.messages.every(isTodoAskSourceMessage);
+      && isTodoTime(m.endedAt) && Array.isArray(m.messages) && m.messages.length <= TODO_ASK_SOURCE_MESSAGES_MAX && m.messages.every(isTodoAskSourceMessage);
   }
   if (t === "todoEditResult") {
     const m = v as Record<string, unknown>;
@@ -6082,6 +6081,8 @@ function isModelFallbackState(value: unknown): boolean {
     (row.resolvedAt === undefined || isNumber(row.resolvedAt)) &&
     (row.reopenedAt === undefined || isNumber(row.reopenedAt)) &&
     (row.turnOriginalModel === undefined || typeof row.turnOriginalModel === "string") &&
+    (row.turnOutcomes === undefined || (typeof row.turnOutcomes === "object" && row.turnOutcomes !== null && !Array.isArray(row.turnOutcomes) &&
+      Object.values(row.turnOutcomes).every(outcome => (FALLBACK_NOTICE_OUTCOMES as readonly unknown[]).includes(outcome)))) &&
     (row.autoRevert === undefined || ([...FALLBACK_AUTO_REVERT_STARTS, ...FALLBACK_REVERT_OUTCOMES] as readonly unknown[]).includes(row.autoRevert))
   );
 }

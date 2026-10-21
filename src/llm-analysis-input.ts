@@ -33,13 +33,22 @@ export interface LlmAnalysisInputContext {
   guardrailSignals: GuardrailSignalSummary[];
   contextFiles: ContextFile[];
   sessionHeadMissing?: boolean;
+  currentGenerationOnly?: boolean;
   transcriptGaps?: TranscriptGapSummary;
 }
+
+export const INPUT_SOURCE_NOTES = {
+  wholeSession: "セッション全件",
+  currentGeneration: "引き継ぎ後の現在の世代の全件",
+  heldOnly: "記録が読めないため Host が保持する直近分のみ。セッション先頭を含まない",
+  priorGenerationsExcluded: "引き継ぎ前の世代の記録は含まない",
+} as const;
 
 export interface TranscriptGapSummary {
   unreadableAgentCount?: number;
   omittedTranscriptCount?: number;
   hierarchyIncomplete?: true;
+  ancestorUsageUnread?: true;
   historyReadFailed?: true;
   historyMalformedLineCount?: number;
   evidenceFoldErrorCount?: number;
@@ -55,6 +64,7 @@ export function formatTranscriptGapNote(gaps: TranscriptGapSummary | undefined):
     parts.push(l10n.t("{0} subagent records were not read because of the limit and are not in the input", gaps.omittedTranscriptCount));
   }
   if (gaps.hierarchyIncomplete) parts.push(l10n.t("The subagent list could not be read completely"));
+  if (gaps.ancestorUsageUnread) parts.push(l10n.t("The earlier conversation's records could not be fully read, so child token usage recorded there is not in the input"));
   if (gaps.historyReadFailed) parts.push(l10n.t("Reading the record failed partway through; nothing after that point is in the input"));
   if (gaps.historyMalformedLineCount !== undefined) {
     parts.push(l10n.t("{0} lines of the record are malformed and are not in the input", gaps.historyMalformedLineCount));
@@ -106,6 +116,7 @@ export interface LlmAnalysisInput {
     bodyLimit: number;
     droppedEvents?: number;
     sessionHeadMissing?: true;
+    currentGenerationOnly?: true;
     transcriptGaps?: TranscriptGapSummary;
     contextFilesInSlices: boolean;
   };
@@ -116,10 +127,20 @@ export function formatInputCoverageLabel(stats: LlmAnalysisInput["stats"]): stri
   const all = stats.events >= stats.sessionEvents;
   const gapNote = formatTranscriptGapNote(stats.transcriptGaps);
   const gapSuffix = gapNote === undefined ? "" : l10n.t(". Record gaps: {0}", gapNote);
+  if (stats.sessionHeadMissing && stats.currentGenerationOnly) {
+    return all
+      ? l10n.t("Input: the {0} most recent events of the current generation because the record could not be read (earlier generations and the start not included){1}", stats.sessionEvents, gapSuffix)
+      : l10n.t("Input: {1} of the {0} most recent events of the current generation because the record could not be read (trimmed to budget; earlier generations and the start not included){2}", stats.sessionEvents, stats.events, gapSuffix);
+  }
   if (stats.sessionHeadMissing) {
     return all
       ? l10n.t("Input: the {0} most recent events because the record could not be read (session start not included){1}", stats.sessionEvents, gapSuffix)
       : l10n.t("Input: {1} of the {0} most recent events because the record could not be read (trimmed to budget; session start not included){2}", stats.sessionEvents, stats.events, gapSuffix);
+  }
+  if (stats.currentGenerationOnly) {
+    return all
+      ? l10n.t("Input: {0} events of the current generation since the handoff (all; earlier generations not included){1}", stats.sessionEvents, gapSuffix)
+      : l10n.t("Input: {1} of {0} events of the current generation since the handoff (trimmed to budget; earlier generations not included){2}", stats.sessionEvents, stats.events, gapSuffix);
   }
   return all
     ? l10n.t("Input: {0} session events (all){1}", stats.sessionEvents, gapSuffix)
@@ -544,7 +565,9 @@ export function buildLlmAnalysisInput(context: LlmAnalysisInputContext): LlmAnal
   let items = buildEventItems(context.events, firstTimestamp, selectedConfig.success, selectedConfig.fail, aliases);
   const totalEventsCount = items.length;
 
-  const headNote = context.sessionHeadMissing ? "記録が読めないため Host が保持する直近分のみ。セッション先頭を含まない" : "セッション全件";
+  const sourceNote = context.sessionHeadMissing ? INPUT_SOURCE_NOTES.heldOnly
+    : context.currentGenerationOnly ? INPUT_SOURCE_NOTES.currentGeneration : INPUT_SOURCE_NOTES.wholeSession;
+  const headNote = context.currentGenerationOnly ? `${sourceNote}。${INPUT_SOURCE_NOTES.priorGenerationsExcluded}` : sourceNote;
   const gapNote = formatTranscriptGapNote(context.transcriptGaps) ?? "なし";
   const coverageString = (range: string, dropped: number) =>
     `(カバレッジ: セッション事象 ${totalEventsCount} 件中 ${totalEventsCount - dropped} 件を入力${dropped > 0 ? "（予算で絞った）" : ""}, 当該スライス範囲 ${range} 件, 入力元: ${headNote}, 記録の欠落: ${gapNote}, contextFilesInSlices: ${contextFilesInSlices}, droppedEvents: ${dropped} 件)`;
@@ -673,6 +696,7 @@ export function buildLlmAnalysisInput(context: LlmAnalysisInputContext): LlmAnal
       bodyLimit: selectedConfig.success,
       ...(droppedEventsCount > 0 ? { droppedEvents: droppedEventsCount } : {}),
       ...(context.sessionHeadMissing ? { sessionHeadMissing: true as const } : {}),
+      ...(context.currentGenerationOnly ? { currentGenerationOnly: true as const } : {}),
       ...(context.transcriptGaps !== undefined ? { transcriptGaps: context.transcriptGaps } : {}),
       contextFilesInSlices,
     },

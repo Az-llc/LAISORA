@@ -1,13 +1,13 @@
 import * as l10n from "@vscode/l10n";
 import { getLaisoraConfiguration } from "./claude-settings";
 
-import { sdkClaudeCodeVersion } from "./claudeHost";
 import { configuredClaudeExecutablePath, resolveSessionCwd } from "./claude-settings";
 import { extensionContext, output } from "./host-context";
 import { normalizeApiKeyPolicy, type NormalizedEventBody } from "./protocol";
 import { buildSessionDigest, buildSummaryPrompt, buildSessionNamePrompt, sanitizeSessionName, generateSessionSummaryViaSdk } from "./session-summary";
-import { isInSessionStore, inspectorSessionFile } from "./session-files";
+import { isInSessionStore, sessionTranscriptRef } from "./session-files";
 import { readSessionHistory } from "./session-transcript";
+import { currentGenerationEvents } from "./time-buckets";
 import { hasSessionRecord } from "./session-record";
 import type { Session } from "./extension";
 import type { SessionStore } from "./store-surfaces";
@@ -52,6 +52,14 @@ function summaryInputFromEvents(
     }
   }
   return { userTexts, toolCalls, agentCount };
+}
+
+function currentGenerationSummaryInput(
+  events: readonly (NormalizedEventBody & { timestamp: number })[]
+): ReturnType<typeof summaryInputFromEvents> & { onlyEarlierGenerations?: true } {
+  const current = currentGenerationEvents(events);
+  const input = summaryInputFromEvents(current.events);
+  return input.userTexts.length === 0 && current.bounded ? { ...input, onlyEarlierGenerations: true } : input;
 }
 
 export class SessionSummaryWiring {
@@ -140,19 +148,21 @@ export class SessionSummaryWiring {
         failure = l10n.t("LAISORA: There is no record to summarize yet.");
         return;
       }
-      const { userTexts, toolCalls, agentCount, readFailure } = await this.collectSummaryInput();
+      const { userTexts, toolCalls, agentCount, readFailure, onlyEarlierGenerations } = await this.collectSummaryInput();
       if (this.supersededSince(logicalGenerationAtStart)) return;
       if (userTexts.length === 0) {
         const reason =
           readFailure === undefined
-            ? "要約する記録がまだありません"
+            ? onlyEarlierGenerations ? "引き継ぎ後の人の発言がまだありません" : "要約する記録がまだありません"
             : `${SUMMARY_INPUT_FAILURE_LABELS[readFailure.kind]}（記録が無いという意味ではありません。同期や権限の状態を確認してください）`;
         output.appendLine(
           `[${this.host.title}] 要約を実行しませんでした: ${reason}${readFailure === undefined ? "" : ` / ${readFailure.detail}`}`
         );
         failure =
           readFailure === undefined
-            ? l10n.t("LAISORA: There is no record to summarize yet.")
+            ? onlyEarlierGenerations
+              ? l10n.t("LAISORA: No messages since the handoff yet.")
+              : l10n.t("LAISORA: There is no record to summarize yet.")
             : l10n.t(
                 "LAISORA: {0} (This does not mean there is no record. Check sync and permissions.)",
                 localizedSummaryInputFailure(readFailure.kind)
@@ -167,7 +177,6 @@ export class SessionSummaryWiring {
         prompt: (naming ? buildSessionNamePrompt : buildSummaryPrompt)(buildSessionDigest(userTexts, toolCalls, agentCount)),
         signal: abort.signal,
         pathToClaudeCodeExecutable: configuredClaudeExecutablePath(getLaisoraConfiguration()),
-        sdkClaudeCodeVersion: sdkClaudeCodeVersion(),
       });
       if (this.supersededSince(logicalGenerationAtStart)) return;
       if (result.summary !== undefined) {
@@ -206,18 +215,21 @@ export class SessionSummaryWiring {
     toolCalls: number;
     agentCount: number;
     readFailure?: SummaryInputFailure;
+    onlyEarlierGenerations?: true;
   }> {
     if ((this.host.workModel.coverage.droppedEventCount ?? 0) > 0) {
-      const file = inspectorSessionFile(this.host);
+      const ref = sessionTranscriptRef(this.host);
+      let rereadOnlyEarlier = false;
       let failure: SummaryInputFailure | undefined =
-        file === null ? { kind: "file_not_located", detail: "セッションの記録ファイルを特定できません" } : undefined;
-      if (file !== null) {
+        ref === null ? { kind: "file_not_located", detail: "セッションの記録ファイルを特定できません" } : undefined;
+      if (ref !== null) {
         try {
-          const history = await readSessionHistory(file, isInSessionStore);
+          const history = await readSessionHistory(ref.file, isInSessionStore, { generationSessionId: ref.sessionId });
           const readError = history.readError ?? history.subagentsReadError;
           if (readError === undefined) {
-            const fromJsonl = summaryInputFromEvents(history.events.map((h) => h.body));
+            const fromJsonl = currentGenerationSummaryInput(history.events.map((h) => ({ ...h.body, timestamp: h.timestamp })));
             if (fromJsonl.userTexts.length > 0) return fromJsonl;
+            rereadOnlyEarlier = fromJsonl.onlyEarlierGenerations === true;
           } else {
             failure = { kind: "read_error", detail: readError };
           }
@@ -227,11 +239,16 @@ export class SessionSummaryWiring {
         }
       }
       output.appendLine(
-        `[${this.host.title}] 要約: ${failure === undefined ? "JSONL に人の発言がありません" : `JSONL を読めません: ${failure.detail}`} — 保持中のイベント列（先頭切り詰めあり）で代用します`
+        `[${this.host.title}] 要約: ${failure !== undefined ? `JSONL を読めません: ${failure.detail}` : rereadOnlyEarlier ? "JSONL に引き継ぎ後の人の発言がありません" : "JSONL に人の発言がありません"} — 保持中のイベント列（先頭切り詰めあり）で代用します`
       );
-      return { ...summaryInputFromEvents(this.host.events), ...(failure !== undefined ? { readFailure: failure } : {}) };
+      const held = currentGenerationSummaryInput(this.host.events);
+      return {
+        ...held,
+        ...(rereadOnlyEarlier ? { onlyEarlierGenerations: true as const } : {}),
+        ...(failure !== undefined ? { readFailure: failure } : {}),
+      };
     }
-    return summaryInputFromEvents(this.host.events);
+    return currentGenerationSummaryInput(this.host.events);
   }
 
   private async persistSessionSummary(): Promise<boolean> {

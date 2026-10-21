@@ -165,14 +165,6 @@ function selectedEfforts(row: ExecutorRow, models?: ExternalModels): readonly (s
   if (!rowComplete(row, models)) return [];
   return row.efforts.length ? canonicalExecutorEfforts(row.executor, row.efforts) : [undefined];
 }
-export const AGENT_EFFORT_ARGUMENT_CLI_VERSION = "2.1.292";
-export function agentEffortArgumentSupported(cliVersion: string | undefined): boolean {
-  const version = (value: string | undefined) => /^(\d+)\.(\d+)\.(\d+)/.exec(value ?? "")?.slice(1).map(Number);
-  const actual = version(cliVersion), required = version(AGENT_EFFORT_ARGUMENT_CLI_VERSION)!;
-  if (!actual) return false;
-  const index = actual.findIndex((part, position) => part !== required[position]);
-  return index < 0 || actual[index] > required[index];
-}
 export function defaultAgentEffort(efforts: readonly OrchestrationEffort[], defaultEffort?: OrchestrationEffort): OrchestrationEffort | undefined {
   if (defaultEffort !== undefined && efforts.includes(defaultEffort)) return defaultEffort;
   return efforts.includes("medium") ? "medium" : efforts[0];
@@ -190,9 +182,6 @@ export function orchestrationVariants(roster: readonly OrchestrationRow[], model
       model: row.model as "haiku" | "sonnet" | "opus", ...(effort ? { effort } : {}), efforts, description: entry.description }];
   }));
 }
-export function delegationEffort(variant: { readonly effort?: OrchestrationEffort }, requested: unknown, perCallEffort: boolean): OrchestrationEffort | undefined {
-  return perCallEffort && variant.effort !== undefined && isOrchestrationEffort(requested) ? requested : variant.effort;
-}
 export function resolveOrchestrationCacheTtl(entry: Pick<OrchestrationRow, "role" | "cacheTtl">): "5m" | "1h" {
   return entry.cacheTtl ?? DEFAULT_ORCHESTRATION_ROSTER.find((candidate) => candidate.role === entry.role)?.cacheTtl ?? "5m";
 }
@@ -204,10 +193,11 @@ export interface OrchestrationAgentDefinition {
   readonly effort?: OrchestrationEffort;
   readonly experimental?: { readonly cacheTtl: "1h" };
 }
+export const AGENT_READ_BEFORE_EDIT = "Before editing a file, read it with the Read tool; a shell read such as cat or head does not count.";
 export function orchestrationAgents(roster: readonly OrchestrationRow[], models?: ExternalModels): Record<string, OrchestrationAgentDefinition> {
   return Object.fromEntries(orchestrationVariants(roster, models).map((variant) => [variant.agentKey, {
     name: claudeAgentName(variant.role, variant.model),
-    description: variant.description, prompt: `You are the ${variant.role} agent. ${variant.description}`, model: variant.model,
+    description: variant.description, prompt: `You are the ${variant.role} agent. ${variant.description}\n${AGENT_READ_BEFORE_EDIT}`, model: variant.model,
     ...(variant.effort === undefined ? {} : { effort: variant.effort }),
     ...(resolveOrchestrationCacheTtl(roster.find((entry) => entry.role === variant.role)!) === "1h" ? { experimental: { cacheTtl: "1h" as const } } : {}),
   }]));
@@ -254,25 +244,24 @@ export function estimateTokens(text: string): number {
   return Math.ceil(asciiChars / 4 + nonAsciiChars / 1.5);
 }
 export const EXTERNAL_CAPABILITIES = "Explorer and reviewer external targets are read-only and return only text. Worker Codex targets may edit files under the chosen working directory, never commit, and cannot run the build; the conductor runs checks and commits.";
-export function conductorInstruction(roster: readonly OrchestrationRow[], policy: string, external = orchestrationExternalTargets(roster), deliverySection = "", perCallEffort = true, models: ExternalModels | undefined, placementLine: string): string {
+export function conductorInstruction(roster: readonly OrchestrationRow[], policy: string, external = orchestrationExternalTargets(roster), models: ExternalModels | undefined, placementLine: string): string {
   const variants = orchestrationVariants(roster, models);
   const metadata = models?.claude?.state === "ok" ? models.claude.models.find((model) => model.id === "opus") : undefined;
   const [d = "medium", up = "high"] = recommendedClaudeEfforts(metadata, [0, 1]);
   const renderedPolicy = policy.replace(/\{(d|up)\}/g, (_, key: string) => key === "d" ? d : up);
   const generated = [
     "Act as the conductor. Delegate using the exact agent key or external target. Model and Effort below are requested settings, not observations of applied values.",
-    ...(perCallEffort && variants.some((variant) => variant.efforts.length)
+    ...(variants.some((variant) => variant.efforts.length)
       ? ["An agent runs at its effort unless you pass the Agent tool's effort argument; pass only a value from that agent's efforts unless the user explicitly asks for another effort or model. An effort named in the conductor policy is an explicit request to pass that argument."] : []),
     ...roster.map((entry) => JSON.stringify({ role: entry.role, description: entry.description,
       agents: variants.filter((variant) => variant.role === entry.role).map(({ agentKey, model, effort, efforts }) =>
-        ({ agentKey, model, ...(effort ? { effort } : {}), ...(perCallEffort && efforts.length ? { efforts } : {}) })),
+        ({ agentKey, model, ...(effort ? { effort } : {}), ...(efforts.length ? { efforts } : {}) })),
       external: external.filter((target) => target.role === entry.role).map(({ target, executor, model, effort }) => ({ target, executor: externalExecutorName(executor), model, ...(effort ? { effort } : {}) })) })),
     ...(external.length ? [`External targets (${EXTERNAL_EXECUTORS.map((definition) => definition.displayName).join(" and ")}) cost no Claude usage. ${EXTERNAL_CAPABILITIES} Call the run tool of laisora_external with the exact target key. A background launch acknowledgement means the work is still running; you can respond to new user input, but wait for its completion notification before dependent review or work.`] : []),
   ].join("\n");
   return [
     `<roster>\n${generated}\n</roster>`,
-    `<knowledge_placement>\n${placementLine}\n</knowledge_placement>`,
-    deliverySection ? `<model_notes>\n${deliverySection}\n</model_notes>` : "",
+    placementLine ? `<knowledge_placement>\n${placementLine}\n</knowledge_placement>` : "",
     policy.trim() ? `<conductor_policy>\n${renderedPolicy}\n</conductor_policy>` : "",
   ].filter(Boolean).join("\n\n");
 }

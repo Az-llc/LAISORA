@@ -1,8 +1,7 @@
 import * as l10n from "@vscode/l10n";
-import type { AskBlock } from "../ask-parser";
+import { askOtherChoice, type AskBlock } from "../ask-parser";
 import { parseMarkdown } from "../markdown-ast";
 import type { TodoAskSourceMessage, TodoAskSourceMessageEnvelope, TodoAskSourceRef, TodoAskWhere, TodoTabItem, WebviewToHost } from "../protocol";
-import { askOtherChoice } from "./ask-view";
 import { todoButton, todoEl as el } from "./todo-edit";
 import { createYouItems, isWaitingYouItem, type AskIdentity, type YouItem, type YouItemsReader } from "./you-items";
 import { youWaitingKindLabel } from "./you-list";

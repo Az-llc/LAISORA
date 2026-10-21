@@ -23,7 +23,32 @@ export function setExtensionContext(context: vscode.ExtensionContext | null): vo
 }
 
 export function setOutput(channel: vscode.OutputChannel): void {
-  output = channel;
+  output = silentAfterDispose(channel);
+}
+
+function silentAfterDispose(channel: vscode.OutputChannel): vscode.OutputChannel {
+  let open = true;
+  const whileOpen =
+    <A extends unknown[]>(write: (...args: A) => void) =>
+    (...args: A): void => {
+      if (open) write(...args);
+    };
+  return {
+    name: channel.name,
+    append: whileOpen((value: string) => channel.append(value)),
+    appendLine: whileOpen((value: string) => channel.appendLine(value)),
+    replace: whileOpen((value: string) => channel.replace(value)),
+    clear: whileOpen(() => channel.clear()),
+    show: whileOpen((columnOrPreserveFocus?: vscode.ViewColumn | boolean, preserveFocus?: boolean) =>
+      channel.show(columnOrPreserveFocus as vscode.ViewColumn, preserveFocus)
+    ) as vscode.OutputChannel["show"],
+    hide: whileOpen(() => channel.hide()),
+    dispose: () => {
+      if (!open) return;
+      open = false;
+      channel.dispose();
+    },
+  };
 }
 
 export function setArtifactServer(server: ArtifactServer | null): void {

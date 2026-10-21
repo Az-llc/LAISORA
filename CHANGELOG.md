@@ -1,5 +1,24 @@
 # Changelog
 
+## 1.10.0
+
+- **Faster reopening.** A restored or reopened conversation starts Claude before its history is
+  drawn, reads its record once, and no longer reads the conversations it was handed off from, so
+  you can send sooner. LOG, SUMMARY and ANALYSIS cover the current conversation since the handoff.
+- **Learning retired.** LAISORA's learning ledger and its tools are gone, and the old learning
+  data is removed once. The placement guard stays and can be turned off with
+  `laisora.guard.enabled`.
+- **ANALYSIS.** The comparison with your usual values is removed.
+- **ToDo.** Card answers in a linked conversation are added to the item's decisions. The drawer no
+  longer covers the composer, and one malformed entry no longer drops a whole list.
+- **Permission denials** appear in LOG only; a call that ran is never shown as denied.
+- A restored tab shows its real title as soon as it is known; a handoff card names the conversation
+  it continues.
+- Time breakdown: waiting for a reply after a call left open no longer counts as tool execution.
+- Export writes messages not yet recorded at their place, and image-only messages as an attachment.
+- Late shutdown no longer logs "Channel has been closed".
+- Claude Agent SDK 0.3.306 (Claude Code CLI 2.1.306).
+
 ## 1.9.1
 
 - **Handoff.** The conversation a handoff opens no longer shows the file-edit cards of the

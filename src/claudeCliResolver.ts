@@ -1,5 +1,5 @@
 import { spawn } from "node:child_process";
-import { constants } from "node:fs";
+import { constants, existsSync } from "node:fs";
 import { access, readFile, realpath } from "node:fs/promises";
 import { homedir } from "node:os";
 import { delimiter, dirname, extname, isAbsolute, join, posix, resolve, win32 } from "node:path";
@@ -10,17 +10,6 @@ export interface ResolvedClaudeCodeExecutable {
   path: string;
   source: "configuration" | "PATH";
   shimPath?: string;
-}
-
-export interface ClaudeVersionCheck {
-  cliVersion?: string;
-  sdkVersion?: string;
-  warning?: string;
-}
-
-export interface ResolvedClaudeCodeStartup {
-  executable: ResolvedClaudeCodeExecutable;
-  version: ClaudeVersionCheck;
 }
 
 interface ResolverEnvironment {
@@ -51,13 +40,13 @@ async function exists(file: string): Promise<boolean> {
   }
 }
 
-async function findOnPath(pathValue: string | undefined): Promise<string | undefined> {
+function findOnPath(pathValue: string | undefined): string | undefined {
   if (!pathValue) return undefined;
   for (const directory of pathValue.split(delimiter)) {
     if (!directory) continue;
     for (const candidate of WINDOWS_PATH_CANDIDATES) {
       const file = join(directory, candidate);
-      if (await exists(file)) return file;
+      if (existsSync(file)) return file;
     }
   }
   return undefined;
@@ -108,9 +97,9 @@ async function resolveCandidate(
   return { path: candidate, source };
 }
 
-function createCacheThatForgetsFailures<T>(): ((key: string, create: () => Promise<T>) => Promise<T>) & { forget(): void } {
+function createCacheThatForgetsFailures<T>(): (key: string, create: () => Promise<T>) => Promise<T> {
   let cached: { key: string; promise: Promise<T> } | undefined;
-  const get = (key: string, create: () => Promise<T>): Promise<T> => {
+  return (key: string, create: () => Promise<T>): Promise<T> => {
     if (cached?.key === key) return cached.promise;
     const promise = create();
     cached = { key, promise };
@@ -119,7 +108,6 @@ function createCacheThatForgetsFailures<T>(): ((key: string, create: () => Promi
     });
     return promise;
   };
-  return Object.assign(get, { forget: () => { cached = undefined; } });
 }
 
 export function createClaudeCodeExecutableResolver(environment?: Partial<ResolverEnvironment>) {
@@ -145,7 +133,7 @@ export function createClaudeCodeExecutableResolver(environment?: Partial<Resolve
 
       if (env.platform !== "win32") return { path: "claude", source: "PATH" as const };
 
-      const candidate = await findOnPath(env.pathValue);
+      const candidate = findOnPath(env.pathValue);
       if (!candidate) throw cliNotFoundError();
       return resolveCandidate(candidate, "PATH", env.platform);
     });
@@ -158,35 +146,16 @@ export function resolveClaudeCodeExecutable(configuredPath?: string): Promise<Re
   return resolveForProcess(configuredPath);
 }
 
-function minorVersion(version: string): string | undefined {
-  const match = /\b(\d+)\.(\d+)(?:\.\d+)?\b/.exec(version);
-  return match ? `${match[1]}.${match[2]}` : undefined;
-}
-
-export function checkClaudeCodeVersion(
-  executablePath: string,
-  sdkVersion?: string,
-  timeoutMs = VERSION_TIMEOUT_MS
-): Promise<ClaudeVersionCheck> {
+export function checkClaudeCodeVersion(executablePath: string, timeoutMs = VERSION_TIMEOUT_MS): Promise<string | undefined> {
   return new Promise((resolveVersion) => {
     const isJavaScript = extname(executablePath).toLowerCase() === ".js";
     let stdout = "";
     let stderr = "";
     let settled = false;
-    const finish = (failure?: string) => {
+    const finish = () => {
       if (settled) return;
       settled = true;
-      const output = `${stdout}\n${stderr}`.trim();
-      const cliVersion = /\b\d+\.\d+(?:\.\d+)?\b/.exec(output)?.[0];
-      const sdkMinor = sdkVersion ? minorVersion(sdkVersion) : undefined;
-      const cliMinor = cliVersion ? minorVersion(cliVersion) : undefined;
-      let warning: string | undefined;
-      if (!cliVersion) {
-        warning = l10n.t("Could not read the Claude Code CLI version, so compatibility is unverified") + (failure ? ` (${failure})` : "");
-      } else if (!sdkVersion || !sdkMinor || !cliMinor) {
-        warning = l10n.t("Could not parse the version formats of the Claude Code CLI and the SDK, so compatibility is unverified");
-      }
-      resolveVersion({ cliVersion, sdkVersion, warning });
+      resolveVersion(/\b\d+\.\d+(?:\.\d+)?\b/.exec(`${stdout}\n${stderr}`)?.[0]);
     };
 
     let child;
@@ -195,38 +164,20 @@ export function checkClaudeCodeVersion(
         windowsHide: true,
         stdio: ["ignore", "pipe", "pipe"],
       });
-    } catch (error) {
-      finish(String(error));
+    } catch {
+      finish();
       return;
     }
     child.stdout?.on("data", (chunk: Buffer) => (stdout += chunk.toString()));
     child.stderr?.on("data", (chunk: Buffer) => (stderr += chunk.toString()));
-    child.on("error", (error) => finish(String(error)));
+    child.on("error", () => finish());
     child.on("close", () => finish());
     const timer = setTimeout(() => {
       child.kill();
-      finish(l10n.t("timeout ({0}ms)", timeoutMs));
+      finish();
     }, timeoutMs);
     child.on("close", () => clearTimeout(timer));
   });
-}
-
-const startupCache = createCacheThatForgetsFailures<ResolvedClaudeCodeStartup>();
-
-export function resolveClaudeCodeStartup(
-  configuredPath: string | undefined,
-  sdkVersion?: string
-): Promise<ResolvedClaudeCodeStartup> {
-  const cacheKey = `${configuredPath?.trim() ?? ""}\u0000${sdkVersion ?? ""}`;
-  return startupCache(cacheKey, async () => {
-    const executable = await resolveClaudeCodeExecutable(configuredPath);
-    const version = await checkClaudeCodeVersion(executable.path, sdkVersion);
-    return { executable, version };
-  });
-}
-
-export function forgetClaudeCodeStartup(): void {
-  startupCache.forget();
 }
 
 const TRUTHY_ENV_VALUES = ["1", "true", "yes", "on"];
