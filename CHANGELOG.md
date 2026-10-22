@@ -1,5 +1,26 @@
 # Changelog
 
+## 1.11.0
+
+- **Remote Control per tab.** Turn Remote Control on or off from the tab menu, or with
+  `/remote-control` (alias `/rc`). A card in the chat shows the claude.ai link and the connection
+  state, and messages sent from claude.ai appear in the tab as they arrive. Hide the card with
+  `laisora.remoteControl.showCard`. `laisora.claude.remoteControlAtStartup` now really turns
+  Remote Control on at launch.
+- **Automatic handoff (off by default).** An idle tab can hand off to a new conversation when its
+  context reaches a share of the auto-compact amount (`laisora.handoff.auto.percent`) or a token
+  count, and shortly before a 1-hour prompt cache expires. Before handing off, Claude is asked to
+  finish the step in progress and record its state.
+- **History tabs** sort conversations by where they were started: Claude desktop conversations
+  count as Claude Code, and a Claude Code conversation continued in LAISORA stays in the Claude
+  Code tab.
+- **PLAN** counts the steps of every plan in the conversation and no longer says all steps are
+  done while an earlier plan still has open steps.
+- LOG, GRAPH, PLAN, ANALYSIS and the status line show the same numbers for the same quantity.
+- A reopened conversation shows an approval card that was interrupted as withdrawn.
+- A conversation handoff left behind by a crash is cleaned up at the next start.
+- Claude Agent SDK 0.3.309 (Claude Code CLI 2.1.309).
+
 ## 1.10.0
 
 - **Faster reopening.** A restored or reopened conversation starts Claude before its history is

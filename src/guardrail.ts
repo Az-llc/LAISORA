@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { isChildCall } from "./spans";
 import type { DivergenceReport } from "./l3-divergence";
 import { progressSubjectKey } from "./progress-protocol";
 import { isObservedTime, type NormalizedEvent } from "./protocol";
@@ -545,7 +546,7 @@ function foldEvent(state: GuardrailState, ev: NormalizedEvent): GuardrailState {
   }
 
   if (ev.kind === "assistant_usage") {
-    if (ev.parentToolUseId !== null || typeof ev.usage.outputTokens !== "number") return state;
+    if (isChildCall(ev.parentToolUseId) || typeof ev.usage.outputTokens !== "number") return state;
     const outputTokens = ev.usage.outputTokens;
     const sub = getOrCreateSubject(state, "root");
     if (!sub.turnOutput || sub.turnOutput.turnId !== ev.turnId) sub.turnOutput = { turnId: ev.turnId, outputTokens: 0 };

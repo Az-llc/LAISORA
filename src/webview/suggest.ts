@@ -1,3 +1,4 @@
+import { REMOTE_CONTROL_SLASH_COMMANDS } from "./remote-control-view";
 import { isComposingKey } from "./composing";
 import * as l10n from "@vscode/l10n";
 import { inputEl, suggestEl, vscode } from "./dom";
@@ -102,7 +103,8 @@ export function insertFilePaths(paths: readonly string[]): void {
 
 function updateCommandSuggest(triggerIndex: number, query: string): void {
   const t = activeTab();
-  const commands = t?.commands ?? [];
+  const cliCommands = t?.commands ?? [];
+  const commands = [...cliCommands, ...REMOTE_CONTROL_SLASH_COMMANDS.filter((local) => !cliCommands.some((command) => command.name === local.name))];
   const filtered = commands.filter(
     (command) => command.name.startsWith(query) || command.aliases?.some((alias) => alias.startsWith(query))
   );

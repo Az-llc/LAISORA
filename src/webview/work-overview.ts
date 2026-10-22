@@ -2,10 +2,11 @@ import type { PlanUsage } from "../plan-usage";
 import type { AnalysisPlansView, AnalysisTimeView, TokenDisplay, RoleRunView, RoleSummaryView } from "../role-summary";
 import type { RoleCacheTtlView } from "../cache-ttl-cost";
 import { deriveEarlierPlanViews, derivePlanView, planStepKey } from "./plan-view";
-import { planContextOf, planNow, planPeriodEnd, UNMEASURED_LABEL } from "../plan-steps";
+import { blockElapsedMs, blockElapsedRunning, planContextOf, timeWindowMeasured, planNow, planRowPeriods, planPeriodEnd, UNMEASURED_LABEL } from "../plan-steps";
 import { renderPlanSection, planTokens } from "./plan-panel";
 import { createLoader } from "./loader";
-import { EXECUTORS } from "../orchestration-executors";
+import { EXECUTORS, externalRunStatus } from "../orchestration-executors";
+import { delegationCount } from "../claude-tool-names";
 import type {
   HostToWebview,
   OrchestrationView,
@@ -22,6 +23,7 @@ import { formatDateTime } from "./l10n";
 import { termSpan, type TermKey } from "./term";
 import { WorkGraph, coverageRows, emptyWorkText, fillProblemCoverage, historyUndetermined, loadingHistoryText, NO_WORK_SUMMARY_TEXT, type GraphScrollPort } from "./work-graph";
 import { ROW_H } from "./row-frame";
+import { memberRunTimes, runElapsedMs } from "../spans";
 import { AgentInspector } from "./agent-inspector";
 import * as l10n from "@vscode/l10n";
 import { noRecordReason } from "../session-record";
@@ -446,7 +448,7 @@ export class WorkOverview {
     this.planSection.className = "plan-section";
     const time = this.activeSemantic()?.timeBuckets;
     const block = time?.blocks.at(-1);
-    const context = this.payload?.planContext ?? (block && block.closedAt === undefined ? planContextOf(block, block.end, this.turnRunning) : undefined);
+    const context = this.payload?.planContext ?? (block && block.closedAt === undefined ? planContextOf(block, block.end, this.turnRunning, planRowPeriods(time!)) : undefined);
     const view = derivePlanView(this.payload, this.planOrchestration, this.lastTickMs ?? 0, context);
     for (const agent of time?.agents ?? []) {
       if (this.payload?.planTools !== undefined) continue;
@@ -454,7 +456,7 @@ export class WorkOverview {
       const lanes = [...view.now, ...view.steps.flatMap(step => step.lanes)];
       if (lanes.some(lane => lane.id === `agent:${agent.transcriptAgentId ?? agent.toolUseId}`)) continue;
       view.now.push({ id: `agent:${agent.toolUseId}`, agent: agent.subagentType ?? "Claude", title: agent.description,
-        start: agent.start, elapsed: (this.nowMs(time) ?? agent.end) - agent.start, status: "running", tokens: null, cacheRead: 0, external: false });
+        start: agent.start, elapsed: runElapsedMs(memberRunTimes(agent, this.nowMs(time) ?? agent.end)), status: "running", tokens: null, cacheRead: 0, external: false });
     }
     for (const task of time?.backgroundTasks ?? []) {
       if (this.payload?.planTools !== undefined) continue;
@@ -1315,7 +1317,7 @@ export class WorkOverview {
       const outcome = run.outcome === "ok" ? l10n.t("Succeeded") : run.outcome === "failed" ? l10n.t("Failed")
         : run.outcome === "timeout" ? l10n.t("Timed out") : run.outcome === "stopped" ? l10n.t("Stopped") : l10n.t("Refused");
       const numbers = `${outcome} · ${this.hudDuration(run.durationMs).textContent} · ${usage(run.usage)}` + (run.cwd ? ` · ${run.cwd}` : "");
-      const failed = run.outcome === "failed" || run.outcome === "timeout";
+      const failed = externalRunStatus(run.outcome) === "failed";
       const entry = row(externalRuns, `${run.role} · ${EXECUTORS[run.executor].displayName}`,
         `${run.model ?? unknown} · ${run.effort ?? unknown}`, l10n.t("EXTERNAL"), failed ? "" : numbers);
       if (failed) entry.querySelector(".orchestration-numbers")!.append(span("l-failure", "✗ "), numbers);
@@ -1570,7 +1572,8 @@ export class WorkOverview {
     return value;
   }
 
-  private renderHud(view: TimeBucketView | undefined, semantic: SemanticModelPayload | undefined): HTMLElement {
+  private renderHud(shown: TimeBucketView | undefined, semantic: SemanticModelPayload | undefined): HTMLElement {
+    const view = timeWindowMeasured(shown) ? shown : undefined;
     const hud = div("wo-hud");
     const graph = this.hudGroup("graph", l10n.t("03 GRAPH"), l10n.t("Time"), l10n.t("Open GRAPH (time breakdown and parallelism)"));
     const figures = div("wo-hud-figures");
@@ -1708,11 +1711,13 @@ export class WorkOverview {
       const steps = new Set(history?.flatMap(entry => entry.kind === "todos" ? entry.items.map(item => planStepKey(entry, item)) : []));
       const count = block.kind === "plan" ? String(block.steps?.length ?? 0) : history?.length ? String(steps.size) : "—";
       const usage = this.planUsage?.blocks.find(value => value.blockId === block.blockId);
-      const elapsed = span("earlier-elapsed", block.durationMs === null ? "—" : formatDuration(block.durationMs));
-      if (block.durationMs !== null && block.running && this.turnRunning) {
+      const live = blockElapsedRunning(block) && this.turnRunning;
+      const blockElapsed = blockElapsedMs(block, live ? this.nowMs(view) ?? block.end : block.end);
+      const elapsed = span("earlier-elapsed", `${blockElapsed.provisional ? "≈" : ""}${formatDuration(blockElapsed.ms)}`);
+      if (live) {
         elapsed.dataset.liveElapsed = "block";
         elapsed.dataset.start = String(block.start);
-        elapsed.textContent = formatDuration(Math.max(block.durationMs, (this.nowMs(view) ?? block.end) - block.start));
+        if (blockElapsed.provisional) elapsed.dataset.provisional = "true";
       }
       const stats = span("earlier-stats", "");
       stats.append(at, ` · ${l10n.t("{0} steps", count)} · ${l10n.t("{0} tokens", planTokens(usage?.slices.length ? usage.tokens : null))}`);
@@ -1768,7 +1773,7 @@ export class WorkOverview {
         } else if (el.dataset.liveElapsed === "bg") {
           el.textContent = l10n.t("· Elapsed {0}", formatDuration(nowMs - start));
         } else {
-          el.textContent = formatDuration(nowMs - start);
+          el.textContent = `${el.dataset.provisional ? "≈" : ""}${formatDuration(nowMs - start)}`;
         }
       }
     }
@@ -1813,7 +1818,7 @@ export class WorkOverview {
     const line = div("wl-code");
     line.append(span("l-label", l10n.t("LOG")), span("", l10n.t("Execution record")));
     if (this.payload?.coverage.summary === "complete") {
-      const agents = this.payload.phases.reduce((total, phase) => total + phase.agentCount, 0);
+      const agents = this.payload.phases.reduce((total, phase) => total + delegationCount(phase), 0);
       line.appendChild(span("wl-totals", l10n.t("Tools {0} calls · Failures {1} · Subagents {2}", this.totalToolCount(this.payload), this.totalFailCount(this.payload), agents)));
     }
     this.logSumEl.appendChild(line);

@@ -31,6 +31,7 @@ import {
 import {
   createParseYielder,
   createRecordUuidFilter,
+  extractHumanUserPrompt,
   extractVerbatimUserUtterances,
   isHandoffGenerationBoundary,
 } from "./session-transcript";
@@ -248,9 +249,100 @@ function persistedEntries(value: unknown): PersistedHandoff[] {
   });
 }
 
-export function isHandoffForkInFlight(persisted: unknown, sessionId: string, now: number): boolean {
-  return persistedEntries(persisted).some((entry) =>
-    entry.forkSessionId === sessionId && typeof entry.leaseUntil === "number" && entry.leaseUntil > now);
+const localRunningForks = new Map<string, string>();
+
+export type HandoffForkState = "handing_off" | "stale" | "cleanup_failed";
+
+export function handoffForkState(
+  inFlight: unknown,
+  orphans: unknown,
+  sessionId: string,
+  now: number,
+  ownRunning: ReadonlyMap<string, string> = localRunningForks
+): HandoffForkState | undefined {
+  if ([...ownRunning.values()].includes(sessionId)) return "handing_off";
+  const flight = persistedEntries(inFlight).filter((entry) => entry.forkSessionId === sessionId);
+  if (flight.some((entry) => typeof entry.leaseUntil === "number" && entry.leaseUntil > now)) return "handing_off";
+  if (persistedEntries(orphans).some((entry) => entry.forkSessionId === sessionId)) return "cleanup_failed";
+  return flight.length > 0 ? "stale" : undefined;
+}
+
+export function isHandoffForkHidden(state: HandoffForkState | undefined): boolean {
+  return state === "handing_off" || state === "stale";
+}
+
+interface HandoffSweepResolution {
+  resolved: readonly PersistedHandoff[];
+  failed: readonly PersistedHandoff[];
+}
+
+function settleHandoffRegistries(
+  inFlight: unknown,
+  orphans: unknown,
+  resolution: HandoffSweepResolution
+): { inFlight: PersistedHandoff[]; orphans: PersistedHandoff[] } {
+  const sameRun = (a: PersistedHandoff, b: PersistedHandoff): boolean => a.filePath === b.filePath && a.runId === b.runId;
+  const settled = [...resolution.resolved, ...resolution.failed];
+  const nextInFlight = persistedEntries(inFlight).filter((entry) => !settled.some((done) => sameRun(entry, done)));
+  const keptOrphans = persistedEntries(orphans).filter((entry) => !resolution.resolved.some((done) => sameRun(entry, done)));
+  const moved = resolution.failed.filter((entry) => !keptOrphans.some((orphan) => orphan.filePath === entry.filePath));
+  return { inFlight: nextInFlight, orphans: [...keptOrphans, ...moved] };
+}
+
+export type HeldForkTabAction = "keep" | "reopen" | "drop";
+
+export function heldForkTabAction(
+  state: HandoffForkState | undefined,
+  forkFile: "present" | "missing" | "unknown"
+): HeldForkTabAction {
+  if (state === "handing_off" || state === "stale") return "keep";
+  if (state === "cleanup_failed") return "drop";
+  if (forkFile === "present") return "reopen";
+  return forkFile === "missing" ? "drop" : "keep";
+}
+
+export type HeldForkTabEvent =
+  | { kind: "opened" | "closed"; sessionId: string }
+  | { kind: "settled"; sessionId: string; action: HeldForkTabAction };
+
+export interface HeldForkTab<T> {
+  tab: T;
+  preceding: readonly string[];
+}
+
+export function holdForkTab<T extends { sessionId: string }>(
+  held: readonly HeldForkTab<T>[],
+  tab: T,
+  preceding: readonly string[]
+): HeldForkTab<T>[] {
+  const existing = held.find((h) => h.tab.sessionId === tab.sessionId);
+  return [...held.filter((h) => h !== existing), { tab, preceding: existing?.preceding ?? preceding }];
+}
+
+export function releaseHeldForkTab<T extends { sessionId: string }>(
+  held: readonly HeldForkTab<T>[],
+  event: HeldForkTabEvent
+): HeldForkTab<T>[] {
+  if (event.kind === "settled" && event.action !== "drop") return [...held];
+  return held.filter((h) => h.tab.sessionId !== event.sessionId);
+}
+
+export function heldTabInsertIndex(liveIds: readonly (string | undefined)[], preceding: readonly string[]): number {
+  let index = 0;
+  liveIds.forEach((id, at) => { if (id !== undefined && preceding.includes(id)) index = at + 1; });
+  return index;
+}
+
+export function withHeldForkTabs<T extends { sessionId: string; order: number }>(
+  live: readonly T[],
+  held: readonly HeldForkTab<T>[]
+): T[] {
+  const merged = [...live];
+  for (const h of [...held].sort((a, b) => a.tab.order - b.tab.order)) {
+    if (merged.some((tab) => tab.sessionId === h.tab.sessionId)) continue;
+    merged.splice(heldTabInsertIndex(merged.map((tab) => tab.sessionId), h.preceding), 0, h.tab);
+  }
+  return merged.map((tab, order) => ({ ...tab, order }));
 }
 
 function isWithinProjects(filePath: string, projectsRoot: string): boolean {
@@ -317,6 +409,10 @@ function forkIncompleteReason(
   if (!only.ok || only.version !== "2") return "envelope_unparsed";
   if (only.envelope.snapshot.forkSessionId !== forkSessionId) return "envelope_fork_mismatch";
   return undefined;
+}
+
+export function forkHasUserTurns(records: readonly Record<string, unknown>[]): boolean {
+  return records.some((record) => asRecord(record.forkedFrom) === undefined && extractHumanUserPrompt(record) !== null);
 }
 
 export interface HandoffDetail {
@@ -861,6 +957,7 @@ export class HandoffRunner {
           owner: OWNER_ID,
           leaseUntil: this.deps.now() + HANDOFF_LEASE_MS,
         };
+        localRunningForks.set(forkFilePath, forkSessionId);
         await this.addRegistryEntry(IN_FLIGHT_KEY, registryEntry);
 
         if (this.terminal === undefined) {
@@ -983,10 +1080,14 @@ export class HandoffRunner {
     } finally {
       if (this.terminal !== "done") this.abortController?.abort();
       if (registryEntry !== undefined) {
-        if (this.terminal !== "done" && forkFilePath !== undefined) {
-          await this.deleteFailedFork(registryEntry);
+        try {
+          if (this.terminal !== "done" && forkFilePath !== undefined) {
+            await this.deleteFailedFork(registryEntry);
+          }
+          await this.removeRegistryEntry(IN_FLIGHT_KEY, registryEntry.filePath);
+        } finally {
+          localRunningForks.delete(registryEntry.filePath);
         }
-        await this.removeRegistryEntry(IN_FLIGHT_KEY, registryEntry.filePath);
       }
     }
 
@@ -1019,14 +1120,18 @@ export class HandoffRunner {
   private async addRegistryEntry(key: string, entry: PersistedHandoff): Promise<void> {
     const entries = persistedEntries(this.deps.persist.get(key));
     entries.push(entry);
-    await this.deps.persist.update(key, entries.slice(-MAX_PERSISTED_HANDOFFS));
+    if (entries.length > MAX_PERSISTED_HANDOFFS) {
+      this.deps.log(`handoff registry ${key} holds ${entries.length} entries; keeping all of them`);
+    }
+    await this.deps.persist.update(key, entries);
   }
 
   private async renewLease(entry: PersistedHandoff): Promise<void> {
     const entries = persistedEntries(this.deps.persist.get(IN_FLIGHT_KEY));
     const index = entries.findIndex((candidate) => candidate.filePath === entry.filePath);
-    if (index < 0) return;
-    entries[index] = { ...entries[index], leaseUntil: this.deps.now() + HANDOFF_LEASE_MS };
+    const renewed = { ...(index < 0 ? entry : entries[index]), leaseUntil: this.deps.now() + HANDOFF_LEASE_MS };
+    if (index < 0) entries.push(renewed);
+    else entries[index] = renewed;
     await this.deps.persist.update(IN_FLIGHT_KEY, entries);
   }
 
@@ -1105,15 +1210,19 @@ export class HandoffRunner {
         continue;
       }
 
-      let complete = false;
+      let records: readonly Record<string, unknown>[] | undefined;
       try {
-        complete =
-          forkIncompleteReason((await deps.readRecords(entry.filePath)).records, entry.forkSessionId) === undefined;
+        records = (await deps.readRecords(entry.filePath)).records;
       } catch (error) {
         deps.log(`handoff orphan parse failed: ${entry.forkSessionId}: ${errorDetail(error)}`);
       }
-      if (complete) {
+      if (records !== undefined && forkIncompleteReason(records, entry.forkSessionId) === undefined) {
         kept.push(entry.filePath);
+        continue;
+      }
+      if (records !== undefined && forkHasUserTurns(records)) {
+        kept.push(entry.filePath);
+        deps.log(`handoff orphan kept: the copy has turns the user wrote after the fork: ${entry.forkSessionId}`);
         continue;
       }
       if (!isWithinProjects(entry.filePath, projectsRoot)) {
@@ -1131,16 +1240,23 @@ export class HandoffRunner {
       }
     }
 
-    const remaining = new Set(failed);
-    await deps.persist.update(
-      IN_FLIGHT_KEY,
-      persistedEntries(deps.persist.get(IN_FLIGHT_KEY))
-        .filter((entry) => active.has(entry.filePath) || remaining.has(entry.filePath))
-    );
-    await deps.persist.update(
-      ORPHANS_KEY,
-      persistedEntries(deps.persist.get(ORPHANS_KEY)).filter((entry) => remaining.has(entry.filePath))
-    );
+    const resolvedPaths = new Set([...deleted, ...kept]);
+    const failedPaths = new Set(failed);
+    const resolution: HandoffSweepResolution = {
+      resolved: unique.filter((entry) => resolvedPaths.has(entry.filePath)),
+      failed: unique.filter((entry) => failedPaths.has(entry.filePath)),
+    };
+    if (resolution.resolved.length > 0 || resolution.failed.length > 0) {
+      // A fork in neither registry is listed and openable (handoffForkState), so ORPHANS is written first.
+      await deps.persist.update(
+        ORPHANS_KEY,
+        settleHandoffRegistries(deps.persist.get(IN_FLIGHT_KEY), deps.persist.get(ORPHANS_KEY), resolution).orphans
+      );
+      await deps.persist.update(
+        IN_FLIGHT_KEY,
+        settleHandoffRegistries(deps.persist.get(IN_FLIGHT_KEY), deps.persist.get(ORPHANS_KEY), resolution).inFlight
+      );
+    }
     return { deleted, kept, failed, active: [...active.keys()] };
   }
 }

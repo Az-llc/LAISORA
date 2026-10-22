@@ -1,11 +1,14 @@
 import { createLoader } from "./loader";
+import { isChildCall } from "../spans";
 import { mergeAskChoice } from "./ask-choice";
 import { createSessionHeader } from "./session-header";
+import { remoteControlCardAction, remoteControlCardNotes, remoteControlCardState, remoteControlLabel } from "./remote-control-view";
+import { ACTIONS_MENU_GLYPH } from "./todo-edit";
 import { onTodoAsksClosedInTodo, todoAsksClosedInTodo } from "./todo-asks";
 import { addTodoToolCall, isTodoWriteTool, renderTodoHead, setTodoToolCardResult, todoToolCard } from "./todo-chat";
 import { renderTodoCrumbs, todoAgentLabel, todoAgentText, todoLinkHub, todoTabMarks } from "./todo-links";
 import { PlanPanel } from "./plan-panel";
-import { applyFallbackModel, fallbackNoticeOriginal, fallbackNoticeOutcome, foldModelFallback, resolveFallbackByChoice } from "../protocol";
+import { agentElapsedMs, applyFallbackModel, fallbackNoticeOriginal, fallbackNoticeOutcome, foldModelFallback, resolveFallbackByChoice } from "../protocol";
 import type { ModelFallbackState } from "../protocol";
 import { YouList } from "./you-list";
 import { bindUserLabel, onUserLabelChange } from "./user-label";
@@ -20,6 +23,7 @@ import type {
   NormalizedEvent,
   PermissionModeId,
   ResumePreviewMessage,
+  RemoteControlView,
   RestoredApprovalCard,
   SessionImageRef,
   SlashCommandInfo,
@@ -41,14 +45,15 @@ import { closeGlyphButton } from "./close-button";
 import { buildApprovalBody, buildRestoredApprovalCard } from "./approval";
 import { clock, formatDuration, monthDayClock, toolSummary } from "./format";
 import { uiLocale } from "./l10n";
-import { createCopyButton, renderMarkdownInto } from "./markdown";
+import { formatHandoffTime, formatHandoffTokens } from "../handoff-format";
+import { createCopyButton, externalLinkElement, renderMarkdownInto } from "./markdown";
 import { forgetCodeBlockStates } from "./markdown-codeblock";
 import { askHeading, askOptionContent, rejectRenderedAsks, settleUncheckedAsks, updateAskCounters } from "./ask-view";
 import { askOtherChoice } from "../ask-parser";
 import { askQualityCheckEnabled, editSummaryEnabled, onEditSummaryChange } from "./menu";
 import { aggregateTurnEdits, buildEditSummaryCard, type TurnFileEdit } from "./edit-summary-card";
 import { createYouItems, encodeAskDismissal, encodeAskResolution, youAnchor, type AskIdentity, type AskResolutionRecord, type YouItemsReader } from "./you-items";
-import { findCommitBoundary, joinRecordTexts, prependRecordParts, recordSeparator, type RecordTextPart } from "../commit-boundary";
+import { findCommitBoundary, joinRecordTexts, prependRecordParts, recordSeparator, withoutRetracted, type RecordTextPart } from "../commit-boundary";
 import { breaksParagraph, cardHome, compareTurnOrder, editSummaryPlace, labelPendingParts, legacyAskKeys, locateInParts, mergedParagraph, paragraphKey, paragraphText, prependTurnLayout, turnLabelModel, type ModelMark, type TurnItem, type TurnOrder, type TurnParagraph } from "./turn-layout";
 import { isConvRenderableEvent, permissionDeniedTarget } from "../conv-renderable";
 import {
@@ -67,6 +72,7 @@ import type { WorkViewMode } from "./work-overview";
 import type { GraphScrollPort } from "./work-graph";
 import { refreshFind, refreshFindCount } from "./find-bar";
 import { deriveStatusLine, statusLineText, truncateToolIntent } from "./status-line";
+import { delegationCount, isTaskTool } from "../claude-tool-names";
 import type { ToolIntentInput } from "../tool-intent";
 import {
   SCROLL_BOTTOM_GAP_PX,
@@ -83,11 +89,6 @@ import {
 
 export function requestIsOpen(id: string, latest: string | undefined, overrides: ReadonlyMap<string, boolean>): boolean {
   return overrides.get(id) ?? id === latest;
-}
-
-export function agentElapsed(state: WorkAgentStateView, now: number): number {
-  return state.elapsedMs + (state.status === "running" && (state.runStartedAt ?? 0) > 0
-    ? Math.max(0, now - state.runStartedAt!) : 0);
 }
 
 type LogRequest = {
@@ -507,6 +508,17 @@ function handoffRunningText(msg: HandoffStatusMessage): string {
   return l10n.t("Handing off…{0}", HANDOFF_PHASE_TEXTS[msg.phase ?? ""] ?? "");
 }
 
+function handoffAutoStartText(auto: NonNullable<HandoffStatusMessage["auto"]>): string {
+  if (auto.trigger === "notice") return l10n.t("Started automatically after LAISORA's notice: {0}", auto.reason);
+  const tokens = formatHandoffTokens(auto.totalTokens);
+  if (auto.trigger === "size") {
+    return l10n.t("Started automatically: the context is {0} tokens, at or above the threshold of {1} tokens.", tokens, formatHandoffTokens(auto.threshold));
+  }
+  return auto.expiresAt === undefined
+    ? l10n.t("Started automatically: the prompt cache was about to expire with work unfinished (context {0} tokens).", tokens)
+    : l10n.t("Started automatically: the prompt cache of the last reply expires at {0} and work is unfinished (context {1} tokens).", formatHandoffTime(auto.expiresAt), tokens);
+}
+
 const HANDOFF_QUIET_MS = 90_000;
 
 function handoffPlayfulLines(): string[] {
@@ -626,7 +638,9 @@ function fillChips(chipsEl: HTMLElement, data: WorkRowData, models: readonly Mod
 }
 
 function shouldApplyAgentState(stored: WorkAgentStateView | undefined, incoming: WorkAgentStateView, acceptRunChange = false): boolean {
-  return stored === undefined || stored.revision < incoming.revision || (acceptRunChange && stored.runStartedAt !== incoming.runStartedAt);
+  return stored === undefined || stored.revision < incoming.revision || (acceptRunChange && (stored.runStartedAt !== incoming.runStartedAt ||
+    stored.elapsedMs !== incoming.elapsedMs || stored.earlierRuns?.length !== incoming.earlierRuns?.length ||
+    stored.earlierRuns?.at(-1)?.[0] !== incoming.earlierRuns?.at(-1)?.[0] || stored.earlierRuns?.at(-1)?.[1] !== incoming.earlierRuns?.at(-1)?.[1]));
 }
 
 function taskLabel(item: WorkTaskItemView): string {
@@ -1117,6 +1131,53 @@ export class Tab {
     this.titleDateEl.textContent = `${date.getFullYear()}.${String(date.getMonth() + 1).padStart(2, "0")}.${String(date.getDate()).padStart(2, "0")} · ${clock(firstAt)}`;
   }
 
+  private remoteControlCard: { root: HTMLElement; state: HTMLElement; link: HTMLElement } | null = null;
+  setRemoteControl(view: RemoteControlView | undefined): void {
+    this.sessionHeader.setRemoteControl(view);
+    const open = this.remoteControlCard !== null && this.convEl.contains(this.remoteControlCard.root) ? this.remoteControlCard : null;
+    const action = remoteControlCardAction(open !== null, view);
+    if (action === "none") return;
+    const card = action === "create" ? this.renderRemoteControlCard() : open!;
+    const { stateText, sessionUrl } = remoteControlCardState(view);
+    if (action === "create") {
+      setTimeout(() => { if (card.state.textContent === "") card.state.textContent = stateText; }, 0);
+    } else {
+      card.state.textContent = stateText;
+    }
+    card.root.dataset.rcState = sessionUrl === undefined ? "off" : "on";
+    if (sessionUrl === undefined || !(card.link instanceof HTMLAnchorElement) || card.link.getAttribute("href") !== sessionUrl) {
+      const link = sessionUrl === undefined
+        ? handoffNode("span", "handoff-source-link rc-card-link-inactive", l10n.t("Open on claude.ai"))
+        : externalLinkElement(sessionUrl, "web");
+      if (sessionUrl === undefined) {
+        link.setAttribute("role", "link");
+        link.setAttribute("aria-disabled", "true");
+      } else {
+        link.className = "handoff-source-link";
+        link.append(l10n.t("Open on claude.ai"));
+      }
+      card.link.replaceWith(link);
+      card.link = link;
+    }
+    this.remoteControlCard = action === "close" ? null : card;
+    if (action === "create") this.scrollToBottom("conv");
+  }
+
+  private renderRemoteControlCard(): { root: HTMLElement; state: HTMLElement; link: HTMLElement } {
+    const root = this.addBlock("rc-card", "");
+    root.setAttribute("role", "group");
+    root.setAttribute("aria-label", remoteControlLabel());
+    const state = handoffNode("h3", "handoff-title");
+    state.setAttribute("aria-live", "polite");
+    const link = handoffNode("span", "");
+    root.append(
+      handoffNode("div", "handoff-label", handoffNode("b", "", remoteControlLabel().toUpperCase())),
+      handoffNode("div", "handoff-head", state, link),
+      ...remoteControlCardNotes(ACTIONS_MENU_GLYPH).map((note) => handoffNode("p", "handoff-lede", note)),
+    );
+    return { root, state, link };
+  }
+
   setSessionMenuActive(active: boolean): void {
     this.sessionHeader.mountMenu(active ? sessionActionsEl : null);
   }
@@ -1210,7 +1271,7 @@ export class Tab {
   }
 
   private placeTodoToolCard(ev: Extract<NormalizedEvent, { kind: "tool_call_started" }>, past?: PastTurns): void {
-    if (ev.parentToolUseId !== null || ev.priorGeneration === true || !isTodoWriteTool(ev.toolName) || this.todoToolCards.has(ev.toolUseId)) return;
+    if (isChildCall(ev.parentToolUseId) || ev.priorGeneration === true || !isTodoWriteTool(ev.toolName) || this.todoToolCards.has(ev.toolUseId)) return;
     let card = ev.turnId === null ? undefined : this.todoTurnCards.get(ev.turnId);
     if (card !== undefined) addTodoToolCall(card, ev.toolUseId, ev.toolName);
     else {
@@ -1424,6 +1485,7 @@ export class Tab {
       dismiss.onclick = () => this.clearCancelledHandoffNotice();
     } else {
       this.handoffStatusTextEl.textContent = handoffRunningText(msg);
+      if (msg.auto !== undefined) this.handoffStatusSubEl.appendChild(handoffNode("div", "handoff-status-auto", handoffAutoStartText(msg.auto)));
     }
     this.handoffCancelEl.classList.toggle("hidden", terminal);
     this.handoffCancelEl.onclick = terminal
@@ -3342,7 +3404,7 @@ export class Tab {
     entry.card.classList.toggle("running", state.status === "running");
     entry.card.classList.toggle("failed", state.status === "failed");
     if (state.status !== "running") entry.statusEl.textContent = state.status === "failed" ? "✗" : state.status === "completed" ? "✓" : TOOL_STATUS_GLYPH.stale;
-    const elapsed = agentElapsed(state, Date.now());
+    const elapsed = agentElapsedMs(state, Date.now());
     entry.metaEl.textContent = l10n.t("{0} calls · {1}", state.childCount, formatDuration(elapsed));
     entry.metaEl.title = AGENT_STATUS_WORD[state.status];
     if (state.modelMeasured) {
@@ -3389,9 +3451,9 @@ export class Tab {
     status.replaceChildren(data.status === "running" ? createLoader(12) : document.createTextNode(data.statusGlyph ?? TOOL_STATUS_GLYPH[data.status]));
     const name = document.createElement("span");
     name.className = "tool-name";
-    name.textContent = data.toolName.startsWith("Task") ? l10n.t("TASK") : data.toolName;
+    name.textContent = isTaskTool(data.toolName) ? l10n.t("TASK") : data.toolName;
     const preview = document.createElement("span");
-    preview.className = data.toolName.startsWith("Task") ? "tool-preview tool-preview-ui" : "tool-preview";
+    preview.className = isTaskTool(data.toolName) ? "tool-preview tool-preview-ui" : "tool-preview";
     preview.textContent = data.summaryText;
     rowSummary.append(at, status, name, preview);
     if (data.metaText !== undefined) {
@@ -3553,16 +3615,8 @@ export class Tab {
     }
     if (ev.turnId !== null) this.knownTurnIds.add(ev.turnId);
     this.flushDelta();
-    const dropped = new Set(ev.uuids);
-    const touched: HTMLElement[] = [];
-    const kept: typeof this.assistantRuns = [];
-    for (const run of this.assistantRuns) {
-      if (run.uuid !== null && dropped.has(run.uuid)) {
-        if (!touched.includes(run.seg)) touched.push(run.seg);
-        continue;
-      }
-      kept.push(run);
-    }
+    const kept = withoutRetracted(this.assistantRuns, ev.uuids);
+    const touched = [...new Set(this.assistantRuns.filter((run) => !kept.includes(run)).map((run) => run.seg))];
     if (touched.length === 0) return;
     if (suspended && !kept.some(run => run.uuid === null)) this.liveRecordOpen = false;
     this.assistantRuns = kept;
@@ -3937,7 +3991,7 @@ export class Tab {
     const order = [ev.generation, ev.seq, ev.timestamp];
     const last = request.last;
     const newer = !last || order.some((value, index) => value > last.order[index] && order.slice(0, index).every((v, i) => v === last.order[i]));
-    if (newer && (ev.parentToolUseId === null || !this.agentCards.has(ev.parentToolUseId))) request.last = { row, order };
+    if (newer && (!isChildCall(ev.parentToolUseId) || !this.agentCards.has(ev.parentToolUseId))) request.last = { row, order };
     this.refreshLogRow(ev.toolUseId);
   }
 
@@ -3958,7 +4012,7 @@ export class Tab {
     const state = this.agentStates.get(id) ?? this.pastAgentStates.get(id);
     this.logRunningLabels.delete(id);
     if (agent && state?.status === "running") {
-      const update = (now: number) => { agent.metaEl.textContent = l10n.t("{0} calls · {1}", state.childCount, formatDuration(agentElapsed(state, now))); };
+      const update = (now: number) => { agent.metaEl.textContent = l10n.t("{0} calls · {1}", state.childCount, formatDuration(agentElapsedMs(state, now))); };
       this.logRunningLabels.set(id, update);
       update(Date.now());
     } else if (row && data?.status === "running" && data.startedAt > 0) {
@@ -4095,7 +4149,8 @@ export class Tab {
       nextMeta.textContent = startedAt > 0 ? new Date(startedAt).toLocaleTimeString(uiLocale(), { hour: "2-digit", minute: "2-digit", hour12: false }) : l10n.t("Time not observed");
       if (totals) {
         nextMeta.append(" · " + l10n.t("Tools {0} calls (incl. subagents)", totals.toolCount));
-        if (totals.agentCount > 0) nextMeta.append(" · " + l10n.t("Subagents {0}", totals.agentCount));
+        const delegations = delegationCount(totals);
+        if (delegations > 0) nextMeta.append(" · " + l10n.t("Subagents {0}", delegations));
         if (totals.failCount > 0) {
           const failure = document.createElement("span");
           failure.className = "l-failure";
@@ -5028,12 +5083,12 @@ export class Tab {
 
   private onToolCallStarted(ev: Extract<NormalizedEvent, { kind: "tool_call_started" }>): void {
     const isHistory = ev.provenance?.path === "history";
-    if (!isHistory && ev.parentToolUseId === null) {
+    if (!isHistory && !isChildCall(ev.parentToolUseId)) {
       if (!this.withSuspendedReply(ev.turnId, () => this.closeLiveRecord()) && ev.turnId === this.currentTurnId) this.closeLiveRecord();
     }
     this.toolStartTimes.set(ev.toolUseId, ev.timestamp);
     this.placeTodoToolCard(ev);
-    if (!isHistory && ev.parentToolUseId === null) {
+    if (!isHistory && !isChildCall(ev.parentToolUseId)) {
       this.runningMainTools.set(ev.toolUseId, { name: ev.toolName, intentInput: ev.intentInput });
       this.updateStrip();
     }
@@ -5904,7 +5959,7 @@ export class Tab {
     turns: PastTurns
   ): "created" | "duplicate" | "continued" | "skipped" {
     this.observeYouEvent(ev);
-    if (ev.kind === "tool_call_started" && ev.turnId !== null && ev.parentToolUseId === null && isTodoWriteTool(ev.toolName)) {
+    if (ev.kind === "tool_call_started" && ev.turnId !== null && !isChildCall(ev.parentToolUseId) && isTodoWriteTool(ev.toolName)) {
       this.placeTodoToolCard(ev, turns);
       return "skipped";
     }

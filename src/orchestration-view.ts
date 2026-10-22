@@ -1,4 +1,4 @@
-import { EXECUTORS, isExternalExecutorId, type ExternalExecutorId } from "./orchestration-executors";
+import { EXECUTORS, isExternalExecutorId, isExternalRunOutcome, type ExternalExecutorId } from "./orchestration-executors";
 import type { AgentRunRecord, ExternalRunRecord, TokenUsage } from "./orchestration-external";
 import { orchestrationVariants, type ExternalRow, type OrchestrationRow } from "./orchestration-roster";
 import type { ClaudeConversation, ClaudeHostOptions } from "./claudeHost";
@@ -16,11 +16,13 @@ export interface OrchestrationView {
     startedAt: string; endedAt: string; durationMs: number; usage: TokenUsage | null }>;
 }
 
-export function orchestrationViewForConversation(conv: ClaudeConversation, current: Partial<ClaudeHostOptions>): OrchestrationView | undefined {
+export type AgentRoleOf = (agent: { agentType?: string; transcriptAgentId?: string; startedAt?: number }) => string | null;
+
+export function orchestrationViewForConversation(conv: ClaudeConversation, current: Partial<ClaudeHostOptions>, roleOf: AgentRoleOf = (agent) => conv.attributedRole(agent)): OrchestrationView | undefined {
   if (!conv.orchestrationActive) return undefined;
   return projectOrchestrationView(conv.orchestrationRoster, conv.orchestrationExternalRoster,
     conv.orchestrationSettingsChanged(current), conv.observedAgentSettings, conv.observedAgentRuns,
-    conv.orchestrationRuns.filter((run) => run.kind === "external"), true, conv.recordedAgentRoles, conv.orchestrationAgentVariants);
+    conv.orchestrationRuns.filter((run) => run.kind === "external"), true, roleOf, conv.orchestrationAgentVariants);
 }
 
 export function orchestrationViewFromStartingRoster(evidence: RosterEvidence): OrchestrationView | undefined {
@@ -33,7 +35,7 @@ export function orchestrationViewFromStartingRoster(evidence: RosterEvidence): O
     variant.effort ??= agent.effort ?? undefined;
     variants.set(agent.agentKey, variant);
   }
-  return projectOrchestrationView([], [], false, new Map(), new Map(), [], injection.perCallEffort === true, new Map(), [...variants.values()]);
+  return projectOrchestrationView([], [], false, new Map(), new Map(), [], injection.perCallEffort === true, () => null, [...variants.values()]);
 }
 
 interface OrchestrationVariantView { role: string; agentKey: string; model: string; effort?: string; efforts: string[] }
@@ -56,9 +58,8 @@ export function projectOrchestrationView(
   roster: readonly OrchestrationRow[], external: readonly ExternalRow[], settingsChanged: boolean,
   settings: ReadonlyMap<string, Readonly<{ agentType?: string; model?: string; effort?: string }>>,
   agents: ReadonlyMap<string, AgentRunRecord>, runs: readonly ExternalRunRecord[], perCallEffort = false,
-  recordedRoles: ReadonlyMap<string, string> = new Map(), variants: readonly OrchestrationVariantView[] = orchestrationVariants(roster)
+  roleOf: AgentRoleOf = () => null, variants: readonly OrchestrationVariantView[] = orchestrationVariants(roster)
 ): OrchestrationView {
-  const roleByAgentKey = new Map([...recordedRoles, ...variants.map((variant) => [variant.agentKey, variant.role] as const)]);
   return {
     roster: {
       agents: variants.map(({ role, agentKey, model, effort, efforts }) => ({ role, agentKey, model, effort: effort ?? null,
@@ -70,7 +71,7 @@ export function projectOrchestrationView(
       const applied = settings.get(agent.agent_id);
       const agentType = observed(applied?.agentType);
       return { agentId: observed(agent.agent_id) ?? "unknown", agentType,
-        role: roleByAgentKey.get(agentType ?? "") ?? null,
+        role: roleOf({ agentType: agentType ?? undefined, transcriptAgentId: agent.agent_id, startedAt: Date.parse(agent.firstSeenAt) }),
         model: observed(applied?.model), effort: observed(applied?.effort),
         firstSeenAt: agent.firstSeenAt, lastActivityAt: agent.lastActivityAt, usage: usageView(agent.usage) };
     }).sort((a, b) => b.lastActivityAt.localeCompare(a.lastActivityAt)).slice(0, 50),
@@ -186,7 +187,7 @@ function isOrchestrationRunView(value: unknown): boolean {
     effort: () => value.effort === undefined || metadata(value.effort),
     role: () => metadata(value.role),
     executor: () => executor(value.executor),
-    outcome: () => ["ok", "failed", "timeout", "refused", "stopped"].includes(value.outcome as string),
+    outcome: () => isExternalRunOutcome(value.outcome),
     startedAt: () => isoTimestampShape(value.startedAt),
     endedAt: () => isoTimestampShape(value.endedAt),
     durationMs: () => finite(value.durationMs),

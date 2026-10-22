@@ -1,6 +1,7 @@
 import * as l10n from "@vscode/l10n";
 import { renderMarkdownInto } from "./markdown";
 import type { RestoredApprovalCard } from "../protocol";
+import { isDelegationTool } from "../claude-tool-names";
 import { askHeading, askOptionContent } from "./ask-view";
 import { youAnchor } from "./you-items";
 
@@ -94,6 +95,16 @@ export function buildApprovalBody(toolName: string, inputJson?: string, inputSum
     return [approvalLead(inputSummary ? `${toolName}: ${inputSummary}` : l10n.t("Allow {0} to run?", toolName))];
   }
   const out: HTMLElement[] = [];
+  if (isDelegationTool(toolName)) {
+    out.push(approvalLead(l10n.t("Will launch a subagent.")));
+    const type = str(obj.subagent_type);
+    if (type) out.push(approvalField(l10n.t("Type"), type));
+    const desc = str(obj.description);
+    if (desc) out.push(approvalField(l10n.t("Task"), desc));
+    const prompt = str(obj.prompt);
+    if (prompt) out.push(approvalField(l10n.t("Instructions"), clip(prompt, 1500), true));
+    return out;
+  }
   switch (toolName) {
     case "ExitPlanMode": {
       out.push(approvalLead(l10n.t("Review the implementation plan. Approving will exit plan mode and begin implementation.")));
@@ -160,17 +171,6 @@ export function buildApprovalBody(toolName: string, inputJson?: string, inputSum
       if (url) out.push(approvalField(str(obj.url) ? "URL" : l10n.t("Search query"), url));
       const prompt = str(obj.prompt);
       if (prompt) out.push(approvalField(l10n.t("Fetch purpose"), clip(prompt, 500)));
-      break;
-    }
-    case "Agent":
-    case "Task": {
-      out.push(approvalLead(l10n.t("Will launch a subagent.")));
-      const type = str(obj.subagent_type);
-      if (type) out.push(approvalField(l10n.t("Type"), type));
-      const desc = str(obj.description);
-      if (desc) out.push(approvalField(l10n.t("Task"), desc));
-      const prompt = str(obj.prompt);
-      if (prompt) out.push(approvalField(l10n.t("Instructions"), clip(prompt, 1500), true));
       break;
     }
     default: {

@@ -5,11 +5,13 @@ import type { Hash } from "node:crypto";
 import type {
   AuthStatus,
   EventProvenance,
+  ImageRefInfo,
   NormalizedEventBody,
   RuntimeCapability,
   TaskNotificationInfo,
   UsageSnapshot,
 } from "./protocol";
+import { extractHumanUserText, extractImageRefs } from "./human-input-vocabulary";
 import { captureToolIntentInput } from "./tool-intent";
 import { assistantUsageFromRaw, isSyntheticModel, summarizeToolInput } from "./protocol";
 import type { HostArtifactAccess } from "./artifact-access";
@@ -17,6 +19,7 @@ import { extractResumeSignals, extractStage0ToolFields, isResumeSignalToolName }
 import { redactAbsolutePaths, redactOptional } from "./path-redaction";
 import { countFileEdit, singleToolUseResult } from "./edit-summary";
 import { AUTO_MODE_UNEVALUATED } from "./tool-result-signals";
+import { isDelegationTool } from "./claude-tool-names";
 
 export function localizeLocalCommandReply(record: Record<string, unknown>, text: string): string {
   const message = record.message as Record<string, unknown> | undefined;
@@ -66,6 +69,21 @@ export interface ClaudeLiveNormalizerOptions {
   knownBackgroundTask?: (taskId: string) => "agent" | "tool" | "unconfirmed" | undefined;
   onRawToolUse?: (toolUseId: string, tool: string, input: Record<string, unknown>) => void;
   onRawToolResult?: (result: RawToolResult) => void;
+}
+
+export const OWN_INPUT_MEMORY_MAX = 200;
+
+export interface InboundHumanInput { uuid: string; text: string; imageRefs?: ImageRefInfo[] }
+
+export function inboundHumanInput(record: Record<string, unknown>): InboundHumanInput | null {
+  if (record.type !== "user" || record.isReplay !== true || record.isSynthetic === true) return null;
+  if (record.parent_tool_use_id !== undefined && record.parent_tool_use_id !== null) return null;
+  if ((record.origin as { kind?: unknown } | undefined)?.kind !== "human") return null;
+  const uuid = parseWireUuid(record);
+  const text = uuid === null ? null : extractHumanUserText(record);
+  if (uuid === null || text === null) return null;
+  const imageRefs = extractImageRefs((record.message as { content?: unknown } | undefined)?.content, uuid);
+  return { uuid, text, ...(imageRefs === undefined ? {} : { imageRefs }) };
 }
 
 export interface RawToolResult {
@@ -343,6 +361,7 @@ export class ClaudeLiveNormalizer {
   private resumeSignalToolNames = new Map<string, string>();
   private rawToolUses = new Map<string, { tool: string; parentToolUseId: string | null }>();
   private emittedAssistantUsageMessageIds = new Set<string>();
+  private readonly ownInputs = new Set<string>();
   private rootAssistantUsage: ReturnType<typeof assistantUsageFromRaw> = {};
   droppedTaskNotificationCount = 0;
 
@@ -358,6 +377,15 @@ export class ClaudeLiveNormalizer {
 
   setTurnState(state: "idle" | "running" | "interrupting"): void {
     this.turnState = state;
+  }
+
+  noteOwnInput(uuid: string): void {
+    this.ownInputs.add(uuid);
+    if (this.ownInputs.size > OWN_INPUT_MEMORY_MAX) this.ownInputs.delete(this.ownInputs.values().next().value!);
+  }
+
+  forgetOwnInput(uuid: string): void {
+    this.ownInputs.delete(uuid);
   }
 
   private latestRateLimitReset: number | null = null;
@@ -905,7 +933,7 @@ export class ClaudeLiveNormalizer {
           if (block.type === "tool_use" && attributedTurnId) {
             const blockName = typeof block.name === "string" ? block.name : "";
             const blockId = typeof block.id === "string" ? block.id : "";
-            const isAgentTool = blockName === "Task" || blockName === "Agent";
+            const isAgentTool = isDelegationTool(blockName);
             if (isAgentTool && blockId) {
               this.delegationTurnByToolUseId.set(blockId, attributedTurnId);
               if (this.delegationTurnByToolUseId.size > 1000) {
@@ -970,6 +998,18 @@ export class ClaudeLiveNormalizer {
       }
 
       case "user": {
+        const echoed = record.isReplay === true && (record.parent_tool_use_id ?? null) === null ? parseWireUuid(record) : null;
+        if (echoed !== null && this.ownInputs.delete(echoed)) break;
+        const inbound = inboundHumanInput(record);
+        if (inbound !== null) {
+          const turnId = this.currentTurnId ?? this.startTurn(undefined, defaultMeta);
+          this.emit({
+            kind: "user_message", turnId, text: inbound.text, uuid: inbound.uuid,
+            ...(inbound.imageRefs === undefined ? {} : { imageRefs: inbound.imageRefs }),
+            ...(ownTs === undefined ? {} : { sentAt: ownTs }),
+          }, defaultMeta);
+          break;
+        }
         const msgObj = record.message as Record<string, unknown> | undefined;
         const content = msgObj?.content;
         const resultParentToolUseId =

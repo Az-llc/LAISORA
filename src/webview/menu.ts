@@ -14,6 +14,7 @@ import { EFFORT_ORDER, MODE_LABELS, MODE_ORDER, activeTab, activeTabId, closeUsa
 import type { ComposerSendKey, HostToWebview, ModelInfo } from "../protocol";
 import { setSessionMenuExtras, type SessionMenuExtra } from "./session-header";
 import type { Tab } from "./tab";
+import { REMOTE_CONTROL_CARD_HIDDEN_CLASS } from "./remote-control-view";
 
 const INPUT_PLACEHOLDER_SHIFT_ENTER = l10n.t("Type a message (Shift+Enter to send / Enter for a new line)");
 
@@ -25,6 +26,7 @@ const editSummaryListeners = new Set<() => void>();
 export function applyUserSettings(msg: Extract<HostToWebview, { type: "userSettings" }>): void {
   sendKey = msg.composerSendKey;
   askQualityCheck = msg.askQualityCheck === true;
+  document.body.classList.toggle(REMOTE_CONTROL_CARD_HIDDEN_CLASS, msg.remoteControlCard === false);
   const nextEditSummary = msg.editSummaryEnabled === true;
   if (nextEditSummary === editSummary) return;
   editSummary = nextEditSummary;

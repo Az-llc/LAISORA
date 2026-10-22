@@ -599,6 +599,10 @@ button#auth.chip:hover { filter: brightness(1.15); }
 .session-name-submenu[data-side="left"] { left: auto; right: 100%; }
 .session-name-submenu[data-side="inline"] { position: static; width: auto; max-width: none; margin-left: 12px; box-shadow: none; }
 .session-menu-surface [hidden] { display: none; }
+.session-switch-item .l-switch { display: inline-block; flex: none; margin-left: auto; }
+.session-menu-surface .session-switch-item { gap: 16px; }
+.session-menu-surface .session-switch-item[aria-disabled="true"], .session-switch-item[aria-disabled="true"] .l-switch { cursor: default; }
+.session-switch-item[aria-disabled="true"] .l-switch { opacity: var(--l-disabled-opacity); }
 .session-name-loading { flex: none; color: var(--vscode-foreground); }
 .session-name-failure { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--vscode-descriptionForeground); font-size: 12px; }
 .session-rename-form { display: flex; flex: 1; min-width: 0; gap: 4px; flex-wrap: wrap; }
@@ -759,7 +763,8 @@ button#auth.chip:hover { filter: brightness(1.15); }
 .handoff-status-link:hover { text-decoration: underline; text-underline-offset: 3px; }
 .handoff-status-link:focus-visible { outline: 1px solid var(--vscode-focusBorder); outline-offset: 1px; }
 
-.panel-conv .block.handoff-card {
+.panel-conv .block.handoff-card,
+.panel-conv .block.rc-card {
   position: relative;
   max-width: 760px;
   margin: 8px 0 20px;
@@ -769,7 +774,8 @@ button#auth.chip:hover { filter: brightness(1.15); }
   line-height: 1.7;
   text-wrap: pretty;
 }
-.panel-conv .block.handoff-card::before {
+.panel-conv .block.handoff-card::before,
+.panel-conv .block.rc-card::before {
   content: "";
   position: absolute;
   left: calc(0px - var(--conv-gutter));
@@ -3620,6 +3626,9 @@ mark.find-match-current {
 .user-label:not(.user-label-custom) { text-transform: uppercase; }
 .user-label-custom { text-transform: none; }
 .conv-title-date { padding: 4px 12px 0 var(--conv-gutter); font-size: 10px; line-height: 14px; letter-spacing: 0.08em; font-variant: small-caps; color: var(--vscode-descriptionForeground); }
+.rc-card-hidden .rc-card { display: none; }
+.rc-card-link-inactive, .rc-card-link-inactive:hover { color: var(--vscode-disabledForeground, var(--vscode-descriptionForeground)); text-decoration: none; cursor: default; }
+.rc-card[data-rc-state="off"] .handoff-title { color: var(--vscode-descriptionForeground); }
 
 .laisora-plan { display: flex; align-items: baseline; gap: 8px; margin: 8px 0; font: inherit; }
 .declared-goal { min-width: 0; }

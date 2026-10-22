@@ -26,6 +26,7 @@ import { hostTodoStore, noteTodoConversationEvent, postTodoSnapshot, todoBetaEna
 import { postAttachments } from "./composer-io";
 import { pendingAttachments } from "./pending-attachments";
 import { flushChosenTitle } from "./session-list-wiring";
+import { noteAutoHandoffEvent, noteAutoHandoffUserSend } from "./handoff-wiring";
 import * as l10n from "@vscode/l10n";
 import { isUnusedSession, type Session } from "./session";
 import { applyLiveDiscoveredModels, modelsMessage } from "./gateway-models";
@@ -40,6 +41,7 @@ import type { SessionStore } from "./store-surfaces";
 import { completionVerdict, numberedLaunchVerdict, resumeVerdict } from "./time-buckets";
 import { isRunningMainLane, knownBackgroundTask } from "./work-model";
 import { parseLaisoraInput, type LaisoraInput } from "./laisora-input";
+import { flushRemoteControlRecord, noteBridgeState, noteRemoteControlClosed, setRemoteControl, startRemoteControlAtLaunch } from "./remote-control-wiring";
 
 const orchestrationPublishers = new WeakMap<ClaudeConversation, OrchestrationViewPublisher>();
 
@@ -58,6 +60,7 @@ export function postOrchestrationView(s: Session): void {
       if (s.closed || s.conversation !== conv) return undefined;
       const current = getLaisoraConfiguration();
       const placementSettings = placementSettingsOf(current);
+      const evidence = s.semantic.rosterEvidence();
       return orchestrationViewForConversation(conv, {
         orchestrationEnabled: current.get<boolean>("orchestration.enabled")!,
         guardEnabled: placementSettings.guardEnabled,
@@ -65,7 +68,7 @@ export function postOrchestrationView(s: Session): void {
         orchestrationAgents: current.get<unknown>("orchestration.agents"),
         externalTimeoutMinutes: current.get<number>("orchestration.externalTimeoutMinutes")!,
         conductorPolicy: current.get<string>("orchestration.conductorPolicy")!,
-      });
+      }, (agent) => conv.attributedRole(agent, evidence));
     }, (state) => store?.post({ type: "orchestrationView", tabId: s.tabId, state }));
     orchestrationPublishers.set(conv, publisher);
   }
@@ -514,7 +517,7 @@ export async function sendLaisoraInput(s: Session, input: LaisoraInput, text: st
 
 export async function handleConversationMessage(
   st: SessionStore,
-  msg: Extract<WebviewToHost, { type: "send" | "cancelAutoResume" | "interrupt" | "approvalDecision" | "setMode" | "setEffort" | "setModel" }>,
+  msg: Extract<WebviewToHost, { type: "send" | "cancelAutoResume" | "interrupt" | "approvalDecision" | "setMode" | "setEffort" | "setModel" | "setRemoteControl" }>,
   target: Session | undefined
 ): Promise<void> {
   switch (msg.type) {
@@ -599,6 +602,7 @@ export async function handleConversationMessage(
       } else {
         disposition("accepted-nonhuman");
       }
+      noteAutoHandoffUserSend(target!);
       target!.conversation!.send(msg.text, msg.images, sentAt, false, messageUuid);
       break;
     }
@@ -628,6 +632,9 @@ export async function handleConversationMessage(
       await applyModelChange(st, s, msg.model);
       break;
     }
+    case "setRemoteControl":
+      await setRemoteControl(target!, msg.enabled, "user");
+      break;
   }
 }
 
@@ -758,6 +765,7 @@ async function ensureConversationInner(s: Session, requestedAt: number): Promise
       if (s.conversation === conv) postOrchestrationView(s);
     },
     onCliVersion: (version) => noteRunningExecutorVersion("claude", version),
+    onBridgeState: (connection) => noteBridgeState(s, conv, connection),
     interruptForceKillTimeoutMs: cfg.get<number>("interruptForceKillTimeoutMs")!,
     onEvent: (raw, conversationId, meta) => {
       const own = conversationId === s.expectedConversationId && !s.closed;
@@ -778,6 +786,9 @@ async function ensureConversationInner(s: Session, requestedAt: number): Promise
         rederiveConfiguredEffort(store, s);
       }
       s.pushEvent(ev, conversationId, meta);
+      if (own && ev.kind === "conversation_closed") noteRemoteControlClosed(s, conv);
+      if (own && ev.kind === "auth_status") flushRemoteControlRecord(s);
+      if (own) noteAutoHandoffEvent(s, ev);
       if (own) settleFallbackRevert(store, s, conv, ev);
       if (own && todoEnabled) noteTodoConversationEvent(s, ev);
       if (TURN_END_KINDS.has(ev.kind)) noteCliUpdateOpportunity();
@@ -819,6 +830,7 @@ async function ensureConversationInner(s: Session, requestedAt: number): Promise
     }
     s.conversation = conv;
     noteCliStarted(s);
+    void startRemoteControlAtLaunch(s, conv);
     if (s.permissionMode !== launchPermissionMode) {
       void requestPermissionMode(store, s, s.permissionMode, launchPermissionMode).catch((e: unknown) =>
         output.appendLine(`[${s.title}] setPermissionMode 失敗: ${String(e)}`));

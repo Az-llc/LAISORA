@@ -1,11 +1,12 @@
 import { extractArtifactAccesses, projectArtifactAccess, PROGRESS_WIRE_TOOL_NAME } from "./artifact-access";
 import type { EffectCoverage, HostArtifactAccess, ProjectedArtifactAccess } from "./artifact-access";
-import { redactAbsolutePaths, redactOptional } from "./path-redaction";
+import { redactAbsolutePaths } from "./path-redaction";
 import type { DelegationInfo, ProgressEmission, ProgressState, TaskNotificationInfo } from "./protocol";
-import { parseTaskIntentFromRawInput } from "./work-model";
+import { observedTaskIntent } from "./work-model";
 import type { TaskIntent } from "./work-model";
 import { taskNotificationDisplayFields } from "./transcript-display";
 import { isExternalRunTool } from "./orchestration-executors";
+import { DELEGATION_TOOL_NAMES, isDelegationTool } from "./claude-tool-names";
 
 export interface Stage0ToolFields {
   delegation?: DelegationInfo;
@@ -62,22 +63,6 @@ export function extractProgressEmission(
   };
 }
 
-function redactTaskIntent(intent: TaskIntent | undefined): TaskIntent | undefined {
-  if (!intent) return undefined;
-  if (intent.kind === "todo") {
-    return { ...intent, items: intent.items.map(item => ({
-      ...item,
-      taskKey: `todo:${redactAbsolutePaths(item.taskKey.slice("todo:".length))}`,
-      description: redactAbsolutePaths(item.description),
-      activeForm: redactOptional(item.activeForm),
-    })) };
-  }
-  if (intent.kind === "create") {
-    return { ...intent, subject: redactAbsolutePaths(intent.subject), activeForm: redactOptional(intent.activeForm) };
-  }
-  return { ...intent, taskKey: `task:${redactAbsolutePaths(intent.taskKey.slice("task:".length))}`, subject: redactOptional(intent.subject),
-    activeForm: redactOptional(intent.activeForm) };
-}
 
 export function extractStage0ToolFields(
   toolName: string,
@@ -85,7 +70,7 @@ export function extractStage0ToolFields(
   toolUseId: string,
   baseDir: string
 ): Stage0ToolFields {
-  const isAgentTool = toolName === "Task" || toolName === "Agent";
+  const isAgentTool = isDelegationTool(toolName);
 
   let delegation: DelegationInfo | undefined;
   if (isAgentTool && input) {
@@ -108,7 +93,7 @@ export function extractStage0ToolFields(
     }
   }
 
-  const taskIntentStructured = redactTaskIntent(parseTaskIntentFromRawInput(toolName, input, toolUseId));
+  const taskIntentStructured = observedTaskIntent(toolName, input, toolUseId);
   const extraction = extractArtifactAccesses(toolName, input, baseDir);
   const progressEmission = extractProgressEmission(toolName, input);
 
@@ -128,7 +113,7 @@ export interface ResumeSignals {
   backgroundTaskId?: string;
 }
 
-export const RESUME_SIGNAL_TOOL_NAMES: ReadonlySet<string> = new Set(["Task", "Agent", "SendMessage", "Bash"]);
+export const RESUME_SIGNAL_TOOL_NAMES: ReadonlySet<string> = new Set([...DELEGATION_TOOL_NAMES, "SendMessage", "Bash"]);
 export const isResumeSignalToolName = (name: string): boolean =>
   RESUME_SIGNAL_TOOL_NAMES.has(name) || /^mcp__[A-Za-z0-9_-]+__[A-Za-z0-9_-]+$/.test(name) || isExternalRunTool(name);
 
@@ -140,7 +125,7 @@ export function extractResumeSignals(
   rawResultText: string
 ): ResumeSignals | undefined {
   const text = rawResultText.trimStart();
-  if (toolName === "Task" || toolName === "Agent") {
+  if (toolName !== undefined && isDelegationTool(toolName)) {
     if (text.startsWith("Async agent launched successfully")) {
       const m = /^agentId:\s*([A-Za-z0-9._-]+)/m.exec(text);
       if (m) return { asyncLaunchedAgentId: m[1] };

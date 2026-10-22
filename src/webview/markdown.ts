@@ -121,6 +121,14 @@ function linkKindIcon(kind: "file" | "folder" | "app" | "web" | "mail"): SVGSVGE
   return svg;
 }
 
+export function externalLinkElement(href: string, kind: "web" | "mail"): HTMLAnchorElement {
+  const a = document.createElement("a");
+  a.href = href;
+  a.rel = "noopener noreferrer";
+  a.appendChild(linkKindIcon(kind));
+  return a;
+}
+
 function externalLinkCopyText(url: URL): string {
   if (url.protocol !== "mailto:") return url.href;
   try {
@@ -306,11 +314,8 @@ export function renderMarkdownInto(container: HTMLElement, src: string, tabId?: 
         }
         const fileTarget = externalUrl === undefined && tabId !== undefined ? parseHostFileLinkTarget(node.href) : null;
         if (externalUrl !== undefined) {
-          const a = document.createElement("a");
-          a.href = node.href;
-          a.rel = "noopener noreferrer";
+          const a = externalLinkElement(node.href, externalUrl.protocol === "mailto:" ? "mail" : "web");
           if (node.title) a.title = node.title;
-          a.appendChild(linkKindIcon(externalUrl.protocol === "mailto:" ? "mail" : "web"));
           for (const child of node.children) renderNode(child, a);
           target.appendChild(a);
           const copyText = externalLinkCopyText(externalUrl);

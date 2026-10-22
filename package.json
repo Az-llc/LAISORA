@@ -2,7 +2,7 @@
   "name": "laisora",
   "displayName": "LAISORA",
   "description": "%extension.description%",
-  "version": "1.10.0",
+  "version": "1.11.0",
   "publisher": "az-llc",
   "categories": [
     "AI",
@@ -187,6 +187,53 @@
           "default": true,
           "scope": "application",
           "description": "%config.laisora.editSummary.enabled.description%"
+        },
+        "laisora.remoteControl.showCard": {
+          "type": "boolean",
+          "default": true,
+          "scope": "application",
+          "description": "%config.laisora.remoteControl.showCard.description%"
+        },
+        "laisora.handoff.auto.enabled": {
+          "type": "boolean",
+          "default": false,
+          "scope": "application",
+          "description": "%config.laisora.handoff.auto.enabled.description%"
+        },
+        "laisora.handoff.auto.mode": {
+          "type": "string",
+          "enum": [
+            "ratio",
+            "tokens"
+          ],
+          "enumDescriptions": [
+            "%config.laisora.handoff.auto.mode.ratio%",
+            "%config.laisora.handoff.auto.mode.tokens%"
+          ],
+          "default": "ratio",
+          "scope": "application",
+          "description": "%config.laisora.handoff.auto.mode.description%"
+        },
+        "laisora.handoff.auto.percent": {
+          "type": "integer",
+          "minimum": 10,
+          "maximum": 95,
+          "default": 70,
+          "scope": "application",
+          "description": "%config.laisora.handoff.auto.percent.description%"
+        },
+        "laisora.handoff.auto.tokens": {
+          "type": "integer",
+          "minimum": 100000,
+          "default": 500000,
+          "scope": "application",
+          "description": "%config.laisora.handoff.auto.tokens.description%"
+        },
+        "laisora.handoff.cacheExpiry.enabled": {
+          "type": "boolean",
+          "default": false,
+          "scope": "application",
+          "description": "%config.laisora.handoff.cacheExpiry.enabled.description%"
         },
         "laisora.claude.fileLinkInstruction": {
           "type": "boolean",
@@ -507,7 +554,7 @@
     "typecheck": "tsc --noEmit"
   },
   "devDependencies": {
-    "@anthropic-ai/claude-agent-sdk": "^0.3.306",
+    "@anthropic-ai/claude-agent-sdk": "^0.3.309",
     "@types/node": "^24.0.0",
     "@types/vscode": "^1.90.0",
     "@vscode/l10n": "0.0.18",

@@ -24,16 +24,33 @@ import {
 } from "./protocol";
 import {
   errText,
+  lookupSessionFile,
   persistChosenTitle,
   resolveSessionImage,
   sessionTranscriptRef,
 } from "./session-files";
-import { IN_FLIGHT_KEY, isHandoffForkInFlight } from "./handoff-runner";
+import {
+  HandoffRunner,
+  IN_FLIGHT_KEY,
+  ORPHANS_KEY,
+  handoffForkState,
+  heldForkTabAction,
+  heldTabInsertIndex,
+  holdForkTab,
+  isHandoffForkHidden,
+  releaseHeldForkTab,
+  withHeldForkTabs,
+  type HandoffForkState,
+  type HeldForkTab,
+  type HeldForkTabEvent,
+} from "./handoff-runner";
+import { handoffFs, handoffPersist, readHandoffRecords } from "./handoff-wiring";
+import { openResumedSession } from "./resume-hydration";
 import { normalizeTitleValue } from "./session-display-title";
 import { sessionRecordId } from "./session-record";
 import type { SessionCandidate } from "./session-list";
 import { SESSION_RESOLVE_BATCH, candidatePathIndex, displayTitleFromSummary, rankSessionCandidates, streamSessionRows } from "./session-list";
-import type { SessionStore } from "./store-surfaces";
+import { reorderSessionTabs, type SessionStore } from "./store-surfaces";
 import { postTodoSnapshot } from "./todo-surface";
 
 const USED_SESSIONS_KEY = "history.laisoraSessions";
@@ -105,7 +122,7 @@ function openTabsPersistFailed(error: unknown): void {
 
 export function persistOpenTabs(): Promise<void> {
   try {
-    const entries = openTabEntries();
+    const entries = withHeldForkTabs(openTabEntries(), heldForkTabs);
     const serialized = JSON.stringify(entries);
     if (serialized === lastPersistedOpenTabs) return Promise.resolve();
     postTodoSnapshot();
@@ -139,8 +156,114 @@ export function readPersistedOpenTabs(): PersistedOpenTab[] {
   }
   return entries.sort((a, b) => a.order - b.order);
 }
+function handoffRegistries(): { inFlight: unknown; orphans: unknown } {
+  const globalState = extensionContext?.globalState;
+  return { inFlight: globalState?.get<unknown>(IN_FLIGHT_KEY), orphans: globalState?.get<unknown>(ORPHANS_KEY) };
+}
+export function handoffForkStateOf(sessionId: string, now: number): HandoffForkState | undefined {
+  const { inFlight, orphans } = handoffRegistries();
+  return handoffForkState(inFlight, orphans, sessionId, now);
+}
 export function handoffForkInFlight(sessionId: string, now: number): boolean {
-  return isHandoffForkInFlight(extensionContext?.globalState?.get<unknown>(IN_FLIGHT_KEY), sessionId, now);
+  return isHandoffForkHidden(handoffForkStateOf(sessionId, now));
+}
+export function postSessionListChanged(): void {
+  store?.post({ type: "sessionListChanged" });
+}
+
+export async function sweepHandoffForksAtStartup(): Promise<void> {
+  try {
+    const result = await HandoffRunner.sweepOrphans(
+      { fs: handoffFs, persist: handoffPersist(), readRecords: readHandoffRecords, log: (line) => output.appendLine(line) },
+      claudeProjectsDir()
+    );
+    if (result.deleted.length + result.kept.length + result.failed.length > 0) postSessionListChanged();
+  } catch (error) {
+    output.appendLine(`[startup] handoff の孤児回収に失敗: ${errText(error)}`);
+  }
+  settleHeldForkTabs();
+}
+
+let heldForkTabs: HeldForkTab<PersistedOpenTab>[] = [];
+const reopeningForkTabs = new Set<string>();
+
+export function holdHandoffForkTab(entry: PersistedOpenTab): void {
+  const preceding = readPersistedOpenTabs()
+    .filter((tab) => tab.order < entry.order && tab.sessionId !== entry.sessionId)
+    .map((tab) => tab.sessionId);
+  heldForkTabs = holdForkTab(heldForkTabs, entry, preceding);
+  void persistOpenTabs();
+}
+
+export function noteHandoffForkTab(event: HeldForkTabEvent): void {
+  heldForkTabs = releaseHeldForkTab(heldForkTabs, event);
+}
+
+function noticeInFirstTab(message: string): void {
+  const first = store?.sessions.values().next().value;
+  first?.pushEvent({ kind: "error", message, fatal: false });
+}
+
+export function unfinishedHandoffTabNotice(label: string, state: HandoffForkState | undefined): string {
+  switch (state) {
+    case "handing_off":
+    case "stale":
+      return l10n.t("The tab \"{0}\" was not restored: its handoff had not finished. LAISORA keeps it in the tab list and checks the copy at startup.", label);
+    case "cleanup_failed":
+      return l10n.t("The tab \"{0}\" was not restored: it is a copy left by a handoff that did not finish, and it could not be removed.", label);
+    default:
+      return l10n.t("The tab \"{0}\" was not restored: it was a copy left by a handoff that did not finish, and it has been removed.", label);
+  }
+}
+
+function dropHeldForkTab(tab: PersistedOpenTab, message: string): void {
+  noteHandoffForkTab({ kind: "settled", sessionId: tab.sessionId, action: "drop" });
+  void persistOpenTabs();
+  noticeInFirstTab(message);
+}
+
+function settleHeldForkTabs(): void {
+  if (heldForkTabs.length === 0) return;
+  for (const held of heldForkTabs) {
+    const tab = held.tab;
+    if (reopeningForkTabs.has(tab.sessionId)) continue;
+    const state = handoffForkStateOf(tab.sessionId, Date.now());
+    const lookup = state === undefined ? lookupSessionFile(tab.sessionId) : undefined;
+    const action = heldForkTabAction(
+      state,
+      lookup === undefined || lookup.reason === "scan_failed" ? "unknown" : lookup.path !== null ? "present" : "missing"
+    );
+    if (action === "drop") dropHeldForkTab(tab, unfinishedHandoffTabNotice(tab.title ?? tab.sessionId, state));
+    else if (action === "reopen" && lookup?.path) reopenHeldForkTab(held, lookup.path);
+  }
+}
+
+function reopenHeldForkTab(held: HeldForkTab<PersistedOpenTab>, filePath: string): void {
+  const tab = held.tab;
+  const st = store;
+  if (!st) return;
+  const label = tab.title ?? tab.sessionId;
+  const failed = (): void => dropHeldForkTab(tab, l10n.t("Could not restore the tab \"{0}\" (session {1}).", label, tab.sessionId));
+  reopeningForkTabs.add(tab.sessionId);
+  void openResumedSession(st, { sessionId: tab.sessionId, filePath, activate: false, knownCwd: tab.cwd, restoreEntry: tab })
+    .then((opened) => {
+      if (opened.session !== undefined) {
+        const others = [...st.sessions.values()].filter((s) => s !== opened.session);
+        const order = others.map((s) => s.tabId);
+        order.splice(heldTabInsertIndex(others.map((s) => sessionRecordId(s)), held.preceding), 0, opened.session.tabId);
+        reorderSessionTabs(st, order);
+      } else if (opened.handoffFork === "cleanup_failed") {
+        dropHeldForkTab(tab, unfinishedHandoffTabNotice(label, opened.handoffFork));
+      } else if ([...st.sessions.values()].some((s) => !s.closed && sessionRecordId(s) === tab.sessionId)) {
+        noteHandoffForkTab({ kind: "opened", sessionId: tab.sessionId });
+      } else if (opened.handoffFork === undefined) {
+        failed();
+      }
+    }, (error) => {
+      output.appendLine(`[restore] could not reopen the tab of a finished handoff: ${tab.sessionId}: ${errText(error)}`);
+      failed();
+    })
+    .finally(() => reopeningForkTabs.delete(tab.sessionId));
 }
 const HIDDEN_SESSIONS_KEY = "history.hiddenSessions";
 export function hiddenSessionIds(): Set<string> {
@@ -165,18 +288,26 @@ interface HistoryListing {
   token: number;
   candidates: SessionCandidate[];
   knownIds: ReadonlySet<string>;
-  origins: Map<string, "claude" | "unknown" | "failed">;
+  origins: Map<string, HistoricalOrigin | "failed">;
   degradation: SessionScanDegradation;
 }
 const historyPages = new Map<string, HistoryListing>();
 
-const originCache = new Map<string, "claude" | "unknown">();
-async function historicalOrigin(file: string, probes?: { count: number; bytes: number }): Promise<"claude" | "unknown" | "failed"> {
+const originCache = new Map<string, HistoricalOrigin>();
+type HistoricalOrigin = "claude" | "claude-fork" | "unknown";
+const CLAUDE_CODE_ENTRYPOINTS: ReadonlySet<string> = new Set(["cli", "claude-vscode", "claude-desktop"]);
+function historySourceOf(origin: HistoricalOrigin | "failed", indexedByLaisora: boolean): HistorySource | undefined {
+  if (origin === "claude") return "claude";
+  if (origin === "claude-fork") return indexedByLaisora ? "laisora" : "claude";
+  if (origin === "failed") return indexedByLaisora ? "laisora" : undefined;
+  return "laisora";
+}
+async function historicalOrigin(file: string, probes?: { count: number; bytes: number }): Promise<HistoricalOrigin | "failed"> {
   const cached = originCache.get(file);
   if (cached) return cached;
   const handle = await open(file, "r").catch(() => undefined);
   if (!handle) return "failed";
-  let origin: "claude" | "unknown" = "unknown";
+  let origin: HistoricalOrigin = "unknown";
   try {
     const buffer = Buffer.alloc(65536);
     const { bytesRead } = await handle.read(buffer, 0, buffer.length, 0);
@@ -186,7 +317,7 @@ async function historicalOrigin(file: string, probes?: { count: number; bytes: n
         const record = JSON.parse(line);
         if (record.type !== "user" && record.type !== "assistant") continue;
         if (typeof record.entrypoint !== "string") continue;
-        origin = record.entrypoint === "cli" || record.entrypoint === "claude-vscode" ? "claude" : "unknown";
+        origin = !CLAUDE_CODE_ENTRYPOINTS.has(record.entrypoint) ? "unknown" : record.forkedFrom ? "claude-fork" : "claude";
         break;
       } catch { }
     }
@@ -330,7 +461,7 @@ async function listPastSessions(
     (options.showHidden === true || !hidden.has(c.sessionId)) && !handoffForkInFlight(c.sessionId, scanDoneT));
   const token = continuation?.token ?? requestId;
   const knownIds = continuation?.knownIds ?? new Set(Object.keys(known));
-  const origins = continuation?.origins ?? new Map<string, "claude" | "unknown" | "failed">();
+  const origins = continuation?.origins ?? new Map<string, HistoricalOrigin | "failed">();
   if (!continuation) historyPages.set(pageKey, {token, candidates, knownIds, origins, degradation});
   const pathBySessionId = candidatePathIndex(candidates);
   const sortDoneT = Date.now();
@@ -342,19 +473,19 @@ async function listPastSessions(
   let originMs = 0;
   const matchesSource = async (c: SessionCandidate): Promise<boolean> => {
     if (!options.source) return true;
-    if (knownIds.has(c.sessionId)) return source === "laisora";
+    const indexed = knownIds.has(c.sessionId);
     let origin = origins.get(c.sessionId);
     if (origin === undefined) {
       const t = Date.now();
       origin = await historicalOrigin(c.filePath, originProbes);
       originMs += Date.now() - t;
       origins.set(c.sessionId, origin);
-      if (origin === "failed" && source === "claude") {
+      if (origin === "failed" && historySourceOf(origin, indexed) === undefined && source === "claude") {
         degradation.statFailed++;
         output.appendLine(`[history] 由来を読めません（一覧から除外）: ${c.sessionId}・req ${requestId}`);
       }
     }
-    return source === "laisora" ? origin !== "claude" : origin === "claude";
+    return historySourceOf(origin, indexed) === source;
   };
   let firstRowT = 0;
   let resolveStarts = 0;

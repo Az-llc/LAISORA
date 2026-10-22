@@ -1,10 +1,11 @@
 import { createHash } from "node:crypto";
+import { isChildCall } from "./spans";
 import type { NormalizedEvent, ProgressState } from "./protocol";
 import { progressSubjectKey } from "./progress-protocol";
 import type { HostArtifactAccess } from "./artifact-access";
 import { PROGRESS_WIRE_TOOL_NAME } from "./artifact-access";
 import type { TaskIntent, TaskStatus } from "./work-model";
-import { CLAUDE_VOCABULARY, taskCreateKeyFromResult } from "./work-model";
+import { bookkeepingIntent, CLAUDE_VOCABULARY, taskCreateKeyFromResult } from "./work-model";
 import { isPureCommandWrapper } from "./human-input-vocabulary";
 import { redactAbsolutePaths } from "./path-redaction";
 import { isRejectedBeforeRun } from "./tool-result-signals";
@@ -341,7 +342,7 @@ function classifyGapEvent(
     case "assistant_text_delta":
       return { canEnd: true, canStart: true, turnId: event.turnId ?? null };
     case "tool_call_started":
-      if (event.parentToolUseId != null) return null;
+      if (isChildCall(event.parentToolUseId)) return null;
       return { canEnd: true, canStart: true, turnId: event.turnId ?? null };
     case "turn_completed":
       return { canEnd: true, canStart: false, turnId: event.turnId ?? null };
@@ -365,7 +366,7 @@ function nextOpenSidechain(
   event: NormalizedEvent
 ): readonly string[] {
   if (event.kind === "tool_call_started") {
-    if (event.parentToolUseId == null || open.includes(event.toolUseId)) return open;
+    if (!isChildCall(event.parentToolUseId) || open.includes(event.toolUseId)) return open;
     const added = [...open, event.toolUseId];
     return added.length > MAX_OPEN_SIDECHAIN_TOOLS
       ? added.slice(added.length - MAX_OPEN_SIDECHAIN_TOOLS)
@@ -574,8 +575,9 @@ function foldEvidenceBody(
   const { activeTaskKeyAtStart, activeAmbiguousAtStart } = activeTaskState(summaryMap);
 
   let pendingIntents = index.pendingIntents;
-  if (event.taskIntentStructured) {
-    pendingIntents = { ...pendingIntents, [toolUseId]: { intent: event.taskIntentStructured } };
+  const intent = bookkeepingIntent(event);
+  if (intent) {
+    pendingIntents = { ...pendingIntents, [toolUseId]: { intent } };
     const keys = Object.keys(pendingIntents);
     if (keys.length > MAX_PENDING_INTENTS) {
       const trimmed = { ...pendingIntents };

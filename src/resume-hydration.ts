@@ -40,9 +40,20 @@ import {
 import { createGuardrailState } from "./guardrail";
 import { initialSessionFacts } from "./session-facts";
 import { isInSessionStore, lookupSessionFile } from "./session-files";
-import { foldTitleRecords, splitCompleteLines } from "./session-display-title";
+import { firstRecordCwd, splitCompleteLines } from "./session-display-title";
 import { displayTitleFromSummary } from "./session-list";
-import { handoffForkInFlight, holdsChosenTitle, rememberSession, refreshTabTitle, sessionDisplayTitleOf, sessionSummaryOf } from "./session-list-wiring";
+import { isHandoffForkHidden, type HandoffForkState } from "./handoff-runner";
+import {
+  handoffForkStateOf,
+  holdHandoffForkTab,
+  holdsChosenTitle,
+  noteHandoffForkTab,
+  rememberSession,
+  refreshTabTitle,
+  sessionDisplayTitleOf,
+  sessionSummaryOf,
+  type PersistedOpenTab,
+} from "./session-list-wiring";
 import { currentGenerationRecords } from "./time-buckets";
 import {
   captureResumeReadSet,
@@ -61,6 +72,7 @@ import {
   type SessionTranscript,
   type TranscriptMessage,
 } from "./session-transcript";
+import { childSpansOf } from "./transcript-time-buckets";
 import {
   Session,
   historyScopeKey,
@@ -150,7 +162,7 @@ async function readRecordedSessionCwd(
       ...splitCompleteLines(tail, tailStart).lines,
     ];
     const relocation = lastRelocatedCwd(lines);
-    const firstCwd = foldTitleRecords({ candidates: {} }, lines).cwd;
+    const firstCwd = firstRecordCwd(lines);
     const dirName = basename(dirname(filePath));
     const matching = [relocation.cwd, firstCwd].filter(
       (candidate): candidate is string =>
@@ -211,6 +223,7 @@ export interface ResumeHydration {
 interface ResumeOpenOutcome {
   tabPosted: boolean;
   session: Session | undefined;
+  handoffFork?: HandoffForkState;
 }
 
 function restoredHandoffContextUsage(value: unknown): HandoffContextUsage | undefined {
@@ -253,6 +266,7 @@ export async function openResumedSession(
     inherit?: { model: string | null | undefined; effort: Session["effortOverride"] };
     knownCwd?: string;
     startMeasurement?: StartMeasurement;
+    restoreEntry?: PersistedOpenTab;
   }
 ): Promise<ResumeOpenOutcome> {
   let tabPosted = false;
@@ -261,10 +275,17 @@ export async function openResumedSession(
     void vscode.window.showWarningMessage(l10n.t("LAISORA: Logs outside the session store cannot be restored."));
     return { tabPosted, session: undefined };
   }
-  if (handoffForkInFlight(req.sessionId, Date.now())) {
-    output.appendLine(`[drop] resume of a fork whose handoff is still running: ${req.sessionId}`);
-    void vscode.window.showWarningMessage(l10n.t("LAISORA: This conversation is still being handed off. Open it after the handoff finishes."));
-    return { tabPosted, session: undefined };
+  const forkState = handoffForkStateOf(req.sessionId, Date.now());
+  if (forkState !== undefined) {
+    output.appendLine(`[drop] resume of a handoff copy (${forkState}): ${req.sessionId}`);
+    if (req.restoreEntry !== undefined) {
+      if (isHandoffForkHidden(forkState)) holdHandoffForkTab(req.restoreEntry);
+    } else {
+      void vscode.window.showWarningMessage(forkState === "handing_off"
+        ? l10n.t("LAISORA: This conversation is still being handed off. Open it after the handoff finishes.")
+        : l10n.t("LAISORA: This conversation is a copy left by a handoff that did not finish, so it cannot be opened."));
+    }
+    return { tabPosted, session: undefined, handoffFork: forkState };
   }
   const inFlight = [...st.sessions.values()].find(
     (t) => t.resuming && t.resumeSessionId === req.sessionId
@@ -298,6 +319,7 @@ export async function openResumedSession(
       try {
         detached = s.detachConversation();
         s.resetLogicalSession();
+        s.remoteControl.choice = undefined;
         s.resetDiscardedProfileForResume();
       } finally {
         s.clearing = false;
@@ -318,6 +340,7 @@ export async function openResumedSession(
       logicalGeneration: s.logicalGeneration,
       source: "resume",
     };
+    s.semantic.loadExternalRuns(s.conversation);
     s.analysisStore.loadPersistedArtifactsFromStore();
     s.analysisStore.flushPendingPersistence();
     if (canReuse) {
@@ -384,6 +407,7 @@ export async function openResumedSession(
         : { type: "tabCreated", tab: s.resumePreviewSnapshot(hydration), activate: req.activate }
     );
     tabPosted = !canReuse;
+    noteHandoffForkTab({ kind: "opened", sessionId: req.sessionId });
     trackResumeTitle(st, s, hydration, titleRequest);
     output.appendLine(
       `[${s.title}] resume phase1 描画: ${Date.now() - resumeT0}ms` +
@@ -583,6 +607,7 @@ export function createHydrationDraft(s: Session): EventFoldDraft {
     backgroundActivity: createBackgroundActivityState(),
     workModel: createWorkModelState(),
     evidenceIndex: createEvidenceIndex(),
+    childSpans: s.childSpans,
     events: [],
     titleRefreshed: s.titleRefreshed,
     titleRefreshing: s.titleRefreshing,
@@ -680,17 +705,133 @@ export async function foldHistoryEvents(
   draft: EventFoldDraft,
   history: { events: readonly HistoryEvent[] },
   visit: (step: FoldEventResult, ev: HistoryEvent) => "continue" | "stop",
-  invalidated: () => boolean
+  invalidated: () => boolean,
+  untimedAt?: number
 ): Promise<"complete" | "stopped" | "invalidated"> {
   const maybeYield = createHydrationYielder();
   for (const ev of currentGenerationRecords(history.events)) {
     const step = foldEventState(draft, ev.body, undefined, {
-      timestamp: ev.timestamp,
+      timestamp: isObservedTime(ev.timestamp) || draft.lastEventTimestamp !== undefined ? ev.timestamp : untimedAt ?? ev.timestamp,
       hostArtifacts: ev.hostArtifacts,
       gapBoundaries: ev.gapBoundaries,
       suppressPost: true,
     });
     if (visit(step, ev) === "stop") return "stopped";
+    const pending = maybeYield();
+    if (pending) {
+      await pending;
+      if (invalidated()) return "invalidated";
+    }
+  }
+  return "complete";
+}
+
+export function earliestRecordedTime(
+  messages: readonly TranscriptMessage[],
+  history: { readonly events: readonly HistoryEvent[] }
+): number | undefined {
+  let earliest: number | undefined;
+  for (const at of [...messages.map((m) => m.timestamp), ...currentGenerationRecords(history.events).map((ev) => ev.timestamp)]) {
+    if (isObservedTime(at) && (earliest === undefined || at < earliest)) earliest = at;
+  }
+  return earliest;
+}
+
+export async function readRestoredRecords(
+  filePath: string,
+  sessionId: string,
+  readSet: ResumeReadSet | undefined,
+  parentRecords: ParentRecordSource | undefined,
+  capturedTranscript?: SessionTranscript
+): Promise<{ transcript: SessionTranscript; history: SessionHistoryRead }> {
+  const transcript = capturedTranscript ?? await readSessionTranscript(filePath, isInSessionStore, readSet, sessionId, parentRecords);
+  const history = await readSessionHistory(filePath, isInSessionStore, {
+    ...(readSet === undefined ? {} : { resumeReadSet: readSet }),
+    generationSessionId: sessionId,
+    parentRecords,
+  });
+  return { transcript, history };
+}
+
+function restoredReadNotices(
+  transcript: Pick<SessionTranscript, "messages" | "readError" | "malformedLineCount">,
+  history: Pick<SessionHistoryRead, "events" | "readError" | "subagentsReadError" | "malformedLineCount">
+): NormalizedEventBody[] {
+  if (transcript.readError || history.readError) {
+    const err = transcript.readError ?? history.readError;
+    const nothingRead = history.events.length === 0 && transcript.messages.length === 0;
+    return [{
+      kind: "error",
+      message: nothingRead
+        ? l10n.t("Could not read the past log ({0}). Resuming without history (the CLI-side resume continues).", String(err))
+        : l10n.t(
+            "Could not read the past log ({0}). Resuming with only the part that could be read (the CLI-side resume continues).",
+            String(err)
+          ),
+      fatal: false,
+    }];
+  }
+  if (history.subagentsReadError) {
+    return [{
+      kind: "error",
+      message: l10n.t(
+        "Could not read the subagent record list ({0}). Subagent work is not included in the history (the CLI-side resume continues).",
+        history.subagentsReadError
+      ),
+      fatal: false,
+    }];
+  }
+  if (transcript.malformedLineCount > 0 || history.malformedLineCount > 0) {
+    const count = Math.max(transcript.malformedLineCount, history.malformedLineCount);
+    return [{
+      kind: "error",
+      message: l10n.t("{0} lines of the past log could not be read. Part of the history is missing.", count),
+      fatal: false,
+    }];
+  }
+  return [];
+}
+
+export async function foldRestoredRecords(
+  draft: EventFoldDraft,
+  transcript: Pick<SessionTranscript, "messages" | "readError" | "malformedLineCount">,
+  history: Pick<SessionHistoryRead, "events" | "readError" | "subagentsReadError" | "malformedLineCount">,
+  visit: (step: FoldEventResult) => "continue" | "stop",
+  invalidated: () => boolean
+): Promise<"complete" | "stopped" | "invalidated"> {
+  const plan = restoredMessagePlan(transcript.messages, history);
+  const untimedAt = earliestRecordedTime(transcript.messages, history);
+  const foldBody = (body: NormalizedEventBody, own?: number): "continue" | "stop" => {
+    const timestamp = isObservedTime(own) ? own : draft.lastEventTimestamp === undefined ? untimedAt : undefined;
+    return visit(foldEventState(draft, body, undefined, {
+      ...(timestamp === undefined ? {} : { timestamp }),
+      suppressPost: true,
+    }));
+  };
+  const foldMessages = (messages: readonly TranscriptMessage[]): "continue" | "stop" => {
+    for (const m of messages) if (foldBody(replayedMessageEvent(m), m.timestamp) === "stop") return "stop";
+    return "continue";
+  };
+  if (foldMessages(plan.head) === "stop") return "stopped";
+  const folded = await foldHistoryEvents(
+    draft,
+    history,
+    (step, ev) => {
+      if (visit(step) === "stop") return "stop";
+      const uuid = restoredRecordUuid(ev.body);
+      const following = uuid === undefined ? undefined : plan.after.get(uuid);
+      if (uuid === undefined || following === undefined) return "continue";
+      plan.after.delete(uuid);
+      return foldMessages(following);
+    },
+    invalidated,
+    untimedAt
+  );
+  if (folded !== "complete") return folded;
+  for (const notice of restoredReadNotices(transcript, history)) if (foldBody(notice) === "stop") return "stopped";
+  const maybeYield = createHydrationYielder();
+  for (const m of [...[...plan.after.values()].flat(), ...plan.tail]) {
+    if (foldMessages([m]) === "stop") return "stopped";
     const pending = maybeYield();
     if (pending) {
       await pending;
@@ -893,15 +1034,8 @@ async function runResumeHydrationStages(
       output.appendLine(`[${s.title}] resume shared parse turn not reached after ${turn.waitedMs}ms; reading unshared`);
     }
     if (invalidated()) return abort("読み取りの順番待ちの間にセッションが変化しました");
-    transcript = capturedTranscript ?? await readSessionTranscript(h.filePath, isInSessionStore, h.readSet, h.sessionId, parentRecords);
-    if (capturedTranscript === undefined) stage("transcript");
-    if (invalidated()) return abort("読み取り中にセッションが変化しました");
-    history = await readSessionHistory(h.filePath, isInSessionStore, {
-      ...(h.readSet === undefined ? {} : { resumeReadSet: h.readSet }),
-      generationSessionId: h.sessionId,
-      parentRecords,
-    });
-    stage("history");
+    ({ transcript, history } = await readRestoredRecords(h.filePath, h.sessionId, h.readSet, parentRecords, capturedTranscript));
+    stage(capturedTranscript === undefined ? "transcript+history" : "history");
     if (invalidated()) return abort("履歴読み取り中にセッションが変化しました");
     conversation = await readConversationMessages(h.filePath, isInSessionStore, h.readSet, h.sessionId, parentRecords);
     stage("conversation");
@@ -961,6 +1095,7 @@ async function runResumeHydrationStages(
   }
 
   const draft = createHydrationDraft(s);
+  draft.childSpans = childSpansOf(restored.agents, restored.readAt);
   const sink: DraftEffectSink = {
     guardrailRefresh: false,
     guardrailTick: false,
@@ -968,27 +1103,12 @@ async function runResumeHydrationStages(
     commandsTouched: false,
     liveTurnCompleted: false,
   };
-  const foldIntoDraft = (
-    partial: NormalizedEventBody & { provenance?: EventProvenance }
-  ): void => {
-    applyDraftEffects(
-      foldEventState(draft, partial, undefined, { suppressPost: true }).effects,
-      sink
-    );
-  };
-  const plan = restoredMessagePlan(messages, history);
-  for (const m of plan.head) foldIntoDraft(replayedMessageEvent(m));
-  const folded = await foldHistoryEvents(
+  const folded = await foldRestoredRecords(
     draft,
+    transcript,
     history,
-    (step, ev) => {
+    (step) => {
       applyDraftEffects(step.effects, sink);
-      const uuid = restoredRecordUuid(ev.body);
-      const following = uuid === undefined ? undefined : plan.after.get(uuid);
-      if (uuid !== undefined && following !== undefined) {
-        plan.after.delete(uuid);
-        for (const m of following) foldIntoDraft(replayedMessageEvent(m));
-      }
       return "continue";
     },
     invalidated
@@ -1034,49 +1154,9 @@ async function runResumeHydrationStages(
   });
   draft.workModel = markBackgroundUnconfirmed(draft.workModel, draft.lastEventTimestamp ?? Date.now());
 
-  if (transcript.readError || history.readError) {
-    const err = transcript.readError ?? history.readError;
-    const nothingRead = history.events.length === 0 && messages.length === 0;
-    foldIntoDraft({
-      kind: "error",
-      message: nothingRead
-        ? l10n.t("Could not read the past log ({0}). Resuming without history (the CLI-side resume continues).", String(err))
-        : l10n.t(
-            "Could not read the past log ({0}). Resuming with only the part that could be read (the CLI-side resume continues).",
-            String(err)
-          ),
-      fatal: false,
-    });
-  } else if (history.subagentsReadError) {
-    foldIntoDraft({
-      kind: "error",
-      message: l10n.t(
-        "Could not read the subagent record list ({0}). Subagent work is not included in the history (the CLI-side resume continues).",
-        history.subagentsReadError
-      ),
-      fatal: false,
-    });
-  } else if (transcript.malformedLineCount > 0 || history.malformedLineCount > 0) {
-    const count = Math.max(transcript.malformedLineCount, history.malformedLineCount);
-    foldIntoDraft({
-      kind: "error",
-      message: l10n.t("{0} lines of the past log could not be read. Part of the history is missing.", count),
-      fatal: false,
-    });
-  }
   const anchors = messages
     .map((m) => m.uuid)
     .filter((u): u is string => typeof u === "string" && u.length > 0);
-  const maybeYield = createHydrationYielder();
-  for (const m of [...[...plan.after.values()].flat(), ...plan.tail]) {
-    foldIntoDraft(replayedMessageEvent(m));
-    const pending = maybeYield();
-    if (pending) {
-      await pending;
-      if (invalidated()) return abort("表示メッセージ整形中にセッションが変化しました");
-    }
-  }
-  stage("replay");
 
   if (conversation.handoffEnvelope?.snapshot.forkSessionId === h.sessionId) {
     const sourceId = conversation.handoffEnvelope.snapshot.sourceSessionId;
@@ -1122,6 +1202,7 @@ async function runResumeHydrationStages(
   commitHydrationDraft(s, draft, sink.commandsTouched);
   refreshFallbackAppliedModel(st, s);
   s.restoredAgents = restored.agents;
+  s.childSpans = draft.childSpans;
   s.hydrationCoverageUnconfirmed = false;
   s.conversationAnchorUuids = anchors;
   h.journal.length = 0;

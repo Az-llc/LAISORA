@@ -15,6 +15,7 @@ import type {
 import { summarizeToolInput } from "./protocol";
 import { claudeProjectsDir } from "./claude-env";
 import { extractResumeSignals } from "./tool-observation";
+import { withImagePlaceholders } from "./transcript-display";
 
 export const INSPECTOR_TOOL_PAGE_SIZE = 25;
 export const INSPECTOR_MESSAGE_PAGE_SIZE = 20;
@@ -456,7 +457,7 @@ function toolItems(records: readonly Record<string, unknown>[]): {
       const value = asRecord(block);
       if (value?.type === "tool_use" && typeof value.id === "string" && typeof value.name === "string") toolNames.set(value.id, value.name);
       if (value?.type !== "tool_result" || typeof value.tool_use_id !== "string") continue;
-      const raw = typeof value.content === "string" ? value.content : JSON.stringify(value.content) ?? "";
+      const raw = typeof value.content === "string" ? value.content : JSON.stringify(withImagePlaceholders(value.content)) ?? "";
       const preview = clipUtf8(raw, 4096);
       const isError = value.is_error === true;
       const signals = isError ? undefined : extractResumeSignals(toolNames.get(value.tool_use_id), toolResultText(value.content));

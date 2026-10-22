@@ -1,9 +1,15 @@
 import * as l10n from "@vscode/l10n";
 import type { TaskStatus } from "./work-model";
 import type { PlanContext } from "./protocol";
-import type { AgentSpanView, BackgroundTaskSpanView, ConductorModel, MainModelSpan, PlanBlockStepView, RequestBlockView, TimeBucketInterval, TimeBucketView } from "./time-buckets";
+import type { AgentSpanView, BackgroundTaskSpanView, ConductorModel, ExternalRunCallView, MainModelSpan, PlanBlockStepView, RequestBlockView, TimeBucketInterval, TimeBucketView } from "./time-buckets";
+import { measureSpans, memberRunTimes, runSpans, unionSpans } from "./spans";
+import { delegationCount } from "./claude-tool-names";
 
-export interface PlanFrameMembers { agents: AgentSpanView[]; bgTasks: BackgroundTaskSpanView[] }
+export interface PlanFrameMembers { agents: AgentSpanView[]; bgTasks: BackgroundTaskSpanView[]; externalRuns: ExternalRunCallView[] }
+
+export function planMemberDelegationCount(members: PlanFrameMembers | undefined): number {
+  return delegationCount({ agentCount: members?.agents.length ?? 0, externalRunCount: members?.externalRuns?.length ?? 0 });
+}
 
 export interface PlanFrameRow {
   key: string;
@@ -147,19 +153,21 @@ export function planRowTime(routes: readonly PlanRoute[], start: number, end: nu
 
 // GRAPH (src/webview/work-graph.ts#WorkGraph.buildRows) and ANALYSIS (src/role-summary.ts#deriveAnalysisPlans)
 // both take their blocks, order, rows, 00, numbers, titles, members and routing from here.
-export function planFrame(view: Pick<TimeBucketView, "blocks" | "agents" | "backgroundTasks" | "intervals" | "mainModelSpans">): PlanFrame {
+export function planFrame(view: Pick<TimeBucketView, "blocks" | "agents" | "backgroundTasks" | "externalRunCalls" | "intervals" | "mainModelSpans">): PlanFrame {
   const rows: PlanFrameRow[] = [];
   const placed = new Set<string>();
   const take = (pick: (owner: { blockId?: string; stepKey?: string }) => boolean): PlanFrameMembers => {
     const agents = (view.agents ?? []).filter(a => !placed.has(`agent:${a.toolUseId}`) && pick(a));
     const bgTasks = (view.backgroundTasks ?? []).filter(bg => !placed.has(`bg:${bg.toolUseId}`) && pick(bg));
     for (const a of agents) placed.add(`agent:${a.toolUseId}`);
+    const externalRuns = (view.externalRunCalls ?? []).filter(call => !placed.has(`ext:${call.toolUseId}`) && pick(call));
     for (const bg of bgTasks) placed.add(`bg:${bg.toolUseId}`);
-    return { agents, bgTasks };
+    for (const call of externalRuns) placed.add(`ext:${call.toolUseId}`);
+    return { agents, bgTasks, externalRuns };
   };
   const routes = planRoutes(view.blocks);
   const conductorWork = planConductorWork(view, routes);
-  const lead: PlanFrameMembers = { agents: [], bgTasks: [] };
+  const lead: PlanFrameMembers = { agents: [], bgTasks: [], externalRuns: [] };
   let leadBlock: RequestBlockView | undefined;
   let leadTail: number | undefined;
   for (const block of view.blocks) {
@@ -168,8 +176,9 @@ export function planFrame(view: Pick<TimeBucketView, "blocks" | "agents" | "back
     const own = take(owner => owner.blockId === block.blockId);
     lead.agents.push(...own.agents);
     lead.bgTasks.push(...own.bgTasks);
+    lead.externalRuns.push(...own.externalRuns);
     // The 00 belongs to the latest block that sends anything to it; its liveness follows that block.
-    if (items.length === 0 || own.agents.length > 0 || own.bgTasks.length > 0 || (block.conductorAttribution ?? []).some(segment => segment.keys.length === 0)) leadBlock = block;
+    if (items.length === 0 || own.agents.length > 0 || own.bgTasks.length > 0 || own.externalRuns.length > 0 || (block.conductorAttribution ?? []).some(segment => segment.keys.length === 0)) leadBlock = block;
     if (block.conductorTail != null) leadTail = block.conductorTail;
     items.forEach((step, index) => {
       const work = conductorWork.get(planItemRowKey(block.blockId, step.key)) ?? [];
@@ -181,7 +190,7 @@ export function planFrame(view: Pick<TimeBucketView, "blocks" | "agents" | "back
   // 00 exists whenever a moment routes to it (so work, usage, tool calls and runs there always have a row) or a member is placed on it.
   const unplanned = routes.filter(route => route.rows.includes(PLAN_UNPLANNED_ROW_KEY));
   const anchor = leadBlock ?? view.blocks.find(block => planItemsOf(block).length > 0);
-  if (anchor !== undefined && (unplanned.length > 0 || lead.agents.length > 0 || lead.bgTasks.length > 0)) {
+  if (anchor !== undefined && (unplanned.length > 0 || lead.agents.length > 0 || lead.bgTasks.length > 0 || lead.externalRuns.length > 0)) {
     const open = unplanned.find(route => route.end === Infinity);
     rows.unshift({ key: PLAN_UNPLANNED_ROW_KEY, kind: "item", block: anchor, number: "00", title: l10n.t("Unplanned work"),
       members: lead, conductorWork: conductorWork.get(PLAN_UNPLANNED_ROW_KEY) ?? [],
@@ -235,28 +244,53 @@ export function planRowPeriod(row: Pick<PlanFrameRow, "kind" | "block" | "item" 
   }
   // A block row is its own window: its members have their own rows, and stretching it would draw later blocks' work on it.
   if (row.kind === "item") for (const member of [...row.members.agents, ...row.members.bgTasks]) {
-    parts.push({ start: member.start, end: member.end, open: live && member.open === true });
+    const memberParts = planMemberSpans(member);
+    memberParts.forEach((span, index) => parts.push({ ...span, open: live && member.open === true && index === memberParts.length - 1 }));
   }
   if (parts.length === 0) return undefined;
   const resolved = parts.map(part => ({ start: part.start, end: part.open ? Math.max(part.end, now) : part.end })).sort((a, b) => a.start - b.start);
-  const spans = mergePlanSpans(resolved.filter(part => part.end > part.start));
+  const spans = unionPlanSpans(resolved);
   return { start: resolved[0].start, end: Math.max(...resolved.map(part => part.end)), running: parts.some(part => part.open),
     spans: spans.length > 0 ? spans : [{ start: resolved[0].start, end: Math.max(...resolved.map(part => part.end)) }] };
 }
 
-// Sorted by start; touching or overlapping spans become one.
-function mergePlanSpans(sorted: readonly PlanSpan[]): PlanSpan[] {
-  const merged: PlanSpan[] = [];
-  for (const span of sorted) {
-    const last = merged.at(-1);
-    if (last !== undefined && span.start <= last.end) last.end = Math.max(last.end, span.end);
-    else merged.push({ ...span });
-  }
-  return merged;
+// The spans a member worked in a row; its last span is the one an open member extends.
+function planMemberSpans(member: { start: number; end: number; earlierRuns?: readonly [number, number][]; resumedAt?: number }): PlanSpan[] {
+  return runSpans(memberRunTimes(member)).map(([start, end]) => ({ start, end }));
+}
+
+function unionPlanSpans(spans: readonly PlanSpan[]): PlanSpan[] {
+  return unionSpans(spans.map(span => [span.start, span.end])).map(([start, end]) => ({ start, end }));
 }
 
 export function planSpansMs(spans: readonly PlanSpan[]): number {
-  return spans.reduce((sum, span) => sum + span.end - span.start, 0);
+  return measureSpans(spans.map(span => [span.start, span.end]));
+}
+
+export function planBlockName(plan: { goal?: string; steps?: ReadonlyArray<Pick<PlanStepTiming, "title" | "status" | "removed">> }): string | undefined {
+  return plan.goal ?? plan.steps?.find(step => !step.removed && step.status !== "completed")?.title;
+}
+
+export interface PlanHeading { text: string; declared: boolean }
+
+export function planHeading(plan: { goal?: string; steps?: ReadonlyArray<Pick<PlanStepTiming, "title" | "status" | "removed">> }): PlanHeading | undefined {
+  if (plan.goal !== undefined) return { text: plan.goal, declared: true };
+  const current = plan.steps?.find(step => !step.removed && step.status === "in_progress");
+  return current === undefined ? undefined : { text: current.title, declared: false };
+}
+
+export const PLAN_CONDUCTOR_BUCKETS = ["generate", "tool", "delegation", "confirm", "reply"] as const satisfies readonly TimeBucketInterval["bucket"][];
+
+export function planBlockConductorMs(block: RequestBlockView): (number | null)[] {
+  const metrics = block.metrics;
+  return metrics === undefined ? [block.generateMs ?? null, block.toolMs ?? null, block.subagentWaitMs ?? null, block.confirmMs ?? null, block.replyMs ?? null]
+    : [metrics.generateMs ?? null, metrics.toolMs ?? null, metrics.subagentWaitMs ?? null, metrics.decisionWaitMs ?? null, metrics.replyWaitMs ?? null];
+}
+
+export function planRowConductorParts(row: Pick<PlanFrameRow, "block" | "conductorWork">, period: PlanRowPeriod | undefined): (number | null)[] {
+  const measured = planBlockConductorMs(row.block);
+  return PLAN_CONDUCTOR_BUCKETS.map((bucket, index) => period === undefined || measured[index] === null ? null
+    : row.conductorWork.reduce((sum, interval) => interval.bucket === bucket ? sum + interval.end - interval.start : sum, 0));
 }
 
 export function planRowIndexAt(rows: ReadonlyArray<{ kind: string; item?: unknown; period?: Pick<PlanRowPeriod, "spans"> }>, t: number): number {
@@ -281,13 +315,41 @@ export function planRowIndexAt(rows: ReadonlyArray<{ kind: string; item?: unknow
 // A step's in-progress spans from its transitions, each running to the next transition or to end; re-sent in_progress
 // continues the span it is in.
 export function planStepActiveSpans(transitions: readonly PlanStepTransition[], end: number): PlanSpan[] {
-  return mergePlanSpans(transitions.flatMap((change, index) => change.active
-    ? [{ start: change.at, end: Math.max(change.at, Math.min(transitions[index + 1]?.at ?? end, end)) }] : []));
+  const raw = transitions.flatMap((change, index) => change.active
+    ? [{ start: change.at, end: Math.max(change.at, Math.min(transitions[index + 1]?.at ?? end, end)) }] : []);
+  const spans = unionPlanSpans(raw);
+  // A zero-width last span is a step that has just gone in progress: src/plan-steps.ts#planRowPeriod extends it to now.
+  const last = raw.at(-1);
+  const tail = spans.at(-1);
+  if (last !== undefined && last.end === last.start && (tail === undefined || tail.end < last.start)) spans.push(last);
+  return spans;
 }
 
 // A period computed at an earlier "now", shown at a later one.
 export function planPeriodEnd(period: Pick<PlanRowPeriod, "end" | "running">, now: number): number {
   return period.running ? Math.max(period.end, now) : period.end;
+}
+
+export function blockElapsedMs(block: Pick<RequestBlockView, "durationMs" | "running" | "workEndedAt" | "start" | "end"> & { metrics?: { provisional?: boolean } },
+  now: number): { ms: number; provisional: boolean } {
+  const running = blockElapsedRunning(block);
+  if (block.durationMs === null) return { ms: Math.max(0, (running ? Math.max(now, block.end) : block.workEndedAt ?? block.end) - block.start), provisional: true };
+  return { ms: running ? Math.max(block.durationMs, now - block.start) : block.durationMs, provisional: block.metrics?.provisional === true };
+}
+
+export function blockElapsedRunning(block: Pick<RequestBlockView, "running" | "workEndedAt">): boolean {
+  return block.running && block.workEndedAt === undefined;
+}
+
+export function timeWindowMeasured(view: Pick<TimeBucketView, "firstAt" | "lastAt"> | undefined): view is TimeBucketView {
+  return view !== undefined && view.firstAt !== null && view.lastAt !== null;
+}
+
+export function planWorkEnd(steps: readonly { removed: boolean; status: string; endedAt: number | null }[] | undefined, start: number,
+  end: number, lastActivityEnd: number | undefined): number | undefined {
+  const remaining = (steps ?? []).filter(step => !step.removed);
+  return remaining.length > 0 && remaining.every(step => step.status === "completed")
+    ? Math.min(end, Math.max(start, lastActivityEnd ?? start, ...remaining.map(step => step.endedAt ?? start))) : undefined;
 }
 
 // Conductor work runs on a row now while the row is live and the conductor's open turn is attributed to it; an open
@@ -335,16 +397,54 @@ export function planStepTaskKey(key: string): string | undefined {
   return key.startsWith(TASK_STEP_KEY_HEAD) ? key.slice(TASK_STEP_KEY_HEAD.length) : undefined;
 }
 
+export const TODO_KEY_PREFIX = "todo:";
+
+// The work model's task key of a PLAN step key (src/work-model.ts#todoIntentItems builds TodoWrite keys the same way).
+export function planWorkTaskKey(stepKey: string): string {
+  return planStepTaskKey(stepKey) ?? `${TODO_KEY_PREFIX}${stepKey}`;
+}
+
+// The steps the PLAN shows as not removed, in every PLAN block of the generation, keyed as the work model keys them;
+// a step key seen again in a later block takes that block's place. The LOG TASKS card lists exactly these.
+export function planCurrentSteps(blocks: ReadonlyArray<{ kind: string; steps?: ReadonlyArray<Pick<PlanStepTiming, "key" | "title" | "status" | "removed">> }>):
+  Array<{ taskKey: string; title: string; status: TaskStatus }> {
+  const current = new Map<string, { taskKey: string; title: string; status: TaskStatus }>();
+  for (const block of blocks) {
+    if (block.kind !== "plan") continue;
+    for (const step of block.steps ?? []) {
+      if (step.removed) continue;
+      const taskKey = planWorkTaskKey(step.key);
+      current.delete(taskKey);
+      current.set(taskKey, { taskKey, title: step.title, status: step.status });
+    }
+  }
+  return [...current.values()];
+}
+
 const TASK_STEP_KEY_RE = new RegExp(`^${TASK_STEP_KEY_HEAD}${TASK_KEY_PREFIX}(\\d+)$`);
 const ITEM_NUMBER_PREFIX_RE = /^(\d{2,}) /;
 
-export function planContextOf(block: { blockId: string; text: string; start: number; goal?: string; steps?: ReadonlyArray<PlanStepTiming & { number: number; activeSpans?: PlanSpan[] }>;
-  metrics?: { tokens?: PlanContext["tokens"] } }, end: number, running: boolean): PlanContext {
+// Every frame row's period at the view's own now, as GRAPH and ANALYSIS show it (src/plan-steps.ts#planRowPeriod).
+export function planRowPeriods(view: Pick<TimeBucketView, "blocks" | "agents" | "backgroundTasks" | "intervals" | "mainModelSpans" | "lastAt">): ReadonlyMap<string, PlanRowPeriod> {
+  const live = planLive(view);
+  const now = planNow(view, undefined, live);
+  return new Map(planFrame(view).rows.flatMap(row => {
+    const period = planRowPeriod(row, now, live);
+    return period === undefined ? [] : [[row.key, period] as const];
+  }));
+}
+
+export function planContextOf(block: { blockId: string; text: string; start: number; durationMs?: number | null; workEndedAt?: number; running?: boolean; goal?: string; steps?: ReadonlyArray<PlanStepTiming & { number: number }>;
+  metrics?: { tokens?: PlanContext["tokens"]; provisional?: boolean } }, end: number, running: boolean, periods: ReadonlyMap<string, PlanRowPeriod>): PlanContext {
   return { blockId: block.blockId, text: block.text, start: block.start, ...(block.goal === undefined ? {} : { goal: block.goal }),
     ...(block.metrics?.tokens === undefined ? {} : { tokens: block.metrics.tokens }),
-    steps: (block.steps ?? []).map(({ key, number, title, status, removed, startedAt, endedAt, activeSpans }) =>
-      ({ key, number, title, status, removed, startedAt, endedAt, ...(activeSpans === undefined ? {} : { activeSpans }) })),
-    end: Math.max(block.start, end), running };
+    steps: (block.steps ?? []).map(({ key, number, title, status, removed, startedAt, endedAt }) => {
+      const period = periods.get(planItemRowKey(block.blockId, key));
+      return { key, number, title, status, removed, startedAt, endedAt, ...(period === undefined ? {} : { period: { spans: period.spans, running: period.running } }) };
+    }),
+    end: Math.max(block.start, end), ...(block.durationMs === undefined ? {} : { durationMs: block.durationMs }),
+    ...(block.workEndedAt === undefined ? {} : { workEndedAt: block.workEndedAt }),
+    ...(block.metrics?.provisional ? { provisional: true } : {}), ...(block.running === undefined ? {} : { blockRunning: block.running }), running };
 }
 
 export function planItemNumber(seen: string[], key: string): number {
@@ -370,6 +470,25 @@ export function planNumberedStep<S extends { number: number }>(blocks: readonly 
     if (step !== undefined) return { blockIndex, step };
   }
   return undefined;
+}
+
+export function planSuccessorStep<S extends { key: string; carriedTo?: string }>(blocks: readonly { blockId: string; steps?: readonly S[] }[],
+  found: { blockIndex: number; step: S }): { blockIndex: number; step: S } {
+  let current = found;
+  while (current.step.carriedTo !== undefined) {
+    const { key, carriedTo } = current.step;
+    const blockIndex = blocks.findIndex((block, index) => index > current.blockIndex && block.blockId === carriedTo);
+    const step = blockIndex < 0 ? undefined : blocks[blockIndex].steps?.find(value => value.key === key);
+    if (step === undefined) break;
+    current = { blockIndex, step };
+  }
+  return current;
+}
+
+export function planPlacedStep<S extends { number: number; key: string; carriedTo?: string }>(blocks: readonly { blockId: string; start: number; closedAt?: number; steps?: readonly S[] }[],
+  number: number, at: number): { blockIndex: number; step: S } | undefined {
+  const found = planNumberedStep(blocks, number, at);
+  return found === undefined ? undefined : planSuccessorStep(blocks, found);
 }
 
 export interface PlanStepTiming {

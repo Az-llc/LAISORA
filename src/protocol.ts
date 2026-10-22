@@ -2,12 +2,15 @@ import { isToolIntentInput, type ToolIntentInput } from "./tool-intent";
 import { isAccentSettings, isAccentSettingValue, type AccentSettings, type AccentSetting } from "./accent";
 import { isDisplayName } from "./display-name";
 import { isEventLimit } from "./event-limits";
+import { configurationBound } from "./configuration-defaults";
 import { normalizeSystemAppExtension } from "./file-link-open-mode";
 import { isPlanUsage, type MainTokenTotal } from "./plan-usage";
 import type { FailureSummaryView } from "./exec-log-marks";
 import type { HandoffCompactStats } from "./handoff-envelope";
+import type { HandoffNoticeFacts } from "./steering-envelope";
 import type { AnalysisPlansView, RoleSummaryView } from "./role-summary";
-import { EXECUTORS, isExecutorId, type ExecutorId } from "./orchestration-executors";
+import { EXECUTORS, isExecutorId, isExternalRunOutcome, type ExecutorId } from "./orchestration-executors";
+import { isDelegationTool } from "./claude-tool-names";
 import { isExternalTimeout, isExternalDetection, isExternalModels, type ExternalModels, type ExternalDetection } from "./orchestration-roster";
 import { isOrchestrationSettingRoster, type OrchestrationSettingRow, type RecommendedRosterChange } from "./orchestration-roster";
 import { isOrchestrationView, type OrchestrationView } from "./orchestration-view";
@@ -15,7 +18,8 @@ export type { OrchestrationView } from "./orchestration-view";
 import * as l10n from "@vscode/l10n";
 import { FILE_LINK_TARGET_MAX_LEN } from "./file-link-target";
 export { FILE_LINK_TARGET_MAX_LEN } from "./file-link-target";
-import { findToolPlacement, findWorkSegment, phaseStateOf, runningMainPlacement } from "./work-model";
+import { agentRuns, findToolPlacement, findWorkSegment, phaseStateOf, runningMainPlacement } from "./work-model";
+import { planCurrentSteps } from "./plan-steps";
 import { BACKGROUND_ACTIVITY_LIST_MAX, type BackgroundActivitySnapshot } from "./background-activity";
 import { isTodoAskIdentity, isTodoTime, isTodoDocLabel, isTodoImageName, isTodoGroupName, isTodoFolderPath, TODO_ITEM_SHAPES, TODO_CHANGE_FIELDS, isTodoChangeRecord, isTodoGroupAlias, isTodoBriefText, isTodoDocFields, isTodoGuessReason, isTodoId, isTodoMemoEntry, isTodoMemoText, isTodoSessionId, todoItemFieldValid, TODO_OPERATION_ERRORS, TODO_REVERT_BLOCKS, type TodoPlacementBasis, type TodoChangePlace, type TodoCaptured, TODO_ASK_PLACES, type TodoAskPlace, TODO_ASK_SOURCE_MESSAGES_MAX, TODO_BATCH_MAX, type TodoBatchStep, TODO_GROUP_COLOR_COUNT, TODO_TEMPLATE_NAME_MAX, TODO_ACKNOWLEDGE_MAX, TODO_IMAGE_EXTENSIONS, TODO_TITLE_MAX, WORK_MEMO_SECTIONS, TODO_START_KINDS, type TodoStartKind, type TodoAuthor, type TodoCompletion, type TodoDocKind, type TodoImageMediaType, type TodoOperationError, type TodoPriority, type TodoRevertBlock, type TodoState, type WorkMemoSection, type TodoDecision } from "./todo-model";
 export { BACKGROUND_ACTIVITY_LIST_MAX } from "./background-activity";
@@ -33,6 +37,7 @@ import type {
 } from "./work-model";
 import type { EffectCoverage, ProjectedArtifactAccess } from "./artifact-access";
 import type { TimeBucket, TimeBucketView } from "./time-buckets";
+import { currentRunStart, runElapsedMs, type ChildTranscriptSpan, type Span } from "./spans";
 import type { AnalysisFactsView, SummaryAnalysisView } from "./analysis-facts-view";
 import type { Coverage, ExecutionAttemptNode, SemanticModel, SemanticNode } from "./semantic-model";
 import type { L3Report, SerializationClassification } from "./l3-analysis";
@@ -308,7 +313,7 @@ export type NormalizedEventBody =
     | { kind: "assistant_message_uuid"; turnId: string; uuid: string }
     | { kind: "ask_rejected"; turnId: string; titles: string[] }
     | { kind: "assistant_retracted"; turnId: string | null; uuids: string[] }
-    | { kind: "local_command_output"; text: string; uuid?: string; priorGeneration?: true }
+    | { kind: "local_command_output"; text: string; uuid?: string; priorGeneration?: true; handoffNotice?: HandoffNoticeFacts; handoffNoticeStopped?: true }
     | ({ kind: "model_refusal_fallback" } & ModelRefusalFallback)
     | { kind: "model_fallback_revert"; turnId: string | null; fallbackKey?: string; originalModel: string; outcome: FallbackRevertOutcome }
     | {
@@ -433,6 +438,10 @@ export const GUARDRAIL_ONLY_EVENT_KINDS: ReadonlySet<NormalizedEventBody["kind"]
 
 export function isGuardrailOnlyEventKind(kind: NormalizedEventBody["kind"]): boolean {
   return GUARDRAIL_ONLY_EVENT_KINDS.has(kind);
+}
+
+export function isLlmAnalysisExecution<E extends { kind: string }>(event: E): event is Extract<E, { kind: "tool_call_finished" }> {
+  return event.kind === "tool_call_finished";
 }
 
 export interface AskUserQuestionOption {
@@ -583,6 +592,29 @@ export function reportedPermissionMode(
   };
 }
 
+export const BRIDGE_CONNECTIONS = ["ready", "connected", "failed", "policy_disabled"] as const;
+export type BridgeConnection = (typeof BRIDGE_CONNECTIONS)[number];
+
+export interface RemoteControlView {
+  available: boolean;
+  pending: boolean;
+  sessionUrl?: string;
+  connection?: BridgeConnection;
+}
+
+export function isRemoteControlSessionUrl(value: unknown): value is string {
+  return typeof value === "string" && value.startsWith("https://");
+}
+
+export function isRemoteControlView(value: unknown): value is RemoteControlView {
+  if (typeof value !== "object" || value === null) return false;
+  const v = value as Record<string, unknown>;
+  return typeof v.available === "boolean" && typeof v.pending === "boolean"
+    && (v.sessionUrl === undefined || isRemoteControlSessionUrl(v.sessionUrl))
+    && (v.connection === undefined || (BRIDGE_CONNECTIONS as readonly unknown[]).includes(v.connection))
+    && hasOnlyKeys(v, ["available", "pending", "sessionUrl", "connection"]);
+}
+
 export interface SlashCommandInfo {
   name: string;
   description: string;
@@ -621,6 +653,12 @@ export function summarizeToolInput(toolName: string, input: unknown): string | n
     const parts = fp.split(/[\\/]/);
     return parts[parts.length - 1] || fp;
   };
+  if (isDelegationTool(toolName)) {
+    const desc = str(obj.description) ?? str(obj.subject);
+    if (desc) return desc;
+    const prompt = str(obj.prompt);
+    return prompt ? clip(prompt) : null;
+  }
   switch (toolName) {
     case "Bash": {
       const desc = str(obj.description);
@@ -644,13 +682,6 @@ export function summarizeToolInput(toolName: string, input: unknown): string | n
       return str(obj.url);
     case "WebSearch":
       return str(obj.query);
-    case "Agent":
-    case "Task": {
-      const desc = str(obj.description) ?? str(obj.subject);
-      if (desc) return desc;
-      const prompt = str(obj.prompt);
-      return prompt ? clip(prompt) : null;
-    }
     case "TaskUpdate":
       return str(obj.subject) ?? str(obj.status);
     case "ExitPlanMode":
@@ -728,6 +759,71 @@ export const FILE_LINK_SETTINGS = [...FILE_LINK_BOOLEAN_SETTINGS, "openWithSyste
 export type FileLinkBooleanSetting = (typeof FILE_LINK_BOOLEAN_SETTINGS)[number];
 export type FileLinkSetting = (typeof FILE_LINK_SETTINGS)[number];
 
+export const HANDOFF_AUTO_MODES = ["ratio", "tokens"] as const;
+export type HandoffAutoMode = typeof HANDOFF_AUTO_MODES[number];
+export const HANDOFF_AUTO_PERCENT_MIN = configurationBound("handoff.auto.percent", "minimum");
+export const HANDOFF_AUTO_PERCENT_MAX = configurationBound("handoff.auto.percent", "maximum");
+export const HANDOFF_AUTO_TOKENS_MIN = configurationBound("handoff.auto.tokens", "minimum");
+
+export const HANDOFF_AUTO_SETTING_KEYS = {
+  enabled: "handoff.auto.enabled",
+  mode: "handoff.auto.mode",
+  percent: "handoff.auto.percent",
+  tokens: "handoff.auto.tokens",
+  cacheExpiryEnabled: "handoff.cacheExpiry.enabled",
+} as const;
+
+export interface HandoffAutoSettings {
+  enabled: boolean;
+  mode: HandoffAutoMode;
+  percent: number;
+  tokens: number;
+  cacheExpiryEnabled: boolean;
+}
+
+export type HandoffAutoSettingName = keyof HandoffAutoSettings;
+
+export function isHandoffAutoSettingValue(setting: unknown, value: unknown): boolean {
+  switch (setting) {
+    case "enabled":
+    case "cacheExpiryEnabled":
+      return typeof value === "boolean";
+    case "mode":
+      return (HANDOFF_AUTO_MODES as readonly unknown[]).includes(value);
+    case "percent":
+      return typeof value === "number" && Number.isSafeInteger(value) && value > 0
+        && (HANDOFF_AUTO_PERCENT_MIN === undefined || value >= HANDOFF_AUTO_PERCENT_MIN) && (HANDOFF_AUTO_PERCENT_MAX === undefined || value <= HANDOFF_AUTO_PERCENT_MAX);
+    case "tokens":
+      return typeof value === "number" && Number.isSafeInteger(value) && value > 0 && (HANDOFF_AUTO_TOKENS_MIN === undefined || value >= HANDOFF_AUTO_TOKENS_MIN);
+    default:
+      return false;
+  }
+}
+
+function isHandoffAutoSettings(value: unknown): value is HandoffAutoSettings {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
+  const names = Object.keys(HANDOFF_AUTO_SETTING_KEYS);
+  return hasOnlyKeys(value as Record<string, unknown>, names)
+    && names.every((name) => isHandoffAutoSettingValue(name, (value as Record<string, unknown>)[name]));
+}
+
+export type HandoffAutoStart =
+  | { trigger: "size"; totalTokens: number; threshold: number }
+  | { trigger: "cache_expiry"; totalTokens: number; expiresAt?: number };
+
+export type HandoffAutoNotice = { trigger: "notice"; reason: string };
+export const HANDOFF_AUTO_REASON_MAX = 500;
+
+function isHandoffAutoStart(value: unknown): value is HandoffAutoStart | HandoffAutoNotice {
+  if (typeof value !== "object" || value === null) return false;
+  const m = value as Record<string, unknown>;
+  const count = (n: unknown): boolean => typeof n === "number" && Number.isFinite(n) && n >= 0;
+  if (m.trigger === "notice") return hasOnlyKeys(m, ["trigger", "reason"]) && typeof m.reason === "string" && m.reason.length > 0 && m.reason.length <= HANDOFF_AUTO_REASON_MAX;
+  return m.trigger === "size"
+    ? hasOnlyKeys(m, ["trigger", "totalTokens", "threshold"]) && count(m.totalTokens) && count(m.threshold)
+    : m.trigger === "cache_expiry" && hasOnlyKeys(m, ["trigger", "totalTokens", "expiresAt"]) && count(m.totalTokens) && (m.expiresAt === undefined || count(m.expiresAt));
+}
+
 export type SettingsPageToHost =
   | { type: "settingsPageReady" }
   | { type: "recheckExternalExecutors" }
@@ -747,6 +843,8 @@ export type SettingsPageToHost =
   | { type: "setMemoryBlockProjectType"; requestId: number; enabled: boolean }
   | { type: "setTodoEnabled"; requestId: number; enabled: boolean }
   | { type: "setEditSummaryEnabled"; requestId: number; enabled: boolean }
+  | { type: "setRemoteControlCard"; requestId: number; enabled: boolean }
+  | { type: "setHandoffAutoSetting"; requestId: number; setting: HandoffAutoSettingName; value: boolean | number | string }
   | { type: "setOrchestrationSetting"; requestId: number; setting: "enabled" | "agents" | "conductorPolicy" | "externalTimeoutMinutes"; value: unknown }
   | { type: "setFileLinkSetting"; requestId: number; setting: FileLinkBooleanSetting; enabled: boolean }
   | { type: "setFileLinkSetting"; requestId: number; setting: "openWithSystemApp"; value: string[] }
@@ -775,7 +873,7 @@ export interface SettingsProfileProjection {
 export type HostToSettingsPage =
   | { type: "conductorPreview"; requestId: number; text: string; tokens: number }
   | { type: "recommendedRoster"; revision: string; changes: RecommendedRosterChange[] }
-  | ({ type: "settingsState"; appearance?: AccentSettings; displayName?: string; eventLimit?: number; composerSendKey: ComposerSendKey; apiKeyPolicy: ApiKeyPolicy; restoreTabsOnStartup: boolean; cliAutoUpdate: Record<ExecutorId, boolean>; initialModel?: string; autoContinueAtUsageLimit: boolean; guardEnabled: boolean; memoryBlockProjectType: boolean; todoEnabled: boolean; editSummaryEnabled: boolean; reloadNeeded: boolean; replyTo?: number; writeFailure?: SettingWriteFailure }
+  | ({ type: "settingsState"; appearance?: AccentSettings; displayName?: string; eventLimit?: number; composerSendKey: ComposerSendKey; apiKeyPolicy: ApiKeyPolicy; restoreTabsOnStartup: boolean; cliAutoUpdate: Record<ExecutorId, boolean>; initialModel?: string; autoContinueAtUsageLimit: boolean; guardEnabled: boolean; memoryBlockProjectType: boolean; todoEnabled: boolean; editSummaryEnabled: boolean; remoteControlCard: boolean; handoffAuto?: HandoffAutoSettings; reloadNeeded: boolean; replyTo?: number; writeFailure?: SettingWriteFailure }
     & SettingsProfileProjection & Record<FileLinkBooleanSetting, boolean> & { openWithSystemApp: string[] } & { orchestrationEnabled: boolean; orchestrationAgents: OrchestrationSettingRow[]; orchestrationDefaults: OrchestrationSettingRow[]; conductorPolicy: string; conductorPolicyDefault: string; externalTimeoutMinutes: number; externalDetection: Record<ExecutorId, ExternalDetection>; externalModels: ExternalModels });
 
 function isSettingsRequestId(v: unknown): v is number {
@@ -814,8 +912,11 @@ export function isSettingsPageToHost(v: unknown): v is SettingsPageToHost {
     return isSettingsRequestId(m.requestId)
       && (API_KEY_POLICIES as readonly string[]).includes(m.policy as string) && hasOnlyKeys(m, ["type", "requestId", "policy"]);
   }
-  if (t === "setAutoContinueAtUsageLimit" || t === "setRestoreTabsOnStartup" || t === "setGuardEnabled" || t === "setMemoryBlockProjectType" || t === "setTodoEnabled" || t === "setEditSummaryEnabled") {
+  if (t === "setAutoContinueAtUsageLimit" || t === "setRestoreTabsOnStartup" || t === "setGuardEnabled" || t === "setMemoryBlockProjectType" || t === "setTodoEnabled" || t === "setEditSummaryEnabled" || t === "setRemoteControlCard") {
     return isSettingsRequestId(m.requestId) && typeof m.enabled === "boolean" && hasOnlyKeys(m, ["type", "requestId", "enabled"]);
+  }
+  if (t === "setHandoffAutoSetting") {
+    return isSettingsRequestId(m.requestId) && isHandoffAutoSettingValue(m.setting, m.value) && hasOnlyKeys(m, ["type", "requestId", "setting", "value"]);
   }
   if (t === "setCliAutoUpdate") {
     return isSettingsRequestId(m.requestId) && isExecutorId(m.executor) && typeof m.enabled === "boolean" && hasOnlyKeys(m, ["type", "requestId", "executor", "enabled"]);
@@ -885,7 +986,8 @@ export function isHostToSettingsPage(v: unknown): v is HostToSettingsPage {
       && typeof m.restoreTabsOnStartup === "boolean" && isCliAutoUpdate(m.cliAutoUpdate)
       && (m.initialModel === undefined || typeof m.initialModel === "string")
       && typeof m.autoContinueAtUsageLimit === "boolean" && typeof m.guardEnabled === "boolean" && typeof m.memoryBlockProjectType === "boolean" && typeof m.todoEnabled === "boolean"
-      && typeof m.editSummaryEnabled === "boolean" && typeof m.reloadNeeded === "boolean"
+      && typeof m.editSummaryEnabled === "boolean" && typeof m.remoteControlCard === "boolean" && typeof m.reloadNeeded === "boolean"
+      && (m.handoffAuto === undefined || isHandoffAutoSettings(m.handoffAuto))
       && typeof m.orchestrationEnabled === "boolean" && typeof m.conductorPolicy === "string"
       && typeof m.conductorPolicyDefault === "string"
       && isOrchestrationSettingRoster(m.orchestrationAgents) && isOrchestrationSettingRoster(m.orchestrationDefaults)
@@ -894,7 +996,7 @@ export function isHostToSettingsPage(v: unknown): v is HostToSettingsPage {
       && Array.isArray(m.openWithSystemApp) && m.openWithSystemApp.every((item) => typeof item === "string")
       && (m.replyTo === undefined || isSettingsRequestId(m.replyTo))
       && (m.writeFailure === undefined || m.replyTo !== undefined && isSettingWriteFailure(m.writeFailure))
-      && hasOnlyKeys(m, ["type", "initialModel", "appearance", "displayName", "eventLimit", "composerSendKey", "apiKeyPolicy", "restoreTabsOnStartup", "cliAutoUpdate", "autoContinueAtUsageLimit", "guardEnabled", "memoryBlockProjectType", "todoEnabled", "editSummaryEnabled", "reloadNeeded", ...FILE_LINK_SETTINGS, "orchestrationEnabled", "orchestrationAgents", "orchestrationDefaults", "conductorPolicy", "conductorPolicyDefault", "externalTimeoutMinutes", "externalDetection", "externalModels", "replyTo", "writeFailure", "conductorPreview", "recommendedRosterSame"]);
+      && hasOnlyKeys(m, ["type", "initialModel", "appearance", "displayName", "eventLimit", "composerSendKey", "apiKeyPolicy", "restoreTabsOnStartup", "cliAutoUpdate", "autoContinueAtUsageLimit", "guardEnabled", "memoryBlockProjectType", "todoEnabled", "editSummaryEnabled", "remoteControlCard", "handoffAuto", "reloadNeeded", ...FILE_LINK_SETTINGS, "orchestrationEnabled", "orchestrationAgents", "orchestrationDefaults", "conductorPolicy", "conductorPolicyDefault", "externalTimeoutMinutes", "externalDetection", "externalModels", "replyTo", "writeFailure", "conductorPreview", "recommendedRosterSame"]);
   }
   t satisfies never;
   return false;
@@ -920,6 +1022,7 @@ export type WebviewToHost =
     }
   | { type: "newTab" }
   | { type: "composerFocus"; focused: boolean }
+  | { type: "composerDrafts"; tabIds: string[] }
   | { type: "closeTab"; tabId: string }
   | { type: "clearTab"; tabId: string }
   | { type: "setMode"; tabId: string; mode: PermissionModeId }
@@ -931,6 +1034,7 @@ export type WebviewToHost =
   | { type: "openEditDiff"; tabId: string; firstToolUseId: string; lastToolUseId: string }
   | { type: "copyFilePath"; tabId: string; target: string; reqId: number }
   | { type: "exportTab"; tabId: string }
+  | { type: "setRemoteControl"; tabId: string; enabled?: boolean }
   | { type: "renameTab"; tabId: string; title: string }
   | { type: "listSessions"; source?: "laisora" | "claude"; cursor?: string; showHidden?: boolean }
   | { type: "renameSession"; sessionId: string; filePath: string; title: string; requestId?: string }
@@ -1251,6 +1355,7 @@ export type WorkAgentOrigin = "live" | "restored";
 
 export interface WorkAgentNode {
   runStartedAt?: number;
+  earlierRuns?: Span[];
   intentInput?: ToolIntentInput;
   agentId: string;
   transcriptAgentId?: string;
@@ -1259,6 +1364,7 @@ export interface WorkAgentNode {
   parentToolUseId: string | null;
   spawnDepth: number;
   agentType?: string;
+  role?: string;
   description: string;
   modelDeclared?: string;
   modelMeasured?: string;
@@ -1274,6 +1380,16 @@ export interface WorkAgentNode {
   revision: number;
   origin: WorkAgentOrigin;
   children: WorkAgentNode[];
+}
+
+export function subagentModel(agent: { modelMeasured?: string; modelDeclared?: string }): string | undefined {
+  return agent.modelMeasured ?? agent.modelDeclared;
+}
+
+export function withSubagentModels(view: TimeBucketView, agents: readonly WorkAgentNode[]): TimeBucketView {
+  const models = new Map(agents.flatMap(agent => { const model = subagentModel(agent); return model === undefined ? [] : [[agent.toolUseId, model] as const]; }));
+  if (!view.agents.some(agent => models.has(agent.toolUseId) && models.get(agent.toolUseId) !== agent.model)) return view;
+  return { ...view, agents: view.agents.map(agent => { const model = models.get(agent.toolUseId); return model === undefined ? agent : { ...agent, model }; }) };
 }
 
 export function flattenAgents(phases: readonly { agents: readonly WorkAgentNode[] }[], unlinkedAgents: readonly WorkAgentNode[] = []): WorkAgentNode[] {
@@ -1472,6 +1588,7 @@ export interface WorkSegmentView {
 
 export interface WorkAgentStateView {
   runStartedAt?: number;
+  earlierRuns?: Span[];
   toolUseId: string;
   status: WorkStatus;
   childCount: number;
@@ -1480,6 +1597,17 @@ export interface WorkAgentStateView {
   tokens?: number;
   modelMeasured?: string;
   revision: number;
+}
+
+type AgentRunFields = Pick<WorkAgentStateView, "elapsedMs" | "status" | "runStartedAt" | "earlierRuns"> & { startedAt?: number };
+
+export function agentRunStart(agent: AgentRunFields): number | undefined {
+  return currentRunStart(agent.runStartedAt, agent.startedAt);
+}
+
+export function agentElapsedMs(agent: AgentRunFields, now: number): number {
+  const runStart = agent.status === "running" ? agentRunStart(agent) : undefined;
+  return runStart === undefined ? agent.elapsedMs : runElapsedMs({ earlierRuns: agent.earlierRuns, runStart, runEnd: now });
 }
 
 export interface WorkTaskTotalsView {
@@ -1513,7 +1641,7 @@ export interface WorkEventInfo {
 
 export interface PlanContextStep {
   key: string; number: number; title: string; status: import("./work-model").TaskStatus; removed: boolean; startedAt: number | null; endedAt: number | null;
-  activeSpans?: import("./plan-steps").PlanSpan[];
+  period?: Pick<import("./plan-steps").PlanRowPeriod, "spans" | "running">;
   // The step's routed Claude tokens (src/role-summary.ts#derivePlanPlacement); absent when the Host did not allocate them.
   tokens?: import("./plan-usage").PlanTokenTotal | null;
 }
@@ -1522,9 +1650,10 @@ export interface PlanContextStep {
 export interface PlanContextPlacement { toolUseId: string; agentId?: string; stepKey: string | null }
 
 export interface PlanContext {
-  blockId: string; start: number; end: number; text: string; goal?: string; running: boolean; steps?: PlanContextStep[];
+  blockId: string; start: number; end: number; durationMs?: number | null; workEndedAt?: number; provisional?: boolean; blockRunning?: boolean; text: string; goal?: string; running: boolean; steps?: PlanContextStep[];
   placements?: PlanContextPlacement[];
   tokens?: import("./plan-usage").PlanTokenTotal | null;
+  external?: import("./plan-usage").PlanTokenTotal | null;
 }
 
 export interface WorkModelPayload {
@@ -1711,13 +1840,19 @@ export function isTimeBucketsCoverage(v: unknown): v is TimeBucketsCoverage {
   );
 }
 
-function taskItemViews(state: WorkModelState): WorkTaskItemView[] {
-  return state.tasks.map((task) => ({
-    taskKey: task.taskKey,
-    description: task.description,
-    activeForm: task.activeForm,
-    status: task.status,
-  }));
+export type PlanTaskBlocks = Parameters<typeof planCurrentSteps>[0];
+
+// The TASKS card lists the PLAN's current steps (src/plan-steps.ts#planCurrentSteps); the work model adds only activeForm.
+function taskItemViews(state: WorkModelState, planBlocks: PlanTaskBlocks): WorkTaskItemView[] {
+  return planCurrentSteps(planBlocks).map((step) => {
+    const activeForm = state.tasks.find((task) => task.taskKey === step.taskKey)?.activeForm;
+    return { taskKey: step.taskKey, description: step.title, ...(activeForm === undefined ? {} : { activeForm }), status: step.status };
+  });
+}
+
+function sameTaskItemViews(a: readonly WorkTaskItemView[], b: readonly WorkTaskItemView[]): boolean {
+  return a.length === b.length && a.every((item, i) => item.taskKey === b[i].taskKey && item.description === b[i].description
+    && item.activeForm === b[i].activeForm && item.status === b[i].status);
 }
 
 function taskTotalsView(phase: {
@@ -1795,10 +1930,17 @@ function findCyclicRestoredIds(restoredAgents: readonly RestoredAgent[]): Set<st
   return cyclic;
 }
 
+function childSpanIndex(childSpans: readonly ChildTranscriptSpan[] | undefined): Map<string, ChildTranscriptSpan> {
+  return new Map((childSpans ?? []).map(span => [span.toolUseId, span]));
+}
+
 export function projectWorkModel(
   state: WorkModelState,
-  restoredAgents: readonly RestoredAgent[] = []
+  restoredAgents: readonly RestoredAgent[] = [],
+  planBlocks: PlanTaskBlocks,
+  childSpans: readonly ChildTranscriptSpan[]
 ): WorkModelPayload {
+  const childOf = childSpanIndex(childSpans);
   const restoredByToolUseId = new Map<string, RestoredAgent>();
   const restoredById = new Map(restoredAgents.map(agent => [agent.agentId, agent]));
   for (const agent of restoredAgents) {
@@ -1830,8 +1972,8 @@ export function projectWorkModel(
     parent.children.push(node);
   };
 
-  const rollup = state.rollup;
-  if (rollup) {
+  if (state.rollup) {
+    const { toolSpans: _toolSpans, confirmSpans: _confirmSpans, trimmedToolMs: _trimmedToolMs, trimmedUntil: _trimmedUntil, ...rollup } = state.rollup;
     phases.push({
       ...rollup,
       phaseId: rollup.phaseId,
@@ -1869,10 +2011,9 @@ export function projectWorkModel(
         effortDeclared: agent.effortDeclared,
         effortMeasured: restored?.effortMeasured,
         status: agent.status,
-        runStartedAt: agent.runStartedAt ?? agent.startedAt,
+        ...agentRuns(agent, childOf.get(agent.toolUseId)),
         startedAt: agent.startedAt,
         endedAt: agent.endedAt,
-        elapsedMs: agent.elapsedMs,
         tokens: agent.tokens,
         childCount: agent.childCount,
         failCount: agent.failCount,
@@ -1890,7 +2031,7 @@ export function projectWorkModel(
       attach(node, node.parentAgentId === null ? undefined : nodeByKey.get(node.parentAgentId), roots);
     }
     const isCurrent = phase.phaseId === state.currentPhaseId;
-    const { agents: _agents, ...rest } = phase;
+    const { agents: _agents, toolSpans: _toolSpans, confirmSpans: _confirmSpans, trimmedToolMs: _trimmedToolMs, trimmedUntil: _trimmedUntil, ...rest } = phase;
     phases.push({
       ...rest,
       kind: "phase",
@@ -1945,7 +2086,7 @@ export function projectWorkModel(
     ambiguity: state.ambiguity,
     phases,
     unlinkedAgents,
-    tasks: taskItemViews(state),
+    tasks: taskItemViews(state, planBlocks),
     taskTotals: state.phases
       .filter((phase) => phase.taskKey !== undefined)
       .map((phase) => taskTotalsView(phase)),
@@ -1955,7 +2096,9 @@ export function projectWorkModel(
 export function projectWorkEvent(
   previousState: WorkModelState,
   nextState: WorkModelState,
-  event: NormalizedEvent
+  event: NormalizedEvent,
+  planBlocks: { previous: PlanTaskBlocks; next: PlanTaskBlocks },
+  childSpans: readonly ChildTranscriptSpan[]
 ): WorkEventInfo | undefined {
   if (event.kind === "assistant_text_delta" && nextState.currentSegmentId === previousState.currentSegmentId) {
     return undefined;
@@ -2014,6 +2157,7 @@ export function projectWorkEvent(
   }
 
   const agents: WorkAgentStateView[] = [];
+  let childOf: Map<string, ChildTranscriptSpan> | undefined;
   const taskTotals: WorkTaskTotalsView[] = [];
   for (const phase of nextState.phases) {
     if (phase.revision !== revision) continue;
@@ -2030,12 +2174,11 @@ export function projectWorkEvent(
     for (const agent of phase.agents) {
       if (agent.revision !== revision) continue;
       agents.push({
-        runStartedAt: agent.runStartedAt ?? agent.startedAt,
+        ...agentRuns(agent, (childOf ??= childSpanIndex(childSpans)).get(agent.toolUseId)),
         toolUseId: agent.toolUseId,
         status: agent.status,
         childCount: agent.childCount,
         failCount: agent.failCount,
-        elapsedMs: agent.elapsedMs,
         tokens: agent.tokens,
         modelMeasured: agent.modelMeasured,
         revision: agent.revision,
@@ -2051,17 +2194,12 @@ export function projectWorkEvent(
     touched = true;
   }
 
-  if (
-    nextState.tasks !== previousState.tasks ||
-    nextState.tasks.some((task) => task.revision === revision)
-  ) {
-    info.tasks = nextState.tasks.map((task) => ({
-      taskKey: task.taskKey,
-      description: task.description,
-      activeForm: task.activeForm,
-      status: task.status,
-    }));
-    touched = true;
+  if (planBlocks.next !== planBlocks.previous || nextState.tasks !== previousState.tasks) {
+    const tasks = taskItemViews(nextState, planBlocks.next);
+    if (!sameTaskItemViews(tasks, taskItemViews(previousState, planBlocks.previous))) {
+      info.tasks = tasks;
+      touched = true;
+    }
   }
 
   const staled: string[] = [];
@@ -2177,6 +2315,7 @@ function isWorkAgentNode(v: unknown, depth = 0): v is WorkAgentNode {
     parentToolUseId: () => a.parentToolUseId === null || typeof a.parentToolUseId === "string",
     spawnDepth: () => isNumber(a.spawnDepth),
     agentType: () => isOptionalString(a.agentType),
+    role: () => isOptionalString(a.role),
     description: () => typeof a.description === "string",
     modelDeclared: () => isOptionalString(a.modelDeclared),
     modelMeasured: () => isOptionalString(a.modelMeasured),
@@ -2184,6 +2323,7 @@ function isWorkAgentNode(v: unknown, depth = 0): v is WorkAgentNode {
     effortMeasured: () => isOptionalString(a.effortMeasured),
     status: () => WORK_STATUSES.includes(a.status as string),
     runStartedAt: () => a.runStartedAt === undefined || isNumber(a.runStartedAt),
+    earlierRuns: () => a.earlierRuns === undefined || isSpanList(a.earlierRuns),
     startedAt: () => a.startedAt === undefined || isNumber(a.startedAt),
     endedAt: () => a.endedAt === undefined || isNumber(a.endedAt),
     elapsedMs: () => isNumber(a.elapsedMs),
@@ -2224,6 +2364,7 @@ function isWorkPhaseView(v: unknown): v is WorkPhaseView {
     isOperationCounts(p.operationCounts) &&
     isNumber(p.taskCount) &&
     isNumber(p.agentCount) &&
+    (p.externalRunCount === undefined || isNumber(p.externalRunCount)) &&
     isNumber(p.agentTokens) &&
     isNumber(p.childToolCount) &&
     isNumber(p.childFailCount) &&
@@ -2273,7 +2414,7 @@ function isPlanContextStep(value: unknown): boolean {
     removed: () => typeof row.removed === "boolean",
     startedAt: () => row.startedAt === null || isNumber(row.startedAt),
     endedAt: () => row.endedAt === null || isNumber(row.endedAt),
-    activeSpans: () => row.activeSpans === undefined || isArrayOf(row.activeSpans, isPlanSpan),
+    period: () => row.period === undefined || isPlanStepPeriod(row.period),
     tokens: () => row.tokens === undefined || row.tokens === null || isPlanTokenTotal(row.tokens),
   };
   return Object.values(checks).every(check => check());
@@ -2283,6 +2424,12 @@ function isPlanSpan(value: unknown): boolean {
   if (!value || typeof value !== "object") return false;
   const span = value as Record<string, unknown>;
   return isNumber(span.start) && isNumber(span.end) && (span.end as number) >= (span.start as number);
+}
+
+function isPlanStepPeriod(value: unknown): boolean {
+  if (!value || typeof value !== "object") return false;
+  const period = value as Record<string, unknown>;
+  return typeof period.running === "boolean" && isArrayOf(period.spans, isPlanSpan);
 }
 
 function isPlanContextPlacement(value: unknown): boolean {
@@ -2301,10 +2448,15 @@ function isPlanContext(value: unknown): boolean {
     (row.goal === undefined || typeof row.goal === "string") &&
     isNumber(row.start) &&
     isNumber(row.end) &&
+    (row.workEndedAt === undefined || isNumber(row.workEndedAt)) &&
+    (row.durationMs === undefined || row.durationMs === null || isNumber(row.durationMs)) &&
+    (row.provisional === undefined || typeof row.provisional === "boolean") &&
+    (row.blockRunning === undefined || typeof row.blockRunning === "boolean") &&
     typeof row.running === "boolean" &&
     (row.steps === undefined || isArrayOf(row.steps, isPlanContextStep)) &&
     (row.placements === undefined || isArrayOf(row.placements, isPlanContextPlacement)) &&
-    (row.tokens === undefined || row.tokens === null || isPlanTokenTotal(row.tokens))
+    (row.tokens === undefined || row.tokens === null || isPlanTokenTotal(row.tokens)) &&
+    (row.external === undefined || row.external === null || isPlanTokenTotal(row.external))
   );
 }
 
@@ -2993,9 +3145,7 @@ function isTimeBucketsPayload(v: unknown): boolean {
   if (typeof v !== "object" || v === null || Array.isArray(v)) return false;
   const { blocks, agents, backgroundTasks, bars, main, intervals, tail } = v as Record<string, unknown>;
   const checks: { [K in keyof TimeBucketView]-?: () => boolean } = {
-    subagentOnlySpans: () => (v as TimeBucketView).subagentOnlySpans === undefined ||
-      isArrayOf((v as TimeBucketView).subagentOnlySpans, span => Array.isArray(span) && span.length === 2 &&
-        isNumber(span[0]) && isNumber(span[1]) && span[1] >= span[0]),
+    subagentOnlySpans: () => (v as TimeBucketView).subagentOnlySpans === undefined || isSpanList((v as TimeBucketView).subagentOnlySpans),
     generationBoundaryAt: () => (v as TimeBucketView).generationBoundaryAt === undefined || isNumber((v as TimeBucketView).generationBoundaryAt),
     bars: () => isTimeBarsView(bars),
     main: () => main === undefined || isTimeMainView(main),
@@ -3019,6 +3169,7 @@ function isTimeBucketsPayload(v: unknown): boolean {
     // Preserve the shared-array case: the original guard selected by array identity.
     agents: () => agents === undefined || isArrayOf(agents, agents === backgroundTasks ? isTimeBackgroundTaskView : isTimeAgentView),
     backgroundTasks: () => backgroundTasks === undefined || isArrayOf(backgroundTasks, isTimeBackgroundTaskView),
+    externalRunCalls: () => (v as TimeBucketView).externalRunCalls === undefined || isArrayOf((v as TimeBucketView).externalRunCalls, isTimeExternalRunCallView),
     droppedIntervalCount: () => true,
     droppedBlockCount: () => true,
   };
@@ -3066,6 +3217,22 @@ function isTimeTailView(v: unknown): boolean {
   return Object.values(checks).every(check => check());
 }
 
+function isTimeExternalRunCallView(v: unknown): boolean {
+  if (typeof v !== "object" || v === null || Array.isArray(v)) return false;
+  const call = v as Record<string, unknown>;
+  const checks: { [K in keyof NonNullable<TimeBucketView["externalRunCalls"]>[number]]-?: () => boolean } = {
+    toolUseId: () => typeof call.toolUseId === "string",
+    turnId: () => typeof call.turnId === "string",
+    blockId: () => call.blockId === undefined || typeof call.blockId === "string",
+    stepKey: () => call.stepKey === undefined || typeof call.stepKey === "string",
+    description: () => typeof call.description === "string",
+    start: () => isNumber(call.start),
+    end: () => isNumber(call.end) && (call.end as number) >= (call.start as number),
+    open: () => typeof call.open === "boolean",
+  };
+  return Object.values(checks).every(check => check());
+}
+
 function isTimeBackgroundTaskView(v: unknown): boolean {
   if (typeof v !== "object" || v === null || Array.isArray(v)) return false;
   const lane = v as Record<string, unknown>;
@@ -3102,6 +3269,7 @@ function isTimeRequestBlockView(v: unknown): boolean {
     },
     goal: () => block.goal === undefined || typeof block.goal === "string",
     closedAt: () => block.closedAt === undefined || isNumber(block.closedAt),
+    workEndedAt: () => block.workEndedAt === undefined || isNumber(block.workEndedAt),
     steps: () => block.steps === undefined || isArrayOf(block.steps, isPlanBlockStep),
     conductorIntervals: () => block.conductorIntervals === undefined || isArrayOf(block.conductorIntervals, isTimeIntervalView),
     conductorTail: () => block.conductorTail === undefined || isNullableNumber(block.conductorTail),
@@ -3198,6 +3366,7 @@ function isPlanBlockStep(v: unknown): boolean {
     at(step.end) &&
     at(step.durationMs) &&
     (step.activeSpans === undefined || isArrayOf(step.activeSpans, isPlanSpan)) &&
+    (step.carriedTo === undefined || typeof step.carriedTo === "string") &&
     (step.startedAt === null || step.end === null || (step.end as number) >= (step.startedAt as number))
   );
 }
@@ -3218,7 +3387,7 @@ function isRoleRunView(v: unknown): boolean {
     isNumber(r.shade) &&
     isNullableNumber(r.startedAt) &&
     typeof r.running === "boolean" &&
-    (r.outcome === null || ["ok", "failed", "timeout", "refused", "stopped"].includes(r.outcome as string)) &&
+    (r.outcome === null || isExternalRunOutcome(r.outcome)) &&
     isNullableNumber(r.durationMs) && isNullableNumber(r.tokens) &&
     (r.durationPartial === undefined || typeof r.durationPartial === "boolean") &&
     (r.tokensPartial === undefined || typeof r.tokensPartial === "boolean") &&
@@ -3423,6 +3592,7 @@ export type HostToWebview =
       utteranceCount?: number;
       unreadableLineCount?: number;
       decisions?: HandoffDecisionCounts;
+      auto?: HandoffAutoStart | HandoffAutoNotice;
     }
   | {
       type: "handoffDetail";
@@ -3451,6 +3621,7 @@ export type HostToWebview =
   | { type: "sessions"; source?: "laisora" | "claude"; showHidden?: boolean; nextCursor?: string; append?: boolean; requestId: number; sessions: SessionListItem[]; complete: boolean; degraded?: SessionScanDegradation }
   | { type: "sessionRenamed"; sessionId: string; title: string; requestId?: string }
   | { type: "sessionHiddenChanged"; sessionId: string; hidden: boolean }
+  | { type: "sessionListChanged" }
   | { type: "sessionListActionFailed"; sessionId: string; action: SessionListAction; reason: string; requestId?: string }
   | { type: "analysisFailed"; kind: "action"; tabId: string; reason: string }
   | { type: "composerPrefill"; tabId: string; text: string }
@@ -3458,7 +3629,8 @@ export type HostToWebview =
   | { type: "workModel"; tabId: string; model: WorkModelPayload }
   | { type: "semanticModel"; tabId: string; model: SemanticModelPayload }
   | { type: "llmAnalysisSetting"; enabled: boolean }
-  | { type: "userSettings"; appearance?: AccentSettings; displayName?: string; composerSendKey: ComposerSendKey; askQualityCheck?: boolean; editSummaryEnabled: boolean }
+  | { type: "userSettings"; appearance?: AccentSettings; displayName?: string; composerSendKey: ComposerSendKey; askQualityCheck?: boolean; editSummaryEnabled: boolean; remoteControlCard?: boolean }
+  | { type: "remoteControlState"; tabId: string; state: RemoteControlView }
   | { type: "tabNotice"; tabId: string; text: string }
   | {
       type: "llmAnalysisRunState";
@@ -3717,6 +3889,7 @@ export interface ConversationSnapshot {
   headOmitted?: { count: number; hasConvEvent: boolean };
   backgroundActivity?: BackgroundActivitySnapshot;
   autoResumeAt?: number | null;
+  remoteControl?: RemoteControlView;
   events: NormalizedEvent[];
 }
 
@@ -3791,6 +3964,10 @@ export function isWebviewToHost(v: unknown): v is WebviewToHost {
     return hasOnlyKeys(v as Record<string, unknown>, ["type", "focused"])
       && typeof (v as { focused?: unknown }).focused === "boolean";
   }
+  if (t === "composerDrafts") {
+    const m = v as Record<string, unknown>;
+    return hasOnlyKeys(m, ["type", "tabIds"]) && isTabOrder(m.tabIds);
+  }
   if (t === "setMode") {
     return typeof tabId === "string" && isPermissionModeId((v as { mode?: unknown }).mode);
   }
@@ -3844,6 +4021,10 @@ export function isWebviewToHost(v: unknown): v is WebviewToHost {
       isToolUseIdRef(message.firstToolUseId) && isToolUseIdRef(message.lastToolUseId);
   }
   if (t === "exportTab") return typeof tabId === "string";
+  if (t === "setRemoteControl") {
+    const m = v as Record<string, unknown>;
+    return typeof tabId === "string" && (m.enabled === undefined || typeof m.enabled === "boolean") && hasOnlyKeys(m, ["type", "tabId", "enabled"]);
+  }
   if (t === "renameTab") {
     const title = (v as { title?: unknown }).title;
     return typeof tabId === "string" && typeof title === "string" && title.trim().length > 0 && title.length <= RENAME_TITLE_MAX;
@@ -4179,6 +4360,10 @@ export function isWebviewToHost(v: unknown): v is WebviewToHost {
   }
   t satisfies never;
   return false;
+}
+
+function isSpanList(value: unknown): boolean {
+  return isArrayOf(value, span => Array.isArray(span) && span.length === 2 && isNumber(span[0]) && isNumber(span[1]) && span[1] >= span[0]);
 }
 
 function isArrayOf(value: unknown, check: (item: unknown) => boolean): boolean {
@@ -5046,7 +5231,8 @@ export function isHostToWebview(v: unknown): v is HostToWebview {
       (m.contextUsage === undefined || isHandoffContextUsage(m.contextUsage)) &&
       (m.utteranceCount === undefined || typeof m.utteranceCount === "number") &&
       isUnreadableLineCount(m.unreadableLineCount) &&
-      isHandoffDecisionCounts(m.decisions)
+      isHandoffDecisionCounts(m.decisions) &&
+      (m.auto === undefined || isHandoffAutoStart(m.auto))
     );
   }
   if (t === "handoffDetail") {
@@ -5168,6 +5354,7 @@ export function isHostToWebview(v: unknown): v is HostToWebview {
     const m = v as Record<string, unknown>;
     return hasOnlyKeys(m, ["type", "sessionId", "hidden"]) && typeof m.sessionId === "string" && typeof m.hidden === "boolean";
   }
+  if (t === "sessionListChanged") return hasOnlyKeys(v as Record<string, unknown>, ["type"]);
   if (t === "sessionListActionFailed") {
     const m = v as Record<string, unknown>;
     return hasOnlyKeys(m, ["type", "sessionId", "action", "reason", "requestId"]) && typeof m.sessionId === "string" &&
@@ -5228,7 +5415,12 @@ export function isHostToWebview(v: unknown): v is HostToWebview {
       && (displayName === undefined || isDisplayName(displayName))
       && (COMPOSER_SEND_KEYS as readonly string[]).includes((v as { composerSendKey?: unknown }).composerSendKey as string)
       && [undefined, true, false].includes((v as { askQualityCheck?: unknown }).askQualityCheck as boolean | undefined)
-      && typeof (v as { editSummaryEnabled?: unknown }).editSummaryEnabled === "boolean";
+      && typeof (v as { editSummaryEnabled?: unknown }).editSummaryEnabled === "boolean"
+      && [undefined, true, false].includes((v as { remoteControlCard?: unknown }).remoteControlCard as boolean | undefined);
+  }
+  if (t === "remoteControlState") {
+    const m = v as Record<string, unknown>;
+    return typeof tabId === "string" && isRemoteControlView(m.state) && hasOnlyKeys(m, ["type", "tabId", "state"]);
   }
   if (t === "todoSnapshot") {
     const m = v as Record<string, unknown>;
@@ -5459,6 +5651,7 @@ function isWorkRequestView(value: unknown): boolean {
     typeof request.number === "string" &&
     isNumber(request.toolCount) &&
     isNumber(request.agentCount) &&
+    (request.externalRunCount === undefined || isNumber(request.externalRunCount)) &&
     isNumber(request.failCount) &&
     isNumber(request.revision)
   );
@@ -5559,6 +5752,7 @@ function isWorkAgentStateView(item: unknown): boolean {
   return (
     typeof agent.toolUseId === "string" &&
     (agent.runStartedAt === undefined || isNumber(agent.runStartedAt)) &&
+    (agent.earlierRuns === undefined || isSpanList(agent.earlierRuns)) &&
     (WORK_STATUSES as string[]).includes(agent.status as string) &&
     isNumber(agent.childCount) &&
     isNumber(agent.failCount) &&
@@ -5666,6 +5860,7 @@ function isConversationSnapshot(value: unknown): boolean {
     headOmitted: () => s.headOmitted === undefined || isHeadOmitted(s.headOmitted),
     backgroundActivity: () => s.backgroundActivity === undefined || isBackgroundActivitySnapshot(s.backgroundActivity),
     autoResumeAt: () => s.autoResumeAt === undefined || s.autoResumeAt === null || isNumber(s.autoResumeAt),
+    remoteControl: () => s.remoteControl === undefined || isRemoteControlView(s.remoteControl),
     handoffSource: () => s.handoffSource === undefined || isHandoffSource(s.handoffSource),
     events: () => (Array.isArray(s.events)) && ((s.events as unknown[]).every(isPlausibleNormalizedEvent)),
     configModel: () => true,
@@ -5779,6 +5974,8 @@ function isTimeAgentView(value: unknown): boolean {
     blockId: () => true,
     start: () => true,
     end: () => true,
+    earlierRuns: () => row.earlierRuns === undefined || isSpanList(row.earlierRuns),
+    resumedAt: () => row.resumedAt === undefined || isNumber(row.resumedAt),
     open: () => true,
     isBackground: () => true,
     description: () => true,

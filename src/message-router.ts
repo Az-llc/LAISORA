@@ -5,7 +5,7 @@ import { setComposerFocus } from "./composer-paste";
 import { handleAnalysisMessage } from "./analysis-messages";
 import { handleConversationMessage } from "./conversation-lifecycle";
 import { openEditDiff } from "./edit-diff-host";
-import { handleHandoffMessage } from "./handoff-wiring";
+import { handleHandoffMessage, noteComposerDrafts } from "./handoff-wiring";
 import { handleResumeMessage } from "./resume-hydration";
 import { handleSurfaceMessage, reorderSessionTabs } from "./store-surfaces";
 import { runHostActionMessage, userSettingsMessage } from "./gateway-host-actions";
@@ -53,6 +53,7 @@ export async function handleWebviewMessage(
       case "setMode":
       case "setEffort":
       case "setModel":
+      case "setRemoteControl":
         await handleConversationMessage(st, msg, target);
         break;
       case "startHandoff":
@@ -95,6 +96,9 @@ export async function handleWebviewMessage(
         break;
       case "composerFocus":
         setComposerFocus(sender, msg.focused);
+        break;
+      case "composerDrafts":
+        noteComposerDrafts(sender, msg.tabIds);
         break;
       case "runHostAction":
         await runHostActionMessage(msg);

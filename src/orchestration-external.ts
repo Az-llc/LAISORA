@@ -13,7 +13,7 @@ import type { ApiKeyPolicy } from "./protocol";
 
 export { isExternalRows, isExternalTimeout } from "./orchestration-roster";
 export type { ExternalRow } from "./orchestration-roster";
-import { EXECUTORS, EXTERNAL_EXECUTORS, isExternalExecutorId, isExternalModel, tokenUsage, type TokenUsage, type ExecutorProbe } from "./orchestration-executors";
+import { EXECUTORS, EXTERNAL_EXECUTORS, isExternalExecutorId, isExternalModel, isExternalRunOutcome, tokenUsage, type ExternalRunOutcome, type TokenUsage, type ExecutorProbe } from "./orchestration-executors";
 export { tokenUsage, parseAgyModels, parseCodexModels } from "./orchestration-executors";
 export type { TokenUsage } from "./orchestration-executors";
 export const WINDOWS_COMMAND_LINE_UTF16_LIMIT = 32767;
@@ -29,7 +29,7 @@ export interface ExternalRunRecord {
   readonly startedAt: string;
   readonly endedAt: string;
   readonly durationMs: number;
-  readonly outcome: "ok" | "failed" | "timeout" | "refused" | "stopped";
+  readonly outcome: ExternalRunOutcome;
   readonly reason?: string;
   readonly usage?: TokenUsage;
   readonly runId?: string;
@@ -115,7 +115,6 @@ export async function appendRunRecord(directory: string, record: OrchestrationRu
   await appendFile(join(directory, "runs.jsonl"), `${JSON.stringify(record)}\n`, "utf8");
 }
 
-const OUTCOMES: readonly ExternalRunRecord["outcome"][] = ["ok", "failed", "timeout", "refused", "stopped"];
 const timestamp = (value: unknown): value is string => typeof value === "string" && Number.isFinite(Date.parse(value));
 
 export function decodeExternalRunRecord(raw: unknown): ExternalRunRecord | undefined {
@@ -123,7 +122,7 @@ export function decodeExternalRunRecord(raw: unknown): ExternalRunRecord | undef
   const r = raw as Record<string, unknown>;
   if (r.kind !== "external" || typeof r.role !== "string" || !/^[a-z][a-z0-9-]*$/.test(r.role) || !isExternalExecutorId(r.executor)) return undefined;
   if (!timestamp(r.startedAt) || !timestamp(r.endedAt) || typeof r.durationMs !== "number" || !Number.isFinite(r.durationMs) || r.durationMs < 0) return undefined;
-  if (!OUTCOMES.includes(r.outcome as ExternalRunRecord["outcome"])) return undefined;
+  if (!isExternalRunOutcome(r.outcome)) return undefined;
   if (r.model !== undefined && (!isExternalModel(r.model) || r.model === "")) return undefined;
   if (r.effort !== undefined && (typeof r.effort !== "string" || !/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(r.effort))) return undefined;
   if ((r.cwd !== undefined && typeof r.cwd !== "string") || (r.reason !== undefined && typeof r.reason !== "string")) return undefined;
@@ -172,7 +171,8 @@ export function decodeAgentRunRecord(raw: unknown): AgentRunRecord | undefined {
   return Object.freeze({ ...r, usage: tokenUsage(r.usage) }) as unknown as AgentRunRecord;
 }
 
-export async function readRunRecords(directory: string, select: (raw: Record<string, unknown>) => boolean = () => true) {
+export async function readRunRecords(directory: string, select: (raw: Record<string, unknown>) => boolean = () => true,
+  countsUnreadable: (raw: Record<string, unknown>) => boolean = select) {
   let text: string;
   try { text = await readFile(join(directory, "runs.jsonl"), "utf8"); }
   catch (error) { return { runs: [] as OrchestrationRunRecord[], unreadableLines: 0, readError: (error as NodeJS.ErrnoException).code !== "ENOENT" }; }
@@ -184,14 +184,24 @@ export async function readRunRecords(directory: string, select: (raw: Record<str
     try { raw = JSON.parse(line); } catch { unreadableLines++; continue; }
     if (!raw || typeof raw !== "object" || !select(raw as Record<string, unknown>)) continue;
     const run = decodeExternalRunRecord(raw) ?? decodeAgentRunRecord(raw);
-    if (run) runs.push(run); else unreadableLines++;
+    if (run) runs.push(run); else if (countsUnreadable(raw as Record<string, unknown>)) unreadableLines++;
   }
   return { runs, unreadableLines, readError: false };
 }
 
 export async function readSessionExternalRuns(directory: string, sessionId: string): Promise<SessionExternalRuns> {
-  const result = await readRunRecords(directory, raw => raw.sessionId === sessionId && raw.kind !== "agent");
-  return { ...result, runs: result.runs.filter((run): run is ExternalRunRecord => run.kind === "external") };
+  return (await readExternalRunsForSession(directory, sessionId)).session;
+}
+
+export async function readExternalRunsForSession(directory: string, sessionId: string):
+  Promise<{ session: SessionExternalRuns; byToolUseId: ReadonlyMap<string, ExternalRunRecord> }> {
+  const ofSession = (raw: Record<string, unknown>) => raw.sessionId === sessionId && raw.kind !== "agent";
+  const result = await readRunRecords(directory, raw => ofSession(raw) || raw.kind === "external" && typeof raw.toolUseId === "string", ofSession);
+  const external = result.runs.filter((run): run is ExternalRunRecord => run.kind === "external");
+  return {
+    session: { ...result, runs: external.filter(run => run.sessionId === sessionId) },
+    byToolUseId: new Map(external.flatMap(run => run.toolUseId !== undefined ? [[run.toolUseId, run] as const] : [])),
+  };
 }
 
 export function resolveExternalExecutable(executor: ExternalRow["executor"], env = process.env, platform = process.platform): string | undefined {

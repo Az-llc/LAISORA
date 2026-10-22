@@ -11,10 +11,17 @@ import { resolveOrchestrationCacheTtl, emptyOrchestrationRole, externalExecutorN
 import { type OrchestrationSettingRow, type RecommendedRosterChange } from "../orchestration-roster";
 import * as l10n from "@vscode/l10n";
 import { uiLocale } from "./l10n";
+import { CACHE_EXPIRY_LEAD_MS, CACHE_EXPIRY_MIN_TOTAL_TOKENS } from "../handoff-auto";
 import { CLAUDE_MODEL_PRICES, PROMPT_CACHE_PRICES_CHECKED_ON, PROMPT_CACHE_WRITE_MULTIPLIER, type TokenPrices } from "../claude-prices";
 import {
   FILE_LINK_BOOLEAN_SETTINGS,
+  HANDOFF_AUTO_PERCENT_MAX,
+  HANDOFF_AUTO_PERCENT_MIN,
+  HANDOFF_AUTO_TOKENS_MIN,
+  isHandoffAutoSettingValue,
   isHostToSettingsPage,
+  type HandoffAutoMode,
+  type HandoffAutoSettingName,
   type ApiKeyPolicy,
   type ComposerSendKey,
   type FileLinkBooleanSetting,
@@ -100,12 +107,12 @@ function rowNote(text: HTMLElement, className: string, note: string): HTMLElemen
 }
 
 function switchButton(id: string): HTMLButtonElement {
-  const button = element("button", "settings-switch");
+  const button = element("button", "l-switch");
   button.id = id;
   button.type = "button";
   button.setAttribute("role", "switch");
   button.disabled = true;
-  button.appendChild(element("span", "settings-switch-thumb"));
+  button.appendChild(element("span", "l-switch-thumb"));
   return button;
 }
 
@@ -398,6 +405,80 @@ const todoCard = section(generalCategory, "ToDo");
 const todoSwitch = switchButton("setting-todo-enabled");
 const todoText = row(todoCard, l10n.t("(Beta) Enable ToDo"), l10n.t("The ToDo tab, drawer and cats switch right away. Claude's ToDo tools are available from the next conversation you start or resume."), todoSwitch);
 
+const handoffAutoCard = section(generalCategory, l10n.t("Automatic handoff"));
+function numberInput(id: string, min: number | undefined, max: number | undefined, step: string): HTMLInputElement {
+  const input = element("input", "settings-input");
+  input.id = id;
+  input.type = "number";
+  if (min !== undefined) input.min = String(min);
+  if (max !== undefined) input.max = String(max);
+  input.step = step;
+  input.required = true;
+  input.disabled = true;
+  return input;
+}
+const handoffAutoModeSelect = select<HandoffAutoMode>([
+  ["ratio", l10n.t("Share of the automatic compact amount")],
+  ["tokens", l10n.t("Token count")],
+]);
+handoffAutoModeSelect.id = "setting-handoff-auto-mode";
+const handoffAutoControls = {
+  enabled: switchButton("setting-handoff-auto-enabled"),
+  mode: handoffAutoModeSelect,
+  percent: numberInput("setting-handoff-auto-percent", HANDOFF_AUTO_PERCENT_MIN, HANDOFF_AUTO_PERCENT_MAX, "1"),
+  tokens: numberInput("setting-handoff-auto-tokens", HANDOFF_AUTO_TOKENS_MIN, undefined, "1"),
+  cacheExpiryEnabled: switchButton("setting-handoff-cache-expiry-enabled"),
+} satisfies Record<HandoffAutoSettingName, HTMLElement>;
+const handoffAutoTexts: Record<HandoffAutoSettingName, HTMLElement> = {
+  enabled: row(handoffAutoCard, l10n.t("Hand off automatically when the context is large"), l10n.t("When a conversation finishes its turn and is waiting with a context at or above the threshold below, hand it off to a new conversation. It starts only when nothing runs in the background, no message is waiting to be sent and the message box is empty, and at most once per conversation."), handoffAutoControls.enabled),
+  mode: row(handoffAutoCard, l10n.t("Threshold"), l10n.t("Share: a share of the amount at which Claude Code compacts the conversation automatically. Token count: a fixed number of tokens, or that automatic compact amount if it is smaller."), handoffAutoControls.mode),
+  percent: row(handoffAutoCard, l10n.t("Share"), HANDOFF_AUTO_PERCENT_MIN !== undefined && HANDOFF_AUTO_PERCENT_MAX !== undefined
+    ? l10n.t("Percent of the automatic compact amount, from {0}% to {1}%.", HANDOFF_AUTO_PERCENT_MIN, HANDOFF_AUTO_PERCENT_MAX)
+    : l10n.t("Percent of the automatic compact amount."), handoffAutoControls.percent),
+  tokens: row(handoffAutoCard, l10n.t("Token count"), HANDOFF_AUTO_TOKENS_MIN !== undefined
+    ? l10n.t("Context tokens, {0} or more.", HANDOFF_AUTO_TOKENS_MIN.toLocaleString(uiLocale()))
+    : l10n.t("Token count"), handoffAutoControls.tokens),
+  cacheExpiryEnabled: row(handoffAutoCard, l10n.t("Hand off before the prompt cache expires"), l10n.t("When a waiting conversation's last reply was cached for 1 hour, work is unfinished (a PLAN step or an unanswered decision) and the context holds at least {0} tokens, hand it off {1} minutes before that cache expires unless you send a message first. The same background and message box conditions apply.", CACHE_EXPIRY_MIN_TOTAL_TOKENS.toLocaleString(uiLocale()), CACHE_EXPIRY_LEAD_MS / 60_000), handoffAutoControls.cacheExpiryEnabled),
+};
+handoffAutoControls.percent.parentElement?.appendChild(element("span", "settings-input-unit", "%"));
+const pendingHandoffAuto: Record<HandoffAutoSettingName, number | null> = { enabled: null, mode: null, percent: null, tokens: null, cacheExpiryEnabled: null };
+function requestHandoffAutoSetting(setting: HandoffAutoSettingName, value: boolean | number | string): void {
+  if (current?.handoffAuto === undefined || pendingHandoffAuto[setting] !== null) return;
+  if (!isHandoffAutoSettingValue(setting, value)) {
+    const control = handoffAutoControls[setting];
+    if (control instanceof HTMLInputElement) control.reportValidity();
+    return;
+  }
+  const requestId = nextRequestId();
+  pendingHandoffAuto[setting] = requestId;
+  handoffAutoControls[setting].disabled = true;
+  post({ type: "setHandoffAutoSetting", requestId, setting, value });
+}
+function renderHandoffAuto(state: SettingsState): void {
+  const settings = state.handoffAuto;
+  for (const name of Object.keys(pendingHandoffAuto) as HandoffAutoSettingName[]) {
+    if (pendingHandoffAuto[name] === state.replyTo) pendingHandoffAuto[name] = null;
+  }
+  if (settings === undefined) return;
+  const { enabled, mode, percent, tokens, cacheExpiryEnabled } = handoffAutoControls;
+  enabled.setAttribute("aria-checked", String(settings.enabled));
+  enabled.disabled = pendingHandoffAuto.enabled !== null;
+  mode.querySelector(".settings-option-unknown")?.remove();
+  if (pendingHandoffAuto.mode === null) mode.value = settings.mode;
+  mode.disabled = pendingHandoffAuto.mode !== null || !settings.enabled;
+  if (pendingHandoffAuto.percent === null && document.activeElement !== percent) percent.value = String(settings.percent);
+  percent.disabled = pendingHandoffAuto.percent !== null || !settings.enabled || settings.mode !== "ratio";
+  if (pendingHandoffAuto.tokens === null && document.activeElement !== tokens) tokens.value = String(settings.tokens);
+  tokens.disabled = pendingHandoffAuto.tokens !== null || !settings.enabled || settings.mode !== "tokens";
+  cacheExpiryEnabled.setAttribute("aria-checked", String(settings.cacheExpiryEnabled));
+  cacheExpiryEnabled.disabled = pendingHandoffAuto.cacheExpiryEnabled !== null;
+}
+handoffAutoControls.enabled.addEventListener("click", () => requestHandoffAutoSetting("enabled", current?.handoffAuto?.enabled !== true));
+handoffAutoControls.cacheExpiryEnabled.addEventListener("click", () => requestHandoffAutoSetting("cacheExpiryEnabled", current?.handoffAuto?.cacheExpiryEnabled !== true));
+handoffAutoControls.mode.addEventListener("change", () => requestHandoffAutoSetting("mode", handoffAutoControls.mode.value));
+handoffAutoControls.percent.addEventListener("change", () => requestHandoffAutoSetting("percent", handoffAutoControls.percent.valueAsNumber));
+handoffAutoControls.tokens.addEventListener("change", () => requestHandoffAutoSetting("tokens", handoffAutoControls.tokens.valueAsNumber));
+
 const sendKeySelect = select<ComposerSendKey>([
   ["enter", "Enter"],
   ["shiftEnter", "Shift+Enter"],
@@ -443,12 +524,12 @@ initialModelSelect.addEventListener("change", () => {
   post({ type: "setInitialModel", requestId: pendingInitialModel, model: initialModelSelect.value });
 });
 
-const restoreSwitch = element("button", "settings-switch");
+const restoreSwitch = element("button", "l-switch");
 restoreSwitch.id = "setting-restore-tabs";
 restoreSwitch.type = "button";
 restoreSwitch.setAttribute("role", "switch");
 restoreSwitch.disabled = true;
-restoreSwitch.appendChild(element("span", "settings-switch-thumb"));
+restoreSwitch.appendChild(element("span", "l-switch-thumb"));
 const restoreText = row(
   chatCard,
   l10n.t("Restore tabs on startup"),
@@ -481,6 +562,8 @@ const autoContinueSwitch = switchButton("setting-auto-continue-usage-limit");
 row(chatCard, l10n.t("Resume automatically when the usage limit resets"), l10n.t("When the claude.ai usage limit stops a conversation, continue it automatically after the limit resets. The same setting is used by Claude Code in the terminal."), autoContinueSwitch);
 const editSummarySwitch = switchButton("setting-edit-summary-enabled");
 const editSummaryText = row(chatCard, l10n.t("Show edited files after each reply"), l10n.t("At the end of each reply, list the files Claude edited in that turn with the lines added and removed. Click a file to compare it before and after the turn."), editSummarySwitch);
+const remoteControlCardSwitch = switchButton("setting-remote-control-card");
+const remoteControlCardText = row(chatCard, l10n.t("Show the Remote Control card"), l10n.t("When Remote Control turns on for a conversation, show a card in the conversation with the claude.ai link, the connection state and when the session is reachable. The card also shows when Remote Control turns off."), remoteControlCardSwitch);
 
 const apiKeyGroup = element("div", "settings-segmented");
 apiKeyGroup.id = "setting-api-key-policy";
@@ -947,7 +1030,7 @@ function lockOrchestration(): void {
   }
 }
 function settingsHiddenLabel(control: HTMLElement, title: string): HTMLLabelElement {
-  const label = element("label", "settings-visually-hidden", title);
+  const label = element("label", "l-visually-hidden", title);
   label.htmlFor = control.id;
   return label;
 }
@@ -1000,7 +1083,7 @@ function renderOrchestration(state: SettingsState): void {
           ? l10n.t("Inspects a finished change. It looks with eyes other than the author's, so use opus, Antigravity or Codex.") : undefined;
     if (goldenRule) {
       role.title = goldenRule;
-      const accessibleRule = element("span", "settings-visually-hidden", goldenRule);
+      const accessibleRule = element("span", "l-visually-hidden", goldenRule);
       accessibleRule.id = `roster-${index}-golden-rule`;
       role.setAttribute("aria-describedby", accessibleRule.id);
       header.appendChild(accessibleRule);
@@ -1256,7 +1339,7 @@ generalCategory.appendChild(footer);
 let current: SettingsState | null = null;
 let requestSerial = 0;
 const nextRequestId = (): number => ++requestSerial;
-const pending: { autoContinue: number | null; restore: number | null; apiKey: number | null; guard: number | null; memoryBlockProjectType: number | null; todo: number | null; editSummary: number | null } = { autoContinue: null, restore: null, apiKey: null, guard: null, memoryBlockProjectType: null, todo: null, editSummary: null };
+const pending: { autoContinue: number | null; restore: number | null; apiKey: number | null; guard: number | null; memoryBlockProjectType: number | null; todo: number | null; editSummary: number | null; remoteControlCard: number | null } = { autoContinue: null, restore: null, apiKey: null, guard: null, memoryBlockProjectType: null, todo: null, editSummary: null, remoteControlCard: null };
 const pendingAutoUpdate = new Map<ExecutorId, number>();
 const pendingFileLink: Record<FileLinkBooleanSetting, number | null> = {
   fileLinkInstruction: null,
@@ -1289,6 +1372,8 @@ function writeAnchor(message: SettingsPageToHost): HTMLElement | undefined {
     case "setMemoryBlockProjectType": return memoryBlockProjectTypeText;
     case "setTodoEnabled": return todoText;
     case "setEditSummaryEnabled": return editSummaryText;
+    case "setRemoteControlCard": return remoteControlCardText;
+    case "setHandoffAutoSetting": return handoffAutoTexts[message.setting];
     case "setApiKeyPolicy": return apiKeyText;
     case "setFileLinkSetting": return message.setting === "openWithSystemApp" ? extensionText : rowTextOf(fileLinkSwitches[message.setting]);
     case "setOrchestrationSetting":
@@ -1371,6 +1456,10 @@ function render(state: SettingsState): void {
   if (pending.editSummary === state.replyTo) pending.editSummary = null;
   editSummarySwitch.setAttribute("aria-checked", String(state.editSummaryEnabled));
   editSummarySwitch.disabled = pending.editSummary !== null;
+  if (pending.remoteControlCard === state.replyTo) pending.remoteControlCard = null;
+  remoteControlCardSwitch.setAttribute("aria-checked", String(state.remoteControlCard));
+  remoteControlCardSwitch.disabled = pending.remoteControlCard !== null;
+  renderHandoffAuto(state);
   if (pending.restore === state.replyTo) pending.restore = null;
   if (pending.apiKey === state.replyTo) pending.apiKey = null;
   for (const key of FILE_LINK_BOOLEAN_SETTINGS) {
@@ -1475,6 +1564,13 @@ editSummarySwitch.addEventListener("click", () => {
   pending.editSummary = requestId;
   editSummarySwitch.disabled = true;
   post({ type: "setEditSummaryEnabled", requestId, enabled: !current.editSummaryEnabled });
+});
+remoteControlCardSwitch.addEventListener("click", () => {
+  if (current === null || pending.remoteControlCard !== null) return;
+  const requestId = nextRequestId();
+  pending.remoteControlCard = requestId;
+  remoteControlCardSwitch.disabled = true;
+  post({ type: "setRemoteControlCard", requestId, enabled: !current.remoteControlCard });
 });
 for (const key of FILE_LINK_BOOLEAN_SETTINGS) {
   const control = fileLinkSwitches[key];

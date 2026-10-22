@@ -1,12 +1,13 @@
 import * as l10n from "@vscode/l10n";
 import { ROW_H } from "./row-frame";
-import { planConductorRunning, planFrame, planLive, planMemberEnd, planNow, planRowIndexAt, planRowPeriod, planRowProvisional, planSpansMs, UNMEASURED_LABEL, type PlanFrameMembers, type PlanRowPeriod, type PlanSpan } from "../plan-steps";
+import { blockElapsedMs, planConductorRunning, planMemberDelegationCount, planFrame, planLive, planMemberEnd, planNow, PLAN_CONDUCTOR_BUCKETS, planRowConductorParts, planRowIndexAt, planRowPeriod, planRowProvisional, planSpansMs, UNMEASURED_LABEL, type PlanFrameMembers, type PlanRowPeriod, type PlanSpan } from "../plan-steps";
 import { displayedAncestorUsageGap, type SemanticModelPayload, type TimeBucketsCoverage, type WorkAgentNode, type WorkModelPayload } from "../protocol";
 import type { AgentSpanView, BackgroundTaskSpanView, ConductorModel, PlanBlockStepView, RequestBlockView, TimeBucket, TimeBucketInterval, TimeBucketView } from "../time-buckets";
 import type { AgentInspector, InspectorAxis } from "./agent-inspector";
 import { failureCount } from "./failure-count";
 import { formatDuration, clock, dayClock } from "./format";
 import { formatDateTime } from "./l10n";
+import { memberRunTimes, runElapsedMs, runSpans } from "../spans";
 import { termSpan, type TermKey } from "./term";
 
 export const NO_WORK_SUMMARY_TEXT = l10n.t("No work summary yet.");
@@ -294,12 +295,13 @@ interface GraphRow {
   conductorIntervals?: TimeBucketInterval[];
   conductorTail?: number;
   conductorModels?: ConductorModel[];
+  conductorWork?: TimeBucketInterval[];
   block?: RequestBlockView;
   agent?: AgentSpanView;
   bgTask?: BackgroundTaskSpanView;
   parentBlock?: RequestBlockView;
   parentItem?: RowKey;
-  members?: { agents: AgentSpanView[]; bgTasks: BackgroundTaskSpanView[] };
+  members?: PlanFrameMembers;
   // Head rows only: the number and title src/plan-steps.ts#planFrame gives both GRAPH and ANALYSIS.
   number?: string;
   title?: string;
@@ -311,6 +313,15 @@ interface GraphRow {
 }
 
 type FoldKind = "reply" | "confirm" | "unobserved";
+
+function cardTimeRows(parts: readonly (number | null)[], duration: (ms: number) => string): [TermKey, string][] {
+  const terms: Record<(typeof PLAN_CONDUCTOR_BUCKETS)[number], TermKey> = { generate: "LLM generation", tool: "Tool execution",
+    delegation: "Waiting for subagent", confirm: "Waiting for your answer", reply: "Waiting for reply" };
+  return PLAN_CONDUCTOR_BUCKETS.flatMap((bucket, index) => {
+    const ms = parts[index];
+    return ms === null || ms === undefined || bucket === "delegation" && ms === 0 ? [] : [[terms[bucket], duration(ms)] as [TermKey, string]];
+  });
+}
 
 function isFoldBucket(bucket: TimeBucket): bucket is "reply" | "confirm" {
   return bucket === "reply" || bucket === "confirm";
@@ -397,8 +408,8 @@ function titled<T extends SVGElement>(el: T, text: string): T {
 }
 
 function blockDuration(b: RequestBlockView, end: number): string {
-  if (b.durationMs === null) return l10n.t("Not measured");
-  return `${b.metrics?.provisional ? "≈" : ""}${formatDuration(b.running ? Math.max(b.durationMs, end - b.start) : b.durationMs)}`;
+  const elapsed = blockElapsedMs(b, end);
+  return `${elapsed.provisional ? "≈" : ""}${formatDuration(elapsed.ms)}`;
 }
 
 function clip(text: string, max: number): string {
@@ -856,11 +867,11 @@ export class WorkGraph {
       const conductor = row.item === undefined ? { conductorSpans: row.conductorSpans, conductorOpenFrom: row.conductorOpenFrom,
         conductorIntervals: row.conductorWork.filter(interval => interval.bucket !== "reply"), conductorTail: row.conductorTail } : {};
       const intervals = row.item?.conductorIntervals ?? conductor.conductorIntervals ?? [];
-      const blockEnd = planRowPeriod({ kind: "block", block: parentBlock, members: { agents: [], bgTasks: [] } }, now, live)!.end;
+      const blockEnd = planRowPeriod({ kind: "block", block: parentBlock, members: { agents: [], bgTasks: [], externalRuns: [] } }, now, live)!.end;
       const starts = [...(period ? [period.start] : []), ...intervals.map(interval => interval.start)];
       const ends = [...(period ? [period.end] : []), ...intervals.map(interval => interval.end)];
       const extent: [number, number] = starts.length === 0 ? [blockEnd, blockEnd] : [Math.min(...starts), Math.max(...ends)];
-      const head = { item: row.item, parentBlock, period, provisional, extent, conductorModels: row.conductorModels, ...conductor };
+      const head = { item: row.item, parentBlock, period, provisional, extent, conductorModels: row.conductorModels, conductorWork: row.conductorWork, ...conductor };
       rows.push({ key: row.key, kind: "item", members: row.members, number: row.number, title: row.title, ...head });
       if (this.expandedItems.has(row.key)) {
         rows.push({ key: row.key.replace(/^item:/, "conductor:"), kind: "conductor", parentItem: row.key, ...head });
@@ -874,14 +885,15 @@ export class WorkGraph {
   private memberRows(rows: GraphRow[], members: PlanFrameMembers, now: number, live: boolean, parentBlock?: RequestBlockView, parentItem?: RowKey): void {
     const period = (member: AgentSpanView | BackgroundTaskSpanView): Pick<GraphRow, "period" | "extent"> => {
       const end = planMemberEnd(member, now, live);
-      return { period: { start: member.start, end, running: live && member.open, spans: [{ start: member.start, end }] }, extent: [member.start, end] };
+      const spans = runSpans(memberRunTimes(member, end)).map(([start, stop]) => ({ start, end: stop }));
+      return { period: { start: member.start, end, running: live && member.open, spans }, extent: [member.start, end] };
     };
     for (const agent of members.agents) rows.push({ key: `agent:${agent.toolUseId}`, kind: "agent", agent, parentBlock, parentItem, ...period(agent) });
     for (const bg of members.bgTasks) rows.push({ key: `bg:${bg.toolUseId}`, kind: "bg", bgTask: bg, parentBlock, parentItem, ...period(bg) });
   }
 
   private subagentCount(row: GraphRow): number {
-    return (row.members?.agents.length ?? 0) + (row.members?.bgTasks.filter((bg) => bg.subagent).length ?? 0);
+    return planMemberDelegationCount(row.members);
   }
 
   private togglableKeys(): RowKey[] {
@@ -1028,8 +1040,9 @@ export class WorkGraph {
       }
     }
     for (const a of this.hiddenCategories.has("sub") ? [] : view.agents) {
-      const aEnd = planMemberEnd(a, end, planLive(view));
-      mini.appendChild(svgEl("rect", { x: px(a.start), y: 23, width: Math.max(0.8, px(aEnd) - px(a.start)), height: 4, class: `wg-seg wg-seg-sub${a.open ? " open" : ""}`, rx: 1 }));
+      for (const [runStart, runEnd] of runSpans(memberRunTimes(a, planMemberEnd(a, end, planLive(view))))) {
+        mini.appendChild(svgEl("rect", { x: px(runStart), y: 23, width: Math.max(0.8, px(runEnd) - px(runStart)), height: 4, class: `wg-seg wg-seg-sub${a.open ? " open" : ""}`, rx: 1 }));
+      }
     }
     for (const bg of this.hiddenCategories.has("sub") ? [] : view.backgroundTasks ?? []) {
       const bgEnd = planMemberEnd(bg, end, planLive(view));
@@ -1278,21 +1291,27 @@ export class WorkGraph {
       } else if (row.agent !== undefined) {
         const a = row.agent;
         const aEnd = row.extent[1];
-        addLabels(agentLabel(a), [l10n.t("Subagent"), a.subagentType, a.model].filter(Boolean).join(" · "), formatDuration(aEnd - a.start), agentLabel(a), a.model);
+        const aMs = runElapsedMs(memberRunTimes(a, aEnd));
+        addLabels(agentLabel(a), [l10n.t("Subagent"), a.subagentType, a.model].filter(Boolean).join(" · "), formatDuration(aMs), agentLabel(a), a.model);
         if (drawBars && !this.hiddenCategories.has("sub")) {
-          const x0 = scale.x(Math.max(a.start, range.start));
-          const x1 = scale.x(Math.min(aEnd, range.end));
-          g.appendChild(svgEl("path", { d: `M ${x0} ${this.narrow ? cy - 8 : y - 2} V ${cy} h 4`, class: "wg-sub-link" }));
-          const bar = svgEl("rect", { x: x0, y: cy - (this.narrow ? 3 : 4), width: Math.max(2, x1 - x0), height: this.narrow ? 6 : 8, class: `wg-seg wg-seg-sub${a.open ? " open" : ""}` });
-          bar.dataset.bucket = "sub";
-          const clipA = this.clipped(a.start, aEnd, range);
-          if (clipA !== undefined) bar.dataset.clipped = clipA;
-          titled(bar, segTitle(l10n.t("Subagent"), a.start, row.period?.running ? null : aEnd, clipA !== undefined ? l10n.t("Continues outside the window") : undefined));
-          g.appendChild(bar);
+          const runs = row.period?.spans ?? [{ start: a.start, end: aEnd }];
+          g.appendChild(svgEl("path", { d: `M ${scale.x(Math.max(a.start, range.start))} ${this.narrow ? cy - 8 : y - 2} V ${cy} h 4`, class: "wg-sub-link" }));
+          runs.forEach((run, index) => {
+            const last = index === runs.length - 1;
+            if (runs.length > 1 && (run.end < range.start || run.start > range.end)) return;
+            const x0 = scale.x(Math.max(run.start, range.start));
+            const x1 = scale.x(Math.min(run.end, range.end));
+            const bar = svgEl("rect", { x: x0, y: cy - (this.narrow ? 3 : 4), width: Math.max(2, x1 - x0), height: this.narrow ? 6 : 8, class: `wg-seg wg-seg-sub${a.open && last ? " open" : ""}` });
+            bar.dataset.bucket = "sub";
+            const clipA = this.clipped(run.start, run.end, range);
+            if (clipA !== undefined) bar.dataset.clipped = clipA;
+            titled(bar, segTitle(l10n.t("Subagent"), run.start, row.period?.running && last ? null : run.end, clipA !== undefined ? l10n.t("Continues outside the window") : undefined));
+            g.appendChild(bar);
+          });
         }
         if (row.period?.running) g.classList.add("running");
         const name = agentLabel(a);
-        g.setAttribute("aria-label", `${a.description ? `${l10n.t("Subagent")} ` : ""}${clip(name, 40)} ${clock(a.start)} ${formatDuration(aEnd - a.start)}${outsideSuffix}`);
+        g.setAttribute("aria-label", `${a.description ? `${l10n.t("Subagent")} ` : ""}${clip(name, 40)} ${clock(a.start)} ${formatDuration(aMs)}${outsideSuffix}`);
       } else if (row.kind === "bg" && row.bgTask !== undefined) {
         const bg = row.bgTask;
         const bgEnd = row.extent[1];
@@ -1400,7 +1419,7 @@ export class WorkGraph {
         kind: "agent",
         agentId,
         label: agentLabel(a),
-        meta: [a.subagentType, a.model, formatDuration(a.end - a.start)].filter((v) => v !== undefined && v !== "").join(" · "),
+        meta: [a.subagentType, a.model, formatDuration(runElapsedMs(memberRunTimes(a)))].filter((v) => v !== undefined && v !== "").join(" · "),
         axis: this.axisFor(a.start, a.end),
         stats: { toolCount: a.toolCount, failCount: a.failCount },
       }, opener);
@@ -1425,7 +1444,7 @@ export class WorkGraph {
       this.inspector.open({
         kind: "block",
         label: clip(b.text, 60),
-        meta: `${clock(b.anchorAt)} · ${blockDuration(b, b.end)}`,
+        meta: `${clock(b.anchorAt)} · ${blockDuration(b, planNow({ blocks: [b], agents: [], backgroundTasks: [], lastAt: b.end }, this.lastTickMs, this.running))}`,
         axis: this.axisFor(b.anchorAt, b.end),
         text: b.text,
         rows: this.blockRows(b),
@@ -1435,17 +1454,15 @@ export class WorkGraph {
 
   private blockRows(b: RequestBlockView): [TermKey | Node, string | Node][] {
     const text = (s: string) => document.createTextNode(s);
-    const duration = (ms: number) => `${b.metrics?.provisional ? "≈" : ""}${formatDuration(ms)}`;
+    const now = planNow({ blocks: [b], agents: [], backgroundTasks: [], lastAt: b.end }, this.lastTickMs, this.running);
+    const provisional = blockElapsedMs(b, now).provisional;
+    const duration = (ms: number) => `${provisional ? "≈" : ""}${formatDuration(ms)}`;
     const rows: [TermKey | Node, string | Node][] = [
       [text(l10n.t("Kind")), b.kind === "plan" ? l10n.t("Work block") : l10n.t("Request block (a person's message)")],
       [text(l10n.t("Start")), formatDateTime(b.anchorAt)],
-      [text(l10n.t("Elapsed")), blockDuration(b, b.end)],
+      [text(l10n.t("Elapsed")), blockDuration(b, now)],
     ];
-    if (b.generateMs !== null) rows.push(["LLM generation", duration(b.generateMs)]);
-    rows.push(["Tool execution", duration(b.toolMs)]);
-    if (b.subagentWaitMs > 0) rows.push(["Waiting for subagent", duration(b.subagentWaitMs)]);
-    rows.push(["Waiting for your answer", duration(b.confirmMs)]);
-    if (b.replyMs !== null) rows.push(["Waiting for reply", duration(b.replyMs)]);
+    rows.push(...cardTimeRows([b.generateMs, b.toolMs, b.subagentWaitMs, b.confirmMs, b.replyMs], duration));
     rows.push([text(l10n.t("Tool operations")), l10n.t("{0} calls", b.toolCount)]);
     rows.push([text(l10n.t("Failures")), failureCount(b.failCount)]);
     if (b.agentCount > 0) rows.push(["Subagent", `${b.agentCount}`]);
@@ -1461,13 +1478,7 @@ export class WorkGraph {
     if (span !== undefined) {
       rows.push([text(l10n.t("Start")), formatDateTime(span[0])], [text(l10n.t("Elapsed")), duration(span[1] - span[0])]);
     }
-    if (item !== undefined && item.startedAt !== null) {
-      if (item.generateMs !== null) rows.push(["LLM generation", duration(item.generateMs)]);
-      if (item.toolMs !== null) rows.push(["Tool execution", duration(item.toolMs)]);
-      if (item.subagentWaitMs !== null && item.subagentWaitMs > 0) rows.push(["Waiting for subagent", duration(item.subagentWaitMs)]);
-      if (item.decisionWaitMs !== null) rows.push(["Waiting for your answer", duration(item.decisionWaitMs)]);
-      if (item.replyWaitMs !== null) rows.push(["Waiting for reply", duration(item.replyWaitMs)]);
-    }
+    if (row.parentBlock !== undefined) rows.push(...cardTimeRows(planRowConductorParts({ block: row.parentBlock, conductorWork: row.conductorWork ?? [] }, row.period), duration));
     const subagents = this.subagentCount(row);
     if (subagents > 0) rows.push(["Subagent", `${subagents}`]);
     return rows;

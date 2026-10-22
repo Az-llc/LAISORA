@@ -27,7 +27,16 @@ export function claudeModelIdLabel(model: string): string {
 
 export const EXTERNAL_RUN_TOOL_SUFFIX = "__laisora_external__run";
 export function isExternalRunTool(toolName: string): boolean {
-  return toolName.endsWith(EXTERNAL_RUN_TOOL_SUFFIX);
+  return typeof toolName === "string" && toolName.endsWith(EXTERNAL_RUN_TOOL_SUFFIX);
+}
+
+export const EXTERNAL_RUN_OUTCOMES = ["ok", "failed", "timeout", "refused", "stopped"] as const;
+export type ExternalRunOutcome = typeof EXTERNAL_RUN_OUTCOMES[number];
+export function isExternalRunOutcome(value: unknown): value is ExternalRunOutcome {
+  return (EXTERNAL_RUN_OUTCOMES as readonly unknown[]).includes(value);
+}
+export function externalRunStatus(outcome: ExternalRunOutcome): "completed" | "stopped" | "failed" {
+  return outcome === "ok" ? "completed" : outcome === "stopped" ? "stopped" : "failed";
 }
 
 export const AGY_EFFORTS = ["low", "medium", "high"] as const;
@@ -242,4 +251,16 @@ export function externalExecutorMap<T>(value: (executor: ExternalExecutorId) => 
 
 export function executorMap<T>(value: (executor: ExecutorId) => T): Record<ExecutorId, T> {
   return Object.fromEntries(Object.values(EXECUTORS).map(({ id }) => [id, value(id)])) as Record<ExecutorId, T>;
+}
+
+export interface ExternalTarget { role: string; executor: ExternalExecutorId; model: string; effort?: string }
+
+export function parseExternalTargetKey(target: string): ExternalTarget | undefined {
+  const match = /^([^/]+)\/([^@]+)@(.+)$/.exec(target.trim());
+  if (!match || !isExternalExecutorId(match[2])) return undefined;
+  const [, role, executor, variant] = match;
+  const efforts: readonly string[] = executor === "codex" ? CODEX_EFFORTS : AGY_EFFORTS;
+  const suffix = variant.slice(variant.lastIndexOf("-") + 1);
+  const effort = efforts.includes(suffix) ? suffix : undefined;
+  return { role, executor: executor as ExternalExecutorId, model: effort ? variant.slice(0, -effort.length - 1) : variant, ...(effort ? { effort } : {}) };
 }

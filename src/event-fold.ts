@@ -3,9 +3,10 @@ import type { ModelFallbackState, ModelInfo } from "./protocol";
 import type { ClaudeConversation } from "./claudeHost";
 import type { HostArtifactAccess } from "./artifact-access";
 import { applyActivityEvent, type BackgroundActivityState } from "./background-activity";
-import { attachTimeBucketRequestNumbers, inProgressStepOfDelegation } from "./time-buckets";
+import { attachTimeBucketRequestNumbers, foldTimeBuckets, inProgressStepOfDelegation } from "./time-buckets";
 import { foldEvidence, type SemanticEvidenceIndex } from "./evidence-index";
 import { windowEvents } from "./event-window";
+import type { ChildTranscriptSpan } from "./spans";
 import { foldGuardrail, touchedSignalIds, type GuardrailState } from "./guardrail";
 import {
   AuthStatus,
@@ -21,7 +22,7 @@ import {
   UNOBSERVED_TIME,
 } from "./protocol";
 import { foldSessionFacts, type SessionFactsAccumulator } from "./session-facts";
-import { backgroundAgentDispatch, backgroundTaskLaunchedSince, markEventLogTrimmed, reduceWorkModel, type WorkModelState } from "./work-model";
+import { backgroundAgentDispatch, backgroundTaskLaunchedSince, markEventLogTrimmed, noteChildUsage, reduceWorkModel, type WorkModelState } from "./work-model";
 import { configuredEventLimit } from "./claude-settings";
 
 export function trimEventLog(events: NormalizedEvent[], max = configuredEventLimit()): NormalizedEvent[] {
@@ -92,6 +93,7 @@ export interface EventFoldDraft {
   backgroundActivity: BackgroundActivityState;
   workModel: WorkModelState;
   evidenceIndex: SemanticEvidenceIndex;
+  childSpans: readonly ChildTranscriptSpan[];
   events: NormalizedEvent[];
   titleRefreshed: boolean;
   titleRefreshing: boolean;
@@ -175,9 +177,11 @@ export function foldEventState(
       seq: draft.seq,
       timestamp: at,
     } as NormalizedEvent;
+    const timeBuckets = draft.evidenceIndex.timeBuckets;
     foldReaders(draft, ev, true, undefined, effects);
     effects.push({ type: "schedule_guardrail_refresh" });
     if (!meta?.suppressPost) effects.push({ type: "schedule_work_model_post" });
+    if (!meta?.suppressPost && draft.evidenceIndex.timeBuckets !== timeBuckets) effects.push({ type: "schedule_semantic_model_post" });
     if (partial.provenance?.path === "live") effects.push({ type: "schedule_guardrail_tick" });
     return { draft, normalizedEvent: null, effects };
   }
@@ -289,6 +293,11 @@ function foldReaders(draft: EventFoldDraft, ev: NormalizedEvent, guardrailOnly: 
   hostArtifacts: HostArtifactAccess[] | undefined, effects: FoldEffect[]): void {
   draft.sessionFacts = foldSessionFacts(draft.sessionFacts, ev);
   if (guardrailOnly) {
+    if (ev.kind === "assistant_usage") {
+      draft.workModel = noteChildUsage(draft.workModel, ev);
+      const timeBuckets = foldTimeBuckets(draft.evidenceIndex.timeBuckets, ev);
+      if (timeBuckets !== draft.evidenceIndex.timeBuckets) draft.evidenceIndex = { ...draft.evidenceIndex, timeBuckets };
+    }
     try {
       const before = draft.guardrail;
       draft.guardrail = foldGuardrail(draft.guardrail, { type: "event", event: ev });
@@ -304,6 +313,7 @@ function foldReaders(draft: EventFoldDraft, ev: NormalizedEvent, guardrailOnly: 
     return;
   }
   const previousWorkModel = draft.workModel;
+  const previousPlanBlocks = draft.evidenceIndex.timeBuckets.blocks;
   const reduced = reduceWorkModelSafely(draft.workModel, ev);
   draft.workModel = reduced.state;
   if (reduced.error !== undefined) {
@@ -365,6 +375,7 @@ function foldReaders(draft: EventFoldDraft, ev: NormalizedEvent, guardrailOnly: 
   if (draft.guardrailLiveSince === undefined && ev.provenance?.path === "live") {
     draft.guardrailLiveSince = ev.timestamp;
   }
-  const work = projectWorkEvent(previousWorkModel, draft.workModel, ev);
+  const work = projectWorkEvent(previousWorkModel, draft.workModel, ev,
+    { previous: previousPlanBlocks, next: draft.evidenceIndex.timeBuckets.blocks }, draft.childSpans);
   if (work !== undefined) ev.work = work;
 }

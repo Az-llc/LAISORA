@@ -850,6 +850,10 @@ export function noteTodoSessionEnded(s: Session): void {
   if (todoStore) void applyHostTodoOperation(todoStore, { kind: "releaseConversation", sessionId, owner: TODO_WINDOW_ID }, "human");
 }
 
+export function linkedTodoItemIdOf(s: Session): string | undefined {
+  return todoBetaEnabled() ? cachedItemOf(s) : undefined;
+}
+
 function cachedItemOf(s: Session): string | undefined {
   const sessionId = sessionRecordId(s);
   return s.todoItemId ?? (sessionId ? sessionItems.get(sessionId) ?? undefined : undefined);

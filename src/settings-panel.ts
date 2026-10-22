@@ -17,6 +17,8 @@ import {
   writeMemoryBlockProjectType,
   writeTodoEnabled,
   writeEditSummaryEnabled,
+  writeRemoteControlCard,
+  writeHandoffAutoSetting,
   writeCliAutoUpdate,
   writeComposerSendKey,
   writeFileLinkSetting,
@@ -131,6 +133,12 @@ export async function handleSettingsPageMessage(webview: vscode.Webview, raw: un
       break;
     case "setEditSummaryEnabled":
       writeFailure = await writeEditSummaryEnabled(raw.enabled);
+      break;
+    case "setRemoteControlCard":
+      writeFailure = await writeRemoteControlCard(raw.enabled);
+      break;
+    case "setHandoffAutoSetting":
+      writeFailure = await writeHandoffAutoSetting(raw.setting, raw.value);
       break;
     case "setOrchestrationSetting":
       writeFailure = await writeOrchestrationSetting(raw.setting, raw.value);

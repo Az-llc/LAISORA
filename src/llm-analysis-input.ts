@@ -1,5 +1,5 @@
 import * as l10n from "@vscode/l10n";
-import type { L3ReportPayload, NormalizedEventBody, SemanticModelPayload } from "./protocol";
+import { isLlmAnalysisExecution, type L3ReportPayload, type NormalizedEventBody, type SemanticModelPayload } from "./protocol";
 import type { SemanticModel } from "./semantic-model";
 import { buildCitationAliasTable } from "./llm-citation-alias";
 import type { CitationAliasTable } from "./llm-citation-alias";
@@ -228,7 +228,7 @@ function buildEventItems(
       continue;
     }
 
-    if (event.kind === "tool_call_finished") {
+    if (isLlmAnalysisExecution(event)) {
       const toolUseId = event.toolUseId;
       let alias = toolIdToAlias.get(toolUseId);
       if (!alias) {

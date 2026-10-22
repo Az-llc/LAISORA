@@ -32,6 +32,18 @@ export function refreshHistList(): void {
   if (!histPanelEl.classList.contains("hidden") && editing === undefined) paintHistList();
 }
 
+let refreshRequested = false;
+let refreshing: { base: SessionListItem[]; rows: SessionListItem[] } | undefined;
+let reloadDeferred = false;
+let firstPageIds = new Set<string>();
+
+export function reloadHistList(): void {
+  if (histPanelEl.classList.contains("hidden")) return;
+  if (editing !== undefined) { reloadDeferred = true; return; }
+  refreshRequested = true;
+  vscode.postMessage({ type: "listSessions", source: historySource, ...(showHidden ? { showHidden: true } : {}) });
+}
+
 let historySource: "laisora" | "claude" = "laisora";
 let showHidden = false;
 let nextCursor: string | undefined;
@@ -39,6 +51,9 @@ let moreButton: HTMLButtonElement | undefined;
 let hiddenToggle: HTMLButtonElement | undefined;
 const sourceButtons = new Map<string, HTMLButtonElement>();
 function requestHistory(append = false): void {
+  refreshRequested = false;
+  refreshing = undefined;
+  reloadDeferred = false;
   sessionsPhase = "partial";
   vscode.postMessage({
     type: "listSessions",
@@ -160,13 +175,33 @@ export function applySessionChunk(
   if (requestId < sessionsRequestId) return;
   if (requestId > sessionsRequestId) {
     sessionsRequestId = requestId;
-    if (!append) latestSessions = [];
-    latestDegraded = undefined;
+    refreshing = refreshRequested && !append ? { base: latestSessions, rows: [] } : undefined;
+    refreshRequested = false;
+    if (refreshing === undefined) {
+      if (!append) latestSessions = [];
+      latestDegraded = undefined;
+    }
+  }
+  if (refreshing !== undefined) {
+    refreshing.rows.push(...sessions);
+    if (!complete) return;
+    const fresh = [...new Map(refreshing.rows.map(row => [row.sessionId, row])).values()];
+    const freshIds = new Set(fresh.map(row => row.sessionId));
+    const oldFirstPage = firstPageIds;
+    const beyond = cursor === undefined ? [] : refreshing.base.filter(row => !freshIds.has(row.sessionId) && !oldFirstPage.has(row.sessionId));
+    refreshing = undefined;
+    firstPageIds = freshIds;
+    sessionsPhase = "complete";
+    latestDegraded = degraded;
+    nextCursor = cursor;
+    renderHistList([...fresh, ...beyond]);
+    return;
   }
   sessionsPhase = complete ? "complete" : "partial";
   latestDegraded = degraded;
   if (complete) nextCursor = cursor;
   renderHistList([...new Map(latestSessions.concat(sessions).map(row => [row.sessionId, row])).values()]);
+  if (complete && !append) firstPageIds = new Set(latestSessions.map(row => row.sessionId));
 }
 
 export function renderHistList(sessions: SessionListItem[]): void {
@@ -419,6 +454,7 @@ function endRename(restoreFocus: boolean): void {
   current.input.remove();
   current.title.hidden = false;
   if (renderDeferred) paintHistList();
+  if (reloadDeferred) { reloadDeferred = false; reloadHistList(); }
   if (restoreFocus) histListEl.focus();
 }
 

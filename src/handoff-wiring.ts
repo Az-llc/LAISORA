@@ -30,13 +30,61 @@ import {
   type HandoffRecordsRead,
   COMPACT_HEARTBEAT_GRACE_MS,
 } from "./handoff-runner";
-import { extensionContext, output } from "./host-context";
-import { normalizeApiKeyPolicy, restoredHandoffRunId, type HostToWebview, type WebviewToHost } from "./protocol";
+import { extensionContext, output, store } from "./host-context";
+import { liveBackgroundTasks, runningDelegationIds } from "./background-activity";
+import { pendingAttachments } from "./pending-attachments";
+import { buildHandoffNoticeEnvelope, handoffNoticeTitle } from "./steering-envelope";
+import {
+  CACHE_EXPIRY_MIN_TOTAL_TOKENS,
+  HANDED_OFF_SOURCES_KEY,
+  autoHandoffPermitted,
+  handedOffSourcesOf,
+  handoffOriginOf,
+  postTurnMeasurement,
+  rememberHandedOffSource,
+  autoHandoffMemoryFor,
+  currentAutoStart,
+  noticedTurnEndCandidate,
+  noteNoticeFromEvents,
+  noteNoticeTurnInterrupted,
+  cacheExpiryAutoStart,
+  cacheExpiryDeadline,
+  decisionPendingSinceUserSend,
+  noteAutoHandoffRefused,
+  activeNotice,
+  autoStartDisplay,
+  noteTurnEndAfterNotice,
+  noticeTrigger,
+  noteHandoffNoticeSent,
+  handoffNoticeFactsOf,
+  noteAutoHandoffStarted,
+  heldCandidateStep,
+  quietAutoRefusal,
+  noteHandoffSettled,
+  noteTurnCompleted,
+  noteUserSend,
+  planHasUnfinishedStep,
+  resolveHandoffAutoSettings,
+  sizeAutoStart,
+  type AutoHandoffGateInput,
+  type AutoHandoffMemory,
+} from "./handoff-auto";
+import {
+  normalizeApiKeyPolicy,
+  restoredHandoffRunId,
+  type AssistantUsage,
+  type HandoffAutoSettings,
+  type HandoffAutoNotice,
+  type HandoffAutoStart,
+  type HostToWebview,
+  type NormalizedEventBody,
+  type WebviewToHost,
+} from "./protocol";
 import { lookupSessionFile } from "./session-files";
 import { sessionRecordId } from "./session-record";
-import { sessionDisplayTitleOf } from "./session-list-wiring";
+import { handoffForkStateOf, postSessionListChanged, sessionDisplayTitleOf } from "./session-list-wiring";
 import type { SessionStore } from "./store-surfaces";
-import { relinkTodoConversation, todoHandoffMemo } from "./todo-surface";
+import { linkedTodoItemIdOf, relinkTodoConversation, todoHandoffMemo } from "./todo-surface";
 
 export const handoffDetailSources = new Map<string, { runId: string; detail: HandoffDetail }>();
 
@@ -68,7 +116,7 @@ export async function readHandoffRecords(filePath: string): Promise<HandoffRecor
   return parseHandoffRecords(await readFile(filePath, "utf8"));
 }
 
-async function runHandoff(st: SessionStore, sender: vscode.Webview, target: Session): Promise<void> {
+async function runHandoff(st: SessionStore, sender: vscode.Webview | null, target: Session, auto?: HandoffAutoStart | HandoffAutoNotice): Promise<boolean | undefined> {
   const runId = randomUUID();
   const profile = inheritedProfile(target);
   const source = { sessionId: sessionRecordId(target) ?? "", title: target.title };
@@ -94,26 +142,25 @@ async function runHandoff(st: SessionStore, sender: vscode.Webview, target: Sess
   let snapshotWrite: Promise<void> = Promise.resolve();
   let snapshotPending = false;
 
-  if (busy()) {
-    fail("source_busy");
-    return;
-  }
-  if (handoffRuns.has(target.tabId)) {
-    fail("already_running");
-    return;
-  }
+  const refuse = (reason: string): undefined => {
+    if (quietAutoRefusal(auto !== undefined, reason)) output.appendLine(`[${target.title}] automatic handoff not started: ${reason}`);
+    else fail(reason);
+    return undefined;
+  };
+  if (busy()) return refuse("source_busy");
+  if (handoffRuns.has(target.tabId)) return refuse("already_running");
   const reservation: { runId: string; runner: HandoffRunner | null } = { runId, runner: null };
   handoffRuns.set(target.tabId, reservation);
   try {
     if (source.sessionId.length === 0) {
       fail("fork_failed", "no_session_id");
-      return;
+      return false;
     }
     const cfg = getLaisoraConfiguration();
     const cwd = resolveSessionCwd(target);
     if (cwd === undefined) {
       fail("fork_failed", "no_cwd");
-      return;
+      return false;
     }
     let runtime: Awaited<ReturnType<typeof resolveHandoffRuntime>>;
     try {
@@ -123,7 +170,7 @@ async function runHandoff(st: SessionStore, sender: vscode.Webview, target: Sess
       );
     } catch (e) {
       fail("fork_failed", String(e));
-      return;
+      return false;
     }
 
     const runner = new HandoffRunner({
@@ -151,6 +198,7 @@ async function runHandoff(st: SessionStore, sender: vscode.Webview, target: Sess
           phase,
           message: l10n.t("Handing off"),
           source,
+          ...(auto === undefined ? {} : { auto }),
         });
       },
       onForkCreated: (forkSessionId) => {
@@ -168,6 +216,7 @@ async function runHandoff(st: SessionStore, sender: vscode.Webview, target: Sess
           progress: { heartbeats: info.heartbeats, elapsedMs: info.elapsedMs, since: info.since },
           message: l10n.t("Handing off"),
           source,
+          ...(auto === undefined ? {} : { auto }),
         });
       },
     });
@@ -182,6 +231,7 @@ async function runHandoff(st: SessionStore, sender: vscode.Webview, target: Sess
     const before = sourceUnchanged() ? await sourceConversation?.captureHandoffContextUsage() ?? null : null;
     contextUsage.before = sourceUnchanged() ? before : null;
     const workMemo = await todoHandoffMemo(source.sessionId);
+    if (busy()) return refuse("source_busy");
     const outcome: HandoffOutcome = await runner.run({
       sourceSessionId: source.sessionId,
       sourceTitle: source.title,
@@ -189,26 +239,29 @@ async function runHandoff(st: SessionStore, sender: vscode.Webview, target: Sess
       sourceBusy: busy,
       ...(workMemo !== undefined ? { workMemo } : {}),
     });
+    if (!outcome.ok && quietAutoRefusal(auto !== undefined, outcome.reason)) return undefined;
     if (!outcome.ok) {
       const forkSessionId = outcome.forkSessionId;
+      if (forkSessionId !== undefined && handoffForkStateOf(forkSessionId, Date.now()) === "cleanup_failed") postSessionListChanged();
       if (forkSessionId !== undefined && (await lookupSessionFile(forkSessionId)).reason === "not_found") {
         void snapshotWrite.then(() => handoffPersist().update(handoffContextUsageKey(forkSessionId), undefined)).catch((error) =>
           output.appendLine("[handoff] context snapshot could not be removed: " + String(error)));
       }
       fail(outcome.reason, outcome.detail);
-      return;
+      return false;
     }
     const contextUsageKey = handoffContextUsageKey(outcome.forkSessionId);
     if (outcome.unreadableLineCount > 0) {
       void handoffPersist().update(handoffUnreadableLinesKey(outcome.forkSessionId), outcome.unreadableLineCount).catch((error) =>
         output.appendLine("[handoff] unreadable line count could not be saved: " + String(error)));
     }
+    await rememberHandedOff(source.sessionId);
     await relinkTodoConversation(source.sessionId, outcome.forkSessionId);
     const startMeasurement = createStartMeasurement();
     const opened = await openResumedSession(st, {
       sessionId: outcome.forkSessionId,
       filePath: outcome.forkFilePath,
-      activate: shouldActivateForkTab(st.activeTabIdOf(sender), target.tabId),
+      activate: shouldActivateForkTab(sender === null ? undefined : st.activeTabIdOf(sender), target.tabId),
       inherit: profile,
       knownCwd: cwd,
       startMeasurement,
@@ -216,7 +269,7 @@ async function runHandoff(st: SessionStore, sender: vscode.Webview, target: Sess
     if (!opened.tabPosted || opened.session === undefined) {
       startMeasurement.abandon();
       fail("tab_failed");
-      return;
+      return false;
     }
     const forkSession = opened.session;
     const decisions = outcome.detail?.decisions;
@@ -275,8 +328,10 @@ async function runHandoff(st: SessionStore, sender: vscode.Webview, target: Sess
       output.appendLine("[handoff] context snapshot could not be saved: " + String(error));
       if (forkSession.logicalGeneration === generation && !forkSession.closed) st.post({ ...done, tabId: forkSession.tabId });
     });
+    return true;
   } catch (e) {
     fail("commit_failed", String(e));
+    return false;
   } finally {
     if (handoffRuns.get(target.tabId)?.runId === runId) handoffRuns.delete(target.tabId);
   }
@@ -401,9 +456,12 @@ export async function handleHandoffMessage(
   target: Session | undefined
 ): Promise<void> {
   switch (msg.type) {
-    case "startHandoff":
-      await runHandoff(st, sender, target!);
+    case "startHandoff": {
+      const generation = target!.logicalGeneration;
+      const completed = await runHandoff(st, sender, target!);
+      if (completed !== undefined) noteAutoHandoffSettled(target!, completed, generation);
       break;
+    }
     case "getHandoffDetail":
       await sendHandoffDetailPart(st, sender, target!.tabId, msg.runId, msg.part, msg.refresh === true);
       break;
@@ -470,4 +528,274 @@ export async function settleHandoffContextUsage(measurement: StartMeasurement, u
   const after = await measurement.result;
   if (after === undefined) delete usage.after;
   else usage.after = after;
+}
+
+interface AutoHandoffTab {
+  memory: AutoHandoffMemory;
+  turnEnded: boolean;
+  candidate?: HandoffAutoStart;
+  heldByBackground: boolean;
+  response?: { at: number; usage: AssistantUsage };
+  lastUserSendAt?: number;
+  usage?: { totalTokens: number; autoCompactThreshold?: number };
+  noticeTurn?: string;
+  timer?: ReturnType<typeof setTimeout>;
+}
+
+const NOTICE_TURN_PENDING = "";
+const autoHandoffTabs = new WeakMap<Session, AutoHandoffTab>();
+const composerDraftTabs = new Map<vscode.Webview, ReadonlySet<string>>();
+
+function autoHandoffTab(s: Session): AutoHandoffTab {
+  const current = autoHandoffTabs.get(s);
+  if (current !== undefined && current.memory.generation === s.logicalGeneration) return current;
+  if (current !== undefined) clearAutoHandoffWait(current);
+  const fresh: AutoHandoffTab = { memory: autoHandoffMemoryFor(undefined, s.logicalGeneration), turnEnded: false, heldByBackground: false };
+  autoHandoffTabs.set(s, fresh);
+  return fresh;
+}
+
+function clearAutoHandoffWait(tab: AutoHandoffTab): void {
+  if (tab.timer !== undefined) clearTimeout(tab.timer);
+  tab.timer = undefined;
+  tab.candidate = undefined;
+  tab.heldByBackground = false;
+}
+
+export function clearAutoHandoff(s: Session): void {
+  const tab = autoHandoffTabs.get(s);
+  if (tab === undefined) return;
+  clearAutoHandoffWait(tab);
+  tab.turnEnded = false;
+}
+
+function readAutoHandoffSettings(): HandoffAutoSettings {
+  const cfg = getLaisoraConfiguration();
+  return resolveHandoffAutoSettings((key) => cfg.get<unknown>(key));
+}
+
+function composerHasText(tabId: string): boolean {
+  for (const tabIds of composerDraftTabs.values()) if (tabIds.has(tabId)) return true;
+  return pendingAttachments.count(tabId) > 0;
+}
+
+function handedOffSources(): string[] {
+  return handedOffSourcesOf(handoffPersist().get(HANDED_OFF_SOURCES_KEY));
+}
+
+async function rememberHandedOff(sessionId: string): Promise<void> {
+  try {
+    const { list, dropped } = rememberHandedOffSource(handoffPersist().get(HANDED_OFF_SOURCES_KEY), sessionId);
+    if (dropped.length > 0) output.appendLine(`[handoff] handed-off source list is full; dropped ${dropped.length} oldest: ${dropped.join(", ")}`);
+    await handoffPersist().update(HANDED_OFF_SOURCES_KEY, list);
+  } catch (error) {
+    output.appendLine(`[handoff] handed-off source could not be saved: ${String(error)}`);
+  }
+}
+
+function autoHandoffPermittedFor(s: Session, tab: AutoHandoffTab): boolean {
+  return autoHandoffPermitted(tab.memory, sessionRecordId(s), handedOffSources());
+}
+
+function autoHandoffGateOf(s: Session): AutoHandoffGateInput {
+  const conv = s.conversation;
+  return {
+    idle: conv !== null && !conv.isClosed && conv.state === "idle" && s.starting === null && !s.closed && !s.clearing
+      && s.hydration?.buffering !== true,
+    runningAgents: runningDelegationIds(s.backgroundActivity).length,
+    runningBackgroundTasks: liveBackgroundTasks(s.backgroundActivity).length,
+    runningExternalRuns: conv?.runningExternalRunCount ?? 0,
+    queuedMessages: (conv?.queuedInputCount ?? 0) + s.unsentSends.size,
+    composerHasText: composerHasText(s.tabId),
+    handoffRunning: handoffRuns.has(s.tabId),
+  };
+}
+
+function unfinishedWorkOf(s: Session): boolean {
+  return planHasUnfinishedStep(s.evidenceIndex.timeBuckets.blocks) || decisionPendingSinceUserSend(s.events);
+}
+
+function tryAutoHandoff(s: Session): void {
+  const tab = autoHandoffTab(s);
+  const candidate = tab.candidate;
+  const st = store;
+  if (candidate === undefined || st === null) return;
+  tab.memory = noteNoticeFromEvents(tab.memory, s.events);
+  const now = Date.now();
+  const notice = activeNotice(tab.memory, now);
+  const start = autoHandoffPermittedFor(s, tab)
+    ? currentAutoStart(candidate, {
+      settings: readAutoHandoffSettings(),
+      usage: tab.usage ?? {},
+      origin: handoffOriginOf(s.handoffSource),
+      noticeSent: notice !== undefined,
+      now,
+    })
+    : undefined;
+  if (start === undefined) {
+    clearAutoHandoffWait(tab);
+    return;
+  }
+  const step = heldCandidateStep(tab.heldByBackground, autoHandoffGateOf(s));
+  if (step.action === "hold") {
+    tab.heldByBackground = step.heldByBackground;
+    return;
+  }
+  if (step.action === "drop") {
+    output.appendLine(`[${s.title}] automatic handoff deferred to the next turn end: background work finished`);
+    clearAutoHandoffWait(tab);
+    return;
+  }
+  clearAutoHandoffWait(tab);
+  if (notice === undefined) {
+    sendAutoHandoffNotice(s, tab, start);
+    return;
+  }
+  tab.memory = noteAutoHandoffStarted(tab.memory);
+  output.appendLine(`[${s.title}] automatic handoff: ${JSON.stringify(start)}`);
+  const generation = s.logicalGeneration;
+  void runHandoff(st, st.activeWebview, s, autoStartDisplay(start, notice, handoffNoticeTitle)).then((completed) => {
+    if (completed !== undefined) noteAutoHandoffSettled(s, completed, generation);
+    else if (s.logicalGeneration === generation) autoHandoffTab(s).memory = noteAutoHandoffRefused(autoHandoffTab(s).memory);
+  }).catch((error: unknown) => output.appendLine(`[${s.title}] automatic handoff failed: ${String(error)}`));
+}
+
+function sendAutoHandoffNotice(s: Session, tab: AutoHandoffTab, start: HandoffAutoStart): void {
+  const conv = s.conversation;
+  const facts = handoffNoticeFactsOf(start, linkedTodoItemIdOf(s));
+  if (facts === undefined) {
+    output.appendLine(`[${s.title}] automatic handoff notice not sent: no cache expiry time`);
+    return;
+  }
+  tab.noticeTurn = NOTICE_TURN_PENDING;
+  const result = conv === null || conv.isClosed
+    ? { ok: false as const, reason: "closed", message: "handoff notice: the conversation is not connected" }
+    : conv.sendHandoffNotice(buildHandoffNoticeEnvelope(facts, Date.now()), facts);
+  if (!result.ok) {
+    tab.noticeTurn = undefined;
+    output.appendLine(`[${s.title}] automatic handoff notice not sent: ${result.reason} ${result.message}`);
+    return;
+  }
+  tab.memory = noteHandoffNoticeSent(tab.memory, facts, Date.now());
+  output.appendLine(`[${s.title}] automatic handoff notice sent: ${JSON.stringify(facts)}`);
+}
+
+function noteAutoHandoffSettled(s: Session, completed: boolean, generation: number): void {
+  if (s.logicalGeneration !== generation) return;
+  const tab = autoHandoffTab(s);
+  clearAutoHandoffWait(tab);
+  tab.memory = noteHandoffSettled(tab.memory, completed);
+}
+
+function evaluateAutoHandoff(s: Session, tab: AutoHandoffTab, usage: Extract<NormalizedEventBody, { kind: "context_usage" }>): void {
+  clearAutoHandoffWait(tab);
+  tab.usage = { totalTokens: usage.totalTokens, ...(usage.autoCompactThreshold === undefined ? {} : { autoCompactThreshold: usage.autoCompactThreshold }) };
+  tab.memory = noteNoticeFromEvents(tab.memory, s.events);
+  if (!autoHandoffPermittedFor(s, tab)) return;
+  const notice = activeNotice(tab.memory, Date.now());
+  if (notice !== undefined) {
+    tab.candidate = noticedTurnEndCandidate(noticeTrigger(notice), usage, cacheExpiryDeadline(tab.response)?.expiresAt);
+    tryAutoHandoff(s);
+    if (tab.candidate === undefined && autoHandoffPermittedFor(s, tab)) armCacheExpiryTimer(s, tab, usage.totalTokens);
+    return;
+  }
+  const settings = readAutoHandoffSettings();
+  const size = sizeAutoStart(settings, usage, handoffOriginOf(s.handoffSource));
+  if (size !== undefined) {
+    tab.candidate = size;
+    tryAutoHandoff(s);
+    return;
+  }
+  armCacheExpiryTimer(s, tab, usage.totalTokens);
+}
+
+function armCacheExpiryTimer(s: Session, tab: AutoHandoffTab, totalTokens: number): void {
+  const settings = readAutoHandoffSettings();
+  const deadline = cacheExpiryDeadline(tab.response);
+  if (!settings.cacheExpiryEnabled || deadline === undefined || totalTokens < CACHE_EXPIRY_MIN_TOTAL_TOKENS || tab.timer !== undefined) return;
+  tab.timer = setTimeout(() => {
+    tab.timer = undefined;
+    if (s.closed || autoHandoffTabs.get(s) !== tab || s.logicalGeneration !== tab.memory.generation) return;
+    const start = cacheExpiryAutoStart({
+      settings: readAutoHandoffSettings(),
+      totalTokens: tab.usage?.totalTokens,
+      response: tab.response,
+      lastUserSendAt: tab.lastUserSendAt,
+      unfinishedWork: unfinishedWorkOf(s),
+      now: Date.now(),
+    });
+    if (start === undefined) return;
+    tab.candidate = start;
+    tryAutoHandoff(s);
+  }, Math.max(0, deadline.at - Date.now()));
+}
+
+function noteNoticeTurnEnded(s: Session, tab: AutoHandoffTab, turnId: string | undefined, interrupted: boolean): void {
+  if (tab.noticeTurn === undefined || (turnId !== undefined && tab.noticeTurn !== turnId)) return;
+  tab.noticeTurn = undefined;
+  if (!interrupted) return;
+  tab.memory = noteNoticeTurnInterrupted(tab.memory);
+  output.appendLine(`[${s.title}] automatic handoff off for this conversation: the notice turn did not complete`);
+}
+
+export function noteAutoHandoffEvent(s: Session, ev: NormalizedEventBody): void {
+  const tab = autoHandoffTab(s);
+  switch (ev.kind) {
+    case "assistant_usage":
+      if (ev.parentToolUseId === null) {
+        const at = s.conversation?.lastRootMessageStartedAt;
+        tab.response = at === undefined ? undefined : { at, usage: ev.usage };
+      }
+      return;
+    case "turn_started":
+      if (tab.noticeTurn === NOTICE_TURN_PENDING) tab.noticeTurn = ev.turnId;
+      tab.turnEnded = false;
+      clearAutoHandoffWait(tab);
+      return;
+    case "turn_completed":
+      noteNoticeTurnEnded(s, tab, ev.turnId, false);
+      tab.memory = noteTurnEndAfterNotice(tab.memory, Date.now());
+      tab.turnEnded = true;
+      tab.memory = noteTurnCompleted(tab.memory);
+      return;
+    case "turn_failed":
+    case "turn_interrupted":
+      noteNoticeTurnEnded(s, tab, ev.turnId, true);
+      tab.turnEnded = false;
+      clearAutoHandoffWait(tab);
+      return;
+    case "conversation_opened":
+    case "conversation_closed":
+      noteNoticeTurnEnded(s, tab, undefined, true);
+      tab.turnEnded = false;
+      clearAutoHandoffWait(tab);
+      return;
+    case "context_usage": {
+      const conv = s.conversation;
+      if (tab.turnEnded && conv !== null && conv.state === "idle") {
+        if (!postTurnMeasurement(conv.contextUsageTurnsEnded, conv.turnsEnded)) return;
+        tab.turnEnded = false;
+        evaluateAutoHandoff(s, tab, ev);
+      } else {
+        tryAutoHandoff(s);
+      }
+      return;
+    }
+    default:
+      tryAutoHandoff(s);
+  }
+}
+
+export function noteAutoHandoffUserSend(s: Session): void {
+  const tab = autoHandoffTab(s);
+  tab.lastUserSendAt = Date.now();
+  tab.memory = noteUserSend(tab.memory);
+  tab.turnEnded = false;
+  clearAutoHandoffWait(tab);
+}
+
+export function noteComposerDrafts(sender: vscode.Webview, tabIds: readonly string[] | null): void {
+  if (tabIds === null) composerDraftTabs.delete(sender);
+  else composerDraftTabs.set(sender, new Set(tabIds));
+  for (const s of store?.sessions.values() ?? []) tryAutoHandoff(s);
 }

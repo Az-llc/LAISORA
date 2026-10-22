@@ -1,8 +1,9 @@
 import { toolIntentLabel } from "./status-line";
-import { flattenAgents, type OrchestrationView, type PlanContext, type WorkAgentNode, type WorkModelPayload } from "../protocol";
+import { agentElapsedMs, flattenAgents, type OrchestrationView, type PlanContext, type PlanContextStep, type WorkAgentNode, type WorkModelPayload } from "../protocol";
 import { externalTokens, type PlanTokenTotal } from "../plan-usage";
+import { externalRunStatus } from "../orchestration-executors";
 import type { TaskStatus, WorkStatus } from "../work-model";
-import { planItemNumber, planSpansMs, planStepKey, transitionPlanStep, type PlanSpan } from "../plan-steps";
+import { blockElapsedMs, planHeading, planItemNumber, planPeriodEnd, planSpansMs, planStepKey, transitionPlanStep } from "../plan-steps";
 export { normalizePlanContent, planStepKey } from "../plan-steps";
 
 export interface PlanLane {
@@ -13,13 +14,12 @@ export interface PlanStep {
   key: string; number: number | null; title: string; activeForm?: string; status: TaskStatus;
   removed: boolean; added: boolean; addedAt: number | null; ahead: boolean;
   startedAt: number | null; endedAt: number | null; elapsed: number | null;
-  // The Host's in-progress spans (src/plan-steps.ts#planStepActiveSpans); elapsed is their length when present.
-  activeSpans?: PlanSpan[];
+  period?: PlanContextStep["period"];
   tokens: PlanTokenTotal | null; lanes: PlanLane[];
 }
 export interface PlanView {
-  block?: string; goal: string; steps: PlanStep[]; now: PlanLane[]; current: number | null; completed: number;
-  elapsed: number | null; claude: PlanTokenTotal | null; external: PlanTokenTotal | null; partial: boolean;
+  block?: string; goal: string; goalDeclared: boolean; name: string; steps: PlanStep[]; now: PlanLane[]; current: number | null; completed: number;
+  elapsed: number | null; elapsedProvisional: boolean; claude: PlanTokenTotal | null; external: PlanTokenTotal | null; partial: boolean;
 }
 
 export function planStepDone(step: { removed: boolean; status: TaskStatus }): boolean {
@@ -38,18 +38,38 @@ export function planLaneRunning(lane: PlanLane): boolean {
   return lane.status === "running";
 }
 
+export function planAllStepsDone(view: PlanView, earlier: readonly PlanView[]): boolean {
+  return view.steps.length > 0 && [view, ...earlier].every(plan => plan.steps.every(planStepSettled));
+}
+
+export function planStepCount(view: PlanView, earlier: readonly PlanView[]): { position: number; total: number } | undefined {
+  const steps = [...earlier, view].flatMap(plan => plan.steps.filter(step => !step.removed && step.number !== null));
+  if (!steps.length) return undefined;
+  const current = planCurrentStep(view, earlier);
+  const index = current === undefined ? -1 : steps.indexOf(current);
+  return { position: index >= 0 ? index + 1 : steps.filter(planStepDone).length, total: steps.length };
+}
+
+export function planCurrentStep(view: PlanView, earlier: readonly PlanView[]): PlanStep | undefined {
+  for (const plan of [view, ...[...earlier].reverse()]) {
+    const step = plan.current === null ? undefined : plan.steps.find(value => value.number === plan.current);
+    if (step !== undefined) return step;
+  }
+  return undefined;
+}
+
 export function deriveEarlierPlanViews(model: WorkModelPayload | undefined, orchestration: OrchestrationView | undefined,
   nowMs: number): PlanView[] {
-  return (model?.earlierPlans ?? []).map(context => {
-    const view = derivePlanView(model, orchestration, nowMs, context);
-    return { ...view, goal: view.goal || context.text };
-  });
+  return (model?.earlierPlans ?? []).map(context => derivePlanView(model, orchestration, nowMs, context));
 }
 
 export function derivePlanView(model: WorkModelPayload | undefined, orchestration: OrchestrationView | undefined,
   nowMs: number, context: PlanContext | undefined = model?.planContext): PlanView {
-  const view: PlanView = { block: context?.blockId, goal: context?.goal ?? "", steps: [], now: [], current: null,
-    completed: 0, elapsed: context ? Math.max(0, (context.running ? Math.max(nowMs, context.end) : context.end) - context.start) : null,
+  const heading = context === undefined ? undefined : planHeading(context);
+  const blockElapsed = context === undefined ? undefined : blockElapsedMs({ durationMs: context.durationMs === undefined ? (context.workEndedAt ?? context.end) - context.start : context.durationMs,
+    running: context.blockRunning ?? context.running, workEndedAt: context.workEndedAt, start: context.start, end: context.end, metrics: { provisional: context.provisional } }, nowMs);
+  const view: PlanView = { block: context?.blockId, goal: heading?.text ?? "", goalDeclared: heading?.declared ?? false, name: context?.text ?? "", steps: [], now: [], current: null,
+    completed: 0, elapsed: blockElapsed?.ms ?? null, elapsedProvisional: blockElapsed?.provisional ?? false,
     claude: null, external: null, partial: context !== undefined && model?.planHistoryLostThrough !== undefined &&
       model.planHistoryLostThrough >= context.start || model?.coverage.summary === "prefix-truncated" };
   const members = context?.steps === undefined ? undefined : new Set(context.steps.map(step => step.key));
@@ -103,7 +123,7 @@ export function derivePlanView(model: WorkModelPayload | undefined, orchestratio
       const step = reconstructed.get(record.key) ?? { key: record.key, number: record.number, title: record.title, status: record.status,
         removed: record.removed, added: false, addedAt: null, ahead: false, startedAt: null, endedAt: null, elapsed: null, tokens: null, lanes: [] };
       Object.assign(step, { number: record.number, title: record.title, status: record.status, removed: record.removed,
-        startedAt: record.startedAt, endedAt: record.endedAt, activeSpans: record.activeSpans, tokens: record.tokens ?? null });
+        startedAt: record.startedAt, endedAt: record.endedAt, period: record.period, tokens: record.tokens ?? null });
       return step;
     });
   }
@@ -114,7 +134,7 @@ export function derivePlanView(model: WorkModelPayload | undefined, orchestratio
   const latest = model?.planContext;
   const runningUntil = context === undefined || latest?.running ? Math.max(nowMs, unit.end, latest?.end ?? unit.end) : latest?.end ?? unit.end;
   const shownEarlier = new Set((context?.blockId === latest?.blockId ? model?.earlierPlans ?? [] : []).flatMap(earlier =>
-    (earlier.placements ?? []).filter(placement => earlier.steps?.some(step => step.key === placement.stepKey && planStepSettled(step)))
+    (earlier.placements ?? []).filter(placement => placement.stepKey !== null)
       .map(placement => placement.toolUseId)));
   const agents = flattenAgents(model?.phases ?? [], model?.unlinkedAgents);
   const nodes = new Map(agents.map(agent => [agent.agentId, agent]));
@@ -129,21 +149,14 @@ export function derivePlanView(model: WorkModelPayload | undefined, orchestratio
   const byAgentId = new Map((context?.placements ?? []).flatMap(placement => placement.agentId === undefined ? [] : [[placement.agentId, placement.stepKey] as const]));
   const current = view.steps.find(step => !step.removed && step.status === "in_progress");
   view.current = current?.number ?? null;
-  view.goal ||= current?.title ?? "";
   for (const step of view.steps) {
     step.ahead = !step.removed && step.status === "in_progress" && current !== undefined && view.steps.indexOf(step) > view.steps.indexOf(current);
+    const period = step.period;
     const until = unit.running ? Math.max(nowMs, unit.end) : unit.end;
-    const spans = step.activeSpans?.map((span, index, all) =>
-      index === all.length - 1 && step.endedAt === null ? { start: span.start, end: Math.max(span.end, until) } : span);
-    step.elapsed = step.startedAt === null ? null : spans !== undefined && spans.length > 0 ? planSpansMs(spans)
-      : Math.max(0, (step.endedAt ?? until) - step.startedAt);
+    step.elapsed = period === undefined ? null : planSpansMs(period.spans.map((span, index, all) =>
+      index === all.length - 1 ? { start: span.start, end: planPeriodEnd({ end: span.end, running: period.running }, until) } : span));
   }
   view.completed = view.steps.filter(planStepDone).length;
-  const remaining = view.steps.filter(step => !step.removed);
-  if (remaining.length && remaining.every(step => step.status === "completed")) {
-    const end = Math.max(...remaining.map(step => step.endedAt ?? unit.start));
-    view.elapsed = Math.max(0, end - unit.start);
-  }
   view.claude = context?.tokens ?? null;
   const seen = new Set<string>();
   const inWindow = (lane: PlanLane): boolean =>
@@ -161,10 +174,10 @@ export function derivePlanView(model: WorkModelPayload | undefined, orchestratio
   };
   const visit = (agent: WorkAgentNode): void => {
     const observed = orchestration?.agents.find(value => value.agentId === (agent.transcriptAgentId ?? agent.agentId));
-    const lane: PlanLane = { id: `agent:${agent.transcriptAgentId ?? agent.agentId}`, agent: observed?.role ?? agent.agentType ?? agent.modelMeasured ?? agent.modelDeclared ?? "Claude",
+    const lane: PlanLane = { id: `agent:${agent.transcriptAgentId ?? agent.agentId}`, agent: agent.role ?? agent.agentType ?? agent.modelMeasured ?? agent.modelDeclared ?? "Claude",
       title: agent.status === "running" && agent.intentInput ? toolIntentLabel("Agent", agent.intentInput) : agent.description, start: agent.startedAt ?? null,
       elapsed: agent.status === "running" && agent.startedAt !== undefined && (context === undefined || unit.running)
-        ? Math.max(agent.elapsedMs, nowMs - agent.startedAt)
+        ? agentElapsedMs(agent, nowMs)
         : agent.origin === "restored" && (agent.startedAt === undefined || agent.endedAt === undefined) ? null : agent.elapsedMs,
       status: agent.status, tokens: agent.tokens ?? externalTokens(observed?.usage ?? null)?.tokens ?? null,
       cacheRead: externalTokens(observed?.usage ?? null)?.cacheRead ?? 0, external: false, ...(agent.description ? { description: agent.description } : {}) };
@@ -198,14 +211,12 @@ export function derivePlanView(model: WorkModelPayload | undefined, orchestratio
   for (const [index, run] of (orchestration?.runs ?? []).entries()) {
     const tokens = externalTokens(run.usage);
     attach({ id: `external:${run.startedAt}:${index}`, agent: run.role, title: [run.executor, run.model, run.effort].filter(Boolean).join(" · "),
-      start: Date.parse(run.startedAt), elapsed: run.durationMs, status: run.outcome === "ok" ? "completed" : run.outcome === "stopped" ? "stopped" : "failed",
+      start: Date.parse(run.startedAt), elapsed: run.durationMs, status: externalRunStatus(run.outcome),
       tokens: tokens?.tokens ?? null, cacheRead: tokens?.cacheRead ?? 0, external: true }, { toolUseId: run.toolUseId });
   }
   for (const tool of model?.planTools ?? []) attach({ id: `tool:${tool.id}`, agent: "Claude", title: toolIntentLabel(tool.name, tool.intentInput),
     start: tool.startedAt, elapsed: Math.max(0, (unit.running ? Math.max(nowMs, unit.end) : unit.end) - tool.startedAt),
     status: "running", tokens: null, cacheRead: 0, external: false }, { toolUseId: tool.id });
-  const external = [...view.now, ...view.steps.flatMap(step => step.lanes)].filter(lane => lane.external);
-  if (external.length && external.every(lane => lane.tokens !== null)) view.external = {
-    tokens: external.reduce((sum, lane) => sum + lane.tokens!, 0), cacheRead: external.reduce((sum, lane) => sum + lane.cacheRead, 0) };
+  view.external = context?.external ?? null;
   return view;
 }

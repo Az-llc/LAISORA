@@ -44,6 +44,11 @@ export function appendRecordPart(parts: RecordTextPart[], part: RecordTextPart):
   }
 }
 
+export function withoutRetracted<T extends { uuid: string | null }>(parts: readonly T[], uuids: readonly string[]): T[] {
+  const dropped = new Set(uuids);
+  return parts.filter((part) => part.uuid === null || !dropped.has(part.uuid));
+}
+
 export function prependRecordParts(older: readonly RecordTextPart[], newer: readonly RecordTextPart[]): RecordTextPart[] {
   const parts: RecordTextPart[] = [];
   for (const part of [...older, ...newer]) appendRecordPart(parts, part);

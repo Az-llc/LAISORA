@@ -15,18 +15,24 @@ export function claudeModelPrices(model: string | null): ClaudeModelPrices | und
 
 const otherTtl = (ttl: CacheTtl): CacheTtl => ttl === "5m" ? "1h" : "5m";
 
-export function runCacheTtlCost(requests: readonly CacheTtlRequest[], prices: ClaudeModelPrices | undefined): RunCacheTtlCost | null {
-  if (prices === undefined || requests.length === 0) return null;
-  const ordered = [...requests].sort((a, b) => a.at - b.at);
+export function cacheWriteTtl(usages: readonly Pick<AssistantUsage, "cacheCreation5mInputTokens" | "cacheCreation1hInputTokens">[]): CacheTtl | null {
   let written5m = 0, written1h = 0;
-  for (const { usage } of ordered) {
-    if (usage.inputTokens === undefined || usage.cacheCreationInputTokens === undefined || usage.cacheReadInputTokens === undefined
-      || usage.outputTokens === undefined || usage.cacheCreation5mInputTokens === undefined || usage.cacheCreation1hInputTokens === undefined) return null;
+  for (const usage of usages) {
+    if (usage.cacheCreation5mInputTokens === undefined || usage.cacheCreation1hInputTokens === undefined) return null;
     written5m += usage.cacheCreation5mInputTokens;
     written1h += usage.cacheCreation1hInputTokens;
   }
   if ((written5m > 0) === (written1h > 0)) return null;
-  const actual: CacheTtl = written1h > 0 ? "1h" : "5m";
+  return written1h > 0 ? "1h" : "5m";
+}
+
+export function runCacheTtlCost(requests: readonly CacheTtlRequest[], prices: ClaudeModelPrices | undefined): RunCacheTtlCost | null {
+  if (prices === undefined || requests.length === 0) return null;
+  const ordered = [...requests].sort((a, b) => a.at - b.at);
+  if (ordered.some(({ usage }) => usage.inputTokens === undefined || usage.cacheCreationInputTokens === undefined
+    || usage.cacheReadInputTokens === undefined || usage.outputTokens === undefined)) return null;
+  const actual = cacheWriteTtl(ordered.map(({ usage }) => usage));
+  if (actual === null) return null;
   const result = { "5m": { costUsd: 0, readTokens: 0, contextTokens: 0 }, "1h": { costUsd: 0, readTokens: 0, contextTokens: 0 } };
   let previousPrefix = 0;
   ordered.forEach(({ at, usage }, index) => {

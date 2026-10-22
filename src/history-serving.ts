@@ -10,7 +10,8 @@ import {
 } from "./conversation-history";
 import {
   createHydrationDraft,
-  foldHistoryEvents,
+  foldRestoredRecords,
+  readRestoredRecords,
 } from "./resume-hydration";
 import {
   historyScopeKey,
@@ -41,7 +42,7 @@ import {
   sessionTranscriptLookup,
   type SessionFileLookup,
 } from "./session-files";
-import { readConversationMessages, readSessionHistory } from "./session-transcript";
+import { readConversationMessages, unturnedParentRecordSource } from "./session-transcript";
 import { sessionRecordId } from "./session-record";
 import { currentScopeMax, type SessionStore } from "./store-surfaces";
 
@@ -520,7 +521,19 @@ export async function handleHistoryMessage(
             );
             break;
           }
-          const history = await readSessionHistory(ref.file, isInSessionStore, { generationSessionId: ref.sessionId });
+          const resumed = session.hydration;
+          const readSet =
+            resumed !== null && resumed.filePath === ref.file && resumed.sessionId === ref.sessionId
+              ? resumed.readSet
+              : undefined;
+          const parentRecords = unturnedParentRecordSource(ref.file, readSet);
+          let restored: Awaited<ReturnType<typeof readRestoredRecords>>;
+          try {
+            restored = await readRestoredRecords(ref.file, ref.sessionId, readSet, parentRecords);
+          } finally {
+            parentRecords.release();
+          }
+          const { transcript, history } = restored;
           if (!requestStillValid()) {
             await postWorklogTranscriptError(
               st, sender, session, msg.requestId, generation, "stale-request"
@@ -545,8 +558,9 @@ export async function handleHistoryMessage(
           const draft = createHydrationDraft(session);
           draft.generation = anchor.generation;
           const scopeEvents: NormalizedEvent[] = [];
-          const outcome = await foldHistoryEvents(
+          const outcome = await foldRestoredRecords(
             draft,
+            transcript,
             history,
             (step) => {
               const folded = step.normalizedEvent;

@@ -1,10 +1,13 @@
 import * as l10n from "@vscode/l10n";
+import { CLI_USER_INTERRUPTED_TEXTS } from "./human-input-vocabulary";
 import { "Denied by the LAISORA user" as enLaisoraDenial } from "../l10n/bundle.l10n.json";
 import { "Denied by the LAISORA user" as jaLaisoraDenial } from "../l10n/bundle.l10n.ja.json";
 
 // Tool result text the harness writes for calls that were refused, stopped or rejected, used to classify failures.
 const PERMISSION_REFUSED = String.raw`The user doesn't want to proceed with this tool use\b`;
-const USER_INTERRUPTED = String.raw`\[Request interrupted by user(?: for tool use)?\]`;
+const CLI_REJECTION_RE = /^(?:Error: )?User rejected tool use\b/;
+const escapeRegExp = (text: string): string => text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+const USER_INTERRUPTED = CLI_USER_INTERRUPTED_TEXTS.map(escapeRegExp).join("|");
 const HOOK_DENIAL = String.raw`PreToolUse(?::[\w|*]+)? hook error:`;
 const HARNESS_DENIED = "Permission for this action was denied by";
 const INPUT_VALIDATION = "InputValidationError|Invalid arguments for tool";
@@ -16,7 +19,6 @@ const ISOLATION_WORKTREE_REFUSED = String.raw`Refusing to use [^\n]* as an isola
 export function laisoraDenialMessage(): string {
   return l10n.t("Denied by the LAISORA user");
 }
-const escapeRegExp = (text: string): string => text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 const LAISORA_DENIALS = [enLaisoraDenial, jaLaisoraDenial].map(escapeRegExp);
 
 const anchored = (...parts: string[]): RegExp => new RegExp(`^(?:${parts.join("|")})`);
@@ -36,6 +38,29 @@ export function isHookDenial(text: string): boolean {
   return HOOK_DENIAL_RE.test(stripToolUseErrorTags(text).trimStart());
 }
 
+const LAISORA_DENIAL_RE = new RegExp(`^(?:Error: )?(?:${LAISORA_DENIALS.join("|")})`);
+
+export function isCliRejectionText(text: string): boolean {
+  return CLI_REJECTION_RE.test(stripToolUseErrorTags(text).trimStart());
+}
+
+export function isLaisoraDenialText(text: string): boolean {
+  return LAISORA_DENIAL_RE.test(stripToolUseErrorTags(text).trimStart());
+}
+
 export function isRejectedBeforeRun(result: { isError?: boolean; resultPreview: string }): boolean {
   return result.isError === true && REJECTED_BEFORE_RUN_RE.test(stripToolUseErrorTags(result.resultPreview).trimStart());
+}
+
+export type TaskTerminal = "completed" | "failed" | "stale";
+
+export type TaskNotificationOutcome = "completed" | "failed" | "stopped";
+
+export function taskNotificationOutcome(status: string | undefined): TaskNotificationOutcome | undefined {
+  return status === "completed" ? "completed" : status === "failed" ? "failed" : status === "stopped" || status === "killed" ? "stopped" : undefined;
+}
+
+export function taskNotificationTerminal(status: string | undefined): TaskTerminal {
+  const outcome = taskNotificationOutcome(status);
+  return outcome === "completed" || outcome === "failed" ? outcome : "stale";
 }

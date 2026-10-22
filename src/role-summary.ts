@@ -1,13 +1,15 @@
 import * as l10n from "@vscode/l10n";
-import { conductorModelAtEnd, PLAN_UNPLANNED_ROW_KEY, planConductorRunning, splitByConductorModel, planFrame, planItemRowKey, planLive, planNow, planNumberedStep, planRowPeriod, planRowProvisional, planRowsAt, planRowTime, UNMEASURED_LABEL } from "./plan-steps";
+import { conductorModelAtEnd, PLAN_UNPLANNED_ROW_KEY, planConductorRunning, splitByConductorModel, planFrame, planItemRowKey, planLive, planNow, planPlacedStep, planBlockConductorMs, PLAN_CONDUCTOR_BUCKETS, planRowConductorParts, planRowPeriod, planRowProvisional, planRowsAt, planRowTime, UNMEASURED_LABEL } from "./plan-steps";
 import { attestedExternalRun, type ExternalRunRecord } from "./orchestration-external";
 import { EXECUTORS, isOrchestrationEffort } from "./orchestration-roster";
 import { flattenAgents, type WorkAgentNode, type WorkPhaseView } from "./protocol";
 import { attributeSubagent, type RosterEvidence } from "./roster-evidence";
 import { externalTokens, summarizeMainTokens, type PlanTokenTotal, type PlanUsageAccumulator } from "./plan-usage";
-import { keyedGet, keyedValues, largestRemainder, measureSpans, unionSpans, type ConductorModel, type KeyedLog, type RequestBlockView,
+import { keyedGet, keyedValues, largestRemainder, type ConductorModel, type KeyedLog, type RequestBlockView,
   type TimeBucketView } from "./time-buckets";
-import type { AnalysisToolRecord } from "./session-facts";
+import { memberRunTimes, runSpans, unionMs, type Span } from "./spans";
+import type { AnalysisToolRecord, ExternalRunCall } from "./session-facts";
+import { parseExternalTargetKey } from "./orchestration-executors";
 import { deriveExecLogFindings, deriveFailureSummary, type FailureSummaryView } from "./exec-log-marks";
 import { CACHE_HIT_TERM, claudeModelPrices, roleCacheTtl, runCacheTtlCost, type RoleCacheTtlView } from "./cache-ttl-cost";
 import type { CacheTtl } from "./claude-prices";
@@ -139,7 +141,7 @@ function subagentRun(agent: WorkAgentNode, evidence: RosterEvidence, usage?: Pla
   const requestedModel = agent.modelDeclared ?? variant?.model ?? null;
   const callEffort = attributed?.perCallEffort && variant?.effort && isOrchestrationEffort(agent.intentInput?.effort) ? agent.intentInput.effort : undefined;
   const requestedEffort = callEffort ?? agent.effortDeclared ?? variant?.effort ?? null;
-  const finished = agent.origin === "live" && (agent.status === "completed" || agent.status === "failed");
+  const finished = agent.origin === "live" && agent.status !== "running";
   const measured = summarizeMainTokens(usage);
   const cacheMeasured = usage !== undefined && [...usage.values()].every(value => value.usage.cacheReadInputTokens !== undefined);
   return {
@@ -199,6 +201,29 @@ function externalRun(run: ExternalRunRecord, tools: KeyedLog<AnalysisToolRecord>
   };
 }
 
+function externalCallRun(call: ExternalRunCall & { running: boolean }, blockId: string | null = null): RunDraft {
+  const target = call.target === undefined ? undefined : parseExternalTargetKey(call.target);
+  return {
+    blockId,
+    toolUseId: call.toolUseId,
+    cacheRead: null,
+    outputTokens: null,
+    role: target?.role ?? null,
+    source: "external",
+    name: call.target ?? "",
+    executor: target?.executor ?? "",
+    model: target?.model ?? null,
+    modelSource: target === undefined ? null : "requested",
+    effort: target?.effort ?? null,
+    effortSource: target?.effort === undefined ? null : "requested",
+    startedAt: call.startedAt,
+    running: call.running,
+    outcome: call.outcome ?? null,
+    durationMs: call.outcome !== undefined && call.endedAt !== undefined ? Math.max(0, call.endedAt - call.startedAt) : null,
+    tokens: null,
+  };
+}
+
 function sumOf(values: readonly (number | null)[]): { total: number | null; partial: boolean } {
   let total: number | null = null;
   let partial = false;
@@ -225,6 +250,7 @@ export function deriveRoleSummary(input: {
   subagentUsage?: ReadonlyMap<string, PlanUsageAccumulator>;
   timeBuckets?: TimeBucketView;
   analysisTools?: KeyedLog<AnalysisToolRecord>;
+  externalRunCalls?: readonly (ExternalRunCall & { running: boolean })[];
 }): RoleSummaryView {
   const agents = flattenAgents(input.phases, input.unlinkedAgents);
   let rollupAgentCount = 0;
@@ -234,18 +260,26 @@ export function deriveRoleSummary(input: {
   const currentAgents = agents.filter(a => input.generationBoundaryAt === undefined || a.startedAt !== undefined && a.startedAt >= input.generationBoundaryAt);
   const recoveredCount = currentAgents.filter((a) => a.origin === "restored").length;
   const omittedSubagentCount = Math.max(0, rollupAgentCount - recoveredCount);
-  const blockByToolUseId = new Map<string, string | undefined>();
-  for (const span of [...input.timeBuckets?.agents ?? [], ...input.timeBuckets?.backgroundTasks ?? []]) {
-    blockByToolUseId.set(span.toolUseId, span.blockId);
-  }
+  const blockByToolUseId = spanBlockIds(input.timeBuckets);
   const drafts: RunDraft[] = [
     ...currentAgents.map((a) => subagentRun(a, input.rosterEvidence, input.subagentUsage?.get(a.toolUseId),
       blockByToolUseId.get(a.toolUseId) ?? null)),
-    ...input.externalRuns.filter(run => input.generationBoundaryAt === undefined || Date.parse(run.startedAt) >= input.generationBoundaryAt).map(run => externalRun(run,
-      input.analysisTools, run.toolUseId ? blockByToolUseId.get(run.toolUseId) ?? null : null)),
+    ...externalRunDrafts(input.externalRuns, input.generationBoundaryAt, input.analysisTools,
+      toolUseId => blockByToolUseId.get(toolUseId) ?? null),
+    ...(input.externalRunCalls ?? []).map(call => externalCallRun(call, blockByToolUseId.get(call.toolUseId) ?? null)),
   ].sort(byStart);
 
   return summarizeRoleRuns(drafts, omittedSubagentCount, input.externalRunsCoverage);
+}
+
+function externalRunDrafts(runs: readonly ExternalRunRecord[], generationBoundaryAt: number | undefined,
+  tools: KeyedLog<AnalysisToolRecord> | undefined, blockOf: (toolUseId: string) => string | null = () => null): RunDraft[] {
+  return runs.filter(run => generationBoundaryAt === undefined || Date.parse(run.startedAt) >= generationBoundaryAt)
+    .map(run => externalRun(run, tools, run.toolUseId ? blockOf(run.toolUseId) : null));
+}
+
+function spanBlockIds(view: Pick<TimeBucketView, "agents" | "backgroundTasks"> | undefined): Map<string, string | undefined> {
+  return new Map([...view?.agents ?? [], ...view?.backgroundTasks ?? []].map(span => [span.toolUseId, span.blockId]));
 }
 
 function summarizeRoleRuns(drafts: RunDraft[], omittedSubagentCount = 0, coverage?: ExternalRunsCoverage): RoleSummaryView {
@@ -334,9 +368,8 @@ function mergeRoleRuns(role: RoleView): RoleView {
   return { ...role, runs };
 }
 
-const CONDUCTOR_BUCKETS = ["generate", "tool", "delegation", "confirm", "reply"] as const;
 
-const spanTotal = (intervals: readonly { start: number; end: number }[]): number => measureSpans(unionSpans(intervals.map(({ start, end }) => [start, end])));
+const spanTotal = (intervals: readonly { start: number; end: number }[]): number => unionMs(intervals.map(({ start, end }) => [start, end]));
 
 function analysisTime(values: (number | null)[]): AnalysisTimeView {
   const sum = sumOf(values);
@@ -386,18 +419,10 @@ function analysisRows(view: TimeBucketView | undefined, roles: RoleSummaryView, 
     const routed = planRowTime(routes, start, end);
     return new Map([...routed.rows].flatMap(([key, ms]) => { const row = byKey.get(key); return row === undefined ? [] : [[row, ms / routed.covered] as const]; }));
   };
-  const blockValues = (block: RequestBlockView): (number | null)[] => {
-    const metrics = block.metrics;
-    return metrics === undefined ? [block.generateMs ?? null, block.toolMs ?? null, block.subagentWaitMs ?? null, block.confirmMs ?? null, block.replyMs ?? null, null]
-      : [metrics.generateMs ?? null, metrics.toolMs ?? null, metrics.subagentWaitMs ?? null,
-        metrics.decisionWaitMs ?? null, metrics.replyWaitMs ?? null, metrics.subagentOnlyMs ?? null];
-  };
+  const blockValues = (block: RequestBlockView): (number | null)[] =>
+    [...planBlockConductorMs(block), block.metrics === undefined ? null : block.metrics.subagentOnlyMs ?? null];
   for (const row of rows) {
     const values = blockValues(row.block);
-    CONDUCTOR_BUCKETS.forEach((bucket, index) => {
-      row.values[index] = values[index] === null ? null
-        : row.frame.conductorWork.filter(interval => interval.bucket === bucket).reduce((sum, interval) => sum + interval.end - interval.start, 0);
-    });
     // Without subagent-only spans a block measured at zero is zero on every row.
     if (values[5] === 0) row.values[5] = 0;
     if (row.block.metrics?.tokens != null) row.tokens = { tokens: 0, cacheRead: 0, outputTokens: 0 };
@@ -414,13 +439,16 @@ function analysisRows(view: TimeBucketView | undefined, roles: RoleSummaryView, 
   }
   if (view?.subagentOnlySpans !== undefined) {
     for (const row of rows) row.values[5] = 0;
-    const activeOwners = [...view.agents, ...view.backgroundTasks.filter(task => task.subagent)];
+    const activeOwners = [...view.agents, ...view.backgroundTasks.filter(task => task.subagent)]
+      .map(owner => ({ owner, runs: runSpans(memberRunTimes(owner)) }));
+    const runsDuring = (runs: readonly Span[], start: number, end: number) => runs.some(([runStart, runEnd]) => runStart < end && runEnd > start);
     for (const [start, end] of view.subagentOnlySpans) {
-      const active = activeOwners.filter(owner => owner.start < end && owner.end > start);
-      const points = [...new Set([start, end, ...active.flatMap(owner => [Math.max(start, owner.start), Math.min(end, owner.end)])])]
+      const active = activeOwners.filter(({ runs }) => runsDuring(runs, start, end));
+      const points = [...new Set([start, end, ...active.flatMap(({ runs }) => runs.flatMap(([runStart, runEnd]) =>
+        runStart < end && runEnd > start ? [Math.max(start, runStart), Math.min(end, runEnd)] : []))])]
         .sort((a, b) => a - b);
       for (let i = 0; i + 1 < points.length; i++) {
-        const owners = new Set(active.filter(owner => owner.start < points[i + 1] && owner.end > points[i]).map(ownerRow));
+        const owners = new Set(active.filter(({ runs }) => runsDuring(runs, points[i], points[i + 1])).map(({ owner }) => ownerRow(owner)));
         for (const row of owners) if (row) row.values[5] = (row.values[5] ?? 0) + (points[i + 1] - points[i]);
       }
     }
@@ -428,31 +456,42 @@ function analysisRows(view: TimeBucketView | undefined, roles: RoleSummaryView, 
   const owners = new Map([...view?.agents ?? [], ...view?.backgroundTasks ?? []].map(owner => [owner.toolUseId, owner]));
   const headerRuns: RunDraft[] = [];
   const seenRuns = new Set<string>();
-  // A run without a span (a foreground external run) goes to the item its description number names, the same lookup as
-  // the launch guard (src/time-buckets.ts#numberedLaunchVerdict), else to the 00.
-  const runRow = (run: Pick<RoleRunView, "toolUseId" | "startedAt" | "blockId">): Row | undefined => {
+  // A run without a span (a foreground external run) goes to the item its description number names, the same placement as
+  // a run with a span (src/plan-steps.ts#planPlacedStep), else to the 00.
+  type RunRef = Pick<RoleRunView, "toolUseId" | "startedAt" | "blockId">;
+  const runPlace = (run: RunRef): { owner?: NonNullable<ReturnType<typeof owners.get>>; blockId?: string | null; stepKey?: string } => {
     const owner = run.toolUseId === undefined ? undefined : owners.get(run.toolUseId);
-    if (owner) return ownerRow(owner);
+    if (owner) return { owner, blockId: owner.blockId ?? blockAt(blocks, owner.start)?.blockId };
     const at = run.startedAt;
     const number = run.toolUseId === undefined || tools === undefined ? undefined : keyedGet(tools, run.toolUseId)?.itemNumber;
-    const numbered = number === undefined || at === null ? undefined : planNumberedStep(blocks, number, at);
-    if (numbered !== undefined) return rowOf(blocks[numbered.blockIndex].blockId, numbered.step.key);
-    return rowOf(run.blockId ?? blockAt(blocks, at)?.blockId) ?? (at === null ? undefined : rowsAt(at)[0]);
+    const numbered = number === undefined || at === null ? undefined : planPlacedStep(blocks, number, at);
+    if (numbered !== undefined) return { blockId: blocks[numbered.blockIndex].blockId, stepKey: numbered.step.key };
+    return { blockId: run.blockId ?? blockAt(blocks, at)?.blockId };
   };
+  const runRow = (run: RunRef): Row | undefined => {
+    const place = runPlace(run);
+    if (place.owner) return ownerRow(place.owner);
+    return rowOf(place.blockId, place.stepKey)
+      ?? (place.stepKey !== undefined || run.startedAt === null ? undefined : rowsAt(run.startedAt)[0]);
+  };
+  // The work block a run belongs to, by the same decision as its ANALYSIS row; the 00 row's block is not the run's.
+  const runBlockId = (run: RunRef): string | undefined => runPlace(run).blockId ?? runRow(run)?.block.blockId;
   for (const role of roles.roles) for (const run of role.runs) {
     const row = runRow(run);
     if (!row || run.toolUseId !== undefined && seenRuns.has(run.toolUseId)) continue;
     if (run.toolUseId !== undefined) seenRuns.add(run.toolUseId);
-    const draft = { ...run, blockId: row.block.blockId, role: role.role };
+    const draft = { ...run, blockId: runBlockId(run) ?? row.block.blockId, role: role.role };
     row.runs.push(draft);
     headerRuns.push(draft);
   }
-  return { frameBlocks, rows, rowsAt, ownerRow, owners, runRow, headerRuns, now, live, blockValues };
+  return { frameBlocks, rows, rowsAt, ownerRow, owners, runRow, runBlockId, headerRuns, now, live, blockValues };
 }
 
 export interface PlanPlacement {
   tokens: Map<string, PlanTokenTotal | null>;
   placements: Array<{ toolUseId: string; agentId?: string; stepKey: string | null }>;
+  // The block's ROLES external runs, null when there are none or one is unmeasured.
+  external: PlanTokenTotal | null;
 }
 
 const NO_ROLES: RoleSummaryView = { roles: [], omittedSubagentCount: 0 };
@@ -461,8 +500,20 @@ const NO_ROLES: RoleSummaryView = { roles: [], omittedSubagentCount: 0 };
 // only rows of the asked block name a step. Step tokens are those rows' routed tokens. Lanes start as their ANALYSIS
 // runs do: an external run by src/role-summary.ts#externalRunStart.
 export function derivePlanPlacements(view: TimeBucketView | undefined, tools: KeyedLog<AnalysisToolRecord> | undefined,
-  lanes: ReadonlyArray<{ toolUseId: string; start: number | null }>): (blockId: string) => PlanPlacement {
-  const { rows, owners, runRow } = analysisRows(view, NO_ROLES, tools);
+  lanes: ReadonlyArray<{ toolUseId: string; start: number | null }>,
+  external: { runs: readonly ExternalRunRecord[]; generationBoundaryAt?: number } = { runs: [] }): (blockId: string) => PlanPlacement {
+  const { rows, owners, runRow, runBlockId } = analysisRows(view, NO_ROLES, tools);
+  const spanBlocks = spanBlockIds(view);
+  const externalByBlock = new Map<string, RunDraft[]>();
+  for (const run of externalRunDrafts(external.runs, external.generationBoundaryAt, tools, toolUseId => spanBlocks.get(toolUseId) ?? null)) {
+    const blockId = runBlockId(run);
+    if (blockId !== undefined) externalByBlock.set(blockId, [...externalByBlock.get(blockId) ?? [], run]);
+  }
+  const externalOf = (blockId: string): PlanTokenTotal | null => {
+    const runs = externalByBlock.get(blockId) ?? [];
+    if (runs.length === 0 || runs.some(run => run.tokens === null)) return null;
+    return { tokens: runs.reduce((sum, run) => sum + run.tokens!, 0), cacheRead: runs.reduce((sum, run) => sum + (run.cacheRead ?? 0), 0) };
+  };
   const routed = new Map<string, { agentId?: string; row: (typeof rows)[number] | undefined }>();
   for (const [toolUseId, owner] of owners) {
     const agentId = "transcriptAgentId" in owner ? owner.transcriptAgentId : undefined;
@@ -473,6 +524,7 @@ export function derivePlanPlacements(view: TimeBucketView | undefined, tools: Ke
     tokens: new Map(rows.filter(row => row.block.blockId === blockId && row.step !== undefined).map(row => [row.step!.key, row.tokens])),
     placements: [...routed].map(([toolUseId, { agentId, row }]) => ({ toolUseId, ...(agentId === undefined ? {} : { agentId }),
       stepKey: row?.block.blockId === blockId ? row.step?.key ?? null : null })),
+    external: externalOf(blockId),
   });
 }
 
@@ -505,12 +557,13 @@ export function deriveAnalysisPlans(view: TimeBucketView | undefined, roles: Rol
   const allMarks: AnalysisToolRecord["marks"] = [];
   let headerToolCount = 0, headerFailCount = 0;
   for (const tool of tools ? keyedValues(tools) : []) {
-    const calls = tool.startedAt === undefined ? [] : rowsAt(tool.startedAt);
+    const counted = tool.bookkeeping !== true;
+    const calls = !counted || tool.startedAt === undefined ? [] : rowsAt(tool.startedAt);
     for (const row of calls) row.toolCount++;
     if (calls.length) headerToolCount++;
     const failures = tool.failed && tool.finishedAt !== undefined ? rowsAt(tool.finishedAt) : [];
-    for (const row of failures) { row.failCount++; row.marks.push(...tool.marks); }
-    if (failures.length) { headerFailCount++; allMarks.push(...tool.marks); }
+    for (const row of failures) { if (counted) row.failCount++; row.marks.push(...tool.marks); }
+    if (failures.length) { if (counted) headerFailCount++; allMarks.push(...tool.marks); }
   }
   const conductorRun = (blockId: string | null, startedAt: number, time: AnalysisTimeView, mainTokens: PlanTokenTotal | null, running: boolean,
     model: ConductorModel | null | undefined): RunDraft => {
@@ -526,7 +579,8 @@ export function deriveAnalysisPlans(view: TimeBucketView | undefined, roles: Rol
     const span = planRowPeriod(frame, now, live);
     const unmeasured = span === undefined;
     const empty = unmeasured && rowRuns.length === 0;
-    const time = analysisTime(empty ? values.map(() => null) : unmeasured ? values.map((ms, i) => i < 5 ? null : ms) : values);
+    const rowValues = [...planRowConductorParts(frame, span), values[5]];
+    const time = analysisTime(empty ? rowValues.map(() => null) : rowValues);
     time.partial = !empty && time.partial;
     const planRoles = summarizeRoleRuns(unmeasured ? rowRuns : [conductorRun(block.blockId, step?.startedAt ?? block.start, time, mainTokens,
       planConductorRunning(frame, span), conductorModelAtEnd(view?.mainModelSpans, frame.conductorWork)), ...rowRuns]);
@@ -580,7 +634,7 @@ export function deriveAnalysisPlans(view: TimeBucketView | undefined, roles: Rol
         return end > start ? [{ ...interval, start, end }] : [];
       });
       const values = blockValues(block);
-      const bucketValues = CONDUCTOR_BUCKETS.map((bucket, i) => values[i] === null ? null
+      const bucketValues = PLAN_CONDUCTOR_BUCKETS.map((bucket, i) => values[i] === null ? null
         : share(values[i]!, clipped.filter(piece => piece.bucket === bucket), piece => piece.end - piece.start));
       const tokens = block.metrics?.tokens ?? null;
       const tokenValues = tokens === null ? null : (["tokens", "cacheRead", "outputTokens"] as const)
@@ -595,7 +649,7 @@ export function deriveAnalysisPlans(view: TimeBucketView | undefined, roles: Rol
     }
     const current = keyOf(conductorModelAtEnd(spans, [lastWindow]));
     const runs = [...parts].map(([key, part]) => {
-      const buckets = CONDUCTOR_BUCKETS.map((_, i) => sumOf(part.values.map(values => values[i])));
+      const buckets = PLAN_CONDUCTOR_BUCKETS.map((_, i) => sumOf(part.values.map(values => values[i])));
       const tokens = sumOf(part.tokens.map(value => value?.tokens ?? null));
       const cacheRead = sumOf(part.tokens.map(value => value?.cacheRead ?? null));
       const outputTokens = sumOf(part.tokens.map(value => value?.outputTokens ?? null));

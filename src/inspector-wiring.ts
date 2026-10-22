@@ -11,6 +11,7 @@ import type { Session } from "./extension";
 import { output } from "./host-context";
 import {
   projectWorkModel,
+  subagentModel,
   type AgentInspectorErrorReason,
   type WebviewToHost,
   type WorkAgentNode,
@@ -55,7 +56,7 @@ function findInspectorAgent(roots: readonly WorkAgentNode[], agentId: string): W
 }
 
 function inspectorAgentForSession(session: Session, agentId: string): WorkAgentNode | undefined {
-  const model = projectWorkModel(session.workModel, session.restoredAgents);
+  const model = projectWorkModel(session.workModel, session.restoredAgents, session.evidenceIndex.timeBuckets.blocks, session.childSpans);
   const roots = [...model.unlinkedAgents];
   for (const phase of model.phases) roots.push(...phase.agents);
   return findInspectorAgent(roots, agentId);
@@ -137,7 +138,8 @@ export async function handleInspectorMessage(
           requestId: msg.requestId,
           generation,
           fingerprint: result.fingerprint,
-          page: result.page,
+          page: result.page.section === "overview" && subagentModel(agent) !== undefined
+            ? { ...result.page, overview: { ...result.page.overview, modelMeasured: subagentModel(agent) } } : result.page,
         };
         if (Buffer.byteLength(JSON.stringify(response), "utf8") > INSPECTOR_RESPONSE_BYTES) {
           if (result.page.nextCursor !== undefined) releaseInspectorCursor(result.page.nextCursor);

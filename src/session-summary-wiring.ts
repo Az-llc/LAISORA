@@ -8,6 +8,7 @@ import { buildSessionDigest, buildSummaryPrompt, buildSessionNamePrompt, sanitiz
 import { isInSessionStore, sessionTranscriptRef } from "./session-files";
 import { readSessionHistory } from "./session-transcript";
 import { currentGenerationEvents } from "./time-buckets";
+import { bookkeepingIntent } from "./work-model";
 import { hasSessionRecord } from "./session-record";
 import type { Session } from "./extension";
 import type { SessionStore } from "./store-surfaces";
@@ -47,7 +48,7 @@ function summaryInputFromEvents(
     if (ev.kind === "user_message" && ev.text.trim().length > 0) userTexts.push(ev.text);
     else if (ev.kind === "replayed_message" && ev.role === "user" && ev.text.trim().length > 0) userTexts.push(ev.text);
     else if (ev.kind === "tool_call_started") {
-      toolCalls += 1;
+      if (bookkeepingIntent(ev) === undefined) toolCalls += 1;
       if (ev.delegation !== undefined) agentCount += 1;
     }
   }

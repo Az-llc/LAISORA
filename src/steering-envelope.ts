@@ -1,12 +1,15 @@
 import type { GuardrailLevel, GuardrailSignalKind } from "./guardrail";
 import { containsAbsolutePath, redactAbsolutePaths } from "./path-redaction";
 import * as l10n from "@vscode/l10n";
+import { isTodoId, todoToolName } from "./todo-model";
+import { formatHandoffTime, formatHandoffTokens } from "./handoff-format";
 
 export const STEER_TAG = "laisora-steer";
 export const STEER_SCHEMA = "gs1";
 export const STEER_SUPPORTED_VERSIONS: readonly string[] = ["1"];
 
 export type SteeringMode = "steer" | "escalate" | "report";
+export type SteeringEnvelopeMode = SteeringMode | "handoff_notice";
 export type SteeringLevel = 2 | 3;
 export type SteeringTrigger = "auto" | "manual";
 
@@ -23,9 +26,13 @@ export interface SteeringSignalSummary {
   lostMs?: number;
 }
 
+export type HandoffNoticeFacts =
+  | { reason: "size"; totalTokens: number; threshold: number; todoItemId?: string }
+  | { reason: "cache_expiry"; totalTokens: number; expiresAt: number; todoItemId?: string };
+
 export interface SteeringEnvelopeBody {
   schema: "gs1";
-  mode: SteeringMode;
+  mode: SteeringEnvelopeMode;
   level: SteeringLevel;
   issuedAt: number;
   trigger: SteeringTrigger;
@@ -37,6 +44,7 @@ export interface SteeringEnvelopeBody {
     autoLevel: GuardrailLevel;
   };
   signals: SteeringSignalSummary[];
+  notice?: HandoffNoticeFacts;
   instruction: string;
 }
 
@@ -56,7 +64,7 @@ export type SteeringParseResult =
   | { ok: true; version: string; body: SteeringEnvelopeBody; raw: string }
   | { ok: false; reason: SteeringRejectReason };
 
-export const STEER_LEVEL_BY_MODE: Record<SteeringMode, SteeringLevel> = { steer: 2, escalate: 3, report: 2 };
+export const STEER_LEVEL_BY_MODE: Record<SteeringEnvelopeMode, SteeringLevel> = { steer: 2, escalate: 3, report: 2, handoff_notice: 2 };
 
 const OPEN_RE = new RegExp(`^<${STEER_TAG}(\\s[^>]*)?>`, "i");
 const VERSION_RE = /version\s*=\s*"([^"]*)"/i;
@@ -66,7 +74,13 @@ function isRecord(v: unknown): v is Record<string, unknown> {
   return typeof v === "object" && v !== null && !Array.isArray(v);
 }
 
-const ROOT_KEYS = new Set(["schema", "mode", "level", "issuedAt", "trigger", "decision", "signals", "instruction"]);
+const ROOT_KEYS = new Set(["schema", "mode", "level", "issuedAt", "trigger", "decision", "signals", "notice", "instruction"]);
+const NOTICE_KEYS: Record<HandoffNoticeFacts["reason"], Set<string>> = {
+  size: new Set(["reason", "totalTokens", "threshold", "todoItemId"]),
+  cache_expiry: new Set(["reason", "totalTokens", "expiresAt", "todoItemId"]),
+};
+export const HANDOFF_NOTICE_DECISION_KEY = "handoff_notice";
+const NOTICE_ITEM_ID_RE = /^[A-Za-z0-9._:-]+$/;
 const DECISION_KEYS = new Set(["key", "signalIds", "taskId", "recommendedLevel", "autoLevel"]);
 const SIGNAL_KEYS = new Set(["signalId", "kind", "target", "subjectId", "taskId", "count", "confidence", "firstAt", "lastAt", "lostMs"]);
 const SIGNAL_KINDS = new Set([
@@ -128,6 +142,53 @@ export function steeringInstruction(mode: SteeringMode, signals: readonly Steeri
   );
 }
 
+const HANDOFF_NOTICE_HEAD = "Machine-generated LAISORA notice; not a human message or request.";
+const HANDOFF_NOTICE_PREPARE =
+  "so LAISORA will hand this conversation off to a fresh session after you end your turn. Prepare for that, then end your turn:\n" +
+  "- Do not start new work, new delegations, commits, or test runs. Finish only the unit of work in progress so no file is left half-edited.\n" +
+  "- Let running agents and background tasks finish; do not launch new ones.\n";
+const HANDOFF_NOTICE_RECORD_LINKED = (itemId: string): string =>
+  `- Write the TODO work memo for item ${itemId} with the ${todoToolName("write_memo")} tool: current position, next steps, decisions made. Leave open decisions open; do not decide them for the user.\n`;
+const HANDOFF_NOTICE_RECORD_UNLINKED =
+  "- State in your final message: what is done, what is in progress and where it stopped, decisions made, decisions still open. Leave open decisions open; do not decide them for the user.\n";
+const HANDOFF_NOTICE_TAIL = "- Update PLAN step states, then end your turn with a short status. If the user sends a message before the handoff, answer it normally; the handoff follows when that turn ends.";
+
+function handoffNoticeReason(notice: HandoffNoticeFacts): string {
+  return notice.reason === "size"
+    ? `The context has reached ${notice.totalTokens} tokens, at or above the ${notice.threshold}-token handoff threshold`
+    : `The prompt cache of the last reply expires soon (context ${notice.totalTokens} tokens)`;
+}
+
+export function handoffNoticeInstruction(notice: HandoffNoticeFacts): string {
+  const record = notice.todoItemId === undefined ? HANDOFF_NOTICE_RECORD_UNLINKED : HANDOFF_NOTICE_RECORD_LINKED(notice.todoItemId);
+  return `${HANDOFF_NOTICE_HEAD} ${handoffNoticeReason(notice)}, ${HANDOFF_NOTICE_PREPARE}${record}${HANDOFF_NOTICE_TAIL}`;
+}
+
+export function buildHandoffNoticeEnvelope(notice: HandoffNoticeFacts, issuedAt: number): string {
+  return buildSteeringEnvelope({
+    schema: "gs1",
+    mode: "handoff_notice",
+    level: STEER_LEVEL_BY_MODE.handoff_notice,
+    issuedAt,
+    trigger: "auto",
+    decision: { key: HANDOFF_NOTICE_DECISION_KEY, signalIds: [], recommendedLevel: 0, autoLevel: 0 },
+    signals: [],
+    notice,
+    instruction: handoffNoticeInstruction(notice),
+  });
+}
+
+function isNonNegativeInteger(v: unknown): v is number {
+  return typeof v === "number" && Number.isSafeInteger(v) && v >= 0;
+}
+
+function isHandoffNoticeFacts(v: unknown): v is HandoffNoticeFacts {
+  if (!isRecord(v) || (v.reason !== "size" && v.reason !== "cache_expiry")) return false;
+  if (!hasOnlyKeys(v, NOTICE_KEYS[v.reason]) || !isNonNegativeInteger(v.totalTokens)) return false;
+  if (v.todoItemId !== undefined && !(isTodoId(v.todoItemId) && NOTICE_ITEM_ID_RE.test(v.todoItemId))) return false;
+  return v.reason === "size" ? isNonNegativeInteger(v.threshold) : isNonNegativeInteger(v.expiresAt);
+}
+
 export function buildSteeringEnvelope(body: SteeringEnvelopeBody, version = "1"): string {
   const safe = JSON.parse(JSON.stringify(body)) as SteeringEnvelopeBody;
   safe.instruction = redactAbsolutePaths(safe.instruction);
@@ -157,7 +218,7 @@ export function parseSteeringEnvelope(text: string): SteeringParseResult {
   if (!hasOnlyKeys(parsed, ROOT_KEYS)) return { ok: false, reason: "unknown_field" };
   const mode = parsed.mode;
   const level = parsed.level;
-  if ((mode !== "steer" && mode !== "escalate" && mode !== "report") || (level !== 2 && level !== 3)) {
+  if ((mode !== "steer" && mode !== "escalate" && mode !== "report" && mode !== "handoff_notice") || (level !== 2 && level !== 3)) {
     return { ok: false, reason: "schema_mismatch" };
   }
   if (STEER_LEVEL_BY_MODE[mode] !== level) return { ok: false, reason: "level_mode_mismatch" };
@@ -181,6 +242,24 @@ export function parseSteeringEnvelope(text: string): SteeringParseResult {
   if ((parsed.trigger !== "auto" && parsed.trigger !== "manual") || !isFiniteNumber(parsed.issuedAt)) {
     return { ok: false, reason: "schema_mismatch" };
   }
+  if (mode === "handoff_notice") {
+    if (
+      parsed.signals.length !== 0 ||
+      decision.key !== HANDOFF_NOTICE_DECISION_KEY ||
+      (decision.signalIds as unknown[]).length !== 0 ||
+      decision.taskId !== undefined ||
+      decision.recommendedLevel !== 0 ||
+      decision.autoLevel !== 0 ||
+      parsed.trigger !== "auto" ||
+      !isHandoffNoticeFacts(parsed.notice)
+    ) {
+      return { ok: false, reason: "schema_mismatch" };
+    }
+    const noticeBody = parsed as unknown as SteeringEnvelopeBody & { notice: HandoffNoticeFacts };
+    if (noticeBody.instruction !== handoffNoticeInstruction(noticeBody.notice)) return { ok: false, reason: "instruction_mismatch" };
+    return { ok: true, version, raw: trimmed.slice(0, closeAt + CLOSE_TAG.length), body: noticeBody };
+  }
+  if (parsed.notice !== undefined) return { ok: false, reason: "unknown_field" };
   if (mode === "report") {
     if (parsed.signals.length < 1 || parsed.signals.length > 20) {
       return { ok: false, reason: "schema_mismatch" };
@@ -232,7 +311,7 @@ export function parseSteeringEnvelope(text: string): SteeringParseResult {
     }
   }
   const body = parsed as unknown as SteeringEnvelopeBody;
-  if (body.instruction !== steeringInstruction(mode, body.signals)) return { ok: false, reason: "instruction_mismatch" };
+  if (body.instruction !== steeringInstruction(mode as SteeringMode, body.signals)) return { ok: false, reason: "instruction_mismatch" };
   return { ok: true, version, raw: trimmed.slice(0, closeAt + CLOSE_TAG.length), body };
 }
 
@@ -240,6 +319,7 @@ export type SteeringSendRejectReason =
   | "closed"
   | "interrupting"
   | "not_running"
+  | "not_idle"
   | "invalid_envelope"
   | "redaction";
 
@@ -310,4 +390,37 @@ export function admitReportSend(
     };
   }
   return { ok: true };
+}
+
+export function admitHandoffNoticeSend(
+  state: { closed: boolean; turnState: "idle" | "running" | "interrupting" },
+  envelopeText: string,
+  checkRedaction: (text: string) => { ok: true } | { ok: false; violations: { field: string }[] }
+): SteeringAdmission {
+  if (state.closed) return { ok: false, reason: "closed", message: "handoff notice: the conversation has ended", transient: true };
+  if (state.turnState !== "idle") return { ok: false, reason: "not_idle", message: "handoff notice: the conversation is not idle", transient: true };
+  const parsed = parseSteeringEnvelope(envelopeText);
+  if (!parsed.ok || parsed.body.mode !== "handoff_notice") {
+    return { ok: false, reason: "invalid_envelope", message: `handoff notice: invalid envelope (${parsed.ok ? parsed.body.mode : parsed.reason})`, transient: false };
+  }
+  const redaction = checkRedaction(envelopeText);
+  if (!redaction.ok) {
+    return { ok: false, reason: "redaction", message: `handoff notice: Host-only values included (${redaction.violations.map((v) => v.field).join(", ")})`, transient: false };
+  }
+  return { ok: true };
+}
+
+export function handoffNoticeTitle(notice: HandoffNoticeFacts): string {
+  return notice.reason === "size"
+    ? l10n.t("Automatic handoff threshold reached ({0} / {1} tokens)", formatHandoffTokens(notice.totalTokens), formatHandoffTokens(notice.threshold))
+    : l10n.t("The prompt cache expires soon ({0})", formatHandoffTime(notice.expiresAt));
+}
+
+export function handoffNoticeCardText(notice: HandoffNoticeFacts): string {
+  return `${handoffNoticeTitle(notice)} ${l10n.t("Claude was asked to prepare for the handoff. It will start in a new tab once Claude reaches a good stopping point.")}`;
+}
+
+export function handoffNoticeOf(text: string): HandoffNoticeFacts | undefined {
+  const parsed = parseSteeringEnvelope(text);
+  return parsed.ok && parsed.body.mode === "handoff_notice" ? parsed.body.notice : undefined;
 }

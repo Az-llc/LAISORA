@@ -1,3 +1,5 @@
+import { initialTabRemoteControl, type TabRemoteControl } from "./remote-control";
+import { remoteControlView } from "./remote-control-wiring";
 import { randomUUID } from "node:crypto";
 
 import * as l10n from "@vscode/l10n";
@@ -26,6 +28,7 @@ import {
   type FoldEffect,
 } from "./event-fold";
 import { windowEvents } from "./event-window";
+import type { ChildTranscriptSpan } from "./spans";
 import {
   createGuardrailState,
   type GuardrailState,
@@ -111,6 +114,7 @@ export class Session {
   workModel: WorkModelState = createWorkModelState();
   evidenceIndex: SemanticEvidenceIndex = createEvidenceIndex();
   restoredAgents: RestoredAgent[] = [];
+  childSpans: readonly ChildTranscriptSpan[] = [];
   guardrail: GuardrailState = createGuardrailState();
   guardrailLiveSince?: number;
   liveGuardrailSignalIds = new Set<string>();
@@ -204,6 +208,7 @@ export class Session {
   historyFingerprint: string | null = null;
   conversationAnchorUuids: string[] = [];
   conversationHistoryGaps: { malformedLineCount: number; droppedWithoutUuidCount: number } | undefined = undefined;
+  remoteControl: TabRemoteControl = initialTabRemoteControl();
 
   constructor(private readonly store: SessionStore, index: number) {
     this.title = l10n.t("Conversation {0}", index);
@@ -259,6 +264,7 @@ export class Session {
     this.evidenceIndex = createEvidenceIndex();
     this.sessionFacts = initialSessionFacts();
     this.restoredAgents = [];
+    this.childSpans = [];
     this.semantic.semanticMemo = null;
     this.semantic.semanticDerivationFailedLast = false;
     this.semantic.lastGoodSemanticPayload = undefined;
@@ -274,6 +280,7 @@ export class Session {
     }
     this.handoffSource = undefined;
     this.resumeFilePath = undefined;
+    this.remoteControl = initialTabRemoteControl(this.remoteControl.choice);
     releaseHistoryWindow(historyScopeKey(this));
     releaseHistoryWindow(historyTranscriptScopeKey(this));
     this.historyFingerprint = null;
@@ -593,6 +600,7 @@ export class Session {
         llmDiagnostics: llmDiagnosticsAudience() !== "off" && llmAnalysisEnabled(),
         backgroundActivity: this.backgroundActivitySnapshot(),
         autoResumeAt: this.conversation?.pendingAutoResumeAt ?? null,
+        remoteControl: remoteControlView(this),
         events: this.events,
         ...(this.hydration === null ? {} : { resumeHydration: this.hydrationSnapshotState() }),
       },
@@ -658,7 +666,8 @@ export class Session {
 
   resumePreviewSnapshot(h: ResumeHydration): TabSnapshot {
     const loading = h.phase !== "failed";
-    const base = projectWorkModel(this.workModel, this.restoredAgents);
+    const base = projectWorkModel(this.workModel, this.restoredAgents, this.evidenceIndex.timeBuckets.blocks, this.childSpans);
+    this.semantic.attachAgentRoles(base);
     const projected = this.hydrationProjected(h);
     return {
       tabId: this.tabId,
@@ -701,6 +710,7 @@ export class Session {
         llmDiagnostics: llmDiagnosticsAudience() !== "off" && llmAnalysisEnabled(),
         backgroundActivity: this.backgroundActivitySnapshot(),
         autoResumeAt: this.conversation?.pendingAutoResumeAt ?? null,
+        remoteControl: remoteControlView(this),
         events: loading ? [] : this.events,
         resumeHydration: this.hydrationSnapshotState(),
       },
@@ -740,6 +750,7 @@ export class Session {
         llmDiagnostics: llmDiagnosticsAudience() !== "off" && llmAnalysisEnabled(),
         backgroundActivity: this.backgroundActivitySnapshot(),
         autoResumeAt: this.conversation?.pendingAutoResumeAt ?? null,
+        remoteControl: remoteControlView(this),
         events: [],
       },
     };

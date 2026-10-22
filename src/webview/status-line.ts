@@ -1,22 +1,18 @@
 import * as l10n from "@vscode/l10n";
-import { flattenAgents, type WorkModelPayload } from "../protocol";
+import { agentElapsedMs, agentRunStart, flattenAgents, type WorkModelPayload } from "../protocol";
 import { basename, firstLine, type ToolIntentInput } from "../tool-intent";
 import { monthDayClock } from "./format";
-import { CODEX_EFFORTS, AGY_EFFORTS, EXECUTORS, isExternalRunTool } from "../orchestration-executors";
+import { EXECUTORS, isExternalRunTool, parseExternalTargetKey } from "../orchestration-executors";
+import { isDelegationTool } from "../claude-tool-names";
 
 export const TOOL_INTENT_MAX_LENGTH = 80;
 
 function externalTargetLabel(target: string): string {
-  const match = /^([^/]+)\/([^@]+)@(.+)$/.exec(target);
-  if (!match) return target;
-  const [, role, executor, variant] = match;
-  const efforts: readonly string[] = executor === "codex" ? CODEX_EFFORTS : executor === "agy" ? AGY_EFFORTS : [];
-  const suffix = variant.slice(variant.lastIndexOf("-") + 1);
-  const effort = efforts.includes(suffix) ? suffix : "";
-  const model = effort ? variant.slice(0, -effort.length - 1) : variant;
+  const parsed = parseExternalTargetKey(target);
+  if (!parsed) return target;
+  const { role, executor, model, effort } = parsed;
   const family = executor === "codex" ? /^gpt-\d+(?:\.\d+)?-(astra|sol|luna|terra)$/.exec(model)?.[1] : undefined;
-  const label = family ? family[0].toUpperCase() + family.slice(1)
-    : `${executor === "codex" || executor === "agy" ? EXECUTORS[executor].displayName : executor} ${model}`;
+  const label = family ? family[0].toUpperCase() + family.slice(1) : `${EXECUTORS[executor].displayName} ${model}`;
   return l10n.t("{0} ({1})", [label, effort].filter(Boolean).join(" "), role);
 }
 
@@ -26,15 +22,14 @@ export function toolIntentLabel(name: string, input: ToolIntentInput = {}): stri
     const task = description || firstLine(input.prompt ?? "");
     if (input.target?.trim() && task) return l10n.t("Delegating to {0}: {1}", externalTargetLabel(input.target.trim()), task);
   }
+  if (isDelegationTool(name) && description) {
+    const agent = input.subagent_type?.trim() || input.agent_key?.trim();
+    return agent ? l10n.t("Delegating to {0}: {1}", agent, description) : l10n.t("Delegating: {0}", description);
+  }
   switch (name) {
     case "Bash": case "PowerShell":
       if (description) return description;
       break;
-    case "Agent": case "Task": {
-      const agent = input.subagent_type?.trim() || input.agent_key?.trim();
-      if (description) return agent ? l10n.t("Delegating to {0}: {1}", agent, description) : l10n.t("Delegating: {0}", description);
-      break;
-    }
     case "Read": if (input.file_path) return l10n.t("Reading {0}", basename(input.file_path)); break;
     case "Edit": if (input.file_path) return l10n.t("Editing {0}", basename(input.file_path)); break;
     case "Write": if (input.file_path) return l10n.t("Writing {0}", basename(input.file_path)); break;
@@ -74,14 +69,10 @@ export interface StatusLineInput {
   declared: string | null;
 }
 
-function agentStarts(model: WorkModelPayload | undefined): Map<string, number> {
+function agentStarts(model: WorkModelPayload | undefined, now: number): Map<string, number> {
   const starts = new Map<string, number>();
-  const resumes = new Map<string, number>();
-  for (const entry of model?.planHistory ?? []) {
-    if (entry.kind === "resume") resumes.set(entry.agentId, Math.max(resumes.get(entry.agentId) ?? 0, entry.at));
-  }
   for (const agent of flattenAgents(model?.phases ?? [], model?.unlinkedAgents)) {
-    const start = resumes.get(agent.agentId) ?? agent.startedAt;
+    const start = agent.status === "running" && agentRunStart(agent) !== undefined ? now - agentElapsedMs(agent, now) : agent.startedAt;
     if (start !== undefined && start > 0) starts.set(agent.toolUseId, start);
   }
   return starts;
@@ -99,7 +90,7 @@ export function deriveStatusLine(input: StatusLineInput): StatusLine {
     if (isExternalRunTool(tool.name)) delegates.set(tool.id, tool.startedAt > 0 ? tool.startedAt : null);
   }
   if (delegates.size > 0) {
-    const starts = agentStarts(input.workModel);
+    const starts = agentStarts(input.workModel, input.now);
     let since: number | null = null;
     for (const [id, toolStart] of delegates) {
       const start = starts.get(id) ?? toolStart;

@@ -12,9 +12,13 @@ import { detectExternalExecutor, listExternalModels } from "./orchestration-exte
 import { externalExecutorName, isExternalModels, isExternalTimeout, type ExternalDetection, type ExternalModels, type ExternalModelsState } from "./orchestration-roster";
 import { DEFAULT_ORCHESTRATION_ROSTER, buildRecommendedClaudeRoster, isOrchestrationSettingRoster, orchestrationSettingRows, recommendedOrchestrationRoster, recommendedRosterChanges, type OrchestrationSettingRow } from "./orchestration-roster";
 import * as vscode from "vscode";
+import { resolveHandoffAutoSettings } from "./handoff-auto";
 import {
+  HANDOFF_AUTO_SETTING_KEYS,
+  isHandoffAutoSettingValue,
   normalizeApiKeyPolicy,
   normalizeComposerSendKey,
+  type HandoffAutoSettingName,
   type ApiKeyPolicy,
   type ComposerSendKey,
   type FileLinkSetting,
@@ -33,10 +37,15 @@ import { restoreTabsOnStartupEnabled } from "./session-list-wiring";
 import { TODO_BETA_SETTING } from "./todo-store";
 import { todoBetaEnabled } from "./todo-surface";
 import { EDIT_SUMMARY_SETTING } from "./edit-summary";
+import { REMOTE_CONTROL_CARD_SETTING } from "./remote-control";
 import { GUARD_ENABLED_SETTING, MEMORY_BLOCK_PROJECT_TYPE_SETTING, placementOf, placementSettingsOf } from "./placement-line";
 
 export function editSummarySettingEnabled(): boolean {
   return getLaisoraConfiguration().get<boolean>(EDIT_SUMMARY_SETTING) === true;
+}
+
+export function remoteControlCardEnabled(): boolean {
+  return getLaisoraConfiguration().get<boolean>(REMOTE_CONTROL_CARD_SETTING) !== false;
 }
 
 export function accentSettings(): AccentSettings {
@@ -67,6 +76,7 @@ export function userSettingsMessage(): Extract<HostToWebview, { type: "userSetti
     composerSendKey: normalizeComposerSendKey(getLaisoraConfiguration().get<string>("composer.sendKey")!),
     askQualityCheck: getLaisoraConfiguration().get<boolean>("claude.askQualityCheck") === true,
     editSummaryEnabled: editSummarySettingEnabled(),
+    remoteControlCard: remoteControlCardEnabled(),
   };
 }
 
@@ -228,6 +238,8 @@ export function settingsStateMessage(): Extract<HostToSettingsPage, { type: "set
     todoEnabled: todoBetaEnabled(cfg),
     reloadNeeded: settingsReloadNeeded(cfg),
     editSummaryEnabled: editSummarySettingEnabled(),
+    remoteControlCard: remoteControlCardEnabled(),
+    handoffAuto: resolveHandoffAutoSettings((key) => cfg.get<unknown>(key)),
     orchestrationAgents: readRoster(cfg.get<unknown>("orchestration.agents")),
     orchestrationDefaults: readRoster(cfg.inspect("orchestration.agents")?.defaultValue ?? DEFAULT_ORCHESTRATION_ROSTER),
     conductorPolicy: cfg.get<string>("orchestration.conductorPolicy")!,
@@ -326,6 +338,14 @@ export async function writeTodoEnabled(enabled: boolean): Promise<SettingWriteFa
 
 export async function writeEditSummaryEnabled(enabled: boolean): Promise<SettingWriteFailure | undefined> {
   return updateUserSetting(EDIT_SUMMARY_SETTING, enabled);
+}
+
+export async function writeRemoteControlCard(enabled: boolean): Promise<SettingWriteFailure | undefined> {
+  return updateUserSetting(REMOTE_CONTROL_CARD_SETTING, enabled);
+}
+
+export async function writeHandoffAutoSetting(setting: HandoffAutoSettingName, value: unknown): Promise<SettingWriteFailure | undefined> {
+  return isHandoffAutoSettingValue(setting, value) ? updateUserSetting(HANDOFF_AUTO_SETTING_KEYS[setting], value) : undefined;
 }
 
 let normalizedRosterLogged = false;

@@ -62,6 +62,7 @@ export class SessionAnalysisStore {
         logicalGeneration: this.host.logicalGeneration,
         source: "auth",
       };
+      this.host.semantic.loadExternalRuns(this.host.conversation);
       this.loadPersistedArtifactsFromStore();
       this.flushPendingPersistence();
     } else if (this.host.ownerState.kind === "pinned") {

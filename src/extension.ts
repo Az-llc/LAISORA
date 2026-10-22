@@ -1,8 +1,6 @@
 import * as l10n from "@vscode/l10n";
 import * as vscode from "vscode";
 import { randomBytes } from "node:crypto";
-import { HandoffRunner } from "./handoff-runner";
-import { claudeProjectsDir } from "./claude-env";
 import { scheduleCliUpdates } from "./claude-cli-update";
 import { CLI_AUTO_UPDATE_SETTINGS } from "./cli-update-policy";
 export { handleAnalysisMessage } from "./analysis-messages";
@@ -14,6 +12,7 @@ export { normalizeDriveLetter } from "./claude-settings";
 import { TODO_BETA_SETTING } from "./todo-store";
 import { disposeTodoSurface, releaseOwnedTodoConversations, syncTodoSurface, toggleTodoDrawer } from "./todo-surface";
 import { EDIT_SUMMARY_SETTING } from "./edit-summary";
+import { REMOTE_CONTROL_CARD_SETTING } from "./remote-control";
 import { GUARD_ENABLED_SETTING, MEMORY_BLOCK_PROJECT_TYPE_SETTING } from "./placement-line";
 import { removeRetiredBaselineCache, removeRetiredLearningStore } from "./retired-storage";
 import { registerEditDiffProvider } from "./edit-diff-host";
@@ -38,7 +37,6 @@ import {
   semanticViewEnabled,
 } from "./session-semantic";
 import { SessionStore, tabLimit } from "./store-surfaces";
-import { handoffFs, handoffPersist, readHandoffRecords } from "./handoff-wiring";
 export { createStartMeasurement } from "./handoff-wiring";
 import { PROTOCOL_VERSION } from "./protocol";
 import { hostCpuMs, openResumedSession as resumePersistedTab, startLoopLagProbe } from "./resume-hydration";
@@ -49,6 +47,8 @@ import {
   readPersistedOpenTabs,
   releaseAccountUsageWaiter,
   restoreTabsOnStartupEnabled,
+  sweepHandoffForksAtStartup,
+  unfinishedHandoffTabNotice,
   writeHeldChosenTitle,
   type PersistedOpenTab,
 } from "./session-list-wiring";
@@ -56,6 +56,7 @@ import { configuredSystemAppExtensions, userSettingsMessage } from "./gateway-ho
 export { settingsStateMessage, setExternalDetectorForTest } from "./gateway-host-actions";
 import { openSettingsPanel, postSettingsState } from "./settings-panel";
 import { postOrchestrationView } from "./conversation-lifecycle";
+import { clearAutoHandoff } from "./handoff-wiring";
 import { registerReadOnlyFileProvider } from "./composer-io";
 import { pasteClipboardTextIntoComposer, setComposerFocus } from "./composer-paste";
 export { Session, historyScopeKey, historyTranscriptScopeKey, isUnusedSession } from "./session";
@@ -117,6 +118,7 @@ async function restorePersistedTabs(st: SessionStore, entries: PersistedOpenTab[
         filePath: lookup.path,
         activate: started.length === 0,
         knownCwd: entry.cwd,
+        restoreEntry: entry,
       }),
     });
   }
@@ -126,7 +128,9 @@ async function restorePersistedTabs(st: SessionStore, entries: PersistedOpenTab[
   let restored = 0;
   for (const item of started) {
     const opened = await item.outcome;
-    if (opened.session === undefined) {
+    if (opened.handoffFork !== undefined) {
+      notices.push(unfinishedHandoffTabNotice(item.label, opened.handoffFork));
+    } else if (opened.session === undefined) {
       notices.push(l10n.t("Could not restore the tab \"{0}\" (session {1}).", item.label, item.sessionId));
     } else {
       restored++;
@@ -185,10 +189,7 @@ function activateReady(context: vscode.ExtensionContext): void {
   setOutput(vscode.window.createOutputChannel("LAISORA"));
   output.appendLine(`[startup] ${sinceActivation()} activate at ${localIsoTime(activatedAt)}`);
   sampleStartupLoopLag(activatedAt);
-  void HandoffRunner.sweepOrphans(
-    { fs: handoffFs, persist: handoffPersist(), readRecords: readHandoffRecords, log: (line) => output.appendLine(line) },
-    claudeProjectsDir()
-  ).catch((e) => output.appendLine(`[startup] handoff の孤児回収に失敗: ${String(e)}`));
+  void sweepHandoffForksAtStartup();
   void removeRetiredLearningStore(context.globalStorageUri?.fsPath, (line) => output.appendLine(line));
   void removeRetiredBaselineCache(context.globalState, (line) => output.appendLine(line));
   scheduleCliUpdates(context);
@@ -214,7 +215,7 @@ function activateReady(context: vscode.ExtensionContext): void {
         if (cacheTtlSetting) session.semantic.scheduleSemanticModelPost();
       }
     }
-    if (affectsProductConfiguration(e, "composer.sendKey") || affectsProductConfiguration(e, "appearance") || affectsProductConfiguration(e, "claude.askQualityCheck") || affectsProductConfiguration(e, EDIT_SUMMARY_SETTING)) store?.post(userSettingsMessage());
+    if (affectsProductConfiguration(e, "composer.sendKey") || affectsProductConfiguration(e, "appearance") || affectsProductConfiguration(e, "claude.askQualityCheck") || affectsProductConfiguration(e, EDIT_SUMMARY_SETTING) || affectsProductConfiguration(e, REMOTE_CONTROL_CARD_SETTING)) store?.post(userSettingsMessage());
     if (
       affectsProductConfiguration(e, "appearance") ||
       affectsProductConfiguration(e, "composer.sendKey") ||
@@ -223,6 +224,7 @@ function activateReady(context: vscode.ExtensionContext): void {
       affectsProductConfiguration(e, "restoreTabsOnStartup") ||
       affectsProductConfiguration(e, TODO_BETA_SETTING) ||
       affectsProductConfiguration(e, EDIT_SUMMARY_SETTING) ||
+      affectsProductConfiguration(e, REMOTE_CONTROL_CARD_SETTING) ||
       affectsProductConfiguration(e, GUARD_ENABLED_SETTING) ||
       affectsProductConfiguration(e, MEMORY_BLOCK_PROJECT_TYPE_SETTING) ||
       Object.values(CLI_AUTO_UPDATE_SETTINGS).some((key) => affectsProductConfiguration(e, key)) ||
@@ -237,7 +239,8 @@ function activateReady(context: vscode.ExtensionContext): void {
       affectsProductConfiguration(e, "orchestration.enabled") ||
       affectsProductConfiguration(e, "orchestration.agents") ||
       affectsProductConfiguration(e, "orchestration.externalTimeoutMinutes") ||
-      affectsProductConfiguration(e, "orchestration.conductorPolicy")
+      affectsProductConfiguration(e, "orchestration.conductorPolicy") ||
+      affectsProductConfiguration(e, "handoff")
     ) {
       postSettingsState();
     }
@@ -504,6 +507,7 @@ async function settleForShutdown(): Promise<void> {
       s.guardrailRunner.clearGuardrailTickTimer();
       s.discardLlmAnalysis();
       s.startMeasurement?.abandon();
+      clearAutoHandoff(s);
     }
   }
   await Promise.all([

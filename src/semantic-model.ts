@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { unionMs, isChildCall } from "./spans";
 import type { HostArtifactAccess } from "./artifact-access";
 import type {
   ArtifactAccessRecord,
@@ -11,6 +12,7 @@ import type {
 } from "./evidence-index";
 import { assignmentRefOf, deriveAssignmentProgressStates } from "./evidence-index";
 import { progressSubjectKey } from "./progress-protocol";
+import { subagentModel } from "./protocol";
 import type { TaskStatus, WorkCoverage, WorkModelState, WorkStatus } from "./work-model";
 import { findToolPlacement, semanticRevision, type WorkAgent, type WorkSegment } from "./work-model";
 import { deriveTimeBuckets, type ChildTranscriptSpan, type TimeBucketView } from "./time-buckets";
@@ -306,16 +308,7 @@ function normalizeStability(stability: EvidenceIdentityStability): IdentityStabi
 }
 
 function extractTodoContent(taskKey: string): string | undefined {
-  if (!taskKey.startsWith("todo:")) return undefined;
-  const raw = taskKey.slice("todo:".length);
-  const lastSpace = raw.lastIndexOf(" ");
-  if (lastSpace > 0) {
-    const suffix = raw.slice(lastSpace + 1);
-    if (/^\d+$/.test(suffix)) {
-      return raw.slice(0, lastSpace);
-    }
-  }
-  return raw;
+  return taskKey.startsWith("todo:") ? taskKey.slice("todo:".length) : undefined;
 }
 
 function deriveTaskDefinitions(
@@ -494,33 +487,6 @@ function deriveTaskDefinitions(
   return tasks;
 }
 
-export function calculateIntervalUnion(intervals: [number, number][]): number {
-  if (intervals.length === 0) return 0;
-  const valid = intervals
-    .filter(([s, e]) => !isNaN(s) && !isNaN(e))
-    .map(([s, e]) => [s, Math.max(s, e)] as [number, number])
-    .sort((a, b) => a[0] - b[0] || a[1] - b[1]);
-
-  if (valid.length === 0) return 0;
-
-  let totalMs = 0;
-  let currentStart = valid[0][0];
-  let currentEnd = valid[0][1];
-
-  for (let i = 1; i < valid.length; i++) {
-    const [s, e] = valid[i];
-    if (s <= currentEnd) {
-      currentEnd = Math.max(currentEnd, e);
-    } else {
-      totalMs += currentEnd - currentStart;
-      currentStart = s;
-      currentEnd = e;
-    }
-  }
-  totalMs += currentEnd - currentStart;
-  return totalMs;
-}
-
 function collectAllAgents(state: WorkModelState): WorkAgent[] {
   const agentMap = new Map<string, WorkAgent>();
   for (const phase of state.phases) {
@@ -541,7 +507,7 @@ function collectDescendantAgentIds(
   const result = new Set<string>([rootAgentId]);
   const byParent = new Map<string, DelegationRecord[]>();
   for (const d of delegations) {
-    if (d.parentToolUseId !== null) {
+    if (isChildCall(d.parentToolUseId)) {
       const l = byParent.get(d.parentToolUseId) ?? [];
       l.push(d);
       byParent.set(d.parentToolUseId, l);
@@ -689,7 +655,7 @@ function rootDelegationOf(
 ): DelegationRecord | undefined {
   let cur = delByToolUseId.get(toolUseId);
   let hops = 0;
-  while (cur !== undefined && cur.parentToolUseId !== null) {
+  while (cur !== undefined && isChildCall(cur.parentToolUseId)) {
     cur = delByToolUseId.get(cur.parentToolUseId);
     if (++hops > 16) return undefined;
   }
@@ -811,7 +777,7 @@ function populateTaskExecutionInfo(
     const intervals = taskAttempts.map(
       (a) => [a.startedAt, a.endedAt ?? a.startedAt] as [number, number]
     );
-    const durationUnionMs = calculateIntervalUnion(intervals);
+    const durationUnionMs = unionMs(intervals);
 
     task.executionWindow = {
       startedAt,
@@ -897,7 +863,7 @@ export function deriveAttempts(
   const delegationSegmentIds = new Set<string>();
 
   for (const del of evidence.delegations) {
-    if (del.parentToolUseId !== null) {
+    if (isChildCall(del.parentToolUseId)) {
       continue;
     }
     const rootAgent = allAgents.find(
@@ -940,7 +906,7 @@ export function deriveAttempts(
         intervals.push([ag.startedAt, ag.endedAt ?? ag.startedAt]);
       }
     }
-    const elapsedMs = calculateIntervalUnion(intervals);
+    const elapsedMs = unionMs(intervals);
 
     let totalTokens = 0;
     let hasTokens = false;
@@ -978,7 +944,7 @@ export function deriveAttempts(
     const actor = {
       agentId: del.agentId,
       agentType: del.agentType,
-      model: rootAgent?.modelMeasured ?? rootAgent?.modelDeclared,
+      model: rootAgent === undefined ? undefined : subagentModel(rootAgent),
       effort: rootAgent?.effortMeasured ?? rootAgent?.effortDeclared,
       measured: rootAgent?.modelMeasured !== undefined || rootAgent?.effortMeasured !== undefined,
     };
@@ -1106,7 +1072,7 @@ export function deriveAttempts(
     const groupIntervals = group.map(
       (s) => [s.startedAt, s.endedAt ?? s.startedAt] as [number, number]
     );
-    const elapsedMs = calculateIntervalUnion(groupIntervals);
+    const elapsedMs = unionMs(groupIntervals);
     const startedAt = Math.min(...group.map((s) => s.startedAt));
     const allEnded = group.every((s) => s.endedAt !== undefined);
     const endedAt = allEnded ? Math.max(...group.map((s) => s.endedAt!)) : undefined;
@@ -1238,7 +1204,7 @@ export function deriveAgentRuns(
   const depthOf = (toolUseId: string): number => {
     let depth = 1;
     let cur = delByToolUseId.get(toolUseId);
-    while (cur && cur.parentToolUseId !== null && delByToolUseId.has(cur.parentToolUseId)) {
+    while (cur && isChildCall(cur.parentToolUseId) && delByToolUseId.has(cur.parentToolUseId)) {
       depth++;
       cur = delByToolUseId.get(cur.parentToolUseId);
       if (depth > 16) break;
@@ -1249,7 +1215,7 @@ export function deriveAgentRuns(
     let cur = delByToolUseId.get(toolUseId);
     let root = toolUseId;
     let hops = 0;
-    while (cur && cur.parentToolUseId !== null && delByToolUseId.has(cur.parentToolUseId)) {
+    while (cur && isChildCall(cur.parentToolUseId) && delByToolUseId.has(cur.parentToolUseId)) {
       root = cur.parentToolUseId;
       cur = delByToolUseId.get(cur.parentToolUseId);
       if (++hops > 16) break;
@@ -1260,13 +1226,13 @@ export function deriveAgentRuns(
   for (const del of evidence.delegations) {
     const agent = agentByToolUseId.get(del.toolUseId);
     const parentAgentRunId =
-      del.parentToolUseId !== null && delByToolUseId.has(del.parentToolUseId)
+      isChildCall(del.parentToolUseId) && delByToolUseId.has(del.parentToolUseId)
         ? `agentRun:agent:${del.parentToolUseId}`
         : undefined;
     const root = rootOf(del.toolUseId);
     const rootDel = delByToolUseId.get(root);
     const parentId =
-      rootDel !== undefined && rootDel.parentToolUseId === null ? `attempt:${root}` : undefined;
+      rootDel !== undefined && !isChildCall(rootDel.parentToolUseId) ? `attempt:${root}` : undefined;
 
     runs.push({
       nodeId: `agentRun:${del.agentId}`,

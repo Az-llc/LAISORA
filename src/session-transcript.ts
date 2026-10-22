@@ -25,16 +25,20 @@ import { HANDOFF_TAG, parseHandoffEnvelope, type HandoffEnvelopeV2 } from "./han
 import { isLaisoraInputText, laisoraInputLine, parseLaisoraInput } from "./laisora-input";
 import { ASK_QUALITY_DENIAL_HEAD, feedbackRejectedTitles, resolveRejectedAsks, type AskRejection } from "./markdown-ast";
 import {
-  COMMAND_ARGS_RE,
-  COMMAND_NAME_RE,
-  INJECTED_TAG_RE,
+  CLI_USER_INTERRUPTED_TEXTS,
   isGapBoundaryText,
-  isNonHumanCommandName,
   joinTextBlocks,
-  PURE_COMMAND_WRAPPER_RE,
   STEER_TAG_RE,
-  LAISORA_ENVELOPE_RE,
+  QUEUED_COMMAND_TYPE,
+  contentText as extractText,
+  extractCliInsertedUserText,
+  extractHumanUserText,
+  extractImageRefs,
+  extractQueuedPromptRecord,
 } from "./human-input-vocabulary";
+export { extractCliInsertedUserText, extractHumanUserText, extractImageRefs, extractQueuedPromptRecord } from "./human-input-vocabulary";
+import { isCliRejectionText, isLaisoraDenialText } from "./tool-result-signals";
+import { handoffNoticeCardText, handoffNoticeOf } from "./steering-envelope";
 
 export interface HistoryEvent {
   body: NormalizedEventBody & { provenance: EventProvenance };
@@ -64,7 +68,6 @@ const RESUME_TAIL_MAX_RECORDS = 1500;
 const RESUME_CAPTURE_CHUNK_BYTES = 64 * 1024;
 const AGENT_WAKE_ORIGIN_KINDS: ReadonlySet<string> = new Set(["task-notification", "peer"]);
 const EARLIER_GENERATION_TURN_ID = "replay-earlier-generation";
-const QUEUED_COMMAND_TYPE = "queued_command";
 const TOOL_RESULT_TYPE = "tool_result";
 const APPROVAL_RESOLVED_TYPE = "approval_resolved";
 // A record whose JSON line lacks the quoted value cannot carry it: JSON.stringify writes ASCII string values verbatim.
@@ -428,11 +431,14 @@ async function parsedRecordLines(text: string, sessionId: string | undefined): P
   return records;
 }
 
-async function readRecordLines(filePath: string, resumeReadSet: ResumeReadSet | undefined): Promise<RecordLines> {
+async function readParentText(filePath: string, resumeReadSet: ResumeReadSet | undefined): Promise<string> {
+  if (resumeReadSet) return readUtf8Prefix(filePath, resumeReadSet.parentEndOffset);
   const { readFile } = await import("node:fs/promises");
-  const text = resumeReadSet
-    ? await readUtf8Prefix(filePath, resumeReadSet.parentEndOffset)
-    : await readFile(filePath, "utf8");
+  return readFile(filePath, "utf8");
+}
+
+async function readRecordLines(filePath: string, resumeReadSet: ResumeReadSet | undefined): Promise<RecordLines> {
+  const text = await readParentText(filePath, resumeReadSet);
   return recordLinesOver(text.split("\n"), text.endsWith("\n"));
 }
 
@@ -440,14 +446,14 @@ export class ParentRecordSource {
   private pending: Promise<RecordLines> | undefined;
   private released = false;
 
-  constructor(readonly filePath: string, readonly readSet: ResumeReadSet, private readonly onRelease: () => void) {}
+  constructor(readonly filePath: string, readonly readSet: ResumeReadSet | undefined, private readonly onRelease: () => void) {}
 
   records(filePath: string, resumeReadSet: ResumeReadSet | undefined): Promise<RecordLines> {
     if (this.released || filePath !== this.filePath || resumeReadSet !== this.readSet) {
       return readRecordLines(filePath, resumeReadSet);
     }
     if (this.pending === undefined) {
-      const pending = readUtf8Prefix(this.filePath, this.readSet.parentEndOffset)
+      const pending = readParentText(this.filePath, this.readSet)
         .then((text) => parsedRecordLines(text, recordFileSessionId(this.filePath)));
       this.pending = pending;
       pending.catch(() => {
@@ -548,6 +554,10 @@ export function claimParentParseTurn(reserveMs: number): ParentParseClaim {
   const claim = new ParseTurnClaim(reserveMs);
   parseTurnClaims.push(claim);
   return claim;
+}
+
+export function unturnedParentRecordSource(filePath: string, readSet: ResumeReadSet | undefined): ParentRecordSource {
+  return new ParentRecordSource(filePath, readSet, () => {});
 }
 
 export async function parentRecordSource(
@@ -911,9 +921,11 @@ async function readHistory(
   let currentTurnId: string | null = null;
   let lastTurnActivityTimestamp = 0;
   let pendingSilentTurn = true;
+  let openNoticeCard: RawHistoryItem | undefined;
   const openPendingSilentTurn = (at: number): void => {
     if (!pendingSilentTurn) return;
     pendingSilentTurn = false;
+    openNoticeCard = undefined;
     turnOrdinal++;
     currentTurnId = "replay-turn-" + turnOrdinal;
     lastTurnActivityTimestamp = at;
@@ -1086,7 +1098,11 @@ async function readHistory(
         const humanText = prompt?.text ?? null;
         const cliInsertedText = obj.type === "user" && humanText === null ? extractCliInsertedUserText(obj) : null;
         const agentWake = obj.type === "user" && AGENT_WAKE_ORIGIN_KINDS.has(String(asRecord(obj.origin)?.kind));
-        if (humanText === null && currentTurnId !== null && (STEER_TAG_RE.test(joinedText) || agentWake)) {
+        const handoffNotice = obj.type === "user" && humanText === null ? handoffNoticeOf(joinedText) : undefined;
+        if (openNoticeCard !== undefined && obj.type === "user" && isInterruptMarker(content)) {
+          (openNoticeCard.body as Extract<NormalizedEventBody, { kind: "local_command_output" }>).handoffNoticeStopped = true;
+        }
+        if (humanText === null && currentTurnId !== null && handoffNotice === undefined && (STEER_TAG_RE.test(joinedText) || agentWake)) {
           const completedTime = lastTurnActivityTimestamp || recordTime;
           rawEvents.push({
             body: { kind: "turn_completed", turnId: currentTurnId, provenance: { path: "history" } },
@@ -1099,13 +1115,14 @@ async function readHistory(
           }
           currentTurnId = null;
           pendingSilentTurn = true;
+          openNoticeCard = undefined;
         }
         const askFeedback = cliInsertedText !== null && currentTurnId !== null && cliInsertedText.includes(ASK_QUALITY_DENIAL_HEAD) ? cliInsertedText : null;
         if (askFeedback !== null && currentTurnId !== null) {
           const texts = historyTurnTexts(rawEvents, currentTurnId).map((item) => (item.body as { text: string }).text);
           askRejections.push({ turnId: currentTurnId, upTo: texts.length, titles: feedbackRejectedTitles(texts.join("\n\n"), askFeedback) });
         }
-        const turnInsertedText = askFeedback === null ? cliInsertedText : null;
+        const turnInsertedText = askFeedback === null ? cliInsertedText ?? (handoffNotice !== undefined ? joinedText : null) : null;
         const absorbedMidTurn = extractQueuedPromptRecord(obj) !== null && prompt !== null && currentTurnId !== null;
         if (absorbedMidTurn && prompt !== null) {
           rawEvents.push({
@@ -1148,13 +1165,22 @@ async function readHistory(
               kind: "turn_started",
               turnId: currentTurnId,
               ...(turnInsertedText !== null ? { cliInserted: true as const } : {}),
-              ...(turnInsertedText !== null && isLaisoraInputText(turnInsertedText) ? { laisoraInput: true as const } : {}),
+              ...(turnInsertedText !== null && (handoffNotice !== undefined || isLaisoraInputText(turnInsertedText)) ? { laisoraInput: true as const } : {}),
               provenance: { path: "history" },
             },
             timestamp: recordTime,
             sourcePriority: 0,
             fileOrder: parentOrderCounter++,
           });
+          openNoticeCard = undefined;
+          if (handoffNotice !== undefined) {
+            openNoticeCard = {
+              body: { kind: "local_command_output", text: handoffNoticeCardText(handoffNotice), handoffNotice,
+                ...(typeof obj.uuid === "string" ? { uuid: obj.uuid } : {}), provenance: { path: "history" } },
+              timestamp: recordTime, sourcePriority: 0, fileOrder: parentOrderCounter++,
+            };
+            rawEvents.push(openNoticeCard);
+          }
 
           if (prompt !== null) {
             const imageRefs = prompt.imageRefs;
@@ -2004,6 +2030,11 @@ function createConversationRecordParser(sessionId?: string, keep?: (message: Con
               if (line !== undefined && uuid.length > 0) messages.push({ uuid, role: "system", text: line, timestamp: lastTimestamp });
               continue;
             }
+            const handoffNotice = obj.type === "user" ? handoffNoticeOf(verbatimTextOf(obj)) : undefined;
+            if (handoffNotice !== undefined) {
+              if (uuid.length > 0) messages.push({ uuid, role: "system", text: handoffNoticeCardText(handoffNotice), timestamp: lastTimestamp });
+              continue;
+            }
             if (feedback !== null && feedback.includes(ASK_QUALITY_DENIAL_HEAD)) {
               const texts = messages.slice(askTurnFrom).filter((message) => message.role === "assistant").map((message) => message.text);
               askRejections.push({ upTo: texts.length, titles: feedbackRejectedTitles(texts.join("\n\n"), feedback) });
@@ -2271,6 +2302,7 @@ const SUBAGENT_TAIL_SCAN_LINES = 40;
 
 export interface SubagentRestore {
   agents: RestoredAgent[];
+  readAt: number;
   metaCount: number;
   malformedMetaCount: number;
   transcriptsRead: number;
@@ -2288,6 +2320,7 @@ export async function readSubagentAgents(
   const startedAt = Date.now();
   const result: SubagentRestore = {
     agents: [],
+    readAt: startedAt,
     metaCount: 0,
     malformedMetaCount: 0,
     transcriptsRead: 0,
@@ -2454,6 +2487,7 @@ interface ApprovalResultRecord {
   answers?: Record<string, string>;
   behavior?: "allow" | "deny" | "withdrawn";
   isError?: boolean;
+  detailText?: string;
 }
 
 function stringAnswers(value: unknown): Record<string, string> | undefined {
@@ -2469,6 +2503,66 @@ function approvalBehavior(value: unknown): ApprovalResultRecord["behavior"] {
 interface ApprovalRestoreIndex {
   results: ReadonlyMap<string, ApprovalResultRecord>;
   seen: Set<string>;
+  unresolved?: Array<{ id: string; messageId: string | undefined; result: ApprovalResultRecord | undefined; card: RestoredApprovalCard }>;
+}
+
+function isRejectionInResultText(result: ApprovalResultRecord | undefined): boolean {
+  return result?.isError === true && isCliRejectionText(result.text);
+}
+
+function isCliRejectedResult(result: ApprovalResultRecord | undefined): boolean {
+  return isRejectionInResultText(result) || (result?.isError === true && isCliRejectionText(result.detailText ?? ""));
+}
+
+function isLaisoraDeniedResult(result: ApprovalResultRecord | undefined): boolean {
+  return result?.isError === true && (isLaisoraDenialText(result.text) || isLaisoraDenialText(result.detailText ?? ""));
+}
+
+export type ApprovalFollowUp = "interrupt" | "turn";
+
+export function restoredApprovalResolution(
+  result: ApprovalResultRecord | undefined,
+  answers: Record<string, string> | undefined,
+  followUp: ApprovalFollowUp | undefined
+): RestoredApprovalCard["resolution"] {
+  if (result?.behavior === "allow") return "allowed";
+  if (result?.behavior === "deny" || isLaisoraDeniedResult(result)) return "denied";
+  if (result?.behavior === "withdrawn") return "withdrawn";
+  if (isCliRejectedResult(result)) return followUp === "interrupt" ? "withdrawn" : "denied";
+  if (answers) return "answered";
+  if (result?.isError) return "failed";
+  return result === undefined && followUp !== undefined ? "withdrawn" : "unknown";
+}
+
+function isInterruptMarker(content: unknown): boolean {
+  const blocks = Array.isArray(content) ? content : [content];
+  return blocks.some((block) => {
+    const b = typeof block === "string" ? { type: "text", text: block } : asRecord(block);
+    const text = b?.type === "text" ? b.text : b?.type === "tool_result" ? joinTextBlocks(b.content) : undefined;
+    return typeof text === "string" && CLI_USER_INTERRUPTED_TEXTS.includes(text.trim());
+  });
+}
+
+export function approvalFollowUpOf(record: Record<string, unknown>, pendingMessageId: string | undefined): ApprovalFollowUp | undefined {
+  if (record.isSidechain === true) return undefined;
+  if (record.type === "assistant") {
+    const messageId = asRecord(record.message)?.id;
+    return typeof messageId === "string" && pendingMessageId !== undefined && messageId !== pendingMessageId ? "turn" : undefined;
+  }
+  if (record.type !== "user") return undefined;
+  if (isInterruptMarker(asRecord(record.message)?.content)) return "interrupt";
+  return extractHumanUserText(record) !== null ? "turn" : undefined;
+}
+
+function settleFollowedApprovals(index: ApprovalRestoreIndex, record: Record<string, unknown>): void {
+  if (!index.unresolved?.length) return;
+  index.unresolved = index.unresolved.filter(({ id, messageId, result, card }) => {
+    if (result === undefined && index.results.has(id)) return false;
+    const followUp = approvalFollowUpOf(record, messageId);
+    if (followUp === undefined) return true;
+    card.resolution = restoredApprovalResolution(result, card.answers, followUp);
+    return false;
+  });
 }
 
 function addApprovalResults(results: Map<string, ApprovalResultRecord>, record: Record<string, any>): void {
@@ -2479,7 +2573,9 @@ function addApprovalResults(results: Map<string, ApprovalResultRecord>, record: 
   if (record.type !== "user") return;
   const content = asRecord(record.message)?.content;
   if (!Array.isArray(content)) return;
-  const detail = content.filter((block) => asRecord(block)?.type === TOOL_RESULT_TYPE).length === 1 ? asRecord(record.toolUseResult) : null;
+  const single = content.filter((block) => asRecord(block)?.type === TOOL_RESULT_TYPE).length === 1;
+  const detail = single ? asRecord(record.toolUseResult) : null;
+  const detailText = single && typeof record.toolUseResult === "string" ? record.toolUseResult : undefined;
   for (const block of content) {
     const result = asRecord(block);
     if (result?.type !== TOOL_RESULT_TYPE || typeof result.tool_use_id !== "string") continue;
@@ -2488,6 +2584,7 @@ function addApprovalResults(results: Map<string, ApprovalResultRecord>, record: 
       answers: stringAnswers(detail?.answers),
       behavior: approvalBehavior(detail?.behavior),
       isError: result.is_error === true,
+      ...(detailText !== undefined ? { detailText } : {}),
     });
   }
 }
@@ -2539,6 +2636,7 @@ function extractRestoredApprovalMessages(
   timestamp: number
 ): ConversationMessage[] {
   if (record.isSidechain === true) return [];
+  settleFollowedApprovals(index, record);
   const content = asRecord(record.message)?.content;
   const uses = record.type === "approval_request"
     ? [{ id: record.requestId, name: record.toolName, input: record.input ?? record.inputJson ?? record.rawInputJson }]
@@ -2549,8 +2647,7 @@ function extractRestoredApprovalMessages(
     if (!use || typeof use.id !== "string" || !use.id || typeof use.name !== "string") continue;
     if (index.seen.has(use.id)) continue;
     const result = index.results.get(use.id);
-    const rejected = result?.isError === true && /^(?:Error: )?User rejected tool use\b/.test(result.text);
-    if (record.type !== "approval_request" && use.name !== "AskUserQuestion" && use.name !== "ExitPlanMode" && !result?.behavior && !rejected) continue;
+    if (record.type !== "approval_request" && use.name !== "AskUserQuestion" && use.name !== "ExitPlanMode" && !result?.behavior && !isRejectionInResultText(result)) continue;
     index.seen.add(use.id);
     let input = use.input;
     if (typeof input === "string") {
@@ -2559,14 +2656,15 @@ function extractRestoredApprovalMessages(
     const questions = use.name === "AskUserQuestion" ? restoredQuestions(asRecord(input) ?? {}) : undefined;
     let answers = result?.answers;
     if (!answers && questions && result?.text) answers = recordedQuestionAnswers(result.text, questions);
-    const resolution: RestoredApprovalCard["resolution"] = result?.behavior === "allow" ? "allowed"
-      : result?.behavior === "deny" || rejected ? "denied"
-      : result?.behavior === "withdrawn" ? "withdrawn"
-      : answers ? "answered" : result?.isError ? "failed" : "unknown";
+    const resolution = restoredApprovalResolution(result, answers, undefined);
     const restoredApproval = redactCardValue({
       requestId: use.id, toolName: use.name, inputJson: JSON.stringify(redactCardValue(input ?? {})),
       ...(questions ? { questions } : {}), ...(answers ? { answers } : {}), resolution,
     }) as RestoredApprovalCard;
+    if (result === undefined || (isCliRejectedResult(result) && !result.behavior)) {
+      const messageId = record.type === "assistant" ? asRecord(record.message)?.id : undefined;
+      (index.unresolved ??= []).push({ id: use.id, messageId: typeof messageId === "string" ? messageId : undefined, result, card: restoredApproval });
+    }
     messages.push({ uuid: `approval:${use.id}`, role: "assistant", text: "", timestamp, restoredApproval });
   }
   return messages;
@@ -2582,80 +2680,6 @@ function extractAssistantRecordText(content: unknown, narrationBlockIndexes?: un
   return assistantRecordText(content, narrationBlockIndexes).text;
 }
 
-function extractText(content: unknown, trim = true): string {
-  if (typeof content === "string") return trim ? content.trim() : content;
-  if (!Array.isArray(content)) return "";
-  const text = content
-    .filter((block): block is { type: string; text: string } => {
-      return typeof block === "object" && block !== null &&
-        (block as { type?: unknown }).type === "text" &&
-        typeof (block as { text?: unknown }).text === "string";
-    })
-    .map((block) => block.text)
-    .filter((text) => !text.startsWith("<ide_") && !text.startsWith("<system-reminder>"))
-    .join("\n");
-  return trim ? text.trim() : text;
-}
-
-export function extractImageRefs(
-  content: unknown,
-  uuid: string | undefined
-): ImageRefInfo[] | undefined {
-  if (!uuid || !Array.isArray(content)) return undefined;
-  const refs: ImageRefInfo[] = [];
-  let imageIndex = 0;
-  for (const block of content) {
-    const rec = asRecord(block);
-    if (rec?.type !== "image") continue;
-    const source = asRecord(rec.source);
-    if (source?.type === "base64" && typeof source.media_type === "string") {
-      const mt = source.media_type;
-      if (mt === "image/png" || mt === "image/jpeg" || mt === "image/gif" || mt === "image/webp") {
-        refs.push({
-          ref: { kind: "record", uuid, index: imageIndex },
-          mediaType: mt,
-        });
-      }
-    }
-    imageIndex++;
-  }
-  return refs.length > 0 ? refs : undefined;
-}
-
-function extractUserRecordText(obj: Record<string, unknown>): string | null {
-  if (obj.type !== "user" || obj.isSidechain) return null;
-  if (obj.isCompactSummary === true) return null;
-  const origin = asRecord(obj.origin);
-  if (origin && origin.kind !== "human") return null;
-  const text = extractText(asRecord(obj.message)?.content);
-  if (!text) {
-    if (joinTextBlocks(asRecord(obj.message)?.content).trim()) return null;
-    return extractImageRefs(asRecord(obj.message)?.content, typeof obj.uuid === "string" ? obj.uuid : undefined) ? "" : null;
-  }
-  if (text.startsWith("<local-command-stdout>")) return null;
-  if (LAISORA_ENVELOPE_RE.test(text)) return null;
-  if (INJECTED_TAG_RE.test(text)) {
-    const args = COMMAND_ARGS_RE.exec(text)?.[1]?.trim();
-    const command = COMMAND_NAME_RE.exec(text)?.[1];
-    if (!args || (command && PURE_COMMAND_WRAPPER_RE.test(`/${command}`))) return null;
-    if (isNonHumanCommandName(command)) return null;
-    return args;
-  }
-  if (text.startsWith("Caveat:") || text.startsWith("Base directory for this skill:")) return null;
-  if (text === "[Request interrupted by user]" || text === "[Request interrupted by user for tool use]") return null;
-  return text;
-}
-
-export function extractHumanUserText(obj: Record<string, unknown>): string | null {
-  const record = extractQueuedPromptRecord(obj) ?? obj;
-  return record.isMeta === true || isLaisoraInputRecord(record) ? null : extractUserRecordText(record);
-}
-
-function isLaisoraInputRecord(record: Record<string, unknown>): boolean {
-  const text = extractUserRecordText(record);
-  return text !== null && isLaisoraInputText(text);
-}
-
 function sentUserUuidOf(obj: Record<string, unknown>): string | undefined {
   const attachment = asRecord(obj.attachment);
   const queued = obj.type === "attachment" && attachment?.type === QUEUED_COMMAND_TYPE;
@@ -2664,15 +2688,6 @@ function sentUserUuidOf(obj: Record<string, unknown>): string | undefined {
   if (origin && origin.kind !== "human") return undefined;
   const uuid = queued ? attachment?.source_uuid : obj.uuid;
   return typeof uuid === "string" && uuid.length > 0 ? uuid : undefined;
-}
-
-export function extractQueuedPromptRecord(obj: Record<string, unknown>): Record<string, unknown> | null {
-  const attachment = asRecord(obj.attachment);
-  if (obj.type !== "attachment" || attachment?.type !== QUEUED_COMMAND_TYPE || attachment.commandMode !== "prompt") return null;
-  if (obj.isSidechain === true || obj.isMeta === true || attachment.isMeta === true) return null;
-  const origin = asRecord(attachment.origin) ?? asRecord(obj.origin);
-  if (origin && origin.kind !== "human") return null;
-  return { ...obj, type: "user", origin, message: { content: attachment.prompt } };
 }
 
 export function extractHumanUserPrompt(obj: Record<string, unknown>, queuedSources?: ReadonlyMap<string, string | undefined>, seenQueuedPrompts?: Set<string>): {
@@ -2709,10 +2724,6 @@ function queuedPromptSources(lines: readonly string[]): Map<string, string | und
   const sources = new Map<string, string | undefined>();
   collectPrePass(lines, (index) => lineValue(lines[index]), sources, undefined);
   return sources;
-}
-
-export function extractCliInsertedUserText(obj: Record<string, unknown>): string | null {
-  return obj.isMeta === true || isLaisoraInputRecord(obj) ? extractUserRecordText(obj) : null;
 }
 
 export interface VerbatimUtterance {

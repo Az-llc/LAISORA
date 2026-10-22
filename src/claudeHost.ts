@@ -33,7 +33,8 @@ import type {
   NormalizedEventBody,
   UsageSnapshot,
 } from "./protocol";
-import { summarizeToolInput, type ApiKeyPolicy } from "./protocol";
+import { summarizeToolInput, type ApiKeyPolicy, type BridgeConnection } from "./protocol";
+import { bridgeStateOf, enableRemoteControl, type RemoteControlSession } from "./remote-control";
 import { resolveClaudeCodeExecutable } from "./claudeCliResolver";
 import {
   buildClaudeEnv,
@@ -42,7 +43,7 @@ import {
 } from "./claude-env";
 import { PROGRESS_PROTOCOL_SPEC_PP1 } from "./progress-protocol";
 import { checkEnvelopeRedaction } from "./send-boundary";
-import { admitReportSend, admitSteeringSend, type SteeringAdmission } from "./steering-envelope";
+import { admitHandoffNoticeSend, admitReportSend, admitSteeringSend, handoffNoticeCardText, type HandoffNoticeFacts, type SteeringAdmission } from "./steering-envelope";
 
 export type SteeringSendResult = SteeringAdmission;
 import type { ProgressTrackingMode } from "./progress-protocol";
@@ -51,7 +52,7 @@ import { FILE_WRITING_TOOLS } from "./file-writing-tools";
 import { z } from "zod";
 import { ClaudeLiveNormalizer, parseAliases, type RawToolResult } from "./claude-normalizer";
 import { conductorInstruction, orchestrationExternalTargets, orchestrationVariants, resolveOrchestrationRoster, type OrchestrationRow, type ExternalModels } from "./orchestration-roster";
-import { injectionOf, MAX_AGENT_STARTS, readRosterEvidence, type AgentStartObservation, type InjectedAgentDefinition, type RosterEvidence, type RosterInjection } from "./roster-evidence";
+import { attributeSubagent, injectionOf, MAX_AGENT_STARTS, readRosterEvidence, type AgentStartObservation, type InjectedAgentDefinition, type RosterEvidence, type RosterInjection } from "./roster-evidence";
 import { placementOf, type Placement } from "./placement-line";
 import { laisoraDenialMessage } from "./tool-result-signals";
 import { failClosedGuard } from "./guard-evaluation";
@@ -62,6 +63,7 @@ import { laisoraInputLine, markLaisoraInput, type LaisoraInput } from "./laisora
 import { createTodoMcpServer, TODO_ROOT_SCOPE, TODO_SERVER_NAME, TODO_TOOL_NAMES, todoLinkedInstruction, todoWorkspaceRoots, type TodoLinkedItem } from "./todo-mcp";
 import type { TodoStore } from "./todo-store";
 import { claudeModelIdLabel, isExternalRunTool } from "./orchestration-executors";
+import { isDelegationLaunchTool, isDelegationTool } from "./claude-tool-names";
 import type { CompletionVerdict, NumberedLaunchVerdict, ResumeVerdict } from "./time-buckets";
 import { planItemLabel, type PlanStepUpdate } from "./plan-steps";
 import { AgentAttribution } from "./orchestration-attribution";
@@ -79,6 +81,7 @@ type SDKUserMessage = {
   session_id: string;
   shouldQuery?: boolean;
   isMeta?: boolean;
+  uuid: string;
 };
 
 type PermissionResult = ClaudeCodePermissionResult;
@@ -87,6 +90,7 @@ type InterruptReceipt = { still_queued?: string[]; cancelled?: string[] };
 
 const CAP_INTERRUPT_CANCEL_QUEUED = "interrupt_cancel_queued_v1";
 const TODO_RECENT_FILES = 20;
+export const REPLAY_USER_MESSAGES_ARG = "replay-user-messages";
 
 export const FILE_LINK_INSTRUCTION = (cwd = ""): string => {
   const base = cwd
@@ -177,7 +181,7 @@ interface QueryHandle extends AsyncIterable<any> {
   getSettings?(): Promise<unknown>;
   renameSession?(title: string, sessionId?: string): Promise<void>;
   supportedModels(): Promise<Array<{ model?: string; id?: string; value?: string; resolvedModel?: string; displayName?: string; description?: string; supportsEffort?: boolean; supportedEffortLevels?: string[] }>>;
-  initializationResult(): Promise<{ claude_code_version?: string } | undefined>;
+  initializationResult(): Promise<{ claude_code_version?: string; remote_control_auto_enable?: boolean } | undefined>;
   usage_EXPERIMENTAL_MAY_CHANGE_DO_NOT_RELY_ON_THIS_API_YET?(opts?: { skipBehaviors?: boolean }): Promise<unknown>;
   getContextUsage(): Promise<{
     percentage: number;
@@ -219,6 +223,7 @@ export interface ClaudeHostOptions {
   conductorPolicy?: string;
   onOrchestrationChanged?: () => void;
   onCliVersion?: (version: string) => void;
+  onBridgeState?: (connection: BridgeConnection) => void;
   interruptForceKillTimeoutMs: number;
   testInterruptHang?: boolean;
   progressTracking?: ProgressTrackingMode;
@@ -352,7 +357,7 @@ export class ClaudeConversation {
   private attribution: AgentAttribution;
   private readonly externalToolUses: Array<{ id: string; input: Record<string, unknown> }> = [];
   private observeToolResult(result: RawToolResult): void {
-    if (["Agent", "Task"].includes(result.tool)) void this.attribution.result(result.toolUseId, result.text, result.isError);
+    if (isDelegationTool(result.tool)) void this.attribution.result(result.toolUseId, result.text, result.isError);
   }
   private readonly externalRows: readonly ExternalRow[];
   private readonly activeExternalRuns = new Set<Promise<unknown>>();
@@ -414,13 +419,13 @@ export class ClaudeConversation {
   }
 
   private readonly recordedAgents = new Map<string, InjectedAgentDefinition>();
-  get recordedAgentRoles(): ReadonlyMap<string, string> {
-    return new Map([...this.recordedAgents].map(([key, definition]) => [key, definition.role]));
-  }
   private readonly rosterInjections: RosterInjection[] = [];
   private readonly agentStarts = new Map<string, AgentStartObservation>();
   get rosterEvidence(): RosterEvidence {
     return { injections: [...this.rosterInjections], starts: [...this.agentStarts.values()] };
+  }
+  attributedRole(agent: { agentType?: string; transcriptAgentId?: string; startedAt?: number }, evidence: RosterEvidence = this.rosterEvidence): string | null {
+    return attributeSubagent(evidence, agent)?.definition.role ?? null;
   }
 
   private observeAgentStart(input: unknown): void {
@@ -466,6 +471,9 @@ export class ClaudeConversation {
   private contextUsageInFlight: Promise<HandoffContextMeasurement | null> | null = null;
   private contextUsagePending = false;
   private contextUsageGeneration = 0;
+  turnsEnded = 0;
+  contextUsageTurnsEnded = 0;
+  lastRootMessageStartedAt: number | undefined;
   private resolveInitialContextUsage!: (value: HandoffContextMeasurement | null) => void;
   readonly initialContextUsage = new Promise<HandoffContextMeasurement | null>((resolve) => {
     this.resolveInitialContextUsage = resolve;
@@ -521,8 +529,8 @@ export class ClaudeConversation {
       loadAgentDef: (subagentType: string) => this.loadAgentDef(subagentType),
       emit: (body, meta) => this.emit(body, meta),
       onRawToolUse: (id, tool, input) => {
-        if (tool === "Agent" || tool === "Task") this.attribution.dispatch(id, input);
-        if (tool === "mcp__laisora_external__run") this.externalToolUses.push({ id, input });
+        if (isDelegationTool(tool)) this.attribution.dispatch(id, input);
+        if (isExternalRunTool(tool)) this.externalToolUses.push({ id, input });
       },
       onRawToolResult: result => this.observeToolResult(result),
       onTurnEnd: () => {
@@ -531,6 +539,7 @@ export class ClaudeConversation {
           this.interruptTimer = null;
         }
         for (const requestId of this.pendingApprovals.keys()) this.resolveApproval(requestId, "deny", undefined, "turn-end");
+        this.turnsEnded += 1;
         void this.requestContextUsage();
       },
       isClosed: () => this.closed,
@@ -670,6 +679,7 @@ ${ctxJson}`
       permissionMode: this.opts.permissionMode,
       settingSources: this.opts.settingSources,
       settings: { remoteControlAtStartup: this.opts.remoteControlAtStartup === true, ...SDK_AUTO_CONTINUE_SETTINGS, ultracode: false },
+      extraArgs: { [REPLAY_USER_MESSAGES_ARG]: null },
       includePartialMessages: true,
       pathToClaudeCodeExecutable: resolvedExecutable.path,
       canUseTool,
@@ -870,7 +880,7 @@ ${ctxJson}`
       const planItemGuard: ClaudeCodeSdk.HookCallback = async input => {
         if (input.hook_event_name !== "PreToolUse" || input.agent_id) return {};
         const value = input.tool_input as Record<string, unknown> | undefined;
-        const launch = ["Agent", "Task"].includes(input.tool_name) || isExternalRunTool(input.tool_name);
+        const launch = isDelegationLaunchTool(input.tool_name);
         const to = input.tool_name === "SendMessage" && typeof value?.to === "string" ? value.to : undefined;
         const completion = input.tool_name === "TaskUpdate" || input.tool_name === "TodoWrite";
         if (!launch && to === undefined && !completion) return {};
@@ -912,8 +922,8 @@ ${ctxJson}`
     if (this.orchestrationEnabled) {
       const observeDispatch: ClaudeCodeSdk.HookCallback = async input => {
         if (input.hook_event_name !== "PreToolUse") return {};
-        if (input.tool_name === "Agent" || input.tool_name === "Task") this.attribution.dispatch(input.tool_use_id, input.tool_input as Record<string, unknown>);
-        if (input.tool_name === "mcp__laisora_external__run" && !this.externalToolUses.some(entry => entry.id === input.tool_use_id)) this.externalToolUses.push({ id: input.tool_use_id, input: input.tool_input as Record<string, unknown> });
+        if (isDelegationTool(input.tool_name)) this.attribution.dispatch(input.tool_use_id, input.tool_input as Record<string, unknown>);
+        if (isExternalRunTool(input.tool_name) && !this.externalToolUses.some(entry => entry.id === input.tool_use_id)) this.externalToolUses.push({ id: input.tool_use_id, input: input.tool_input as Record<string, unknown> });
         return {};
       };
       options.hooks = { ...(options.hooks ?? {}), PreToolUse: [...(options.hooks?.PreToolUse ?? []), { hooks: [observeDispatch] }] };
@@ -998,15 +1008,7 @@ ${ctxJson}`
       checkEnvelopeRedaction
     );
     if (!admission.ok) return admission;
-    this.invalidateHandoffContextUsage();
-    this.inputQueue.push({
-      type: "user",
-      message: { role: "user", content: [{ type: "text", text: envelopeText }] },
-      parent_tool_use_id: null,
-      session_id: "",
-    });
-    this.inputWaiter?.();
-    this.inputWaiter = null;
+    this.queueUserInput([{ type: "text", text: envelopeText }], { uuid: randomUUID() });
     return { ok: true };
   }
 
@@ -1017,21 +1019,45 @@ ${ctxJson}`
       checkEnvelopeRedaction
     );
     if (!admission.ok) return admission;
+    this.queueUserInput([{ type: "text", text: envelopeText }], { uuid: randomUUID() });
+    return { ok: true };
+  }
+
+  sendHandoffNotice(envelopeText: string, notice: HandoffNoticeFacts): SteeringSendResult {
+    const admission = admitHandoffNoticeSend(
+      { closed: this.closed, turnState: this.normalizer.turnState },
+      envelopeText,
+      checkEnvelopeRedaction
+    );
+    if (!admission.ok) return admission;
+    const uuid = randomUUID();
+    this.normalizer.startTurn(undefined, { timestamp: Date.now() }, true);
+    this.emit({ kind: "local_command_output", text: handoffNoticeCardText(notice), uuid, handoffNotice: notice });
+    this.queueUserInput([{ type: "text", text: envelopeText }], { uuid });
+    return { ok: true };
+  }
+
+  private queueUserInput(content: UserContentBlock[], extra: { isMeta?: true; uuid: `${string}-${string}-${string}-${string}-${string}` }): void {
     this.invalidateHandoffContextUsage();
+    this.normalizer.noteOwnInput(extra.uuid);
     this.inputQueue.push({
       type: "user",
-      message: { role: "user", content: [{ type: "text", text: envelopeText }] },
+      message: { role: "user", content },
+      ...extra,
       parent_tool_use_id: null,
       session_id: "",
     });
     this.inputWaiter?.();
     this.inputWaiter = null;
-    return { ok: true };
   }
 
   cancelAutoResume(): void { this.usageLimitResume.cancel(); }
 
   get pendingAutoResumeAt(): number | null { return this.usageLimitResume.pendingResumeAt; }
+
+  get queuedInputCount(): number { return this.inputQueue.length; }
+
+  get runningExternalRunCount(): number { return this.activeExternalRuns.size; }
 
   get pendingApprovalToolUseIds(): readonly string[] {
     return [...this.pendingApprovals.values()].flatMap(p => p.toolUseId === undefined ? [] : [p.toolUseId]);
@@ -1074,17 +1100,7 @@ ${ctxJson}`
       ),
       { type: "text", text },
     ];
-    this.invalidateHandoffContextUsage();
-    this.inputQueue.push({
-      type: "user",
-      message: { role: "user", content },
-      ...(automatic ? { isMeta: true } : {}),
-      ...(uuid === undefined ? {} : { uuid }),
-      parent_tool_use_id: null,
-      session_id: "",
-    });
-    this.inputWaiter?.();
-    this.inputWaiter = null;
+    this.queueUserInput(content, { ...(automatic ? { isMeta: true as const } : {}), uuid: uuid ?? randomUUID() });
   }
 
   async interrupt(): Promise<void> {
@@ -1094,6 +1110,7 @@ ${ctxJson}`
     this.normalizer.turnState = "interrupting";
     const turnId = this.normalizer.currentTurnId;
     const drained = this.inputQueue.length;
+    for (const input of this.inputQueue) this.normalizer.forgetOwnInput(input.uuid);
     this.inputQueue = [];
     if (drained > 0) {
       this.emit({
@@ -1232,6 +1249,9 @@ ${ctxJson}`
       if (text) this.turnAssistantText.push(text);
     }
     if (msg?.type !== "tool_progress") this.lastRecordReceivedAt = Date.now();
+    if (msg?.type === "stream_event" && msg.parent_tool_use_id == null && msg.event?.type === "message_start") this.lastRootMessageStartedAt = Date.now();
+    const bridge = bridgeStateOf(msg);
+    if (bridge !== undefined) this.opts.onBridgeState?.(bridge);
     if (msg?.type === "system" && msg?.subtype === "init" && Array.isArray(msg.capabilities)) {
       this.cliCapabilities = msg.capabilities.filter((c: unknown): c is string => typeof c === "string");
     }
@@ -1308,6 +1328,22 @@ ${ctxJson}`
     if (!this.q || this.closed) throw new Error("Claude conversation is not connected");
     this.invalidateHandoffContextUsage();
     await this.q.applyFlagSettings({ effortLevel: effort });
+  }
+
+  async setRemoteControl(enabled: boolean, reattachSessionId?: string): Promise<RemoteControlSession | null> {
+    if (!this.q || this.closed) throw new Error("Claude conversation is not connected");
+    return enableRemoteControl(this.q, enabled, reattachSessionId);
+  }
+
+  async remoteControlAutoEnable(): Promise<boolean> {
+    const q = this.q;
+    if (!q || this.closed) return false;
+    try {
+      const init = await q.initializationResult();
+      return init?.remote_control_auto_enable === true;
+    } catch {
+      return false;
+    }
   }
 
   async captureHandoffContextUsage(): Promise<HandoffContextMeasurement | null> {
@@ -1426,6 +1462,7 @@ ${ctxJson}`
 
   private async measureContextUsage(q: QueryHandle, initial: boolean): Promise<HandoffContextMeasurement | null> {
     const generation = this.contextUsageGeneration;
+    const turnsEnded = this.turnsEnded;
     let measurement: HandoffContextMeasurement | null = null;
     let timeout: ReturnType<typeof setTimeout> | null = null;
     let settled = false;
@@ -1458,6 +1495,7 @@ ${ctxJson}`
         return null;
       }
       if (this.state === "idle") measurement = { totalTokens: usage.totalTokens, measuredAt: new Date().toISOString() };
+      this.contextUsageTurnsEnded = turnsEnded;
       this.emit({
         kind: "context_usage",
         percentage: usage.percentage,

@@ -1,5 +1,6 @@
 import { redactAbsolutePaths } from "./path-redaction";
 import { isExternalRunTool } from "./orchestration-executors";
+import { isDelegationTool } from "./claude-tool-names";
 
 const INTENT_FIELDS = ["description", "subagent_type", "agent_key", "effort", "target", "prompt", "file_path", "pattern", "url", "query"] as const;
 export type ToolIntentInput = Partial<Record<typeof INTENT_FIELDS[number], string>>;
@@ -30,7 +31,7 @@ export function captureToolIntentInput(name: string, input: unknown): ToolIntent
   const source = input as Record<string, unknown>;
   const fields: readonly (typeof INTENT_FIELDS[number])[] = isExternalRunTool(name)
     ? ["target", "description", "prompt"]
-    : name === "Agent" || name === "Task" ? ["description", "subagent_type", "agent_key", "effort"]
+    : isDelegationTool(name) ? ["description", "subagent_type", "agent_key", "effort"]
     : name === "Bash" || name === "PowerShell" ? ["description"]
     : name === "Read" || name === "Edit" || name === "Write" ? ["file_path"]
     : name === "Grep" || name === "Glob" ? ["pattern"]

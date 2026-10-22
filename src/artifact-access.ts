@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { isDelegationTool, TASK_TOOL_NAMES } from "./claude-tool-names";
 
 export type ArtifactMode = "read" | "write" | "exec" | "unknown";
 
@@ -108,9 +109,7 @@ export function projectArtifactAccess(host: HostArtifactAccess): ProjectedArtifa
 export const PROGRESS_WIRE_TOOL_NAME = "mcp__laisora_progress__progress";
 
 const KNOWN_NO_EFFECT_TOOLS = new Set([
-  "TodoWrite",
-  "TaskCreate",
-  "TaskUpdate",
+  ...TASK_TOOL_NAMES,
   "ToolSearch",
   "ExitPlanMode",
   "AskUserQuestion",
@@ -128,7 +127,7 @@ export function extractArtifactAccesses(
   input: Record<string, unknown> | undefined,
   baseDir: string
 ): ArtifactExtraction {
-  if (toolName === "Agent" || toolName === "Task") {
+  if (isDelegationTool(toolName)) {
     return { artifacts: [], effectCoverage: "complete", effectClass: "delegate" };
   }
 

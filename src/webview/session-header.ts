@@ -1,8 +1,11 @@
 import * as l10n from "@vscode/l10n";
-import { RENAME_TITLE_MAX, type HostToWebview, type WebviewToHost } from "../protocol";
+import { RENAME_TITLE_MAX, type HostToWebview, type RemoteControlView, type WebviewToHost } from "../protocol";
 import { isComposingKey } from "./composing";
 import { createLoader } from "./loader";
 import { ACTIONS_MENU_GLYPH } from "./todo-edit";
+import { remoteControlLabel, remoteControlOn } from "./remote-control-view";
+
+export const SESSION_MENU_ORDER = ["name", "handoff", "export", "remoteControl", "extras"] as const;
 
 export interface SessionMenuExtra { label: string; icon: string; run: () => void }
 let sessionMenuExtras: (() => SessionMenuExtra[]) | null = null;
@@ -217,16 +220,39 @@ export function createSessionHeader(tabId: string, title: string, send: (message
   for (const surface of [panel, submenu, dropdown]) surface.addEventListener("keydown", event => {
     if (!["ArrowDown", "ArrowUp", "Home", "End"].includes(event.key)) return;
     event.preventDefault(); event.stopPropagation();
-    const items = Array.from(surface.querySelectorAll<HTMLButtonElement>('[role="menuitem"]')).filter(item => item.closest('[role="menu"]') === surface && !item.disabled);
+    const items = Array.from(surface.querySelectorAll<HTMLButtonElement>('[role^="menuitem"]')).filter(item => item.closest('[role="menu"]') === surface && !item.disabled);
     const index = items.indexOf(document.activeElement as HTMLButtonElement);
     const next = event.key === "Home" ? 0 : event.key === "End" ? items.length - 1 : (index + (event.key === "ArrowDown" ? 1 : -1) + items.length) % items.length;
     items[next]?.focus();
   });
-  action(l10n.t("Hand off to a new conversation"), "⇉", () => send({type: "startHandoff", tabId}));
-  action(l10n.t("Export conversation to Markdown"), "↧", () => send({type: "exportTab", tabId}));
+  const handoff = action(l10n.t("Hand off to a new conversation"), "⇉", () => send({type: "startHandoff", tabId}));
+  const exportItem = action(l10n.t("Export conversation to Markdown"), "↧", () => send({type: "exportTab", tabId}));
+  const remoteSwitch = document.createElement("span");
+  remoteSwitch.className = "l-switch";
+  remoteSwitch.setAttribute("aria-hidden", "true");
+  remoteSwitch.append(Object.assign(document.createElement("span"), { className: "l-switch-thumb" }));
+  const remoteControl = document.createElement("button");
+  remoteControl.type = "button";
+  remoteControl.className = "session-switch-item";
+  remoteControl.setAttribute("role", "menuitemcheckbox");
+  remoteControl.append(document.createTextNode(remoteControlLabel()), remoteSwitch);
+  const setRemoteControl = (view: RemoteControlView | undefined) => {
+    remoteControl.setAttribute("aria-checked", String(remoteControlOn(view)));
+    remoteControl.setAttribute("aria-disabled", String(view?.available !== true || view.pending));
+    remoteControl.setAttribute("aria-busy", String(view?.pending === true));
+  };
+  setRemoteControl(undefined);
+  remoteControl.onclick = () => {
+    const busy = remoteControl.getAttribute("aria-busy") === "true";
+    if (remoteControl.getAttribute("aria-disabled") === "true" && !busy) return;
+    const enabled = remoteControl.getAttribute("aria-checked") !== "true";
+    remoteControl.setAttribute("aria-disabled", "true");
+    send({type: "setRemoteControl", tabId, enabled});
+  };
   const extras = document.createElement("div");
   extras.className = "session-actions-extras";
-  panel.appendChild(extras);
+  const menuItems: Record<(typeof SESSION_MENU_ORDER)[number], HTMLElement> = { name: nameItem, handoff, export: exportItem, remoteControl, extras };
+  panel.append(...SESSION_MENU_ORDER.map(key => menuItems[key]));
   menu.addEventListener("keydown", event => {
     if (event.key === "Escape") { event.preventDefault(); event.stopPropagation(); closeSubmenu(); menu.open = false; toggle.focus(); }
     if (event.target === toggle && event.key === "ArrowDown") { event.preventDefault(); menu.open = true; nameButton.focus(); }
@@ -253,5 +279,5 @@ export function createSessionHeader(tabId: string, title: string, send: (message
       if (focusSuggestion) { focusSuggestion = false; input.focus(); input.select(); }
     } else menu.remove();
   };
-  return {element: root, updateTitle, mountMenu, receiveSuggestion};
+  return {element: root, updateTitle, mountMenu, receiveSuggestion, setRemoteControl};
 }

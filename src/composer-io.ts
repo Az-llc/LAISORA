@@ -33,21 +33,33 @@ import {
   type WebviewToHost,
 } from "./protocol";
 import { pendingAttachments } from "./pending-attachments";
-import { createHydrationDraft, foldHistoryEvents } from "./resume-hydration";
+import { createHydrationDraft, earliestRecordedTime, foldHistoryEvents } from "./resume-hydration";
 import { isInSessionStore, sessionTranscriptRef } from "./session-files";
 import { readSessionHistory } from "./session-transcript";
 import type { SessionStore } from "./store-surfaces";
-import { appendRecordPart, joinRecordTexts, type RecordTextPart } from "./commit-boundary";
+import { appendRecordPart, joinRecordTexts, withoutRetracted, type RecordTextPart } from "./commit-boundary";
 
 function createExportSink(lines: string[], userHeading: string): {
   push: (ev: NormalizedEventBody) => void;
-  flush: () => void;
+  finish: () => void;
 } {
-  const assistantParts: RecordTextPart[] = [];
+  const out: Array<string | RecordTextPart[]> = [];
+  let assistantParts: RecordTextPart[] = [];
   const flush = () => {
-    const assistantBuf = joinRecordTexts(assistantParts.map(part => part.text));
-    if (assistantBuf.trim()) lines.push("## Assistant", "", assistantBuf.trim(), "");
-    assistantParts.length = 0;
+    if (assistantParts.length > 0) out.push(assistantParts);
+    assistantParts = [];
+  };
+  const finish = () => {
+    flush();
+    for (const entry of out) {
+      if (typeof entry === "string") {
+        lines.push(entry);
+        continue;
+      }
+      const assistantBuf = joinRecordTexts(entry.map(part => part.text));
+      if (assistantBuf.trim()) lines.push("## Assistant", "", assistantBuf.trim(), "");
+    }
+    out.length = 0;
   };
   const userBody = (text: string, imageCount: number): string => {
     const parts = text.trim() === "" ? [] : [text];
@@ -58,12 +70,12 @@ function createExportSink(lines: string[], userHeading: string): {
     switch (ev.kind) {
       case "user_message":
         flush();
-        lines.push(userHeading, "", userBody(ev.text, (ev.images?.length ?? 0) + (ev.imageRefs?.length ?? 0)), "");
+        out.push(userHeading, "", userBody(ev.text, (ev.images?.length ?? 0) + (ev.imageRefs?.length ?? 0)), "");
         break;
       case "replayed_message":
         flush();
-        if (ev.role === "user") lines.push(userHeading, "", userBody(ev.text, ev.imageRefs?.length ?? 0), "");
-        else lines.push("## Assistant", "", ev.text, "");
+        if (ev.role === "user") out.push(userHeading, "", userBody(ev.text, ev.imageRefs?.length ?? 0), "");
+        else out.push("## Assistant", "", ev.text, "");
         break;
       case "assistant_text_delta":
         appendRecordPart(assistantParts, { text: ev.text, uuid: null });
@@ -73,10 +85,17 @@ function createExportSink(lines: string[], userHeading: string): {
         break;
       case "tool_call_started":
         flush();
-        lines.push(
+        out.push(
           `> ⚙ ${ev.toolName}: \`${(ev.inputSummary ?? ev.inputPreview).slice(0, 200).replace(/`/g, "'")}\``,
           ""
         );
+        break;
+      case "assistant_retracted":
+        assistantParts = withoutRetracted(assistantParts, ev.uuids);
+        for (let i = 0; i < out.length; i++) {
+          const entry = out[i];
+          if (typeof entry !== "string") out[i] = withoutRetracted(entry, ev.uuids);
+        }
         break;
       case "turn_completed":
       case "turn_interrupted":
@@ -84,13 +103,13 @@ function createExportSink(lines: string[], userHeading: string): {
         flush();
         break;
       case "error":
-        lines.push(`> ⚠ ${ev.message}`, "");
+        out.push(`> ⚠ ${ev.message}`, "");
         break;
       default:
         break;
     }
   };
-  return { push, flush };
+  return { push, finish };
 }
 
 function heldEventsForExport(events: readonly NormalizedEvent[]): NormalizedEvent[] {
@@ -134,7 +153,7 @@ async function buildExportMarkdown(s: Session): Promise<string> {
     lines.push(l10n.t("- Note: the record could not be read, so only the part held in memory was exported."), "");
     const sink = createExportSink(lines, userHeading);
     for (const ev of heldEventsForExport(s.events)) sink.push(ev);
-    sink.flush();
+    sink.finish();
     return lines.join("\n");
   }
   lines.push("");
@@ -155,7 +174,8 @@ async function buildExportMarkdown(s: Session): Promise<string> {
       sink.push(ev);
       return "continue";
     },
-    () => false
+    () => false,
+    earliestRecordedTime([], history)
   );
   const pushLive = (ev: NormalizedEvent): void => {
     if (ev.kind === "user_message" && ev.uuid !== undefined && history.sentUserUuids.has(ev.uuid)) return;
@@ -186,7 +206,7 @@ async function buildExportMarkdown(s: Session): Promise<string> {
     pushLive(ev);
   }
   releaseAwaiting(false);
-  sink.flush();
+  sink.finish();
   return lines.join("\n");
 }
 

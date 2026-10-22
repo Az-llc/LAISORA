@@ -15,6 +15,7 @@ import type {
   ImageAttachment,
   ImageRefInfo,
   NormalizedEvent,
+  OrchestrationView,
   PendingAttachmentInfo,
   PermissionModeId,
   ResumeHydrationPhase,
@@ -51,7 +52,7 @@ import {
   vscode,
   CONTEXT_CHIP_EMPTY,
 } from "./dom";
-import { applySessionChunk, applySessionHiddenChanged, applySessionListActionFailed, applySessionRenamed, historyTitleCell, initHistory, openHistPanel, refreshHistList, setHistoryTodoOpened } from "./history";
+import { applySessionChunk, applySessionHiddenChanged, applySessionListActionFailed, applySessionRenamed, historyTitleCell, initHistory, openHistPanel, refreshHistList, reloadHistList, setHistoryTodoOpened } from "./history";
 import {
   applyUserSettings,
   closeAuthPicker,
@@ -64,6 +65,7 @@ import {
   syncMenuCursor,
 } from "./menu";
 import { closeSuggest, handleFilesResponse, initSuggest, insertFilePaths } from "./suggest";
+import { REMOTE_CONTROL_COMMAND, parseRemoteControlCommand } from "./remote-control-view";
 import { setFileLinkHostPlatform, setFileLinkSystemAppExtensions } from "../markdown-ast";
 import { handleCopyFilePathResult } from "./markdown";
 import type { ScrollCarry, ViewMode } from "./tab";
@@ -309,6 +311,19 @@ export function persistState(): void {
   const { askDismissedMessages, askResolvedMessages, askCheckedMessages, codeWrap } = vscode.getState() ?? {};
   const next: PersistedState = { activeTabId: activeTabId ?? todoReturnTabId, drafts: out, views, workViews, analysisViews, scrollAnchors, askChecks, askDismissed, askDismissedMessages, askResolved, askResolvedMessages, askCheckedMessages, codeWrap, todo: todoTab.viewState() };
   vscode.setState(next);
+  reportComposerDrafts();
+}
+
+let reportedComposerDrafts: string | null = null;
+
+function reportComposerDrafts(): void {
+  if (activeTabId) drafts.set(activeTabId, inputEl.value);
+  const tabIds = [...tabs.keys()].filter((tabId) => (drafts.get(tabId) ?? "").trim().length > 0
+    || attachmentsOf(tabId).length > 0);
+  const key = tabIds.join("\n");
+  if (key === reportedComposerDrafts) return;
+  reportedComposerDrafts = key;
+  vscode.postMessage({ type: "composerDrafts", tabIds });
 }
 
 const SCROLL_PERSIST_DELAY_MS = 250;
@@ -505,6 +520,7 @@ function autosizeComposer(): void {
 function clearComposerInput(): void {
   inputEl.value = "";
   autosizeComposer();
+  reportComposerDrafts();
 }
 
 export function refreshChrome(): void {
@@ -1607,6 +1623,11 @@ function coverageBackfillHint(tabId: string): CoverageBackfillHint {
   };
 }
 
+function applyOrchestrationView(tabId: string, state: OrchestrationView | undefined): void {
+  tabs.get(tabId)?.planPanel.setOrchestration(state);
+  overviews.get(tabId)?.setOrchestration(state);
+}
+
 function displayWorkModel(tabId: string, model: WorkModelPayload | undefined): WorkModelPayload | undefined {
   const merged = withLocalEventDrop(model, localEventDrops.get(tabId) ?? 0);
   const hint = coverageBackfillHint(tabId);
@@ -2141,6 +2162,7 @@ function addTab(snap: TabSnapshot, scrollCarry?: ScrollCarry): Tab {
   }
   if (snap.state.resumeSessionId) t.resumeSessionId = snap.state.resumeSessionId;
   t.replaceAutoResumeReservation(snap.state.autoResumeAt ?? null);
+  t.setRemoteControl(snap.state.remoteControl);
   t.setTurnState(snap.state.turnState);
   const savedView = vscode.getState()?.views?.[snap.tabId];
   if (savedView === "work") t.setViewMode("work", false, false);
@@ -2326,6 +2348,8 @@ function initMessageBus(): void {
           activateFirstUsableTab(chosen);
         }
         activeTabAfterInit = activeTabId;
+        reportedComposerDrafts = null;
+        reportComposerDrafts();
         if (todoWasShown || todoShowPending) {
           todoShowPending = false;
           showTodoTab();
@@ -2342,7 +2366,7 @@ function initMessageBus(): void {
       }
       case "events": {
         const t = tabs.get(msg.tabId);
-        if (msg.events.some((event) => event.kind === "conversation_opened")) overviews.get(msg.tabId)?.setOrchestration(undefined);
+        if (msg.events.some((event) => event.kind === "conversation_opened")) applyOrchestrationView(msg.tabId, undefined);
         let unread = false;
         if (t) {
           for (const ev of msg.events) {
@@ -2423,8 +2447,7 @@ function initMessageBus(): void {
         break;
       }
       case "orchestrationView": {
-        tabs.get(msg.tabId)?.planPanel.setOrchestration(msg.state);
-        overviews.get(msg.tabId)?.setOrchestration(msg.state);
+        applyOrchestrationView(msg.tabId, msg.state);
         break;
       }
       case "planUsage": {
@@ -2583,6 +2606,9 @@ function initMessageBus(): void {
         if (t) t.commands = msg.commands;
         break;
       }
+      case "remoteControlState":
+        tabs.get(msg.tabId)?.setRemoteControl(msg.state);
+        break;
       case "models": {
         const t = tabs.get(msg.tabId);
         if (t) {
@@ -2678,6 +2704,10 @@ function initMessageBus(): void {
       }
       case "sessionHiddenChanged": {
         applySessionHiddenChanged(msg.sessionId, msg.hidden);
+        break;
+      }
+      case "sessionListChanged": {
+        reloadHistList();
         break;
       }
       case "sessionListActionFailed": {
@@ -2801,6 +2831,7 @@ function attachmentsOf(tabId: string | null): PendingAttachmentInfo[] {
 }
 
 function renderAttachments(): void {
+  reportComposerDrafts();
   reflowComposer((settle) => {
     attachmentsEl.textContent = "";
     const tabId = activeTabId;
@@ -3211,6 +3242,19 @@ function send(): void {
     clearComposerInput();
     persistState();
     if (activeTabId) vscode.postMessage({ type: "clearTab", tabId: activeTabId });
+    return;
+  }
+  const remoteControlCommand = parseRemoteControlCommand(text);
+  if (remoteControlCommand !== undefined) {
+    const t = activeTab();
+    if (!t || !activeTabId) return;
+    if (remoteControlCommand === "usage") {
+      t.addBlock("system warn", l10n.t("Usage: /{0} (turns Remote Control on or off for this conversation)", REMOTE_CONTROL_COMMAND));
+      return;
+    }
+    clearComposerInput();
+    persistState();
+    vscode.postMessage({ type: "setRemoteControl", tabId: activeTabId });
     return;
   }
   if (text === "/export") {

@@ -11,12 +11,25 @@ export function boundedDisplayText(text: string): string {
   return end === display.length ? display : `${display.slice(0, end)}\n[${display.length - end} characters omitted]`;
 }
 
+export const IMAGE_PLACEHOLDER = "[Image]";
+
+function isImageBlock(value: unknown): boolean {
+  return typeof value === "object" && value !== null && (value as { type?: unknown }).type === "image";
+}
+
+export function withImagePlaceholders(value: unknown): unknown {
+  if (isImageBlock(value)) return IMAGE_PLACEHOLDER;
+  if (Array.isArray(value)) return value.map(withImagePlaceholders);
+  if (typeof value !== "object" || value === null) return value;
+  return Object.fromEntries(Object.entries(value).map(([k, v]) => [k, withImagePlaceholders(v)]));
+}
+
 export function toolResultPreview(content: unknown): string {
   if (typeof content === "string") return boundedDisplayText(content);
   if (!Array.isArray(content)) return "";
   const text = content.filter(b => b?.type === "text" && typeof b.text === "string").map(b => b.text).join("\n");
-  const images = content.filter(b => b?.type === "image").length;
-  const marker = images === 0 ? "" : images === 1 ? "[Image]" : `[${images} images]`;
+  const images = content.filter(isImageBlock).length;
+  const marker = images === 0 ? "" : images === 1 ? IMAGE_PLACEHOLDER : `[${images} images]`;
   return [boundedDisplayText(text), marker].filter(Boolean).join("\n");
 }
 

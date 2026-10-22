@@ -135,3 +135,39 @@
 .l-you-mark { width: 8px; height: 8px; background: var(--laisora-accent); }
 .l-emphasis { color: var(--laisora-accent); }
 .l-loading { color: var(--vscode-foreground); }
+.l-visually-hidden { position: absolute; width: 1px; height: 1px; padding: 0; overflow: hidden; clip-path: inset(50%); white-space: nowrap; }
+.l-switch {
+  position: relative;
+  box-sizing: border-box;
+  width: 30px;
+  height: 16px;
+  padding: 0;
+  border: 1px solid var(--vscode-contrastBorder, var(--vscode-checkbox-border, var(--vscode-widget-border, rgba(128, 128, 128, 0.6))));
+  border-radius: 2px;
+  background: var(--vscode-input-background, var(--vscode-checkbox-background));
+  cursor: pointer;
+}
+
+.l-switch-thumb {
+  position: absolute;
+  top: 2px;
+  left: 2px;
+  width: 10px;
+  height: 10px;
+  background: var(--vscode-descriptionForeground);
+}
+
+.l-switch[aria-checked="true"], [aria-checked="true"] > .l-switch {
+  border-color: var(--vscode-contrastActiveBorder, var(--vscode-button-background));
+  background: var(--vscode-button-background);
+}
+
+.l-switch[aria-checked="true"] .l-switch-thumb, [aria-checked="true"] > .l-switch .l-switch-thumb {
+  left: 16px;
+  background: var(--vscode-contrastActiveBorder, var(--vscode-button-foreground));
+}
+
+button.l-switch:not([aria-checked]) .l-switch-thumb {
+  left: 9px;
+  opacity: 0.4;
+}

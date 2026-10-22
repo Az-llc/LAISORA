@@ -198,7 +198,7 @@ html, body {
 }
 
 .settings-select:disabled,
-.settings-switch:disabled,
+.l-switch:disabled,
 .settings-segment:disabled,
 .settings-swatch:disabled {
   opacity: var(--l-disabled-opacity);
@@ -242,42 +242,6 @@ html, body {
   border-color: var(--vscode-contrastActiveBorder, var(--vscode-button-background));
 }
 
-.settings-switch {
-  position: relative;
-  box-sizing: border-box;
-  width: 30px;
-  height: 16px;
-  padding: 0;
-  border: 1px solid var(--vscode-contrastBorder, var(--vscode-checkbox-border, var(--vscode-widget-border, rgba(128, 128, 128, 0.6))));
-  border-radius: 2px;
-  background: var(--vscode-input-background, var(--vscode-checkbox-background));
-  cursor: pointer;
-}
-
-.settings-switch-thumb {
-  position: absolute;
-  top: 2px;
-  left: 2px;
-  width: 10px;
-  height: 10px;
-  background: var(--vscode-descriptionForeground);
-}
-
-.settings-switch[aria-checked="true"] {
-  border-color: var(--vscode-contrastActiveBorder, var(--vscode-button-background));
-  background: var(--vscode-button-background);
-}
-
-.settings-switch[aria-checked="true"] .settings-switch-thumb {
-  left: 16px;
-  background: var(--vscode-contrastActiveBorder, var(--vscode-button-foreground));
-}
-
-.settings-switch:not([aria-checked]) .settings-switch-thumb {
-  left: 9px;
-  opacity: 0.4;
-}
-
 .settings-swatches { display: flex; flex-wrap: wrap; gap: 2px; }
 .settings-swatch {
   display: inline-flex;
@@ -315,7 +279,7 @@ html, body {
 }
 
 .settings-select:focus-visible,
-.settings-switch:focus-visible,
+.l-switch:focus-visible,
 .settings-segment:focus-visible,
 .settings-swatch:focus-visible,
 .settings-tab:focus-visible,
@@ -339,7 +303,8 @@ html, body {
 }
 textarea.settings-input { height: auto; }
 .settings-input::placeholder { color: var(--vscode-input-placeholderForeground, var(--vscode-descriptionForeground)); }
-.settings-input:disabled {
+.settings-input:disabled,
+.settings-input:disabled + .settings-input-unit {
   opacity: var(--l-disabled-opacity);
 }
 .settings-input:focus-visible {
@@ -497,7 +462,7 @@ textarea.settings-input { height: auto; }
 .settings-role-card, .settings-policy-card { padding: var(--settings-gap-4); border: var(--settings-rule); }
 .settings-role-card { container-type: inline-size; container-name: roster-role; }
 .settings-role-header { display: flex; align-items: baseline; gap: var(--settings-gap-3); margin-bottom: var(--settings-gap-3); }
-.settings-role-header .settings-switch { flex: 0 0 auto; }
+.settings-role-header .l-switch { flex: 0 0 auto; }
 .settings-role-name { flex: 1; min-width: 0; overflow-wrap: anywhere; }
 .settings-mono { font-family: var(--vscode-editor-font-family); }
 .settings-role-description { width: 100%; }
@@ -551,7 +516,6 @@ textarea.settings-input { height: auto; }
 .settings-cli-name { display: flex; align-items: center; flex-wrap: wrap; gap: var(--settings-gap-2); }
 .settings-timeout-control { display: flex; align-items: center; gap: var(--settings-gap-2); }
 #setting-external-timeout { width: 72px; }
-.settings-visually-hidden { position: absolute; width: 1px; height: 1px; padding: 0; overflow: hidden; clip-path: inset(50%); white-space: nowrap; }
 @media (max-width: 1000px) {
   .settings-body { grid-template-columns: minmax(0, 1fr); }
   .settings-toc { display: none; }

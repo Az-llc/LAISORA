@@ -1,4 +1,5 @@
 import { displayedAncestorUsageGap, type NormalizedEvent, type TimeBucketsCoverage } from "./protocol";
+import { isChildCall } from "./spans";
 import type { RosterSource } from "./roster-evidence";
 import { readSessionHistory, readSubagentAgents, type HistoryEvent, type SessionHistoryRead, type SubagentRestore } from "./session-transcript";
 import {
@@ -24,13 +25,23 @@ export interface TranscriptIds {
 }
 
 export function childSpansOf(
-  agents: ReadonlyArray<{ toolUseId: string; startedAt?: number; endedAt?: number }>
+  agents: ReadonlyArray<{ toolUseId: string; startedAt?: number; endedAt?: number }>,
+  readAt: number
 ): ChildTranscriptSpan[] {
   return agents.map((a) => ({
     toolUseId: a.toolUseId,
     ...(a.startedAt !== undefined ? { startedAt: a.startedAt } : {}),
     ...(a.endedAt !== undefined ? { endedAt: a.endedAt } : {}),
+    readAt,
   }));
+}
+
+export function withRecordedRuns(childSpans: readonly ChildTranscriptSpan[], view: TimeBucketView): ChildTranscriptSpan[] {
+  const rows = new Map(view.agents.map((agent) => [agent.toolUseId, agent]));
+  return childSpans.map((span) => {
+    const row = rows.get(span.toolUseId);
+    return row?.earlierRuns === undefined ? span : { ...span, runs: { earlierRuns: row.earlierRuns, ...(row.resumedAt === undefined ? {} : { resumedAt: row.resumedAt }) } };
+  });
 }
 
 export function timeBucketsFromHistory(
@@ -59,7 +70,7 @@ export function timeBucketsFromHistory(
     if (
       currentModel !== undefined &&
       e.timestamp > 0 &&
-      (body.kind === "assistant_text_delta" || (body.kind === "tool_call_started" && body.parentToolUseId === null))
+      (body.kind === "assistant_text_delta" || (body.kind === "tool_call_started" && !isChildCall(body.parentToolUseId)))
     ) {
       modelMarks = pushModelMark(modelMarks, e.timestamp, currentModel, markedInTurn);
       markedInTurn = true;
@@ -73,18 +84,19 @@ export function timeBucketsFromHistory(
       generation: ids.generation,
     } as NormalizedEvent;
     state = foldTimeBuckets(state, ev, { childSpans, modelMarks });
-    if (ev.kind === "assistant_usage" && ev.parentToolUseId === null) usage = foldPlanUsage(usage, ev.messageId, e.timestamp, ev.usage);
+    if (ev.kind === "assistant_usage" && !isChildCall(ev.parentToolUseId)) usage = foldPlanUsage(usage, ev.messageId, e.timestamp, ev.usage);
     if (ev.kind === "turn_started" || ev.kind === "user_message") {
       requests = reduceWorkModel(requests, ev);
       state = attachTimeBucketRequestNumbers(state, requests.requests ?? []);
     }
   }
-  const view = deriveTimeBuckets(state, { childSpans, modelMarks });
+  const view = deriveTimeBuckets(state, { childSpans, modelMarks, streamOpen: false });
   return projectWorkBlockTokens(view, projectPlanUsage(usage, view.blocks));
 }
 
 export interface TranscriptTimeBucketsRead {
   rosterSources?: RosterSource[];
+  childSpans?: ChildTranscriptSpan[];
   view: TimeBucketView | undefined;
   coverage: TimeBucketsCoverage | undefined;
 }
@@ -123,8 +135,11 @@ export function transcriptTimeBucketsOf(
 ): TranscriptTimeBucketsRead {
   const ancestorUsageReadError = displayedAncestorUsageGap(history.coverage);
   const subagentCoverage = subagentReadCoverage(restored);
+  const childSpans = childSpansOf(restored.agents, restored.readAt);
+  const view = timeBucketsFromHistory(history.events, childSpans, ids);
   return {
-    view: timeBucketsFromHistory(history.events, childSpansOf(restored.agents), ids),
+    view,
+    childSpans: withRecordedRuns(childSpans, view),
     rosterSources: history.rosterSources,
     coverage: ancestorUsageReadError === undefined ? subagentCoverage : { ...subagentCoverage, ancestorUsageReadError },
   };
