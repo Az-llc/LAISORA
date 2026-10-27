@@ -1,5 +1,5 @@
 import { getLaisoraConfiguration } from "./claude-settings";
-import { configuredSystemAppExtensions } from "./gateway-host-actions";
+import { configuredSystemAppExtensions, openWelcome } from "./gateway-host-actions";
 import * as vscode from "vscode";
 import * as l10n from "@vscode/l10n";
 
@@ -349,7 +349,8 @@ export function openNewConversationTab(st: SessionStore, initialize?: (session: 
     return undefined;
   }
   const session = st.createSession();
-  initialize?.(session);
+  if (initialize) initialize(session);
+  else session.welcome = openWelcome();
   st.post({ type: "tabCreated", tab: session.snapshot(), activate: true });
   warmup(session);
   return session;
@@ -425,6 +426,7 @@ export async function handleSurfaceMessage(
       if (closedSessionId !== undefined) noteHandoffForkTab({ kind: "closed", sessionId: closedSessionId });
       void persistOpenTabs();
       const replacement = st.sessions.size === 0 ? st.createSession() : null;
+      if (replacement) replacement.welcome = openWelcome();
       if (replacement) st.post({ type: "tabCreated", tab: replacement.snapshot(), activate: true, replacement: true });
       st.post({ type: "tabClosed", tabId: msg.tabId });
       postSettingsState();

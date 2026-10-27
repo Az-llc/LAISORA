@@ -2,13 +2,58 @@ import * as l10n from "@vscode/l10n";
 import type { TaskStatus } from "./work-model";
 import type { PlanContext } from "./protocol";
 import type { AgentSpanView, BackgroundTaskSpanView, ConductorModel, ExternalRunCallView, MainModelSpan, PlanBlockStepView, RequestBlockView, TimeBucketInterval, TimeBucketView } from "./time-buckets";
-import { measureSpans, memberRunTimes, runSpans, unionSpans } from "./spans";
+import { measureSpans, memberRunTimes, runSpans, subtractSpans, unionSpans, type Span } from "./spans";
 import { delegationCount } from "./claude-tool-names";
 
-export interface PlanFrameMembers { agents: AgentSpanView[]; bgTasks: BackgroundTaskSpanView[]; externalRuns: ExternalRunCallView[] }
+export interface PlanNestedMember {
+  agent?: AgentSpanView;
+  extRun?: ExternalRunCallView;
+  parentToolUseId: string;
+  depth: number;
+}
+
+export interface PlanNestedRange { start: number; count: number }
+
+export interface PlanFrameMembers { agents: AgentSpanView[]; bgTasks: BackgroundTaskSpanView[]; externalRuns: ExternalRunCallView[];
+  nested?: PlanNestedMember[]; nestedRanges?: ReadonlyMap<string, PlanNestedRange>; unknown?: AgentSpanView[] }
+
+export function foregroundExternalCalls(view: Pick<TimeBucketView, "externalRunCalls" | "backgroundTasks">): ExternalRunCallView[] {
+  const backgrounded = new Set((view.backgroundTasks ?? []).map(bg => bg.toolUseId));
+  return (view.externalRunCalls ?? []).filter(call => !backgrounded.has(call.toolUseId));
+}
+
+export function planNestedMembers(view: Pick<TimeBucketView, "nestedAgents" | "nestedExternalRuns">):
+  (roots: readonly AgentSpanView[]) => { nested: PlanNestedMember[]; nestedRanges: Map<string, PlanNestedRange> } {
+  const children = new Map<string, { agent?: AgentSpanView; extRun?: ExternalRunCallView; start: number }[]>();
+  const add = (parentToolUseId: string | undefined, child: { agent?: AgentSpanView; extRun?: ExternalRunCallView; start: number }) => {
+    if (parentToolUseId !== undefined) children.set(parentToolUseId, [...children.get(parentToolUseId) ?? [], child]);
+  };
+  for (const agent of view.nestedAgents ?? []) add(agent.parentToolUseId, { agent, start: agent.start });
+  for (const extRun of view.nestedExternalRuns ?? []) add(extRun.parentToolUseId, { extRun, start: extRun.start });
+  for (const list of children.values()) list.sort((a, b) => a.start - b.start);
+  return roots => {
+    const nested: PlanNestedMember[] = [];
+    const nestedRanges = new Map<string, PlanNestedRange>();
+    const visit = (parentToolUseId: string, depth: number): void => {
+      if (nestedRanges.has(parentToolUseId)) return;
+      const range = { start: nested.length, count: 0 };
+      nestedRanges.set(parentToolUseId, range);
+      for (const child of children.get(parentToolUseId) ?? []) {
+        nested.push({ ...(child.agent ? { agent: child.agent } : { extRun: child.extRun }), parentToolUseId, depth });
+        if (child.agent) visit(child.agent.toolUseId, depth + 1);
+      }
+      range.count = nested.length - range.start;
+      if (range.count === 0) nestedRanges.delete(parentToolUseId);
+    };
+    for (const root of roots) visit(root.toolUseId, 1);
+    return { nested, nestedRanges };
+  };
+}
 
 export function planMemberDelegationCount(members: PlanFrameMembers | undefined): number {
-  return delegationCount({ agentCount: members?.agents.length ?? 0, externalRunCount: members?.externalRuns?.length ?? 0 });
+  return delegationCount({ agentCount: (members?.agents.length ?? 0) + (members?.nested?.filter(entry => entry.agent !== undefined).length ?? 0) + (members?.unknown?.length ?? 0),
+    externalRunCount: (members?.externalRuns?.length ?? 0) + (members?.bgTasks.filter(bg => bg.subagent).length ?? 0)
+      + (members?.nested?.filter(entry => entry.extRun !== undefined).length ?? 0) });
 }
 
 export interface PlanFrameRow {
@@ -153,17 +198,20 @@ export function planRowTime(routes: readonly PlanRoute[], start: number, end: nu
 
 // GRAPH (src/webview/work-graph.ts#WorkGraph.buildRows) and ANALYSIS (src/role-summary.ts#deriveAnalysisPlans)
 // both take their blocks, order, rows, 00, numbers, titles, members and routing from here.
-export function planFrame(view: Pick<TimeBucketView, "blocks" | "agents" | "backgroundTasks" | "externalRunCalls" | "intervals" | "mainModelSpans">): PlanFrame {
+export function planFrame(view: Pick<TimeBucketView, "blocks" | "agents" | "backgroundTasks" | "externalRunCalls" | "nestedAgents" | "nestedExternalRuns" | "unknownLaunchers" | "intervals" | "mainModelSpans" | "subagentOnlySpans" | "backgroundOnlySpans">): PlanFrame {
   const rows: PlanFrameRow[] = [];
   const placed = new Set<string>();
+  const nestedUnder = planNestedMembers(view);
   const take = (pick: (owner: { blockId?: string; stepKey?: string }) => boolean): PlanFrameMembers => {
-    const agents = (view.agents ?? []).filter(a => !placed.has(`agent:${a.toolUseId}`) && pick(a));
-    const bgTasks = (view.backgroundTasks ?? []).filter(bg => !placed.has(`bg:${bg.toolUseId}`) && pick(bg));
-    for (const a of agents) placed.add(`agent:${a.toolUseId}`);
-    const externalRuns = (view.externalRunCalls ?? []).filter(call => !placed.has(`ext:${call.toolUseId}`) && pick(call));
-    for (const bg of bgTasks) placed.add(`bg:${bg.toolUseId}`);
-    for (const call of externalRuns) placed.add(`ext:${call.toolUseId}`);
-    return { agents, bgTasks, externalRuns };
+    const fresh = <T extends { toolUseId: string; blockId?: string; stepKey?: string }>(members: readonly T[] | undefined): T[] => {
+      const taken = (members ?? []).filter(member => !placed.has(member.toolUseId) && pick(member));
+      for (const member of taken) placed.add(member.toolUseId);
+      return taken;
+    };
+    const agents = fresh(view.agents);
+    const bgTasks = fresh(view.backgroundTasks);
+    const externalRuns = fresh(foregroundExternalCalls(view));
+    return { agents, bgTasks, externalRuns, ...nestedUnder(agents) };
   };
   const routes = planRoutes(view.blocks);
   const conductorWork = planConductorWork(view, routes);
@@ -183,29 +231,41 @@ export function planFrame(view: Pick<TimeBucketView, "blocks" | "agents" | "back
     items.forEach((step, index) => {
       const work = conductorWork.get(planItemRowKey(block.blockId, step.key)) ?? [];
       rows.push({ key: planItemRowKey(block.blockId, step.key), kind: "item", block, number: planItemLabel(step.number), title: step.title,
-        item: { ...step, conductorIntervals: work.filter(interval => interval.bucket !== "reply") }, members: byItem[index], conductorWork: work,
+        item: { ...step, conductorIntervals: work.filter(interval => !isWaitPart(interval.bucket)) }, members: byItem[index], conductorWork: work,
         conductorModels: conductorModelsDuring(view.mainModelSpans, work) });
     });
   }
+  const unknownByRow = new Map<string, AgentSpanView[]>();
+  for (const agent of view.unknownLaunchers ?? []) {
+    const key = planRowsAt(routes, agent.start).find(rowKey => rowKey !== PLAN_UNPLANNED_ROW_KEY && rows.some(row => row.key === rowKey)) ?? PLAN_UNPLANNED_ROW_KEY;
+    unknownByRow.set(key, [...unknownByRow.get(key) ?? [], agent]);
+  }
+  for (const row of rows) {
+    const unknown = unknownByRow.get(row.key);
+    if (unknown !== undefined) row.members = { ...row.members, unknown, ...nestedUnder([...row.members.agents, ...unknown]) };
+  }
+  const leadUnknown = unknownByRow.get(PLAN_UNPLANNED_ROW_KEY) ?? [];
   // 00 exists whenever a moment routes to it (so work, usage, tool calls and runs there always have a row) or a member is placed on it.
   const unplanned = routes.filter(route => route.rows.includes(PLAN_UNPLANNED_ROW_KEY));
   const anchor = leadBlock ?? view.blocks.find(block => planItemsOf(block).length > 0);
-  if (anchor !== undefined && (unplanned.length > 0 || lead.agents.length > 0 || lead.bgTasks.length > 0 || lead.externalRuns.length > 0)) {
+  const hasLead = anchor !== undefined && (unplanned.length > 0 || lead.agents.length > 0 || lead.bgTasks.length > 0 || lead.externalRuns.length > 0 || leadUnknown.length > 0);
+  if (hasLead) {
     const open = unplanned.find(route => route.end === Infinity);
     rows.unshift({ key: PLAN_UNPLANNED_ROW_KEY, kind: "item", block: anchor, number: "00", title: l10n.t("Unplanned work"),
-      members: lead, conductorWork: conductorWork.get(PLAN_UNPLANNED_ROW_KEY) ?? [],
+      members: { ...lead, ...nestedUnder([...lead.agents, ...leadUnknown]), ...(leadUnknown.length > 0 ? { unknown: leadUnknown } : {}) }, conductorWork: conductorWork.get(PLAN_UNPLANNED_ROW_KEY) ?? [],
       conductorModels: conductorModelsDuring(view.mainModelSpans, conductorWork.get(PLAN_UNPLANNED_ROW_KEY) ?? []),
       conductorSpans: unplanned.map(route => ({ start: route.start, end: route.end === Infinity ? route.start : route.end })),
       ...(open === undefined ? {} : { conductorOpenFrom: open.start }),
       ...(leadTail === undefined ? {} : { conductorTail: leadTail }) });
   }
-  return { rows, unplaced: take(() => true), routes };
+  const unplaced = take(() => true);
+  return { rows, unplaced: !hasLead && leadUnknown.length > 0 ? { ...unplaced, unknown: leadUnknown, ...nestedUnder([...unplaced.agents, ...leadUnknown]) } : unplaced, routes };
 }
 
 // A view is live while a block runs or a member is still open; rows' open parts follow "now" only then.
-export function planLive(view: Pick<TimeBucketView, "blocks" | "agents" | "backgroundTasks">): boolean {
-  return view.blocks.some(block => block.running) || (view.agents ?? []).some(agent => agent.open)
-    || (view.backgroundTasks ?? []).some(task => task.open);
+export function planLive(view: Pick<TimeBucketView, "blocks" | "agents" | "backgroundTasks" | "nestedAgents" | "nestedExternalRuns">): boolean {
+  return view.blocks.some(block => block.running) || [...view.agents ?? [], ...view.backgroundTasks ?? [], ...view.nestedAgents ?? [], ...view.nestedExternalRuns ?? []]
+    .some(member => member.open);
 }
 
 // One "now" for GRAPH and ANALYSIS: it follows the clock while the screen's conversation turn runs (the webview learns a
@@ -243,7 +303,8 @@ export function planRowPeriod(row: Pick<PlanFrameRow, "kind" | "block" | "item" 
     spans.forEach((span, index) => parts.push({ ...span, open: live && inProgress && index === spans.length - 1 }));
   }
   // A block row is its own window: its members have their own rows, and stretching it would draw later blocks' work on it.
-  if (row.kind === "item") for (const member of [...row.members.agents, ...row.members.bgTasks]) {
+  if (row.kind === "item") for (const member of [...row.members.agents, ...row.members.bgTasks.filter(bg => bg.subagent), ...row.members.externalRuns,
+    ...(row.members.nested ?? []).flatMap(entry => entry.agent ?? entry.extRun ?? []), ...row.members.unknown ?? []]) {
     const memberParts = planMemberSpans(member);
     memberParts.forEach((span, index) => parts.push({ ...span, open: live && member.open === true && index === memberParts.length - 1 }));
   }
@@ -280,6 +341,34 @@ export function planHeading(plan: { goal?: string; steps?: ReadonlyArray<Pick<Pl
 }
 
 export const PLAN_CONDUCTOR_BUCKETS = ["generate", "tool", "delegation", "confirm", "reply"] as const satisfies readonly TimeBucketInterval["bucket"][];
+
+export const MAIN_PROCESSING_BUCKETS = ["generate", "tool", "delegation"] as const satisfies readonly typeof PLAN_CONDUCTOR_BUCKETS[number][];
+
+export const ANALYSIS_TIME_PART_KEYS = [...PLAN_CONDUCTOR_BUCKETS, "subagentOnly", "backgroundOnly"] as const;
+
+export const WAIT_TIME_PART_KEYS = ["confirm", "reply"] as const satisfies readonly typeof PLAN_CONDUCTOR_BUCKETS[number][];
+
+export const PROCESSING_TIME_PART_KEYS = [...MAIN_PROCESSING_BUCKETS, "subagentOnly", "backgroundOnly"] as const satisfies readonly typeof ANALYSIS_TIME_PART_KEYS[number][];
+
+export type ShownTimePartKey = typeof PROCESSING_TIME_PART_KEYS[number];
+
+export function timePartShown(key: string): key is ShownTimePartKey {
+  return (PROCESSING_TIME_PART_KEYS as readonly string[]).includes(key);
+}
+
+export function isWaitPart(key: string): key is typeof WAIT_TIME_PART_KEYS[number] {
+  return (WAIT_TIME_PART_KEYS as readonly string[]).includes(key);
+}
+
+export function viewTimePartValues(main: TimeBucketView["main"]): (number | null)[] {
+  const values: Record<typeof ANALYSIS_TIME_PART_KEYS[number], number | null> = { generate: main.generateMs, tool: main.toolMs,
+    delegation: main.subagentWaitMs, confirm: main.confirmMs, reply: main.replyMs, subagentOnly: main.subOnlyMs, backgroundOnly: main.backgroundOnlyMs ?? null };
+  return ANALYSIS_TIME_PART_KEYS.map(key => values[key]);
+}
+
+export function analysisTimePart(key: typeof ANALYSIS_TIME_PART_KEYS[number]): number {
+  return ANALYSIS_TIME_PART_KEYS.indexOf(key);
+}
 
 export function planBlockConductorMs(block: RequestBlockView): (number | null)[] {
   const metrics = block.metrics;
@@ -330,15 +419,12 @@ export function planPeriodEnd(period: Pick<PlanRowPeriod, "end" | "running">, no
   return period.running ? Math.max(period.end, now) : period.end;
 }
 
-export function blockElapsedMs(block: Pick<RequestBlockView, "durationMs" | "running" | "workEndedAt" | "start" | "end"> & { metrics?: { provisional?: boolean } },
-  now: number): { ms: number; provisional: boolean } {
-  const running = blockElapsedRunning(block);
-  if (block.durationMs === null) return { ms: Math.max(0, (running ? Math.max(now, block.end) : block.workEndedAt ?? block.end) - block.start), provisional: true };
-  return { ms: running ? Math.max(block.durationMs, now - block.start) : block.durationMs, provisional: block.metrics?.provisional === true };
+export function blockTimeProvisional(block: Pick<RequestBlockView, "durationMs"> & { metrics?: { provisional?: boolean } }): boolean {
+  return block.durationMs === null || block.metrics?.provisional === true;
 }
 
-export function blockElapsedRunning(block: Pick<RequestBlockView, "running" | "workEndedAt">): boolean {
-  return block.running && block.workEndedAt === undefined;
+export function viewTimeProvisional(view: Pick<TimeBucketView, "blocks"> | undefined): boolean {
+  return (view?.blocks ?? []).some(blockTimeProvisional);
 }
 
 export function timeWindowMeasured(view: Pick<TimeBucketView, "firstAt" | "lastAt"> | undefined): view is TimeBucketView {
@@ -358,12 +444,32 @@ export function planConductorRunning(row: Pick<PlanFrameRow, "item" | "conductor
   return period?.running === true && (row.item?.conductorTail ?? row.conductorTail) != null;
 }
 
-export function planRowProvisional(row: Pick<PlanFrameRow, "block" | "item">, period: PlanRowPeriod | undefined): boolean {
-  return period?.running === true || (row.item !== undefined ? row.item.provisional === true : row.block.metrics?.provisional === true);
+export function planRowProvisional(row: Partial<Pick<PlanFrameRow, "block" | "item">>, period: PlanRowPeriod | undefined): boolean {
+  return period?.running === true || (row.item !== undefined ? row.item.provisional === true : row.block !== undefined && blockTimeProvisional(row.block));
+}
+
+export function planMainIntervals(view: Pick<TimeBucketView, "intervals" | "subagentOnlySpans" | "backgroundOnlySpans">): TimeBucketInterval[] {
+  const worked = unionSpans([...view.subagentOnlySpans ?? [], ...view.backgroundOnlySpans ?? []]);
+  return (view.intervals ?? []).filter(interval => interval.lane === "main").flatMap(interval =>
+    isWaitPart(interval.bucket) && worked.length > 0
+      ? subtractSpans([[interval.start, interval.end] as Span], worked).map(([start, end]) => { const { backgroundOverlapMs: _overlap, ...rest } = interval; return { ...rest, start, end }; })
+      : [interval]);
+}
+
+// The waits GRAPH leaves out of its axis: the recorded waits with the work that ran during them taken out, and a live wait
+// after lastAt with the members still running taken out.
+export function planWaitSpans(view: Pick<TimeBucketView, "intervals" | "subagentOnlySpans" | "backgroundOnlySpans" | "tail" | "lastAt" | "agents" | "backgroundTasks" | "nestedAgents" | "nestedExternalRuns">,
+  end: number, live: boolean): Span[] {
+  const recorded = planMainIntervals(view).flatMap(interval => isWaitPart(interval.bucket) ? [[interval.start, interval.end] as Span] : []);
+  const lastAt = view.lastAt;
+  if (lastAt === null || view.tail.main === null || !isWaitPart(view.tail.main) || end <= lastAt) return recorded;
+  const running = unionSpans([...view.agents, ...view.backgroundTasks ?? [], ...view.nestedAgents ?? [], ...view.nestedExternalRuns ?? []]
+    .flatMap(member => runSpans(memberRunTimes(member, planMemberEnd(member, end, live)))));
+  return [...recorded, ...subtractSpans([[lastAt, end]], running)];
 }
 
 // Main-lane work per frame row key, routed from the view's intervals only (an overlay carries its live part there too).
-function planConductorWork(view: Pick<TimeBucketView, "blocks" | "intervals">, routes: readonly PlanRoute[]): Map<string, TimeBucketInterval[]> {
+function planConductorWork(view: Pick<TimeBucketView, "intervals" | "subagentOnlySpans" | "backgroundOnlySpans">, routes: readonly PlanRoute[]): Map<string, TimeBucketInterval[]> {
   const result = new Map<string, TimeBucketInterval[]>();
   const add = (row: string, interval: TimeBucketInterval) => {
     const list = result.get(row) ?? [];
@@ -371,7 +477,7 @@ function planConductorWork(view: Pick<TimeBucketView, "blocks" | "intervals">, r
     result.set(row, list);
   };
   let first = 0;
-  for (const interval of (view.intervals ?? []).filter(interval => interval.lane === "main").sort((a, b) => a.start - b.start)) {
+  for (const interval of planMainIntervals(view).sort((a, b) => a.start - b.start)) {
     while (first < routes.length && routes[first].end <= interval.start) first++;
     for (let i = first; i < routes.length && routes[i].start < interval.end; i++) {
       const route = routes[i];
@@ -425,7 +531,7 @@ const TASK_STEP_KEY_RE = new RegExp(`^${TASK_STEP_KEY_HEAD}${TASK_KEY_PREFIX}(\\
 const ITEM_NUMBER_PREFIX_RE = /^(\d{2,}) /;
 
 // Every frame row's period at the view's own now, as GRAPH and ANALYSIS show it (src/plan-steps.ts#planRowPeriod).
-export function planRowPeriods(view: Pick<TimeBucketView, "blocks" | "agents" | "backgroundTasks" | "intervals" | "mainModelSpans" | "lastAt">): ReadonlyMap<string, PlanRowPeriod> {
+export function planRowPeriods(view: Pick<TimeBucketView, "blocks" | "agents" | "backgroundTasks" | "intervals" | "mainModelSpans" | "lastAt" | "externalRunCalls">): ReadonlyMap<string, PlanRowPeriod> {
   const live = planLive(view);
   const now = planNow(view, undefined, live);
   return new Map(planFrame(view).rows.flatMap(row => {
@@ -435,9 +541,8 @@ export function planRowPeriods(view: Pick<TimeBucketView, "blocks" | "agents" | 
 }
 
 export function planContextOf(block: { blockId: string; text: string; start: number; durationMs?: number | null; workEndedAt?: number; running?: boolean; goal?: string; steps?: ReadonlyArray<PlanStepTiming & { number: number }>;
-  metrics?: { tokens?: PlanContext["tokens"]; provisional?: boolean } }, end: number, running: boolean, periods: ReadonlyMap<string, PlanRowPeriod>): PlanContext {
+  metrics?: { provisional?: boolean } }, end: number, running: boolean, periods: ReadonlyMap<string, PlanRowPeriod>): PlanContext {
   return { blockId: block.blockId, text: block.text, start: block.start, ...(block.goal === undefined ? {} : { goal: block.goal }),
-    ...(block.metrics?.tokens === undefined ? {} : { tokens: block.metrics.tokens }),
     steps: (block.steps ?? []).map(({ key, number, title, status, removed, startedAt, endedAt }) => {
       const period = periods.get(planItemRowKey(block.blockId, key));
       return { key, number, title, status, removed, startedAt, endedAt, ...(period === undefined ? {} : { period: { spans: period.spans, running: period.running } }) };
@@ -461,11 +566,11 @@ export function planItemNumberOf(description: string | undefined): number | unde
 }
 
 // The item a numbered launch names: the newest block open at the launch that holds that number.
-export function planNumberedStep<S extends { number: number }>(blocks: readonly { start: number; closedAt?: number; steps?: readonly S[] }[],
+export function planNumberedStep<S extends { number: number }>(blocks: readonly { start: number; steps?: readonly S[] }[],
   number: number, at: number): { blockIndex: number; step: S } | undefined {
   for (let blockIndex = blocks.length - 1; blockIndex >= 0; blockIndex--) {
     const block = blocks[blockIndex];
-    if (block.start > at || block.closedAt !== undefined && at >= block.closedAt) continue;
+    if (block.start > at) continue;
     const step = block.steps?.filter(value => value.number === number).at(-1);
     if (step !== undefined) return { blockIndex, step };
   }
@@ -485,7 +590,7 @@ export function planSuccessorStep<S extends { key: string; carriedTo?: string }>
   return current;
 }
 
-export function planPlacedStep<S extends { number: number; key: string; carriedTo?: string }>(blocks: readonly { blockId: string; start: number; closedAt?: number; steps?: readonly S[] }[],
+export function planPlacedStep<S extends { number: number; key: string; carriedTo?: string }>(blocks: readonly { blockId: string; start: number; steps?: readonly S[] }[],
   number: number, at: number): { blockIndex: number; step: S } | undefined {
   const found = planNumberedStep(blocks, number, at);
   return found === undefined ? undefined : planSuccessorStep(blocks, found);

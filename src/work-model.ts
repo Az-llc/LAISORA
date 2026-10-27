@@ -1,7 +1,7 @@
 import type { ToolIntentInput } from "./tool-intent";
-import type { NormalizedEvent, ResumeHydrationPhase } from "./protocol.js";
+import { isHistoryEvent, type NormalizedEvent, type ResumeHydrationPhase } from "./protocol";
 import * as l10n from "@vscode/l10n";
-import { isRequestMessage, mainCallTimeKind, MAX_TIME_TOOL_INTERVALS, toolTimeSpans } from "./time-buckets";
+import { isRequestMessage, mainCallTimeKind, MAX_TIME_TOOL_INTERVALS, toolTimeSpans, type UnknownLauncher } from "./time-buckets";
 import { isRejectedBeforeRun, taskNotificationTerminal } from "./tool-result-signals";
 import { DELEGATION_TOOL_NAMES, isCountedExternalRunCall, TASK_TOOL_NAMES } from "./claude-tool-names";
 import { isPureCommandWrapper } from "./human-input-vocabulary";
@@ -9,7 +9,7 @@ import { parseMarkdown } from "./markdown-ast";
 import { appendRecordPart, findCommitBoundary, joinRecordTexts, type RecordTextPart } from "./commit-boundary";
 import { redactAbsolutePaths, redactOptional } from "./path-redaction";
 import { planStepKey, planWorkTaskKey, TASK_KEY_PREFIX, TASK_PENDING_KEY_PREFIX, TODO_KEY_PREFIX } from "./plan-steps";
-import { childActivity, childUsageCounts, isChildCall, closeRun, currentRunStart, delegationRuns, insertSpan, measureSpans, runElapsedMs, runEnd, unionSpans,
+import { childActivity, childUsageCounts, isChildCall, unfinishedCallEnd, closeRun, currentRunStart, delegationRuns, insertSpan, measureSpans, runElapsedMs, runEnd, unionSpans,
   moreRuns, type ChildTranscriptSpan, type RecordedRuns, type RunStop, type Span } from "./spans";
 
 export const MAX_PHASES = 256;
@@ -39,7 +39,8 @@ export interface WorkCoverage {
   untrackedApprovalCount?: number;
   untrackedBackgroundCount?: number;
   unreadableAgentCount?: number;
-  omittedTranscriptCount?: number;
+  usageOnlyTranscriptCount?: number;
+  usagePendingTranscriptCount?: number;
   depthLimitedAgentCount?: number;
   hierarchyIncomplete?: true;
   ancestorUsageReadError?: string;
@@ -212,6 +213,9 @@ export interface WorkTool {
   notifiedTokens?: number;
   ended?: true;
   launchOnly?: true;
+  launchUnknown?: true;
+  childCount?: number;
+  failCount?: number;
 }
 
 export interface BackgroundTaskEntry {
@@ -235,6 +239,7 @@ export interface EvictedLaunch {
 
 export interface WorkModelState {
   evictedLaunches?: Record<string, EvictedLaunch>;
+  pendingUnknownLaunchers?: Record<string, UnknownLauncher>;
   requests?: WorkRequestTotals[];
   requestOffset?: number;
   requestByTurn?: Record<string, number>;
@@ -253,6 +258,7 @@ export interface WorkModelState {
   phaseByTaskKey: Record<string, string>;
   runningAgentToolUseIds: string[];
   runningToolUseIds: string[];
+  unfinishedSince?: number;
   backgroundTasks: Record<string, BackgroundTaskEntry>;
   activeTaskKey?: string;
   ambiguity?: "multiple-active-tasks";
@@ -1509,8 +1515,59 @@ function deletePlacement(d: Draft, toolUseId: string): void {
   index.size--;
 }
 
+export function seedUnknownLauncherOwners(state: WorkModelState, launchers: readonly UnknownLauncher[]): WorkModelState {
+  return launchers.length === 0 ? state : { ...state, pendingUnknownLaunchers: Object.fromEntries(launchers.map(launcher => [launcher.toolUseId, launcher])) };
+}
+
+function addUnknownLauncher(d: Draft, launcher: UnknownLauncher, at: number, callTurnId?: string): WorkTool | undefined {
+  const startedAt = launcher.startedAt ?? at;
+  let segment = d.next.segments.reduce<WorkSegment | undefined>((found, value) => value.startedAt <= startedAt && (found === undefined || value.startedAt >= found.startedAt) ? value : found,
+    undefined) ?? d.next.segments[0];
+  if (segment === undefined) {
+    const turnId = callTurnId ?? d.next.requests?.[0]?.turnIds[0];
+    if (turnId === undefined) return undefined;
+    segment = place(d, destination(d, "delegated", startedAt), startedAt, turnId);
+  }
+  const { [launcher.toolUseId]: _added, ...pending } = d.next.pendingUnknownLaunchers ?? {};
+  d.next.pendingUnknownLaunchers = Object.keys(pending).length === 0 ? undefined : pending;
+  const phase = draftPhase(d, segment.phaseId);
+  const phaseRef: PhaseRef = phase === undefined ? { kind: "rollup" } : { kind: "phase", phaseId: phase.phaseId };
+  const turnId = segment.turnIds[0];
+  const requestIndex = turnId === undefined ? undefined : d.next.requestByTurn?.[turnId];
+  const target = draftTotals(d, phaseRef);
+  if (target) target.totals.agentCount++;
+  const request = draftRequest(d, requestIndex);
+  if (request) request.agentCount++;
+  const placement: WorkTool = { requestIndex, toolUseId: launcher.toolUseId, parentToolUseId: null, toolName: "Agent", description: launcher.description,
+    operation: "delegated", startedAt, counted: false, phaseRef, segmentId: segment.segmentId, agentId: `agent:${launcher.toolUseId}`, spawnDepth: 1, ended: true,
+    launchUnknown: true };
+  setPlacement(d, placement);
+  return placement;
+}
+
+function countUnknownLauncherCall(d: Draft, ownerToolUseId: string, failed: boolean): void {
+  if (!findToolPlacement(d.next, ownerToolUseId)?.launchUnknown) return;
+  const placement = draftPlacement(d, ownerToolUseId)!;
+  if (failed) placement.failCount = (placement.failCount ?? 0) + 1;
+  else placement.childCount = (placement.childCount ?? 0) + 1;
+}
+
+function unknownLauncherOwner(d: Draft, parentToolUseId: string | null, at: number, turnId: string): WorkTool | undefined {
+  const launcher = isChildCall(parentToolUseId) ? d.next.pendingUnknownLaunchers?.[parentToolUseId] : undefined;
+  return launcher === undefined ? undefined : addUnknownLauncher(d, launcher, at, turnId);
+}
+
+export function settleUnknownLaunchers(state: WorkModelState, lastActivity: number): WorkModelState {
+  const pending = Object.values(state.pendingUnknownLaunchers ?? {});
+  if (pending.length === 0) return state;
+  const d = beginDraft(state);
+  d.next.revision = state.revision;
+  for (const launcher of pending) addUnknownLauncher(d, launcher, launcher.startedAt ?? lastActivity);
+  return d.next;
+}
+
 function handleToolStart(d: Draft, e: ToolStartedSignal): void {
-  const owner = launchingAgent(d.next, e.parentToolUseId);
+  const owner = launchingAgent(d.next, e.parentToolUseId) ?? unknownLauncherOwner(d, e.parentToolUseId, e.timestamp, e.turnId);
   if (owner === undefined && isChildCall(e.parentToolUseId)) return;
   noteChildActivity(d, owner, e.timestamp, false);
   if (isBookkeepingTool(e.toolName)) {
@@ -1563,6 +1620,7 @@ function handleToolStart(d: Draft, e: ToolStartedSignal): void {
       const ownerAgent = draftAgent(d, target.phase, owner.agentId);
       if (ownerAgent) ownerAgent.childCount++;
     }
+    countUnknownLauncherCall(d, owner.toolUseId, false);
   }
 
   let agentId: string | undefined;
@@ -1688,6 +1746,7 @@ function finishBackground(
         const owner = draftAgent(d, target.phase, placement.ownerAgentId);
         if (owner) owner.failCount++;
       }
+      if (placement.parentToolUseId !== null) countUnknownLauncherCall(d, placement.parentToolUseId, true);
     }
     if (placement.agentId !== undefined) {
       if (placement.stale) target.totals.staleCount--;
@@ -1851,14 +1910,13 @@ export function runningMainPlacement(state: WorkModelState, toolUseId: string): 
   return tool !== undefined && !tool.stale && !isChildCall(tool.parentToolUseId) ? tool : undefined;
 }
 
-// The values the PLAN panel shows a lane's state from: an agent lane's WorkAgent.status (src/webview/plan-view.ts#planLaneRunning),
-// a tool lane's running main placement (planTools in src/protocol.ts#projectWorkModel).
-export function isRunningMainLane(state: WorkModelState, toolUseId: string): boolean {
+export function isRunningLane(state: WorkModelState, toolUseId: string): boolean {
   for (let index = state.phases.length - 1; index >= 0; index--) {
-    const agent = state.phases[index].agents.find(value => value.toolUseId === toolUseId && !isChildCall(value.parentToolUseId));
+    const agent = state.phases[index].agents.find(value => value.toolUseId === toolUseId);
     if (agent !== undefined) return agent.status === "running";
   }
-  return state.runningToolUseIds.includes(toolUseId) && runningMainPlacement(state, toolUseId) !== undefined;
+  const placement = state.runningToolUseIds.includes(toolUseId) ? findToolPlacement(state, toolUseId) : undefined;
+  return placement !== undefined && !placement.stale;
 }
 
 export function knownBackgroundTask(state: WorkModelState, hydration: { phase: ResumeHydrationPhase } | null, taskId: string):
@@ -1997,6 +2055,31 @@ export function backgroundTaskLaunchedSince(state: WorkModelState, taskId: strin
   return placement !== undefined && backgroundRunStart(placement) >= since;
 }
 
+function isUnfinishedMainTool(state: WorkModelState, toolUseId: string): boolean {
+  const placement = findToolPlacement(state, toolUseId);
+  return placement !== undefined && placement.agentId === undefined && placement.background === undefined && !isChildCall(placement.parentToolUseId);
+}
+
+function closeUnfinishedMainTools(d: Draft, stoppedAt: number | undefined, lastActivity: number): void {
+  for (const toolUseId of d.next.runningToolUseIds.filter((id) => isUnfinishedMainTool(d.next, id))) {
+    const placement = findToolPlacement(d.next, toolUseId)!;
+    markToolStale(d, toolUseId, unfinishedCallEnd(placement.startedAt, stoppedAt, lastActivity), false);
+    removeRunningTool(d, toolUseId);
+  }
+  if (d.next.unfinishedSince !== undefined) d.next.unfinishedSince = undefined;
+}
+
+export function markHydrationUnconfirmed(state: WorkModelState, lastActivity: number): WorkModelState {
+  let next = settleUnknownLaunchers(state, lastActivity);
+  if (next.runningToolUseIds.some((id) => isUnfinishedMainTool(next, id)) || next.unfinishedSince !== undefined) {
+    const d = beginDraft(next);
+    d.next.revision = next.revision;
+    closeUnfinishedMainTools(d, undefined, lastActivity);
+    next = d.next;
+  }
+  return markBackgroundUnconfirmed(next, lastActivity);
+}
+
 export function markBackgroundUnconfirmed(state: WorkModelState, timestamp: number): WorkModelState {
   const open = Object.entries(state.backgroundTasks).filter(([, e]) => e.terminal === undefined);
   if (open.length === 0) return state;
@@ -2089,6 +2172,7 @@ function handleToolFinish(d: Draft, e: ToolFinishedSignal): void {
       const ownerAgent = draftAgent(d, target.phase, placement.ownerAgentId);
       if (ownerAgent) ownerAgent.failCount++;
     }
+    if (placement.parentToolUseId !== null) countUnknownLauncherCall(d, placement.parentToolUseId, true);
   }
   if (isCountedExternalRunCall({ toolName: placement.toolName }) && !isCountedExternalRunCall({ toolName: placement.toolName, rejectedBeforeRun: isRejectedBeforeRun(e) })) {
     target.totals.externalRunCount = Math.max(0, (target.totals.externalRunCount ?? 0) - 1);
@@ -2119,7 +2203,7 @@ function handleToolFinish(d: Draft, e: ToolFinishedSignal): void {
   if (tokens !== undefined) agent.tokens = tokens;
 }
 
-function markRunningWorkStale(d: Draft, timestamp: number, includeBackground: boolean): void {
+function markRunningWorkStale(d: Draft, timestamp: number, includeBackground: boolean, keepTool: (toolUseId: string) => boolean = () => false): void {
   const isBackground = (toolUseId: string): boolean => findToolPlacement(d.next, toolUseId)?.background !== undefined;
   const keptAgents: string[] = [];
   for (const toolUseId of d.next.runningAgentToolUseIds) {
@@ -2131,7 +2215,7 @@ function markRunningWorkStale(d: Draft, timestamp: number, includeBackground: bo
   }
   const keptTools: string[] = [];
   for (const toolUseId of d.next.runningToolUseIds) {
-    if (!includeBackground && isBackground(toolUseId)) {
+    if (!includeBackground && isBackground(toolUseId) || keepTool(toolUseId)) {
       keptTools.push(toolUseId);
       continue;
     }
@@ -2251,7 +2335,10 @@ function applySignal(d: Draft, signal: WorkSignal): void {
     case "turn_completed":
       d.next.turnActive = false;
       closeSegment(d, signal.timestamp);
-      markRunningWorkStale(d, signal.timestamp, false);
+      if (isHistoryEvent(signal)) {
+        if (d.next.runningToolUseIds.some((id) => isUnfinishedMainTool(d.next, id))) d.next.unfinishedSince = signal.timestamp;
+        markRunningWorkStale(d, signal.timestamp, false, (id) => isUnfinishedMainTool(d.next, id));
+      } else markRunningWorkStale(d, signal.timestamp, false);
       return;
     case "turn_interrupted":
     case "turn_failed":
@@ -2264,6 +2351,7 @@ function applySignal(d: Draft, signal: WorkSignal): void {
       d.next.turnActive = true;
       closeSegment(d, signal.timestamp);
       settlePendingStale(d, signal.timestamp);
+      if (d.next.unfinishedSince !== undefined) closeUnfinishedMainTools(d, Math.min(signal.timestamp, d.next.unfinishedSince), signal.timestamp);
       markRunningWorkStale(d, signal.timestamp, false);
       return;
     case "conversation_closed":
@@ -2302,14 +2390,14 @@ export function markEventLogTrimmed(state: WorkModelState, droppedCount: number)
 
 export function markSubagentGaps(
   state: WorkModelState,
-  gaps: { unreadableAgentCount: number; hierarchyIncomplete: boolean }
+  gaps: Pick<WorkCoverage, "unreadableAgentCount" | "usagePendingTranscriptCount" | "usageOnlyTranscriptCount">,
+  hierarchyIncomplete: boolean
 ): WorkModelState {
-  if (gaps.unreadableAgentCount <= 0 && !gaps.hierarchyIncomplete) return state;
+  const counts = (["unreadableAgentCount", "usagePendingTranscriptCount", "usageOnlyTranscriptCount"] as const).filter(key => (gaps[key] ?? 0) > 0);
+  if (counts.length === 0 && !hierarchyIncomplete) return state;
   const coverage: WorkCoverage = { ...state.coverage, details: "prefix-truncated" };
-  if (gaps.unreadableAgentCount > 0) {
-    coverage.unreadableAgentCount = (coverage.unreadableAgentCount ?? 0) + gaps.unreadableAgentCount;
-  }
-  if (gaps.hierarchyIncomplete) {
+  for (const key of counts) coverage[key] = (coverage[key] ?? 0) + gaps[key]!;
+  if (hierarchyIncomplete) {
     coverage.summary = "prefix-truncated";
     coverage.hierarchyIncomplete = true;
   }

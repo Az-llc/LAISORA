@@ -2,9 +2,10 @@ import { isToolIntentInput, type ToolIntentInput } from "./tool-intent";
 import { isAccentSettings, isAccentSettingValue, type AccentSettings, type AccentSetting } from "./accent";
 import { isDisplayName } from "./display-name";
 import { isEventLimit } from "./event-limits";
+import { isTranscriptRetentionDays, isTranscriptRetentionFallback, type TranscriptRetentionFallback } from "./transcript-retention";
 import { configurationBound } from "./configuration-defaults";
 import { normalizeSystemAppExtension } from "./file-link-open-mode";
-import { isPlanUsage, type MainTokenTotal } from "./plan-usage";
+import type { MainTokenTotal } from "./plan-usage";
 import type { FailureSummaryView } from "./exec-log-marks";
 import type { HandoffCompactStats } from "./handoff-envelope";
 import type { HandoffNoticeFacts } from "./steering-envelope";
@@ -19,7 +20,7 @@ import * as l10n from "@vscode/l10n";
 import { FILE_LINK_TARGET_MAX_LEN } from "./file-link-target";
 export { FILE_LINK_TARGET_MAX_LEN } from "./file-link-target";
 import { agentRuns, findToolPlacement, findWorkSegment, phaseStateOf, runningMainPlacement } from "./work-model";
-import { planCurrentSteps } from "./plan-steps";
+import { ANALYSIS_TIME_PART_KEYS, MAIN_PROCESSING_BUCKETS, planCurrentSteps } from "./plan-steps";
 import { BACKGROUND_ACTIVITY_LIST_MAX, type BackgroundActivitySnapshot } from "./background-activity";
 import { isTodoAskIdentity, isTodoTime, isTodoDocLabel, isTodoImageName, isTodoGroupName, isTodoFolderPath, TODO_ITEM_SHAPES, TODO_CHANGE_FIELDS, isTodoChangeRecord, isTodoGroupAlias, isTodoBriefText, isTodoDocFields, isTodoGuessReason, isTodoId, isTodoMemoEntry, isTodoMemoText, isTodoSessionId, todoItemFieldValid, TODO_OPERATION_ERRORS, TODO_REVERT_BLOCKS, type TodoPlacementBasis, type TodoChangePlace, type TodoCaptured, TODO_ASK_PLACES, type TodoAskPlace, TODO_ASK_SOURCE_MESSAGES_MAX, TODO_BATCH_MAX, type TodoBatchStep, TODO_GROUP_COLOR_COUNT, TODO_TEMPLATE_NAME_MAX, TODO_ACKNOWLEDGE_MAX, TODO_IMAGE_EXTENSIONS, TODO_TITLE_MAX, WORK_MEMO_SECTIONS, TODO_START_KINDS, type TodoStartKind, type TodoAuthor, type TodoCompletion, type TodoDocKind, type TodoImageMediaType, type TodoOperationError, type TodoPriority, type TodoRevertBlock, type TodoState, type WorkMemoSection, type TodoDecision } from "./todo-model";
 export { BACKGROUND_ACTIVITY_LIST_MAX } from "./background-activity";
@@ -36,8 +37,8 @@ import type {
   WorkTotals,
 } from "./work-model";
 import type { EffectCoverage, ProjectedArtifactAccess } from "./artifact-access";
-import type { TimeBucket, TimeBucketView } from "./time-buckets";
-import { currentRunStart, runElapsedMs, type ChildTranscriptSpan, type Span } from "./spans";
+import type { AgentSpanView, TimeBucket, TimeBucketView } from "./time-buckets";
+import { currentRunStart, launchlessRunSpan, memberRunTimes, runElapsedMs, type ChildTranscriptSpan, type Span } from "./spans";
 import type { AnalysisFactsView, SummaryAnalysisView } from "./analysis-facts-view";
 import type { Coverage, ExecutionAttemptNode, SemanticModel, SemanticNode } from "./semantic-model";
 import type { L3Report, SerializationClassification } from "./l3-analysis";
@@ -59,6 +60,10 @@ export type IngestionPath = "live" | "history" | "snapshot";
 export interface EventProvenance {
   path: IngestionPath;
   unavailableFields?: string[];
+}
+
+export function isHistoryEvent(event: { provenance?: EventProvenance }): boolean {
+  return event.provenance?.path === "history";
 }
 
 export interface DelegationInfo {
@@ -694,6 +699,49 @@ export function summarizeToolInput(toolName: string, input: unknown): string | n
 export const HOST_ACTIONS = ["openSettings", "addClaudeModel"] as const;
 export type HostAction = (typeof HOST_ACTIONS)[number];
 
+export const SETTINGS_REVEAL_TARGETS = ["handoffAuto", "orchestration", "appearance"] as const;
+export type SettingsRevealTarget = (typeof SETTINGS_REVEAL_TARGETS)[number];
+export function isSettingsRevealTarget(v: unknown): v is SettingsRevealTarget {
+  return (SETTINGS_REVEAL_TARGETS as readonly unknown[]).includes(v);
+}
+
+export const WELCOME_SETTINGS = ["showNews", "showTips"] as const;
+export type WelcomeSetting = (typeof WELCOME_SETTINGS)[number];
+export type WelcomeSettings = Record<WelcomeSetting, boolean>;
+export interface WelcomeState extends WelcomeSettings { dismissedNewsVersion?: string }
+export interface WelcomeOpen { openedAt: number; roll: number; newsVersion?: string; tipId?: string }
+export type WelcomeTab = WelcomeOpen & WelcomeSettings;
+export interface WelcomeTipMark { id: string; index: number }
+export const WELCOME_TEXT_MAX = 64;
+
+export function isWelcomeText(v: unknown): v is string {
+  return typeof v === "string" && v.length > 0 && v.length <= WELCOME_TEXT_MAX;
+}
+
+export function isWelcomeTipMark(v: unknown): v is WelcomeTipMark {
+  if (typeof v !== "object" || v === null) return false;
+  const m = v as Record<string, unknown>;
+  return isWelcomeText(m.id) && typeof m.index === "number" && Number.isSafeInteger(m.index) && m.index >= 0 && hasOnlyKeys(m, ["id", "index"]);
+}
+
+function isWelcomeSettings(v: unknown, extraKeys: readonly string[] = []): v is WelcomeSettings {
+  if (typeof v !== "object" || v === null) return false;
+  const m = v as Record<string, unknown>;
+  return WELCOME_SETTINGS.every((key) => typeof m[key] === "boolean") && hasOnlyKeys(m, [...WELCOME_SETTINGS, ...extraKeys]);
+}
+
+function isWelcomeState(v: unknown): v is WelcomeState {
+  return isWelcomeSettings(v, ["dismissedNewsVersion"])
+    && ((v as Record<string, unknown>).dismissedNewsVersion === undefined || isWelcomeText((v as Record<string, unknown>).dismissedNewsVersion));
+}
+
+function isWelcomeTab(v: unknown): v is WelcomeTab {
+  if (!isWelcomeSettings(v, ["openedAt", "roll", "newsVersion", "tipId"])) return false;
+  const m = v as unknown as Record<string, unknown>;
+  return typeof m.openedAt === "number" && Number.isFinite(m.openedAt) && typeof m.roll === "number" && m.roll >= 0 && m.roll < 1
+    && (m.newsVersion === undefined || isWelcomeText(m.newsVersion)) && (m.tipId === undefined || isWelcomeText(m.tipId));
+}
+
 export const API_KEY_POLICIES = ["inherit", "subscriptionOnly"] as const;
 export type ApiKeyPolicy = (typeof API_KEY_POLICIES)[number];
 export function normalizeApiKeyPolicy(v: unknown): ApiKeyPolicy {
@@ -839,11 +887,13 @@ export type SettingsPageToHost =
   | { type: "setRestoreTabsOnStartup"; requestId: number; enabled: boolean }
   | { type: "setCliAutoUpdate"; requestId: number; executor: ExecutorId; enabled: boolean }
   | { type: "setEventLimit"; requestId: number; value: number }
+  | { type: "setTranscriptRetentionDays"; requestId: number; value: number | null }
   | { type: "setGuardEnabled"; requestId: number; enabled: boolean }
   | { type: "setMemoryBlockProjectType"; requestId: number; enabled: boolean }
   | { type: "setTodoEnabled"; requestId: number; enabled: boolean }
   | { type: "setEditSummaryEnabled"; requestId: number; enabled: boolean }
   | { type: "setRemoteControlCard"; requestId: number; enabled: boolean }
+  | { type: "setWelcomeSetting"; requestId: number; setting: WelcomeSetting; enabled: boolean }
   | { type: "setHandoffAutoSetting"; requestId: number; setting: HandoffAutoSettingName; value: boolean | number | string }
   | { type: "setOrchestrationSetting"; requestId: number; setting: "enabled" | "agents" | "conductorPolicy" | "externalTimeoutMinutes"; value: unknown }
   | { type: "setFileLinkSetting"; requestId: number; setting: FileLinkBooleanSetting; enabled: boolean }
@@ -873,7 +923,8 @@ export interface SettingsProfileProjection {
 export type HostToSettingsPage =
   | { type: "conductorPreview"; requestId: number; text: string; tokens: number }
   | { type: "recommendedRoster"; revision: string; changes: RecommendedRosterChange[] }
-  | ({ type: "settingsState"; appearance?: AccentSettings; displayName?: string; eventLimit?: number; composerSendKey: ComposerSendKey; apiKeyPolicy: ApiKeyPolicy; restoreTabsOnStartup: boolean; cliAutoUpdate: Record<ExecutorId, boolean>; initialModel?: string; autoContinueAtUsageLimit: boolean; guardEnabled: boolean; memoryBlockProjectType: boolean; todoEnabled: boolean; editSummaryEnabled: boolean; remoteControlCard: boolean; handoffAuto?: HandoffAutoSettings; reloadNeeded: boolean; replyTo?: number; writeFailure?: SettingWriteFailure }
+  | { type: "revealSetting"; target: SettingsRevealTarget }
+  | ({ type: "settingsState"; appearance?: AccentSettings; displayName?: string; eventLimit?: number; transcriptRetentionDays?: number; transcriptRetentionFallback: TranscriptRetentionFallback; composerSendKey: ComposerSendKey; apiKeyPolicy: ApiKeyPolicy; restoreTabsOnStartup: boolean; cliAutoUpdate: Record<ExecutorId, boolean>; initialModel?: string; autoContinueAtUsageLimit: boolean; guardEnabled: boolean; memoryBlockProjectType: boolean; todoEnabled: boolean; editSummaryEnabled: boolean; remoteControlCard: boolean; welcome?: WelcomeSettings; handoffAuto?: HandoffAutoSettings; reloadNeeded: boolean; replyTo?: number; writeFailure?: SettingWriteFailure }
     & SettingsProfileProjection & Record<FileLinkBooleanSetting, boolean> & { openWithSystemApp: string[] } & { orchestrationEnabled: boolean; orchestrationAgents: OrchestrationSettingRow[]; orchestrationDefaults: OrchestrationSettingRow[]; conductorPolicy: string; conductorPolicyDefault: string; externalTimeoutMinutes: number; externalDetection: Record<ExecutorId, ExternalDetection>; externalModels: ExternalModels });
 
 function isSettingsRequestId(v: unknown): v is number {
@@ -899,6 +950,9 @@ export function isSettingsPageToHost(v: unknown): v is SettingsPageToHost {
   if (t === "setEventLimit") {
     return isSettingsRequestId(m.requestId) && isEventLimit(m.value) && hasOnlyKeys(m, ["type", "requestId", "value"]);
   }
+  if (t === "setTranscriptRetentionDays") {
+    return isSettingsRequestId(m.requestId) && (m.value === null || isTranscriptRetentionDays(m.value)) && hasOnlyKeys(m, ["type", "requestId", "value"]);
+  }
   if (t === "setComposerSendKey") {
     return isSettingsRequestId(m.requestId)
       && (COMPOSER_SEND_KEYS as readonly string[]).includes(m.sendKey as string) && hasOnlyKeys(m, ["type", "requestId", "sendKey"]);
@@ -914,6 +968,10 @@ export function isSettingsPageToHost(v: unknown): v is SettingsPageToHost {
   }
   if (t === "setAutoContinueAtUsageLimit" || t === "setRestoreTabsOnStartup" || t === "setGuardEnabled" || t === "setMemoryBlockProjectType" || t === "setTodoEnabled" || t === "setEditSummaryEnabled" || t === "setRemoteControlCard") {
     return isSettingsRequestId(m.requestId) && typeof m.enabled === "boolean" && hasOnlyKeys(m, ["type", "requestId", "enabled"]);
+  }
+  if (t === "setWelcomeSetting") {
+    return isSettingsRequestId(m.requestId) && (WELCOME_SETTINGS as readonly unknown[]).includes(m.setting) && typeof m.enabled === "boolean"
+      && hasOnlyKeys(m, ["type", "requestId", "setting", "enabled"]);
   }
   if (t === "setHandoffAutoSetting") {
     return isSettingsRequestId(m.requestId) && isHandoffAutoSettingValue(m.setting, m.value) && hasOnlyKeys(m, ["type", "requestId", "setting", "value"]);
@@ -977,16 +1035,20 @@ export function isHostToSettingsPage(v: unknown): v is HostToSettingsPage {
   if (t === "conductorPreview") return hasOnlyKeys(m, ["type", "requestId", "text", "tokens"]) && isSettingsRequestId(m.requestId)
     && typeof m.text === "string" && typeof m.tokens === "number" && Number.isFinite(m.tokens);
   if (t === "recommendedRoster") return hasOnlyKeys(m, ["type", "revision", "changes"]) && isRosterRevision(m.revision) && Array.isArray(m.changes) && m.changes.every(isRecommendedRosterChange);
+  if (t === "revealSetting") return hasOnlyKeys(m, ["type", "target"]) && isSettingsRevealTarget(m.target);
   if (t === "settingsState") {
     return isSettingsProfiles(m) && (m.appearance === undefined || isAccentSettings(m.appearance))
       && (m.displayName === undefined || isDisplayName(m.displayName))
       && (m.eventLimit === undefined || isEventLimit(m.eventLimit))
+      && (m.transcriptRetentionDays === undefined || isTranscriptRetentionDays(m.transcriptRetentionDays))
+      && isTranscriptRetentionFallback(m.transcriptRetentionFallback)
       && (COMPOSER_SEND_KEYS as readonly string[]).includes(m.composerSendKey as string)
       && (API_KEY_POLICIES as readonly string[]).includes(m.apiKeyPolicy as string)
       && typeof m.restoreTabsOnStartup === "boolean" && isCliAutoUpdate(m.cliAutoUpdate)
       && (m.initialModel === undefined || typeof m.initialModel === "string")
       && typeof m.autoContinueAtUsageLimit === "boolean" && typeof m.guardEnabled === "boolean" && typeof m.memoryBlockProjectType === "boolean" && typeof m.todoEnabled === "boolean"
       && typeof m.editSummaryEnabled === "boolean" && typeof m.remoteControlCard === "boolean" && typeof m.reloadNeeded === "boolean"
+      && (m.welcome === undefined || isWelcomeSettings(m.welcome))
       && (m.handoffAuto === undefined || isHandoffAutoSettings(m.handoffAuto))
       && typeof m.orchestrationEnabled === "boolean" && typeof m.conductorPolicy === "string"
       && typeof m.conductorPolicyDefault === "string"
@@ -996,7 +1058,7 @@ export function isHostToSettingsPage(v: unknown): v is HostToSettingsPage {
       && Array.isArray(m.openWithSystemApp) && m.openWithSystemApp.every((item) => typeof item === "string")
       && (m.replyTo === undefined || isSettingsRequestId(m.replyTo))
       && (m.writeFailure === undefined || m.replyTo !== undefined && isSettingWriteFailure(m.writeFailure))
-      && hasOnlyKeys(m, ["type", "initialModel", "appearance", "displayName", "eventLimit", "composerSendKey", "apiKeyPolicy", "restoreTabsOnStartup", "cliAutoUpdate", "autoContinueAtUsageLimit", "guardEnabled", "memoryBlockProjectType", "todoEnabled", "editSummaryEnabled", "remoteControlCard", "handoffAuto", "reloadNeeded", ...FILE_LINK_SETTINGS, "orchestrationEnabled", "orchestrationAgents", "orchestrationDefaults", "conductorPolicy", "conductorPolicyDefault", "externalTimeoutMinutes", "externalDetection", "externalModels", "replyTo", "writeFailure", "conductorPreview", "recommendedRosterSame"]);
+      && hasOnlyKeys(m, ["type", "initialModel", "appearance", "displayName", "eventLimit", "transcriptRetentionDays", "transcriptRetentionFallback", "composerSendKey", "apiKeyPolicy", "restoreTabsOnStartup", "cliAutoUpdate", "autoContinueAtUsageLimit", "guardEnabled", "memoryBlockProjectType", "todoEnabled", "editSummaryEnabled", "remoteControlCard", "welcome", "handoffAuto", "reloadNeeded", ...FILE_LINK_SETTINGS, "orchestrationEnabled", "orchestrationAgents", "orchestrationDefaults", "conductorPolicy", "conductorPolicyDefault", "externalTimeoutMinutes", "externalDetection", "externalModels", "replyTo", "writeFailure", "conductorPreview", "recommendedRosterSame"]);
   }
   t satisfies never;
   return false;
@@ -1042,7 +1104,9 @@ export type WebviewToHost =
   | { type: "summarizeSession"; tabId: string }
   | { type: "suggestSessionName"; tabId: string }
   | { type: "openThemePicker" }
-  | { type: "runHostAction"; action: "openSettings" }
+  | { type: "runHostAction"; action: "openSettings"; target?: SettingsRevealTarget }
+  | { type: "welcomeAction"; action: "dismissNews"; version: string }
+  | { type: "welcomeAction"; action: "hideTips" }
   | { type: "runHostAction"; action: "addClaudeModel"; tabId: string }
   | { type: "requestAccountUsage"; tabId: string; requestId: string }
   | { type: "requestAccountUsage"; requestId: string }
@@ -1375,12 +1439,16 @@ export interface WorkAgentNode {
   endedAt?: number;
   elapsedMs: number;
   tokens?: number;
+  roleRun?: WorkAgentRunMeasures;
   childCount: number;
   failCount: number;
   revision: number;
   origin: WorkAgentOrigin;
+  launchUnknown?: true;
   children: WorkAgentNode[];
 }
+
+export interface WorkAgentRunMeasures { elapsedMs: number | null; tokens: number | null; cacheRead: number | null; outputTokens: number | null; tokensPartial?: boolean }
 
 export function subagentModel(agent: { modelMeasured?: string; modelDeclared?: string }): string | undefined {
   return agent.modelMeasured ?? agent.modelDeclared;
@@ -1388,8 +1456,18 @@ export function subagentModel(agent: { modelMeasured?: string; modelDeclared?: s
 
 export function withSubagentModels(view: TimeBucketView, agents: readonly WorkAgentNode[]): TimeBucketView {
   const models = new Map(agents.flatMap(agent => { const model = subagentModel(agent); return model === undefined ? [] : [[agent.toolUseId, model] as const]; }));
-  if (!view.agents.some(agent => models.has(agent.toolUseId) && models.get(agent.toolUseId) !== agent.model)) return view;
-  return { ...view, agents: view.agents.map(agent => { const model = models.get(agent.toolUseId); return model === undefined ? agent : { ...agent, model }; }) };
+  const stale = (list: readonly AgentSpanView[] | undefined) => (list ?? []).some(agent => models.has(agent.toolUseId) && models.get(agent.toolUseId) !== agent.model);
+  if (!stale(view.agents) && !stale(view.nestedAgents)) return view;
+  const modelled = (list: readonly AgentSpanView[]) => list.map(agent => { const model = models.get(agent.toolUseId); return model === undefined ? agent : { ...agent, model }; });
+  return { ...view, agents: modelled(view.agents), ...(view.nestedAgents === undefined ? {} : { nestedAgents: modelled(view.nestedAgents) }) };
+}
+
+export function launchedInGeneration(startedAt: number | undefined, generationBoundaryAt: number | undefined): boolean {
+  return generationBoundaryAt === undefined || startedAt !== undefined && startedAt >= generationBoundaryAt;
+}
+
+export function unknownLauncherAgents(agents: readonly WorkAgentNode[], generationBoundaryAt: number | undefined): WorkAgentNode[] {
+  return agents.filter(agent => agent.launchUnknown === true && launchedInGeneration(agent.startedAt, generationBoundaryAt));
 }
 
 export function flattenAgents(phases: readonly { agents: readonly WorkAgentNode[] }[], unlinkedAgents: readonly WorkAgentNode[] = []): WorkAgentNode[] {
@@ -1427,11 +1505,9 @@ export interface AgentInspectorOverview {
   instruction: string;
   modelMeasured?: string;
   effortMeasured?: string;
-  startedAt?: number;
-  endedAt?: number;
-  elapsedMs?: number;
   spawnedWithWorktree?: boolean;
   worktreeBranch?: string;
+  recordStartedAt?: number;
 }
 
 export interface AgentInspectorToolItem {
@@ -1543,6 +1619,7 @@ export interface RestoredAgent {
   effortMeasured?: string;
   startedAt?: number;
   endedAt?: number;
+  endedTurn?: true;
 }
 
 export interface WorkPhaseView extends WorkTotals {
@@ -1642,8 +1719,18 @@ export interface WorkEventInfo {
 export interface PlanContextStep {
   key: string; number: number; title: string; status: import("./work-model").TaskStatus; removed: boolean; startedAt: number | null; endedAt: number | null;
   period?: Pick<import("./plan-steps").PlanRowPeriod, "spans" | "running">;
-  // The step's routed Claude tokens (src/role-summary.ts#derivePlanPlacement); absent when the Host did not allocate them.
-  tokens?: import("./plan-usage").PlanTokenTotal | null;
+  tokens?: PlanContextTokens | null;
+  work?: PlanContextWork;
+}
+
+export interface PlanContextTokens { tokens: number; cacheRead: number | null; partial?: boolean }
+
+export interface PlanContextWork { ms: number | null; partial?: boolean; provisional?: boolean }
+
+export interface PlanContextExternalRun {
+  toolUseId?: string; role: string; title: string; startedAt: number | null; durationMs: number | null;
+  outcome: import("./orchestration-executors").ExternalRunOutcome | null; running: boolean;
+  tokens: number | null; cacheRead: number | null; stepKey: string | null;
 }
 
 // stepKey null: the lane is not on a step of this PLAN. agentId names a delegation's subagent for lanes known only by it.
@@ -1652,8 +1739,11 @@ export interface PlanContextPlacement { toolUseId: string; agentId?: string; ste
 export interface PlanContext {
   blockId: string; start: number; end: number; durationMs?: number | null; workEndedAt?: number; provisional?: boolean; blockRunning?: boolean; text: string; goal?: string; running: boolean; steps?: PlanContextStep[];
   placements?: PlanContextPlacement[];
-  tokens?: import("./plan-usage").PlanTokenTotal | null;
-  external?: import("./plan-usage").PlanTokenTotal | null;
+  tokens?: PlanContextTokens | null;
+  work?: PlanContextWork | null;
+  external?: PlanContextTokens | null;
+  externalRuns?: PlanContextExternalRun[];
+  counted?: string[];
 }
 
 export interface WorkModelPayload {
@@ -1663,6 +1753,9 @@ export interface WorkModelPayload {
   planHistoryLostThrough?: number;
   planContext?: PlanContext;
   earlierPlans?: PlanContext[];
+  blockTotals?: import("./role-summary").BlockTokenTotals[];
+  unknownLaunchers?: Array<{ turnId: string; toolUseIds: string[] }>;
+  externalRuns?: Array<{ label: string; run: import("./role-summary").RoleRunView }>;
   planTools?: Array<{ id: string; name: string; description: string; startedAt: number; intentInput?: ToolIntentInput }>;
   runningMainTools?: Array<{ id: string; name: string; startedAt: number; intentInput?: ToolIntentInput }>;
   version: number;
@@ -1817,10 +1910,17 @@ export interface SemanticModelPayload extends Omit<SemanticModel, "nodes" | "pro
 export interface TimeBucketsCoverage {
   sessionReadError?: string;
   subagentReadError?: string;
-  transcriptReadFailureCount?: number;
-  omittedTranscriptCount?: number;
-  malformedMetaCount?: number;
+  unreadSubagentCount?: number;
   ancestorUsageReadError?: string;
+}
+
+export function subagentDetailUnreadCount(gaps: { unreadableAgentCount?: number; usagePendingTranscriptCount?: number; usageOnlyTranscriptCount?: number }): number {
+  return (gaps.unreadableAgentCount ?? 0) + (gaps.usagePendingTranscriptCount ?? 0) + (gaps.usageOnlyTranscriptCount ?? 0);
+}
+
+export function timeBucketsCoverageDegraded(coverage: TimeBucketsCoverage | undefined): boolean {
+  return coverage !== undefined && (coverage.sessionReadError !== undefined || coverage.subagentReadError !== undefined
+    || coverage.ancestorUsageReadError !== undefined || (coverage.unreadSubagentCount ?? 0) > 0);
 }
 
 export function displayedAncestorUsageGap(coverage: { ancestorUsageReadError?: string; ancestorUsageReachesGeneration?: true }): string | undefined {
@@ -1834,9 +1934,7 @@ export function isTimeBucketsCoverage(v: unknown): v is TimeBucketsCoverage {
     isOptionalString(c.sessionReadError) &&
     isOptionalString(c.subagentReadError) &&
     isOptionalString(c.ancestorUsageReadError) &&
-    (c.transcriptReadFailureCount === undefined || isNumber(c.transcriptReadFailureCount)) &&
-    (c.omittedTranscriptCount === undefined || isNumber(c.omittedTranscriptCount)) &&
-    (c.malformedMetaCount === undefined || isNumber(c.malformedMetaCount))
+    (c.unreadSubagentCount === undefined || isNumber(c.unreadSubagentCount))
   );
 }
 
@@ -1880,6 +1978,7 @@ function restoredToNode(agent: RestoredAgent): WorkAgentNode {
       : 0;
   return {
     agentId: agent.agentId,
+    transcriptAgentId: agent.agentId,
     parentAgentId: agent.parentAgentId,
     toolUseId: agent.toolUseId,
     parentToolUseId: null,
@@ -1932,6 +2031,18 @@ function findCyclicRestoredIds(restoredAgents: readonly RestoredAgent[]): Set<st
 
 function childSpanIndex(childSpans: readonly ChildTranscriptSpan[] | undefined): Map<string, ChildTranscriptSpan> {
   return new Map((childSpans ?? []).map(span => [span.toolUseId, span]));
+}
+
+function unknownLauncherRequests(state: WorkModelState, restoredAgents: readonly RestoredAgent[]): Pick<WorkModelPayload, "unknownLaunchers"> {
+  const byRequest = new Map<string, string[]>();
+  for (const agent of restoredAgents) {
+    const placement = findToolPlacement(state, agent.toolUseId);
+    if (!placement?.launchUnknown) continue;
+    const index = placement.requestIndex;
+    const turnId = index === undefined ? undefined : state.requests?.[index - (state.requestOffset ?? 0)]?.turnIds[0];
+    if (turnId !== undefined) byRequest.set(turnId, [...byRequest.get(turnId) ?? [], agent.toolUseId]);
+  }
+  return byRequest.size === 0 ? {} : { unknownLaunchers: [...byRequest].map(([turnId, toolUseIds]) => ({ turnId, toolUseIds })) };
 }
 
 export function projectWorkModel(
@@ -2047,7 +2158,12 @@ export function projectWorkModel(
     .slice()
     .sort((a, b) => a.spawnDepth - b.spawnDepth);
   for (const agent of pending) {
-    const node = restoredToNode(agent);
+    const launcher = findToolPlacement(state, agent.toolUseId);
+    const span = launcher?.launchUnknown ? launchlessRunSpan(childOf.get(agent.toolUseId), agent) : undefined;
+    const node: WorkAgentNode = { ...restoredToNode(agent),
+      ...(launcher?.launchUnknown ? { launchUnknown: true, childCount: launcher.childCount ?? 0, failCount: launcher.failCount ?? 0,
+        ...(agent.endedTurn ? { status: "completed" as const } : {}),
+        ...(span === undefined ? {} : { startedAt: span.start, endedAt: span.end, elapsedMs: runElapsedMs(memberRunTimes(span)) }) } : {}) };
     nodeByKey.set(agent.agentId, node);
     const parent =
       agent.parentAgentId === null || cyclicRestoredIds.has(agent.agentId)
@@ -2086,6 +2202,7 @@ export function projectWorkModel(
     ambiguity: state.ambiguity,
     phases,
     unlinkedAgents,
+    ...unknownLauncherRequests(state, restoredAgents),
     tasks: taskItemViews(state, planBlocks),
     taskTotals: state.phases
       .filter((phase) => phase.taskKey !== undefined)
@@ -2275,6 +2392,8 @@ function isWorkCoverage(v: unknown): v is WorkCoverage {
     (c.untrackedApprovalCount === undefined || isNumber(c.untrackedApprovalCount)) &&
     (c.untrackedBackgroundCount === undefined || isNumber(c.untrackedBackgroundCount)) &&
     (c.unreadableAgentCount === undefined || isNumber(c.unreadableAgentCount)) &&
+    (c.usageOnlyTranscriptCount === undefined || isNumber(c.usageOnlyTranscriptCount)) &&
+    (c.usagePendingTranscriptCount === undefined || isNumber(c.usagePendingTranscriptCount)) &&
     (c.depthLimitedAgentCount === undefined || isNumber(c.depthLimitedAgentCount)) &&
     (c.hierarchyIncomplete === undefined || c.hierarchyIncomplete === true) &&
     isOptionalString(c.ancestorUsageReadError) &&
@@ -2328,14 +2447,24 @@ function isWorkAgentNode(v: unknown, depth = 0): v is WorkAgentNode {
     endedAt: () => a.endedAt === undefined || isNumber(a.endedAt),
     elapsedMs: () => isNumber(a.elapsedMs),
     tokens: () => a.tokens === undefined || isNumber(a.tokens),
+    roleRun: () => a.roleRun === undefined || isWorkAgentRunMeasures(a.roleRun),
     childCount: () => isNumber(a.childCount),
     failCount: () => isNumber(a.failCount),
     revision: () => isNumber(a.revision),
     origin: () => a.origin === "live" || a.origin === "restored",
+    launchUnknown: () => a.launchUnknown === undefined || a.launchUnknown === true,
     children: () => (Array.isArray(a.children)) && ((a.children as unknown[]).every((child) => isWorkAgentNode(child, depth + 1))),
     transcriptAgentId: () => true,
   };
   return Object.values(checks).every(check => check());
+}
+
+function isWorkAgentRunMeasures(v: unknown): boolean {
+  if (typeof v !== "object" || v === null) return false;
+  const r = v as Record<string, unknown>;
+  const count = (x: unknown) => x === null || isNumber(x) && (x as number) >= 0;
+  return count(r.elapsedMs) && count(r.tokens) && count(r.cacheRead) && count(r.outputTokens)
+    && (r.tokensPartial === undefined || typeof r.tokensPartial === "boolean");
 }
 
 function isWorkPhaseView(v: unknown): v is WorkPhaseView {
@@ -2388,6 +2517,11 @@ export function isWorkModelPayload(v: unknown): v is WorkModelPayload {
     planHistoryLostThrough: () => m.planHistoryLostThrough === undefined || isNumber(m.planHistoryLostThrough),
     planContext: () => m.planContext === undefined || isPlanContext(m.planContext),
     earlierPlans: () => m.earlierPlans === undefined || isArrayOf(m.earlierPlans, isPlanContext),
+    blockTotals: () => m.blockTotals === undefined || isArrayOf(m.blockTotals, isBlockTokenTotals),
+    unknownLaunchers: () => m.unknownLaunchers === undefined || isArrayOf(m.unknownLaunchers, value => typeof value === "object" && value !== null
+      && typeof (value as Record<string, unknown>).turnId === "string" && isArrayOf((value as Record<string, unknown>).toolUseIds, item => typeof item === "string")),
+    externalRuns: () => m.externalRuns === undefined || isArrayOf(m.externalRuns, value => !!value && typeof value === "object"
+      && typeof (value as { label?: unknown }).label === "string" && isRoleRunView((value as { run?: unknown }).run)),
     runningMainTools: () => m.runningMainTools === undefined || isArrayOf(m.runningMainTools, isRunningMainToolView),
     planTools: () => m.planTools === undefined || isArrayOf(m.planTools, isPlanToolView),
     version: () => isNumber(m.version),
@@ -2415,7 +2549,41 @@ function isPlanContextStep(value: unknown): boolean {
     startedAt: () => row.startedAt === null || isNumber(row.startedAt),
     endedAt: () => row.endedAt === null || isNumber(row.endedAt),
     period: () => row.period === undefined || isPlanStepPeriod(row.period),
-    tokens: () => row.tokens === undefined || row.tokens === null || isPlanTokenTotal(row.tokens),
+    tokens: () => row.tokens === undefined || row.tokens === null || isPlanContextTokens(row.tokens),
+    work: () => row.work === undefined || isPlanContextWork(row.work),
+  };
+  return Object.values(checks).every(check => check());
+}
+
+function isPlanContextWork(value: unknown): boolean {
+  if (!value || typeof value !== "object") return false;
+  const row = value as Record<string, unknown>;
+  return (row.ms === null || isNumber(row.ms) && (row.ms as number) >= 0) && (row.partial === undefined || typeof row.partial === "boolean") &&
+    (row.provisional === undefined || typeof row.provisional === "boolean");
+}
+
+function isPlanContextTokens(value: unknown): boolean {
+  if (!value || typeof value !== "object") return false;
+  const row = value as Record<string, unknown>;
+  return isNumber(row.tokens) && (row.tokens as number) >= 0 && (row.cacheRead === null || isNumber(row.cacheRead) && (row.cacheRead as number) >= 0)
+    && (row.partial === undefined || typeof row.partial === "boolean");
+}
+
+function isPlanContextExternalRun(value: unknown): boolean {
+  if (!value || typeof value !== "object") return false;
+  const row = value as Record<string, unknown>;
+  const count = (x: unknown) => x === null || isNumber(x) && (x as number) >= 0;
+  const checks: { [K in keyof PlanContextExternalRun]-?: () => boolean } = {
+    toolUseId: () => row.toolUseId === undefined || typeof row.toolUseId === "string",
+    role: () => typeof row.role === "string",
+    title: () => typeof row.title === "string",
+    startedAt: () => row.startedAt === null || isNumber(row.startedAt),
+    durationMs: () => count(row.durationMs),
+    outcome: () => row.outcome === null || isExternalRunOutcome(row.outcome),
+    running: () => typeof row.running === "boolean",
+    tokens: () => count(row.tokens),
+    cacheRead: () => count(row.cacheRead),
+    stepKey: () => row.stepKey === null || typeof row.stepKey === "string",
   };
   return Object.values(checks).every(check => check());
 }
@@ -2455,8 +2623,11 @@ function isPlanContext(value: unknown): boolean {
     typeof row.running === "boolean" &&
     (row.steps === undefined || isArrayOf(row.steps, isPlanContextStep)) &&
     (row.placements === undefined || isArrayOf(row.placements, isPlanContextPlacement)) &&
-    (row.tokens === undefined || row.tokens === null || isPlanTokenTotal(row.tokens)) &&
-    (row.external === undefined || row.external === null || isPlanTokenTotal(row.external))
+    (row.tokens === undefined || row.tokens === null || isPlanContextTokens(row.tokens)) &&
+    (row.work === undefined || row.work === null || isPlanContextWork(row.work)) &&
+    (row.external === undefined || row.external === null || isPlanContextTokens(row.external)) &&
+    (row.externalRuns === undefined || isArrayOf(row.externalRuns, isPlanContextExternalRun)) &&
+    (row.counted === undefined || isArrayOf(row.counted, value => typeof value === "string"))
   );
 }
 
@@ -3146,6 +3317,9 @@ function isTimeBucketsPayload(v: unknown): boolean {
   const { blocks, agents, backgroundTasks, bars, main, intervals, tail } = v as Record<string, unknown>;
   const checks: { [K in keyof TimeBucketView]-?: () => boolean } = {
     subagentOnlySpans: () => (v as TimeBucketView).subagentOnlySpans === undefined || isSpanList((v as TimeBucketView).subagentOnlySpans),
+    mainToolCallSpans: () => (v as TimeBucketView).mainToolCallSpans === undefined,
+    backgroundOnlySpans: () => (v as TimeBucketView).backgroundOnlySpans === undefined || isSpanList((v as TimeBucketView).backgroundOnlySpans),
+    unmeasuredSpans: () => (v as TimeBucketView).unmeasuredSpans === undefined || isSpanList((v as TimeBucketView).unmeasuredSpans),
     generationBoundaryAt: () => (v as TimeBucketView).generationBoundaryAt === undefined || isNumber((v as TimeBucketView).generationBoundaryAt),
     bars: () => isTimeBarsView(bars),
     main: () => main === undefined || isTimeMainView(main),
@@ -3170,6 +3344,9 @@ function isTimeBucketsPayload(v: unknown): boolean {
     agents: () => agents === undefined || isArrayOf(agents, agents === backgroundTasks ? isTimeBackgroundTaskView : isTimeAgentView),
     backgroundTasks: () => backgroundTasks === undefined || isArrayOf(backgroundTasks, isTimeBackgroundTaskView),
     externalRunCalls: () => (v as TimeBucketView).externalRunCalls === undefined || isArrayOf((v as TimeBucketView).externalRunCalls, isTimeExternalRunCallView),
+    nestedAgents: () => (v as TimeBucketView).nestedAgents === undefined || isArrayOf((v as TimeBucketView).nestedAgents, isTimeAgentView),
+    nestedExternalRuns: () => (v as TimeBucketView).nestedExternalRuns === undefined || isArrayOf((v as TimeBucketView).nestedExternalRuns, isTimeExternalRunCallView),
+    unknownLaunchers: () => (v as TimeBucketView).unknownLaunchers === undefined || isArrayOf((v as TimeBucketView).unknownLaunchers, isTimeAgentView),
     droppedIntervalCount: () => true,
     droppedBlockCount: () => true,
   };
@@ -3187,6 +3364,8 @@ function isTimeMainView(v: unknown): boolean {
     confirmMs: () => true,
     replyMs: () => true,
     subOnlyMs: () => true,
+    backgroundOnlyMs: () => main.backgroundOnlyMs === undefined || main.backgroundOnlyMs === null || duration(main.backgroundOnlyMs),
+    unmeasuredMs: () => main.unmeasuredMs === undefined,
     spanMs: () => true,
   };
   return Object.values(checks).every(check => check());
@@ -3229,6 +3408,7 @@ function isTimeExternalRunCallView(v: unknown): boolean {
     start: () => isNumber(call.start),
     end: () => isNumber(call.end) && (call.end as number) >= (call.start as number),
     open: () => typeof call.open === "boolean",
+    parentToolUseId: () => call.parentToolUseId === undefined || typeof call.parentToolUseId === "string",
   };
   return Object.values(checks).every(check => check());
 }
@@ -3265,10 +3445,9 @@ function isTimeRequestBlockView(v: unknown): boolean {
     }),
     kind: () => {
       if (block.kind !== undefined && !["say", "command", "interrupt", "plan"].includes(block.kind as string)) return false;
-      return !(block.kind === "plan" && (!isArrayOf(block.steps, isPlanBlockStep) || !isArrayOf(block.userMessages, isPlanBlockMarker) || !isPlanBlockMetrics(block.metrics)));
+      return !(block.kind === "plan" && (!isArrayOf(block.steps, isPlanBlockStep) || !isPlanBlockMetrics(block.metrics)));
     },
     goal: () => block.goal === undefined || typeof block.goal === "string",
-    closedAt: () => block.closedAt === undefined || isNumber(block.closedAt),
     workEndedAt: () => block.workEndedAt === undefined || isNumber(block.workEndedAt),
     steps: () => block.steps === undefined || isArrayOf(block.steps, isPlanBlockStep),
     conductorIntervals: () => block.conductorIntervals === undefined || isArrayOf(block.conductorIntervals, isTimeIntervalView),
@@ -3279,14 +3458,12 @@ function isTimeRequestBlockView(v: unknown): boolean {
       return isNumber(span.start) && isNumber(span.end) && (span.turnId === undefined || typeof span.turnId === "string")
         && Array.isArray(span.keys) && span.keys.every(key => typeof key === "string");
     }),
-    userMessages: () => block.userMessages === undefined || isArrayOf(block.userMessages, isPlanBlockMarker),
     metrics: () => block.metrics === undefined || isPlanBlockMetrics(block.metrics),
     requestNumber: () => block.requestNumber === undefined || block.requestNumber === null ||
       typeof block.requestNumber === "string" && /^\d+$/.test(block.requestNumber),
     processingMs: () => block.processingMs === undefined || block.processingMs === null ||
       isNumber(block.processingMs) && (block.processingMs as number) >= 0,
     subagentWaitMs: () => block.subagentWaitMs === undefined || duration(block.subagentWaitMs),
-    strip: () => block.strip === undefined || block.strip === null || isTimeRequestStrip(block.strip),
     blockId: () => true,
     text: () => true,
     start: () => true,
@@ -3310,27 +3487,17 @@ function isTimeBarsView(v: unknown): boolean {
   if (typeof v !== "object" || v === null || Array.isArray(v)) return false;
   const b = v as Record<string, unknown>;
   const duration = (x: unknown) => isNumber(x) && (x as number) >= 0;
-  const { totalMs, mainMs, toolMs } = b;
+  const { totalMs, mainMs, cumulativeMs } = b;
   const checks: { [K in keyof TimeBucketView["bars"]]-?: () => boolean } = {
     totalMs: () => totalMs === null || duration(totalMs),
     mainMs: () => mainMs === null || duration(mainMs),
-    toolMs: () => toolMs === null || duration(toolMs),
     subMs: () => duration(b.subMs),
+    cumulativeMs: () => cumulativeMs === null || duration(cumulativeMs),
   };
   return Object.values(checks).every(check => check());
 }
 
-function isPlanBlockMarker(v: unknown): boolean {
-  if (typeof v !== "object" || v === null || Array.isArray(v)) return false;
-  const marker = v as Record<string, unknown>;
-  const checks: { [K in keyof NonNullable<TimeBucketView["blocks"][number]["userMessages"]>[number]]-?: () => boolean } = {
-    at: () => (isNumber(marker.at)) && ((marker.at as number) >= 0),
-    text: () => typeof marker.text === "string",
-  };
-  return Object.values(checks).every(check => check());
-}
-
-function isPlanBlockMetrics(v: unknown): boolean {
+function isPlanBlockMetrics(v: unknown, withTokens = true): boolean {
   if (typeof v !== "object" || v === null || Array.isArray(v)) return false;
   const m = v as Record<string, unknown>;
   const duration = (x: unknown) => x === null || isNumber(x) && (x as number) >= 0;
@@ -3340,14 +3507,15 @@ function isPlanBlockMetrics(v: unknown): boolean {
     duration(m.toolMs) &&
     duration(m.subagentWaitMs) &&
     duration(m.subagentOnlyMs) &&
+    (m.backgroundOnlyMs === undefined || duration(m.backgroundOnlyMs)) &&
     duration(m.decisionWaitMs) &&
     duration(m.replyWaitMs) &&
-    (m.tokens === null || isPlanTokenTotal(m.tokens))
+    (!withTokens || m.tokens === null || isPlanTokenTotal(m.tokens))
   );
 }
 
 function isPlanBlockStep(v: unknown): boolean {
-  if (!isPlanBlockMetrics(v)) return false;
+  if (!isPlanBlockMetrics(v, false)) return false;
   const step = v as Record<string, unknown>;
   const at = (x: unknown) => x === null || isNumber(x) && (x as number) >= 0;
   return (
@@ -3384,15 +3552,18 @@ function isRoleRunView(v: unknown): boolean {
     isNullableString(r.model) && isValueSource(r.modelSource) &&
     isNullableString(r.effort) && isValueSource(r.effortSource) &&
     typeof r.variantLabel === "string" &&
-    isNumber(r.shade) &&
     isNullableNumber(r.startedAt) &&
     typeof r.running === "boolean" &&
     (r.outcome === null || isExternalRunOutcome(r.outcome)) &&
+    (r.cwd === undefined || typeof r.cwd === "string") &&
     isNullableNumber(r.durationMs) && isNullableNumber(r.tokens) &&
     (r.durationPartial === undefined || typeof r.durationPartial === "boolean") &&
     (r.tokensPartial === undefined || typeof r.tokensPartial === "boolean") &&
     isNullableNumber(r.timePercent) && isNullableNumber(r.tokenPercent) &&
-    (r.count === undefined || Number.isSafeInteger(r.count) && (r.count as number) > 0)
+    (r.count === undefined || Number.isSafeInteger(r.count) && (r.count as number) > 0) &&
+    (r.kinds === undefined || isArrayOf(r.kinds, kind => typeof kind === "object" && kind !== null &&
+      isNullableNumber((kind as Record<string, unknown>).ms) && isNullableNumber((kind as Record<string, unknown>).percent)) &&
+      (r.kinds as unknown[]).length === MAIN_PROCESSING_BUCKETS.length)
   );
 }
 
@@ -3417,16 +3588,23 @@ function isTokenDisplay(v: unknown): boolean {
 function isAnalysisTimeView(v: unknown): boolean {
   if (typeof v !== "object" || v === null) return false;
   const t = v as Record<string, unknown>;
-  return isNullableNumber(t.totalMs) && typeof t.partial === "boolean" && Array.isArray(t.parts) && t.parts.length === 6 &&
+  return isNullableNumber(t.totalMs) && typeof t.partial === "boolean" && Array.isArray(t.parts) && t.parts.length === ANALYSIS_TIME_PART_KEYS.length &&
     t.parts.every(part => typeof part === "object" && part !== null && isNullableNumber(part.ms) && isNullableNumber(part.percent) &&
       (part.partial === undefined || typeof part.partial === "boolean"));
+}
+
+function isBlockTokenTotals(value: unknown): boolean {
+  if (typeof value !== "object" || value === null) return false;
+  const b = value as Record<string, unknown>;
+  const tokens = (x: unknown) => x === null || isPlanContextTokens(x);
+  return typeof b.blockId === "string" && tokens(b.claude) && tokens(b.external) && tokens(b.total) && (b.work === undefined || isPlanContextWork(b.work));
 }
 
 function isAnalysisPlansView(v: unknown): v is AnalysisPlansView {
   if (typeof v !== "object" || v === null) return false;
   const a = v as Record<string, unknown>;
   const keys = new Set<string>();
-  return isAnalysisTimeView(a.time) && isNullableNumber(a.mainTokens) && isTokenDisplay(a.tokens) && isRoleSummaryView(a.roles) && isFailureSummaryView(a.failures) &&
+  return isAnalysisTimeView(a.time) && isNullableNumber(a.mainTokens) && isRoleSummaryView(a.roles) && isFailureSummaryView(a.failures) &&
     isArrayOf(a.plans, value => {
       if (typeof value !== "object" || value === null) return false;
       const p = value as Record<string, unknown>;
@@ -3436,7 +3614,7 @@ function isAnalysisPlansView(v: unknown): v is AnalysisPlansView {
         typeof p.title === "string" && typeof p.number === "string" && /^\d{2,}$/.test(p.number) &&
         isNullableNumber(p.start) && isNullableNumber(p.end) && typeof p.running === "boolean" && typeof p.provisional === "boolean" && isAnalysisTimeView(p.time) &&
         isNullableNumber(p.timeWidthPercent) && isNullableNumber(p.tokenWidthPercent) && isTokenDisplay(p.tokens) &&
-        typeof p.tokensPartial === "boolean" && isRoleSummaryView(p.roles) && isFailureSummaryView(p.failures);
+        typeof p.tokensPartial === "boolean" && isRoleSummaryView(p.roles) && isFailureSummaryView(p.failures) && isSpanList(p.backgroundOnlySpans);
     });
 }
 
@@ -3535,7 +3713,6 @@ export interface LlmAnalysisRunProgress {
 }
 
 export type HostToWebview =
-  | { type: "planUsage"; tabId: string; state: import("./plan-usage").PlanUsage }
   | { type: "orchestrationView"; tabId: string; state: OrchestrationView }
   | { type: "init"; protocolVersion: number; tabs: TabSnapshot[]; hostWindows?: boolean; systemAppExtensions?: string[] }
   | { type: "events"; tabId: string; events: NormalizedEvent[] }
@@ -3629,7 +3806,7 @@ export type HostToWebview =
   | { type: "workModel"; tabId: string; model: WorkModelPayload }
   | { type: "semanticModel"; tabId: string; model: SemanticModelPayload }
   | { type: "llmAnalysisSetting"; enabled: boolean }
-  | { type: "userSettings"; appearance?: AccentSettings; displayName?: string; composerSendKey: ComposerSendKey; askQualityCheck?: boolean; editSummaryEnabled: boolean; remoteControlCard?: boolean }
+  | { type: "userSettings"; appearance?: AccentSettings; displayName?: string; composerSendKey: ComposerSendKey; askQualityCheck?: boolean; editSummaryEnabled: boolean; remoteControlCard?: boolean; welcome?: WelcomeState }
   | { type: "remoteControlState"; tabId: string; state: RemoteControlView }
   | { type: "tabNotice"; tabId: string; text: string }
   | {
@@ -3875,9 +4052,9 @@ export interface ConversationSnapshot {
   resumeSessionId?: string;
   resumeFilePath?: string;
   handoffSource?: HandoffSourceSnapshot;
+  welcome?: WelcomeTab;
   resumeHydration?: ResumeHydrationSnapshotState;
   workModel?: WorkModelPayload;
-  planUsage?: import("./plan-usage").PlanUsage;
   semanticView?: boolean;
   semanticModel?: SemanticModelPayload;
   llmAnalysisEnabled?: boolean;
@@ -4039,7 +4216,12 @@ export function isWebviewToHost(v: unknown): v is WebviewToHost {
     if (!(HOST_ACTIONS as readonly string[]).includes(action as string)) return false;
     if (action === "addClaudeModel") return typeof tabId === "string" && tabId.length > 0
       && Object.keys(m).every((key) => key === "type" || key === "action" || key === "tabId");
-    return Object.keys(m).every((key) => key === "type" || key === "action");
+    return (m.target === undefined || isSettingsRevealTarget(m.target)) && hasOnlyKeys(m, ["type", "action", "target"]);
+  }
+  if (t === "welcomeAction") {
+    const m = v as Record<string, unknown>;
+    if (m.action === "dismissNews") return isWelcomeText(m.version) && hasOnlyKeys(m, ["type", "action", "version"]);
+    return m.action === "hideTips" && hasOnlyKeys(m, ["type", "action"]);
   }
   if (t === "accountUsagePanelClosed") return Object.keys(v).every((key) => key === "type");
   if (t === "requestAccountUsage") {
@@ -5155,12 +5337,6 @@ export function isHostToWebview(v: unknown): v is HostToWebview {
   const t = (v as { type?: unknown }).type as HostToWebview["type"];
   const tabId = (v as { tabId?: unknown }).tabId;
 
-  if (t === "planUsage") {
-    return typeof tabId === "string" && Object.keys(v).length === 3
-      && hasOnlyKeys(v as Record<string, unknown>, ["type", "tabId", "state"])
-      && isPlanUsage((v as { state?: unknown }).state);
-  }
-
   if (t === "orchestrationView") {
     return typeof tabId === "string" && hasOnlyKeys(v as Record<string, unknown>, ["type", "tabId", "state"])
       && isOrchestrationView((v as { state?: unknown }).state);
@@ -5416,7 +5592,8 @@ export function isHostToWebview(v: unknown): v is HostToWebview {
       && (COMPOSER_SEND_KEYS as readonly string[]).includes((v as { composerSendKey?: unknown }).composerSendKey as string)
       && [undefined, true, false].includes((v as { askQualityCheck?: unknown }).askQualityCheck as boolean | undefined)
       && typeof (v as { editSummaryEnabled?: unknown }).editSummaryEnabled === "boolean"
-      && [undefined, true, false].includes((v as { remoteControlCard?: unknown }).remoteControlCard as boolean | undefined);
+      && [undefined, true, false].includes((v as { remoteControlCard?: unknown }).remoteControlCard as boolean | undefined)
+      && ((v as { welcome?: unknown }).welcome === undefined || isWelcomeState((v as { welcome?: unknown }).welcome));
   }
   if (t === "remoteControlState") {
     const m = v as Record<string, unknown>;
@@ -5840,7 +6017,6 @@ function isConversationSnapshot(value: unknown): boolean {
     auth: () => s.auth === null || typeof s.auth === "object",
     permissionMode: () => isPermissionModeId(s.permissionMode),
     workModel: () => s.workModel === undefined || isWorkModelPayload(s.workModel),
-    planUsage: () => s.planUsage === undefined || isPlanUsage(s.planUsage),
     semanticView: () => s.semanticView === undefined || typeof s.semanticView === "boolean",
     semanticModel: () => s.semanticModel === undefined || isSemanticModelPayload(s.semanticModel),
     effortOverride: () => s.effortOverride === undefined || s.effortOverride === null || typeof s.effortOverride === "string",
@@ -5861,6 +6037,7 @@ function isConversationSnapshot(value: unknown): boolean {
     backgroundActivity: () => s.backgroundActivity === undefined || isBackgroundActivitySnapshot(s.backgroundActivity),
     autoResumeAt: () => s.autoResumeAt === undefined || s.autoResumeAt === null || isNumber(s.autoResumeAt),
     remoteControl: () => s.remoteControl === undefined || isRemoteControlView(s.remoteControl),
+    welcome: () => s.welcome === undefined || isWelcomeTab(s.welcome),
     handoffSource: () => s.handoffSource === undefined || isHandoffSource(s.handoffSource),
     events: () => (Array.isArray(s.events)) && ((s.events as unknown[]).every(isPlausibleNormalizedEvent)),
     configModel: () => true,
@@ -5960,7 +6137,8 @@ function isAgentInspectorOverview(value: unknown): boolean {
   const row = value as Record<string, unknown>;
   return (
     typeof row.description === "string" &&
-    typeof row.instruction === "string"
+    typeof row.instruction === "string" &&
+    (row.recordStartedAt === undefined || isNumber(row.recordStartedAt))
   );
 }
 
@@ -5982,25 +6160,12 @@ function isTimeAgentView(value: unknown): boolean {
     subagentType: () => true,
     model: () => true,
     transcriptAgentId: () => true,
+    parentToolUseId: () => row.parentToolUseId === undefined || typeof row.parentToolUseId === "string",
     toolCount: () => true,
     failCount: () => true,
     toolMs: () => true,
     generateMs: () => true,
     endSource: () => true,
-  };
-  return Object.values(checks).every(check => check());
-}
-
-function isTimeRequestStrip(value: unknown): boolean {
-  if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
-  const row = value as Record<string, unknown>;
-  const checks: { [K in keyof NonNullable<TimeBucketView["blocks"][number]["strip"]>]-?: () => boolean } = {
-    generatePercent: () => (isNumber(row.generatePercent)) && ((row.generatePercent as number) >= 0) && ((row.generatePercent as number) <= 100),
-    toolPercent: () => (isNumber(row.toolPercent)) && ((row.toolPercent as number) >= 0) && ((row.toolPercent as number) <= 100),
-    subagentWaitPercent: () => (isNumber(row.subagentWaitPercent)) && ((row.subagentWaitPercent as number) >= 0) && ((row.subagentWaitPercent as number) <= 100),
-    confirmPercent: () => (isNumber(row.confirmPercent)) && ((row.confirmPercent as number) >= 0) && ((row.confirmPercent as number) <= 100),
-    replyPercent: () => (isNumber(row.replyPercent)) && ((row.replyPercent as number) >= 0) && ((row.replyPercent as number) <= 100),
-    remainderPercent: () => (isNumber(row.remainderPercent)) && ((row.remainderPercent as number) >= 0) && ((row.remainderPercent as number) <= 100),
   };
   return Object.values(checks).every(check => check());
 }

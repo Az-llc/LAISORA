@@ -8,7 +8,7 @@ import { openEditDiff } from "./edit-diff-host";
 import { handleHandoffMessage, noteComposerDrafts } from "./handoff-wiring";
 import { handleResumeMessage } from "./resume-hydration";
 import { handleSurfaceMessage, reorderSessionTabs } from "./store-surfaces";
-import { runHostActionMessage, userSettingsMessage } from "./gateway-host-actions";
+import { runHostActionMessage, userSettingsMessage, welcomeActionMessage } from "./gateway-host-actions";
 
 import { handleHistoryMessage } from "./history-serving";
 import { output } from "./host-context";
@@ -102,6 +102,9 @@ export async function handleWebviewMessage(
         break;
       case "runHostAction":
         await runHostActionMessage(msg);
+        break;
+      case "welcomeAction":
+        await welcomeActionMessage(msg);
         break;
       case "llmAnalysisRequest":
       case "suggestSessionName":

@@ -5,8 +5,9 @@ import { randomUUID } from "node:crypto";
 import { mkdir, readFile, unlink, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 
-import { configuredClaudeExecutablePath, inheritedProfile, resolveSessionCwd } from "./claude-settings";
+import { configuredClaudeExecutablePath, inheritedProfile, launchFolderMissing, resolveSessionCwd } from "./claude-settings";
 import { claudeConfigDir } from "./claude-env";
+import { transcriptRetentionSettings } from "./transcript-retention";
 import { resolveHandoffRuntime, type ClaudeConversation } from "./claudeHost";
 import { openResumedSession, openSessionById } from "./resume-hydration";
 import type { Session, StartMeasurement } from "./session";
@@ -116,6 +117,8 @@ export async function readHandoffRecords(filePath: string): Promise<HandoffRecor
   return parseHandoffRecords(await readFile(filePath, "utf8"));
 }
 
+const autoFolderMissingShown = new WeakMap<Session, string>();
+
 async function runHandoff(st: SessionStore, sender: vscode.Webview | null, target: Session, auto?: HandoffAutoStart | HandoffAutoNotice): Promise<boolean | undefined> {
   const runId = randomUUID();
   const profile = inheritedProfile(target);
@@ -142,9 +145,9 @@ async function runHandoff(st: SessionStore, sender: vscode.Webview | null, targe
   let snapshotWrite: Promise<void> = Promise.resolve();
   let snapshotPending = false;
 
-  const refuse = (reason: string): undefined => {
-    if (quietAutoRefusal(auto !== undefined, reason)) output.appendLine(`[${target.title}] automatic handoff not started: ${reason}`);
-    else fail(reason);
+  const refuse = (reason: string, detail?: string, quiet = quietAutoRefusal(auto !== undefined, reason)): undefined => {
+    if (quiet) output.appendLine(`[${target.title}] automatic handoff not started: ${reason}`);
+    else fail(reason, detail);
     return undefined;
   };
   if (busy()) return refuse("source_busy");
@@ -162,6 +165,12 @@ async function runHandoff(st: SessionStore, sender: vscode.Webview | null, targe
       fail("fork_failed", "no_cwd");
       return false;
     }
+    if (launchFolderMissing(cwd) !== undefined) {
+      const shownForAuto = autoFolderMissingShown.get(target) === cwd;
+      if (auto !== undefined) autoFolderMissingShown.set(target, cwd);
+      return refuse("folder_missing", cwd, auto !== undefined && shownForAuto);
+    }
+    autoFolderMissingShown.delete(target);
     let runtime: Awaited<ReturnType<typeof resolveHandoffRuntime>>;
     try {
       runtime = await resolveHandoffRuntime(
@@ -181,6 +190,7 @@ async function runHandoff(st: SessionStore, sender: vscode.Webview | null, targe
       model: profile.model ?? undefined,
       effort: profile.effort ?? undefined,
       settingSources: cfg.get<Array<"user" | "project" | "local">>("claude.settingSources")!,
+      transcriptRetention: transcriptRetentionSettings((key) => cfg.get<unknown>(key)),
       lookupSessionFileById: async (id) => lookupSessionFile(id),
       readRecords: readHandoffRecords,
       fs: handoffFs,

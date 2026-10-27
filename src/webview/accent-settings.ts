@@ -8,6 +8,10 @@ interface SettingsControls {
   rowNote(text: HTMLElement, className: string, note: string): HTMLElement;
 }
 
+export function appearanceSectionTitle(): string {
+  return l10n.t("Appearance");
+}
+
 function accentDescription(): string {
   return l10n.t("Colour used for {0}, the current step and heading lines. The send button and keyboard focus rings keep the theme colours.", userLabel());
 }

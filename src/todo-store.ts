@@ -250,7 +250,7 @@ export class TodoStore {
   }
 }
 
-export const TODO_BETA_SETTING = "todo.enabled";
+export const TODO_ENABLED_SETTING = "todo.enabled";
 const openStores = new Map<string, TodoStore>();
 
 export function sharedTodoStore(globalStoragePath: string | undefined, log?: (message: string) => void): TodoStore | undefined {

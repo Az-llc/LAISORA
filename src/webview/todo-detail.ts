@@ -56,6 +56,7 @@ import {
 } from "./todo-edit";
 import { todoMoveSteps } from "./todo-organize";
 import { localDateKey, todoRootGroup } from "./todo-rows";
+import { MARKS } from "./marks";
 
 export interface TodoGroupPlaces {
   readonly folders: readonly string[];
@@ -543,7 +544,7 @@ export class TodoDetail {
         this.render();
         (this.dialog.querySelector(`[data-section="${key}"] .todo-ds-h`) as HTMLElement | null)?.focus();
       });
-      head.append(todoEl("span", "todo-ds-chev", "›"));
+      head.append(todoEl("span", "todo-ds-chev", MARKS.disclosure));
     }
     head.addEventListener("keydown", (e) => {
       if (!e.altKey || (e.key !== "ArrowUp" && e.key !== "ArrowDown")) return;
@@ -929,7 +930,7 @@ export class TodoDetail {
       button.disabled = images.length < 2;
       return button;
     };
-    nav.append(step(l10n.t("‹ Previous image"), l10n.t("Previous image (←)"), "ArrowLeft", -1), step(l10n.t("Next image ›"), l10n.t("Next image (→)"), "ArrowRight", 1));
+    nav.append(step(`${MARKS.previous} ${l10n.t("Previous image")}`, l10n.t("Previous image (←)"), "ArrowLeft", -1), step(`${l10n.t("Next image")} ${MARKS.next}`, l10n.t("Next image (→)"), "ArrowRight", 1));
     wrap.append(bar, stage, nav);
     queueMicrotask(() => { if (!wrap.contains(document.activeElement)) wrap.focus(); });
     return wrap;

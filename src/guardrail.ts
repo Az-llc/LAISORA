@@ -2,7 +2,7 @@ import { createHash } from "node:crypto";
 import { isChildCall } from "./spans";
 import type { DivergenceReport } from "./l3-divergence";
 import { progressSubjectKey } from "./progress-protocol";
-import { isObservedTime, type NormalizedEvent } from "./protocol";
+import { isHistoryEvent, isObservedTime, type NormalizedEvent } from "./protocol";
 import { redactAbsolutePaths } from "./path-redaction";
 import { planItemLabel } from "./plan-steps";
 import { HUMAN_REJECTED_TOOL_RESULT_RE } from "./tool-result-signals";
@@ -763,7 +763,7 @@ export function foldGuardrail(state: GuardrailState, input: GuardrailInput): Gua
   if (input.type === "delegation") {
     return foldDelegation(state, input.event, input.inProgressStep);
   }
-  if (input.type === "event" && input.event.provenance?.path === "history") {
+  if (input.type === "event" && isHistoryEvent(input.event)) {
     return state;
   }
   if (input.type === "event" && !FOLDED_EVENT_KINDS.has(input.event.kind)) {

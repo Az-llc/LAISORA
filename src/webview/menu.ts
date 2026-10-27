@@ -15,6 +15,7 @@ import type { ComposerSendKey, HostToWebview, ModelInfo } from "../protocol";
 import { setSessionMenuExtras, type SessionMenuExtra } from "./session-header";
 import type { Tab } from "./tab";
 import { REMOTE_CONTROL_CARD_HIDDEN_CLASS } from "./remote-control-view";
+import { MARKS } from "./marks";
 
 const INPUT_PLACEHOLDER_SHIFT_ENTER = l10n.t("Type a message (Shift+Enter to send / Enter for a new line)");
 
@@ -103,7 +104,7 @@ function openOlderModels(parent: HTMLElement, models: ModelInfo[], t: Tab | null
   back.className = "mode-menu-item";
   back.setAttribute("role", "menuitem");
   back.dataset.menuKey = "models:back";
-  back.textContent = l10n.t("Back to models");
+  back.textContent = `${MARKS.back} ${l10n.t("Back to models")}`;
   back.onclick = closeOlderModels;
   olderMenu.appendChild(back);
   for (const model of models) olderMenu.appendChild(buildModelRow(t, model));
@@ -471,7 +472,7 @@ export function renderAuthPicker(): void {
       const label = document.createElement("span");
       label.textContent = l10n.t("Older versions");
       const arrow = document.createElement("span");
-      arrow.textContent = "›";
+      arrow.textContent = MARKS.submenu;
       arrow.style.marginLeft = "auto";
       arrow.setAttribute("aria-hidden", "true");
       parent.append(label, arrow);

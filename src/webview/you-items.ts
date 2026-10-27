@@ -234,9 +234,6 @@ export function createYouItems(tabId: string, saved: SavedAskDismissals = {}, lo
     for (const [otherId, other] of features) {
       const otherPosition = positions.get(otherId)!;
       if (otherId === id || other.kind !== own.kind || otherPosition.replyId === position.replyId) continue;
-      const newer = isAfter(orderOf(position), orderOf(otherPosition));
-      const otherResolvedAt = unticked.get(otherId)?.resolvedAt;
-      if (!newer && otherResolvedAt !== undefined && otherResolvedAt <= orderOf(position).at) continue;
       if (!replaceable(own, other)) continue;
       linked.add(otherId);
       replaceableWith.get(otherId)?.add(id);

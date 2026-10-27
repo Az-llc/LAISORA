@@ -4,11 +4,21 @@ import { "Denied by the LAISORA user" as enLaisoraDenial } from "../l10n/bundle.
 import { "Denied by the LAISORA user" as jaLaisoraDenial } from "../l10n/bundle.l10n.ja.json";
 
 // Tool result text the harness writes for calls that were refused, stopped or rejected, used to classify failures.
-const PERMISSION_REFUSED = String.raw`The user doesn't want to proceed with this tool use\b`;
-const CLI_REJECTION_RE = /^(?:Error: )?User rejected tool use\b/;
-const escapeRegExp = (text: string): string => text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+export const escapeRegExp = (text: string): string => text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+const TOOL_USE_REJECTED_HEAD = "The user doesn't want to proceed with this tool use";
+export const TOOL_USE_REJECTED_TEXT = `${TOOL_USE_REJECTED_HEAD}. The tool use was rejected (eg. if it was a file edit, the new_string was NOT written to the file). STOP what you are doing and wait for the user to tell you how to proceed.`;
+export const TOOL_USE_REJECTED_RESULT = "User rejected tool use";
+const PERMISSION_REFUSED = `${escapeRegExp(TOOL_USE_REJECTED_HEAD)}\\b`;
+export const TOOL_USE_ERROR_PREFIX = "Error: ";
+const OPTIONAL_ERROR_PREFIX = `(?:${escapeRegExp(TOOL_USE_ERROR_PREFIX)})?`;
+const CLI_REJECTION_RE = new RegExp(`^${OPTIONAL_ERROR_PREFIX}${escapeRegExp(TOOL_USE_REJECTED_RESULT)}\\b`);
 const USER_INTERRUPTED = CLI_USER_INTERRUPTED_TEXTS.map(escapeRegExp).join("|");
-const HOOK_DENIAL = String.raw`PreToolUse(?::[\w|*]+)? hook error:`;
+const HOOK_DENIAL_EVENT = "PreToolUse";
+const HOOK_DENIAL_SUFFIX = " hook error:";
+export function hookDenialText(toolName: string, reason: string): string {
+  return `${HOOK_DENIAL_EVENT}:${toolName}${HOOK_DENIAL_SUFFIX} ${reason}`;
+}
+const HOOK_DENIAL = String.raw`${escapeRegExp(HOOK_DENIAL_EVENT)}(?::\S+)?${escapeRegExp(HOOK_DENIAL_SUFFIX)}`;
 const HARNESS_DENIED = "Permission for this action was denied by";
 const INPUT_VALIDATION = "InputValidationError|Invalid arguments for tool";
 export const AUTO_MODE_UNEVALUATED = "Auto mode could not evaluate this action and is blocking it for safety";
@@ -38,7 +48,7 @@ export function isHookDenial(text: string): boolean {
   return HOOK_DENIAL_RE.test(stripToolUseErrorTags(text).trimStart());
 }
 
-const LAISORA_DENIAL_RE = new RegExp(`^(?:Error: )?(?:${LAISORA_DENIALS.join("|")})`);
+const LAISORA_DENIAL_RE = new RegExp(`^${OPTIONAL_ERROR_PREFIX}(?:${LAISORA_DENIALS.join("|")})`);
 
 export function isCliRejectionText(text: string): boolean {
   return CLI_REJECTION_RE.test(stripToolUseErrorTags(text).trimStart());

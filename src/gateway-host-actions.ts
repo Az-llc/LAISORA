@@ -3,11 +3,11 @@ import { isAccentColor, isAccentSettingValue, type AccentSetting, type AccentSet
 import { createHash } from "node:crypto";
 import { redactAbsolutePaths } from "./path-redaction";
 import { conductorInstruction, estimateTokens, resolveOrchestrationRoster, orchestrationExternalTargets } from "./orchestration-roster";
-import { homedir } from "node:os";
 import { listClaudeModels, detectClaudeExecutor, relabelRememberedClaudeModels } from "./orchestration-claude";
 import { EXECUTORS, executorMap, type ExecutorId } from "./orchestration-executors";
 import { systemAppExtensions } from "./file-link-open-mode";
-import { CLI_AUTO_UPDATE_SETTINGS, cliAutoUpdateEnabled, compareSemVer, parseSemVer } from "./cli-update-policy";
+import { CLI_AUTO_UPDATE_SETTINGS, cliAutoUpdateEnabled } from "./cli-update-policy";
+import { compareSemVer, parseSemVer } from "./semver";
 import { detectExternalExecutor, listExternalModels } from "./orchestration-external";
 import { externalExecutorName, isExternalModels, isExternalTimeout, type ExternalDetection, type ExternalModels, type ExternalModelsState } from "./orchestration-roster";
 import { DEFAULT_ORCHESTRATION_ROSTER, buildRecommendedClaudeRoster, isOrchestrationSettingRoster, orchestrationSettingRows, recommendedOrchestrationRoster, recommendedRosterChanges, type OrchestrationSettingRow } from "./orchestration-roster";
@@ -23,22 +23,31 @@ import {
   type ComposerSendKey,
   type FileLinkSetting,
   type HostToSettingsPage,
+  isWelcomeText,
+  isWelcomeTipMark,
+  type WelcomeOpen,
+  type WelcomeSetting,
+  type WelcomeSettings,
+  type WelcomeState,
   type HostToWebview,
   type SettingWriteFailure,
   type WebviewToHost,
 } from "./protocol";
 import * as l10n from "@vscode/l10n";
-import { configuredClaudeExecutablePath, configuredDisplayName, configuredEventLimit, getLaisoraConfiguration, readClaudeCodeSettings } from "./claude-settings";
+import { configuredClaudeExecutablePath, configuredDisplayName, configuredEventLimit, existingFolderOrHome, getLaisoraConfiguration, readClaudeCodeSettings } from "./claude-settings";
 import { isEventLimit } from "./event-limits";
+import { TRANSCRIPT_RETENTION_DAYS_KEY, configuredTranscriptRetentionDays, isTranscriptRetentionDays, transcriptRetentionFallback } from "./transcript-retention";
 import { isDisplayName } from "./display-name";
 import { extensionContext, output, store } from "./host-context";
 import { ADDITIONAL_MODELS_KEY, CLAUDE_VERSION_ID, additionalClaudeModelIds, recomputeModelRows, modelsMessage } from "./gateway-models";
 import { restoreTabsOnStartupEnabled } from "./session-list-wiring";
-import { TODO_BETA_SETTING } from "./todo-store";
-import { todoBetaEnabled } from "./todo-surface";
+import { TODO_ENABLED_SETTING } from "./todo-store";
+import { todoFeatureEnabled } from "./todo-surface";
 import { EDIT_SUMMARY_SETTING } from "./edit-summary";
 import { REMOTE_CONTROL_CARD_SETTING } from "./remote-control";
 import { GUARD_ENABLED_SETTING, MEMORY_BLOCK_PROJECT_TYPE_SETTING, placementOf, placementSettingsOf } from "./placement-line";
+import { welcomeNews, welcomeTips } from "./welcome-content";
+import { laterWelcomeVersion, nextWelcomeTip, welcomeNewsVersion } from "./welcome-rules";
 
 export function editSummarySettingEnabled(): boolean {
   return getLaisoraConfiguration().get<boolean>(EDIT_SUMMARY_SETTING) === true;
@@ -46,6 +55,62 @@ export function editSummarySettingEnabled(): boolean {
 
 export function remoteControlCardEnabled(): boolean {
   return getLaisoraConfiguration().get<boolean>(REMOTE_CONTROL_CARD_SETTING) !== false;
+}
+
+export const WELCOME_SETTING_KEYS: Record<WelcomeSetting, string> = { showNews: "welcome.showNews", showTips: "welcome.showTips" };
+export const WELCOME_DISMISSED_NEWS_KEY = "laisora.welcome.dismissedNewsVersion";
+export const WELCOME_LAST_TIP_KEY = "laisora.welcome.lastTip";
+const WELCOME_TIP_ID_NAMES = { menuGlyph: "", handoffItem: "", appearanceSection: "", historyButton: "" };
+
+export function welcomeSettingChanged(affects: (key: string) => boolean): boolean {
+  return Object.values(WELCOME_SETTING_KEYS).some(affects);
+}
+
+export function welcomeSettings(): WelcomeSettings {
+  const cfg = getLaisoraConfiguration();
+  return { showNews: cfg.get<boolean>(WELCOME_SETTING_KEYS.showNews) !== false, showTips: cfg.get<boolean>(WELCOME_SETTING_KEYS.showTips) !== false };
+}
+
+function dismissedNewsVersion(): string | undefined {
+  const dismissed = extensionContext?.globalState.get<unknown>(WELCOME_DISMISSED_NEWS_KEY);
+  return isWelcomeText(dismissed) ? dismissed : undefined;
+}
+
+function welcomeState(): WelcomeState {
+  const dismissed = dismissedNewsVersion();
+  return { ...welcomeSettings(), ...(dismissed === undefined ? {} : { dismissedNewsVersion: dismissed }) };
+}
+
+export function openWelcome(): WelcomeOpen | undefined {
+  const context = extensionContext;
+  if (!context) return undefined;
+  const running = context.extension?.packageJSON?.version as unknown;
+  const newsVersion = typeof running === "string" ? welcomeNewsVersion(running, welcomeNews(), dismissedNewsVersion()) : undefined;
+  const last = context.globalState.get<unknown>(WELCOME_LAST_TIP_KEY);
+  const tip = nextWelcomeTip(isWelcomeTipMark(last) ? last : undefined, welcomeTips(WELCOME_TIP_ID_NAMES).map((entry) => entry.id));
+  if (tip !== undefined) void context.globalState.update(WELCOME_LAST_TIP_KEY, tip);
+  return { openedAt: Date.now(), roll: Math.random(), ...(newsVersion === undefined ? {} : { newsVersion }), ...(tip === undefined ? {} : { tipId: tip.id }) };
+}
+
+export async function welcomeActionMessage(msg: Extract<WebviewToHost, { type: "welcomeAction" }>): Promise<void> {
+  if (msg.action === "hideTips") {
+    const failure = await updateUserSetting(WELCOME_SETTING_KEYS.showTips, false);
+    if (failure === undefined) return;
+    void vscode.window.showWarningMessage(l10n.t("LAISORA: Could not save the setting."));
+  } else {
+    const state = extensionContext?.globalState;
+    for (const session of store?.sessions.values() ?? []) {
+      if (session.welcome?.newsVersion === msg.version) session.welcome = { ...session.welcome, newsVersion: undefined };
+    }
+    if (state && laterWelcomeVersion(msg.version, dismissedNewsVersion())) {
+      await state.update(WELCOME_DISMISSED_NEWS_KEY, msg.version);
+    }
+  }
+  store?.post(userSettingsMessage());
+}
+
+export async function writeWelcomeSetting(setting: WelcomeSetting, enabled: boolean): Promise<SettingWriteFailure | undefined> {
+  return updateUserSetting(WELCOME_SETTING_KEYS[setting], enabled);
 }
 
 export function accentSettings(): AccentSettings {
@@ -77,6 +142,7 @@ export function userSettingsMessage(): Extract<HostToWebview, { type: "userSetti
     askQualityCheck: getLaisoraConfiguration().get<boolean>("claude.askQualityCheck") === true,
     editSummaryEnabled: editSummarySettingEnabled(),
     remoteControlCard: remoteControlCardEnabled(),
+    welcome: welcomeState(),
   };
 }
 
@@ -162,7 +228,7 @@ export function refreshExternalDetection(detect = detectorOverride ?? detectExte
   });
   const executors = Object.values(EXECUTORS).map(({ id }) => id);
   const configuredPath = configuredClaudeExecutablePath(getLaisoraConfiguration());
-  const cwd = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ?? homedir();
+  const cwd = existingFolderOrHome(vscode.workspace.workspaceFolders?.[0]?.uri.fsPath);
   detectionPending = Promise.all(executors.map(async (executor) => {
       const started = Date.now();
       let detected: ExternalDetection;
@@ -222,6 +288,7 @@ export function settingsStateMessage(): Extract<HostToSettingsPage, { type: "set
   const cfg = getLaisoraConfiguration();
   const timeout = cfg.get<number>("orchestration.externalTimeoutMinutes")!;
   const placementSettings = placementSettingsOf(cfg);
+  const claudeCodeSettings = readClaudeCodeSettings(true);
   return {
     type: "settingsState",
     conductorPreview: projectConductorPreview(),
@@ -235,10 +302,11 @@ export function settingsStateMessage(): Extract<HostToSettingsPage, { type: "set
     orchestrationEnabled: cfg.get<boolean>("orchestration.enabled")! === true,
     guardEnabled: placementSettings.guardEnabled,
     memoryBlockProjectType: placementSettings.blockProjectType,
-    todoEnabled: todoBetaEnabled(cfg),
+    todoEnabled: todoFeatureEnabled(cfg),
     reloadNeeded: settingsReloadNeeded(cfg),
     editSummaryEnabled: editSummarySettingEnabled(),
     remoteControlCard: remoteControlCardEnabled(),
+    welcome: welcomeSettings(),
     handoffAuto: resolveHandoffAutoSettings((key) => cfg.get<unknown>(key)),
     orchestrationAgents: readRoster(cfg.get<unknown>("orchestration.agents")),
     orchestrationDefaults: readRoster(cfg.inspect("orchestration.agents")?.defaultValue ?? DEFAULT_ORCHESTRATION_ROSTER),
@@ -249,8 +317,10 @@ export function settingsStateMessage(): Extract<HostToSettingsPage, { type: "set
     restoreTabsOnStartup: restoreTabsOnStartupEnabled(),
     cliAutoUpdate: executorMap((id) => cliAutoUpdateEnabled(cfg, id)),
     eventLimit: configuredEventLimit(),
+    ...transcriptRetentionDaysState(cfg),
+    transcriptRetentionFallback: transcriptRetentionFallback(cfg.get<string[]>("claude.settingSources")!, claudeCodeSettings.cleanupPeriodDays),
     initialModel: cfg.get<string>("claude.initialModel")!.trim(),
-    autoContinueAtUsageLimit: readClaudeCodeSettings(true).autoContinueAtUsageLimit !== false,
+    autoContinueAtUsageLimit: claudeCodeSettings.autoContinueAtUsageLimit !== false,
     fileLinkInstruction: cfg.get<boolean>(FILE_LINK_SETTING_KEYS.fileLinkInstruction)! !== false,
     planInstruction: cfg.get<boolean>(FILE_LINK_SETTING_KEYS.planInstruction)! !== false,
     revealInExplorer: cfg.get<boolean>(FILE_LINK_SETTING_KEYS.revealInExplorer)! !== false,
@@ -308,6 +378,16 @@ export async function writeEventLimit(value: number): Promise<SettingWriteFailur
   }
 }
 
+function transcriptRetentionDaysState(cfg: vscode.WorkspaceConfiguration): { transcriptRetentionDays?: number } {
+  const days = configuredTranscriptRetentionDays((key) => cfg.get<unknown>(key));
+  return days === null ? {} : { transcriptRetentionDays: days };
+}
+
+export async function writeTranscriptRetentionDays(value: number | null): Promise<SettingWriteFailure | undefined> {
+  if (value !== null && !isTranscriptRetentionDays(value)) return undefined;
+  return updateUserSetting(TRANSCRIPT_RETENTION_DAYS_KEY, value ?? undefined);
+}
+
 export async function writeInitialModel(model: string): Promise<SettingWriteFailure | undefined> {
   return updateUserSetting("claude.initialModel", model);
 }
@@ -333,7 +413,7 @@ export async function writeMemoryBlockProjectType(enabled: boolean): Promise<Set
 }
 
 export async function writeTodoEnabled(enabled: boolean): Promise<SettingWriteFailure | undefined> {
-  return updateUserSetting(TODO_BETA_SETTING, enabled);
+  return updateUserSetting(TODO_ENABLED_SETTING, enabled);
 }
 
 export async function writeEditSummaryEnabled(enabled: boolean): Promise<SettingWriteFailure | undefined> {
@@ -410,7 +490,7 @@ export async function writeRestoreTabsOnStartup(enabled: boolean): Promise<Setti
 }
 
 export async function runHostActionMessage(msg: Extract<WebviewToHost, { type: "runHostAction" }>): Promise<void> {
-  if (msg.action === "openSettings") await vscode.commands.executeCommand("laisora.openSettings");
+  if (msg.action === "openSettings") await vscode.commands.executeCommand("laisora.openSettings", ...(msg.target === undefined ? [] : [msg.target]));
   if (msg.action === "addClaudeModel") {
     const target = store?.sessions.get(msg.tabId);
     if (!target) return;

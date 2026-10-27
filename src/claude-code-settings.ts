@@ -2,7 +2,7 @@ import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { claudeConfigDir } from "./claude-env";
 
-type ClaudeCodeSettings = { model?: string; defaultMode?: string; autoContinueAtUsageLimit?: boolean };
+type ClaudeCodeSettings = { model?: string; defaultMode?: string; autoContinueAtUsageLimit?: boolean; cleanupPeriodDays?: unknown };
 
 const autoContinueListeners = new Set<() => void>();
 export function onAutoContinueSettingChange(listener: () => void): () => void {
@@ -21,6 +21,7 @@ function readClaudeCodeSettingsUncached(): ClaudeCodeSettings {
     const raw = JSON.parse(readFileSync(join(claudeConfigDir(), "settings.json"), "utf8"));
     return {
       autoContinueAtUsageLimit: raw.autoContinueAtUsageLimit !== false,
+      cleanupPeriodDays: raw.cleanupPeriodDays,
       model: typeof raw.model === "string" ? raw.model : undefined,
       defaultMode:
         typeof raw.permissions?.defaultMode === "string" ? raw.permissions.defaultMode : undefined,

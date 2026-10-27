@@ -1,4 +1,4 @@
-import type { NormalizedEvent } from "./protocol";
+import { isHistoryEvent, type NormalizedEvent } from "./protocol";
 
 export const BACKGROUND_ACTIVITY_LIST_MAX = 256;
 
@@ -126,7 +126,7 @@ export function applyActivityEvent(state: BackgroundActivityState, ev: Normalize
       break;
     case "tool_call_started":
       if (
-        ev.provenance?.path !== "history" &&
+        !isHistoryEvent(ev) &&
         ev.work?.placement !== undefined &&
         ev.work.agents?.some((agent) => agent.toolUseId === ev.toolUseId) === true
       ) {

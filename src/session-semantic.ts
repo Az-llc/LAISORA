@@ -6,7 +6,7 @@ import { deriveExecLogFindings, deriveFailureSummary } from "./exec-log-marks";
 import { readExternalRunsForSession, type ExternalRunRecord, type SessionExternalRuns } from "./orchestration-external";
 import { resolveOrchestrationCacheTtl, resolveOrchestrationRoster } from "./orchestration-roster";
 import type { CacheTtl } from "./claude-prices";
-import { deriveAnalysisPlans, derivePlanPlacements, deriveRoleSummary, externalRunStart, type ExternalRunsCoverage, type PlanPlacement } from "./role-summary";
+import { deriveAnalysisPlans, derivePlanPlacements, deriveRoleSummary, subagentRunMeasures, type ExternalRunsCoverage, type PlanPlacement } from "./role-summary";
 import {
   attributeSubagent,
   emptyRosterEvidence,
@@ -36,6 +36,7 @@ import {
   type WorkModelPayload,
   flattenAgents,
   projectWorkModel,
+  timeBucketsCoverageDegraded,
   withSubagentModels,
 } from "./protocol";
 import { deriveSemanticModel, type SemanticModel } from "./semantic-model";
@@ -43,10 +44,10 @@ import { deriveSessionFacts, type ExternalRunCall, type SessionFacts, type Sessi
 import { isInSessionStore, sessionTranscriptRef } from "./session-files";
 import type { Session } from "./extension";
 import type { SessionStore } from "./store-surfaces";
-import { currentWorkBlock, deriveTimeBuckets, keyedValues, overlayLiveTimeBucketState, projectWorkBlockTokens, type ChildTranscriptSpan, type TimeBucketState, type TimeBucketView } from "./time-buckets";
+import { currentWorkBlock, deriveTimeBuckets, keyedValues, overlayLiveTimeBucketState, projectWorkBlockTokens, webviewTimeBuckets, type ChildTranscriptSpan, type TimeBucketState, type TimeBucketView } from "./time-buckets";
 import { planContextOf, planRowPeriods } from "./plan-steps";
 import { readTranscriptTimeBucketsWithCoverage, transcriptTimeBucketsOf } from "./transcript-time-buckets";
-import { transcriptReadStillCurrent, type SessionHistoryRead, type SubagentRestore } from "./session-transcript";
+import { foldDeferredChildCoverage, openUsageScanOwner, readDeferredChildUsage, releaseUsageScanOwner, transcriptReadStillCurrent, type DeferredChildUsage, type DeferredChildUsageRead, type SessionHistoryRead, type SubagentRestore, type UsageScanOwner } from "./session-transcript";
 import { childSpansChangeRuns, findToolPlacement, type WorkCoverage, type WorkModelState } from "./work-model";
 
 export const SEMANTIC_MODEL_POST_INTERVAL_MS = 1000;
@@ -98,6 +99,11 @@ function externalOf(conv: Session["conversation"]): ExternalRunRecord[] {
   return (conv?.orchestrationRuns ?? []).filter((run): run is ExternalRunRecord => run.kind === "external");
 }
 
+function carriedExternalRuns(cache: { conversation: Session["conversation"]; persisted: readonly ExternalRunRecord[] },
+  conv: Session["conversation"]): readonly ExternalRunRecord[] {
+  return cache.conversation === conv ? cache.persisted : mergeExternalRuns(externalOf(cache.conversation), cache.persisted);
+}
+
 function mergeExternalRuns(first: readonly ExternalRunRecord[], second: readonly ExternalRunRecord[]): ExternalRunRecord[] {
   const seen = new Set<string>();
   const out: ExternalRunRecord[] = [];
@@ -141,8 +147,11 @@ export function derivationFailureLabel(stage: DerivationFailure["stage"]): strin
 }
 
 function placedPlanContext(context: PlanContext, placement: PlanPlacement): PlanContext {
-  return { ...context, steps: context.steps?.map(step => ({ ...step, tokens: placement.tokens.get(step.key) ?? null })), placements: placement.placements,
-    external: placement.external };
+  return { ...context, tokens: placement.claude, work: placement.blockWork, steps: context.steps?.map(step => {
+    const work = placement.work.get(step.key);
+    return { ...step, tokens: placement.tokens.get(step.key) ?? null, ...(work === undefined ? {} : { work }) };
+  }), placements: placement.placements,
+    external: placement.external, externalRuns: placement.externalRuns, counted: placement.counted };
 }
 
 export class SessionSemantic {
@@ -191,6 +200,40 @@ export class SessionSemantic {
     this.clearTranscriptTimeBucketsTimer();
   }
 
+  usageOwner: UsageScanOwner = openUsageScanOwner();
+
+  releaseTranscriptReads(): void {
+    releaseUsageScanOwner(this.usageOwner);
+    this.usageOwner = openUsageScanOwner();
+    if (this.host.closed) releaseUsageScanOwner(this.usageOwner);
+  }
+
+  async loadDeferredChildUsage(items: readonly DeferredChildUsage[]): Promise<void> {
+    if (items.length === 0) return;
+    const generation = this.host.logicalGeneration;
+    let reads: DeferredChildUsageRead[];
+    try {
+      reads = await readDeferredChildUsage(items, this.usageOwner);
+    } catch (error) {
+      output.appendLine(`[${this.host.title}] deferred child usage read failed: ${String(error)}`);
+      reads = items.map(item => ({ item, events: [], usageRead: false, malformedLineCount: 0 }));
+    }
+    if (this.host.closed || generation !== this.host.logicalGeneration) return;
+    for (const read of reads) {
+      try {
+        for (const event of read.events) this.host.pushEvent(event.body, undefined, { timestamp: event.timestamp, suppressPost: true });
+      } catch (error) {
+        output.appendLine(`[${this.host.title}] deferred child usage fold failed: ${String(error)}`);
+        read.usageRead = false;
+      }
+    }
+    this.host.workModel = { ...this.host.workModel, coverage: foldDeferredChildCoverage(this.host.workModel.coverage, reads) };
+    this.transcriptReadSeed = undefined;
+    this.scheduleTranscriptTimeBuckets();
+    this.scheduleWorkModelPost();
+    this.scheduleSemanticModelPost();
+  }
+
   seedTranscriptTimeBuckets(file: string, sessionId: string, history: SessionHistoryRead, restored: SubagentRestore): void {
     this.transcriptReadSeed = { file, sessionId, logicalGeneration: this.host.logicalGeneration, history, restored };
   }
@@ -235,7 +278,7 @@ export class SessionSemantic {
         await transcriptReadStillCurrent(seed.history, isInSessionStore) && await transcriptReadStillCurrent(seed.restored, isInSessionStore);
       const read = seedCurrent
         ? transcriptTimeBucketsOf(seed.history, seed.restored, ids)
-        : await readTranscriptTimeBucketsWithCoverage(ref.file, isInSessionStore, ids, ref.sessionId);
+        : await readTranscriptTimeBucketsWithCoverage(ref.file, isInSessionStore, ids, ref.sessionId, this.usageOwner);
       view = read.view;
       coverage = read.coverage;
       rosterSources = read.rosterSources;
@@ -248,7 +291,7 @@ export class SessionSemantic {
     }
     if (!this.host.closed && logicalGeneration === this.host.logicalGeneration) {
       this.setRosterSources(ref.sessionId, rosterSources ?? []);
-      if (coverage !== undefined) {
+      if (timeBucketsCoverageDegraded(coverage)) {
         output.appendLine(`[${this.host.title}] transcript time buckets degraded: ${JSON.stringify(coverage)}`);
       }
       const coverageChanged = JSON.stringify(coverage) !== JSON.stringify(this.transcriptTimeBucketsCoverage);
@@ -267,14 +310,37 @@ export class SessionSemantic {
     }
   }
 
-  projectedWorkModel(): WorkModelPayload {
+  baseWorkModel(): WorkModelPayload {
     const model = projectWorkModel(this.host.workModel, this.host.restoredAgents, this.host.evidenceIndex.timeBuckets.blocks, this.host.childSpans);
     this.attachAgentRoles(model);
+    const usage = this.host.sessionFacts.subagentUsage;
+    for (const agent of flattenAgents(model.phases, model.unlinkedAgents)) agent.roleRun = subagentRunMeasures(agent, usage?.get(agent.toolUseId));
+    return model;
+  }
+
+  projectedWorkModel(): WorkModelPayload {
+    const model = this.baseWorkModel();
     // The displayed view, so the PLAN panel shows what GRAPH and ANALYSIS show, whether or not the semantic view is on.
     const displayed = this.displayedTimeBuckets();
     const time = displayed === undefined ? undefined : projectWorkBlockTokens(displayed, this.projectedPlanUsage(displayed.blocks));
     const block = time === undefined ? undefined : currentWorkBlock(time);
-    if (time && block) {
+    const tools = this.host.sessionFacts.analysisTools;
+    let placementOf: ReturnType<typeof derivePlanPlacements> | undefined;
+    if (time) {
+      const lanes = [...flattenAgents(model.phases, model.unlinkedAgents).flatMap(agent =>
+          agent.toolUseId === undefined ? [] : [{ toolUseId: agent.toolUseId, start: agent.startedAt ?? null }]),
+        ...(model.planTools ?? []).map(tool => ({ toolUseId: tool.id, start: tool.startedAt }))];
+      const generationBoundaryAt = this.generationBoundaryAt();
+      const roles = deriveRoleSummary({ phases: model.phases, unlinkedAgents: model.unlinkedAgents,
+        ...this.matchExternalCalls(this.knownExternalRuns(this.host.conversation), generationBoundaryAt),
+        rosterEvidence: emptyRosterEvidence(), subagentUsage: this.host.sessionFacts.subagentUsage, timeBuckets: time,
+        analysisTools: tools, generationBoundaryAt });
+      placementOf = derivePlanPlacements(time, tools, lanes, roles);
+      model.blockTotals = placementOf.blockTotals;
+      const externalRuns = roles.roles.flatMap(role => role.runs.filter(run => run.source === "external").map(run => ({ label: role.label, run })));
+      if (externalRuns.length > 0) model.externalRuns = externalRuns;
+    }
+    if (time && block && placementOf) {
       const state = this.host.workModel;
       const approvalToolIds = this.host.conversation?.pendingApprovalToolUseIds ?? [];
       const approvalTools = new Set(approvalToolIds);
@@ -321,15 +387,6 @@ export class SessionSemantic {
       const periods = planRowPeriods(time);
       const context = planContextOf(block, time.lastAt ?? block.start, state.turnActive && !waiting ||
         this.host.streamOpen() && runningWork, periods);
-      const tools = this.host.sessionFacts.analysisTools;
-      // Work posts stay cheap (B5-PLAN-cheap), so only this conversation's external runs, the ones the panel shows
-      // (src/orchestration-view.ts#orchestrationViewForConversation), get a placement.
-      const lanes = [...flattenAgents(model.phases, model.unlinkedAgents).flatMap(agent =>
-          agent.toolUseId === undefined ? [] : [{ toolUseId: agent.toolUseId, start: agent.startedAt ?? null }]),
-        ...(model.planTools ?? []).map(tool => ({ toolUseId: tool.id, start: tool.startedAt })),
-        ...externalOf(this.host.conversation).flatMap(run => run.toolUseId === undefined ? [] : [{ toolUseId: run.toolUseId, start: externalRunStart(run, tools) }])];
-      const placementOf = derivePlanPlacements(time, tools, lanes,
-        { runs: this.knownExternalRuns(this.host.conversation), generationBoundaryAt: this.generationBoundaryAt() });
       model.planContext = placedPlanContext(context, placementOf(block.blockId));
       const earlierPlans = time.blocks.filter(value => value !== block && value.kind === "plan" && value.steps?.length)
         .map(value => placedPlanContext(planContextOf(value, value.end, false, periods), placementOf(value.blockId)));
@@ -389,8 +446,8 @@ export class SessionSemantic {
     }
   }
 
-  projectedPlanUsage(blocks: readonly { blockId: string; start: number; closedAt?: number }[] = this.displayedTimeBuckets()?.blocks ?? this.host.evidenceIndex.timeBuckets.blocks): PlanUsage {
-    const partition = JSON.stringify(blocks.map(block => [block.blockId, block.start, block.closedAt]));
+  projectedPlanUsage(blocks: readonly { blockId: string; start: number }[] = this.displayedTimeBuckets()?.blocks ?? this.host.evidenceIndex.timeBuckets.blocks): PlanUsage {
+    const partition = JSON.stringify(blocks.map(block => [block.blockId, block.start]));
     const memo = this.planUsageMemo;
     if (memo?.facts === this.host.sessionFacts && memo.partition === partition) return memo.usage;
     const usage = projectPlanUsage(this.host.sessionFacts.planUsage, blocks);
@@ -406,8 +463,7 @@ export class SessionSemantic {
     if (this.workModelPostTimer !== null) return;
     this.workModelPostTimer = setTimeout(() => {
       this.workModelPostTimer = null;
-      this.store.post({ type: "planUsage", tabId: this.host.tabId,
-        state: this.projectedPlanUsage() });
+      if (this.host.closed) return;
       this.store.post({
         type: "workModel",
         tabId: this.host.tabId,
@@ -516,7 +572,7 @@ export class SessionSemantic {
     }), this.host.sessionFacts.analysisTools, { usage: this.host.sessionFacts.subagentUsage, settings: configuredCacheTtls() });
     return {
       ...payload,
-      ...(modelledTime === undefined ? {} : { timeBuckets: modelledTime }),
+      ...(modelledTime === undefined ? {} : { timeBuckets: webviewTimeBuckets(modelledTime) }),
       analysisPlans,
       roleSummary: deriveRoleSummary({
         phases: work.phases,
@@ -543,6 +599,12 @@ export class SessionSemantic {
   roleExternalRuns(conv: Session["conversation"], generationBoundaryAt: number | undefined): { externalRuns: ExternalRunRecord[]; externalRunCalls: (ExternalRunCall & { running: boolean })[];
     externalRunsCoverage?: ExternalRunsCoverage } {
     const { externalRuns: known, externalRunsCoverage } = this.externalRuns(conv);
+    const matched = this.matchExternalCalls(known, generationBoundaryAt);
+    return externalRunsCoverage === undefined ? matched : { ...matched, externalRunsCoverage };
+  }
+
+  private matchExternalCalls(known: readonly ExternalRunRecord[], generationBoundaryAt: number | undefined): { externalRuns: ExternalRunRecord[];
+    externalRunCalls: (ExternalRunCall & { running: boolean })[] } {
     const knownByToolUseId = new Map(known.flatMap(run => run.toolUseId === undefined ? [] : [[run.toolUseId, run] as const]));
     const recorded = this.externalRunsCache?.byToolUseId;
     const state = this.host.workModel;
@@ -556,7 +618,7 @@ export class SessionSemantic {
       if (record !== undefined) externalRuns.push(record);
       else externalRunCalls.push({ ...call, running: live.has(call.toolUseId) });
     }
-    return externalRunsCoverage === undefined ? { externalRuns, externalRunCalls } : { externalRuns, externalRunCalls, externalRunsCoverage };
+    return { externalRuns, externalRunCalls };
   }
 
   externalRuns(conv: Session["conversation"]): { externalRuns: ExternalRunRecord[]; externalRunsCoverage?: ExternalRunsCoverage } {
@@ -574,12 +636,11 @@ export class SessionSemantic {
     if (owner === undefined || directory === undefined) return undefined;
     let cache = this.externalRunsCache;
     if (cache?.ownerId === owner && cache.conversation !== conv) {
-      cache.persisted = mergeExternalRuns(externalOf(cache.conversation), cache.persisted);
+      cache.persisted = carriedExternalRuns(cache, conv);
       cache.conversation = conv;
     } else if (cache?.ownerId !== owner) {
-      const carried = cache?.ownerId === owner ? mergeExternalRuns(externalOf(cache.conversation), cache.persisted) : [];
-      const next = { ownerId: owner, conversation: conv, persisted: carried, byToolUseId: cache?.byToolUseId ?? new Map<string, ExternalRunRecord>(),
-        coverage: cache?.ownerId === owner ? cache.coverage : undefined };
+      const next: NonNullable<SessionSemantic["externalRunsCache"]> = { ownerId: owner, conversation: conv, persisted: [],
+        byToolUseId: cache?.byToolUseId ?? new Map<string, ExternalRunRecord>(), coverage: undefined };
       this.externalRunsCache = cache = next;
       this.externalRunsRead = readExternalRunsForSession(directory, owner).then(({ session, byToolUseId }): [SessionExternalRuns, ReadonlyMap<string, ExternalRunRecord>] => [session, byToolUseId])
         .catch((error: unknown): [SessionExternalRuns, ReadonlyMap<string, ExternalRunRecord>] => {
@@ -601,7 +662,7 @@ export class SessionSemantic {
   private knownExternalRuns(conv: Session["conversation"]): ExternalRunRecord[] {
     const cache = this.externalRunsCache;
     const owner = this.host.ownerState?.kind === "pinned" ? this.host.ownerState.ownerId : undefined;
-    return cache !== undefined && cache.ownerId === owner ? mergeExternalRuns(externalOf(conv), cache.persisted) : externalOf(conv);
+    return cache !== undefined && cache.ownerId === owner ? mergeExternalRuns(externalOf(conv), carriedExternalRuns(cache, conv)) : externalOf(conv);
   }
 
   private externalRunsRead: Promise<void> = Promise.resolve();

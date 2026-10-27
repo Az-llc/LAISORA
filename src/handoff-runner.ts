@@ -28,6 +28,7 @@ import {
   type HandoffUtterance,
   type HandoffWorkMemo,
 } from "./handoff-envelope";
+import type { TranscriptRetentionSettings } from "./transcript-retention";
 import {
   createParseYielder,
   createRecordUuidFilter,
@@ -84,6 +85,7 @@ export interface HandoffRunnerDeps {
   model?: string;
   effort?: "low" | "medium" | "high" | "xhigh" | "max";
   settingSources?: Array<"user" | "project" | "local">;
+  transcriptRetention?: TranscriptRetentionSettings;
   lookupSessionFileById: (id: string) => Promise<ForkFileLookup>;
   readRecords: (filePath: string) => Promise<HandoffRecordsRead>;
   fs: { unlink(p: string): Promise<void>; readFile(p: string): Promise<string> };
@@ -120,7 +122,8 @@ export type HandoffFailReason =
   | "commit_failed"
   | "cancelled"
   | "source_busy"
-  | "already_running";
+  | "already_running"
+  | "folder_missing";
 
 export type HandoffOutcome =
   | {
@@ -741,6 +744,7 @@ export class HandoffRunner {
           ...(this.deps.model ? { model: this.deps.model } : {}),
           ...(this.deps.effort ? { effort: this.deps.effort } : {}),
           settingSources: this.deps.settingSources,
+          ...(this.deps.transcriptRetention ? { settings: this.deps.transcriptRetention } : {}),
           permissionMode: "default",
           pathToClaudeCodeExecutable: this.deps.claudeExecutablePath,
           env: this.deps.env,
@@ -854,6 +858,7 @@ export class HandoffRunner {
           ...(this.deps.model ? { model: this.deps.model } : {}),
           ...(this.deps.effort ? { effort: this.deps.effort } : {}),
           settingSources: this.deps.settingSources,
+          ...(this.deps.transcriptRetention ? { settings: this.deps.transcriptRetention } : {}),
           permissionMode: "default",
           pathToClaudeCodeExecutable: this.deps.claudeExecutablePath,
           env: this.deps.env,

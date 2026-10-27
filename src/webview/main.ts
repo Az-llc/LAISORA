@@ -3,8 +3,10 @@ import { setDisplayName } from "./user-label";
 import { prependPreservingView } from "./history-scroll";
 import * as l10n from "@vscode/l10n";
 import { CLOSE_GLYPH } from "./close-button";
+import { installMarkProperties } from "./marks";
 
 const applyAccent = installAccent();
+installMarkProperties(document.documentElement);
 
 import type {
   AccountUsageRow,
@@ -25,7 +27,7 @@ import type {
   UsageSnapshot,
   WorkModelPayload,
 } from "../protocol";
-import { ACCOUNT_USAGE_REPLY_WAIT_MS, fallbackUnresolved, IMAGE_MAX_COUNT, isCurrentAccountUsageRow, PROTOCOL_VERSION, RENAME_TITLE_MAX, isHostToWebview, withLocalEventDrop } from "../protocol";
+import { ACCOUNT_USAGE_REPLY_WAIT_MS, fallbackUnresolved, IMAGE_MAX_COUNT, isCurrentAccountUsageRow, isHistoryEvent, PROTOCOL_VERSION, RENAME_TITLE_MAX, isHostToWebview, withLocalEventDrop } from "../protocol";
 import { hasSessionRecord } from "../session-record";
 import { followsDirectly, historyAnchorIndex, windowEvents } from "../event-window";
 import { findModelRow, resolveModelDisplayName } from "../model-display-name";
@@ -95,6 +97,7 @@ import { TODO_TAB_LABEL, TodoTab } from "./todo-view";
 import { receiveTodoChanges, refreshTodoSplitCards, refreshTodoToolCards, todoSplitCard } from "./todo-chat";
 import { initTodoLinks, todoTabHistoryLink } from "./todo-links";
 import { setTodoSplitRenderer } from "./markdown";
+import { applyWelcomeState, welcomeApplies } from "./welcome";
 
 export const MODE_LABELS: Record<PermissionModeId, string> = {
   default: l10n.t("Ask before actions"),
@@ -2161,6 +2164,7 @@ function addTab(snap: TabSnapshot, scrollCarry?: ScrollCarry): Tab {
     }
   }
   if (snap.state.resumeSessionId) t.resumeSessionId = snap.state.resumeSessionId;
+  if (hydration === undefined && welcomeApplies(snap.state.welcome, snap.state.events, snap.state.headOmitted?.hasConvEvent === true)) t.showWelcome(snap.state.welcome);
   t.replaceAutoResumeReservation(snap.state.autoResumeAt ?? null);
   t.setRemoteControl(snap.state.remoteControl);
   t.setTurnState(snap.state.turnState);
@@ -2192,7 +2196,6 @@ function addTab(snap: TabSnapshot, scrollCarry?: ScrollCarry): Tab {
   t.setWorkViewVisible = (visible) => overview.setVisible(visible);
   overview.setVisible(t.viewMode === "work");
   overview.setYou(t.summaryYou.element);
-  overview.setPlanUsage(snap.state.planUsage);
   overview.setRecordProbe(() => hasSessionRecord(t));
   overview.mount();
   overview.update(displayWorkModel(snap.tabId, snap.state.workModel));
@@ -2371,7 +2374,7 @@ function initMessageBus(): void {
         if (t) {
           for (const ev of msg.events) {
             t.handleEvent(ev);
-            if (ev.kind === "turn_completed" && ev.provenance?.path !== "history" && msg.tabId !== activeTabId) {
+            if (ev.kind === "turn_completed" && !isHistoryEvent(ev) && msg.tabId !== activeTabId) {
               t.noteUnreadReply();
               unread = true;
             }
@@ -2450,10 +2453,6 @@ function initMessageBus(): void {
         applyOrchestrationView(msg.tabId, msg.state);
         break;
       }
-      case "planUsage": {
-        overviews.get(msg.tabId)?.setPlanUsage(msg.state);
-        break;
-      }
       case "semanticModel": {
         tabs.get(msg.tabId)?.observeSessionTime(msg.model?.timeBuckets?.firstAt, "session");
         lastSemanticModels.set(msg.tabId, { model: msg.model, view: true });
@@ -2470,6 +2469,7 @@ function initMessageBus(): void {
         applyAccent(msg.appearance);
         setDisplayName(msg.displayName ?? "");
         applyUserSettings(msg);
+        applyWelcomeState(msg.welcome);
         refreshComposer();
         break;
       }

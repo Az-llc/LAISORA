@@ -2,6 +2,7 @@ import * as l10n from "@vscode/l10n";
 import { CLOSE_GLYPH } from "./close-button";
 import { isWaitingYouItem, type YouItem, type YouItemsReader } from "./you-items";
 import { bindUserLabel } from "./user-label";
+import { foldGlyph } from "./marks";
 
 export function youKindLabel(item: Pick<YouItem, "kind">): string {
   return item.kind === "approve" ? l10n.t("Approval") : item.kind === "decide" ? l10n.t("Decision") : l10n.t("Machine check");
@@ -84,7 +85,7 @@ export class YouList {
         list.append(row);
       } };
       if (resolved.length) {
-        const toggle = node("button", "plan-done-toggle you-resolved-toggle", `✓ ${l10n.t("{0} resolved", String(resolved.length))} ${folded ? "▸" : "▾"}`);
+        const toggle = node("button", "plan-done-toggle you-resolved-toggle", `✓ ${l10n.t("{0} resolved", String(resolved.length))} ${foldGlyph(!folded)}`);
         toggle.type = "button";
         toggle.setAttribute("aria-expanded", String(!folded));
         toggle.onclick = () => {

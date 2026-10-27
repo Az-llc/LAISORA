@@ -77,7 +77,7 @@ LAISORAは知識の置き場所をClaudeに伝え、CLAUDE.md・rules・auto mem
 
 ### そのほか
 
-- このPCに保存し全ウィンドウで共有するToDoリスト。Claudeも項目を追加・更新できます（ベータ。既定はオフ）。
+- このPCに保存し全ウィンドウで共有するToDoリスト。Claudeも項目を追加・更新できます。
 - YOUの代わりに表示する自分の名前と、アクセントカラー。
 - ターンが動いていない間の、ネイティブ導入のClaude Code、単体のCodex CLI、専用のインストーラーで入れたAntigravity CLIの背景更新。
 

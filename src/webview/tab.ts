@@ -8,8 +8,8 @@ import { onTodoAsksClosedInTodo, todoAsksClosedInTodo } from "./todo-asks";
 import { addTodoToolCall, isTodoWriteTool, renderTodoHead, setTodoToolCardResult, todoToolCard } from "./todo-chat";
 import { renderTodoCrumbs, todoAgentLabel, todoAgentText, todoLinkHub, todoTabMarks } from "./todo-links";
 import { PlanPanel } from "./plan-panel";
-import { agentElapsedMs, applyFallbackModel, fallbackNoticeOriginal, fallbackNoticeOutcome, foldModelFallback, resolveFallbackByChoice } from "../protocol";
-import type { ModelFallbackState } from "../protocol";
+import { agentElapsedMs, applyFallbackModel, fallbackNoticeOriginal, fallbackNoticeOutcome, flattenAgents, foldModelFallback, isHistoryEvent, resolveFallbackByChoice } from "../protocol";
+import type { ModelFallbackState, WelcomeTab, WorkAgentNode } from "../protocol";
 import { YouList } from "./you-list";
 import { bindUserLabel, onUserLabelChange } from "./user-label";
 import type { YouItem } from "./you-items";
@@ -43,7 +43,7 @@ import * as l10n from "@vscode/l10n";
 import { inputEl, logsEl, tabbarEl, usagePanelEl, sessionActionsEl, vscode } from "./dom";
 import { closeGlyphButton } from "./close-button";
 import { buildApprovalBody, buildRestoredApprovalCard } from "./approval";
-import { clock, formatDuration, monthDayClock, toolSummary } from "./format";
+import { clock, clockRange, formatDuration, monthDayClock, toolSummary } from "./format";
 import { uiLocale } from "./l10n";
 import { formatHandoffTime, formatHandoffTokens } from "../handoff-format";
 import { createCopyButton, externalLinkElement, renderMarkdownInto } from "./markdown";
@@ -55,7 +55,8 @@ import { aggregateTurnEdits, buildEditSummaryCard, type TurnFileEdit } from "./e
 import { createYouItems, encodeAskDismissal, encodeAskResolution, youAnchor, type AskIdentity, type AskResolutionRecord, type YouItemsReader } from "./you-items";
 import { findCommitBoundary, joinRecordTexts, prependRecordParts, recordSeparator, withoutRetracted, type RecordTextPart } from "../commit-boundary";
 import { breaksParagraph, cardHome, compareTurnOrder, editSummaryPlace, labelPendingParts, legacyAskKeys, locateInParts, mergedParagraph, paragraphKey, paragraphText, prependTurnLayout, turnLabelModel, type ModelMark, type TurnItem, type TurnOrder, type TurnParagraph } from "./turn-layout";
-import { isConvRenderableEvent, permissionDeniedTarget } from "../conv-renderable";
+import { isConvMessageEvent, isConvRenderableEvent, permissionDeniedTarget } from "../conv-renderable";
+import { MARKS } from "./marks";
 import {
   applyActivityEvent,
   backgroundActivityFromSnapshot,
@@ -72,6 +73,7 @@ import type { WorkViewMode } from "./work-overview";
 import type { GraphScrollPort } from "./work-graph";
 import { refreshFind, refreshFindCount } from "./find-bar";
 import { deriveStatusLine, statusLineText, truncateToolIntent } from "./status-line";
+import { WelcomeView } from "./welcome";
 import { delegationCount, isTaskTool } from "../claude-tool-names";
 import type { ToolIntentInput } from "../tool-intent";
 import {
@@ -97,6 +99,7 @@ type LogRequest = {
   turns: Set<string>;
   last?: { row: HTMLElement; order: number[] };
   preview?: { row: HTMLElement; home: Comment };
+  unknownGroup?: HTMLDetailsElement;
 };
 
 type HandoffStatusMessage = Extract<HostToWebview, { type: "handoffStatus" }>;
@@ -158,7 +161,7 @@ function buildHandoffRow(code: string, text: string, name: string, kind?: Handof
     handoffNode("span", "handoff-row-code", code),
     handoffNode("span", "handoff-row-text", handoffNode("span", "handoff-row-label", text), sub),
     num,
-    handoffNode("span", "handoff-row-chev", kind === undefined ? "" : "›"));
+    handoffNode("span", "handoff-row-chev", kind === undefined ? "" : MARKS.disclosure));
   const warns = handoffNode("div", "handoff-row-warns");
   const head = handoffNode(kind === undefined ? "div" : "summary", "handoff-row-head", line, warns);
   const row = handoffNode(kind === undefined ? "div" : "details",
@@ -461,6 +464,7 @@ const HANDOFF_FAILURE_MESSAGES = {
   cancelled: l10n.t("Cancelled"),
   source_busy: l10n.t("Cannot hand off while a turn is running (wait for it to finish or interrupt it)"),
   already_running: l10n.t("A handoff is already running"),
+  folder_missing: l10n.t("Cannot hand off because the working folder of this conversation was not found"),
   tab_failed: l10n.t("The handoff was created. You can open it from history"),
   compact_failed: l10n.t("Could not summarize the conversation. Please try again"),
   hook_not_fired: l10n.t("The summary did not run. Please try again"),
@@ -1427,7 +1431,7 @@ export class Tab {
       if (this.pendingTodoFinishes.size > ORPHAN_FINISH_MAX) this.pendingTodoFinishes.delete(this.pendingTodoFinishes.keys().next().value!);
       return;
     }
-    setTodoToolCardResult(card, ev.toolUseId, ev.resultPreview, ev.isError, ev.provenance?.path !== "history");
+    setTodoToolCardResult(card, ev.toolUseId, ev.resultPreview, ev.isError, !isHistoryEvent(ev));
     if (ev.isError) this.todoCallsFailed.add(ev.toolUseId);
     this.placeTodoCard(card, ev.turnId ?? ev.toolUseId);
   }
@@ -1545,7 +1549,7 @@ export class Tab {
     this.setHandoffStatusKind("done");
     this.handoffStatusEl.setAttribute("role", "status");
     this.handoffStatusIconEl.replaceChildren(document.createTextNode("✓"));
-    const open = handoffNode("button", "handoff-status-link", l10n.t("Open new tab ›")) as HTMLButtonElement;
+    const open = handoffNode("button", "handoff-status-link", `${l10n.t("Open new tab")} ${MARKS.go}`) as HTMLButtonElement;
     open.type = "button";
     open.onclick = () => setActiveTab(fork.tabId);
     this.writeHandoffStatusText(l10n.t("Handed off"), l10n.t("New tab \"{0}\"", fork.title), document.createTextNode(" "), open);
@@ -1730,7 +1734,7 @@ export class Tab {
     const linkBtn = document.createElement("button");
     linkBtn.type = "button";
     linkBtn.className = "handoff-source-link";
-    linkBtn.textContent = l10n.t("Open previous conversation ›");
+    linkBtn.textContent = `${l10n.t("Open previous conversation")} ${MARKS.go}`;
     linkBtn.setAttribute("aria-label", source.title ? l10n.t("Open previous conversation: {0}", source.title) : l10n.t("Open previous conversation"));
     linkBtn.onclick = (e) => {
       e.preventDefault();
@@ -1948,6 +1952,7 @@ export class Tab {
   private readonly todoCallsFailed = new Set<string>();
   private readonly cardAnchors = new Map<string, Comment>();
   private readonly unsubscribeEditSummary = onEditSummaryChange(() => this.refreshEditSummaries());
+  private welcome: WelcomeView | null = null;
   private lastPastModel: string | null = null;
   private todoCardEl: HTMLDetailsElement | null = null;
   private todoSummaryEl: HTMLElement | null = null;
@@ -2006,6 +2011,8 @@ export class Tab {
   private logLatestRequest: string | undefined;
   private logEventTurn: string | undefined;
   private workModel: WorkModelPayload | undefined;
+  private logUnknownLauncherKey = "";
+  private readonly unplacedOwnedRows = new Map<string, HTMLElement[]>();
   private openYouCount = 0;
   private stripWrapEl!: HTMLElement;
   private stripEl!: HTMLElement;
@@ -2107,7 +2114,19 @@ export class Tab {
     tabbarEl.appendChild(this.tabBtn);
   }
 
+  private endWelcome(): void {
+    this.welcome?.dispose();
+    this.welcome = null;
+  }
+
+  showWelcome(tab: WelcomeTab): void {
+    if (this.welcome !== null) return;
+    this.welcome = new WelcomeView(this.convEl, tab, { post: (message) => vscode.postMessage(message), port: logsEl });
+  }
+
   destroy(): void {
+    this.welcome?.dispose();
+    this.welcome = null;
     forgetCodeBlockStates(this.tabId);
     this.unsubscribeUserLabel();
     this.unsubscribeTodoClosed();
@@ -3289,7 +3308,13 @@ export class Tab {
       if (owner && ownerData) {
         this.insertWork(owner.childrenEl, el);
         (ownerData.childIds ?? (ownerData.childIds = [])).push(toolUseId);
+        const groupRequest = this.isUnknownLauncher(placement.ownerToolUseId)
+          ? owner.card.closest<HTMLElement>(".wl-unknown-launchers")?.dataset.logRequestId : undefined;
+        if (groupRequest !== undefined) this.registerLogMember(el, groupRequest);
         return;
+      }
+      if (this.workModel === undefined || this.isUnknownLauncher(placement.ownerToolUseId)) {
+        this.unplacedOwnedRows.set(placement.ownerToolUseId, [...this.unplacedOwnedRows.get(placement.ownerToolUseId) ?? [], el]);
       }
     }
     if (placement.taskKey !== undefined) {
@@ -3582,7 +3607,7 @@ export class Tab {
   }
 
   private onAssistantMessageUuid(ev: Extract<NormalizedEvent, { kind: "assistant_message_uuid" }>): void {
-    if (ev.provenance?.path === "history" && !this.historyTurnIds.has(ev.turnId)) return;
+    if (isHistoryEvent(ev) && !this.historyTurnIds.has(ev.turnId)) return;
     if (this.withSuspendedReply(ev.turnId, () => this.onAssistantMessageUuid(ev))) return;
     if (!this.replayDone && this.currentTurnId === null && this.assistantRuns.length === 0) {
       if (!this.turnLeadUuids.has(ev.turnId)) this.turnLeadUuids.set(ev.turnId, ev.uuid);
@@ -3592,7 +3617,7 @@ export class Tab {
     this.flushDelta();
     if (this.assistantRuns.length === 0 && !this.turnLeadUuids.has(ev.turnId)) this.turnLeadUuids.set(ev.turnId, ev.uuid);
     labelPendingParts(this.assistantRuns, ev.uuid);
-    if (ev.provenance?.path === "history") this.noteRestoredRecord(this.frameOf(ev.turnId), ev.uuid);
+    if (isHistoryEvent(ev)) this.noteRestoredRecord(this.frameOf(ev.turnId), ev.uuid);
     this.recordAskDismissals(this.youStore.relabel());
     this.syncTodoClosedAsks();
     this.persistAskResolutions();
@@ -3934,7 +3959,6 @@ export class Tab {
         : l10n.t("Turn started");
     if (headline !== null) b.textContent = headline;
     const time = document.createElement("span");
-    time.textContent = timestamp > 0 ? clockLabel(timestamp) : past ? l10n.t("Time not observed") : clockLabel(Date.now());
     time.className = "wl-request-meta";
     const number = document.createElement("span");
     number.className = "wl-request-number";
@@ -4129,10 +4153,10 @@ export class Tab {
       }
       anchor.classList.toggle("wl-request-running", running);
       const duration = anchor.querySelector<HTMLElement>(".wl-request-duration")!;
-      const update = (now: number) => {
-        setTextIfChanged(duration, startedAt > 0 && (end !== undefined || running)
-          ? running ? l10n.t({ message: "Running {0}", args: [formatDuration(Math.max(0, now - startedAt))], comment: ["LOG request elapsed time"] }) : formatDuration(end! - startedAt) : "");
-        if (running || !duration.textContent) {
+      const update = () => {
+        setTextIfChanged(duration, startedAt <= 0 ? l10n.t("Time not observed")
+          : running ? `${l10n.t("Running")} ${clockRange(startedAt, null)}` : clockRange(startedAt, end !== undefined && end > 0 ? end : null));
+        if (running || startedAt <= 0 || end === undefined || end <= 0) {
           duration.removeAttribute("title");
           duration.removeAttribute("aria-label");
           return;
@@ -4142,13 +4166,12 @@ export class Tab {
         duration.setAttribute("aria-label", `${duration.textContent} (${note})`);
       };
       this.logRunningLabels.delete(`request:${id}`);
-      if (running) this.logRunningLabels.set(`request:${id}`, update);
-      update(Date.now());
+      update();
       const meta = anchor.querySelector<HTMLElement>(".wl-request-meta")!;
       const nextMeta = document.createElement("span");
-      nextMeta.textContent = startedAt > 0 ? new Date(startedAt).toLocaleTimeString(uiLocale(), { hour: "2-digit", minute: "2-digit", hour12: false }) : l10n.t("Time not observed");
+      const unknown = this.workModel?.unknownLaunchers?.length ? this.unknownLaunchersOf(id) : [];
       if (totals) {
-        nextMeta.append(" · " + l10n.t("Tools {0} calls (incl. subagents)", totals.toolCount));
+        nextMeta.append(l10n.t("Tools {0} calls (incl. subagents)", totals.toolCount));
         const delegations = delegationCount(totals);
         if (delegations > 0) nextMeta.append(" · " + l10n.t("Subagents {0}", delegations));
         if (totals.failCount > 0) {
@@ -4159,6 +4182,7 @@ export class Tab {
         }
       }
       if (meta.textContent !== nextMeta.textContent) meta.replaceChildren(...Array.from(nextMeta.childNodes));
+      if (unknown.length > 0 || request.unknownGroup) this.renderUnknownLaunchers(id, request, unknown);
       const last = request.last?.row;
       if (request.preview && (open || request.preview.row !== last)) {
         this.restoreLogPreview(request);
@@ -4303,6 +4327,7 @@ export class Tab {
   }
 
   handleEvent(ev: NormalizedEvent): void {
+    if (isConvMessageEvent(ev)) this.endWelcome();
     this.eventOrder = [ev.generation, ev.seq];
     this.observeLogEvent(ev);
     this.observeYouEvent(ev);
@@ -4543,7 +4568,7 @@ export class Tab {
   }
 
   private onTurnStarted(ev: Extract<NormalizedEvent, { kind: "turn_started" }>): void {
-    if (ev.provenance?.path === "history") this.historyTurnIds.add(ev.turnId);
+    if (isHistoryEvent(ev)) this.historyTurnIds.add(ev.turnId);
     this.dropLiveEditTurnEnds();
     this.clearCancelledHandoffNotice();
     if (this.adoptedTurnIds.has(ev.turnId)) {
@@ -4850,7 +4875,7 @@ export class Tab {
     if (this.withSuspendedReply(ev.turnId, () => {
       if (this.liveRecordOpen) this.onAssistantTextDelta(ev);
     })) return;
-    if (ev.provenance?.path === "history" ? ev.turnId !== this.currentTurnId || !this.historyTurnIds.has(ev.turnId)
+    if (isHistoryEvent(ev) ? ev.turnId !== this.currentTurnId || !this.historyTurnIds.has(ev.turnId)
       : ev.turnId !== this.currentTurnId && !this.adoptOrphanTurn(ev)) return;
     const recordUuid = ev.recordUuid;
     const pendingOrdinary = this.liveRecordOpen;
@@ -4892,15 +4917,15 @@ export class Tab {
   }
 
   private onUserMessage(ev: Extract<NormalizedEvent, { kind: "user_message" }>): void {
-    const shown = isConvRenderableEvent(ev) && !(ev.provenance?.path === "history" && this.liveRecordOpen);
+    const shown = isConvRenderableEvent(ev) && !(isHistoryEvent(ev) && this.liveRecordOpen);
     if (shown) this.endAssistantTurnBeforeConvBlock();
     this.applyWork(ev.work);
     this.noteHumanHeadline(ev.text, ev.turnId);
     if (!shown) return;
-    if (ev.provenance?.path !== "history") this.replaceAcceptedOptimisticBubble();
+    if (!isHistoryEvent(ev)) this.replaceAcceptedOptimisticBubble();
     const block = this.addBlock("user", ev.text);
     if (ev.turnId !== null) block.dataset.turnId = ev.turnId;
-    if (ev.provenance?.path === "history") this.noteRestoredRecord(block, ev.uuid);
+    if (isHistoryEvent(ev)) this.noteRestoredRecord(block, ev.uuid);
     for (const im of ev.images ?? []) {
       const img = document.createElement("img");
       img.className = "user-image";
@@ -5041,7 +5066,86 @@ export class Tab {
     };
     for (const phase of model.phases) for (const agent of phase.agents) visitAgent(agent);
     for (const agent of model.unlinkedAgents) visitAgent(agent);
+    const unknownKey = JSON.stringify(model.unknownLaunchers ?? []);
+    if (unknownKey !== this.logUnknownLauncherKey) {
+      this.logUnknownLauncherKey = unknownKey;
+      for (const id of this.logRequests.keys()) this.logDirty.add(id);
+      for (const owner of [...this.unplacedOwnedRows?.keys() ?? []]) if (!this.isUnknownLauncher(owner)) this.unplacedOwnedRows.delete(owner);
+    }
     this.scheduleLogRefresh();
+  }
+
+  private isUnknownLauncher(toolUseId: string): boolean {
+    return (this.workModel?.unknownLaunchers ?? []).some(entry => entry.toolUseIds.includes(toolUseId));
+  }
+
+  private unknownLaunchersOf(id: string): WorkAgentNode[] {
+    const model = this.workModel;
+    const toolUseIds = (model?.unknownLaunchers ?? []).filter(entry => (this.logTurnAliases.get(entry.turnId) ?? entry.turnId) === id).flatMap(entry => entry.toolUseIds);
+    if (model === undefined || toolUseIds.length === 0) return [];
+    const nodes = new Map(flattenAgents(model.phases, model.unlinkedAgents).map(agent => [agent.toolUseId, agent]));
+    return toolUseIds.flatMap(toolUseId => nodes.get(toolUseId) ?? []);
+  }
+
+  private renderUnknownLaunchers(id: string, request: LogRequest, agents: readonly WorkAgentNode[]): void {
+    let group = request.unknownGroup;
+    if (agents.length === 0) {
+      if (group) {
+        request.members.delete(group);
+        group.remove();
+        request.unknownGroup = undefined;
+      }
+      return;
+    }
+    if (!group) {
+      group = document.createElement("details");
+      group.className = "wl-unknown-launchers";
+      group.append(document.createElement("summary"), document.createElement("div"));
+      group.addEventListener("toggle", () => this.renderUnknownLaunchers(id, request, this.unknownLaunchersOf(id)));
+      request.unknownGroup = group;
+    }
+    const summary = group.querySelector("summary")!;
+    setTextIfChanged(summary, [l10n.t("Unknown launcher"), l10n.t("Subagent"), group.open ? "" : `+${agents.length}`].filter(Boolean).join(" · "));
+    const list = group.querySelector<HTMLElement>(":scope > div")!;
+    for (const agent of agents) {
+      const card = this.unknownLauncherCard(agent, request);
+      if (card.parentElement !== list) list.appendChild(card);
+    }
+    const container = request.anchor?.parentElement;
+    const topOf = (node: HTMLElement): HTMLElement | undefined => {
+      let top: HTMLElement | null = node;
+      while (top !== null && top.parentElement !== container) top = top.parentElement;
+      return top ?? undefined;
+    };
+    const tops = [...request.members].filter(node => node.isConnected && !group!.contains(node)).flatMap(node => topOf(node) ?? []);
+    const placed = tops.sort((a, b) => a.compareDocumentPosition(b) & Node.DOCUMENT_POSITION_FOLLOWING ? -1 : 1).at(-1) ?? request.anchor;
+    if (placed && placed !== group && group.previousElementSibling !== placed) placed.after(group);
+    group.dataset.logRequestId = id;
+    request.members.add(group);
+  }
+
+  private unknownLauncherCard(agent: WorkAgentNode, request: LogRequest): HTMLElement {
+    let entry = this.agentCards.get(agent.toolUseId);
+    if (entry === undefined) {
+      const data: WorkRowData = { toolUseId: agent.toolUseId, kind: "agent", toolName: "Agent", summaryText: agent.description, inputPreview: "",
+        status: "stale", startedAt: agent.startedAt ?? 0, childIds: [] };
+      if (agent.agentType) setRowChip(data, "type", agent.agentType);
+      const model = agent.modelMeasured ?? agent.modelDeclared;
+      if (model) setRowChip(data, "model", model);
+      this.rowData.set(agent.toolUseId, data);
+      entry = this.buildAgentCardDom(data);
+      this.agentCards.set(agent.toolUseId, entry);
+    }
+    const data = this.rowData.get(agent.toolUseId)!;
+    for (const row of this.unplacedOwnedRows.get(agent.toolUseId) ?? []) {
+      if (request.preview?.row === row) this.restoreLogPreview(request);
+      if (request.last?.row === row) request.last = undefined;
+      this.insertWork(entry.childrenEl, row);
+      if (request.anchor?.dataset.turnId !== undefined) this.registerLogMember(row, request.anchor.dataset.turnId);
+      if (row.dataset.toolUseId !== undefined && !data.childIds?.includes(row.dataset.toolUseId)) (data.childIds ??= []).push(row.dataset.toolUseId);
+    }
+    this.unplacedOwnedRows.delete(agent.toolUseId);
+    return entry.card;
   }
 
   applyWorkModel(model: WorkModelPayload | undefined): void {
@@ -5082,7 +5186,7 @@ export class Tab {
   }
 
   private onToolCallStarted(ev: Extract<NormalizedEvent, { kind: "tool_call_started" }>): void {
-    const isHistory = ev.provenance?.path === "history";
+    const isHistory = isHistoryEvent(ev);
     if (!isHistory && !isChildCall(ev.parentToolUseId)) {
       if (!this.withSuspendedReply(ev.turnId, () => this.closeLiveRecord()) && ev.turnId === this.currentTurnId) this.closeLiveRecord();
     }
@@ -5970,7 +6074,7 @@ export class Tab {
     if (ev.kind === "model_observed") this.noteModelMark(ev);
     if (ev.kind === "assistant_message_uuid") {
       this.pastTurnItem(turns, ev.turnId, { kind: "uuid", order: [ev.generation, ev.seq], uuid: ev.uuid });
-      if (ev.provenance?.path === "history" && !turns.recordIds.has(ev.turnId)) turns.recordIds.set(ev.turnId, ev.uuid);
+      if (isHistoryEvent(ev) && !turns.recordIds.has(ev.turnId)) turns.recordIds.set(ev.turnId, ev.uuid);
     }
     if (!isConvRenderableEvent(ev)) return "skipped";
     if (ev.kind === "permission_denied") {
@@ -6050,7 +6154,7 @@ export class Tab {
       div.className = "block user";
       div.dataset.convPast = "1";
       if (ev.turnId !== null) div.dataset.turnId = ev.turnId;
-      if (ev.provenance?.path === "history") this.noteRestoredRecord(div, ev.uuid);
+      if (isHistoryEvent(ev)) this.noteRestoredRecord(div, ev.uuid);
       div.textContent = ev.text;
       this.prependTurnLabel(div, "user");
       for (const im of ev.images ?? []) {
@@ -6473,6 +6577,7 @@ export class Tab {
   }
 
   renderOptimisticUserBubble(text: string, clientToken: string, images?: ImageAttachment[]): HTMLElement {
+    this.endWelcome();
     this.endAssistantTurnBeforeConvBlock();
     const block = this.addBlock("user", text);
     block.dataset.hydrationOptimistic = "true";

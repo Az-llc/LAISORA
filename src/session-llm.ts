@@ -3,7 +3,7 @@ import * as vscode from "vscode";
 import * as l10n from "@vscode/l10n";
 
 import type * as ClaudeCodeSdk from "@anthropic-ai/claude-agent-sdk" with { "resolution-mode": "import" };
-import { configuredClaudeExecutablePath, resolveSessionCwd } from "./claude-settings";
+import { configuredClaudeExecutablePath, launchFolderMissing, sessionBackgroundCwd } from "./claude-settings";
 import { output } from "./host-context";
 import {
   runLlmAnalysis,
@@ -20,7 +20,7 @@ import {
 } from "./llm-analysis-input";
 import { LLM_ANALYSIS_PROMPT_VERSION, llmAnalysisOutputLanguage } from "./llm-analysis-prompt";
 import { createSdkLlmAnalysisClient } from "./llm-analysis-sdk-client";
-import { displayedAncestorUsageGap, normalizeApiKeyPolicy } from "./protocol";
+import { normalizeApiKeyPolicy, subagentDetailUnreadCount } from "./protocol";
 import { asFindingVerificationModelFromPayload } from "./llm-finding-verify";
 import { loadContextFiles } from "./llm-context-files";
 import {
@@ -47,15 +47,12 @@ interface AnalysisExecutionProfile {
 interface AnalysisHistoryRead {
   readFailed: boolean;
   malformedLineCount: number;
-  ancestorUsageUnread: boolean;
 }
 
 function createLlmClientForSession(
-  s: Session,
+  cwd: string,
   profile: { effectiveModelId?: string; effectiveEffort?: string }
 ): LlmAnalysisClient | undefined {
-  const cwd = resolveSessionCwd(s);
-  if (cwd === undefined || cwd === "") return undefined;
   if (!profile.effectiveModelId || profile.effectiveModelId.trim() === "") return undefined;
   const cfg = getLaisoraConfiguration();
   return createSdkLlmAnalysisClient({
@@ -73,8 +70,7 @@ export class SessionLlm {
     private readonly store: SessionStore
   ) {}
 
-  private async resolveAnalysisExecutionProfile(): Promise<AnalysisExecutionProfile | "model_unresolved" | null> {
-    const cwd = resolveSessionCwd(this.host) ?? process.cwd();
+  private async resolveAnalysisExecutionProfile(cwd: string): Promise<AnalysisExecutionProfile | "model_unresolved" | null> {
     const modelOverrideVal = this.host.modelOverride ?? this.host.effectiveModel ?? this.host.appliedModel ?? undefined;
     const effortOverrideVal = this.host.effortOverride ?? this.host.effectiveEffort ?? this.host.appliedEffort ?? undefined;
     try {
@@ -136,10 +132,8 @@ export class SessionLlm {
   private transcriptGapSummary(historyRead: AnalysisHistoryRead): TranscriptGapSummary | undefined {
     const c = this.host.workModel.coverage;
     const gaps: TranscriptGapSummary = {
-      ...(c.unreadableAgentCount ? { unreadableAgentCount: c.unreadableAgentCount } : {}),
-      ...(c.omittedTranscriptCount ? { omittedTranscriptCount: c.omittedTranscriptCount } : {}),
+      ...(subagentDetailUnreadCount(c) > 0 ? { unreadableAgentCount: subagentDetailUnreadCount(c) } : {}),
       ...(c.hierarchyIncomplete ? { hierarchyIncomplete: true as const } : {}),
-      ...(historyRead.ancestorUsageUnread ? { ancestorUsageUnread: true as const } : {}),
       ...(historyRead.readFailed ? { historyReadFailed: true as const } : {}),
       ...(historyRead.malformedLineCount ? { historyMalformedLineCount: historyRead.malformedLineCount } : {}),
       ...(c.evidenceFoldErrorCount ? { evidenceFoldErrorCount: c.evidenceFoldErrorCount } : {}),
@@ -162,7 +156,6 @@ export class SessionLlm {
     const heldRead: AnalysisHistoryRead = {
       readFailed: c.historyReadError !== undefined,
       malformedLineCount: c.historyMalformedLineCount ?? 0,
-      ancestorUsageUnread: displayedAncestorUsageGap(c) !== undefined,
     };
     if ((c.droppedEventCount ?? 0) === 0) {
       return { ...currentInput(this.host.events), sessionHeadMissing: false, historyRead: heldRead };
@@ -177,11 +170,7 @@ export class SessionLlm {
           return {
             ...currentInput(history.events.map((h) => ({ ...h.body, timestamp: h.timestamp }))),
             sessionHeadMissing: false,
-            historyRead: {
-              readFailed: false,
-              malformedLineCount: history.malformedLineCount,
-              ancestorUsageUnread: displayedAncestorUsageGap(history.coverage) !== undefined,
-            },
+            historyRead: { readFailed: false, malformedLineCount: history.malformedLineCount },
           };
         }
         failure = readError ?? "記録が空";
@@ -222,7 +211,8 @@ export class SessionLlm {
   }
 
   async requestLlmAnalysis(): Promise<void> {
-    const refusal = this.llmAnalysisRefusal();
+    const cwd = sessionBackgroundCwd(this.host);
+    const refusal = this.llmAnalysisRefusal(cwd);
     if (refusal !== null) {
       output.appendLine(`[${this.host.title}] LLM分析を実行しませんでした: ${refusal}`);
       this.store.post({ type: "llmAnalysisRunState", tabId: this.host.tabId, running: false, refusal });
@@ -253,7 +243,7 @@ export class SessionLlm {
 
     let profile: AnalysisExecutionProfile | "model_unresolved" | null;
     try {
-      profile = await this.resolveAnalysisExecutionProfile();
+      profile = await this.resolveAnalysisExecutionProfile(cwd);
     } catch (error) {
       output.appendLine(`[${this.host.title}] resolveAnalysisExecutionProfile threw: ${String(error)}`);
       profile = null;
@@ -280,7 +270,6 @@ export class SessionLlm {
     let outcome: LlmAnalysisOutcome;
     let analysisInput: ReturnType<typeof buildLlmAnalysisInput> | undefined;
     try {
-      const cwd = resolveSessionCwd(this.host) ?? process.cwd();
       const contextFiles = loadContextFiles(cwd);
       const guardrailSignals = this.host.guardrail.signals.map((s) => ({
         id: s.signalId,
@@ -312,7 +301,7 @@ export class SessionLlm {
       } else {
         outcome = await runLlmAnalysis({
           enabled: true,
-          client: createLlmClientForSession(this.host, profile),
+          client: createLlmClientForSession(cwd, profile),
           cache: this.host.llmCache,
           input,
           promptVersion: LLM_ANALYSIS_PROMPT_VERSION,
@@ -484,7 +473,7 @@ export class SessionLlm {
     );
   }
 
-  private llmAnalysisRefusal(): string | null {
+  private llmAnalysisRefusal(cwd: string): string | null {
     if (!semanticViewEnabled()) return l10n.t("LAISORA: The semantic model is disabled (setting laisora.workLog.semanticView).");
     if (!llmAnalysisEnabled()) return l10n.t("LAISORA: LLM analysis is disabled (setting laisora.workLog.llmAnalysis).");
     if (this.host.starting !== null || (this.host.conversation !== null && !this.host.conversation.isClosed && this.host.conversation.state !== "idle")) {
@@ -492,6 +481,7 @@ export class SessionLlm {
     }
     if (this.host.llmRun !== null) return l10n.t("LAISORA: LLM analysis is already running in this tab.");
     if (this.store.llmAnalysisInFlightCount() > 0) return l10n.t("LAISORA: LLM analysis is running in another tab.");
-    return null;
+    const missingFolder = launchFolderMissing(cwd);
+    return missingFolder === undefined ? null : missingFolder.backgroundRunNotice();
   }
 }

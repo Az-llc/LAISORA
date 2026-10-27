@@ -2,7 +2,7 @@
   "name": "laisora",
   "displayName": "LAISORA",
   "description": "%extension.description%",
-  "version": "1.11.0",
+  "version": "1.12.0",
   "publisher": "az-llc",
   "categories": [
     "AI",
@@ -105,6 +105,16 @@
           "description": "%config.laisora.claude.settingSources.description%",
           "scope": "machine"
         },
+        "laisora.claude.transcriptRetentionDays": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 1,
+          "default": null,
+          "description": "%config.laisora.claude.transcriptRetentionDays.description%",
+          "scope": "machine"
+        },
         "laisora.claude.executablePath": {
           "type": "string",
           "default": "",
@@ -178,7 +188,7 @@
         },
         "laisora.todo.enabled": {
           "type": "boolean",
-          "default": false,
+          "default": true,
           "scope": "application",
           "description": "%config.laisora.todo.enabled.description%"
         },
@@ -193,6 +203,18 @@
           "default": true,
           "scope": "application",
           "description": "%config.laisora.remoteControl.showCard.description%"
+        },
+        "laisora.welcome.showNews": {
+          "type": "boolean",
+          "default": true,
+          "scope": "application",
+          "description": "%config.laisora.welcome.showNews.description%"
+        },
+        "laisora.welcome.showTips": {
+          "type": "boolean",
+          "default": true,
+          "scope": "application",
+          "description": "%config.laisora.welcome.showTips.description%"
         },
         "laisora.handoff.auto.enabled": {
           "type": "boolean",
@@ -397,7 +419,7 @@
             {
               "role": "reviewer",
               "enabled": true,
-              "description": "Independent review of a finished change; reports findings, does not edit",
+              "description": "Independent judgment on a finished change or a design; reports findings, does not edit",
               "rows": [
                 {
                   "executor": "claude",
@@ -488,7 +510,7 @@
         },
         "laisora.orchestration.conductorPolicy": {
           "type": "string",
-          "default": "<scope>\nDeliver the requested scope; ask the user only when different readings would lead to materially different work.\n</scope>\n<delegation>\nDo work yourself when it takes a handful of tool calls; delegate only when separating work, isolating context, or independent judgment outweighs the handoff cost. Use the fewest agents and run independent ones in parallel.\nBriefs state objective, scope, sources, expected output, and how completion is checked. Ask for brief conclusions with pointers; long reports are reread every later turn.\nIf a delegate fails or stalls, read its output, rebrief once naming the gap, then take over or report the blocker.\n</delegation>\n<effort>\nEffort sets how deeply an agent reasons: raise it for work that needs more thought, not for a misread brief or for fixes the findings already specify.\nThe efforts below are explicit instructions; for an external target, choose the target with that effort.\n</effort>\n<workers>\nWorkers run at {d}; use {up} only when a mistake would not be caught by later checks or review (design decisions, conclusions from records, removal judgments, behavior kept identical across many places) or when an action cannot be undone.\nSend review fixes back to the worker that made the change: continue a Claude agent with SendMessage; for an external target, run the same target again with the findings and the current diff. If the work misread the request, correct the brief and send it back the same way.\nStart a new {up} worker only when the work shows shallow reasoning, such as cases left unconsidered or the same kind of defect returning after fixes; a continued agent keeps its effort.\n</workers>\n<reviewers>\nReviewers run at {up}. Tell them to report every finding with its evidence; you triage. Use {d} only for a review that confirms earlier findings were fixed, after a review that found no new defect.\nCount each completed review as a round, the first included. Review again after each fix, and stop when nothing actionable remains. After three rounds, continue only if the latest found a user-visible problem or data loss; otherwise stop and report the open findings to the user.\n</reviewers>\n<acceptance>\nAccept results through artifacts and checks that can fail, judging generated or selected content against the request, not just format. Rerun passed checks only when inputs changed. Before handoff or release, fix and verify material findings, dismiss them with evidence, or get the user's explicit acceptance of the risk.\n</acceptance>",
+          "default": "<scope>\nDeliver the requested scope; ask the user only when different readings would lead to materially different work.\n</scope>\n<delegation>\nDo work yourself when it takes a handful of tool calls; delegate only when separating work, isolating context, or independent judgment outweighs the handoff cost. Use the fewest agents and run independent ones in parallel.\nBriefs state objective, scope, sources, expected output, and how completion is checked. Ask delegates to reply with the conclusion or verdict, findings with their evidence, and pointers; passed checks and out-of-scope observations one line each; nothing said twice. Long reports are reread every later turn; when you need an omitted detail, ask the same agent with SendMessage.\nIf a delegate fails or stalls, read its output, rebrief once naming the gap, then take over or report the blocker.\n</delegation>\n<effort>\nEffort sets how deeply an agent reasons: raise it for work that needs more thought, not for a misread brief or for fixes the findings already specify.\nThe efforts below are explicit instructions; for an external target, choose the target with that effort.\n</effort>\n<workers>\nWorkers run at {d}; use {up} only when a mistake would not be caught by later checks or review (design decisions, conclusions from records, removal judgments, behavior kept identical across many places) or when an action cannot be undone.\nSend review fixes back to the worker that made the change: continue a Claude agent with SendMessage; for an external target, run the same target again with the findings and the current diff. If the work misread the request, correct the brief and send it back the same way.\nStart a new {up} worker only when the work shows shallow reasoning, such as cases left unconsidered or the same kind of defect returning after fixes; a continued agent keeps its effort.\n</workers>\n<reviewers>\nReviewers run at {up}. Tell them to report every finding with its evidence; you triage. Use {d} only for a review that confirms earlier findings were fixed, after a review that found no new defect.\nReview a design or plan once, before it is built; the round rules below apply only to reviews of a finished change.\nCount each completed review as a round, the first included. Review again after each fix, and stop when nothing actionable remains. After three rounds, continue only if the latest found a user-visible problem or data loss; otherwise stop and report the open findings to the user.\n</reviewers>\n<acceptance>\nAccept results through artifacts and checks that can fail, judging generated or selected content against the request, not just format. Rerun passed checks only when inputs changed. Before handoff or release, fix and verify material findings, dismiss them with evidence, or get the user's explicit acceptance of the risk.\n</acceptance>",
           "editPresentation": "multilineText",
           "scope": "application",
           "description": "%config.laisora.orchestration.conductorPolicy.description%"
@@ -554,7 +576,7 @@
     "typecheck": "tsc --noEmit"
   },
   "devDependencies": {
-    "@anthropic-ai/claude-agent-sdk": "^0.3.309",
+    "@anthropic-ai/claude-agent-sdk": "^0.3.311",
     "@types/node": "^24.0.0",
     "@types/vscode": "^1.90.0",
     "@vscode/l10n": "0.0.18",

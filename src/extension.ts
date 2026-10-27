@@ -9,9 +9,10 @@ export { handleHandoffMessage } from "./handoff-wiring";
 export { handleSurfaceMessage } from "./store-surfaces";
 export { readSessionTranscript } from "./session-transcript";
 export { normalizeDriveLetter } from "./claude-settings";
-import { TODO_BETA_SETTING } from "./todo-store";
+import { TODO_ENABLED_SETTING } from "./todo-store";
 import { disposeTodoSurface, releaseOwnedTodoConversations, syncTodoSurface, toggleTodoDrawer } from "./todo-surface";
 import { EDIT_SUMMARY_SETTING } from "./edit-summary";
+import { TRANSCRIPT_RETENTION_DAYS_KEY } from "./transcript-retention";
 import { REMOTE_CONTROL_CARD_SETTING } from "./remote-control";
 import { GUARD_ENABLED_SETTING, MEMORY_BLOCK_PROJECT_TYPE_SETTING } from "./placement-line";
 import { removeRetiredBaselineCache, removeRetiredLearningStore } from "./retired-storage";
@@ -38,7 +39,7 @@ import {
 } from "./session-semantic";
 import { SessionStore, tabLimit } from "./store-surfaces";
 export { createStartMeasurement } from "./handoff-wiring";
-import { PROTOCOL_VERSION } from "./protocol";
+import { PROTOCOL_VERSION, isSettingsRevealTarget } from "./protocol";
 import { hostCpuMs, openResumedSession as resumePersistedTab, startLoopLagProbe } from "./resume-hydration";
 import { lookupSessionFile } from "./session-files";
 import {
@@ -52,7 +53,7 @@ import {
   writeHeldChosenTitle,
   type PersistedOpenTab,
 } from "./session-list-wiring";
-import { configuredSystemAppExtensions, userSettingsMessage } from "./gateway-host-actions";
+import { configuredSystemAppExtensions, openWelcome, userSettingsMessage, welcomeSettingChanged } from "./gateway-host-actions";
 export { settingsStateMessage, setExternalDetectorForTest } from "./gateway-host-actions";
 import { openSettingsPanel, postSettingsState } from "./settings-panel";
 import { postOrchestrationView } from "./conversation-lifecycle";
@@ -77,7 +78,7 @@ function ensureInitialTabs(st: SessionStore): void {
   if (st.sessions.size > 0) return;
   const entries = restoreTabsOnStartupEnabled() ? readPersistedOpenTabs() : [];
   if (entries.length === 0) {
-    st.createSession();
+    st.createSession().welcome = openWelcome();
     return;
   }
   void restorePersistedTabs(st, entries);
@@ -136,7 +137,7 @@ async function restorePersistedTabs(st: SessionStore, entries: PersistedOpenTab[
       restored++;
     }
   }
-  if (st.sessions.size === 0) st.createSession();
+  if (st.sessions.size === 0) st.createSession().welcome = openWelcome();
   const first = st.sessions.values().next().value;
   if (first) {
     for (const message of notices) first.pushEvent({ kind: "error", message, fatal: false });
@@ -200,12 +201,12 @@ function activateReady(context: vscode.ExtensionContext): void {
   if (editDiffs) context.subscriptions.push(editDiffs);
   context.subscriptions.push(
     vscode.commands.registerCommand("laisora.open", () => openPanel(context)),
-    vscode.commands.registerCommand("laisora.openSettings", () => openSettingsPanel(context)),
+    vscode.commands.registerCommand("laisora.openSettings", (target?: unknown) => openSettingsPanel(context, undefined, isSettingsRevealTarget(target) ? target : undefined)),
     vscode.commands.registerCommand("laisora.pasteText", () => pasteClipboardTextIntoComposer(store)),
     vscode.commands.registerCommand("laisora.todoToggleDrawer", () => toggleTodoDrawer())
   );
   const displayConfigSub = vscode.workspace.onDidChangeConfiguration?.((e) => {
-    if (affectsProductConfiguration(e, TODO_BETA_SETTING)) syncTodoSurface();
+    if (affectsProductConfiguration(e, TODO_ENABLED_SETTING)) syncTodoSurface();
     if (["enabled", "agents", "externalTimeoutMinutes", "conductorPolicy"]
       .some((key) => affectsProductConfiguration(e, `orchestration.${key}`))
       || affectsProductConfiguration(e, GUARD_ENABLED_SETTING) || affectsProductConfiguration(e, MEMORY_BLOCK_PROJECT_TYPE_SETTING)) {
@@ -215,20 +216,23 @@ function activateReady(context: vscode.ExtensionContext): void {
         if (cacheTtlSetting) session.semantic.scheduleSemanticModelPost();
       }
     }
-    if (affectsProductConfiguration(e, "composer.sendKey") || affectsProductConfiguration(e, "appearance") || affectsProductConfiguration(e, "claude.askQualityCheck") || affectsProductConfiguration(e, EDIT_SUMMARY_SETTING) || affectsProductConfiguration(e, REMOTE_CONTROL_CARD_SETTING)) store?.post(userSettingsMessage());
+    if (affectsProductConfiguration(e, "composer.sendKey") || affectsProductConfiguration(e, "appearance") || affectsProductConfiguration(e, "claude.askQualityCheck") || affectsProductConfiguration(e, EDIT_SUMMARY_SETTING) || affectsProductConfiguration(e, REMOTE_CONTROL_CARD_SETTING) || welcomeSettingChanged((key) => affectsProductConfiguration(e, key))) store?.post(userSettingsMessage());
     if (
       affectsProductConfiguration(e, "appearance") ||
       affectsProductConfiguration(e, "composer.sendKey") ||
       affectsProductConfiguration(e, "claude.apiKeyPolicy") ||
       affectsProductConfiguration(e, "claude.initialModel") ||
       affectsProductConfiguration(e, "restoreTabsOnStartup") ||
-      affectsProductConfiguration(e, TODO_BETA_SETTING) ||
+      affectsProductConfiguration(e, TODO_ENABLED_SETTING) ||
       affectsProductConfiguration(e, EDIT_SUMMARY_SETTING) ||
       affectsProductConfiguration(e, REMOTE_CONTROL_CARD_SETTING) ||
+      welcomeSettingChanged((key) => affectsProductConfiguration(e, key)) ||
       affectsProductConfiguration(e, GUARD_ENABLED_SETTING) ||
       affectsProductConfiguration(e, MEMORY_BLOCK_PROJECT_TYPE_SETTING) ||
       Object.values(CLI_AUTO_UPDATE_SETTINGS).some((key) => affectsProductConfiguration(e, key)) ||
       affectsProductConfiguration(e, "history.eventLimit") ||
+      affectsProductConfiguration(e, TRANSCRIPT_RETENTION_DAYS_KEY) ||
+      affectsProductConfiguration(e, "claude.settingSources") ||
       affectsProductConfiguration(e, "claude.fileLinkInstruction") ||
       affectsProductConfiguration(e, "claude.planInstruction") ||
       affectsProductConfiguration(e, "fileLinks.openWithSystemApp") ||

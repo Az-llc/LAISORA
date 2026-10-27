@@ -1,6 +1,9 @@
 import { win32 } from "node:path";
 import { envKeysOf, envValueOf } from "./claude-env";
 import { EXECUTORS, type ExecutorId, type ExternalExecutorId } from "./orchestration-executors";
+import { cliVersionNumber, compareSemVer, parseSemVer } from "./semver";
+
+export { cliVersionNumber, compareSemVer, parseSemVer } from "./semver";
 
 export const CLI_UPDATE_INTERVAL_MS = 30 * 60 * 1000;
 export const CLI_UPDATE_LOCK_STALE_MS = 15 * 60 * 1000;
@@ -21,34 +24,6 @@ export type CliUpdateSkip = "notInstalled" | "notStandalone" | "notNative" | "di
 
 export function cliUpdateSkipIsTransient(reason: CliUpdateSkip): boolean {
   return reason === "locked";
-}
-
-interface SemVer {
-  core: [number, number, number];
-  prerelease: string[];
-}
-
-export function parseSemVer(text: string | undefined): SemVer | undefined {
-  const match = cliVersionNumber(text)?.match(/^(\d+)\.(\d+)\.(\d+)(?:-([0-9A-Za-z.-]+))?(?:\+[0-9A-Za-z.-]+)?$/);
-  if (!match) return undefined;
-  return { core: [Number(match[1]), Number(match[2]), Number(match[3])], prerelease: match[4] ? match[4].split(".") : [] };
-}
-
-function comparePrereleaseIdentifier(a: string, b: string): number {
-  const numeric = (value: string) => /^\d+$/.test(value);
-  if (numeric(a) && numeric(b)) return Number(a) - Number(b);
-  if (numeric(a) !== numeric(b)) return numeric(a) ? -1 : 1;
-  return a < b ? -1 : a > b ? 1 : 0;
-}
-
-export function compareSemVer(a: SemVer, b: SemVer): number {
-  for (let i = 0; i < 3; i++) if (a.core[i] !== b.core[i]) return a.core[i] - b.core[i];
-  if (!a.prerelease.length || !b.prerelease.length) return b.prerelease.length - a.prerelease.length;
-  for (let i = 0; i < Math.min(a.prerelease.length, b.prerelease.length); i++) {
-    const order = comparePrereleaseIdentifier(a.prerelease[i], b.prerelease[i]);
-    if (order !== 0) return order;
-  }
-  return a.prerelease.length - b.prerelease.length;
 }
 
 export function cliUpdateVersionGate(installed: string | undefined, latest: string | undefined, latestLookup: boolean): CliUpdateSkip | undefined {
@@ -125,12 +100,6 @@ export function windowsStandardEnv(env: NodeJS.ProcessEnv, platform: NodeJS.Plat
   for (const [key, value] of Object.entries(env)) if (!pathKeys.includes(key)) result[key] = value;
   result[pathKeys[0] ?? "Path"] = [...front, ...rest].join(";");
   return result;
-}
-
-export function cliVersionNumber(text: string | undefined): string | undefined {
-  const trimmed = text?.trim();
-  if (!trimmed) return undefined;
-  return trimmed.match(/\d+\.\d+\.\d+[^\s]*/)?.[0] ?? trimmed;
 }
 
 export function updatedFromVersion(before: string | undefined, after: string | undefined, ok: boolean, known: string | undefined): string | undefined {

@@ -19,6 +19,7 @@ import {
   todoTextField,
 } from "./todo-edit";
 import { todoInsertPosition, type TodoInsertSlot } from "./todo-rows";
+import { MARKS } from "./marks";
 
 export interface TodoSheetDraft {
   title: string;
@@ -156,7 +157,7 @@ export class TodoAddSheet {
     const scroll = el("div", "todo-sheet-scroll");
     const head = el("header", "todo-sheet-head");
     const heading = el("h2", "todo-where todo-sheet-heading");
-    heading.append(el("span", "todo-where-up", `${l10n.t("Add")} ›`), ` ${l10n.t("New item")}`);
+    heading.append(el("span", "todo-where-up", `${l10n.t("Add")} ${MARKS.pathSeparator}`), ` ${l10n.t("New item")}`);
     head.append(heading, todoCloseButton(() => this.close(true)));
 
     const titleLabel = el("label", "todo-sheet-field");

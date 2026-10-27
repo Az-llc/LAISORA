@@ -77,7 +77,7 @@ Follow file links in replies to a location in the editor. Within the workspace a
 
 ### More
 
-- A ToDo list kept on this PC and shared by all windows, which Claude can add to and update (Beta, off by default).
+- A ToDo list kept on this PC and shared by all windows, which Claude can add to and update.
 - Your own name in place of YOU, and an accent color.
 - Background updates, while no turn is running, of a natively installed Claude Code, the standalone Codex CLI, and the Antigravity CLI installed by its own installer.
 

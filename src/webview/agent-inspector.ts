@@ -8,20 +8,21 @@ import type {
   AgentInspectorTruncatedReason,
   HostToWebview,
 } from "../protocol";
-import { formatDuration } from "./format";
 import { formatDateTime, uiLocale } from "./l10n";
+import { approxDuration } from "./format";
 import { vscode } from "./dom";
 import { closeGlyphButton } from "./close-button";
 import { failureCount } from "./failure-count";
 import { createLoader } from "./loader";
 import { termSpan, type TermKey } from "./term";
+import { MARKS } from "./marks";
 
-type UiTabId = "basic" | "instruction" | "report" | "messages" | "tools" | "request";
+type UiTabId = "basic" | "instruction" | "report" | "messages" | "tools";
 
 interface UiTab {
   id: UiTabId;
   label: string;
-  section?: AgentInspectorSection;
+  section: AgentInspectorSection;
 }
 
 const TRUNCATED_REASON_TEXT: Record<AgentInspectorTruncatedReason, string> = {
@@ -39,10 +40,6 @@ const AGENT_TABS: readonly UiTab[] = [
   { id: "report", label: l10n.t("Report"), section: "report" },
   { id: "messages", label: l10n.t("Intermediate replies"), section: "messages" },
   { id: "tools", label: l10n.t("Tool execution"), section: "tools" },
-];
-const BLOCK_TABS: readonly UiTab[] = [
-  { id: "basic", label: l10n.t("Basic info") },
-  { id: "request", label: l10n.t("Request") },
 ];
 
 type BasicFieldId = "type" | "model" | "effort" | "started" | "ended" | "elapsed" | "tools" | "failures" | "isolated";
@@ -77,23 +74,13 @@ export interface InspectorAxis {
   end: number;
 }
 
-export type InspectorTarget =
-  | {
-      kind: "agent";
-      agentId: string;
-      label: string;
-      meta?: string;
-      axis?: InspectorAxis;
-      stats?: { toolCount: number; failCount: number };
-    }
-  | {
-      kind: "block";
-      label: string;
-      meta?: string;
-      axis?: InspectorAxis;
-      text: string;
-      rows: [TermKey | Node, string | Node][];
-    };
+export interface InspectorTarget {
+  agentId: string;
+  label: string;
+  meta?: string;
+  axis?: InspectorAxis;
+  stats?: { toolCount?: number; failCount?: number; run?: { start?: number; end?: number; running: boolean; elapsedMs: number; approximate: boolean } };
+}
 
 function element<K extends keyof HTMLElementTagNameMap>(tag: K, className: string, text?: string): HTMLElementTagNameMap[K] {
   const node = document.createElement(tag);
@@ -208,8 +195,7 @@ export class AgentInspector {
   }
 
   open(target: InspectorTarget, opener?: () => HTMLElement | undefined): void {
-    const sameAgent =
-      target.kind === "agent" && this.target?.kind === "agent" && this.target.agentId === target.agentId;
+    const sameAgent = this.target?.agentId === target.agentId;
     this.target = target;
     this.opener = opener;
     if (!sameAgent) {
@@ -227,7 +213,15 @@ export class AgentInspector {
     this.buildTabs();
     this.render();
     this.closeEl.focus();
-    if (target.kind === "agent") this.requestIfNeeded();
+    this.requestIfNeeded();
+  }
+
+  refresh(target: InspectorTarget): void {
+    const current = this.target;
+    if (!this.visible || current?.agentId !== target.agentId) return;
+    this.target = target;
+    this.renderHead(target);
+    this.renderBody(target, true);
   }
 
   close(): void {
@@ -267,12 +261,8 @@ export class AgentInspector {
     this.render();
   }
 
-  private tabs(): readonly UiTab[] {
-    return this.target?.kind === "block" ? BLOCK_TABS : AGENT_TABS;
-  }
-
   private activeSection(): AgentInspectorSection | undefined {
-    return this.tabs().find((t) => t.id === this.activeTab)?.section;
+    return AGENT_TABS.find((t) => t.id === this.activeTab)?.section;
   }
 
   private setMaximized(maximized: boolean): void {
@@ -283,7 +273,7 @@ export class AgentInspector {
   private buildTabs(): void {
     this.navEl.textContent = "";
     this.tabButtons = new Map();
-    for (const tab of this.tabs()) {
+    for (const tab of AGENT_TABS) {
       const button = element("button", "wi-tab");
       button.type = "button";
       button.id = `wi-tab-${tab.id}-${this.tabId}`;
@@ -299,7 +289,7 @@ export class AgentInspector {
   }
 
   private onTabKey(e: KeyboardEvent, from: UiTabId): void {
-    const tabs = this.tabs();
+    const tabs = AGENT_TABS;
     const at = tabs.findIndex((t) => t.id === from);
     const next = e.key === "ArrowRight" ? (at + 1) % tabs.length
       : e.key === "ArrowLeft" ? (at + tabs.length - 1) % tabs.length
@@ -321,14 +311,14 @@ export class AgentInspector {
 
   private requestIfNeeded(): void {
     const section = this.activeSection();
-    if (!this.visible || section === undefined || this.target?.kind !== "agent") return;
+    if (!this.visible || section === undefined || this.target === undefined) return;
     if (this.pages.has(section) || this.pending) return;
     this.request();
   }
 
   private request(cursor?: string): void {
     const section = this.activeSection();
-    if (!this.visible || this.target?.kind !== "agent" || section === undefined) return;
+    if (!this.visible || this.target === undefined || section === undefined) return;
     const requestId = `${this.tabId}:inspector:${++this.serial}`;
     this.pending = { requestId, agentId: this.target.agentId, section };
     this.lastError = undefined;
@@ -347,7 +337,27 @@ export class AgentInspector {
   private render(): void {
     const target = this.target;
     if (target === undefined) return;
-    for (const tab of this.tabs()) {
+    this.renderBody(target, false);
+  }
+
+  private renderBody(target: InspectorTarget, patch: boolean): void {
+    const busy = this.pending !== undefined;
+    this.renderChrome(busy);
+    const next = element("div", "wi-content");
+    this.coverageEl.textContent = "";
+    delete this.coverageEl.dataset.state;
+    this.renderContent(target, busy, next);
+    if (patch && patchText(this.contentEl, next)) return;
+    const focused = document.activeElement;
+    const focusKey = focused instanceof HTMLElement && this.contentEl.contains(focused) ? focused.dataset.focusKey ?? "" : undefined;
+    this.contentEl.replaceChildren(...Array.from(next.childNodes));
+    if (focusKey === undefined) return;
+    const restored = Array.from(this.contentEl.querySelectorAll<HTMLElement>("[data-focus-key]")).find((el) => el.dataset.focusKey === focusKey);
+    (restored ?? this.closeEl).focus({ preventScroll: true });
+  }
+
+  private renderChrome(busy: boolean): void {
+    for (const tab of AGENT_TABS) {
       const button = this.tabButtons.get(tab.id);
       if (button === undefined) continue;
       const active = tab.id === this.activeTab;
@@ -357,39 +367,25 @@ export class AgentInspector {
       const cnt = button.querySelector<HTMLElement>(".wi-cnt");
       if (cnt) cnt.textContent = this.countLabel(tab);
     }
-    const busy = this.pending !== undefined;
     this.popEl.setAttribute("aria-busy", String(busy));
     this.renderStatus(busy);
-    const focused = document.activeElement;
-    const focusKey = focused instanceof HTMLElement && this.contentEl.contains(focused) ? focused.dataset.focusKey ?? "" : undefined;
-    this.contentEl.textContent = "";
-    this.coverageEl.textContent = "";
-    delete this.coverageEl.dataset.state;
-    this.renderContent(target, busy);
-    if (focusKey === undefined) return;
-    const restored = Array.from(this.contentEl.querySelectorAll<HTMLElement>("[data-focus-key]")).find((el) => el.dataset.focusKey === focusKey);
-    (restored ?? this.closeEl).focus({ preventScroll: true });
   }
 
-  private renderContent(target: InspectorTarget, busy: boolean): void {
-    if (target.kind === "block") {
-      this.renderBlock(target);
-      return;
-    }
+  private renderContent(target: InspectorTarget, busy: boolean, into: HTMLElement): void {
     const section = this.activeSection();
     const page = section !== undefined ? this.pages.get(section) : undefined;
     if (!page) {
-      if (!busy && !this.lastError) this.contentEl.appendChild(element("p", "wi-empty", l10n.t("No history to show.")));
+      if (!busy && !this.lastError) into.appendChild(element("p", "wi-empty", l10n.t("No history to show.")));
       return;
     }
-    this.renderPage(page, target);
+    this.renderPage(page, target, into);
     this.renderCoverage(page.coverage);
   }
 
   private renderHead(target: InspectorTarget): void {
     this.kindEl.replaceChildren(
-      element("b", "", target.kind === "agent" ? "SUBAGENT" : "REQUEST"),
-      termSpan(target.kind === "agent" ? "Subagent" : "Request block")
+      element("b", "", "SUBAGENT"),
+      termSpan("Subagent")
     );
     this.titleEl.textContent = target.label;
     this.metaEl.textContent = target.meta ?? "";
@@ -424,10 +420,8 @@ export class AgentInspector {
   }
 
   private countLabel(tab: UiTab): string {
-    const target = this.target;
     const chars = (n: number) => l10n.t("{0} chars", n.toLocaleString(uiLocale()));
-    if (target?.kind === "block") return tab.id === "request" ? chars(target.text.length) : "";
-    const page = tab.section !== undefined ? this.pages.get(tab.section) : undefined;
+    const page = this.pages.get(tab.section);
     if (page === undefined) return "";
     if (tab.id === "instruction" && page.section === "overview") return chars(page.overview.instruction.length);
     if (tab.id === "report" && page.section === "report") return chars(page.text.length);
@@ -456,20 +450,10 @@ export class AgentInspector {
     this.axisEl.append(line, row);
   }
 
-  private renderBlock(target: Extract<InspectorTarget, { kind: "block" }>): void {
-    if (this.activeTab === "request") {
-      this.contentEl.appendChild(pre("wi-text", target.text));
-      return;
-    }
-    const list = element("dl", "wi-overview");
-    for (const [term, value] of target.rows) addDefinition(list, term, value);
-    this.contentEl.appendChild(list);
-  }
-
   private failuresValue(count: number): Node {
     const value = failureCount(count);
     if (count > 0) {
-      const go = element("button", "wi-link wi-go", l10n.t("View in Tool execution ›"));
+      const go = element("button", "wi-link wi-go", `${l10n.t("View in Tool execution")} ${MARKS.go}`);
       go.type = "button";
       go.dataset.focusKey = "go-tools";
       go.onclick = () => this.setTab("tools", true);
@@ -478,24 +462,27 @@ export class AgentInspector {
     return value;
   }
 
-  private renderPage(page: AgentInspectorPage, target: Extract<InspectorTarget, { kind: "agent" }>): void {
+  private renderPage(page: AgentInspectorPage, target: InspectorTarget, into: HTMLElement): void {
     if (page.section === "overview") {
       if (this.activeTab === "instruction") {
-        this.contentEl.appendChild(page.overview.instruction ? pre("wi-text", page.overview.instruction) : element("p", "wi-empty", l10n.t("No instruction was recorded.")));
+        into.appendChild(page.overview.instruction ? pre("wi-text", page.overview.instruction) : element("p", "wi-empty", l10n.t("No instruction was recorded.")));
         return;
       }
       const list = element("dl", "wi-overview");
       const tools = this.pages.get("tools");
+      const run = target.stats?.run;
+      const startedAt = run?.start ?? page.overview.recordStartedAt;
+      const endedAt = run === undefined || run.running ? undefined : run.end;
       const values: Record<BasicFieldId, string | Node | undefined> = {
         type: page.overview.agentType,
         model: page.overview.modelMeasured,
         effort: page.overview.effortMeasured,
-        started: formatDateTime(page.overview.startedAt ?? null),
-        ended: formatDateTime(page.overview.endedAt ?? null),
-        elapsed: formatDuration(page.overview.elapsedMs ?? 0),
-        tools: target.stats !== undefined ? l10n.t("{0} times", target.stats.toolCount) :
+        started: startedAt === undefined ? undefined : formatDateTime(startedAt),
+        ended: endedAt === undefined ? undefined : formatDateTime(endedAt),
+        elapsed: run === undefined ? undefined : approxDuration(run.elapsedMs, run.approximate),
+        tools: target.stats?.toolCount !== undefined ? l10n.t("{0} times", target.stats.toolCount) :
           tools?.section === "tools" && tools.nextCursor === undefined ? l10n.t("{0} times", tools.tools.length) : undefined,
-        failures: target.stats !== undefined ? this.failuresValue(target.stats.failCount) : undefined,
+        failures: target.stats?.failCount !== undefined ? this.failuresValue(target.stats.failCount) : undefined,
         isolated: page.overview.spawnedWithWorktree === undefined ? undefined : page.overview.spawnedWithWorktree ? l10n.t("Yes") : l10n.t("No"),
       };
       for (const field of BASIC_FIELDS) {
@@ -504,17 +491,17 @@ export class AgentInspector {
         addDefinition(list, "term" in field ? field.term : document.createTextNode(field.label), value);
       }
       if (page.overview.worktreeBranch) addDefinition(list, document.createTextNode("worktree branch"), page.overview.worktreeBranch);
-      this.contentEl.appendChild(list);
+      into.appendChild(list);
       return;
     }
     if (page.section === "tools") {
-      this.renderTools(page);
+      this.renderTools(page, into);
       return;
     }
     if (page.section === "messages") {
       const replies = intermediateReplies(page);
       if (replies.length === 0) {
-        this.contentEl.appendChild(element("p", "wi-empty", l10n.t("No intermediate replies were recorded.")));
+        into.appendChild(element("p", "wi-empty", l10n.t("No intermediate replies were recorded.")));
         return;
       }
       const list = element("div", "wi-messages");
@@ -526,15 +513,15 @@ export class AgentInspector {
         item.append(element("span", "wi-message-no", String(index + 1).padStart(2, "0")), body);
         list.append(item);
       });
-      this.contentEl.appendChild(list);
+      into.appendChild(list);
       return;
     }
-    this.contentEl.appendChild(page.text ? pre("wi-text", page.text) : element("p", "wi-empty", l10n.t("No report was recorded.")));
+    into.appendChild(page.text ? pre("wi-text", page.text) : element("p", "wi-empty", l10n.t("No report was recorded.")));
   }
 
-  private renderTools(page: Extract<AgentInspectorPage, { section: "tools" }>): void {
+  private renderTools(page: Extract<AgentInspectorPage, { section: "tools" }>, into: HTMLElement): void {
     if (page.tools.length === 0) {
-      this.contentEl.appendChild(element("p", "wi-empty", l10n.t("No tool executions were recorded.")));
+      into.appendChild(element("p", "wi-empty", l10n.t("No tool executions were recorded.")));
       return;
     }
     const failed = page.tools.filter((tool) => tool.isError === true).length;
@@ -586,8 +573,21 @@ export class AgentInspector {
       for (const row of rows) row.open = open;
     };
     sync();
-    this.contentEl.append(head, list);
+    into.append(head, list);
   }
+}
+
+function patchText(live: Node, next: Node): boolean {
+  if (live.nodeType !== next.nodeType || live.nodeName !== next.nodeName || live.childNodes.length !== next.childNodes.length) return false;
+  if (live instanceof Element && next instanceof Element) {
+    const names = live.getAttributeNames();
+    if (names.length !== next.getAttributeNames().length || names.some((name) => live.getAttribute(name) !== next.getAttribute(name))) return false;
+  }
+  if (live.childNodes.length === 0) {
+    if (live.nodeType === Node.TEXT_NODE && live.nodeValue !== next.nodeValue) live.nodeValue = next.nodeValue;
+    return live.nodeType === Node.TEXT_NODE || live.textContent === next.textContent;
+  }
+  return Array.from(live.childNodes).every((child, index) => patchText(child, next.childNodes[index]));
 }
 
 function intermediateReplies(page: Extract<AgentInspectorPage, { section: "messages" }>): AgentInspectorMessageItem[] {

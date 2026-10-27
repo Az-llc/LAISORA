@@ -1,5 +1,5 @@
-import { fallbackTakesOverModel, foldModelFallback, stampFallbackTurnOriginal } from "./protocol";
-import type { ModelFallbackState, ModelInfo } from "./protocol";
+import { fallbackTakesOverModel, foldModelFallback, isHistoryEvent, stampFallbackTurnOriginal } from "./protocol";
+import type { ModelFallbackState, ModelInfo, RestoredAgent } from "./protocol";
 import type { ClaudeConversation } from "./claudeHost";
 import type { HostArtifactAccess } from "./artifact-access";
 import { applyActivityEvent, type BackgroundActivityState } from "./background-activity";
@@ -94,6 +94,7 @@ export interface EventFoldDraft {
   workModel: WorkModelState;
   evidenceIndex: SemanticEvidenceIndex;
   childSpans: readonly ChildTranscriptSpan[];
+  restoredAgents?: readonly RestoredAgent[];
   events: NormalizedEvent[];
   titleRefreshed: boolean;
   titleRefreshing: boolean;
@@ -330,7 +331,7 @@ function foldReaders(draft: EventFoldDraft, ev: NormalizedEvent, guardrailOnly: 
       ev,
       hostArtifacts,
       boundaries.length > 0 ? boundaries : undefined,
-      ev.provenance?.path === "history" ? undefined : { appliedEffort: draft.appliedEffort }
+      isHistoryEvent(ev) ? undefined : { appliedEffort: draft.appliedEffort }
     );
     if (ev.kind === "turn_started" || ev.kind === "user_message") {
       const timeBuckets = attachTimeBucketRequestNumbers(draft.evidenceIndex.timeBuckets, draft.workModel.requests ?? []);

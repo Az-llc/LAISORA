@@ -40,7 +40,7 @@ import {
 import { createGuardrailState } from "./guardrail";
 import { initialSessionFacts } from "./session-facts";
 import { isInSessionStore, lookupSessionFile } from "./session-files";
-import { firstRecordCwd, splitCompleteLines } from "./session-display-title";
+import { recordCwds, splitCompleteLines } from "./session-display-title";
 import { displayTitleFromSummary } from "./session-list";
 import { isHandoffForkHidden, type HandoffForkState } from "./handoff-runner";
 import {
@@ -54,7 +54,7 @@ import {
   sessionSummaryOf,
   type PersistedOpenTab,
 } from "./session-list-wiring";
-import { currentGenerationRecords } from "./time-buckets";
+import { currentGenerationRecords, seedUnknownLaunchers, timeBucketLastActivity, unknownLaunchers } from "./time-buckets";
 import {
   captureResumeReadSet,
   claimParentParseTurn,
@@ -64,13 +64,16 @@ import {
   readSessionHistory,
   readSessionTranscript,
   readSubagentAgents,
+  subagentReadGaps,
   type HistoryEvent,
   type ParentParseClaim,
   type ParentRecordSource,
   type ResumeReadSet,
   type SessionHistoryRead,
   type SessionTranscript,
+  type SubagentRestore,
   type TranscriptMessage,
+  type UsageScanOwner,
 } from "./session-transcript";
 import { childSpansOf } from "./transcript-time-buckets";
 import {
@@ -87,9 +90,46 @@ import {
 } from "./store-surfaces";
 import {
   createWorkModelState,
-  markBackgroundUnconfirmed,
+  markHydrationUnconfirmed,
   markSubagentGaps,
+  seedUnknownLauncherOwners,
+  type WorkModelState,
 } from "./work-model";
+
+export function mergeHistoryCoverage(workModel: WorkModelState, history: Pick<SessionHistoryRead, "coverage">): WorkModelState {
+  return {
+    ...workModel,
+    coverage: {
+      ...workModel.coverage,
+      ...(history.coverage.summary !== "complete" ? { summary: history.coverage.summary } : {}),
+      ...(history.coverage.details !== "complete" ? { details: history.coverage.details } : {}),
+      ...(history.coverage.omittedMessageCount
+        ? { omittedMessageCount: history.coverage.omittedMessageCount }
+        : {}),
+      ...(history.coverage.omittedToolCount
+        ? { omittedToolCount: history.coverage.omittedToolCount }
+        : {}),
+      ...(history.coverage.hierarchyIncomplete ? { hierarchyIncomplete: true as const } : {}),
+      ...(history.coverage.ancestorUsageReadError !== undefined
+        ? { ancestorUsageReadError: history.coverage.ancestorUsageReadError }
+        : {}),
+      ...(history.coverage.ancestorUsageReachesGeneration ? { ancestorUsageReachesGeneration: true as const } : {}),
+      ...(history.coverage.historyReadError !== undefined
+        ? { historyReadError: history.coverage.historyReadError }
+        : {}),
+      ...(history.coverage.historyMalformedLineCount
+        ? { historyMalformedLineCount: history.coverage.historyMalformedLineCount }
+        : {}),
+      source: "provider-transcript",
+    },
+  };
+}
+
+export function markRestoredSubagentGaps(workModel: WorkModelState,
+  history: Pick<SessionHistoryRead, "unreadSubagentIds" | "usageOnlySubagentIds" | "usagePendingSubagentIds" | "usageReadSubagentIds">,
+  restored: Pick<SubagentRestore, "malformedMetaCount" | "readError" | "unreadAgentIds">): WorkModelState {
+  return markSubagentGaps(workModel, subagentReadGaps(history, restored), restored.readError !== undefined || restored.malformedMetaCount > 0);
+}
 
 const HYDRATION_SWITCHOVER_MAX = 64;
 const HYDRATION_DRAIN_BATCH = 512;
@@ -162,9 +202,10 @@ async function readRecordedSessionCwd(
       ...splitCompleteLines(tail, tailStart).lines,
     ];
     const relocation = lastRelocatedCwd(lines);
-    const firstCwd = firstRecordCwd(lines);
+    const cwds = recordCwds(lines);
+    const firstCwd = cwds[0];
     const dirName = basename(dirname(filePath));
-    const matching = [relocation.cwd, firstCwd].filter(
+    const matching = [...new Set([relocation.cwd, ...cwds])].filter(
       (candidate): candidate is string =>
         candidate !== undefined && encodedProjectDirName(candidate) === dirName
     );
@@ -726,6 +767,10 @@ export async function foldHistoryEvents(
   return "complete";
 }
 
+export function hydrationLastActivity(draft: Pick<EventFoldDraft, "evidenceIndex" | "lastEventTimestamp">): number {
+  return timeBucketLastActivity(draft.evidenceIndex.timeBuckets) ?? draft.lastEventTimestamp ?? Date.now();
+}
+
 export function earliestRecordedTime(
   messages: readonly TranscriptMessage[],
   history: { readonly events: readonly HistoryEvent[] }
@@ -742,10 +787,12 @@ export async function readRestoredRecords(
   sessionId: string,
   readSet: ResumeReadSet | undefined,
   parentRecords: ParentRecordSource | undefined,
-  capturedTranscript?: SessionTranscript
+  capturedTranscript?: SessionTranscript,
+  usageRead: { usageScanOwner?: UsageScanOwner; largeChildUsage?: "defer" } = {}
 ): Promise<{ transcript: SessionTranscript; history: SessionHistoryRead }> {
   const transcript = capturedTranscript ?? await readSessionTranscript(filePath, isInSessionStore, readSet, sessionId, parentRecords);
   const history = await readSessionHistory(filePath, isInSessionStore, {
+    ...usageRead,
     ...(readSet === undefined ? {} : { resumeReadSet: readSet }),
     generationSessionId: sessionId,
     parentRecords,
@@ -799,6 +846,9 @@ export async function foldRestoredRecords(
   visit: (step: FoldEventResult) => "continue" | "stop",
   invalidated: () => boolean
 ): Promise<"complete" | "stopped" | "invalidated"> {
+  const launchers = unknownLaunchers(draft.restoredAgents ?? [], currentGenerationRecords(history.events));
+  draft.workModel = seedUnknownLauncherOwners(draft.workModel, launchers);
+  draft.evidenceIndex = { ...draft.evidenceIndex, timeBuckets: seedUnknownLaunchers(draft.evidenceIndex.timeBuckets, launchers) };
   const plan = restoredMessagePlan(transcript.messages, history);
   const untimedAt = earliestRecordedTime(transcript.messages, history);
   const foldBody = (body: NormalizedEventBody, own?: number): "continue" | "stop" => {
@@ -1034,7 +1084,8 @@ async function runResumeHydrationStages(
       output.appendLine(`[${s.title}] resume shared parse turn not reached after ${turn.waitedMs}ms; reading unshared`);
     }
     if (invalidated()) return abort("読み取りの順番待ちの間にセッションが変化しました");
-    ({ transcript, history } = await readRestoredRecords(h.filePath, h.sessionId, h.readSet, parentRecords, capturedTranscript));
+    ({ transcript, history } = await readRestoredRecords(h.filePath, h.sessionId, h.readSet, parentRecords, capturedTranscript,
+      { usageScanOwner: s.semantic.usageOwner, largeChildUsage: "defer" }));
     stage(capturedTranscript === undefined ? "transcript+history" : "history");
     if (invalidated()) return abort("履歴読み取り中にセッションが変化しました");
     conversation = await readConversationMessages(h.filePath, isInSessionStore, h.readSet, h.sessionId, parentRecords);
@@ -1096,6 +1147,7 @@ async function runResumeHydrationStages(
 
   const draft = createHydrationDraft(s);
   draft.childSpans = childSpansOf(restored.agents, restored.readAt);
+  draft.restoredAgents = restored.agents;
   const sink: DraftEffectSink = {
     guardrailRefresh: false,
     guardrailTick: false,
@@ -1115,44 +1167,12 @@ async function runResumeHydrationStages(
   );
   stage("fold");
   if (folded === "invalidated") return abort("履歴集計中にセッションが変化しました");
-  draft.workModel = {
-    ...draft.workModel,
-    coverage: {
-      ...draft.workModel.coverage,
-      ...(history.coverage.summary !== "complete" ? { summary: history.coverage.summary } : {}),
-      ...(history.coverage.details !== "complete" ? { details: history.coverage.details } : {}),
-      ...(history.coverage.omittedTranscriptCount
-        ? { omittedTranscriptCount: history.coverage.omittedTranscriptCount }
-        : {}),
-      ...(history.coverage.omittedMessageCount
-        ? { omittedMessageCount: history.coverage.omittedMessageCount }
-        : {}),
-      ...(history.coverage.omittedToolCount
-        ? { omittedToolCount: history.coverage.omittedToolCount }
-        : {}),
-      ...(history.coverage.hierarchyIncomplete ? { hierarchyIncomplete: true as const } : {}),
-      ...(history.coverage.ancestorUsageReadError !== undefined
-        ? { ancestorUsageReadError: history.coverage.ancestorUsageReadError }
-        : {}),
-      ...(history.coverage.ancestorUsageReachesGeneration ? { ancestorUsageReachesGeneration: true as const } : {}),
-      ...(history.coverage.historyReadError !== undefined
-        ? { historyReadError: history.coverage.historyReadError }
-        : {}),
-      ...(history.coverage.historyMalformedLineCount
-        ? { historyMalformedLineCount: history.coverage.historyMalformedLineCount }
-        : {}),
-      source: "provider-transcript",
-    },
-  };
+  draft.workModel = mergeHistoryCoverage(draft.workModel, history);
   draft.evidenceIndex = { ...draft.evidenceIndex, hash: evidenceIndexHash(draft.evidenceIndex) };
   stage("evidence");
 
-  draft.workModel = markSubagentGaps(draft.workModel, {
-    unreadableAgentCount:
-      restored.malformedMetaCount + restored.transcriptReadFailureCount + restored.omittedTranscriptCount,
-    hierarchyIncomplete: restored.readError !== undefined || restored.malformedMetaCount > 0,
-  });
-  draft.workModel = markBackgroundUnconfirmed(draft.workModel, draft.lastEventTimestamp ?? Date.now());
+  draft.workModel = markRestoredSubagentGaps(draft.workModel, history, restored);
+  draft.workModel = markHydrationUnconfirmed(draft.workModel, hydrationLastActivity(draft));
 
   const anchors = messages
     .map((m) => m.uuid)
@@ -1251,6 +1271,8 @@ async function runResumeHydrationStages(
   }
   s.semantic.seedTranscriptTimeBuckets(h.filePath, h.sessionId, history, restored);
   s.semantic.scheduleTranscriptTimeBuckets();
+  void s.semantic.loadDeferredChildUsage(history.deferredChildUsage ?? [])
+    .catch((error: unknown) => output.appendLine(`[${s.title}] deferred child usage failed: ${String(error)}`));
   if (sink.liveTurnCompleted && !s.titleRefreshed && !s.titleRefreshing && !s.closed) {
     s.titleRefreshing = true;
     void refreshTabTitle(s);

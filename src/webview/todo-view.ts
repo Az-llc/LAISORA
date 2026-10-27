@@ -6,7 +6,6 @@ import { TODO_GROUP_COLOR_COUNT, TODO_PRIORITIES, TODO_STATES, TODO_TEMPLATE_NAM
 import type { TodoApp } from "./todo-app";
 import type { AskIdentity } from "./you-items";
 import { TodoAskBoard, type TodoAskActions, type TodoAskHost, type TodoAskRow } from "./todo-asks";
-import { CAT_SHOW_MIN_PX, createTodoCats, type TodoCats } from "./todo-cats";
 import {
   formatTodoDay,
   openTodoMenu,
@@ -53,6 +52,7 @@ import {
 } from "./todo-rows";
 import { parseTodoDate, todoDatePresets } from "./todo-quick";
 import { blankTodoSheetDraft, TodoAddSheet, type TodoSheetDraft } from "./todo-sheet";
+import { MARKS } from "./marks";
 
 export interface TodoViewState {
   readonly shown?: boolean;
@@ -118,8 +118,6 @@ export const TODO_TAB_LABEL = "ToDo";
 export class TodoTab {
   readonly tabBtn: HTMLDivElement;
   readonly pane: HTMLElement;
-  private readonly catsMount: HTMLElement;
-  private cats: TodoCats | null = null;
   private readonly filterBtn: HTMLButtonElement;
   private readonly filterDot: HTMLElement;
   private readonly filterLabel: HTMLElement;
@@ -199,7 +197,6 @@ export class TodoTab {
   private readonly staleBtn: HTMLButtonElement;
   private readonly foldBtn: HTMLButtonElement;
   readonly askActions: TodoAskActions = { answer: row => this.askBoard.answer(row), done: row => this.askBoard.done(row) };
-  private readonly paneResize = new ResizeObserver(() => { if (this.catsInChips() !== this.chipsEl.contains(this.catsMount)) this.render(); });
   private readonly closeMenuOutside = (event: Event) => {
     if (!this.menuEl.contains(event.target as Node) && !this.filterBtn.contains(event.target as Node)) this.closeMenu(false);
   };
@@ -256,7 +253,7 @@ export class TodoTab {
     this.filterDot = el("span", "todo-dot");
     this.filterDot.setAttribute("aria-hidden", "true");
     this.filterLabel = el("span", "todo-filter-label");
-    const caret = el("span", "todo-caret", "▾");
+    const caret = el("span", "todo-caret", MARKS.dropdown);
     caret.setAttribute("aria-hidden", "true");
     this.filterBtn.append(this.filterDot, this.filterLabel, caret);
     this.filterBtn.addEventListener("click", () => this.menuOpen() ? this.closeMenu(true) : this.openMenu());
@@ -268,8 +265,6 @@ export class TodoTab {
     this.menuEl.setAttribute("aria-label", l10n.t("Filter"));
     this.menuEl.hidden = true;
     this.menuEl.addEventListener("keydown", (e) => this.onMenuKey(e));
-    this.catsMount = el("div", "todo-cats-mount");
-    this.catsMount.style.minWidth = `${CAT_SHOW_MIN_PX}px`;
     this.youCountEl = todoButton("todo-you-count", "", () => this.setAskOnly(!this.askOnly));
     this.youCountEl.setAttribute("aria-pressed", "false");
     this.youCountEl.dataset.focusKey = "asks";
@@ -313,7 +308,7 @@ export class TodoTab {
       send: (edit, done) => this.app.edits.send(edit, done),
       closed: draft => this.sheetClosed(draft),
     });
-    head.append(this.whereEl, this.catsMount, actions);
+    head.append(this.whereEl, actions);
     this.chipsEl = el("div", "todo-chips");
     this.searchRowEl = el("div", "todo-searchrow");
     const headWrap = el("div", "todo-headwrap");
@@ -346,7 +341,6 @@ export class TodoTab {
       this.setMode("list");
       this.focusByKey("history");
     });
-    this.paneResize.observe(this.pane);
     document.body.append(this.sheet.root);
     this.app.onNotice(notice => this.showNotice(notice));
     this.app.extras = { waiting: id => this.asking.has(id), groups: () => [...this.colors.keys()], groupPlaces: group => ({ folders: this.groupFolders.get(group) ?? [], aliases: this.groupAliases.get(group) ?? [] }) };
@@ -463,12 +457,6 @@ export class TodoTab {
     this.staleBtn.hidden = this.staleRows.length === 0;
     this.staleBtn.textContent = l10n.t("Mark the old questions done ({0})", this.staleRows.length);
     this.render();
-    this.cats?.setState({
-      asks: rows.filter(row => !row.stale).map(row => row.key),
-      askTarget: count > 0 ? this.youCountEl : null,
-      busy: this.itemsNow.some(item => item.state === "doing" && !finished.has(item.id)),
-      allDone: this.itemsNow.length > 0 && this.itemsNow.every(item => finished.has(item.id)),
-    });
     for (const listener of this.listeners) listener();
   }
 
@@ -568,8 +556,6 @@ export class TodoTab {
       this.revision = -1;
       clearTimeout(this.midnightTimer);
       this.midnightTimer = undefined;
-      this.cats?.destroy();
-      this.cats = null;
       this.askBoard.clear();
       clearTimeout(this.staleTimer);
       this.staleTimer = undefined;
@@ -585,7 +571,6 @@ export class TodoTab {
       return { restoreShown };
     }
     this.enabledNow = true;
-    this.cats ??= createTodoCats(this.catsMount, { signLabel: l10n.t("Beta") });
     if (this.midnightTimer === undefined) this.scheduleMidnight();
     if ("unreadable" in message) {
       this.unreadable = true;
@@ -844,7 +829,7 @@ export class TodoTab {
     this.foldBtn.hidden = this.foldDone && done === 0;
     this.foldBtn.title = this.foldDone ? l10n.t("Show the done items") : l10n.t("Fold done items into “Show N done” at the end of each list");
     this.foldBtn.setAttribute("aria-pressed", this.foldDone ? "false" : "true");
-    this.chipsEl.replaceChildren(this.filterBtn, ...(this.catsInChips() ? [this.catsMount] : []), due, ...parts, this.staleBtn);
+    this.chipsEl.replaceChildren(this.filterBtn, due, ...parts, this.staleBtn);
     if (this.searchRowEl.firstChild !== this.searchEl || this.searchEl.nextSibling !== this.foldBtn) this.searchRowEl.replaceChildren(this.searchEl, this.foldBtn);
   }
 
@@ -1147,7 +1132,7 @@ export class TodoTab {
 
   private renderHead(): void {
     const history = this.mode !== "list";
-    this.whereEl.replaceChildren(...(history ? [el("span", "todo-where-up", "ToDo ›"), document.createTextNode(` ${l10n.t("History")}`)] : []));
+    this.whereEl.replaceChildren(...(history ? [el("span", "todo-where-up", `ToDo ${MARKS.pathSeparator}`), document.createTextNode(` ${l10n.t("History")}`)] : []));
     this.whereEl.hidden = !history;
     this.youCountEl.hidden = history || this.askCount === 0;
     this.addBtn.hidden = history;
@@ -1164,7 +1149,6 @@ export class TodoTab {
         this.historyTabsEl.append(tab);
       }
     }
-    if (!this.chipsEl.contains(this.catsMount) && this.catsMount.previousSibling !== this.whereEl) this.whereEl.after(this.catsMount);
     const since = todoRecentSince(this.historySeenAt, Date.now());
     const unseen = history ? 0 : this.claudeRecent.filter(at => at > since).length;
     this.historyBtn.hidden = history;
@@ -1175,10 +1159,6 @@ export class TodoTab {
     this.historyBtn.replaceChildren(icon, ...(unseen > 0 ? [el("span", "todo-history-badge", String(unseen))] : []));
     this.historyBtn.title = label;
     this.historyBtn.setAttribute("aria-label", label);
-  }
-
-  private catsInChips(): boolean {
-    return this.mode === "list" && getComputedStyle(this.filterBtn).display !== "none";
   }
 
   private openInline(slot: TodoInsertSlot, text: string): void {

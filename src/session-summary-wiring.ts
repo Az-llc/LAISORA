@@ -1,7 +1,7 @@
 import * as l10n from "@vscode/l10n";
 import { getLaisoraConfiguration } from "./claude-settings";
 
-import { configuredClaudeExecutablePath, resolveSessionCwd } from "./claude-settings";
+import { configuredClaudeExecutablePath, launchFolderMissing, sessionBackgroundCwd } from "./claude-settings";
 import { extensionContext, output } from "./host-context";
 import { normalizeApiKeyPolicy, type NormalizedEventBody } from "./protocol";
 import { buildSessionDigest, buildSummaryPrompt, buildSessionNamePrompt, sanitizeSessionName, generateSessionSummaryViaSdk } from "./session-summary";
@@ -149,6 +149,13 @@ export class SessionSummaryWiring {
         failure = l10n.t("LAISORA: There is no record to summarize yet.");
         return;
       }
+      const cwd = sessionBackgroundCwd(this.host);
+      const missingFolder = launchFolderMissing(cwd);
+      if (missingFolder !== undefined) {
+        output.appendLine(`[${this.host.title}] 要約を実行しませんでした: ${missingFolder.message}`);
+        failure = missingFolder.backgroundRunNotice();
+        return;
+      }
       const { userTexts, toolCalls, agentCount, readFailure, onlyEarlierGenerations } = await this.collectSummaryInput();
       if (this.supersededSince(logicalGenerationAtStart)) return;
       if (userTexts.length === 0) {
@@ -174,7 +181,7 @@ export class SessionSummaryWiring {
       const result = await generateSessionSummaryViaSdk({
         modelId,
         apiKeyPolicy: normalizeApiKeyPolicy(getLaisoraConfiguration().get<string>("claude.apiKeyPolicy")!),
-        cwd: resolveSessionCwd(this.host) ?? process.cwd(),
+        cwd,
         prompt: (naming ? buildSessionNamePrompt : buildSummaryPrompt)(buildSessionDigest(userTexts, toolCalls, agentCount)),
         signal: abort.signal,
         pathToClaudeCodeExecutable: configuredClaudeExecutablePath(getLaisoraConfiguration()),

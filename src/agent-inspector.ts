@@ -196,8 +196,6 @@ export async function readAgentInspectorPage(
 
     if (request.section === "overview") {
       const instruction = firstInstruction(records);
-      const startedAt = firstTimestamp(records);
-      const endedAt = lastTimestamp(records);
       const modelMeasured = firstString(records, (record) => asRecord(record.message)?.model);
       const effortMeasured = firstString(records, (record) => record.effort);
       const clippedInstruction = clipUtf8(instruction, INSPECTOR_PREVIEW_BYTES);
@@ -212,12 +210,10 @@ export async function readAgentInspectorPage(
             instruction: clippedInstruction,
             modelMeasured,
             effortMeasured,
-            startedAt,
-            endedAt,
-            elapsedMs: startedAt !== undefined && endedAt !== undefined ? Math.max(0, endedAt - startedAt) : undefined,
             spawnedWithWorktree: typeof located.meta.spawnedWithWorktree === "boolean"
               ? located.meta.spawnedWithWorktree : undefined,
             worktreeBranch: stringValue(located.meta.worktreeBranch),
+            recordStartedAt: records.map((record) => timestampValue(record.timestamp)).find((at) => at !== undefined),
           },
           coverage: withCoverageLimits(baseCoverage(1), previewTruncated ? 1 : 0, false),
         },
@@ -544,22 +540,6 @@ function finalReport(records: readonly Record<string, unknown>[]): string {
     if (text) return text;
   }
   return "";
-}
-
-function firstTimestamp(records: readonly Record<string, unknown>[]): number | undefined {
-  for (const record of records) {
-    const timestamp = timestampValue(record.timestamp);
-    if (timestamp !== undefined) return timestamp;
-  }
-  return undefined;
-}
-
-function lastTimestamp(records: readonly Record<string, unknown>[]): number | undefined {
-  for (let i = records.length - 1; i >= 0; i--) {
-    const timestamp = timestampValue(records[i].timestamp);
-    if (timestamp !== undefined) return timestamp;
-  }
-  return undefined;
 }
 
 function firstString(

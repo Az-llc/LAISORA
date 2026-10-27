@@ -28,6 +28,9 @@ const jaL10nBundleLiteral = JSON.stringify(
   JSON.stringify(JSON.parse(readFileSync("l10n/bundle.l10n.ja.json", "utf8")))
 );
 
+// media/laisora-icon.svg を data: の mask として埋める（src/extension.ts#buildHtml の CSP の img-src は data: だけ）
+const welcomeMarkLiteral = JSON.stringify(`url("data:image/svg+xml,${encodeURIComponent(readFileSync("media/laisora-icon.svg", "utf8"))}")`);
+
 // ESM 出力で @vscode/l10n（CJS main.js）の require("fs") が Dynamic require になり落ちるので、node 向け ESM には require を先頭で与える
 const ESM_NODE_BANNER = { js: 'import { createRequire as __l10nCreateRequire } from "node:module"; const require = __l10nCreateRequire(import.meta.url);' };
 
@@ -82,7 +85,7 @@ const webviewCtx = await esbuild.context({
   // inject は全入力へ差し込まれ、差し込み先より前に評価される。dom.ts / menu.ts が
   // モジュール評価時に l10n.t() を呼ぶため、この順序が日本語表示の前提になっている
   inject: ["src/webview/l10n-boot.ts"],
-  define: { "__LAISORA_L10N_JA_BUNDLE__": jaL10nBundleLiteral },
+  define: { "__LAISORA_L10N_JA_BUNDLE__": jaL10nBundleLiteral, "__LAISORA_WELCOME_MARK__": welcomeMarkLiteral },
   outfile: "dist/webview.js",
   sourcemap: false,
   metafile: true,

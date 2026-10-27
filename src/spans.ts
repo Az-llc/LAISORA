@@ -45,6 +45,10 @@ export function subtractSpans(a: readonly Span[], b: readonly Span[]): Span[] {
   return out;
 }
 
+export function unfinishedCallEnd(startedAt: number, stoppedAt: number | undefined, lastActivity: number): number {
+  return Math.max(startedAt, stoppedAt ?? lastActivity);
+}
+
 export function measureSpans(spans: readonly Span[]): number {
   let total = 0;
   for (const [s0, s1] of spans) total += Math.max(0, s1 - s0);
@@ -113,6 +117,14 @@ export interface ChildTranscriptSpan {
   endedAt?: number;
   readAt: number;
   runs?: RecordedRuns;
+}
+
+type RecordedEnds = { startedAt?: number; endedAt?: number };
+export function launchlessRunSpan(child: ChildTranscriptSpan | undefined, recorded: RecordedEnds, fallbackStart: number): { start: number; end: number };
+export function launchlessRunSpan(child: ChildTranscriptSpan | undefined, recorded: RecordedEnds): { start: number; end: number } | undefined;
+export function launchlessRunSpan(child: ChildTranscriptSpan | undefined, recorded: RecordedEnds, fallbackStart?: number): { start: number; end: number } | undefined {
+  const start = child?.startedAt ?? recorded.startedAt ?? fallbackStart;
+  return start === undefined ? undefined : { start, end: Math.max(start, child?.endedAt ?? recorded.endedAt ?? start) };
 }
 
 export function moreRuns<T extends RecordedRuns>(base: T, other: T): T {

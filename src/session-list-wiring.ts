@@ -5,10 +5,9 @@ import { open } from "node:fs/promises";
 import { join } from "node:path";
 import type * as ClaudeCodeSdk from "@anthropic-ai/claude-agent-sdk" with { "resolution-mode": "import" };
 
-import { homedir } from "node:os";
 import { AccountUsageFetcher, rateLimitsViaUsageCommand } from "./account-usage";
 import { claudeConfigDir, claudeProjectsDir } from "./claude-env";
-import { configuredClaudeExecutablePath, getLaisoraConfiguration, resolveSessionCwd } from "./claude-settings";
+import { configuredClaudeExecutablePath, existingFolderOrHome, getLaisoraConfiguration, resolveSessionCwd } from "./claude-settings";
 import { resolveClaudeCodeExecutable } from "./claudeCliResolver";
 import type { ClaudeConversation } from "./claudeHost";
 import type { Session } from "./extension";
@@ -757,7 +756,7 @@ export async function handleSessionFileMessage(
         ...(conversation ? { viaConversation: (signal: AbortSignal) => conversation.planUsageRateLimits(ACCOUNT_USAGE_TIMEOUT_MS, signal) } : {}),
         viaUsageCommand: (signal) =>
           rateLimitsViaUsageCommand({
-            cwd: (target ? resolveSessionCwd(target) : undefined) ?? homedir(),
+            cwd: existingFolderOrHome(target ? resolveSessionCwd(target) : undefined),
             apiKeyPolicy,
             signal,
             resolveExecutablePath: async () =>

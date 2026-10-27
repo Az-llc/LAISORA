@@ -6,6 +6,7 @@ import type {
   LlmFindingReportView,
 } from "../protocol";
 import { vscode } from "./dom";
+import { MARKS } from "./marks";
 import * as l10n from "@vscode/l10n";
 
 type AttachedView = AttachedAnalysisView;
@@ -134,7 +135,7 @@ function renderEvidenceChip(chip: AttachedEvidenceChip, evidenceNavigation?: Evi
     btn.dataset.alias = chip.alias;
     btn.dataset.kind = chip.kind;
     btn.dataset.evidenceToolUseId = toolUseId;
-    btn.textContent = `[${chip.label} ▸]`;
+    btn.textContent = `[${chip.label} ${MARKS.goTriangle}]`;
     btn.onclick = () => {
       evidenceNavigation.navigate(toolUseId);
     };

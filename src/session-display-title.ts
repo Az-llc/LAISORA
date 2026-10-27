@@ -47,7 +47,8 @@ export function splitCompleteLines(chunk: Uint8Array, baseOffset: number): Split
   return { lines, consumedBytes: consumed };
 }
 
-export function firstRecordCwd(lines: readonly ScannedLine[]): string | undefined {
+export function recordCwds(lines: readonly ScannedLine[]): string[] {
+  const cwds: string[] = [];
   let sessionId: string | undefined;
   for (const line of lines) {
     let record: unknown;
@@ -61,7 +62,7 @@ export function firstRecordCwd(lines: readonly ScannedLine[]): string | undefine
     const recordSessionId = typeof fields.sessionId === "string" ? fields.sessionId : undefined;
     if (sessionId !== undefined && recordSessionId !== undefined && recordSessionId !== sessionId) continue;
     sessionId ??= recordSessionId;
-    if (typeof fields.cwd === "string") return fields.cwd;
+    if (typeof fields.cwd === "string" && !cwds.includes(fields.cwd)) cwds.push(fields.cwd);
   }
-  return undefined;
+  return cwds;
 }

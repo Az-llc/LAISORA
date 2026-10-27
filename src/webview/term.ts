@@ -1,25 +1,29 @@
 import * as l10n from "@vscode/l10n";
 
 export const TERM_NOTES = {
-  "Waiting for your answer": {
-    label: l10n.t("Waiting for your answer"),
-    note: l10n.t("Time the LLM spent waiting for a person to answer a question it asked with AskUserQuestion"),
+  "Subagent only": {
+    label: l10n.t("Subagent only"),
+    note: l10n.t("Time a subagent was running while the main LLM was not generating, running a tool or waiting for a subagent"),
   },
-  "Waiting for reply": {
-    label: l10n.t("Waiting for reply"),
-    note: l10n.t("Time from the end of the LLM's response until the person's next message"),
+  "Background only": {
+    label: l10n.t("Background only"),
+    note: l10n.t("Time a background task was running while neither the main LLM nor a subagent was working"),
   },
   "Subagent": {
     label: l10n.t("Subagent"),
-    note: l10n.t("A separate LLM started by the main LLM with the Agent tool, or an external agent started in the background. Runs in parallel"),
+    note: l10n.t("A separate LLM started by the main LLM with the Agent tool, or an external run"),
   },
   "Background": {
     label: l10n.t("Background"),
     note: l10n.t("A run started with Bash run_in_background that keeps working after the tool response returns. Asynchronous Agent tool launches are counted as subagents"),
   },
-  "Request block": {
-    label: l10n.t("Request block"),
-    note: l10n.t("One unit from a person's message to the next person's message"),
+  "Processing": {
+    label: l10n.t("Processing"),
+    note: l10n.t("Time anything was running (LLM generation, tool execution, waiting for a subagent, subagents and background tasks), with overlapping work counted once"),
+  },
+  "Total work": {
+    label: l10n.t("Total work"),
+    note: l10n.t("LLM generation plus every tool call, subagent, background task and external run added up one by one, so work that ran in parallel is counted once for each item. Live time not observed yet is not included"),
   },
   "effort": {
     label: "effort",
@@ -31,7 +35,7 @@ export const TERM_NOTES = {
   },
   "LLM generation": {
     label: l10n.t("LLM generation"),
-    note: l10n.t("Time the LLM spent generating responses and tool calls (the remainder of a turn after tool execution, waiting for subagents and waiting for confirmation)"),
+    note: l10n.t("Time the LLM spent generating responses and tool calls"),
   },
   "Tool execution": {
     label: l10n.t("Tool execution"),
@@ -54,5 +58,16 @@ export function termSpan(term: TermKey): Node {
   el.title = entry.note;
   el.setAttribute("aria-description", entry.note);
   el.textContent = entry.label;
+  return el;
+}
+
+export function measuredSumNote(content: string | readonly (Node | string)[], partial: boolean | undefined): Node {
+  if (!partial && typeof content === "string") return document.createTextNode(content);
+  const el = document.createElement("span");
+  if (typeof content === "string") el.textContent = content;
+  else el.append(...content);
+  if (!partial) return el;
+  el.className = "term-note";
+  el.title = l10n.t("Includes runs that were not measured; the value is the total of the measured runs");
   return el;
 }

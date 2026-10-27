@@ -1,15 +1,15 @@
-import { isObservedTime, type NormalizedEvent, type NormalizedEventBody } from "./protocol";
+import { isHistoryEvent, isObservedTime, type NormalizedEvent, type NormalizedEventBody, type RestoredAgent } from "./protocol";
 import { redactAbsolutePaths } from "./path-redaction";
 import { IMAGE_PLACEHOLDER } from "./transcript-display";
 import { isPureCommandWrapper, INJECTED_TAG_RE, STEER_TAG_RE } from "./human-input-vocabulary";
 import { bookkeepingIntent, foldPlanDeclarationText, observedTaskIntent, taskCreateKeyFromResult, type TaskIntent, type PlanTextState } from "./work-model";
-import { planBlockName, planItemNumber, planItemNumberOf, planNumberedStep, planPlacedStep, planStepActiveSpans, planStepKey, planStepTaskKey, planSuccessorStep, planWorkEnd, TASK_KEY_PREFIX, TASK_PENDING_KEY_PREFIX, transitionPlanStep, type PlanSpan, type PlanStepTiming, type PlanStepTransition, type PlanStepUpdate } from "./plan-steps";
+import { foregroundExternalCalls, MAIN_PROCESSING_BUCKETS, planBlockName, planItemNumber, planItemNumberOf, planNumberedStep, planPlacedStep, planStepActiveSpans, planStepKey, planStepTaskKey, planSuccessorStep, planWorkEnd, TASK_KEY_PREFIX, TASK_PENDING_KEY_PREFIX, transitionPlanStep, type PlanSpan, type PlanStepTiming, type PlanStepTransition, type PlanStepUpdate } from "./plan-steps";
 import type { PlanUsage, PlanTokenTotal } from "./plan-usage";
 import { isExternalRunTool } from "./orchestration-executors";
 import { delegationCount, isCountedExternalRunCall, isDelegationLaunchTool, isDelegationTool } from "./claude-tool-names";
 import { isRejectedBeforeRun, taskNotificationTerminal } from "./tool-result-signals";
 import { conductorStopTarget } from "./tool-intent";
-import { callLane, moreRuns, type RecordedRuns, childActivity, childRecordEnd, childUsageCounts, closeRun, currentRunStart, delegationRuns, intersectSpans, measureSpans, memberRunTimes, runElapsedMs, runEnd, runSpans, subtractSpans, unionSpans, type CallLane, type ChildTranscriptSpan, type RunStop, type Span, isChildCall } from "./spans";
+import { callLane, unfinishedCallEnd, launchlessRunSpan, moreRuns, type RecordedRuns, childActivity, childRecordEnd, childUsageCounts, closeRun, currentRunStart, delegationRuns, intersectSpans, measureSpans, memberRunTimes, runElapsedMs, runEnd, runSpans, subtractSpans, unionSpans, type CallLane, type ChildTranscriptSpan, type RunStop, type Span, isChildCall } from "./spans";
 
 export type TimeBucket = "generate" | "tool" | "delegation" | "confirm" | "reply";
 export type TimeLane = CallLane;
@@ -161,6 +161,36 @@ export interface DelegationSpan {
   subagentType?: string;
   model?: string;
   rejectedBeforeRun?: true;
+  parentToolUseId?: string;
+}
+
+export interface UnknownLauncher {
+  toolUseId: string;
+  agentId: string;
+  startedAt?: number;
+  endedAt?: number;
+  description: string;
+  agentType?: string;
+  model?: string;
+}
+
+export function unknownLaunchers(restored: readonly RestoredAgent[], records: readonly { body: NormalizedEventBody; timestamp: number }[]): UnknownLauncher[] {
+  const launched = new Set<string>();
+  let boundary: number | undefined;
+  for (const record of records) {
+    if (record.body.kind === "tool_call_started") launched.add(record.body.toolUseId);
+    boundary = generationBoundaryTime(record.body, record.timestamp) ?? boundary;
+  }
+  return restored.filter(agent => agent.toolUseId.length > 0 && !launched.has(agent.toolUseId)
+    && (boundary === undefined || agent.startedAt !== undefined && agent.startedAt >= boundary))
+    .map(agent => ({ toolUseId: agent.toolUseId, agentId: agent.agentId, description: agent.description,
+      ...(agent.startedAt === undefined ? {} : { startedAt: agent.startedAt }), ...(agent.endedAt === undefined ? {} : { endedAt: agent.endedAt }),
+      ...(agent.agentType === undefined ? {} : { agentType: agent.agentType }),
+      ...((agent.modelMeasured ?? agent.modelDeclared) === undefined ? {} : { model: agent.modelMeasured ?? agent.modelDeclared }) }));
+}
+
+export function seedUnknownLaunchers(state: TimeBucketState, launchers: readonly UnknownLauncher[]): TimeBucketState {
+  return launchers.length === 0 ? state : { ...state, unknownLaunchers: launchers };
 }
 
 export interface BackgroundTaskSpan {
@@ -174,6 +204,7 @@ export interface BackgroundTaskSpan {
   notifiedEndedAt?: number;
   staleAt?: number;
   pendingStale?: true;
+  parentToolUseId?: string;
 }
 
 export interface BackgroundTaskSpanView {
@@ -199,6 +230,7 @@ export interface ExternalRunCallView {
   start: number;
   end: number;
   open: boolean;
+  parentToolUseId?: string;
 }
 
 export type RequestBlockKind = "say" | "command" | "interrupt" | "plan";
@@ -211,10 +243,10 @@ export interface PlanBlockStepRecord extends PlanStepTiming {
 }
 export interface PlanBlockMetrics {
   provisional?: boolean;
-  generateMs: number | null; toolMs: number | null; subagentWaitMs: number | null; subagentOnlyMs: number | null;
+  generateMs: number | null; toolMs: number | null; subagentWaitMs: number | null; subagentOnlyMs: number | null; backgroundOnlyMs: number | null;
   decisionWaitMs: number | null; replyWaitMs: number | null; tokens: PlanTokenTotal | null;
 }
-export interface PlanBlockStepView extends PlanStepTiming, PlanBlockMetrics {
+export interface PlanBlockStepView extends PlanStepTiming, Omit<PlanBlockMetrics, "tokens"> {
   conductorIntervals?: TimeBucketInterval[];
   conductorTail?: number | null;
   number: number; end: number | null; durationMs: number | null; longest: boolean; parallel: boolean;
@@ -230,11 +262,10 @@ export interface RequestBlockRecord {
   start: number;
   turnId: string | null;
   goal?: string;
-  closedAt?: number;
   steps?: PlanBlockStepRecord[];
   seenSteps?: string[];
   // requestId: the request's message uuid, so a request absorbed into a later block names that block.
-  userMessages?: { at: number; text: string; requestId?: string }[];
+  userMessages?: { at: number; requestId?: string }[];
 }
 
 export interface TimeBucketState {
@@ -257,6 +288,7 @@ export interface TimeBucketState {
   mainTools: ToolInterval[];
   subTools: ToolInterval[];
   delegations: KeyedLog<DelegationSpan>;
+  unknownLaunchers?: readonly UnknownLauncher[];
   delegationsByAgent: KeyedLog<string[]>;
   backgroundTasks: KeyedLog<BackgroundTaskSpan>;
   backgroundByTask: KeyedLog<string[]>;
@@ -369,10 +401,6 @@ function isWindowKind(kind: string): boolean {
   return kind.startsWith("tool_call_") || kind === "user_message" || kind.startsWith("turn_");
 }
 
-function isLiveEvent(event: NormalizedEvent): boolean {
-  return event.provenance?.path !== "history";
-}
-
 // A block's id names what opened it: the request's message uuid (the same in the transcript and the live fold, since the
 // Host sends that uuid with the message), the plan tool call, or the n-th goal declaration of a request. Only an opening
 // without an identity falls back to its position, and a live opening's position is kept apart from the transcript's, so
@@ -394,10 +422,6 @@ function appendWorkBlock(state: TimeBucketState, block: Omit<RequestBlockRecord,
   return { ...state, blocks: dropped ? blocks.slice(dropped) : blocks, droppedBlockCount: state.droppedBlockCount + dropped };
 }
 
-function firstLine(text: string): string {
-  return text.split(/\r?\n/, 1)[0];
-}
-
 function openPlanBlock(state: TimeBucketState, opening: { goal?: string; text: string; start: number; turnId: string }, live: boolean, openedBy?: string): TimeBucketState {
   const plan = { kind: "plan" as const, ...opening, steps: [], userMessages: [] };
   const last = state.blocks.at(-1);
@@ -405,9 +429,9 @@ function openPlanBlock(state: TimeBucketState, opening: { goal?: string; text: s
     const turnId = last.turnId ?? opening.turnId;
     return { ...state, blocks: [...state.blocks.slice(0, -1), { ...plan, blockId: last.blockId, start: last.start, turnId,
       requestNumber: last.requestNumber ?? requestNumberOf(state.requestNumbers, turnId),
-      userMessages: [{ at: last.start, text: firstLine(last.text), ...(state.request === undefined ? {} : { requestId: state.request.id }) }] }] };
+      userMessages: [{ at: last.start, ...(state.request === undefined ? {} : { requestId: state.request.id }) }] }] };
   }
-  const request = last?.kind === "plan" && last.closedAt === undefined ? last.userMessages?.at(-1) : undefined;
+  const request = last?.kind === "plan" ? last.userMessages?.at(-1) : undefined;
   if (last !== undefined && request !== undefined && request.at > last.start
     && !last.steps?.some(step => step.transitions.some(change => change.at >= request.at))) {
     state = { ...state, blocks: [...state.blocks.slice(0, -1), { ...last, userMessages: last.userMessages!.slice(0, -1) }] };
@@ -425,7 +449,7 @@ function applyPlanTask(state: TimeBucketState, intent: TaskIntent, at: number, t
   if (intent.kind === "update") {
     while (index >= 0 && !state.blocks[index].steps?.some(step => step.taskKey === intent.taskKey)) index--;
     if (index < 0) return state;
-  } else if (state.blocks[index]?.kind !== "plan" || state.blocks[index].closedAt !== undefined) {
+  } else if (state.blocks[index]?.kind !== "plan") {
     const title = intent.kind === "todo" ? intent.items.find(item => item.status !== "completed")?.description : intent.subject;
     if (!title?.trim()) return state;
     state = openPlanBlock(state, { text: redactAbsolutePaths(title), start: at, turnId }, opener.live, opener.toolUseId);
@@ -546,9 +570,9 @@ function staleOpenBackground(
   return n;
 }
 
-function staleOpenMainCalls(state: TimeBucketState, n: TimeBucketState, ts: number): TimeBucketState {
+function staleOpenCalls(state: TimeBucketState, n: TimeBucketState, ts: number, lanes: readonly TimeLane[]): TimeBucketState {
   const stamped = Object.entries(state.openTools).map(([id, tool]) =>
-    [id, tool.lane === "main" && tool.staleAt === undefined ? { ...tool, staleAt: Math.max(tool.at, ts) } : tool] as const);
+    [id, lanes.includes(tool.lane) && tool.staleAt === undefined ? { ...tool, staleAt: Math.max(tool.at, ts) } : tool] as const);
   if (stamped.every(([id, tool]) => tool === state.openTools[id])) return n;
   n.openTools = Object.fromEntries(stamped);
   return n;
@@ -596,6 +620,33 @@ function putDelegation(n: TimeBucketState, from: KeyedLog<DelegationSpan>, d: De
     n.delegationsByAgent = keyedSet(n.delegationsByAgent, d.transcriptAgentId,
       [...keyedGet(n.delegationsByAgent, d.transcriptAgentId) ?? [], d.toolUseId]);
   }
+}
+
+function launchedDelegation(event: Extract<NormalizedEvent, { kind: "tool_call_started" }>, at: number): DelegationSpan {
+  return {
+    toolUseId: event.toolUseId,
+    turnId: event.turnId,
+    startedAt: at,
+    isBackground: event.isBackground === true || event.delegation?.isBackground === true,
+    description: redactAbsolutePaths(event.delegation?.description ?? "").slice(0, 200),
+    subagentType: event.delegation?.subagentType ?? event.subagentType,
+    model: event.delegation?.subagentModel ?? event.subagentModel,
+  };
+}
+
+function ackedDelegation(d: DelegationSpan, interval: ToolInterval, event: Extract<NormalizedEvent, { kind: "tool_call_finished" }>): DelegationSpan {
+  const updated: DelegationSpan = { ...d, ackEndedAt: interval.end };
+  if (interval.rejectedBeforeRun) updated.rejectedBeforeRun = true;
+  if (event.asyncLaunchedAgentId !== undefined) {
+    updated.transcriptAgentId = event.asyncLaunchedAgentId;
+    updated.isBackground = true;
+  }
+  return updated;
+}
+
+function withSubagentInfo(d: DelegationSpan, event: Extract<NormalizedEvent, { kind: "subagent_info" }>): DelegationSpan {
+  if ((event.model === undefined || d.model === event.model) && (event.agentId === undefined || d.transcriptAgentId === event.agentId)) return d;
+  return { ...d, model: event.model ?? d.model, transcriptAgentId: event.agentId ?? d.transcriptAgentId };
 }
 
 function delegationOfAgent(state: TimeBucketState, agentId: string, pick: (d: DelegationSpan) => boolean): DelegationSpan | undefined {
@@ -665,9 +716,22 @@ export function currentGenerationRecords<T extends { body: NormalizedEventBody; 
   return currentGenerationSlice(events, event => event.body, event => event.timestamp).events;
 }
 
+function notifiedCall(notification: { toolUseId?: string }, launch: string): string {
+  return notification.toolUseId ?? launch;
+}
+
 function noteFailedLaunch(state: TimeBucketState, toolUseId: string, status: string | undefined): void {
   if (taskNotificationTerminal(status) !== "failed" || state.failedLaunches?.includes(toolUseId)) return;
   state.failedLaunches = [...state.failedLaunches ?? [], toolUseId].slice(-MAX_TIME_TOOL_INTERVALS);
+}
+
+export function webviewTimeBuckets(view: TimeBucketView): TimeBucketView {
+  const { mainToolCallSpans: _hostOnly, main: { unmeasuredMs: _hostTotal, ...main }, ...shown } = view;
+  return { ...shown, main };
+}
+
+export function timeBucketLastActivity(state: Pick<TimeBucketState, "lastAt">): number | undefined {
+  return state.lastAt;
 }
 
 export function foldTimeBuckets(state: TimeBucketState, event: NormalizedEvent, options?: Parameters<typeof deriveTimeBuckets>[1]): TimeBucketState {
@@ -699,16 +763,17 @@ export function foldTimeBuckets(state: TimeBucketState, event: NormalizedEvent, 
         const goal = redactAbsolutePaths(declaration.goal).trim();
         if (!goal) continue;
         const current = next.blocks.at(-1);
-        if (current?.kind === "plan" && !current.goal && current.closedAt === undefined && !current.userMessages?.some(message => message.at > current.start)) {
+        if (current?.kind === "plan" && !current.goal && !current.userMessages?.some(message => message.at > current.start)) {
           next = { ...next, blocks: [...next.blocks.slice(0, -1), { ...current, goal, text: goal }] };
-        } else next = openPlanBlock(next, { goal, text: goal, start: ts, turnId: event.turnId }, isLiveEvent(event));
+        } else next = openPlanBlock(next, { goal, text: goal, start: ts, turnId: event.turnId }, !isHistoryEvent(event));
       }
       return next;
     }
     case "compact_boundary": {
       const boundaryAt = generationBoundaryTime(event, event.timestamp);
       if (boundaryAt === undefined) return next;
-      return { ...createTimeBucketState(), generationBoundaryAt: boundaryAt, fidelity: state.fidelity, inheritedBoundaryCount: state.inheritedBoundaryCount };
+      return { ...createTimeBucketState(), generationBoundaryAt: boundaryAt, fidelity: state.fidelity, inheritedBoundaryCount: state.inheritedBoundaryCount,
+        ...(state.unknownLaunchers === undefined ? {} : { unknownLaunchers: state.unknownLaunchers }) };
     }
     case "background_tasks": {
       const alive = new Set(event.tasks.filter((t) => t.ambient !== true).map((t) => t.id));
@@ -736,13 +801,14 @@ export function foldTimeBuckets(state: TimeBucketState, event: NormalizedEvent, 
         state = loseOpenDelegations(state, touch(), ts, (d) => d.pendingLost === true);
       }
       const n = touch();
-      if (isLiveEvent(event)) {
+      if (!isHistoryEvent(event)) {
         n.inheritedBoundaryCount = state.inheritedBoundaryCount + 1;
         n.fidelity = "inherited";
       }
       if (ts === undefined) return n;
       const priorEnd = state.openTurn === undefined ? state.turnSpans.buffer[state.turnSpans.size - 1]?.end : undefined;
-      state = staleOpenMainCalls(state, n, Math.min(ts, priorEnd ?? ts));
+      state = staleOpenCalls(state, n, Math.min(ts, priorEnd ?? ts), ["main"]);
+      state = staleOpenCalls(state, n, ts, ["sub"]);
       if (state.openTurn !== undefined) {
         n.turnSpans = appendItem(state.turnSpans, { ...state.openTurn, start: state.openTurn.startedAt, end: Math.max(state.openTurn.startedAt, ts) });
       }
@@ -753,14 +819,14 @@ export function foldTimeBuckets(state: TimeBucketState, event: NormalizedEvent, 
     }
     case "conversation_closed": {
       if (ts === undefined) return next;
-      if (isLiveEvent(event)) state = staleOpenMainCalls(state, touch(), ts);
+      state = staleOpenCalls(state, touch(), ts, isHistoryEvent(event) ? ["sub"] : ["main", "sub"]);
       state = loseOpenDelegations(state, touch(), ts, () => true);
       return staleOpenBackground(state, touch(), ts, () => true);
     }
     case "turn_completed":
     case "turn_interrupted":
     case "turn_failed": {
-      if (ts !== undefined && isLiveEvent(event)) state = staleOpenMainCalls(state, touch(), ts);
+      if (ts !== undefined) state = staleOpenCalls(state, touch(), ts, isHistoryEvent(event) ? ["sub"] : ["main", "sub"]);
       if (ts !== undefined && event.kind !== "turn_completed") {
         state = staleOpenBackground(state, touch(), ts, () => true);
         state = loseOpenDelegations(state, touch(), ts, () => true);
@@ -781,15 +847,15 @@ export function foldTimeBuckets(state: TimeBucketState, event: NormalizedEvent, 
         && ts > state.openTurn.startedAt;
       if (midTurn && current.kind !== "plan") return next;
       touch().request = requestId === undefined ? undefined : { id: requestId, openings: 0 };
-      if (current?.kind === "plan" && current.closedAt === undefined) {
+      if (current?.kind === "plan") {
         next.blocks = [...state.blocks.slice(0, -1), { ...current, userMessages: [...current.userMessages ?? [],
-          { at: ts, text: redactAbsolutePaths(said.split(/\r?\n/, 1)[0]).slice(0, MAX_BLOCK_TEXT), ...(requestId === undefined ? {} : { requestId }) }] }];
+          { at: ts, ...(requestId === undefined ? {} : { requestId }) }] }];
         return next;
       }
       const n = touch();
       const text = redactAbsolutePaths(said).slice(0, MAX_BLOCK_TEXT);
       const block: RequestBlockRecord = {
-        blockId: requestId === undefined ? positionalBlockId(state, isLiveEvent(event)) : `block:${requestId}`,
+        blockId: requestId === undefined ? positionalBlockId(state, !isHistoryEvent(event)) : `block:${requestId}`,
         kind: "say",
         text,
         start: ts,
@@ -825,19 +891,12 @@ export function foldTimeBuckets(state: TimeBucketState, event: NormalizedEvent, 
         },
       };
       if (lane === "main" && event.messageId !== undefined) n.mainMessageId = event.messageId;
-      if (lane === "main" && isDelegationTool(event.toolName) && keyedGet(state.delegations, event.toolUseId) === undefined) {
-        putDelegation(n, state.delegations, {
-          toolUseId: event.toolUseId,
-          turnId: event.turnId,
-          startedAt: ts,
-          isBackground: event.isBackground === true || event.delegation?.isBackground === true,
-          description: redactAbsolutePaths(event.delegation?.description ?? "").slice(0, 200),
-          subagentType: event.delegation?.subagentType ?? event.subagentType,
-          model: event.delegation?.subagentModel ?? event.subagentModel,
-        });
-      } else if (lane === "sub" && isChildCall(event.parentToolUseId)) {
+      if (lane === "sub" && isChildCall(event.parentToolUseId)) {
         const d = keyedGet(state.delegations, event.parentToolUseId);
         if (d !== undefined) putDelegation(n, state.delegations, afterChildActivity(d, ts));
+      }
+      if (isDelegationTool(event.toolName) && keyedGet(n.delegations, event.toolUseId) === undefined) {
+        putDelegation(n, n.delegations, { ...launchedDelegation(event, ts), ...(isChildCall(event.parentToolUseId) ? { parentToolUseId: event.parentToolUseId } : {}) });
       }
       return n;
     }
@@ -856,7 +915,7 @@ export function foldTimeBuckets(state: TimeBucketState, event: NormalizedEvent, 
         if (hit !== undefined) {
           const { pendingLost: _pending, ...rest } = hit;
           putDelegation(n0, n0.delegations, { ...rest, notifiedEndedAt: ts, woke: undefined, lostAt: undefined });
-          noteFailedLaunch(n0, hit.toolUseId, event.taskNotification.status);
+          noteFailedLaunch(n0, notifiedCall(event.taskNotification, hit.toolUseId), event.taskNotification.status);
         }
       }
       if (ts !== undefined && event.taskNotification !== undefined) {
@@ -865,7 +924,7 @@ export function foldTimeBuckets(state: TimeBucketState, event: NormalizedEvent, 
         if (bg !== undefined) {
           n0.backgroundTasks = keyedSet(n0.backgroundTasks, bg.toolUseId, { ...withoutPendingStale(bg), notifiedEndedAt: ts });
           n0.unsettledBackground = n0.unsettledBackground.filter(id => id !== bg.toolUseId);
-          noteFailedLaunch(n0, bg.toolUseId, event.taskNotification.status);
+          noteFailedLaunch(n0, notifiedCall(event.taskNotification, bg.toolUseId), event.taskNotification.status);
         }
       }
       if (ts !== undefined && event.resumedAgentId !== undefined && event.isError !== true) {
@@ -889,7 +948,7 @@ export function foldTimeBuckets(state: TimeBucketState, event: NormalizedEvent, 
       if (open.stopTarget !== undefined && event.isError !== true && !n.stoppedTaskIds?.includes(open.stopTarget)) {
         n.stoppedTaskIds = [...n.stoppedTaskIds ?? [], open.stopTarget].slice(-MAX_STOPPED_TASK_IDS);
       }
-      if (open.lane === "main" && event.backgroundTaskId !== undefined && event.isError !== true && keyedGet(n.backgroundTasks, event.toolUseId) === undefined) {
+      if (event.backgroundTaskId !== undefined && event.isError !== true && keyedGet(n.backgroundTasks, event.toolUseId) === undefined) {
         n.backgroundTasks = keyedSet(n.backgroundTasks, event.toolUseId, {
           toolUseId: event.toolUseId,
           toolName: open.toolName,
@@ -898,6 +957,7 @@ export function foldTimeBuckets(state: TimeBucketState, event: NormalizedEvent, 
           ackAt: ts,
           taskId: event.backgroundTaskId,
           description: open.description ?? open.toolName,
+          ...(isChildCall(open.parentToolUseId) ? { parentToolUseId: open.parentToolUseId } : {}),
         });
         n.backgroundByTask = keyedSet(n.backgroundByTask, event.backgroundTaskId,
           [...keyedGet(n.backgroundByTask, event.backgroundTaskId) ?? [], event.toolUseId]);
@@ -913,37 +973,25 @@ export function foldTimeBuckets(state: TimeBucketState, event: NormalizedEvent, 
         ...(isChildCall(open.parentToolUseId) ? { agentId: open.parentToolUseId } : {}),
         ...(isRejectedBeforeRun(event) ? { rejectedBeforeRun: true as const } : {}),
         ...(open.taskIntent !== undefined ? { bookkeeping: true as const } : {}),
-        ...(open.lane === "main" && isExternalRunTool(open.toolName) && open.description !== undefined ? { description: open.description } : {}),
+        ...(isExternalRunTool(open.toolName) && open.description !== undefined ? { description: open.description } : {}),
       };
       if (open.lane === "main") n.mainTools = pushBounded(state.mainTools, interval, n);
       else n.subTools = pushBounded(state.subTools, interval, n);
       const parentKey = open.lane === "main" ? event.toolUseId : open.parentToolUseId;
       const d = parentKey !== null ? (keyedGet(n.delegations, parentKey) ?? keyedGet(state.delegations, parentKey)) : undefined;
       if (d !== undefined) {
-        const updated: DelegationSpan = { ...d };
-        if (open.lane === "main") {
-          updated.ackEndedAt = interval.end;
-          if (interval.rejectedBeforeRun) updated.rejectedBeforeRun = true;
-          if (event.asyncLaunchedAgentId !== undefined) {
-            updated.transcriptAgentId = event.asyncLaunchedAgentId;
-            updated.isBackground = true;
-          }
-        } else {
-          Object.assign(updated, afterChildActivity(d, interval.end));
-        }
-        putDelegation(n, n.delegations, updated);
+        putDelegation(n, n.delegations, open.lane === "main" ? ackedDelegation(d, interval, event) : { ...d, ...afterChildActivity(d, interval.end) });
       }
+      const launched = open.lane === "sub" ? keyedGet(n.delegations, event.toolUseId) : undefined;
+      if (launched !== undefined) putDelegation(n, n.delegations, ackedDelegation(launched, interval, event));
       return open.lane === "main" && open.taskIntent && !event.isError
-        ? applyPlanTask(n, open.taskIntent, ts, open.turnId, event.resultPreview, { live: isLiveEvent(event), toolUseId: event.toolUseId }) : n;
+        ? applyPlanTask(n, open.taskIntent, ts, open.turnId, event.resultPreview, { live: !isHistoryEvent(event), toolUseId: event.toolUseId }) : n;
     }
     case "subagent_info": {
       const d = keyedGet(state.delegations, event.toolUseId);
-      if (d === undefined || (event.model === undefined || d.model === event.model) &&
-        (event.agentId === undefined || d.transcriptAgentId === event.agentId)) return next;
-      const n = touch();
-      putDelegation(n, state.delegations, { ...d,
-        model: event.model ?? d.model, transcriptAgentId: event.agentId ?? d.transcriptAgentId });
-      return n;
+      const updated = d === undefined ? undefined : withSubagentInfo(d, event);
+      if (updated !== undefined && updated !== d) putDelegation(touch(), state.delegations, updated);
+      return next;
     }
     default:
       return next;
@@ -959,6 +1007,9 @@ export interface TimeBucketTotals {
   confirmMs: number;
   replyMs: number | null;
   subOnlyMs: number | null;
+  backgroundOnlyMs: number | null;
+  // Host only: src/time-buckets.ts#webviewTimeBuckets does not send it.
+  unmeasuredMs?: number | null;
   spanMs: number | null;
 }
 
@@ -987,6 +1038,7 @@ export interface AgentSpanView {
   subagentType?: string;
   model?: string;
   transcriptAgentId?: string;
+  parentToolUseId?: string;
   toolCount: number;
   failCount: number;
   toolMs: number;
@@ -998,7 +1050,6 @@ export interface RequestBlockView {
   blockId: string;
   requestNumber: string | null;
   processingMs: number | null;
-  strip: { generatePercent: number; toolPercent: number; subagentWaitPercent: number; confirmPercent: number; replyPercent: number; remainderPercent: number } | null;
   kind: RequestBlockKind;
   text: string;
   start: number;
@@ -1021,9 +1072,7 @@ export interface RequestBlockView {
   replyMs: number | null;
   running: boolean;
   goal?: string;
-  closedAt?: number;
   steps?: PlanBlockStepView[];
-  userMessages?: { at: number; text: string }[];
   metrics?: PlanBlockMetrics;
 }
 
@@ -1032,6 +1081,9 @@ export interface MainModelSpan extends ConductorModel { start: number; end: numb
 
 export interface TimeBucketView {
   subagentOnlySpans?: Span[];
+  backgroundOnlySpans?: Span[];
+  unmeasuredSpans?: Span[];
+  mainToolCallSpans?: Span[];
   mainModelSpans?: MainModelSpan[];
   generationBoundaryAt?: number;
   fidelity: TimeFidelity;
@@ -1041,7 +1093,7 @@ export interface TimeBucketView {
   spanMs: number | null;
   main: TimeBucketTotals;
   sub: { generateMs: number; toolMs: number; spanMs: number };
-  bars: { totalMs: number | null; mainMs: number | null; toolMs: number | null; subMs: number };
+  bars: { totalMs: number | null; mainMs: number | null; subMs: number; cumulativeMs: number | null };
   agentCount: number;
   maxParallelAgents: number;
   currentParallel: number;
@@ -1055,6 +1107,9 @@ export interface TimeBucketView {
   agents: AgentSpanView[];
   backgroundTasks: BackgroundTaskSpanView[];
   externalRunCalls?: ExternalRunCallView[];
+  nestedAgents?: AgentSpanView[];
+  nestedExternalRuns?: ExternalRunCallView[];
+  unknownLaunchers?: AgentSpanView[];
   blocks: RequestBlockView[];
   droppedIntervalCount: number;
   droppedBlockCount: number;
@@ -1237,6 +1292,105 @@ export function attributeConductorIntervals(state: TimeBucketState, view: TimeBu
   }
 }
 
+interface TimeTotalSpans {
+  generate: readonly Span[]; tool: readonly Span[]; toolCalls: readonly Span[]; subagentWait: readonly Span[]; confirm: readonly Span[];
+  subagent: readonly Span[]; nested: readonly Span[]; background: readonly Span[]; foregroundExternal: readonly Span[]; unmeasured: readonly Span[]; whole: readonly Span[];
+}
+
+function nestedMemberSpans(view: Pick<TimeBucketView, "nestedAgents" | "nestedExternalRuns">): Span[] {
+  return [...view.nestedAgents ?? [], ...view.nestedExternalRuns ?? []].flatMap((member) => runSpans(memberRunTimes(member)));
+}
+
+function clippedSum(spans: readonly Span[], whole: readonly Span[]): number {
+  return spans.reduce((acc, span) => acc + measureSpans(intersectSpans([span], [...whole])), 0);
+}
+
+function timeTotals(s: TimeTotalSpans) {
+  const unmeasured = intersectSpans(unionSpans([...s.unmeasured]), [...s.whole]);
+  const clip = (spans: readonly Span[]): Span[] => subtractSpans(intersectSpans(unionSpans([...spans]), [...s.whole]), unmeasured);
+  const generate = clip(s.generate), tool = clip(s.tool), subagentWait = clip(s.subagentWait), confirm = clip(s.confirm);
+  const mainActive = unionSpans([...generate, ...tool, ...subagentWait, ...confirm]);
+  const directSub = clip(s.subagent);
+  const subActive = unionSpans([...directSub, ...clip(s.nested)]);
+  const background = clip(s.background);
+  const idle = subtractSpans(subtractSpans([...s.whole], unionSpans([...mainActive, ...subActive])), unmeasured);
+  const reply = subtractSpans(idle, background);
+  const mainSpans: Record<typeof MAIN_PROCESSING_BUCKETS[number], Span[]> = { generate, tool, delegation: subagentWait };
+  const conductorWork = unionSpans(MAIN_PROCESSING_BUCKETS.flatMap((bucket) => mainSpans[bucket]));
+  const subOnly = subtractSpans(subActive, conductorWork);
+  const backgroundOnly = subtractSpans(background, unionSpans([...conductorWork, ...subActive]));
+  const processing = unionSpans([...conductorWork, ...subActive, ...background]);
+  const answer = subtractSpans(confirm, processing);
+  const delegated = [...s.subagent, ...s.background, ...s.foregroundExternal];
+  const measuredWindow = subtractSpans([...s.whole], unmeasured);
+  const nestedOnly = subtractSpans(clip(s.nested), unionSpans([...conductorWork, ...directSub, ...background]));
+  return {
+    spans: { generate, tool, subagentWait, processing, reply, idle, subOnly, backgroundOnly, answer, unmeasured },
+    generateMs: measureSpans(generate), toolMs: measureSpans(tool), subagentWaitMs: measureSpans(subagentWait), confirmMs: measureSpans(answer),
+    replyMs: measureSpans(reply), subOnlyMs: measureSpans(subOnly), backgroundOnlyMs: measureSpans(backgroundOnly), processingMs: measureSpans(processing),
+    unmeasuredMs: measureSpans(unmeasured),
+    subMs: spanSum([...s.subagent, ...s.foregroundExternal]),
+    cumulativeMs: measureSpans(generate) + clippedSum(s.toolCalls, measuredWindow) + clippedSum(delegated, measuredWindow)
+      + measureSpans(subtractSpans(subagentWait, unionSpans(delegated))) + measureSpans(nestedOnly),
+  };
+}
+
+type TimeTotals = ReturnType<typeof timeTotals>;
+
+function blockTimeFigures(t: TimeTotals, start: number, end: number): Pick<RequestBlockView, "processingMs" | "replyMs"> {
+  const bspan: Span[] = [[start, end]];
+  const amount = (spans: readonly Span[]): number => measureSpans(intersectSpans([...spans], bspan));
+  return { processingMs: amount(t.spans.processing), replyMs: amount(t.spans.reply) };
+}
+
+function blockMetrics(t: TimeTotals, start: number | null, stop: number, inherited: boolean): PlanBlockMetrics {
+  const interval: Span[] = start === null ? [] : [[start, stop]];
+  const amount = (spans: readonly Span[], available = true): number | null => start !== null && available ? measureSpans(intersectSpans([...spans], interval)) : null;
+  return { generateMs: amount(t.spans.generate, !inherited), toolMs: amount(t.spans.tool), subagentWaitMs: amount(t.spans.subagentWait),
+    subagentOnlyMs: amount(t.spans.subOnly, !inherited), backgroundOnlyMs: amount(t.spans.backgroundOnly, !inherited), decisionWaitMs: amount(t.spans.answer),
+    replyWaitMs: amount(t.spans.reply, !inherited), tokens: null };
+}
+
+function spanSum(spans: readonly Span[]): number {
+  return spans.reduce((acc, [s0, s1]) => acc + (s1 - s0), 0);
+}
+
+function topFigures(t: TimeTotals, inherited: boolean, spanMs: number): Pick<TimeBucketView, "main" | "bars"> {
+  const measured = (value: number): number | null => inherited ? null : value;
+  return {
+    main: { generateMs: measured(t.generateMs), toolMs: t.toolMs, subagentWaitMs: t.subagentWaitMs, confirmMs: t.confirmMs,
+      replyMs: measured(t.replyMs), subOnlyMs: measured(t.subOnlyMs), backgroundOnlyMs: measured(t.backgroundOnlyMs), unmeasuredMs: measured(t.unmeasuredMs), spanMs: measured(spanMs) },
+    bars: { mainMs: measured(t.generateMs + t.toolMs), subMs: t.subMs, totalMs: measured(t.processingMs),
+      cumulativeMs: measured(t.cumulativeMs) },
+  };
+}
+
+function foregroundExternalSpans(externalRunCalls: ExternalRunCallView[], backgroundTasks: BackgroundTaskSpanView[]): Span[] {
+  return foregroundExternalCalls({ externalRunCalls, backgroundTasks }).map((call) => [call.start, call.end] as Span);
+}
+
+function viewTotals(view: TimeBucketView, whole: Span[], unmeasured: readonly Span[] = []): TimeTotals {
+  const main = (bucket: TimeBucketInterval["bucket"]): Span[] => view.intervals.filter((i) => i.lane === "main" && i.bucket === bucket).map((i) => [i.start, i.end] as Span);
+  return timeTotals({ generate: main("generate"), tool: main("tool"), toolCalls: view.mainToolCallSpans ?? [], subagentWait: main("delegation"), confirm: main("confirm"),
+    subagent: [...view.agents.flatMap((a) => runSpans(memberRunTimes(a))), ...view.backgroundTasks.filter((t) => t.subagent).map((t) => [t.start, t.end] as Span)],
+    nested: nestedMemberSpans(view),
+    background: view.backgroundTasks.filter((t) => !t.subagent).map((t) => [t.start, t.end] as Span),
+    foregroundExternal: foregroundExternalSpans(view.externalRunCalls ?? [], view.backgroundTasks), unmeasured, whole });
+}
+
+function delegationRoot(delegations: KeyedLog<DelegationSpan>, toolUseId: string, stopAt: (toolUseId: string) => boolean = () => false): { root?: DelegationSpan; stoppedAt?: string } {
+  const visited = new Set<string>();
+  for (let id: string | undefined = toolUseId; id !== undefined && !visited.has(id);) {
+    visited.add(id);
+    if (stopAt(id)) return { stoppedAt: id };
+    const d: DelegationSpan | undefined = keyedGet(delegations, id);
+    if (d === undefined || d.rejectedBeforeRun) return {};
+    if (d.parentToolUseId === undefined) return { root: d };
+    id = d.parentToolUseId;
+  }
+  return {};
+}
+
 export function deriveTimeBuckets(
   state: TimeBucketState,
   options?: {
@@ -1248,7 +1402,7 @@ export function deriveTimeBuckets(
   }
 ): TimeBucketView {
   const firstAt = state.firstAt ?? null;
-  const lastAt = state.lastAt ?? null;
+  const lastAt = timeBucketLastActivity(state) ?? null;
   const spanMs = firstAt !== null && lastAt !== null ? Math.max(0, lastAt - firstAt) : 0;
   const end = lastAt ?? 0;
   const inherited = state.inheritedBoundaryCount > 0;
@@ -1257,7 +1411,7 @@ export function deriveTimeBuckets(
   const turnUnion = unionSpans(turnSpansAll.map((t) => [t.start, t.end] as Span));
 
   const openMainCalls = lastAt === null ? [] : Object.values(state.openTools).filter((open) => open.lane === "main")
-    .map((open) => ({ toolName: open.toolName, span: [open.at, Math.max(open.at, open.staleAt ?? end)] as Span }));
+    .map((open) => ({ toolName: open.toolName, span: [open.at, unfinishedCallEnd(open.at, open.staleAt, end)] as Span }));
   const mainCalls = [...state.mainTools.map((t) => ({ kind: mainCallTimeKind(t.toolName, t.rejectedBeforeRun === true), span: [t.start, t.end] as Span })),
     ...openMainCalls.map((open) => ({ kind: mainCallTimeKind(open.toolName, false), span: open.span }))];
   const spansOf = (kind: MainCallTimeKind): Span[] => mainCalls.filter((call) => call.kind === kind).map((call) => call.span);
@@ -1268,54 +1422,37 @@ export function deriveTimeBuckets(
 
   const childByToolUseId = new Map<string, ChildTranscriptSpan>();
   for (const c of options?.childSpans ?? []) childByToolUseId.set(c.toolUseId, c);
-  // Descendant tools belong to the displayed direct child. Roll up their
+  // Descendant tools also belong to every delegate above them. Roll up their
   // intervals, not their elapsed spans: concurrent work must remain a union.
-  const directChildIds = new Set(keyedValues(state.delegations).map(d => d.toolUseId));
-  const nestedParents = new Map<string, string | null>();
-  const addNestedParent = (id: string, parent: string | undefined) => {
-    if (parent === undefined) return;
-    const prior = nestedParents.get(id);
-    nestedParents.set(id, prior === undefined || prior === parent ? parent : null);
-  };
-  for (const t of state.subTools) {
-    if (isDelegationTool(t.toolName)) addNestedParent(t.toolUseId, t.agentId);
-  }
-  // A background descendant can emit tools before its launching call finishes.
-  for (const [id, t] of Object.entries(state.openTools)) {
-    if (t.lane === "sub" && isDelegationTool(t.toolName)) {
-      addNestedParent(id, t.parentToolUseId ?? undefined);
-    }
-  }
-  const directChildOf = (id: string): string | undefined => {
-    const visited = new Set<string>();
-    while (!directChildIds.has(id)) {
-      if (visited.has(id)) return undefined;
-      visited.add(id);
-      const parent = nestedParents.get(id);
-      if (parent === undefined || parent === null) return undefined;
-      id = parent;
-    }
-    return id;
-  };
-  const directToolCounts = new Map<string, { total: number; failed: number }>();
+  const delegationList = keyedValues(state.delegations);
+  const launcherOf = new Map(delegationList.flatMap(d => d.parentToolUseId === undefined ? [] : [[d.toolUseId, d.parentToolUseId] as const]));
+  const failedLaunches = new Set(state.failedLaunches);
+  const ownToolCounts = new Map<string, { total: number; failed: number }>();
   const subToolsByAgent = new Map<string, ToolInterval[]>();
   for (const t of state.subTools) {
     if (t.agentId === undefined) continue;
-    if (directChildIds.has(t.agentId) && t.bookkeeping !== true) {
-      const counts = directToolCounts.get(t.agentId) ?? { total: 0, failed: 0 };
+    if (t.bookkeeping !== true) {
+      const counts = ownToolCounts.get(t.agentId) ?? { total: 0, failed: 0 };
       counts.total++;
-      if (t.isError) counts.failed++;
-      directToolCounts.set(t.agentId, counts);
+      if (t.isError || failedLaunches.has(t.toolUseId)) counts.failed++;
+      ownToolCounts.set(t.agentId, counts);
     }
-    const directId = directChildOf(t.agentId);
-    if (directId === undefined) continue;
-    const tools = subToolsByAgent.get(directId) ?? [];
-    tools.push(t);
-    subToolsByAgent.set(directId, tools);
+    const visited = new Set<string>();
+    for (let id: string | undefined = t.agentId; id !== undefined && !visited.has(id); id = launcherOf.get(id)) {
+      visited.add(id);
+      const tools = subToolsByAgent.get(id) ?? [];
+      tools.push(t);
+      subToolsByAgent.set(id, tools);
+    }
   }
-  const agents: AgentSpanView[] = [];
-  for (const d of keyedValues(state.delegations)) {
-    if (d.rejectedBeforeRun) continue;
+  const openCalls = Object.values(state.openTools).filter((open) => open.taskIntent === undefined);
+  for (const open of openCalls) {
+    if (open.lane !== "sub" || open.parentToolUseId === null) continue;
+    const counts = ownToolCounts.get(open.parentToolUseId) ?? { total: 0, failed: 0 };
+    counts.total++;
+    ownToolCounts.set(open.parentToolUseId, counts);
+  }
+  const agentView = (d: DelegationSpan): AgentSpanView => {
     const toolUseId = d.toolUseId;
     const child = childByToolUseId.get(toolUseId);
     const delegation = delegationRuns(d.startedAt, d.earlierRuns, d.resumedAt, child);
@@ -1358,10 +1495,10 @@ export function deriveTimeBuckets(
     const start = delegation.start;
     const resolvedEnd = Math.max(start, spanEnd ?? end);
     const tools = subToolsByAgent.get(toolUseId) ?? [];
-    const counts = directToolCounts.get(toolUseId);
+    const counts = ownToolCounts.get(toolUseId);
     const runs = { ...delegation, end: resolvedEnd };
     const toolMs = measureSpans(intersectSpans(unionSpans(tools.map((t) => [t.start, t.end] as Span)), unionSpans(runSpans(memberRunTimes(runs)))));
-    agents.push({
+    return {
       toolUseId,
       turnId: d.turnId,
       ...runs,
@@ -1371,14 +1508,17 @@ export function deriveTimeBuckets(
       ...(d.subagentType !== undefined ? { subagentType: d.subagentType } : {}),
       ...(d.model !== undefined ? { model: d.model } : {}),
       ...(d.transcriptAgentId !== undefined ? { transcriptAgentId: d.transcriptAgentId } : {}),
+      ...(d.parentToolUseId !== undefined ? { parentToolUseId: d.parentToolUseId } : {}),
       toolCount: counts?.total ?? 0,
       failCount: counts?.failed ?? 0,
       toolMs,
       generateMs: Math.max(0, runElapsedMs(memberRunTimes(runs)) - toolMs),
       endSource: open ? "open" : endSource,
-    });
-  }
+    };
+  };
+  const agents: AgentSpanView[] = delegationList.filter(d => !d.rejectedBeforeRun && d.parentToolUseId === undefined).map(agentView);
   const backgroundTasks: BackgroundTaskSpanView[] = [];
+  const nestedBackground = new Map<string, BackgroundTaskSpanView>();
   const subagentBackgroundSpans: Span[] = [];
   for (const b of keyedValues(state.backgroundTasks)) {
     const liveGateIds = options?.liveDelegationAgentIds;
@@ -1397,7 +1537,7 @@ export function deriveTimeBuckets(
       endSource = "open";
     }
     const subagent = isSubagentWaitTool(b.toolName);
-    backgroundTasks.push({
+    const span: BackgroundTaskSpanView = {
       toolUseId: b.toolUseId,
       taskId: b.taskId,
       turnId: b.turnId,
@@ -1407,10 +1547,16 @@ export function deriveTimeBuckets(
       end: Math.max(b.startedAt, bgEnd ?? end),
       open: bgEnd === undefined,
       endSource,
-    });
+    };
+    if (b.parentToolUseId !== undefined) {
+      if (isCountedExternalRunCall(b)) nestedBackground.set(b.toolUseId, span);
+      continue;
+    }
+    backgroundTasks.push(span);
     if (subagent) subagentBackgroundSpans.push([b.startedAt, Math.max(b.startedAt, bgEnd ?? end)]);
   }
-  const failedLaunches = new Set(state.failedLaunches);
+  const openCallView = (toolUseId: string, o: TimeBucketState["openTools"][string]): ExternalRunCallView =>
+    ({ toolUseId, turnId: o.turnId, description: o.description ?? o.toolName, start: o.at, end: unfinishedCallEnd(o.at, o.staleAt, end), open: o.staleAt === undefined });
   const countedExternalStarts: number[] = [];
   const externalRunCalls: ExternalRunCallView[] = [];
   for (const t of state.mainTools) {
@@ -1422,39 +1568,65 @@ export function deriveTimeBuckets(
   for (const [toolUseId, o] of Object.entries(state.openTools)) {
     if (!isCountedExternalRunCall(o)) continue;
     countedExternalStarts.push(o.at);
-    if (o.lane === "main") externalRunCalls.push({ toolUseId, turnId: o.turnId, description: o.description ?? o.toolName, start: o.at, end: Math.max(o.at, o.staleAt ?? end), open: o.staleAt === undefined });
+    if (o.lane === "main") externalRunCalls.push(openCallView(toolUseId, o));
   }
+  const agentsById = new Map(agents.map(agent => [agent.toolUseId, agent]));
+  const unknownLaunchers = (state.unknownLaunchers ?? []).filter(launcher => delegationRoot(state.delegations, launcher.toolUseId).root === undefined).map((launcher): AgentSpanView => {
+    const { start, end: stop } = launchlessRunSpan(childByToolUseId.get(launcher.toolUseId), launcher, firstAt ?? 0);
+    const counts = ownToolCounts.get(launcher.toolUseId);
+    const toolMs = measureSpans(intersectSpans(unionSpans((subToolsByAgent.get(launcher.toolUseId) ?? []).map((t) => [t.start, t.end] as Span)), [[start, stop]]));
+    return { toolUseId: launcher.toolUseId, turnId: "", start, end: stop, open: false, isBackground: false, description: launcher.description,
+      ...(launcher.agentType === undefined ? {} : { subagentType: launcher.agentType }), ...(launcher.model === undefined ? {} : { model: launcher.model }),
+      transcriptAgentId: launcher.agentId, toolCount: counts?.total ?? 0, failCount: counts?.failed ?? 0, toolMs, generateMs: Math.max(0, stop - start - toolMs),
+      endSource: "child-transcript" };
+  }).sort((a, b) => a.start - b.start);
+  const unknownById = new Map(unknownLaunchers.map(agent => [agent.toolUseId, agent]));
+  const rootOf = (toolUseId: string): AgentSpanView | undefined => {
+    const { root, stoppedAt } = delegationRoot(state.delegations, toolUseId, id => unknownById.has(id));
+    return root !== undefined ? agentsById.get(root.toolUseId) : stoppedAt === undefined ? undefined : unknownById.get(stoppedAt);
+  };
+  const nestedAgents = delegationList.filter(d => !d.rejectedBeforeRun && d.parentToolUseId !== undefined && !unknownById.has(d.toolUseId) && rootOf(d.toolUseId) !== undefined)
+    .map(agentView).sort((a, b) => a.start - b.start);
+  const nestedCalls: { call: ExternalRunCallView; parentToolUseId: string }[] = [];
+  const nestedCall = (call: ExternalRunCallView, parentToolUseId: string) => {
+    const background = nestedBackground.get(call.toolUseId);
+    nestedCalls.push({ parentToolUseId, call: background === undefined ? call
+      : { toolUseId: call.toolUseId, turnId: call.turnId, description: call.description, start: background.start, end: background.end, open: background.open } });
+  };
+  for (const t of state.subTools) {
+    if (isCountedExternalRunCall(t) && t.agentId !== undefined) {
+      nestedCall({ toolUseId: t.toolUseId, turnId: t.turnId, description: t.description ?? t.toolName, start: t.start, end: t.end, open: false }, t.agentId);
+    }
+  }
+  for (const [toolUseId, o] of Object.entries(state.openTools)) {
+    if (o.lane === "sub" && o.parentToolUseId !== null && isCountedExternalRunCall(o)) {
+      nestedCall(openCallView(toolUseId, o), o.parentToolUseId);
+    }
+  }
+  const nestedExternalRuns = nestedCalls.flatMap(({ call, parentToolUseId }) => rootOf(parentToolUseId) !== undefined ? [{ ...call, parentToolUseId }] : [])
+    .sort((a, b) => a.start - b.start);
   const agentSpans = agents.flatMap((a) => runSpans(memberRunTimes(a)));
   const bgSpans = backgroundTasks.map((t) => [t.start, t.end] as Span);
   const subagentSpans: Span[] = [...agentSpans, ...subagentBackgroundSpans];
-  const subActiveUnion = unionSpans(subagentSpans);
+  const nestedSpans = nestedMemberSpans({ nestedAgents, nestedExternalRuns });
+  const subActiveUnion = unionSpans([...subagentSpans, ...nestedSpans]);
 
   const whole: Span[] = firstAt !== null && lastAt !== null ? [[firstAt, lastAt]] : [];
   const generateSpans = subtractSpans(turnUnion, unionSpans([...callUnion, ...confirmUnion]));
   const mainActiveUnion = unionSpans([...turnUnion, ...callUnion, ...confirmUnion]);
   const activeUnion = unionSpans([...mainActiveUnion, ...subActiveUnion]);
-  const replySpans = subtractSpans(whole, activeUnion);
-  const subOnlySpans = intersectSpans(subtractSpans(subActiveUnion, mainActiveUnion), whole);
-  const metrics = (start: number | null, stop: number): PlanBlockMetrics => {
-    const interval: Span[] = start === null ? [] : [[start, stop]];
-    const measured = start !== null;
-    const amount = (spans: readonly Span[], available = true): number | null => measured && available ? measureSpans(intersectSpans(spans, interval)) : null;
-    return { generateMs: amount(generateSpans, !inherited), toolMs: amount(toolUnion),
-      subagentWaitMs: amount(subagentWaitUnion), subagentOnlyMs: amount(subOnlySpans, !inherited), decisionWaitMs: amount(confirmUnion),
-      replyWaitMs: amount(replySpans, !inherited), tokens: null };
-  };
+  const mainToolCallSpans = spansOf("tool");
+  const totals = timeTotals({ generate: generateSpans, tool: toolUnion, toolCalls: mainToolCallSpans, subagentWait: subagentWaitUnion, confirm: confirmUnion, subagent: subagentSpans, nested: nestedSpans,
+    background: backgroundTasks.filter((t) => !t.subagent).map((t) => [t.start, t.end] as Span),
+    foregroundExternal: foregroundExternalSpans(externalRunCalls, backgroundTasks), unmeasured: [], whole });
+  const subOnlySpans = totals.spans.subOnly;
+  const answerSpans = totals.spans.answer;
+  const backgroundOnlySpans = totals.spans.backgroundOnly;
+  const metrics = (start: number | null, stop: number): PlanBlockMetrics => blockMetrics(totals, start, stop, inherited);
 
-  const toolMs = measureSpans(intersectSpans(toolUnion, whole));
-  const subagentWaitMs = measureSpans(intersectSpans(subagentWaitUnion, whole));
-  const confirmMs = measureSpans(intersectSpans(confirmUnion, whole));
-  const generateMs = measureSpans(intersectSpans(generateSpans, whole));
-  const replyMs = measureSpans(replySpans);
-  const subOnlyMs = measureSpans(subOnlySpans);
-  const mainBarMs = generateMs + toolMs;
   const subGenerate = agents.reduce((acc, a) => acc + a.generateMs, 0);
   const subTool = agents.reduce((acc, a) => acc + a.toolMs, 0);
   const subSpan = agents.reduce((acc, a) => acc + runElapsedMs(memberRunTimes(a)), 0);
-  const subBarMs = subagentSpans.reduce((acc, [s0, s1]) => acc + (s1 - s0), 0);
 
   const intervals: TimeBucketInterval[] = [];
   if (!inherited) {
@@ -1470,7 +1642,7 @@ export function deriveTimeBuckets(
   };
   for (const [s0, s1] of confirmUnion) intervals.push(withBgOverlap({ bucket: "confirm", lane: "main", start: s0, end: s1 }));
   if (!inherited) {
-    for (const [s0, s1] of replySpans) intervals.push(withBgOverlap({ bucket: "reply", lane: "main", start: s0, end: s1 }));
+    for (const [s0, s1] of totals.spans.idle) intervals.push(withBgOverlap({ bucket: "reply", lane: "main", start: s0, end: s1 }));
   }
   intervals.sort((a, b) => a.start - b.start || a.end - b.end);
 
@@ -1488,7 +1660,7 @@ export function deriveTimeBuckets(
     const b = state.blocks[i];
     const start = i === 0 && !(inherited && isPositionalLiveBlockId(b.blockId)) && state.droppedBlockCount === 0 && firstAt !== null ? Math.min(firstAt, b.start) : b.start;
     const nextStart = i + 1 < state.blocks.length ? state.blocks[i + 1].start : end;
-    const bEnd = Math.max(start, b.closedAt ?? nextStart);
+    const bEnd = Math.max(start, nextStart);
     const bspan: Span[] = [[start, bEnd]];
     const turnIds = turnSpansAll.filter((t) => t.start >= b.start && t.start < bEnd).map((t) => t.turnId);
     if (b.turnId !== null && !turnIds.includes(b.turnId)) turnIds.unshift(b.turnId);
@@ -1504,20 +1676,17 @@ export function deriveTimeBuckets(
     }
     for (const call of externalRunCalls) if (launchedHere(call.start)) attribute(call, call.start, b.blockId);
     const firstReal = blockTools.length > 0 ? Math.min(...blockTools.map((t) => t.start)) : undefined;
-    const running = state.openTurn !== undefined && b.closedAt === undefined && i === state.blocks.length - 1;
-    const generate = measureSpans(intersectSpans(generateSpans, bspan));
+    const running = state.openTurn !== undefined && i === state.blocks.length - 1;
     const tool = measureSpans(intersectSpans(toolUnion, bspan));
     const subagentWait = measureSpans(intersectSpans(subagentWaitUnion, bspan));
-    const confirm = measureSpans(intersectSpans(confirmUnion, bspan));
-    const reply = measureSpans(intersectSpans(replySpans, bspan));
-    const processing = generate + tool + subagentWait + confirm;
-    const elapsed = bEnd - start;
+    const confirm = measureSpans(intersectSpans(answerSpans, bspan));
+    const figures = blockTimeFigures(totals, start, bEnd);
     const workEndedAt = running ? undefined : planWorkEnd(b.steps, start, bEnd, intersectSpans(activeUnion, bspan).at(-1)?.[1]);
     const steps: PlanBlockStepView[] = (b.steps ?? []).map(step => {
-      const stop = step.startedAt === null ? null : Math.min(step.endedAt ?? end, b.closedAt ?? end);
+      const stop = step.startedAt === null ? null : Math.min(step.endedAt ?? end, end);
       return { key: step.key, number: step.number, title: redactAbsolutePaths(step.title), status: step.status, removed: step.removed,
         ...(step.carriedTo === undefined ? {} : { carriedTo: step.carriedTo }),
-        startedAt: step.startedAt, endedAt: step.endedAt, end: stop, activeSpans: planStepActiveSpans(step.transitions, Math.min(end, b.closedAt ?? end)),
+        startedAt: step.startedAt, endedAt: step.endedAt, end: stop, activeSpans: planStepActiveSpans(step.transitions, end),
         durationMs: inherited || stop === null ? null : Math.max(0, stop - step.startedAt!), longest: false, parallel: false,
         ...metrics(step.startedAt, stop ?? bEnd), provisional: running };
     });
@@ -1528,15 +1697,7 @@ export function deriveTimeBuckets(
     blocks.push({
       blockId: b.blockId,
       requestNumber: b.requestNumber ?? null,
-      processingMs: inherited ? null : processing,
-      strip: inherited || elapsed === 0 ? null : {
-        generatePercent: generate / elapsed * 100,
-        toolPercent: tool / elapsed * 100,
-        subagentWaitPercent: subagentWait / elapsed * 100,
-        confirmPercent: confirm / elapsed * 100,
-        replyPercent: reply / elapsed * 100,
-        remainderPercent: Math.max(0, elapsed - processing - reply) / elapsed * 100,
-      },
+      processingMs: inherited ? null : figures.processingMs,
       kind: b.kind,
       text: b.text,
       start,
@@ -1545,26 +1706,31 @@ export function deriveTimeBuckets(
       durationMs: inherited ? null : (workEndedAt ?? bEnd) - start,
       ...(workEndedAt === undefined ? {} : { workEndedAt }),
       turnIds,
-      toolCount: tools.length,
+      toolCount: tools.length + openCalls.filter((open) => open.lane === "main" && launchedHere(open.at)).length,
       failCount: tools.filter((t) => t.isError || failedLaunches.has(t.toolUseId)).length,
       agentCount: delegationCount({ agentCount: blockAgents.length, externalRunCount: countedExternalStarts.filter(launchedHere).length }),
       generateMs: inherited ? null : measureSpans(intersectSpans(generateSpans, bspan)),
       toolMs: tool,
       subagentWaitMs: subagentWait,
-      confirmMs: measureSpans(intersectSpans(confirmUnion, bspan)),
-      replyMs: inherited ? null : measureSpans(intersectSpans(replySpans, bspan)),
+      confirmMs: confirm,
+      replyMs: inherited ? null : figures.replyMs,
       running,
       metrics: { ...metrics(start, bEnd), provisional: running },
-      ...(b.kind === "plan" ? { goal: b.goal, ...(b.closedAt === undefined ? {} : { closedAt: b.closedAt }), steps,
-        userMessages: (b.userMessages ?? []).map(({ at, text }) => ({ at, text })) } : {}),
+      ...(b.kind === "plan" ? { goal: b.goal, steps } : {}),
     });
+  }
+
+  for (const member of [...nestedAgents, ...nestedExternalRuns]) {
+    const root = rootOf(member.parentToolUseId!)!;
+    if (root.blockId !== undefined) member.blockId = root.blockId;
+    if (root.stepKey !== undefined) member.stepKey = root.stepKey;
   }
 
   const maxParallelAgents = sweepMax(agentSpans);
   const openMainTools = Object.values(state.openTools).filter((o) => o.lane === "main" && o.staleAt === undefined);
   const confirmOpen = openMainTools.some((o) => HUMAN_INPUT_WAIT_TOOLS.has(o.toolName));
   const turnParallel = state.openTurn !== undefined && !confirmOpen ? 1 : 0;
-  const currentParallel = turnParallel + agents.filter((a) => a.open).length + backgroundTasks.filter((t) => t.open).length;
+  const currentParallel = turnParallel + [...agents, ...backgroundTasks, ...nestedAgents, ...nestedExternalRuns].filter((member) => member.open).length;
   const maxConcurrency = Math.max(sweepMax([...subtractSpans(turnUnion, confirmUnion), ...agentSpans, ...bgSpans]), currentParallel);
 
   const tailMain: TimeBucketView["tail"]["main"] =
@@ -1577,33 +1743,20 @@ export function deriveTimeBuckets(
           : state.openTurn !== undefined
             ? "generate"
             : null;
-  const tailAnyOpen = tailMain !== null || agents.some((a) => a.open) || backgroundTasks.some((t) => t.open);
+  const tailAnyOpen = tailMain !== null || [...agents, ...backgroundTasks, ...nestedAgents, ...nestedExternalRuns].some((member) => member.open);
   const tail = { main: tailMain, anyOpen: tailAnyOpen };
 
   const view: TimeBucketView = {
-    ...(inherited ? {} : { subagentOnlySpans: subOnlySpans }),
+    ...(inherited ? {} : { subagentOnlySpans: subOnlySpans, backgroundOnlySpans }),
     ...(state.generationBoundaryAt === undefined ? {} : { generationBoundaryAt: state.generationBoundaryAt }),
     fidelity: state.fidelity,
     inheritedBoundaryCount: state.inheritedBoundaryCount,
     firstAt,
     lastAt,
+    mainToolCallSpans,
     spanMs: inherited ? null : spanMs,
-    main: {
-      generateMs: inherited ? null : generateMs,
-      toolMs,
-      subagentWaitMs,
-      confirmMs,
-      replyMs: inherited ? null : replyMs,
-      subOnlyMs: inherited ? null : subOnlyMs,
-      spanMs: inherited ? null : spanMs,
-    },
+    ...topFigures(totals, inherited, spanMs),
     sub: { generateMs: subGenerate, toolMs: subTool, spanMs: subSpan },
-    bars: {
-      mainMs: inherited ? null : mainBarMs,
-      toolMs: inherited ? null : toolMs,
-      subMs: subBarMs,
-      totalMs: inherited ? null : mainBarMs + subBarMs,
-    },
     agentCount: agents.length,
     maxParallelAgents,
     currentParallel,
@@ -1614,6 +1767,9 @@ export function deriveTimeBuckets(
     agents,
     backgroundTasks,
     externalRunCalls,
+    ...(nestedAgents.length > 0 ? { nestedAgents } : {}),
+    ...(nestedExternalRuns.length > 0 ? { nestedExternalRuns } : {}),
+    ...(unknownLaunchers.length > 0 ? { unknownLaunchers } : {}),
     blocks,
     droppedIntervalCount: state.droppedIntervalCount,
     droppedBlockCount: state.droppedBlockCount,
@@ -1624,35 +1780,19 @@ export function deriveTimeBuckets(
 }
 
 export function projectWorkBlockTokens(view: TimeBucketView, usage: PlanUsage): TimeBucketView {
-  const total = (slices: PlanUsage["blocks"][number]["slices"], start: number | null, end: number): PlanTokenTotal | null => {
-    if (start === null) return null;
-    let result: PlanTokenTotal | null = null;
-    for (const slice of slices) {
-      const overlap = Math.max(0, Math.min(end, slice.end) - Math.max(start, slice.start));
-      if (overlap <= 0) continue;
-      result ??= { tokens: 0, cacheRead: 0 };
-      const ratio = overlap / Math.max(1, slice.end - slice.start);
-      result.tokens += slice.tokens * ratio;
-      result.cacheRead += slice.cacheRead * ratio;
-      if (slice.outputTokens !== undefined) result.outputTokens = (result.outputTokens ?? 0) + slice.outputTokens * ratio;
-    }
-    return result;
-  };
-  const allSlices = usage.blocks.flatMap(block => block.slices);
   const project = (block: RequestBlockView): RequestBlockView => {
     const slices = usage.blocks.filter(value => value.blockId === block.blockId).flatMap(value => value.slices)
-      .filter(slice => slice.start >= block.start && (block.closedAt === undefined || slice.start < block.closedAt));
+      .filter(slice => slice.start >= block.start);
     const { usageSlices: _previousSlices, ...withoutUsageSlices } = block;
     const tokens = slices.length
       ? { tokens: slices.reduce((sum, slice) => sum + slice.tokens, 0), cacheRead: slices.reduce((sum, slice) => sum + slice.cacheRead, 0),
         ...(slices.some(slice => slice.outputTokens !== undefined) ? { outputTokens: slices.reduce((sum, slice) => sum + (slice.outputTokens ?? 0), 0) } : {}) } : null;
-    return { ...withoutUsageSlices, ...(slices.length ? { usageSlices: slices } : {}), ...(block.metrics ? { metrics: { ...block.metrics, tokens } } : {}),
-      ...(block.kind === "plan" ? { steps: block.steps?.map(step => ({ ...step, tokens: total(allSlices, step.startedAt, step.end ?? block.end) })) } : {}) };
+    return { ...withoutUsageSlices, ...(slices.length ? { usageSlices: slices } : {}), ...(block.metrics ? { metrics: { ...block.metrics, tokens } } : {}) };
   };
   return { ...view, blocks: view.blocks.map(project) };
 }
 
-export function currentWorkBlock<B extends { closedAt?: number }>(source: { blocks: readonly B[] }): B | undefined { const block = source.blocks.at(-1); return block?.closedAt === undefined ? block : undefined; }
+export function currentWorkBlock<B>(source: { blocks: readonly B[] }): B | undefined { return source.blocks.at(-1); }
 
 export function planItemKeys(block: RequestBlockRecord): string[] {
   return block.seenSteps ?? (block.steps ?? []).map(step => step.key);
@@ -1674,7 +1814,7 @@ function inProgressUpdate(state: TimeBucketState, blockIndex: number, number: nu
   const { key, taskKey } = step;
   const block = state.blocks[blockIndex];
   if (taskKey === undefined || !taskKey.startsWith(TASK_KEY_PREFIX)) {
-    return blockIndex === state.blocks.length - 1 && block.kind === "plan" && block.closedAt === undefined ? { number, tool: "TodoWrite", title: step.title } : undefined;
+    return blockIndex === state.blocks.length - 1 && block.kind === "plan" ? { number, tool: "TodoWrite", title: step.title } : undefined;
   }
   if (taskKey.startsWith(TASK_PENDING_KEY_PREFIX)) return undefined;
   const reopened = applyPlanTask(state, { kind: "update", taskKey, status: "in_progress" }, state.lastAt ?? 0, state.openTurn?.turnId ?? "", "",
@@ -1740,10 +1880,16 @@ function launchPlacedStep(state: TimeBucketState, selections: readonly { at: num
 
 const isCompletedStep = (step: PlanBlockStepRecord | undefined): boolean => step !== undefined && !step.removed && step.status === "completed";
 
-// `running` is the PLAN panel's rule (src/work-model.ts#isRunningMainLane), so the guards never see a lane as running that
+// `running` is the PLAN panel's rule (src/work-model.ts#isRunningLane), so the guards never see a lane as running that
 // the panel shows ended, or the reverse; only a successful TaskStop ends a lane earlier, so a completion can follow it.
 function laneRunning(state: TimeBucketState, running: (toolUseId: string) => boolean, toolUseId: string, taskId: string | undefined): boolean {
   return running(toolUseId) && (taskId === undefined || !state.stoppedTaskIds?.includes(taskId));
+}
+
+function launchPlacement(state: TimeBucketState, lane: { description: string; startedAt: number; parentToolUseId?: string }): { description: string; at: number } {
+  const launcher = lane.parentToolUseId === undefined ? undefined : keyedGet(state.delegations, lane.parentToolUseId);
+  const root = (launcher === undefined ? undefined : delegationRoot(state.delegations, launcher.toolUseId).root) ?? lane;
+  return { description: root.description, at: root.startedAt };
 }
 
 // A resumed lane keeps the item its launch placed it on (R-DSP-42), so the placement is the launch's, not the resume's.
@@ -1754,7 +1900,8 @@ export function resumeVerdict(state: TimeBucketState, to: string, namedToolUseId
   const resumed = agentId === undefined ? undefined : delegationOfAgent(state, agentId, d => d.isBackground);
   if (resumed === undefined || laneRunning(state, running, resumed.toolUseId, agentId)) return { kind: "allow" };
   const planned = withMessagePlanCalls(state, toolUseId);
-  const placed = launchPlacedStep(planned, responseSelections(planned.blocks, turnSpansUntil(planned, Number.POSITIVE_INFINITY)), resumed.description, resumed.startedAt);
+  const placement = launchPlacement(planned, resumed);
+  const placed = launchPlacedStep(planned, responseSelections(planned.blocks, turnSpansUntil(planned, Number.POSITIVE_INFINITY)), placement.description, placement.at);
   const update = placed !== undefined && isCompletedStep(placed.step)
     ? inProgressUpdate(planned, placed.blockIndex, placed.step.number, placed.step) : undefined;
   return update === undefined ? { kind: "allow" } : { kind: "step-completed", ...update };
@@ -1774,13 +1921,13 @@ export function completionVerdict(state: TimeBucketState, toolName: string, inpu
   if (completing.length === 0) return { kind: "allow" };
   const lanes = [
     ...keyedValues(before.delegations).filter(d => !d.rejectedBeforeRun && laneRunning(before, running, d.toolUseId, d.transcriptAgentId)
-      && (d.ackEndedAt !== undefined || admitted.has(d.toolUseId)))
-      .map(d => ({ description: d.description, at: d.startedAt, id: d.transcriptAgentId })),
+      && (d.ackEndedAt !== undefined || d.parentToolUseId !== undefined || admitted.has(d.toolUseId)))
+      .map(d => ({ ...launchPlacement(before, d), name: d.description, id: d.transcriptAgentId })),
     ...keyedValues(before.backgroundTasks).filter(b => isExternalRunTool(b.toolName) && laneRunning(before, running, b.toolUseId, b.taskId))
-      .map(b => ({ description: b.description, at: b.startedAt, id: b.taskId as string | undefined })),
+      .map(b => ({ ...launchPlacement(before, b), name: b.description, id: b.taskId as string | undefined })),
     ...Object.entries(before.openTools).filter(([id, tool]) => tool.lane === "main" && isExternalRunTool(tool.toolName)
       && keyedGet(before.backgroundTasks, id) === undefined && laneRunning(before, running, id, undefined) && admitted.has(id))
-      .map(([, tool]) => ({ description: tool.description ?? tool.toolName, at: tool.at, id: undefined as string | undefined })),
+      .map(([, tool]) => ({ description: tool.description ?? tool.toolName, at: tool.at, name: tool.description ?? tool.toolName, id: undefined as string | undefined })),
   ];
   const selections = responseSelections(before.blocks, turnSpansUntil(before, Number.POSITIVE_INFINITY));
   const placed = lanes.map(lane => {
@@ -1789,7 +1936,7 @@ export function completionVerdict(state: TimeBucketState, toolName: string, inpu
   });
   const steps = completing.map(({ blockId, step }) => ({ number: step.number,
     lanes: placed.filter(entry => entry.blockId === blockId && entry.key === step.key)
-      .map(({ lane }) => lane.id === undefined ? lane.description : `${lane.description} (${lane.id})`) }))
+      .map(({ lane }) => lane.id === undefined ? lane.name : `${lane.name} (${lane.id})`) }))
     .filter(entry => entry.lanes.length > 0);
   return steps.length > 0 ? { kind: "running-lanes", steps } : { kind: "allow" };
 }
@@ -1844,13 +1991,12 @@ function refreshPlan(measured: RequestBlockView, live: RequestBlockView, provisi
     conductorIntervals: mergeIntervals(measured.conductorIntervals, live.conductorIntervals),
     conductorTail: live.conductorTail,
     ...(metrics === undefined ? {} : { metrics: { ...metrics, provisional } }),
-    ...(measured.kind === "plan" ? { steps: mergedSteps,
-      userMessages: live.userMessages?.length ? live.userMessages : measured.userMessages ?? [] } : {}) };
+    ...(measured.kind === "plan" ? { steps: mergedSteps } : {}) };
 }
 
 function provisionalBlock(block: RequestBlockView): RequestBlockView {
   return block.kind === "plan" ? refreshPlan(block, block, true)
-    : { ...block, durationMs: null, generateMs: null, replyMs: null, processingMs: null, strip: null };
+    : { ...block, durationMs: null, generateMs: null, replyMs: null, processingMs: null };
 }
 
 export function overlayLiveTimeBucketState(measured: TimeBucketView, live: TimeBucketView): TimeBucketView {
@@ -1863,11 +2009,9 @@ export function overlayLiveTimeBucketState(measured: TimeBucketView, live: TimeB
   return { ...view, mainModelSpans };
 }
 
-function overlayLiveTimeBucketStateCore(measured: TimeBucketView, live: TimeBucketView): TimeBucketView {
-  if ((live.generationBoundaryAt ?? 0) > (measured.generationBoundaryAt ?? 0)) return live;
-  if ((measured.generationBoundaryAt ?? 0) > (live.generationBoundaryAt ?? 0)) return measured;
-  const liveAgents = new Map(live.agents.map((a) => [a.toolUseId, a]));
-  const agents: AgentSpanView[] = measured.agents.map((a) => {
+function overlayAgentViews(measured: readonly AgentSpanView[], live: readonly AgentSpanView[]): AgentSpanView[] {
+  const liveAgents = new Map(live.map((a) => [a.toolUseId, a]));
+  const agents: AgentSpanView[] = measured.map((a) => {
     const l = liveAgents.get(a.toolUseId);
     if (l === undefined) return a;
     const runs = moreRuns<RecordedRuns>({ earlierRuns: a.earlierRuns, resumedAt: a.resumedAt }, { earlierRuns: l.earlierRuns, resumedAt: l.resumedAt });
@@ -1876,10 +2020,24 @@ function overlayLiveTimeBucketStateCore(measured: TimeBucketView, live: TimeBuck
     if (l.open) return { ...attributed, open: true, end: Math.max(a.end, l.end), endSource: "open" };
     return { ...attributed, open: false, end: l.end, endSource: l.endSource };
   });
-  for (const l of live.agents) {
-    if (measured.agents.some((a) => a.toolUseId === l.toolUseId)) continue;
+  for (const l of live) {
+    if (measured.some((a) => a.toolUseId === l.toolUseId)) continue;
     agents.push(l);
   }
+  return agents;
+}
+
+function overlayExternalRunCalls(measured: readonly ExternalRunCallView[], live: readonly ExternalRunCallView[]): ExternalRunCallView[] {
+  const liveCalls = new Map(live.map((call) => [call.toolUseId, call]));
+  return [...measured.map((call) => liveCalls.get(call.toolUseId) ?? call), ...live.filter((call) => !measured.some((m) => m.toolUseId === call.toolUseId))];
+}
+
+function overlayLiveTimeBucketStateCore(measured: TimeBucketView, live: TimeBucketView): TimeBucketView {
+  if ((live.generationBoundaryAt ?? 0) > (measured.generationBoundaryAt ?? 0)) return live;
+  if ((measured.generationBoundaryAt ?? 0) > (live.generationBoundaryAt ?? 0)) return measured;
+  const agents = overlayAgentViews(measured.agents, live.agents);
+  const nestedAgents = overlayAgentViews(measured.nestedAgents ?? [], live.nestedAgents ?? []);
+  const unknownLaunchers = overlayAgentViews(measured.unknownLaunchers ?? [], live.unknownLaunchers ?? []);
   const liveBg = new Map(live.backgroundTasks.map((t) => [t.toolUseId, t]));
   const backgroundTasks: BackgroundTaskSpanView[] = measured.backgroundTasks.map((t) => {
     const l = liveBg.get(t.toolUseId);
@@ -1893,21 +2051,20 @@ function overlayLiveTimeBucketStateCore(measured: TimeBucketView, live: TimeBuck
     if (measured.backgroundTasks.some((t) => t.toolUseId === l.toolUseId)) continue;
     backgroundTasks.push(l);
   }
-  const liveCalls = new Map((live.externalRunCalls ?? []).map((call) => [call.toolUseId, call]));
-  const measuredCalls = measured.externalRunCalls ?? [];
-  const externalRunCalls = [...measuredCalls.map((call) => liveCalls.get(call.toolUseId) ?? call),
-    ...(live.externalRunCalls ?? []).filter((call) => !measuredCalls.some((m) => m.toolUseId === call.toolUseId))];
+  const externalRunCalls = overlayExternalRunCalls(measured.externalRunCalls ?? [], live.externalRunCalls ?? []);
+  const nestedExternalRuns = overlayExternalRunCalls(measured.nestedExternalRuns ?? [], live.nestedExternalRuns ?? []);
   const mergedSpans: Span[] = [
     ...agents.flatMap((a) => runSpans(memberRunTimes(a))),
     ...backgroundTasks.map((t) => [t.start, t.end] as Span),
   ];
   const turnParallel = live.turnOpen && live.tail.main !== "confirm" ? 1 : 0;
-  const mergedParallel = turnParallel + agents.filter((a) => a.open).length + backgroundTasks.filter((t) => t.open).length;
+  const mergedParallel = turnParallel + [...agents, ...backgroundTasks, ...nestedAgents, ...nestedExternalRuns].filter((member) => member.open).length;
   let blocks: RequestBlockView[] = measured.blocks.map(block => ({ ...block, running: false }));
   // Rows route the view's intervals (src/plan-steps.ts#planFrame), so the live part after the measured data reaches them
   // from the same source as the refreshed block metrics.
   const horizon = measured.blocks.at(-1)?.end;
   let intervals = measured.intervals;
+  let liveCutoff: number | undefined;
   const liveLast = live.blocks.at(-1);
   if (liveLast !== undefined && (liveLast.running || (live.lastAt ?? 0) > (measured.lastAt ?? 0))) {
     const caughtUp = (live.lastAt ?? 0) >= (measured.lastAt ?? 0);
@@ -1921,7 +2078,6 @@ function overlayLiveTimeBucketStateCore(measured: TimeBucketView, live: TimeBuck
       if (liveBlock === undefined) return block;
       if (liveBlock.kind !== block.kind) return provisionalBlock(liveBlock);
       if (index === lastIndex) {
-        if (block.closedAt !== undefined) return block;
         return { ...(caughtUp ? refreshPlan(block, liveBlock, provisional) : block), start: block.start, anchorAt: block.anchorAt,
           requestNumber: block.requestNumber ?? liveBlock.requestNumber, running: liveBlock.running, end: Math.max(block.end, liveBlock.end) };
       }
@@ -1947,29 +2103,56 @@ function overlayLiveTimeBucketStateCore(measured: TimeBucketView, live: TimeBuck
       const moved = liveBlock !== undefined && liveBlock.end <= next.start ? provisionalBlock(liveBlock) : { ...provisionalBlock(block), durationMs: null };
       return { ...moved, end: Math.min(moved.end, next.start), running: false };
     });
-    if (caughtUp && horizon !== undefined) intervals = [...measuredBefore(measured.intervals, horizon), ...liveAfter(live.intervals, horizon)];
+    if (caughtUp && horizon !== undefined) {
+      intervals = [...measuredBefore(measured.intervals, horizon), ...liveAfter(live.intervals, horizon)];
+      liveCutoff = horizon;
+    }
   }
   // A span the live fold placed in a block the view does not show keeps its measured placement, or is placed by time.
   const shown = new Set(blocks.map(block => block.blockId));
-  const measuredSpans = new Map<string, { blockId?: string; stepKey?: string }>([...measured.agents, ...measured.backgroundTasks, ...measured.externalRunCalls ?? []].map(span => [span.toolUseId, span]));
+  const measuredSpans = new Map<string, { blockId?: string; stepKey?: string }>([...measured.agents, ...measured.backgroundTasks, ...measured.externalRunCalls ?? [],
+    ...measured.nestedAgents ?? [], ...measured.nestedExternalRuns ?? [], ...measured.unknownLaunchers ?? []].map(span => [span.toolUseId, span]));
   const placed = <T extends { toolUseId: string; blockId?: string; stepKey?: string }>(span: T): T => {
     if (span.blockId === undefined || shown.has(span.blockId)) return span;
     const { blockId: _blockId, stepKey: _stepKey, ...unplaced } = span;
     const kept = measuredSpans.get(span.toolUseId);
     return { ...unplaced, ...(kept?.blockId === undefined ? {} : { blockId: kept.blockId }), ...(kept?.stepKey === undefined ? {} : { stepKey: kept.stepKey }) } as T;
   };
-  return {
+  const merged: TimeBucketView = {
     ...measured,
     intervals,
     agents: agents.map(placed),
     backgroundTasks: backgroundTasks.map(placed),
     externalRunCalls: externalRunCalls.map(placed),
+    ...(nestedAgents.length > 0 ? { nestedAgents: nestedAgents.map(placed) } : {}),
+    ...(nestedExternalRuns.length > 0 ? { nestedExternalRuns: nestedExternalRuns.map(placed) } : {}),
+    ...(unknownLaunchers.length > 0 ? { unknownLaunchers: unknownLaunchers.map(placed) } : {}),
     blocks,
-    subagentOnlySpans: live.subagentOnlySpans ?? measured.subagentOnlySpans,
     agentCount: agents.length,
     currentParallel: mergedParallel,
     maxConcurrency: Math.max(measured.maxConcurrency, sweepMax(mergedSpans), mergedParallel),
     turnOpen: live.turnOpen,
     tail: live.tail,
   };
+  return liveCutoff === undefined ? merged : withMergedTotals(merged, measured, live, liveCutoff);
+}
+
+function withMergedTotals(merged: TimeBucketView, measured: TimeBucketView, live: TimeBucketView, cutoff: number): TimeBucketView {
+  if (measured.spanMs === null || merged.firstAt === null) return merged;
+  const asSpans = (spans: readonly { start: number; end: number }[]): Span[] => spans.map(({ start, end }) => [start, end] as Span);
+  const asRanges = (spans: readonly Span[] | undefined) => (spans ?? []).map(([start, end]) => ({ start, end }));
+  const end = Math.max(merged.lastAt ?? merged.firstAt, live.lastAt ?? merged.firstAt);
+  const observedLive = asSpans(liveAfter(live.intervals, cutoff).filter((i) => i.lane === "main" && (i.bucket === "tool" || i.bucket === "delegation" || i.bucket === "confirm")));
+  const carried = measuredBefore(asRanges(measured.unmeasuredSpans), cutoff);
+  const unmeasured = unionSpans([...asSpans(carried),
+    ...(live.spanMs === null && end > cutoff ? subtractSpans([[cutoff, end]], unionSpans(observedLive)) : [])]);
+  const withCalls: TimeBucketView = { ...merged,
+    mainToolCallSpans: asSpans([...measuredBefore(asRanges(measured.mainToolCallSpans), cutoff), ...liveAfter(asRanges(live.mainToolCallSpans), cutoff)]) };
+  const totals = viewTotals(withCalls, [[merged.firstAt, end]], unmeasured);
+  return { ...withCalls, subagentOnlySpans: totals.spans.subOnly, backgroundOnlySpans: totals.spans.backgroundOnly,
+    unmeasuredSpans: totals.spans.unmeasured,
+    blocks: merged.blocks.map((block) => ({ ...block, ...blockTimeFigures(totals, block.start, block.end),
+      ...(block.metrics === undefined ? {} : { metrics: { ...blockMetrics(totals, block.start, block.end, false), tokens: block.metrics.tokens,
+        ...(block.metrics.provisional === undefined ? {} : { provisional: block.metrics.provisional }) } }) })),
+    lastAt: end, spanMs: end - merged.firstAt, ...topFigures(totals, false, end - merged.firstAt) };
 }

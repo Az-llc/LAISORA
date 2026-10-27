@@ -244,6 +244,18 @@ export function estimateTokens(text: string): number {
   return Math.ceil(asciiChars / 4 + nonAsciiChars / 1.5);
 }
 export const EXTERNAL_CAPABILITIES = "Explorer and reviewer external targets are read-only and return only text. Worker Codex targets may edit files under the chosen working directory, never commit, and cannot run the build; the conductor runs checks and commits.";
+export const SUBAGENT_HANDBACK_TOOL = "SubagentHandback";
+export const HANDBACK_OMITTED_MARKER = "Omitted:";
+export const HANDBACK_DENIAL_LIMIT = 2;
+const HANDBACK_OMITTED_INDEX = `a line starting "${HANDBACK_OMITTED_MARKER}" that names what it left out (details, raw output), one line each, or "${HANDBACK_OMITTED_MARKER} none"`;
+export const HANDBACK_INDEX_INSTRUCTION = `Tell every delegate to end its reply with ${HANDBACK_OMITTED_INDEX}.`;
+export function handbackIndexDenial(message: string): string | undefined {
+  return message.split(/\r?\n/).some((line) => line.replace(/^[\s>#*-]*/, "").startsWith(HANDBACK_OMITTED_MARKER)) ? undefined
+    : `End the report with ${HANDBACK_OMITTED_INDEX}, then call ${SUBAGENT_HANDBACK_TOOL} again with the full report.`;
+}
+export function handbackGateVerdict(message: unknown, priorDenials: number): string | undefined {
+  return typeof message === "string" && priorDenials < HANDBACK_DENIAL_LIMIT ? handbackIndexDenial(message) : undefined;
+}
 export function conductorInstruction(roster: readonly OrchestrationRow[], policy: string, external = orchestrationExternalTargets(roster), models: ExternalModels | undefined, placementLine: string): string {
   const variants = orchestrationVariants(roster, models);
   const metadata = models?.claude?.state === "ok" ? models.claude.models.find((model) => model.id === "opus") : undefined;
@@ -258,6 +270,7 @@ export function conductorInstruction(roster: readonly OrchestrationRow[], policy
         ({ agentKey, model, ...(effort ? { effort } : {}), ...(efforts.length ? { efforts } : {}) })),
       external: external.filter((target) => target.role === entry.role).map(({ target, executor, model, effort }) => ({ target, executor: externalExecutorName(executor), model, ...(effort ? { effort } : {}) })) })),
     ...(external.length ? [`External targets (${EXTERNAL_EXECUTORS.map((definition) => definition.displayName).join(" and ")}) cost no Claude usage. ${EXTERNAL_CAPABILITIES} Call the run tool of laisora_external with the exact target key. A background launch acknowledgement means the work is still running; you can respond to new user input, but wait for its completion notification before dependent review or work.`] : []),
+    HANDBACK_INDEX_INSTRUCTION,
   ].join("\n");
   return [
     `<roster>\n${generated}\n</roster>`,

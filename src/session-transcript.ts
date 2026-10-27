@@ -38,6 +38,7 @@ import {
 } from "./human-input-vocabulary";
 export { extractCliInsertedUserText, extractHumanUserText, extractImageRefs, extractQueuedPromptRecord } from "./human-input-vocabulary";
 import { isCliRejectionText, isLaisoraDenialText } from "./tool-result-signals";
+import { TASK_NOTIFICATION_ORIGIN_KIND } from "./task-notification-origin";
 import { handoffNoticeCardText, handoffNoticeOf } from "./steering-envelope";
 
 export interface HistoryEvent {
@@ -62,11 +63,11 @@ export type TranscriptMessage = Omit<ConversationMessage, "uuid"> & { uuid?: str
 
 const REPLAY_MESSAGE_MAX = 80;
 const PRIOR_GENERATION_KINDS: ReadonlySet<NormalizedEventBody["kind"]> = new Set(["compact_boundary", "local_command_output", "user_message", "assistant_text_delta", "model_observed", "tool_call_started", "tool_call_finished"]);
-const MAX_SUBAGENT_TRANSCRIPT_BYTES = 8 * 1024 * 1024;
+export const MAX_SUBAGENT_TRANSCRIPT_BYTES = 8 * 1024 * 1024;
 const RESUME_TAIL_MAX_BYTES = 1024 * 1024;
 const RESUME_TAIL_MAX_RECORDS = 1500;
 const RESUME_CAPTURE_CHUNK_BYTES = 64 * 1024;
-const AGENT_WAKE_ORIGIN_KINDS: ReadonlySet<string> = new Set(["task-notification", "peer"]);
+const AGENT_WAKE_ORIGIN_KINDS: ReadonlySet<string> = new Set([TASK_NOTIFICATION_ORIGIN_KIND, "peer"]);
 const EARLIER_GENERATION_TURN_ID = "replay-earlier-generation";
 const TOOL_RESULT_TYPE = "tool_result";
 const APPROVAL_RESOLVED_TYPE = "approval_resolved";
@@ -159,6 +160,251 @@ async function readHandleRange(
     offset += result.bytesRead;
   }
   return offset === length ? buffer : buffer.subarray(0, offset);
+}
+
+const USAGE_MARKER = '"usage"';
+const USAGE_MARKER_BYTES = Buffer.from(USAGE_MARKER);
+
+async function scanUsageLines(handle: import("node:fs/promises").FileHandle, from: number, byteLength: number,
+  visit: (line: string) => void): Promise<{ complete: number; partial?: string }> {
+  const chunk = Buffer.alloc(1 << 20);
+  let offset = from;
+  let complete = from;
+  let pending: Buffer[] = [];
+  const marked = (line: Buffer): boolean => line.indexOf(USAGE_MARKER_BYTES) !== -1;
+  while (offset < byteLength) {
+    const { bytesRead } = await handle.read(chunk, 0, Math.min(chunk.length, byteLength - offset), offset);
+    if (bytesRead === 0) break;
+    const data = chunk.subarray(0, bytesRead);
+    let start = 0;
+    for (let end = data.indexOf(10); end !== -1; end = data.indexOf(10, start)) {
+      const line = pending.length > 0 ? Buffer.concat([...pending, data.subarray(start, end)]) : data.subarray(start, end);
+      if (marked(line)) visit(line.toString("utf8"));
+      pending = [];
+      start = end + 1;
+      complete = offset + start;
+    }
+    if (start < data.length) pending.push(Buffer.from(data.subarray(start)));
+    offset += bytesRead;
+  }
+  const partial = pending.length > 0 ? Buffer.concat(pending) : undefined;
+  return partial !== undefined && marked(partial) ? { complete, partial: partial.toString("utf8") } : { complete };
+}
+
+const CHILD_USAGE_HASH_BYTES = 4096;
+
+export interface ChildUsageScan {
+  offset: number;
+  prefixLength: number;
+  prefixHash: string;
+  tailHash: string;
+  malformedLineCount: number;
+  records: Record<string, unknown>[];
+}
+
+export type UsageScanOwner = object;
+
+const usageScanOwners = new Map<UsageScanOwner, Set<string>>();
+const childUsageScans = new Map<string, Map<string, ChildUsageScan>>();
+
+export function openUsageScanOwner(): UsageScanOwner {
+  const owner = {};
+  usageScanOwners.set(owner, new Set());
+  return owner;
+}
+
+export function releaseUsageScanOwner(owner: UsageScanOwner): void {
+  const files = usageScanOwners.get(owner);
+  usageScanOwners.delete(owner);
+  for (const file of files ?? []) {
+    if (![...usageScanOwners.values()].some(held => held.has(file))) childUsageScans.delete(file);
+  }
+}
+
+export function heldChildUsageScans(filePath: string): boolean {
+  return childUsageScans.has(filePath);
+}
+
+function usageScansOf(owner: UsageScanOwner | undefined, filePath: string): ReadonlyMap<string, ChildUsageScan> | undefined {
+  return owner !== undefined && usageScanOwners.has(owner) ? childUsageScans.get(filePath) : undefined;
+}
+
+function storeUsageScans(owner: UsageScanOwner | undefined, filePath: string, scans: Map<string, ChildUsageScan>, merge = false): void {
+  const files = owner === undefined ? undefined : usageScanOwners.get(owner);
+  if (files === undefined) return;
+  files.add(filePath);
+  childUsageScans.set(filePath, merge ? new Map([...childUsageScans.get(filePath) ?? [], ...scans]) : scans);
+}
+
+function retainUsageScans(owner: UsageScanOwner | undefined, read: ReadonlySet<string>): void {
+  const files = owner === undefined ? undefined : usageScanOwners.get(owner);
+  for (const file of [...files ?? []]) {
+    if (read.has(file)) continue;
+    files!.delete(file);
+    if (![...usageScanOwners.values()].some(held => held.has(file))) childUsageScans.delete(file);
+  }
+}
+
+function usageRecordOf(line: string): Record<string, unknown> | "malformed" | undefined {
+  if (!line.includes(USAGE_MARKER)) return undefined;
+  const value = lineValue(line);
+  if (value === NOT_OBJECT_LINE || value === UNPARSEABLE_LINE) return "malformed";
+  const obj = recordOf(value);
+  const message = asRecord(obj?.message);
+  if (obj === null || obj.type !== "assistant" || typeof message?.id !== "string" || typeof message.usage !== "object" || message.usage === null) return undefined;
+  return { type: "assistant", ...(obj.uuid === undefined ? {} : { uuid: obj.uuid }), ...(obj.timestamp === undefined ? {} : { timestamp: obj.timestamp }),
+    message: { id: message.id, usage: message.usage } };
+}
+
+export async function scanChildUsage(filePath: string, byteLength: number, previous: ChildUsageScan | undefined):
+  Promise<{ scan: ChildUsageScan; records: Record<string, unknown>[]; malformedLineCount: number; scannedBytes: number }> {
+  const { open } = await import("node:fs/promises");
+  const { createHash } = await import("node:crypto");
+  const handle = await open(filePath, "r");
+  try {
+    const hashOf = async (position: number, length: number): Promise<string> =>
+      createHash("sha256").update(await readHandleRange(handle, position, length)).digest("hex");
+    const tailOf = (offset: number): Promise<string> => hashOf(Math.max(0, offset - CHILD_USAGE_HASH_BYTES), Math.min(CHILD_USAGE_HASH_BYTES, offset));
+    const reuse = previous !== undefined && previous.offset <= byteLength && previous.prefixLength <= byteLength
+      && await hashOf(0, previous.prefixLength) === previous.prefixHash && await tailOf(previous.offset) === previous.tailHash;
+    const from = reuse ? previous.offset : 0;
+    const records = reuse ? [...previous.records] : [];
+    let malformedLineCount = reuse ? previous.malformedLineCount : 0;
+    const { complete, partial } = await scanUsageLines(handle, from, byteLength, (line) => {
+      const record = usageRecordOf(line);
+      if (record === "malformed") malformedLineCount++;
+      else if (record) records.push(record);
+    });
+    const tail = partial === undefined ? undefined : usageRecordOf(partial);
+    const prefixLength = Math.min(CHILD_USAGE_HASH_BYTES, complete);
+    const prefixHash = reuse && previous.prefixLength === prefixLength ? previous.prefixHash : await hashOf(0, prefixLength);
+    return { scan: { offset: complete, prefixLength, prefixHash, tailHash: await tailOf(complete), malformedLineCount, records },
+      records: tail === undefined || tail === "malformed" ? records : [...records, tail], malformedLineCount, scannedBytes: byteLength - from };
+  } finally {
+    await handle.close();
+  }
+}
+
+export interface DeferredChildUsage {
+  transcriptFile: string;
+  childPath: string;
+  byteLength: number;
+  parentToolUseId: string;
+  through?: number;
+  launchedAt?: number;
+  gapThrough?: number;
+  ancestorGap?: { reachesGeneration: boolean };
+}
+
+export interface LargeChildUsageOutcome {
+  usageRead: boolean;
+  malformedLineCount: number;
+}
+
+function largeChildGap({ usageRead, malformedLineCount }: LargeChildUsageOutcome): SubagentGap["cause"] | undefined {
+  return !usageRead ? "unread" : malformedLineCount > 0 ? "malformed" : undefined;
+}
+
+type LargeChildCount = "usagePendingTranscriptCount" | "usageOnlyTranscriptCount" | "unreadableAgentCount";
+
+function countLargeChild(coverage: WorkCoverage, key: LargeChildCount, by = 1): void {
+  const count = (coverage[key] ?? 0) + by;
+  if (count > 0) coverage[key] = count;
+  else delete coverage[key];
+}
+
+function readLargeChildCount(usageRead: boolean): LargeChildCount {
+  return usageRead ? "usageOnlyTranscriptCount" : "unreadableAgentCount";
+}
+
+function ancestorGapThrough(through: number, deeperThrough: number | undefined): number {
+  return deeperThrough === undefined ? through : Math.min(through, deeperThrough);
+}
+
+function ancestorGapReachesGeneration(markedBoundaryAt: number | undefined, gapThrough: number | undefined): boolean {
+  return markedBoundaryAt === undefined || gapThrough === undefined || gapThrough >= markedBoundaryAt;
+}
+
+function childGapMessage(counts: ReadonlyMap<SubagentGap["cause"], ReadonlySet<string>>): string | undefined {
+  if (counts.size === 0) return undefined;
+  return `subagent transcripts incomplete (${[...counts].map(([cause, ids]) => `${cause}=${ids.size}`).join(" ")})`;
+}
+
+export function foldDeferredChildCoverage(coverage: WorkCoverage,
+  outcomes: ReadonlyArray<LargeChildUsageOutcome & { item: DeferredChildUsage }>): WorkCoverage {
+  const next: WorkCoverage = { ...coverage };
+  let malformedLineCount = 0;
+  const ancestorGaps = new Map<SubagentGap["cause"], Set<string>>();
+  let reachesGeneration = false;
+  for (const outcome of outcomes) {
+    if (outcome.item.through === undefined) {
+      malformedLineCount += outcome.malformedLineCount;
+      countLargeChild(next, "usagePendingTranscriptCount", -1);
+      countLargeChild(next, readLargeChildCount(outcome.usageRead));
+    }
+    const cause = largeChildGap(outcome);
+    if (cause === undefined || outcome.item.ancestorGap === undefined) continue;
+    ancestorGaps.set(cause, (ancestorGaps.get(cause) ?? new Set<string>()).add(outcome.item.parentToolUseId));
+    reachesGeneration ||= outcome.item.ancestorGap.reachesGeneration;
+  }
+  if (malformedLineCount > 0) {
+    next.summary = "prefix-truncated";
+    next.details = "prefix-truncated";
+    next.historyMalformedLineCount = (next.historyMalformedLineCount ?? 0) + malformedLineCount;
+  }
+  const ancestorError = childGapMessage(ancestorGaps);
+  if (ancestorError !== undefined) {
+    next.ancestorUsageReadError ??= ancestorError;
+    if (reachesGeneration) next.ancestorUsageReachesGeneration = true;
+  }
+  return next;
+}
+
+type ChildUsageItem = RawHistoryItem & { body: Extract<NormalizedEventBody, { kind: "assistant_usage" }> & { parentToolUseId: string } };
+
+function childUsageEvents(records: readonly Record<string, unknown>[], parentToolUseId: string, turnOf: (recordTime: number) => string,
+  sourcePriority: number): ChildUsageItem[] {
+  const events: ChildUsageItem[] = [];
+  const accept = createRecordUuidFilter();
+  let lastTimestamp = 0;
+  for (const obj of records) {
+    if (!accept(obj)) continue;
+    const rawTs = typeof obj.timestamp === "string" ? Date.parse(obj.timestamp) : NaN;
+    const recordTime = Number.isFinite(rawTs) ? rawTs : lastTimestamp;
+    lastTimestamp = recordTime;
+    const event = childUsageEvent(obj, parentToolUseId, recordTime, () => turnOf(recordTime), sourcePriority, events.length);
+    if (event) events.push(event as ChildUsageItem);
+  }
+  return events;
+}
+
+export interface DeferredChildUsageRead extends LargeChildUsageOutcome {
+  item: DeferredChildUsage;
+  events: Array<{ timestamp: number; body: ChildUsageItem["body"] }>;
+}
+
+export async function readDeferredChildUsage(items: readonly DeferredChildUsage[], owner: UsageScanOwner | undefined): Promise<DeferredChildUsageRead[]> {
+  const reads: DeferredChildUsageRead[] = [];
+  for (const item of items) {
+    try {
+      const { scan, records, malformedLineCount } = await scanChildUsage(item.childPath, item.byteLength, usageScansOf(owner, item.transcriptFile)?.get(item.childPath));
+      storeUsageScans(owner, item.transcriptFile, new Map([[item.childPath, scan]]), true);
+      const events = childUsageEvents(records, item.parentToolUseId, () => "", 0)
+        .filter(({ timestamp }) => item.through === undefined || timestamp <= item.through).map(({ timestamp, body }) => ({ timestamp, body }));
+      reads.push({ item, events, usageRead: true, malformedLineCount });
+    } catch {
+      reads.push({ item, events: [], usageRead: false, malformedLineCount: 0 });
+    }
+  }
+  return reads;
+}
+
+function childUsageEvent(obj: Record<string, unknown>, parentToolUseId: string, recordTime: number, turnOf: () => string,
+  sourcePriority: number, fileOrder: number): RawHistoryItem | undefined {
+  const message = asRecord(obj.message);
+  if (obj.type !== "assistant" || typeof message?.id !== "string" || typeof message.usage !== "object" || message.usage === null) return undefined;
+  return { body: { kind: "assistant_usage", turnId: turnOf(), parentToolUseId, messageId: message.id,
+    usage: assistantUsageFromRaw(message.usage, true), provenance: { path: "history" } }, timestamp: recordTime, sourcePriority, fileOrder };
 }
 
 async function readUtf8Prefix(filePath: string, byteLength: number): Promise<string> {
@@ -784,7 +1030,33 @@ export interface SessionHistoryRead {
   readError?: string;
   subagentsReadError?: string;
   subagentGaps?: SubagentGap[];
+  unreadSubagentIds?: string[];
+  usageOnlySubagentIds?: string[];
+  usagePendingSubagentIds?: string[];
+  usageReadSubagentIds?: string[];
   ancestorUsageReadThrough?: number;
+  deferredChildUsage?: DeferredChildUsage[];
+}
+
+const INLINE_SIDECHAIN_UNREAD_ID = "inline-sidechain";
+
+export type SubagentReadGaps = Pick<WorkCoverage, "unreadableAgentCount" | "usagePendingTranscriptCount" | "usageOnlyTranscriptCount">;
+
+type SubagentReadSources = [history: Pick<SessionHistoryRead, "unreadSubagentIds" | "usageOnlySubagentIds" | "usagePendingSubagentIds" | "usageReadSubagentIds"> | undefined,
+  restored: Pick<SubagentRestore, "unreadAgentIds"> | undefined];
+
+export function subagentReadCategories(...[history, restored]: SubagentReadSources): { unread: ReadonlySet<string>; pending: ReadonlySet<string>; usageOnly: ReadonlySet<string> } {
+  const pending = new Set(history?.usagePendingSubagentIds ?? []);
+  const usageRead = new Set(history?.usageReadSubagentIds ?? []);
+  const usageOnly = new Set([...history?.usageOnlySubagentIds ?? [], ...(restored?.unreadAgentIds ?? []).filter(id => usageRead.has(id))].filter(id => !pending.has(id)));
+  const unread = new Set([...history?.unreadSubagentIds ?? [], ...restored?.unreadAgentIds ?? []].filter(id => !pending.has(id) && !usageOnly.has(id)));
+  return { unread, pending, usageOnly };
+}
+
+export function subagentReadGaps(...sources: SubagentReadSources): SubagentReadGaps {
+  const { unread, pending, usageOnly } = subagentReadCategories(...sources);
+  return { ...(unread.size > 0 ? { unreadableAgentCount: unread.size } : {}), ...(pending.size > 0 ? { usagePendingTranscriptCount: pending.size } : {}),
+    ...(usageOnly.size > 0 ? { usageOnlyTranscriptCount: usageOnly.size } : {}) };
 }
 
 interface SessionHistoryOptions {
@@ -793,6 +1065,8 @@ interface SessionHistoryOptions {
   generationSessionId?: string;
   usageAncestors?: readonly string[];
   parentRecords?: ParentRecordSource;
+  usageScanOwner?: UsageScanOwner;
+  largeChildUsage?: "defer" | "read";
 }
 
 export async function readSessionHistory(
@@ -815,9 +1089,13 @@ async function readHistory(
   parentFilePath: string,
   isAllowedPath: (p: string) => boolean,
   opts: SessionHistoryOptions,
-  usageOnly: boolean
+  usageOnly: boolean,
+  usageScanFiles = new Set<string>()
 ): Promise<HistoryReadOutcome> {
   const inputs = createReadInputs();
+  const previousUsageScans = usageScansOf(opts.usageScanOwner, parentFilePath);
+  const nextUsageScans = new Map<string, ChildUsageScan>();
+  const deferredChildUsage: DeferredChildUsage[] = [];
   let reusable = true;
   const allowed = (p: string): boolean => {
     const ok = isAllowedPath(p);
@@ -883,6 +1161,10 @@ async function readHistory(
   const notificationOrdinals = new Map<string, number>();
   const observedAsyncAgentIds = new Set<string>();
   const ownAgentLaunches = new Map<string, string>();
+  const unreadSubagents = new Set<string>();
+  const usageOnlySubagents = new Set<string>();
+  const usagePendingSubagents = new Set<string>();
+  const usageReadSubagents = new Set<string>();
   const subagentGaps: SubagentGap[] = [];
   const observedBackgroundTaskIds = new Set<string>();
   const resumeSignalToolNames = new Map<string, string>();
@@ -891,7 +1173,7 @@ async function readHistory(
   let droppedTaskNotificationCount = 0;
   const makeNotificationFields = (text: string | TaskNotificationInfo, record?: Record<string, unknown>) => {
     const notification = typeof text === "string" ? parseTaskNotification(text, {
-      trustedOrigin: asRecord(record?.origin)?.kind === "task-notification",
+      trustedOrigin: asRecord(record?.origin)?.kind === TASK_NOTIFICATION_ORIGIN_KIND,
     }) : text;
     if (!notification) return null;
     if (!observedAsyncAgentIds.has(notification.agentId) && !observedBackgroundTaskIds.has(notification.agentId)) {
@@ -1561,15 +1843,34 @@ async function readHistory(
             fileSize = childStamp.size;
           } else {
             coverage.details = "prefix-truncated";
-            coverage.omittedTranscriptCount = (coverage.omittedTranscriptCount ?? 0) + 1;
+            unreadSubagents.add(agentId);
             if (parentToolUseId !== null) subagentGaps.push({ toolUseId: parentToolUseId, cause: "unread" });
             continue;
           }
 
           if (fileSize > MAX_SUBAGENT_TRANSCRIPT_BYTES || !allowed(effectiveChildPath)) {
             coverage.details = "prefix-truncated";
-            coverage.omittedTranscriptCount = (coverage.omittedTranscriptCount ?? 0) + 1;
-            if (parentToolUseId !== null) subagentGaps.push({ toolUseId: parentToolUseId, cause: "unread" });
+            const outcome: LargeChildUsageOutcome = { usageRead: false, malformedLineCount: 0 };
+            if (parentToolUseId !== null && allowed(effectiveChildPath) && opts.largeChildUsage === "defer") {
+              deferredChildUsage.push({ transcriptFile: parentFilePath, childPath: effectiveChildPath, byteLength: fileSize, parentToolUseId });
+              const held = previousUsageScans?.get(effectiveChildPath);
+              if (held !== undefined) nextUsageScans.set(effectiveChildPath, held);
+              usagePendingSubagents.add(agentId);
+              continue;
+            } else if (parentToolUseId !== null && allowed(effectiveChildPath) && opts.largeChildUsage === "read") {
+              try {
+                const { scan, records, malformedLineCount: malformed } = await scanChildUsage(effectiveChildPath, fileSize, previousUsageScans?.get(effectiveChildPath));
+                nextUsageScans.set(effectiveChildPath, scan);
+                malformedLineCount += malformed;
+                rawEvents.push(...childUsageEvents(records, parentToolUseId, recordTime => findTurnIdForTimestamp(parentTurns, recordTime), childFileIndex));
+                Object.assign(outcome, { usageRead: true, malformedLineCount: malformed });
+              } catch {
+                reusable = false;
+              }
+            }
+            (outcome.usageRead ? usageOnlySubagents : unreadSubagents).add(agentId);
+            const cause = largeChildGap(outcome);
+            if (cause !== undefined && parentToolUseId !== null) subagentGaps.push({ toolUseId: parentToolUseId, cause });
             continue;
           }
 
@@ -1579,10 +1880,11 @@ async function readHistory(
               ? await readUtf8Prefix(effectiveChildPath, captured.size)
               : await readFile(childFilePath, "utf8");
             subagentTranscriptsRead++;
+            if (parentToolUseId !== null) usageReadSubagents.add(agentId);
           } catch {
             reusable = false;
             coverage.details = "prefix-truncated";
-            coverage.omittedTranscriptCount = (coverage.omittedTranscriptCount ?? 0) + 1;
+            unreadSubagents.add(agentId);
             if (parentToolUseId !== null) subagentGaps.push({ toolUseId: parentToolUseId, cause: "unread" });
             continue;
           }
@@ -1627,10 +1929,10 @@ async function readHistory(
             const message = asRecord(obj.message);
             const content = message?.content;
 
-            if (parentToolUseId !== null && obj.type === "assistant" && typeof message?.id === "string" && typeof message.usage === "object" && message.usage !== null) {
-              rawEvents.push({ body: { kind: "assistant_usage", turnId: turnOf(), parentToolUseId,
-                messageId: message.id, usage: assistantUsageFromRaw(message.usage, true), provenance: { path: "history" } },
-                timestamp: recordTime, sourcePriority: childFileIndex, fileOrder: childOrderCounter++ });
+            const usageEvent = parentToolUseId === null ? undefined : childUsageEvent(obj, parentToolUseId, recordTime, turnOf, childFileIndex, childOrderCounter);
+            if (usageEvent) {
+              rawEvents.push(usageEvent);
+              childOrderCounter++;
             }
 
             if (obj.type === "user") {
@@ -1756,6 +2058,8 @@ async function readHistory(
   } catch (error) {
     readError = String(error);
   }
+  storeUsageScans(opts.usageScanOwner, parentFilePath, nextUsageScans);
+  usageScanFiles.add(parentFilePath);
 
   const copiedBeforeGeneration = generationBoundaryAt !== undefined && [...usageSources.values()].every((through) => through < generationBoundaryAt!);
   const rosterSources: RosterSource[] = [];
@@ -1763,7 +2067,7 @@ async function readHistory(
   for (const [sessionId, through] of copiedBeforeGeneration ? [] : usageSources) {
     const sourcePath = parentFilePath.replace(/[^\\/]+$/, `${sessionId}.jsonl`);
     if (usageAncestors.includes(sourcePath) || !allowed(sourcePath)) continue;
-    const source = await readUsageSource(sourcePath, isAllowedPath, usageAncestors);
+    const source = await readUsageSource(sourcePath, isAllowedPath, usageAncestors, opts, usageScanFiles);
     if (source.inputs === undefined) reusable = false;
     else mergeReadInputs(inputs, source.inputs);
     rosterSources.push({ sessionId, through }, ...source.rosterSources.map(s => ({ ...s, through: Math.min(through, s.through) })));
@@ -1772,12 +2076,32 @@ async function readHistory(
     const sourceError = unreadError ?? deeperError ?? childGap;
     if (sourceError !== undefined && usageOwnerSources.has(sessionId)) {
       ancestorUsageReadError ??= sourceError;
-      const gapThrough = deeperError === undefined || unreadError !== undefined || childGap !== undefined ? through : Math.min(through, source.ancestorUsageReadThrough ?? through);
+      const gapThrough = ancestorGapThrough(through,
+        deeperError === undefined || unreadError !== undefined || childGap !== undefined ? undefined : source.ancestorUsageReadThrough);
       ancestorUsageReadThrough = Math.max(ancestorUsageReadThrough ?? gapThrough, gapThrough);
     }
     for (const event of source.childUsage) {
       if (!seenToolUseIds.has(event.body.parentToolUseId) || event.timestamp > through) continue;
       rawEvents.push({ body: { ...event.body }, timestamp: event.timestamp, sourcePriority: 0, fileOrder: parentOrderCounter++ });
+    }
+    for (const item of source.deferredChildUsage) {
+      if (!seenToolUseIds.has(item.parentToolUseId)) continue;
+      const direct = item.through === undefined;
+      const counted = usageOwnerSources.has(sessionId)
+        && (direct ? item.launchedAt !== undefined && item.launchedAt <= through : item.gapThrough !== undefined);
+      const { launchedAt: _launchedAt, gapThrough: _gapThrough, ...rest } = item;
+      deferredChildUsage.push({ ...rest, through: Math.min(through, item.through ?? through),
+        ...(counted ? { gapThrough: ancestorGapThrough(through, direct ? undefined : item.gapThrough) } : {}) });
+    }
+  }
+  if (!usageOnly) retainUsageScans(opts.usageScanOwner, usageScanFiles);
+  const markedBoundaryAt = generationSessionId === undefined ? undefined : generationBoundaryAt;
+  if (!usageOnly) {
+    for (const [index, item] of deferredChildUsage.entries()) {
+      if (item.through === undefined) continue;
+      const { gapThrough, ...rest } = item;
+      deferredChildUsage[index] = gapThrough === undefined ? rest
+        : { ...rest, ancestorGap: { reachesGeneration: ancestorGapReachesGeneration(markedBoundaryAt, gapThrough) } };
     }
   }
 
@@ -1811,10 +2135,7 @@ async function readHistory(
   if (subagentsReadError) coverage.hierarchyIncomplete = true;
   if (ancestorUsageReadError !== undefined) {
     coverage.ancestorUsageReadError = ancestorUsageReadError;
-    const markedBoundaryAt = generationSessionId === undefined ? undefined : generationBoundaryAt;
-    if (markedBoundaryAt === undefined || ancestorUsageReadThrough === undefined || ancestorUsageReadThrough >= markedBoundaryAt) {
-      coverage.ancestorUsageReachesGeneration = true;
-    }
+    if (ancestorGapReachesGeneration(markedBoundaryAt, ancestorUsageReadThrough)) coverage.ancestorUsageReachesGeneration = true;
   }
 
   gapBoundaries.sort((a, b) => a - b);
@@ -1829,13 +2150,13 @@ async function readHistory(
 
   if (inlineSidechainSkipped > 0 && subagentTranscriptsRead === 0) {
     coverage.details = "prefix-truncated";
-    coverage.omittedTranscriptCount = (coverage.omittedTranscriptCount ?? 0) + 1;
+    unreadSubagents.add(INLINE_SIDECHAIN_UNREAD_ID);
   }
 
   const missingAnnouncedTranscripts = [...ownAgentLaunches].filter(([id]) => !listedSubagentAgentIds.has(id));
-  if (missingAnnouncedTranscripts.length > 0) {
-    coverage.unreadableAgentCount = (coverage.unreadableAgentCount ?? 0) + missingAnnouncedTranscripts.length;
-    for (const [, toolUseId] of missingAnnouncedTranscripts) subagentGaps.push({ toolUseId, cause: "unlisted" });
+  for (const [agentId, toolUseId] of missingAnnouncedTranscripts) {
+    unreadSubagents.add(agentId);
+    subagentGaps.push({ toolUseId, cause: "unlisted" });
   }
 
   if (readError !== undefined || subagentsReadError !== undefined || boundaryPartialExcludedCount > 0) reusable = false;
@@ -1853,6 +2174,11 @@ async function readHistory(
     readError,
     subagentsReadError,
     ...(subagentGaps.length > 0 ? { subagentGaps } : {}),
+    ...(unreadSubagents.size > 0 ? { unreadSubagentIds: [...unreadSubagents] } : {}),
+    ...(usageOnlySubagents.size > 0 ? { usageOnlySubagentIds: [...usageOnlySubagents] } : {}),
+    ...(usagePendingSubagents.size > 0 ? { usagePendingSubagentIds: [...usagePendingSubagents] } : {}),
+    ...(usageReadSubagents.size > 0 ? { usageReadSubagentIds: [...usageReadSubagents] } : {}),
+    ...(deferredChildUsage.length > 0 ? { deferredChildUsage } : {}),
     ancestorUsageReadThrough,
   }, launchedAt, inputs: reusable ? inputs : undefined };
 }
@@ -1869,6 +2195,7 @@ interface UsageSource {
   ancestorUsageReadThrough?: number;
   gaps: Array<SubagentGap & { launchedAt?: number }>;
   childUsage: Array<{ body: Extract<HistoryEvent["body"], { kind: "assistant_usage" }> & { parentToolUseId: string }; timestamp: number }>;
+  deferredChildUsage: DeferredChildUsage[];
   inputs?: ReadInputs;
 }
 
@@ -1891,6 +2218,10 @@ function usageSourceOf(read: HistoryReadOutcome): UsageSource {
     ancestorUsageReadThrough: history.ancestorUsageReadThrough,
     gaps: (history.subagentGaps ?? []).map((gap) => ({ ...gap, launchedAt: launchedAt.get(gap.toolUseId) })),
     childUsage,
+    deferredChildUsage: (history.deferredChildUsage ?? []).map(item => {
+      const at = item.through === undefined ? launchedAt.get(item.parentToolUseId) : undefined;
+      return at === undefined ? item : { ...item, launchedAt: at };
+    }),
     ...(inputs !== undefined ? { inputs } : {}),
   };
 }
@@ -1898,9 +2229,12 @@ function usageSourceOf(read: HistoryReadOutcome): UsageSource {
 async function readUsageSource(
   sourcePath: string,
   isAllowedPath: (p: string) => boolean,
-  usageAncestors: readonly string[]
+  usageAncestors: readonly string[],
+  { usageScanOwner, largeChildUsage }: SessionHistoryOptions,
+  usageScanFiles: Set<string>
 ): Promise<UsageSource> {
-  return usageSourceOf(await readHistory(sourcePath, isAllowedPath, { usageAncestors }, true));
+  return usageSourceOf(await readHistory(sourcePath, isAllowedPath, { usageAncestors, ...(usageScanOwner === undefined ? {} : { usageScanOwner }),
+    ...(largeChildUsage === undefined ? {} : { largeChildUsage }) }, true, usageScanFiles));
 }
 
 function toolResultSignals(toolName: string | undefined, content: unknown): ReturnType<typeof extractResumeSignals> {
@@ -1928,8 +2262,7 @@ function copiedChildGap(gaps: UsageSource["gaps"], copiedToolUseIds: ReadonlySet
     if (!copiedToolUseIds.has(gap.toolUseId) || at === undefined || at > through) continue;
     counts.set(gap.cause, (counts.get(gap.cause) ?? new Set<string>()).add(gap.toolUseId));
   }
-  if (counts.size === 0) return undefined;
-  return `subagent transcripts incomplete (${[...counts].map(([cause, ids]) => `${cause}=${ids.size}`).join(" ")})`;
+  return childGapMessage(counts);
 }
 
 export interface ConversationMessageParser {
@@ -2294,7 +2627,7 @@ function recordTimestamp(value: unknown, previous: number): number {
   return Math.max(previous, parsed);
 }
 
-const SUBAGENT_TRANSCRIPT_MAX = 64;
+export const SUBAGENT_TRANSCRIPT_MAX = 64;
 const SUBAGENT_HEAD_SCAN_BYTES = 256 * 1024;
 const SUBAGENT_TAIL_SCAN_BYTES = 64 * 1024;
 const SUBAGENT_HEAD_SCAN_LINES = 200;
@@ -2308,6 +2641,7 @@ export interface SubagentRestore {
   transcriptsRead: number;
   transcriptReadFailureCount: number;
   omittedTranscriptCount: number;
+  unreadAgentIds: string[];
   bytesRead: number;
   elapsedMs: number;
   readError?: string;
@@ -2326,6 +2660,7 @@ export async function readSubagentAgents(
     transcriptsRead: 0,
     transcriptReadFailureCount: 0,
     omittedTranscriptCount: 0,
+    unreadAgentIds: [],
     bytesRead: 0,
     elapsedMs: 0,
   };
@@ -2366,6 +2701,7 @@ export async function readSubagentAgents(
     const agentId = name.slice("agent-".length, name.length - ".meta.json".length);
     if (!name.startsWith("agent-") || agentId.length === 0) {
       result.malformedMetaCount++;
+      result.unreadAgentIds.push(`meta:${name}`);
       continue;
     }
     let meta: Record<string, any> | null;
@@ -2377,6 +2713,7 @@ export async function readSubagentAgents(
     }
     if (!meta || typeof meta.toolUseId !== "string" || typeof meta.spawnDepth !== "number") {
       result.malformedMetaCount++;
+      result.unreadAgentIds.push(agentId);
       continue;
     }
     result.agents.push({
@@ -2393,6 +2730,7 @@ export async function readSubagentAgents(
   for (const agent of result.agents) {
     if (result.transcriptsRead >= SUBAGENT_TRANSCRIPT_MAX) {
       result.omittedTranscriptCount++;
+      result.unreadAgentIds.push(agent.agentId);
       continue;
     }
     let edges: TranscriptEdges;
@@ -2401,6 +2739,7 @@ export async function readSubagentAgents(
       edges = await readTranscriptEdges(open, `${dir}/agent-${agent.agentId}.jsonl`);
     } catch {
       result.transcriptReadFailureCount++;
+      result.unreadAgentIds.push(agent.agentId);
       continue;
     }
     result.transcriptsRead++;
@@ -2465,13 +2804,26 @@ function applyTranscriptAttributes(
     }
   }
   const tailLimit = Math.max(0, tail.length - SUBAGENT_TAIL_SCAN_LINES);
+  let last = true;
   for (let i = tail.length - 1; i >= tailLimit; i--) {
+    if (tail[i].trim() === "") continue;
     const record = parseRecord(tail[i]);
     const parsed = record ? recordTimestamp(record.timestamp, 0) : 0;
-    if (parsed <= 0) continue;
+    if (parsed <= 0) {
+      last = false;
+      continue;
+    }
     agent.endedAt = parsed;
+    if (last && endsTurn(record!)) agent.endedTurn = true;
     break;
   }
+}
+
+function endsTurn(record: Record<string, any>): boolean {
+  const message = asRecord(record.message);
+  const content: unknown = message?.content;
+  return record.type === "assistant" && message?.stop_reason === "end_turn"
+    && !(Array.isArray(content) && content.some(block => asRecord(block)?.type === "tool_use"));
 }
 
 function parseRecord(line: string): Record<string, any> | null {

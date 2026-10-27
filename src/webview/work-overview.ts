@@ -1,9 +1,8 @@
-import type { PlanUsage } from "../plan-usage";
-import type { AnalysisPlansView, AnalysisTimeView, TokenDisplay, RoleRunView, RoleSummaryView } from "../role-summary";
+import type { AnalysisPlanView, AnalysisPlansView, AnalysisTimeView, TokenDisplay, RoleRunView, RoleSummaryView, RoleView } from "../role-summary";
 import type { RoleCacheTtlView } from "../cache-ttl-cost";
-import { deriveEarlierPlanViews, derivePlanView, planStepKey } from "./plan-view";
-import { blockElapsedMs, blockElapsedRunning, planContextOf, timeWindowMeasured, planNow, planRowPeriods, planPeriodEnd, UNMEASURED_LABEL } from "../plan-steps";
-import { renderPlanSection, planTokens } from "./plan-panel";
+import { deriveEarlierPlanViews, derivePlanView, planStepCounted } from "./plan-view";
+import { ANALYSIS_TIME_PART_KEYS, MAIN_PROCESSING_BUCKETS, timePartShown, viewTimePartValues, type ShownTimePartKey, viewTimeProvisional, planContextOf, timeWindowMeasured, planNow, planRowPeriods, planPeriodEnd, UNMEASURED_LABEL } from "../plan-steps";
+import { renderPlanSection, planTokens, planWork } from "./plan-panel";
 import { createLoader } from "./loader";
 import { EXECUTORS, externalRunStatus } from "../orchestration-executors";
 import { delegationCount } from "../claude-tool-names";
@@ -18,11 +17,12 @@ import type { TimeBucketView } from "../time-buckets";
 import type { ExecLogFindingView, ExecLogMark, FailureKindView, FailureSummaryView } from "../exec-log-marks";
 import { renderAnalysisFactsView } from "./analysis-facts-view";
 import { vscode } from "./dom";
-import { formatDuration, clock, dayClock } from "./format";
+import { APPROX_MARK, approx, approxDuration, approxTitle, durationParts, formatDuration, clock, dayClock } from "./format";
 import { formatDateTime } from "./l10n";
-import { termSpan, type TermKey } from "./term";
+import { measuredSumNote, termSpan, type TermKey } from "./term";
 import { WorkGraph, coverageRows, emptyWorkText, fillProblemCoverage, historyUndetermined, loadingHistoryText, NO_WORK_SUMMARY_TEXT, type GraphScrollPort } from "./work-graph";
 import { ROW_H } from "./row-frame";
+import { MARKS, foldMark } from "./marks";
 import { memberRunTimes, runElapsedMs } from "../spans";
 import { AgentInspector } from "./agent-inspector";
 import * as l10n from "@vscode/l10n";
@@ -85,17 +85,33 @@ function sameMarks(a: readonly ExecLogMark[] | undefined, b: readonly ExecLogMar
   return a.every((m, i) => m.toolUseId === b[i].toolUseId && m.findingAnchor === b[i].findingAnchor && m.label === b[i].label);
 }
 
-type ChartTone = "c1" | "c2" | "c3" | "c4" | "gen" | "tool" | "sub" | "subwait" | "answer" | "wait" | "unobserved";
-const ANALYSIS_TIME_PARTS: readonly { tone: ChartTone; term: TermKey }[] = [
-  { tone: "gen", term: "LLM generation" }, { tone: "tool", term: "Tool execution" },
-  { tone: "subwait", term: "Waiting for subagent" }, { tone: "answer", term: "Waiting for your answer" },
-  { tone: "wait", term: "Waiting for reply" }, { tone: "sub", term: "Subagent" },
-];
-const ROLE_TONES: readonly ChartTone[] = ["c1", "c2", "c3", "c4"];
+type ChartTone = "sub" | "tokennew" | "tokencache" | "gen" | "tool" | "subonly" | "subwait" | "bgonly";
+type TimePartKey = typeof ANALYSIS_TIME_PART_KEYS[number];
+const TIME_PART_LOOK = {
+  generate: { tone: "gen", term: "LLM generation" },
+  tool: { tone: "tool", term: "Tool execution" },
+  delegation: { tone: "subwait", term: "Waiting for subagent" },
+  subagentOnly: { tone: "subonly", term: "Subagent only" },
+  backgroundOnly: { tone: "bgonly", term: "Background only" },
+} satisfies Record<ShownTimePartKey, { tone: ChartTone; term: TermKey }>;
+const TIME_PARTS = ANALYSIS_TIME_PART_KEYS.flatMap((key, index) => timePartShown(key) ? [{ key, index, ...TIME_PART_LOOK[key] }] : []);
+function timePartListed(key: TimePartKey, ms: number | null | undefined): boolean {
+  return timePartShown(key) && ms !== 0;
+}
+const RUN_TIME_TONE: ChartTone = "sub";
 
 type AnalysisSubtab = "script" | "ai";
 type FoldArea = "roles" | "plans";
 const ANALYSIS_SUBTABS: readonly AnalysisSubtab[] = ["script", "ai"];
+
+export function earlierStepCount(block: TimeBucketView["blocks"][number], model: WorkModelPayload | undefined, last: boolean): string {
+  if (block.kind === "plan") return String((block.steps ?? []).filter(planStepCounted).length);
+  const history = model?.planHistory?.filter(entry => entry.kind === "todos" && entry.at >= block.start && (entry.at < block.end || last && entry.at === block.end));
+  if (model === undefined || !history?.length) return "—";
+  const view = derivePlanView({ ...model, planHistory: history }, undefined, block.end,
+    { blockId: block.blockId, text: block.text, start: block.start, end: block.end, running: false });
+  return String(view.steps.filter(planStepCounted).length);
+}
 
 function planPeriodText(start: number | null, end: number | null, running: boolean, now: number): string {
   return start === null || end === null ? UNMEASURED_LABEL : `${dayClock(start)} → ${dayClock(planPeriodEnd({ end, running }, now))}`;
@@ -151,7 +167,6 @@ export class WorkOverview {
   private flowExpanded = false;
   private readonly planSection = document.createElement("section");
   private readonly youSection = div("wo-you");
-  private planUsage: PlanUsage | undefined;
   private planOrchestration: OrchestrationView | undefined;
 
   private execLogMarks: ExecLogMark[] | undefined;
@@ -438,17 +453,12 @@ export class WorkOverview {
 
   setYou(element: HTMLElement): void { this.youSection.replaceChildren(element); }
 
-  setPlanUsage(usage: PlanUsage | undefined): void {
-    this.planUsage = usage;
-    this.summaryDirty = true;
-    if (this.mode === "summary") this.render();
-  }
 
   private renderPlan(): void {
     this.planSection.className = "plan-section";
     const time = this.activeSemantic()?.timeBuckets;
     const block = time?.blocks.at(-1);
-    const context = this.payload?.planContext ?? (block && block.closedAt === undefined ? planContextOf(block, block.end, this.turnRunning, planRowPeriods(time!)) : undefined);
+    const context = this.payload?.planContext ?? (block ? planContextOf(block, block.end, this.turnRunning, planRowPeriods(time!)) : undefined);
     const view = derivePlanView(this.payload, this.planOrchestration, this.lastTickMs ?? 0, context);
     for (const agent of time?.agents ?? []) {
       if (this.payload?.planTools !== undefined) continue;
@@ -456,19 +466,22 @@ export class WorkOverview {
       const lanes = [...view.now, ...view.steps.flatMap(step => step.lanes)];
       if (lanes.some(lane => lane.id === `agent:${agent.transcriptAgentId ?? agent.toolUseId}`)) continue;
       view.now.push({ id: `agent:${agent.toolUseId}`, agent: agent.subagentType ?? "Claude", title: agent.description,
-        start: agent.start, elapsed: runElapsedMs(memberRunTimes(agent, this.nowMs(time) ?? agent.end)), status: "running", tokens: null, cacheRead: 0, external: false });
+        start: agent.start, elapsed: runElapsedMs(memberRunTimes(agent, this.nowMs(time) ?? agent.end)), status: "running", tokens: null, cacheRead: null, external: false });
     }
     for (const task of time?.backgroundTasks ?? []) {
       if (this.payload?.planTools !== undefined) continue;
       if (!task.open || !this.turnRunning) continue;
       view.now.push({ id: `background:${task.taskId}`, agent: "Claude", title: task.description,
-        start: task.start, elapsed: (this.nowMs(time) ?? task.end) - task.start, status: "running", tokens: null, cacheRead: 0, external: false });
+        start: task.start, elapsed: (this.nowMs(time) ?? task.end) - task.start, status: "running", tokens: null, cacheRead: null, external: false });
     }
     renderPlanSection(this.planSection, view, undefined, deriveEarlierPlanViews(this.payload, this.planOrchestration, this.lastTickMs ?? 0));
   }
 
+  private rosterRunsKey = "[]";
+
   update(payload: WorkModelPayload | undefined): void {
     this.payload = payload;
+    if (this.planOrchestration !== undefined && JSON.stringify(payload?.externalRuns ?? []) !== this.rosterRunsKey) this.setOrchestration(this.planOrchestration);
     this.renderExecLogSummary();
     this.summaryDirty = true;
     if (this.mode === "summary") this.render();
@@ -557,7 +570,6 @@ export class WorkOverview {
     this.graph.tick(nowMs);
     if (this.mode === "analysis") this.refreshPlanPeriods();
     if (this.mode === "summary") this.renderPlan();
-    if (this.mode === "summary" && this.turnRunning) this.refreshLive(nowMs);
     if (this.mode === "analysis" && this.llmProgress !== undefined) this.renderLlmRunLine();
   }
 
@@ -719,24 +731,28 @@ export class WorkOverview {
   }
 
   private renderTimeModule(time: AnalysisTimeView, plans: AnalysisPlansView["plans"] = [], tokens: number | null = null): HTMLElement {
-    const mod = this.metricsModule("time", "TIME", l10n.t("Main processing time"));
-    const mainParts = time.parts.slice(0, 2);
-    const mainMs = mainParts.reduce<number | null>((total, part) => part.ms === null ? total : (total ?? 0) + part.ms, null);
-    const totalText = mainMs === null ? UNMEASURED_LABEL : formatDuration(mainMs);
+    const mod = this.metricsModule("time", "TIME", l10n.t("Processing"));
+    const provisional = viewTimeProvisional(this.activeSemantic()?.timeBuckets);
+    const totalText = time.totalMs === null ? UNMEASURED_LABEL : approx(formatDuration(time.totalMs), provisional);
     const ring = div("wa-ring");
     ring.setAttribute("role", "img");
-    ring.setAttribute("aria-label", l10n.t("Main processing time {0}", totalText));
-    let at = "";
-    const stops: string[] = [];
+    ring.setAttribute("aria-label", l10n.t("Processing {0}", totalText));
+    let at = "0%";
     const legend = div("wa-tl");
-    time.parts.forEach((part, index) => {
-      const { tone, term } = ANALYSIS_TIME_PARTS[index];
-      const percent = index < 2 && part.ms !== null && mainMs !== null && mainMs > 0 ? part.ms / mainMs * 100 : null;
-      if (percent !== null) {
-        const from = at === "" ? "0%" : `calc(${at})`;
-        at = at === "" ? `${percent}%` : `${at} + ${percent}%`;
-        stops.push(`var(--l-chart-${tone}) ${from} calc(${at})`);
+    for (const { key, index, tone, term } of TIME_PARTS) {
+      const part = time.parts[index];
+      const percent = part.percent;
+      if (percent !== null && percent > 0) {
+        const from = at;
+        at = `calc(${at} + ${percent}%)`;
+        const segment = span(`wa-ring-seg wa-tone-${tone}`, "");
+        segment.dataset.tone = tone;
+        const mask = `conic-gradient(transparent 0 ${from}, #000 ${from} ${at}, transparent ${at})`;
+        segment.style.setProperty("mask-image", mask);
+        segment.style.setProperty("-webkit-mask-image", mask);
+        ring.appendChild(segment);
       }
+      if (!timePartListed(key, part.ms)) continue;
       const row = div("wa-lr");
       row.dataset.tone = tone;
       const dot = span(`wa-dot wa-tone-${tone}`, "");
@@ -744,11 +760,10 @@ export class WorkOverview {
       const name = span("wa-ln", "");
       name.appendChild(termSpan(term));
       name.title = name.textContent ?? "";
-      row.append(dot, name, this.roleTotal("wa-lv", part.ms === null ? null : formatDuration(part.ms), part.partial ?? false, false, false));
+      row.append(dot, name, this.roleTotal("wa-lv", part.ms === null ? null : approx(formatDuration(part.ms), provisional), part.partial ?? false, false, false));
       legend.appendChild(row);
-    });
-    if (stops.length > 0) ring.style.background = `conic-gradient(${stops.join(", ")})`;
-    ring.appendChild(this.roleTotal("wa-ring-v", totalText, mainParts.some(part => part.ms === null || part.partial), false, false));
+    }
+    ring.appendChild(this.roleTotal("wa-ring-v", totalText, time.partial, false, false));
     const facts = div("wa-fx");
     if (tokens !== null) facts.appendChild(span("wa-fx-i", l10n.t("Main ≈{0} tok", planTokens(tokens))));
     const periods = plans.flatMap(plan => plan.start === null || plan.end === null ? [] : [[plan.start, plan.end]]);
@@ -759,20 +774,6 @@ export class WorkOverview {
       const end = dayClock(lastAt);
       facts.appendChild(span("wa-fx-i", `${start} → ${start.slice(0, 5) === end.slice(0, 5) ? clock(lastAt) : end}`));
     }
-    const wait = (term: TermKey, part: AnalysisTimeView["parts"][number]) => {
-      const { ms } = part;
-      if (ms === null) return;
-      const item = span("wa-fx-i", "");
-      item.dataset.wait = term;
-      item.append(termSpan(term), this.roleTotal("", ` ${formatDuration(ms)}`, part.partial ?? false, false, false));
-      facts.appendChild(item);
-    };
-    wait("Waiting for reply", time.parts[4]);
-    wait("Waiting for your answer", time.parts[3]);
-    wait("Waiting for subagent", time.parts[2]);
-    const subOnly = this.roleTotal("wa-fx-i", l10n.t("Subagent only {0}", time.parts[5].ms == null ? l10n.t("Not measured") : formatDuration(time.parts[5].ms)), time.parts[5].partial ?? false, false, false);
-    subOnly.dataset.fact = "sub-only";
-    facts.appendChild(subOnly);
     legend.appendChild(facts);
     const body = div("wa-tm");
     body.append(ring, legend);
@@ -780,26 +781,37 @@ export class WorkOverview {
     return mod;
   }
 
-  private analysisTimeBar(time: AnalysisTimeView, widthPercent: number | null, provisional = false): HTMLElement {
-    const track = span("wa-sb wa-sb-t", "");
+  private chartBar(className: string, widthPercent: number | null, segments: readonly { tone: ChartTone; percent: number | null; title: string }[]): HTMLElement {
+    const track = span(`wa-sb ${className}`, "");
+    if (widthPercent === null) return track;
     const fill = span("wa-fill", "");
-    fill.style.width = `${widthPercent ?? 0}%`;
-    time.parts.forEach((part, index) => {
-      const { tone, term } = ANALYSIS_TIME_PARTS[index];
+    fill.style.width = `${widthPercent}%`;
+    for (const { tone, percent, title } of segments) {
+      if (percent === null) continue;
       const segment = span(`wa-seg wa-tone-${tone}`, "");
-      segment.style.width = `${part.percent ?? 0}%`;
-      segment.title = `${termSpan(term).textContent}: ${part.ms === null ? UNMEASURED_LABEL : `${provisional ? "≈" : ""}${formatDuration(part.ms)}`}`;
+      segment.style.width = `${percent}%`;
+      segment.title = title;
       fill.appendChild(segment);
-    });
+    }
     track.appendChild(fill);
     return track;
+  }
+
+  private planTimeBar(plan: AnalysisPlanView): HTMLElement {
+    const { totalMs } = plan.time;
+    return this.chartBar("wa-sb-t", totalMs === null ? null : plan.timeWidthPercent ?? 0,
+      [{ tone: RUN_TIME_TONE, percent: 100, title: totalMs === null ? UNMEASURED_LABEL : approxDuration(totalMs, plan.provisional) }]);
+  }
+
+  private roleName(role: RoleView): string {
+    return role.role === null ? l10n.t("other") : role.label;
   }
 
   private analysisTokenBar(tokens: TokenDisplay, widthPercent: number | null): HTMLElement {
     const track = span("wa-sb wa-sb-k", "");
     const fill = span("wa-fill", "");
     fill.style.width = `${widthPercent ?? 0}%`;
-    for (const [tone, percent] of [["c1", tokens.newPercent], ["c4", tokens.cacheBarPercent]] as const) {
+    for (const [tone, percent] of [["tokennew", tokens.newPercent], ["tokencache", tokens.cacheBarPercent]] as const) {
       const segment = span(`wa-seg wa-tone-${tone}`, "");
       segment.style.width = `${percent ?? 0}%`;
       fill.appendChild(segment);
@@ -876,6 +888,7 @@ export class WorkOverview {
       let lastOpen = group.open;
       const heading = document.createElement("summary");
       heading.className = "wa-analysis-row wa-plan-row";
+      const mark = foldMark(document);
       group.addEventListener("toggle", () => {
         if (this.planHeadings.get(plan.key) !== heading || group.open === lastOpen) return;
         lastOpen = group.open;
@@ -884,7 +897,7 @@ export class WorkOverview {
       });
       const title = span("wa-row-title", "");
       const copy = span("wa-goal-copy", "");
-      const text = span("wa-goal-text", `${plan.provisional ? "≈ " : ""}${plan.title}`);
+      const text = span("wa-goal-text", approxTitle(plan.title, plan.provisional));
       text.title = plan.title;
       const period = span("wa-plan-period", planPeriodText(plan.start, plan.end, plan.running, now));
       // A running row's end follows the clock between Host posts, as GRAPH's row does (src/webview/work-overview.ts#WorkOverview.refreshPlanPeriods).
@@ -893,12 +906,12 @@ export class WorkOverview {
         Object.assign(period.dataset, { start: String(plan.start), end: String(plan.end) });
       }
       copy.append(text, period);
-      title.append(span("wa-chevron", ""), span("wa-plan-number", plan.number), copy);
+      title.append(mark, span("wa-plan-number", plan.number), copy);
       const time = span("wa-metric wa-time-metric", "");
-      time.append(this.roleTotal("wa-tv", plan.time.totalMs === null ? UNMEASURED_LABEL : `${plan.provisional ? "≈" : ""}${formatDuration(plan.time.totalMs)}`, plan.time.partial, false, false),
-        this.analysisTimeBar(plan.time, plan.timeWidthPercent, plan.provisional));
+      time.append(this.roleTotal("wa-tv", plan.time.totalMs === null ? UNMEASURED_LABEL : approxDuration(plan.time.totalMs, plan.provisional), plan.time.partial, false, false),
+        this.planTimeBar(plan));
       const tokens = span("wa-metric wa-tokens-metric", "");
-      tokens.append(this.analysisTokenBar(plan.tokens, plan.tokenWidthPercent), this.roleTotal("wa-kv", `${plan.provisional && plan.tokens.total !== null ? "≈" : ""}${plan.tokens.label}`, plan.tokensPartial, false, false));
+      tokens.append(this.analysisTokenBar(plan.tokens, plan.tokenWidthPercent), this.roleTotal("wa-kv", approx(plan.tokens.label, plan.provisional && plan.tokens.total !== null), plan.tokensPartial, false, false));
       heading.append(title, time, tokens, span("wa-row-err", String(plan.failures.failCount)));
       group.appendChild(heading);
       this.planHeadings.set(plan.key, heading);
@@ -939,11 +952,11 @@ export class WorkOverview {
         row.setAttribute("aria-controls", list.id);
         const name = span("wa-rname", "");
         const label = document.createElement("b");
-        label.textContent = role.role === null ? l10n.t("other") : role.label;
+        label.textContent = this.roleName(role);
         name.append(label, span("wa-rcount", `×${role.count}`));
         row.append(
           this.roleTotal("wa-tv", role.totalMs === null ? null : formatDuration(role.totalMs), role.totalMsPartial, role.running, true),
-          this.roleBar("wa-sb-t", role.timeWidthPercent, role.runs, (run) => run.timePercent),
+          this.roleBar(role),
           name,
           this.analysisTokenBar(role.tokenDisplay, role.tokenWidthPercent),
           this.roleTotal("wa-kv", role.tokenDisplay.label, role.totalTokensPartial, role.running, false)
@@ -985,13 +998,7 @@ export class WorkOverview {
       }
       el.title = l10n.t("Still running; the value will grow");
     }
-    if (!partial) {
-      el.appendChild(document.createTextNode(text));
-      return el;
-    }
-    const note = span("term-note", text);
-    note.title = l10n.t("Includes runs that were not measured; the value is the total of the measured runs");
-    el.appendChild(note);
+    el.appendChild(measuredSumNote(text, partial));
     return el;
   }
 
@@ -1003,39 +1010,34 @@ export class WorkOverview {
       label.append(mark, option.label);
       const value = span("wa-ttlr-v", "");
       value.title = l10n.t("Total of {0} Claude runs", view.claudeRunCount);
-      const amount = span(option.cheaper ? "wa-ttlr-cheap" : "", `≈${option.costLabel}`);
-      const figures = view.partial ? span("term-note", "") : value;
-      figures.append(amount, option.hitPercent === null ? "" : ` (${option.hitPercent}%)`);
-      if (view.partial) {
-        figures.title = l10n.t("Includes runs that were not measured; the value is the total of the measured runs");
-        value.appendChild(figures);
-      }
+      const amount = span(option.cheaper ? "wa-ttlr-cheap" : "", approx(option.costLabel, true));
+      value.appendChild(measuredSumNote([amount, option.hitPercent === null ? "" : ` (${option.hitPercent}%)`], view.partial));
       for (const cell of [label, value]) cell.style.gridRow = String(index + 2);
       return [label, value];
     });
   }
 
-  private roleBar(className: string, widthPercent: number | null, runs: readonly RoleRunView[], percentOf: (run: RoleRunView) => number | null): HTMLElement {
-    const track = span(`wa-sb ${className}`, "");
+  private roleBar(role: RoleView): HTMLElement {
+    const track = this.chartBar("wa-sb-t", role.timeWidthPercent,
+      [{ tone: RUN_TIME_TONE, percent: 100, title: `${this.roleName(role)}: ${role.totalMs === null ? UNMEASURED_LABEL : formatDuration(role.totalMs)}` }]);
     track.setAttribute("aria-hidden", "true");
-    if (widthPercent === null) return track;
-    const fill = span("wa-fill", "");
-    fill.style.width = `${widthPercent}%`;
-    for (const run of runs) {
-      const percent = percentOf(run);
-      if (percent === null) continue;
-      const seg = span(`wa-seg wa-tone-${ROLE_TONES[run.shade] ?? "c4"}`, "");
-      seg.style.width = `${percent}%`;
-      seg.title = `${run.name} · ${run.variantLabel}`;
-      fill.appendChild(seg);
-    }
-    track.appendChild(fill);
+    return track;
+  }
+
+  private kindsBar(run: RoleRunView): HTMLElement {
+    const segments = (run.kinds ?? []).map((kind, index) => {
+      const part = TIME_PARTS.find(value => value.key === MAIN_PROCESSING_BUCKETS[index])!;
+      return { tone: part.tone, percent: kind.percent, title: `${termSpan(part.term).textContent}: ${kind.ms === null ? UNMEASURED_LABEL : formatDuration(kind.ms)}` };
+    });
+    const track = this.chartBar("wa-sb-t", run.timePercent, segments);
+    track.setAttribute("role", "img");
+    track.setAttribute("aria-label", segments.map(segment => segment.title).join(", "));
     return track;
   }
 
   private renderRoleRun(run: RoleRunView): HTMLElement {
     const row = div("wa-ri");
-    const dot = span(`wa-dot wa-tone-${ROLE_TONES[run.shade] ?? "c4"}`, "");
+    const dot = span(`wa-dot wa-tone-${RUN_TIME_TONE}`, "");
     dot.setAttribute("aria-hidden", "true");
     const variant = span("wa-mx", "");
     variant.title = run.variantLabel;
@@ -1057,13 +1059,9 @@ export class WorkOverview {
     name.title = run.name;
     const tokens = run.tokens === null ? this.unmeasuredCell() : this.roleTotal("wa-v", run.tokenDisplay.label, run.tokensPartial ?? false, false, false);
     if (run.tokens !== null) tokens.appendChild(this.analysisTokenBar(run.tokenDisplay, run.tokenPercent));
-    row.append(
-      dot,
-      name,
-      variant,
-      run.durationMs === null ? this.unmeasuredCell() : this.roleTotal("wa-v", formatDuration(run.durationMs), run.durationPartial ?? false, false, false),
-      tokens
-    );
+    const duration = run.durationMs === null ? this.unmeasuredCell() : this.roleTotal("wa-v", formatDuration(run.durationMs), run.durationPartial ?? false, false, false);
+    if (run.kinds !== undefined && run.durationMs !== null) duration.appendChild(this.kindsBar(run));
+    row.append(dot, name, variant, duration, tokens);
     return row;
   }
 
@@ -1187,7 +1185,7 @@ export class WorkOverview {
           const link = document.createElement("button");
           link.type = "button";
           link.className = "llm-evidence-chip wa-ev-link";
-          link.textContent = `${m.ordinalLabel} ›`;
+          link.textContent = `${m.ordinalLabel} ${MARKS.go}`;
           link.title = lineLabel;
           link.setAttribute("aria-label", l10n.t("Execution log line {0}", m.ordinalLabel));
           link.onclick = () => this.onViewChange(() => {
@@ -1312,13 +1310,15 @@ export class WorkOverview {
       numbers.textContent = `${clock(Date.parse(agent.firstSeenAt))} – ${clock(Date.parse(agent.lastActivityAt))} · ${usage(agent.usage)}`;
     }
     const externalRuns = list(l10n.t("External runs"), "runs");
-    const recentRuns = [...state.runs].sort((a, b) => b.startedAt.localeCompare(a.startedAt)).slice(0, 50);
-    for (const run of recentRuns) {
-      const outcome = run.outcome === "ok" ? l10n.t("Succeeded") : run.outcome === "failed" ? l10n.t("Failed")
+    this.rosterRunsKey = JSON.stringify(this.payload?.externalRuns ?? []);
+    const roleRuns = [...this.payload?.externalRuns ?? []].sort((a, b) => (b.run.startedAt ?? 0) - (a.run.startedAt ?? 0)).slice(0, 50);
+    for (const { label, run } of roleRuns) {
+      const outcome = run.running ? l10n.t("Running") : run.outcome === null ? unknown : run.outcome === "ok" ? l10n.t("Succeeded") : run.outcome === "failed" ? l10n.t("Failed")
         : run.outcome === "timeout" ? l10n.t("Timed out") : run.outcome === "stopped" ? l10n.t("Stopped") : l10n.t("Refused");
-      const numbers = `${outcome} · ${this.hudDuration(run.durationMs).textContent} · ${usage(run.usage)}` + (run.cwd ? ` · ${run.cwd}` : "");
-      const failed = externalRunStatus(run.outcome) === "failed";
-      const entry = row(externalRuns, `${run.role} · ${EXECUTORS[run.executor].displayName}`,
+      const numbers = `${outcome} · ${this.hudDuration(run.durationMs).textContent} · ${planTokens(run.tokens)} · ${l10n.t("Cache read")} ${planTokens(run.cacheRead)}` + (run.cwd ? ` · ${run.cwd}` : "");
+      const failed = run.outcome !== null && externalRunStatus(run.outcome) === "failed";
+      const executor = run.executor in EXECUTORS ? EXECUTORS[run.executor as keyof typeof EXECUTORS].displayName : run.executor || unknown;
+      const entry = row(externalRuns, `${label} · ${executor}`,
         `${run.model ?? unknown} · ${run.effort ?? unknown}`, l10n.t("EXTERNAL"), failed ? "" : numbers);
       if (failed) entry.querySelector(".orchestration-numbers")!.append(span("l-failure", "✗ "), numbers);
     }
@@ -1539,35 +1539,39 @@ export class WorkOverview {
     group.dataset.pane = mode;
     group.title = title;
     const line = this.summaryCode(code, subtitle);
-    line.appendChild(span("wo-code-right", "›"));
+    line.appendChild(span("wo-code-right", MARKS.go));
     group.appendChild(line);
     group.onclick = () => this.onViewChange(() => this.setMode(mode, true));
     return group;
   }
 
-  private hudFigure(id: string, label: string, value: string | HTMLElement, small = false): HTMLElement {
+  private hudFigure(id: string, label: string | Node, value: string | HTMLElement, small = false): HTMLElement {
     const figure = div(`wo-hud-figure${small ? " wo-hud-small" : ""}`);
     figure.dataset.figure = id;
-    figure.append(span("wo-hud-key", label), typeof value === "string" ? span("wo-hud-value", value) : value);
+    const key = span("wo-hud-key", typeof label === "string" ? label : "");
+    if (typeof label !== "string") key.appendChild(label);
+    figure.append(key, typeof value === "string" ? span("wo-hud-value", value) : value);
     return figure;
   }
 
-  private hudDuration(ms: number | null | undefined): HTMLElement {
+  private hudTerm(term: TermKey): Node {
+    const label = termSpan(term);
+    if (label instanceof HTMLElement) label.removeAttribute("tabindex");
+    return label;
+  }
+
+  private hudDuration(ms: number | null | undefined, provisional = false): HTMLElement {
     const value = span("wo-hud-value wo-hud-duration", "");
     if (ms === null || ms === undefined) {
       value.textContent = UNMEASURED_LABEL;
       value.title = l10n.t("Not measured");
       return value;
     }
-    const seconds = Math.round(Math.max(0, ms) / 1000);
-    const minutes = Math.floor(seconds / 60);
-    const parts: [number, string][] = minutes >= 60
-      ? [[Math.floor(minutes / 60), l10n.t("h")], [minutes % 60, l10n.t("m")]]
-      : [[minutes, l10n.t("m")], [seconds % 60, l10n.t("s")]];
-    for (const [number, unit] of parts) {
+    if (provisional) value.append(APPROX_MARK);
+    for (const part of durationParts(ms)) {
       const small = document.createElement("small");
-      small.textContent = unit;
-      value.append(String(number).padStart(value.childNodes.length ? 2 : 1, "0"), small);
+      small.textContent = part.unit;
+      value.append(part.value, small);
     }
     return value;
   }
@@ -1577,18 +1581,15 @@ export class WorkOverview {
     const hud = div("wo-hud");
     const graph = this.hudGroup("graph", l10n.t("03 GRAPH"), l10n.t("Time"), l10n.t("Open GRAPH (time breakdown and parallelism)"));
     const figures = div("wo-hud-figures");
-    const elapsed = this.hudDuration(view?.spanMs);
-    if (this.turnRunning && view?.spanMs !== null && view?.firstAt != null) {
-      elapsed.dataset.liveElapsed = "session";
-      elapsed.dataset.start = String(view.firstAt);
-      elapsed.replaceChildren(...Array.from(this.hudDuration((this.nowMs(view) ?? view.lastAt ?? view.firstAt) - view.firstAt).childNodes));
-    }
-    figures.append(this.hudFigure("elapsed", l10n.t("Elapsed"), elapsed),
-      this.hudFigure("processing", l10n.t("Processing"), this.hudDuration(view?.bars.totalMs)),
+    const provisional = viewTimeProvisional(view);
+    const processingFigure = this.hudFigure("processing", this.hudTerm("Processing"), this.hudDuration(view?.bars.totalMs, provisional));
+    const cumulative = this.hudFigure("cumulative", this.hudTerm("Total work"), this.hudDuration(view?.bars.cumulativeMs, provisional), true);
+    figures.append(processingFigure,
+      cumulative,
       this.hudFigure("parallel", this.turnRunning ? l10n.t("Parallelism") : l10n.t("Maximum parallelism"),
         view ? String(this.turnRunning ? view.currentParallel : view.maxConcurrency) : "—", true));
     graph.appendChild(figures);
-    const duration = (ms: number | null | undefined) => ms == null ? l10n.t("Not measured") : formatDuration(ms);
+    const duration = (ms: number | null | undefined, provisional = viewTimeProvisional(view)) => ms == null ? l10n.t("Not measured") : approx(formatDuration(ms), provisional);
     const key = (tone: string, term: TermKey, ms: number | null) => {
       const item = span("", "");
       item.dataset.tone = tone;
@@ -1599,45 +1600,19 @@ export class WorkOverview {
     };
     if (view) {
       const total = div("wo-hud-total");
-      if (view.bars.totalMs != null && view.main.generateMs != null && view.bars.toolMs != null) {
-        for (const [tone, ms] of [["gen", view.main.generateMs], ["tool", view.bars.toolMs], ["sub", view.bars.subMs]] as const) {
+      const values = viewTimePartValues(view.main);
+      if (view.bars.totalMs != null && TIME_PARTS.every(({ index }) => values[index] != null)) {
+        for (const { tone, index } of TIME_PARTS) {
           const part = span(`wo-hud-${tone}`, "");
-          part.style.flex = `${ms} 1 0`;
+          part.style.flex = `${values[index]} 1 0`;
           total.appendChild(part);
         }
       }
       const legend = div("wo-hud-note wo-hud-key-line");
-      legend.append(key("gen", "LLM generation", view.main.generateMs),
-        key("tool", "Tool execution", view.bars.toolMs),
-        key("sub", "Subagent", view.bars.subMs));
-      const strip = div("wo-hud-strip");
-      view.blocks.forEach((block) => {
-        const current = block.running && this.turnRunning;
-        const row = div(`wo-hud-request${current ? " current" : ""}`);
-        row.style.flex = `${block.durationMs ?? 1} 1 0`;
-        const bar = div("wo-hud-request-bar");
-        const processing = block.processingMs ?? null;
-        if (block.strip != null) {
-          for (const [tone, percent] of [["gen", block.strip.generatePercent], ["tool", block.strip.toolPercent], ["subwait", block.strip.subagentWaitPercent], ["answer", block.strip.confirmPercent],
-            ["wait", block.strip.replyPercent], ["remainder", block.strip.remainderPercent]] as const) {
-            const part = span(`wo-hud-${tone}`, "");
-            part.style.width = `${percent}%`;
-            bar.appendChild(part);
-          }
-        }
-        const number = block.requestNumber ?? "—";
-        row.title = `${number} ${block.text.split(/\r?\n/, 1)[0]}\n${l10n.t("Processing {0} · Waiting for reply {1}", duration(processing), duration(block.replyMs))}`;
-        const label = span("wo-hud-request-number", number);
-        if (current) label.appendChild(createLoader(12));
-        row.append(bar, label);
-        strip.appendChild(row);
-      });
-      const waits = div("wo-hud-note wo-hud-key-line");
-      waits.append(span("", l10n.t("Per work block")),
-        key("subwait", "Waiting for subagent", view.main.subagentWaitMs),
-        key("answer", "Waiting for your answer", view.main.confirmMs),
-        key("wait", "Waiting for reply", view.main.replyMs));
-      graph.append(total, legend, strip, waits);
+      for (const { key: partKey, tone, term, index } of TIME_PARTS) {
+        if (timePartListed(partKey, values[index])) legend.append(key(tone, term, values[index]));
+      }
+      graph.append(total, legend);
     }
     hud.append(graph, this.renderSummaryAnalysis(semantic?.summaryAnalysis));
     return hud;
@@ -1707,24 +1682,17 @@ export class WorkOverview {
       row.title = block.text;
       const at = span("earlier-at", block.anchorAt > 0 ? `${monthDay(block.anchorAt)} ${clock(block.anchorAt)}` : "—");
       at.title = formatDateTime(block.anchorAt);
-      const history = this.payload?.planHistory?.filter(entry => entry.kind === "todos" && entry.at >= block.start && (entry.at < block.end || block === view?.blocks.at(-1) && entry.at === block.end));
-      const steps = new Set(history?.flatMap(entry => entry.kind === "todos" ? entry.items.map(item => planStepKey(entry, item)) : []));
-      const count = block.kind === "plan" ? String(block.steps?.length ?? 0) : history?.length ? String(steps.size) : "—";
-      const usage = this.planUsage?.blocks.find(value => value.blockId === block.blockId);
-      const live = blockElapsedRunning(block) && this.turnRunning;
-      const blockElapsed = blockElapsedMs(block, live ? this.nowMs(view) ?? block.end : block.end);
-      const elapsed = span("earlier-elapsed", `${blockElapsed.provisional ? "≈" : ""}${formatDuration(blockElapsed.ms)}`);
-      if (live) {
-        elapsed.dataset.liveElapsed = "block";
-        elapsed.dataset.start = String(block.start);
-        if (blockElapsed.provisional) elapsed.dataset.provisional = "true";
-      }
+      const count = earlierStepCount(block, this.payload, block === view?.blocks.at(-1));
+      const totals = this.payload?.blockTotals?.find(value => value.blockId === block.blockId);
+      const usage = totals?.total ?? null;
+      const elapsed = span("earlier-elapsed", "");
+      elapsed.appendChild(planWork(totals?.work ?? null));
       const stats = span("earlier-stats", "");
-      stats.append(at, ` · ${l10n.t("{0} steps", count)} · ${l10n.t("{0} tokens", planTokens(usage?.slices.length ? usage.tokens : null))}`);
+      stats.append(at, ` · ${l10n.t("{0} steps", count)} · `, measuredSumNote(l10n.t("{0} tokens", planTokens(usage?.tokens ?? null)), usage?.partial));
       const duration = span("earlier-duration", "");
       if (block.running && this.turnRunning) duration.append(l10n.t("Running"), " ");
       duration.appendChild(elapsed);
-      stats.title = l10n.t("Claude tokens. Cache read: {0}", planTokens(usage?.slices.length ? usage.cacheRead : null));
+      stats.title = l10n.t("Cache read: {0} tokens", planTokens(usage?.cacheRead ?? null));
       const title = span("earlier-title", block.text.split(/\r?\n/, 1)[0]);
       if (/[\u3040-\u30ff\u3400-\u9fff]/.test(title.textContent ?? "")) title.lang = "ja";
       const number = span("earlier-number", block.requestNumber ?? "—");
@@ -1741,7 +1709,7 @@ export class WorkOverview {
       const expand = document.createElement("button");
       expand.type = "button";
       expand.className = "earlier-expand";
-      expand.textContent = l10n.t("Previous {0} ▸", blocks.length - EARLIER_LIMIT);
+      expand.textContent = `${l10n.t("Previous {0}", blocks.length - EARLIER_LIMIT)} ${MARKS.foldClosed}`;
       expand.setAttribute("aria-expanded", "false");
       expand.onclick = () => {
         this.flowExpanded = true;
@@ -1761,21 +1729,6 @@ export class WorkOverview {
     const now = planNow(time, this.lastTickMs, this.turnRunning);
     for (const el of Array.from(this.measuredEl.querySelectorAll<HTMLElement>(".wa-live-period"))) {
       el.textContent = planPeriodText(Number(el.dataset.start), Number(el.dataset.end), true, now);
-    }
-  }
-
-  private refreshLive(nowMs: number): void {
-    for (const el of Array.from(this.rootEl.querySelectorAll<HTMLElement>("[data-live-elapsed]"))) {
-      const start = Number(el.dataset.start);
-      if (Number.isFinite(start) && nowMs > start) {
-        if (el.classList.contains("wo-hud-duration")) {
-          el.replaceChildren(...Array.from(this.hudDuration(nowMs - start).childNodes));
-        } else if (el.dataset.liveElapsed === "bg") {
-          el.textContent = l10n.t("· Elapsed {0}", formatDuration(nowMs - start));
-        } else {
-          el.textContent = `${el.dataset.provisional ? "≈" : ""}${formatDuration(nowMs - start)}`;
-        }
-      }
     }
   }
 
@@ -1844,7 +1797,7 @@ export class WorkOverview {
         chip.type = "button";
         chip.className = "wl-chip";
         if (failure) chip.append(span("l-failure", "✗ "));
-        chip.append(span("wl-tag-label", label), span("wl-flag-count", String(count)), " ›");
+        chip.append(span("wl-tag-label", label), span("wl-flag-count", String(count)), ` ${MARKS.go}`);
         chip.dataset.findingAnchor = anchor;
         chip.onclick = () => this.revealFinding(anchor);
         flags.appendChild(chip);

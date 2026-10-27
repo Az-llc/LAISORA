@@ -1,5 +1,5 @@
-import { EXECUTORS, isExternalExecutorId, isExternalRunOutcome, type ExternalExecutorId } from "./orchestration-executors";
-import type { AgentRunRecord, ExternalRunRecord, TokenUsage } from "./orchestration-external";
+import { EXECUTORS, isExternalExecutorId, type ExternalExecutorId } from "./orchestration-executors";
+import type { AgentRunRecord, TokenUsage } from "./orchestration-external";
 import { orchestrationVariants, type ExternalRow, type OrchestrationRow } from "./orchestration-roster";
 import type { ClaudeConversation, ClaudeHostOptions } from "./claudeHost";
 import type { RosterEvidence } from "./roster-evidence";
@@ -12,8 +12,6 @@ export interface OrchestrationView {
   settingsChanged: boolean;
   agents: Array<{ agentId: string; role: string | null; agentType: string | null; model: string | null; effort: string | null;
     firstSeenAt: string; lastActivityAt: string; usage: TokenUsage | null }>;
-  runs: Array<{ toolUseId?: string; cwd?: string; role: string; executor: ExternalExecutorId; model?: string; effort?: string; outcome: ExternalRunRecord["outcome"];
-    startedAt: string; endedAt: string; durationMs: number; usage: TokenUsage | null }>;
 }
 
 export type AgentRoleOf = (agent: { agentType?: string; transcriptAgentId?: string; startedAt?: number }) => string | null;
@@ -22,7 +20,7 @@ export function orchestrationViewForConversation(conv: ClaudeConversation, curre
   if (!conv.orchestrationActive) return undefined;
   return projectOrchestrationView(conv.orchestrationRoster, conv.orchestrationExternalRoster,
     conv.orchestrationSettingsChanged(current), conv.observedAgentSettings, conv.observedAgentRuns,
-    conv.orchestrationRuns.filter((run) => run.kind === "external"), true, roleOf, conv.orchestrationAgentVariants);
+    true, roleOf, conv.orchestrationAgentVariants);
 }
 
 export function orchestrationViewFromStartingRoster(evidence: RosterEvidence): OrchestrationView | undefined {
@@ -35,7 +33,7 @@ export function orchestrationViewFromStartingRoster(evidence: RosterEvidence): O
     variant.effort ??= agent.effort ?? undefined;
     variants.set(agent.agentKey, variant);
   }
-  return projectOrchestrationView([], [], false, new Map(), new Map(), [], injection.perCallEffort === true, () => null, [...variants.values()]);
+  return projectOrchestrationView([], [], false, new Map(), new Map(), injection.perCallEffort === true, () => null, [...variants.values()]);
 }
 
 interface OrchestrationVariantView { role: string; agentKey: string; model: string; effort?: string; efforts: string[] }
@@ -57,7 +55,7 @@ function usageView(usage: TokenUsage | undefined): TokenUsage | null {
 export function projectOrchestrationView(
   roster: readonly OrchestrationRow[], external: readonly ExternalRow[], settingsChanged: boolean,
   settings: ReadonlyMap<string, Readonly<{ agentType?: string; model?: string; effort?: string }>>,
-  agents: ReadonlyMap<string, AgentRunRecord>, runs: readonly ExternalRunRecord[], perCallEffort = false,
+  agents: ReadonlyMap<string, AgentRunRecord>, perCallEffort = false,
   roleOf: AgentRoleOf = () => null, variants: readonly OrchestrationVariantView[] = orchestrationVariants(roster)
 ): OrchestrationView {
   return {
@@ -75,9 +73,6 @@ export function projectOrchestrationView(
         model: observed(applied?.model), effort: observed(applied?.effort),
         firstSeenAt: agent.firstSeenAt, lastActivityAt: agent.lastActivityAt, usage: usageView(agent.usage) };
     }).sort((a, b) => b.lastActivityAt.localeCompare(a.lastActivityAt)).slice(0, 50),
-    runs: runs.map(({ toolUseId, cwd, role, executor, model, effort, outcome, startedAt, endedAt, durationMs, usage }) =>
-      ({ ...(metadata(toolUseId) ? { toolUseId } : {}), ...(typeof cwd === "string" ? { cwd } : {}), role, executor, ...(metadata(model) ? { model } : {}), ...(metadata(effort) ? { effort } : {}), outcome, startedAt, endedAt, durationMs, usage: usageView(usage) }))
-      .sort((a, b) => b.startedAt.localeCompare(a.startedAt)).slice(0, 50),
   };
 }
 
@@ -97,14 +92,12 @@ function usageShape(value: unknown): boolean {
 function executor(value: unknown): boolean { return isExternalExecutorId(value); }
 
 export function isOrchestrationView(value: unknown): value is OrchestrationView {
-  if (!object(value, ["roster", "settingsChanged", "agents", "runs"])) return false;
+  if (!object(value, ["roster", "settingsChanged", "agents"])) return false;
   return (
     typeof value.settingsChanged === "boolean" &&
     isOrchestrationRosterView(value.roster) &&
     Array.isArray(value.agents) &&
-    value.agents.every(isOrchestrationAgentView) &&
-    Array.isArray(value.runs) &&
-    value.runs.every(isOrchestrationRunView)
+    value.agents.every(isOrchestrationAgentView)
   );
 }
 
@@ -174,24 +167,4 @@ function isOrchestrationAgentView(value: unknown): boolean {
     isoTimestampShape(value.lastActivityAt) &&
     usageShape(value.usage)
   );
-}
-
-function isOrchestrationRunView(value: unknown): boolean {
-  if (typeof value !== "object" || value === null) return false;
-  const row = value as Record<string, unknown>;
-  if (!object(value, ["role", "executor", "outcome", "startedAt", "endedAt", "durationMs", "usage", ...(row.toolUseId === undefined ? [] : ["toolUseId"]), ...(row.cwd === undefined ? [] : ["cwd"]), ...(row.model === undefined ? [] : ["model"]), ...(row.effort === undefined ? [] : ["effort"])])) return false;
-  const checks: { [K in keyof OrchestrationView["runs"][number]]-?: () => boolean } = {
-    toolUseId: () => value.toolUseId === undefined || metadata(value.toolUseId),
-    cwd: () => value.cwd === undefined || typeof value.cwd === "string",
-    model: () => value.model === undefined || metadata(value.model),
-    effort: () => value.effort === undefined || metadata(value.effort),
-    role: () => metadata(value.role),
-    executor: () => executor(value.executor),
-    outcome: () => isExternalRunOutcome(value.outcome),
-    startedAt: () => isoTimestampShape(value.startedAt),
-    endedAt: () => isoTimestampShape(value.endedAt),
-    durationMs: () => finite(value.durationMs),
-    usage: () => usageShape(value.usage),
-  };
-  return Object.values(checks).every(check => check());
 }

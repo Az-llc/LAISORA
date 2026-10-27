@@ -1,5 +1,6 @@
 import * as l10n from "@vscode/l10n";
 import { activeTab } from "./main";
+import { WELCOME_CLASS } from "./welcome";
 import {
   findBarEl,
   findCloseBtn,
@@ -84,6 +85,7 @@ export function runSearch(query: string, preserveIndex = false, anchor: "start" 
       }
       if (
         parent.closest(".find-bar") ||
+        parent.closest(`.${WELCOME_CLASS}`) ||
         parent.closest(".turn-label") ||
         parent.closest(".code-copy-status") ||
         parent.closest(".assistant-seg.streaming .seg-tail") ||

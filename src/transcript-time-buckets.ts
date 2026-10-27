@@ -1,7 +1,7 @@
-import { displayedAncestorUsageGap, type NormalizedEvent, type TimeBucketsCoverage } from "./protocol";
+import { displayedAncestorUsageGap, subagentDetailUnreadCount, type NormalizedEvent, type RestoredAgent, type TimeBucketsCoverage } from "./protocol";
 import { isChildCall } from "./spans";
 import type { RosterSource } from "./roster-evidence";
-import { readSessionHistory, readSubagentAgents, type HistoryEvent, type SessionHistoryRead, type SubagentRestore } from "./session-transcript";
+import { readSessionHistory, readSubagentAgents, subagentReadGaps, type HistoryEvent, type SessionHistoryRead, type SubagentRestore, type UsageScanOwner } from "./session-transcript";
 import {
   attachTimeBucketRequestNumbers,
   createTimeBucketState,
@@ -10,6 +10,8 @@ import {
   foldTimeBuckets,
   pushModelMark,
   projectWorkBlockTokens,
+  seedUnknownLaunchers,
+  unknownLaunchers,
   type ChildTranscriptSpan,
   type ModelMark,
   type TimeBucketView,
@@ -37,7 +39,7 @@ export function childSpansOf(
 }
 
 export function withRecordedRuns(childSpans: readonly ChildTranscriptSpan[], view: TimeBucketView): ChildTranscriptSpan[] {
-  const rows = new Map(view.agents.map((agent) => [agent.toolUseId, agent]));
+  const rows = new Map([...view.agents, ...view.nestedAgents ?? []].map((agent) => [agent.toolUseId, agent]));
   return childSpans.map((span) => {
     const row = rows.get(span.toolUseId);
     return row?.earlierRuns === undefined ? span : { ...span, runs: { earlierRuns: row.earlierRuns, ...(row.resumedAt === undefined ? {} : { resumedAt: row.resumedAt }) } };
@@ -47,16 +49,18 @@ export function withRecordedRuns(childSpans: readonly ChildTranscriptSpan[], vie
 export function timeBucketsFromHistory(
   events: readonly HistoryEvent[],
   childSpans: readonly ChildTranscriptSpan[],
-  ids: TranscriptIds
+  ids: TranscriptIds,
+  restoredAgents: readonly RestoredAgent[] = []
 ): TimeBucketView {
-  let state = createTimeBucketState();
+  const records = currentGenerationRecords(events);
+  let state = seedUnknownLaunchers(createTimeBucketState(), unknownLaunchers(restoredAgents, records));
   let requests = createWorkModelState();
   let modelMarks: ModelMark[] = [];
   let currentModel: string | undefined;
   let markedInTurn = false;
   let usage: PlanUsageAccumulator | undefined;
   let seq = 0;
-  for (const e of currentGenerationRecords(events)) {
+  for (const e of records) {
     const body = e.body;
     if (body.kind === "turn_started") markedInTurn = false;
     if (body.kind === "model_observed") {
@@ -101,28 +105,21 @@ export interface TranscriptTimeBucketsRead {
   coverage: TimeBucketsCoverage | undefined;
 }
 
-export function subagentReadCoverage(restored: {
-  readError?: string;
-  transcriptReadFailureCount: number;
-  omittedTranscriptCount: number;
-  malformedMetaCount: number;
-}): TimeBucketsCoverage | undefined {
-  const coverage: TimeBucketsCoverage = {
-    ...(restored.readError !== undefined ? { subagentReadError: restored.readError } : {}),
-    ...(restored.transcriptReadFailureCount > 0 ? { transcriptReadFailureCount: restored.transcriptReadFailureCount } : {}),
-    ...(restored.omittedTranscriptCount > 0 ? { omittedTranscriptCount: restored.omittedTranscriptCount } : {}),
-    ...(restored.malformedMetaCount > 0 ? { malformedMetaCount: restored.malformedMetaCount } : {}),
-  };
-  return Object.keys(coverage).length > 0 ? coverage : undefined;
+export function subagentReadCoverage(history: Pick<SessionHistoryRead, "unreadSubagentIds" | "usageOnlySubagentIds" | "usagePendingSubagentIds" | "usageReadSubagentIds">,
+  restored: Pick<SubagentRestore, "readError" | "unreadAgentIds">): TimeBucketsCoverage {
+  return { ...(restored.readError !== undefined ? { subagentReadError: restored.readError } : {}),
+    unreadSubagentCount: subagentDetailUnreadCount(subagentReadGaps(history, restored)) };
 }
 
 export async function readTranscriptTimeBucketsWithCoverage(
   file: string,
   isAllowedPath: (p: string) => boolean,
   ids: TranscriptIds,
-  generationSessionId?: string
+  generationSessionId?: string,
+  usageScanOwner?: UsageScanOwner
 ): Promise<TranscriptTimeBucketsRead> {
-  const history = await readSessionHistory(file, isAllowedPath, generationSessionId === undefined ? undefined : { generationSessionId });
+  const history = await readSessionHistory(file, isAllowedPath, { ...(generationSessionId === undefined ? {} : { generationSessionId }),
+    ...(usageScanOwner === undefined ? {} : { usageScanOwner }), largeChildUsage: "read" });
   const sessionReadError = history.readError ?? history.subagentsReadError;
   if (sessionReadError !== undefined) return { view: undefined, coverage: { sessionReadError }, rosterSources: history.rosterSources };
   return transcriptTimeBucketsOf(history, await readSubagentAgents(file, isAllowedPath), ids);
@@ -134,9 +131,9 @@ export function transcriptTimeBucketsOf(
   ids: TranscriptIds
 ): TranscriptTimeBucketsRead {
   const ancestorUsageReadError = displayedAncestorUsageGap(history.coverage);
-  const subagentCoverage = subagentReadCoverage(restored);
+  const subagentCoverage = subagentReadCoverage(history, restored);
   const childSpans = childSpansOf(restored.agents, restored.readAt);
-  const view = timeBucketsFromHistory(history.events, childSpans, ids);
+  const view = timeBucketsFromHistory(history.events, childSpans, ids, restored.agents);
   return {
     view,
     childSpans: withRecordedRuns(childSpans, view),

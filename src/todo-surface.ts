@@ -46,7 +46,7 @@ import type { Session } from "./session";
 import { openNewConversationTab, type SessionStore } from "./store-surfaces";
 import { TODO_ACKNOWLEDGE_MAX, isTodoGroupName, todoChangeReverted, todoMarkChanges, todoItemNumbers, todoItemPath, todoParentPlace, todoPlaceText, todoRevertUnitBlock, type TodoChangePlace, type TodoRevertBlock, isClaudeOwnChange, TODO_RECENT_CLAUDE_MS, linkedTodoItem, parseTodoChangeId, memoStaleSince, newestConversation, todoChildBriefs, todoScopeIds, todoSessionLinks, todoStartOf, todoTabStart, revertBlock, runClaimedStart, singleFlight, TODO_CONVERSATION_SEEN_REFRESH_MS, todoConversationTarget, todoGroupsOf, todoTemplatesOf, todoTemplateSize, TODO_BRIEF_MAX, TODO_DELETED_RETENTION_MS, TODO_DOC_TARGET_MAX, TODO_IMAGE_EXTENSIONS, conversationLiveElsewhere, todoAskDismissals, todoAsksClosedInTodo, todoDecisionsToMigrate, todoLinkedSessions, todoRecordAskSources, todoTabLinks, type TodoConversationLink, type TodoTabConversation, type TodoDoc, type TodoImageMediaType, WORK_MEMO_SECTIONS, type TodoChange, type TodoDocument, type TodoItem, type TodoMemoSection, type TodoOperation } from "./todo-model";
 import { setTodoWorkspaceRoots, type TodoLinkedItem } from "./todo-mcp";
-import { sharedTodoStore, TODO_BETA_SETTING, TodoStoreError, type TodoStore } from "./todo-store";
+import { sharedTodoStore, TODO_ENABLED_SETTING, TodoStoreError, type TodoStore } from "./todo-store";
 
 const TODO_SECTION_ORDER_KEY = "laisora.todo.detailSectionOrder";
 const TODO_DETAIL_CHANGES_MAX = 50;
@@ -54,8 +54,8 @@ const TODO_CLAUDE_CHANGES_MAX = 200;
 const TODO_CHANGE_TEXT_MAX = 400;
 const TODO_MEMO_VERSION_TEXT_MAX = 4000;
 
-export function todoBetaEnabled(cfg: Pick<vscode.WorkspaceConfiguration, "get"> = getLaisoraConfiguration()): boolean {
-  return cfg.get<boolean>(TODO_BETA_SETTING) === true;
+export function todoFeatureEnabled(cfg: Pick<vscode.WorkspaceConfiguration, "get"> = getLaisoraConfiguration()): boolean {
+  return cfg.get<boolean>(TODO_ENABLED_SETTING) === true;
 }
 
 export function hostTodoStore(): TodoStore | undefined {
@@ -148,7 +148,7 @@ const askSourceShown = new Map<string, { key: string; at: number }>();
 const TODO_DECISION_CURSOR_PREFIX = "laisora.todo.decisionCursor.";
 
 const decisionRecorder = new TodoDecisionRecorder({
-  enabled: () => todoBetaEnabled() && hostTodoStore() !== undefined,
+  enabled: () => todoFeatureEnabled() && hostTodoStore() !== undefined,
   otherChoice: askOtherChoice,
   saved: sessionId => extensionContext?.globalState.get<unknown>(`${TODO_DECISION_CURSOR_PREFIX}${sessionId}`),
   save: (sessionId, value) => {
@@ -325,7 +325,7 @@ function openSessionTitle(sessionId: string): string | undefined {
 }
 
 async function todoSnapshotMessage(seq: number): Promise<TodoSnapshotMessage> {
-  const todoStore = todoBetaEnabled() ? hostTodoStore() : undefined;
+  const todoStore = todoFeatureEnabled() ? hostTodoStore() : undefined;
   if (!todoStore) return { type: "todoSnapshot", seq, enabled: false };
   let message: TodoSnapshotMessage;
   try {
@@ -342,7 +342,7 @@ async function todoSnapshotMessage(seq: number): Promise<TodoSnapshotMessage> {
     output.appendLine(`[todo] could not read the store for the TODO tab: ${String(error)}`);
     message = { type: "todoSnapshot", seq, enabled: true, unreadable: true };
   }
-  return todoBetaEnabled() ? message : { type: "todoSnapshot", seq, enabled: false };
+  return todoFeatureEnabled() ? message : { type: "todoSnapshot", seq, enabled: false };
 }
 
 export function postTodoSnapshot(target?: vscode.Webview): void {
@@ -356,7 +356,7 @@ export function postTodoSnapshot(target?: vscode.Webview): void {
 let todoWatch: { dispose(): void } | undefined;
 
 export function syncTodoSurface(): void {
-  if (!todoBetaEnabled()) {
+  if (!todoFeatureEnabled()) {
     disposeTodoSurface();
     postTodoSnapshot();
     return;
@@ -388,7 +388,7 @@ export function disposeTodoSurface(): void {
 let ownerTimer: ReturnType<typeof setInterval> | undefined;
 
 function refreshOwnedConversations(): void {
-  const todoStore = todoBetaEnabled() ? hostTodoStore() : undefined;
+  const todoStore = todoFeatureEnabled() ? hostTodoStore() : undefined;
   if (!todoStore) return;
   for (const s of store?.sessions.values() ?? []) {
     const sessionId = sessionRecordId(s);
@@ -397,7 +397,7 @@ function refreshOwnedConversations(): void {
 }
 
 export async function releaseOwnedTodoConversations(): Promise<void> {
-  const todoStore = todoBetaEnabled() ? hostTodoStore() : undefined;
+  const todoStore = todoFeatureEnabled() ? hostTodoStore() : undefined;
   if (todoStore) await applyHostTodoOperation(todoStore, { kind: "releaseOwner", owner: TODO_WINDOW_ID }, "human");
 }
 
@@ -696,7 +696,7 @@ let drawerKeyWebview: vscode.Webview | null = null;
 let drawerKeyContext = false;
 
 function syncDrawerKeyContext(): void {
-  const next = drawerKeyWebview !== null && todoBetaEnabled();
+  const next = drawerKeyWebview !== null && todoFeatureEnabled();
   if (next === drawerKeyContext) return;
   drawerKeyContext = next;
   void vscode.commands.executeCommand("setContext", TODO_DRAWER_KEY_CONTEXT, next);
@@ -710,12 +710,12 @@ export function setTodoDrawerFocus(webview: vscode.Webview, focused: boolean): v
 }
 
 export function toggleTodoDrawer(): void {
-  if (drawerKeyWebview && store && todoBetaEnabled()) void store.postTo(drawerKeyWebview, { type: "todoToggleDrawer" });
+  if (drawerKeyWebview && store && todoFeatureEnabled()) void store.postTo(drawerKeyWebview, { type: "todoToggleDrawer" });
 }
 
 export function offerTodoReopen(st: SessionStore, s: Session, sender: vscode.Webview): void {
   const sessionId = sessionRecordId(s);
-  if (!sessionId || !todoBetaEnabled() || !sessionItems.get(sessionId)) return;
+  if (!sessionId || !todoFeatureEnabled() || !sessionItems.get(sessionId)) return;
   const reopen = l10n.t("Reopen");
   void vscode.window.showInformationMessage(l10n.t("LAISORA: Closed the conversation of a ToDo item, “{0}”.", s.title), reopen).then(choice => {
     if (choice !== reopen) return;
@@ -727,7 +727,7 @@ export function offerTodoReopen(st: SessionStore, s: Session, sender: vscode.Web
 
 export async function handleTodoMessage(msg: TodoMessage, sender: vscode.Webview): Promise<void> {
   const reply = (message: HostToWebview) => { if (store) void store.postTo(sender, message); };
-  const todoStore = todoBetaEnabled() ? hostTodoStore() : undefined;
+  const todoStore = todoFeatureEnabled() ? hostTodoStore() : undefined;
   if (msg.type === "todoSectionOrder") {
     if (todoStore) await extensionContext?.globalState.update(TODO_SECTION_ORDER_KEY, msg.order);
     return;
@@ -809,7 +809,7 @@ export async function handleTodoMessage(msg: TodoMessage, sender: vscode.Webview
 }
 
 async function readTodoDocument(purpose: string): Promise<{ todoStore: TodoStore; document: TodoDocument } | undefined> {
-  const todoStore = todoBetaEnabled() ? hostTodoStore() : undefined;
+  const todoStore = todoFeatureEnabled() ? hostTodoStore() : undefined;
   if (!todoStore) return undefined;
   try { return { todoStore, document: await todoStore.read() }; }
   catch (error) {
@@ -851,7 +851,7 @@ export function noteTodoSessionEnded(s: Session): void {
 }
 
 export function linkedTodoItemIdOf(s: Session): string | undefined {
-  return todoBetaEnabled() ? cachedItemOf(s) : undefined;
+  return todoFeatureEnabled() ? cachedItemOf(s) : undefined;
 }
 
 function cachedItemOf(s: Session): string | undefined {
@@ -880,7 +880,7 @@ export async function todoLinkedItemAtStart(s: Session): Promise<TodoLinkedItem 
 const linkedSessions = new WeakMap<Session, string>();
 
 export function noteTodoConversationEvent(s: Session, ev: { kind: string; auth?: { sessionId?: string } | null }): void {
-  if (!todoBetaEnabled()) return;
+  if (!todoFeatureEnabled()) return;
   if (ev.kind === "auth_status") {
     const sessionId = ev.auth?.sessionId;
     if (!sessionId || s.todoItemId === undefined || linkedSessions.get(s) === sessionId) return;
@@ -916,7 +916,7 @@ export async function todoHandoffMemo(sourceSessionId: string): Promise<HandoffW
 }
 
 export async function relinkTodoConversation(from: string, to: string): Promise<void> {
-  const todoStore = todoBetaEnabled() ? hostTodoStore() : undefined;
+  const todoStore = todoFeatureEnabled() ? hostTodoStore() : undefined;
   if (todoStore) await applyHostTodoOperation(todoStore, { kind: "relinkConversation", from, to }, "human");
 }
 

@@ -27,6 +27,7 @@ import { configuredDisplayName } from "./claude-settings";
 import {
   IMAGE_MAX_BASE64_LEN,
   PICKED_FILE_MAX_COUNT,
+  isHistoryEvent,
   type ImageAttachment,
   type NormalizedEvent,
   type NormalizedEventBody,
@@ -115,7 +116,7 @@ function createExportSink(lines: string[], userHeading: string): {
 function heldEventsForExport(events: readonly NormalizedEvent[]): NormalizedEvent[] {
   const drawn = new Set<string>();
   for (const ev of events) {
-    if (ev.provenance?.path === "history" && (ev.kind === "assistant_message_uuid" || ev.kind === "user_message") && ev.uuid) drawn.add(ev.uuid);
+    if (isHistoryEvent(ev) && (ev.kind === "assistant_message_uuid" || ev.kind === "user_message") && ev.uuid) drawn.add(ev.uuid);
   }
   return events.filter((ev) => {
     if (ev.kind === "replayed_message") return ev.uuid === undefined || !drawn.has(ev.uuid);

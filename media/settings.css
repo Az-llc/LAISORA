@@ -302,6 +302,7 @@ html, body {
   border-radius: 2px;
 }
 textarea.settings-input { height: auto; }
+#setting-transcript-retention-days { field-sizing: content; min-width: 8em; }
 .settings-input::placeholder { color: var(--vscode-input-placeholderForeground, var(--vscode-descriptionForeground)); }
 .settings-input:disabled,
 .settings-input:disabled + .settings-input-unit {

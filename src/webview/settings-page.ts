@@ -1,10 +1,11 @@
 import { isComposingKey } from "./composing";
 import { CLOSE_GLYPH } from "./close-button";
-import { createAccentSettings } from "./accent-settings";
+import { appearanceSectionTitle, createAccentSettings } from "./accent-settings";
 import { bindUserLabel, setDisplayName } from "./user-label";
 import { DISPLAY_NAME_MAX, displayNameLength, normalizeDisplayName } from "../display-name";
 import { normalizeSystemAppExtension } from "../file-link-open-mode";
 import { EVENT_LIMIT_DEFAULT, EVENT_LIMIT_MIN, EVENT_LIMIT_MAX, isEventLimit } from "../event-limits";
+import { TRANSCRIPT_RETENTION_DAYS_MIN, isTranscriptRetentionDays, type TranscriptRetentionFallback } from "../transcript-retention";
 import { EXECUTORS, EXTERNAL_EXECUTORS, DEFAULT_EXECUTOR, canonicalExecutorEfforts, claudeModelIdLabel, executorModelList, modelSelectionState, isExecutorId, isExternalExecutorId, rowEfforts, rowComplete, type ExecutorId, type ExecutorRow, type ExternalModels } from "../orchestration-executors";
 import { findModelRow, modelListStatusText, shortModelDisplayName } from "../model-display-name";
 import { resolveOrchestrationCacheTtl, emptyOrchestrationRole, externalExecutorName, isExternalModel, isExternalTimeout, orchestrationVariants, orchestrationExternalTargets } from "../orchestration-roster";
@@ -27,6 +28,8 @@ import {
   type FileLinkBooleanSetting,
   type HostToSettingsPage,
   type SettingsPageToHost,
+  type SettingsRevealTarget,
+  type WelcomeSetting,
   type SettingWriteFailure,
   type SettingWriteFailureAction,
 } from "../protocol";
@@ -245,7 +248,7 @@ settingsMain.append(settingsPageHead, settingsBody);
 settingsShell.append(settingsNav, settingsMain);
 root.appendChild(settingsShell);
 const [generalCategory, fileCategory, rosterCategory, cliCategory] = settingsCategories.map((category) => category.panel);
-const accentCard = section(generalCategory, l10n.t("Appearance"));
+const accentCard = section(generalCategory, appearanceSectionTitle());
 const displayNameField = element("div", "settings-name-field");
 const displayNameInput = element("input", "settings-input settings-name-input");
 displayNameInput.id = "setting-display-name";
@@ -403,7 +406,7 @@ const memoryBlockProjectTypeSwitch = switchButton("setting-memory-block-project-
 const memoryBlockProjectTypeText = row(guardCard, l10n.t("Block project-type memory writes"), l10n.t("Stops writes of project-type memory (the state of ongoing work). When off, it can be written, but finished work or changed policies can remain in memory, and Claude may act on them as if they were still correct. Applies from the next conversation you start or resume."), memoryBlockProjectTypeSwitch);
 const todoCard = section(generalCategory, "ToDo");
 const todoSwitch = switchButton("setting-todo-enabled");
-const todoText = row(todoCard, l10n.t("(Beta) Enable ToDo"), l10n.t("The ToDo tab, drawer and cats switch right away. Claude's ToDo tools are available from the next conversation you start or resume."), todoSwitch);
+const todoText = row(todoCard, l10n.t("Enable ToDo"), l10n.t("The ToDo tab and drawer switch right away. Claude's ToDo tools are available from the next conversation you start or resume."), todoSwitch);
 
 const handoffAutoCard = section(generalCategory, l10n.t("Automatic handoff"));
 function numberInput(id: string, min: number | undefined, max: number | undefined, step: string): HTMLInputElement {
@@ -557,6 +560,31 @@ eventLimitInput.addEventListener("change", () => {
   eventLimitInput.disabled = true;
   post({ type: "setEventLimit", requestId: pendingEventLimit, value });
 });
+const retentionDaysInput = element("input", "settings-input");
+retentionDaysInput.id = "setting-transcript-retention-days";
+retentionDaysInput.type = "number";
+retentionDaysInput.min = String(TRANSCRIPT_RETENTION_DAYS_MIN);
+retentionDaysInput.step = "1";
+retentionDaysInput.disabled = true;
+const retentionDaysText = row(chatCard, l10n.t("Days to keep conversation records"), l10n.t("Each time Claude Code starts, it deletes conversation records of all projects older than this many days. Empty follows Claude Code's own setting, shown in the field. A number applies only to Claude Code started by LAISORA; Claude Code started from a terminal still deletes by ~/.claude/settings.json, so set the same value there to keep records longer."), retentionDaysInput);
+let pendingRetentionDays: number | null = null;
+function transcriptRetentionFallbackText(fallback: TranscriptRetentionFallback): string {
+  if (fallback.source === "noUserSource") return l10n.t("No deletion");
+  return fallback.source === "userSettings"
+    ? l10n.t("{0} (~/.claude/settings.json)", fallback.days)
+    : l10n.t("{0} (Claude Code default)", fallback.days);
+}
+retentionDaysInput.addEventListener("change", () => {
+  if (pendingRetentionDays !== null) return;
+  const value = retentionDaysInput.value.trim() === "" ? null : retentionDaysInput.valueAsNumber;
+  if (retentionDaysInput.validity.badInput || value !== null && !isTranscriptRetentionDays(value)) {
+    retentionDaysInput.reportValidity();
+    return;
+  }
+  pendingRetentionDays = nextRequestId();
+  retentionDaysInput.disabled = true;
+  post({ type: "setTranscriptRetentionDays", requestId: pendingRetentionDays, value });
+});
 
 const autoContinueSwitch = switchButton("setting-auto-continue-usage-limit");
 row(chatCard, l10n.t("Resume automatically when the usage limit resets"), l10n.t("When the claude.ai usage limit stops a conversation, continue it automatically after the limit resets. The same setting is used by Claude Code in the terminal."), autoContinueSwitch);
@@ -564,6 +592,32 @@ const editSummarySwitch = switchButton("setting-edit-summary-enabled");
 const editSummaryText = row(chatCard, l10n.t("Show edited files after each reply"), l10n.t("At the end of each reply, list the files Claude edited in that turn with the lines added and removed. Click a file to compare it before and after the turn."), editSummarySwitch);
 const remoteControlCardSwitch = switchButton("setting-remote-control-card");
 const remoteControlCardText = row(chatCard, l10n.t("Show the Remote Control card"), l10n.t("When Remote Control turns on for a conversation, show a card in the conversation with the claude.ai link, the connection state and when the session is reachable. The card also shows when Remote Control turns off."), remoteControlCardSwitch);
+const welcomeSwitches: Record<WelcomeSetting, HTMLButtonElement> = {
+  showNews: switchButton("setting-welcome-show-news"),
+  showTips: switchButton("setting-welcome-show-tips"),
+};
+const welcomeTexts: Record<WelcomeSetting, HTMLElement> = {
+  showNews: row(chatCard, l10n.t("Show news on new conversations"), l10n.t("On a new conversation, show the new features and added settings of this LAISORA version until you close them with ×."), welcomeSwitches.showNews),
+  showTips: row(chatCard, l10n.t("Show tips on new conversations"), l10n.t("On a new conversation, show one tip; each new conversation shows the next one. Closing the tip card with × turns this setting off."), welcomeSwitches.showTips),
+};
+const pendingWelcome: Record<WelcomeSetting, number | null> = { showNews: null, showTips: null };
+function renderWelcomeSettings(state: SettingsState): void {
+  for (const setting of Object.keys(welcomeSwitches) as WelcomeSetting[]) {
+    if (pendingWelcome[setting] === state.replyTo) pendingWelcome[setting] = null;
+    if (state.welcome === undefined) continue;
+    welcomeSwitches[setting].setAttribute("aria-checked", String(state.welcome[setting]));
+    welcomeSwitches[setting].disabled = pendingWelcome[setting] !== null;
+  }
+}
+for (const setting of Object.keys(welcomeSwitches) as WelcomeSetting[]) {
+  welcomeSwitches[setting].addEventListener("click", () => {
+    if (current?.welcome === undefined || pendingWelcome[setting] !== null) return;
+    const requestId = nextRequestId();
+    pendingWelcome[setting] = requestId;
+    welcomeSwitches[setting].disabled = true;
+    post({ type: "setWelcomeSetting", requestId, setting, enabled: !current.welcome[setting] });
+  });
+}
 
 const apiKeyGroup = element("div", "settings-segmented");
 apiKeyGroup.id = "setting-api-key-policy";
@@ -1080,7 +1134,7 @@ function renderOrchestration(state: SettingsState): void {
       : entry.role === "explorer"
         ? l10n.t("Reads files to investigate. It never edits, so cheap models are enough.")
         : entry.role === "reviewer"
-          ? l10n.t("Inspects a finished change. It looks with eyes other than the author's, so use opus, Antigravity or Codex.") : undefined;
+          ? l10n.t("Judges a finished change or a design. It looks with eyes other than the author's, so use opus, Antigravity or Codex.") : undefined;
     if (goldenRule) {
       role.title = goldenRule;
       const accessibleRule = element("span", "l-visually-hidden", goldenRule);
@@ -1368,11 +1422,13 @@ function writeAnchor(message: SettingsPageToHost): HTMLElement | undefined {
     case "setRestoreTabsOnStartup": return restoreText;
     case "setCliAutoUpdate": return detectionControls.find(({ executor }) => executor === message.executor)?.text;
     case "setEventLimit": return eventLimitText;
+    case "setTranscriptRetentionDays": return retentionDaysText;
     case "setGuardEnabled": return guardText;
     case "setMemoryBlockProjectType": return memoryBlockProjectTypeText;
     case "setTodoEnabled": return todoText;
     case "setEditSummaryEnabled": return editSummaryText;
     case "setRemoteControlCard": return remoteControlCardText;
+    case "setWelcomeSetting": return welcomeTexts[message.setting];
     case "setHandoffAutoSetting": return handoffAutoTexts[message.setting];
     case "setApiKeyPolicy": return apiKeyText;
     case "setFileLinkSetting": return message.setting === "openWithSystemApp" ? extensionText : rowTextOf(fileLinkSwitches[message.setting]);
@@ -1438,6 +1494,10 @@ function render(state: SettingsState): void {
   if (pendingEventLimit === state.replyTo) pendingEventLimit = null;
   eventLimitInput.disabled = pendingEventLimit !== null;
   if (pendingEventLimit === null) eventLimitInput.value = String(state.eventLimit ?? EVENT_LIMIT_DEFAULT);
+  if (pendingRetentionDays === state.replyTo) pendingRetentionDays = null;
+  retentionDaysInput.disabled = pendingRetentionDays !== null;
+  if (pendingRetentionDays === null) retentionDaysInput.value = state.transcriptRetentionDays === undefined ? "" : String(state.transcriptRetentionDays);
+  retentionDaysInput.placeholder = transcriptRetentionFallbackText(state.transcriptRetentionFallback);
   renderAccent(state.appearance, state.replyTo);
   if (pending.autoContinue === state.replyTo) pending.autoContinue = null;
   autoContinueSwitch.setAttribute("aria-checked", String(state.autoContinueAtUsageLimit));
@@ -1459,6 +1519,7 @@ function render(state: SettingsState): void {
   if (pending.remoteControlCard === state.replyTo) pending.remoteControlCard = null;
   remoteControlCardSwitch.setAttribute("aria-checked", String(state.remoteControlCard));
   remoteControlCardSwitch.disabled = pending.remoteControlCard !== null;
+  renderWelcomeSettings(state);
   renderHandoffAuto(state);
   if (pending.restore === state.replyTo) pending.restore = null;
   if (pending.apiKey === state.replyTo) pending.apiKey = null;
@@ -1583,14 +1644,35 @@ for (const key of FILE_LINK_BOOLEAN_SETTINGS) {
 }
 moreLink.addEventListener("click", () => post({ type: "openVsCodeSettings" }));
 
+const REVEAL_TARGETS: Record<SettingsRevealTarget, { category: string; target: () => HTMLElement }> = {
+  handoffAuto: { category: "general", target: () => handoffAutoTexts.enabled.closest<HTMLElement>(".settings-row") ?? handoffAutoTexts.enabled },
+  orchestration: { category: "roster", target: () => orchestrationCard },
+  appearance: { category: "general", target: () => accentCard.closest<HTMLElement>(".settings-section") ?? accentCard },
+};
+let pendingReveal: SettingsRevealTarget | undefined;
+function revealSetting(target: SettingsRevealTarget): void {
+  if (current === null) {
+    pendingReveal = target;
+    return;
+  }
+  pendingReveal = undefined;
+  const { category, target: place } = REVEAL_TARGETS[target];
+  activateSettingsCategory(category);
+  requestAnimationFrame(() => place().scrollIntoView({ block: "center" }));
+}
+
 window.addEventListener("message", (event: MessageEvent<unknown>) => {
   if (!isHostToSettingsPage(event.data)) return;
-  if (event.data.type === "conductorPreview") {
+  if (event.data.type === "revealSetting") revealSetting(event.data.target);
+  else if (event.data.type === "conductorPreview") {
     if (event.data.requestId !== previewRequest) return;
     instructionPreview.textContent = event.data.text;
     instructionTokens.textContent = l10n.t("≈ {0} tokens", event.data.tokens);
   } else if (event.data.type === "recommendedRoster") renderRecommendation(event.data.revision, event.data.changes);
-  else render(event.data);
+  else {
+    render(event.data);
+    if (pendingReveal !== undefined) revealSetting(pendingReveal);
+  }
 });
 renderSettingsToc();
 post({ type: "settingsPageReady" });

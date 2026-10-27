@@ -1,4 +1,5 @@
-import type { AssistantUsage, OrchestrationView } from "./protocol";
+import type { AssistantUsage } from "./protocol";
+import type { TokenUsage } from "./orchestration-executors";
 import type { RequestBlockRecord } from "./time-buckets";
 
 export interface PlanTokenTotal { tokens: number; cacheRead: number; outputTokens?: number }
@@ -53,7 +54,7 @@ export function foldPlanUsage(state: PlanUsageAccumulator | undefined, messageId
   return accumulator.withMessage(messageId, { at: previous?.at ?? at, usage: merged });
 }
 
-export function projectPlanUsage(state: PlanUsageAccumulator | undefined, blocks: readonly Pick<RequestBlockRecord, "blockId" | "start" | "closedAt">[]): PlanUsage {
+export function projectPlanUsage(state: PlanUsageAccumulator | undefined, blocks: readonly Pick<RequestBlockRecord, "blockId" | "start">[]): PlanUsage {
   const result: PlanUsage = { blocks: blocks.map(block => ({ blockId: block.blockId, tokens: 0, cacheRead: 0, slices: [] })) };
   const slices = blocks.map(() => new Map<number, PlanUsageSlice>());
   for (const { at, usage } of state?.values() ?? []) {
@@ -66,10 +67,10 @@ export function projectPlanUsage(state: PlanUsageAccumulator | undefined, blocks
       else high = middle;
     }
     const index = low - 1;
-    if (index < 0 || at >= (blocks[index].closedAt ?? Infinity)) continue;
+    if (index < 0) continue;
     const block = result.blocks[index];
     const start = Math.max(blocks[index].start, Math.floor(at / 1000) * 1000);
-    const end = Math.min(start + 1000, blocks[index + 1]?.start ?? Infinity, blocks[index].closedAt ?? Infinity);
+    const end = Math.min(start + 1000, blocks[index + 1]?.start ?? Infinity);
     let slice = slices[index].get(start);
     if (!slice) { slice = { start, end, tokens: 0, cacheRead: 0 }; slices[index].set(start, slice); block.slices.push(slice); }
     const tokens = (usage.inputTokens ?? 0) + (usage.cacheCreationInputTokens ?? 0) + (usage.outputTokens ?? 0);
@@ -109,20 +110,7 @@ export function summarizeMainTokens(state: PlanUsageAccumulator | undefined): Ma
   return { tokens, cacheRead, ...(outputTokens === undefined ? {} : { outputTokens }), messageCount, unmeasuredMessageCount, partial: unmeasuredMessageCount > 0 };
 }
 
-function exact(value: unknown, keys: string[]): value is Record<string, unknown> {
-  return value !== null && typeof value === "object" && !Array.isArray(value)
-    && Object.keys(value).length === keys.length && keys.every(key => Object.hasOwn(value, key));
-}
-function count(value: unknown): value is number { return typeof value === "number" && Number.isFinite(value) && value >= 0; }
-export function isPlanUsage(value: unknown): value is PlanUsage {
-  if (!exact(value, ["blocks"])) return false;
-  return (
-    Array.isArray(value.blocks) &&
-    value.blocks.every(isPlanUsageBlock)
-  );
-}
-
-export function externalTokens(usage: OrchestrationView["runs"][number]["usage"]): PlanTokenTotal | null {
+export function externalTokens(usage: TokenUsage | null): PlanTokenTotal | null {
   if (usage === null) return null;
   const input = usage.input_tokens;
   const output = usage.output_tokens;
@@ -131,28 +119,4 @@ export function externalTokens(usage: OrchestrationView["runs"][number]["usage"]
   const cached = usage.cached_input_tokens ?? 0;
   return { tokens: Math.max(0, (input ?? 0) - cached) + (creation ?? 0) + (output ?? 0),
     cacheRead: usage.cache_read_input_tokens ?? usage.cache_read_tokens ?? cached, outputTokens: output ?? 0 };
-}
-
-function isPlanUsageBlock(value: unknown): boolean {
-  if (!exact(value, ["blockId", "tokens", "cacheRead", "slices", ...(value && typeof value === "object" && "outputTokens" in value ? ["outputTokens"] : [])])) return false;
-  return (
-    typeof value.blockId === "string" &&
-    count(value.tokens) &&
-    count(value.cacheRead) &&
-    (value.outputTokens === undefined || count(value.outputTokens)) &&
-    Array.isArray(value.slices) &&
-    value.slices.every(isPlanUsageSlice)
-  );
-}
-
-function isPlanUsageSlice(value: unknown): boolean {
-  if (!exact(value, ["start", "end", "tokens", "cacheRead", ...(value && typeof value === "object" && "outputTokens" in value ? ["outputTokens"] : [])])) return false;
-  return (
-    count(value.start) &&
-    count(value.end) &&
-    count(value.tokens) &&
-    count(value.cacheRead) &&
-    (value.outputTokens === undefined || count(value.outputTokens)) &&
-    (value.end as number) >= (value.start as number)
-  );
 }

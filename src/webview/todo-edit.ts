@@ -5,6 +5,7 @@ import { closeGlyphButton } from "./close-button";
 import { isComposingKey } from "./composing";
 import { formatDateTime, uiLocale } from "./l10n";
 import { addDaysKey, dateOfKey, localDateKey } from "./todo-rows";
+import { MARKS } from "./marks";
 
 const SVG_NS = "http://www.w3.org/2000/svg";
 const TODO_UNDO_DEPTH = 100;
@@ -203,7 +204,7 @@ type MenuLevel = { readonly title: string; readonly entries: readonly TodoMenuEn
 
 function menuLeaves(entries: readonly TodoMenuEntry[], path: string): Array<{ label: string; entry: TodoMenuEntry }> {
   return entries.flatMap(entry => {
-    const label = path ? `${path} › ${entry.label}` : entry.label;
+    const label = path ? `${path} ${MARKS.pathSeparator} ${entry.label}` : entry.label;
     return entry.children ? menuLeaves(entry.children, label) : [{ label, entry }];
   });
 }
@@ -288,7 +289,7 @@ export function openTodoMenu(anchor: HTMLElement, entries: readonly TodoMenuEntr
       button.setAttribute("aria-keyshortcuts", entry.keys);
     }
     if (entry.children) {
-      const sub = todoEl("span", "todo-popmenu-sub", "›");
+      const sub = todoEl("span", "todo-popmenu-sub", MARKS.submenu);
       sub.setAttribute("aria-hidden", "true");
       button.append(sub);
     }
@@ -615,8 +616,8 @@ export function todoGuessMark(reason: string): HTMLElement {
 }
 
 export function todoPlayText(talk: "linked" | "running" | undefined, subItem = false): { readonly label: string; readonly title: string } {
-  if (talk !== undefined) return { label: l10n.t("▶ Continue"), title: l10n.t("Open the newest conversation of this item") };
-  return { label: l10n.t("▶ Start"), title: subItem ? l10n.t("Start this sub-item in its own child conversation") : l10n.t("Open this item's parent conversation and start") };
+  if (talk !== undefined) return { label: `${MARKS.start} ${l10n.t("Continue")}`, title: l10n.t("Open the newest conversation of this item") };
+  return { label: `${MARKS.start} ${l10n.t("Start")}`, title: subItem ? l10n.t("Start this sub-item in its own child conversation") : l10n.t("Open this item's parent conversation and start") };
 }
 
 export function todoPlayButton(talk: "linked" | "running" | undefined, open: () => void, subItem = false): HTMLButtonElement {
@@ -710,7 +711,7 @@ const ERROR_TEXT: Record<TodoEditError, () => string> = {
   reverted: () => l10n.t("That change was already reverted."),
   gone: () => l10n.t("The change or its item is no longer kept."),
   superseded: () => l10n.t("Not changed back: the same field was changed again afterwards."),
-  disabled: () => l10n.t("The ToDo beta is off."),
+  disabled: () => l10n.t("ToDo is turned off in Settings."),
   store: () => l10n.t("Could not save to the ToDo list."),
 };
 

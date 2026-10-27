@@ -1,25 +1,25 @@
 import { toolIntentLabel } from "./status-line";
-import { agentElapsedMs, flattenAgents, type OrchestrationView, type PlanContext, type PlanContextStep, type WorkAgentNode, type WorkModelPayload } from "../protocol";
-import { externalTokens, type PlanTokenTotal } from "../plan-usage";
+import { agentElapsedMs, flattenAgents, type OrchestrationView, type PlanContext, type PlanContextStep, type PlanContextTokens, type PlanContextWork, type WorkAgentNode, type WorkModelPayload } from "../protocol";
 import { externalRunStatus } from "../orchestration-executors";
 import type { TaskStatus, WorkStatus } from "../work-model";
-import { blockElapsedMs, planHeading, planItemNumber, planPeriodEnd, planSpansMs, planStepKey, transitionPlanStep } from "../plan-steps";
+import { planHeading, planItemNumber, planStepKey, transitionPlanStep } from "../plan-steps";
 export { normalizePlanContent, planStepKey } from "../plan-steps";
 
 export interface PlanLane {
   id: string; agent: string; title: string; start: number | null; elapsed: number | null;
-  status: WorkStatus | "stopped"; tokens: number | null; cacheRead: number; external: boolean; resumedAt?: number; description?: string;
+  status: WorkStatus | "stopped"; tokens: number | null; tokensPartial?: boolean; cacheRead: number | null; contextTokens?: number; external: boolean;
+  resumedAt?: number; description?: string;
 }
 export interface PlanStep {
   key: string; number: number | null; title: string; activeForm?: string; status: TaskStatus;
   removed: boolean; added: boolean; addedAt: number | null; ahead: boolean;
-  startedAt: number | null; endedAt: number | null; elapsed: number | null;
+  startedAt: number | null; endedAt: number | null; work: PlanContextWork | null;
   period?: PlanContextStep["period"];
-  tokens: PlanTokenTotal | null; lanes: PlanLane[];
+  tokens: PlanContextTokens | null; lanes: PlanLane[];
 }
 export interface PlanView {
   block?: string; goal: string; goalDeclared: boolean; name: string; steps: PlanStep[]; now: PlanLane[]; current: number | null; completed: number;
-  elapsed: number | null; elapsedProvisional: boolean; claude: PlanTokenTotal | null; external: PlanTokenTotal | null; partial: boolean;
+  work: PlanContextWork | null; workProvisional: boolean; claude: PlanContextTokens | null; external: PlanContextTokens | null; externalRunCount: number; partial: boolean;
 }
 
 export function planStepDone(step: { removed: boolean; status: TaskStatus }): boolean {
@@ -42,8 +42,12 @@ export function planAllStepsDone(view: PlanView, earlier: readonly PlanView[]): 
   return view.steps.length > 0 && [view, ...earlier].every(plan => plan.steps.every(planStepSettled));
 }
 
+export function planStepCounted(step: { removed: boolean; number: number | null }): boolean {
+  return !step.removed && step.number !== null;
+}
+
 export function planStepCount(view: PlanView, earlier: readonly PlanView[]): { position: number; total: number } | undefined {
-  const steps = [...earlier, view].flatMap(plan => plan.steps.filter(step => !step.removed && step.number !== null));
+  const steps = [...earlier, view].flatMap(plan => plan.steps.filter(planStepCounted));
   if (!steps.length) return undefined;
   const current = planCurrentStep(view, earlier);
   const index = current === undefined ? -1 : steps.indexOf(current);
@@ -66,11 +70,10 @@ export function deriveEarlierPlanViews(model: WorkModelPayload | undefined, orch
 export function derivePlanView(model: WorkModelPayload | undefined, orchestration: OrchestrationView | undefined,
   nowMs: number, context: PlanContext | undefined = model?.planContext): PlanView {
   const heading = context === undefined ? undefined : planHeading(context);
-  const blockElapsed = context === undefined ? undefined : blockElapsedMs({ durationMs: context.durationMs === undefined ? (context.workEndedAt ?? context.end) - context.start : context.durationMs,
-    running: context.blockRunning ?? context.running, workEndedAt: context.workEndedAt, start: context.start, end: context.end, metrics: { provisional: context.provisional } }, nowMs);
   const view: PlanView = { block: context?.blockId, goal: heading?.text ?? "", goalDeclared: heading?.declared ?? false, name: context?.text ?? "", steps: [], now: [], current: null,
-    completed: 0, elapsed: blockElapsed?.ms ?? null, elapsedProvisional: blockElapsed?.provisional ?? false,
-    claude: null, external: null, partial: context !== undefined && model?.planHistoryLostThrough !== undefined &&
+    completed: 0, work: context?.work ?? null,
+    workProvisional: context?.work?.provisional === true,
+    claude: null, external: null, externalRunCount: 0, partial: context !== undefined && model?.planHistoryLostThrough !== undefined &&
       model.planHistoryLostThrough >= context.start || model?.coverage.summary === "prefix-truncated" };
   const members = context?.steps === undefined ? undefined : new Set(context.steps.map(step => step.key));
   const unit = context ?? { start: Number.POSITIVE_INFINITY, end: nowMs, running: false, steps: [] };
@@ -101,7 +104,7 @@ export function derivePlanView(model: WorkModelPayload | undefined, orchestratio
         step = { key, number, title: item.description, status: "unknown", removed: false,
           added: hasPlan && (entry.source !== "tasks" || hasStartedPlan || userAfterPlan),
           addedAt: hasPlan && userAfterPlan ? entry.at : null, ahead: false,
-          startedAt: null, endedAt: null, elapsed: null, tokens: null, lanes: [] };
+          startedAt: null, endedAt: null, work: null, tokens: null, lanes: [] };
         view.steps.push(step);
       }
       transitionPlanStep(step, entry.at, item.status);
@@ -121,9 +124,9 @@ export function derivePlanView(model: WorkModelPayload | undefined, orchestratio
     const reconstructed = new Map(view.steps.map(step => [step.key, step]));
     view.steps = unit.steps.map(record => {
       const step = reconstructed.get(record.key) ?? { key: record.key, number: record.number, title: record.title, status: record.status,
-        removed: record.removed, added: false, addedAt: null, ahead: false, startedAt: null, endedAt: null, elapsed: null, tokens: null, lanes: [] };
+        removed: record.removed, added: false, addedAt: null, ahead: false, startedAt: null, endedAt: null, work: null, tokens: null, lanes: [] };
       Object.assign(step, { number: record.number, title: record.title, status: record.status, removed: record.removed,
-        startedAt: record.startedAt, endedAt: record.endedAt, period: record.period, tokens: record.tokens ?? null });
+        startedAt: record.startedAt, endedAt: record.endedAt, period: record.period, tokens: record.tokens ?? null, work: record.work ?? null });
       return step;
     });
   }
@@ -149,12 +152,9 @@ export function derivePlanView(model: WorkModelPayload | undefined, orchestratio
   const byAgentId = new Map((context?.placements ?? []).flatMap(placement => placement.agentId === undefined ? [] : [[placement.agentId, placement.stepKey] as const]));
   const current = view.steps.find(step => !step.removed && step.status === "in_progress");
   view.current = current?.number ?? null;
+  const unitUntil = unit.running ? Math.max(nowMs, unit.end) : unit.end;
   for (const step of view.steps) {
     step.ahead = !step.removed && step.status === "in_progress" && current !== undefined && view.steps.indexOf(step) > view.steps.indexOf(current);
-    const period = step.period;
-    const until = unit.running ? Math.max(nowMs, unit.end) : unit.end;
-    step.elapsed = period === undefined ? null : planSpansMs(period.spans.map((span, index, all) =>
-      index === all.length - 1 ? { start: span.start, end: planPeriodEnd({ end: span.end, running: period.running }, until) } : span));
   }
   view.completed = view.steps.filter(planStepDone).length;
   view.claude = context?.tokens ?? null;
@@ -172,15 +172,17 @@ export function derivePlanView(model: WorkModelPayload | undefined, orchestratio
     (lanes ?? view.now).push(lane);
     return lanes ?? view.now;
   };
+  const counted = context?.counted === undefined ? undefined : new Set(context.counted);
   const visit = (agent: WorkAgentNode): void => {
-    const observed = orchestration?.agents.find(value => value.agentId === (agent.transcriptAgentId ?? agent.agentId));
+    const measures = counted === undefined || counted.has(agent.toolUseId) ? agent.roleRun : undefined;
     const lane: PlanLane = { id: `agent:${agent.transcriptAgentId ?? agent.agentId}`, agent: agent.role ?? agent.agentType ?? agent.modelMeasured ?? agent.modelDeclared ?? "Claude",
       title: agent.status === "running" && agent.intentInput ? toolIntentLabel("Agent", agent.intentInput) : agent.description, start: agent.startedAt ?? null,
       elapsed: agent.status === "running" && agent.startedAt !== undefined && (context === undefined || unit.running)
         ? agentElapsedMs(agent, nowMs)
-        : agent.origin === "restored" && (agent.startedAt === undefined || agent.endedAt === undefined) ? null : agent.elapsedMs,
-      status: agent.status, tokens: agent.tokens ?? externalTokens(observed?.usage ?? null)?.tokens ?? null,
-      cacheRead: externalTokens(observed?.usage ?? null)?.cacheRead ?? 0, external: false, ...(agent.description ? { description: agent.description } : {}) };
+        : agent.status === "running" ? agent.elapsedMs : agent.roleRun?.elapsedMs ?? null,
+      status: agent.status, tokens: measures?.tokens ?? null, ...(measures?.tokensPartial ? { tokensPartial: true } : {}),
+      cacheRead: measures?.cacheRead ?? null, ...(agent.tokens === undefined ? {} : { contextTokens: agent.tokens }), external: false,
+      ...(agent.description ? { description: agent.description } : {}) };
     const resumed = resumes.get(agent.agentId);
     const owner = { toolUseId: agent.toolUseId, agentId: agent.transcriptAgentId ?? agent.agentId };
     if (!resumed) attach(lane, owner);
@@ -194,7 +196,7 @@ export function derivePlanView(model: WorkModelPayload | undefined, orchestratio
         const end = segmentEnd(agent.agentId, position);
         const until = end.status === "running" ? runningUntil : end.endedAt;
         const segment: PlanLane = { ...lane, id, title: agent.description, start: at, resumedAt: at, status: end.status,
-          elapsed: until === undefined ? null : Math.max(0, until - at), tokens: null, cacheRead: 0 };
+          elapsed: until === undefined ? null : Math.max(0, until - at), tokens: null, tokensPartial: false, cacheRead: null, contextTokens: undefined };
         if (seen.has(id) || placed === undefined && !inWindow(segment)) return;
         seen.add(id);
         (placed ?? view.now).push(segment);
@@ -203,20 +205,25 @@ export function derivePlanView(model: WorkModelPayload | undefined, orchestratio
   };
   agents.forEach(visit);
   for (const agent of orchestration?.agents ?? []) {
-    const tokens = externalTokens(agent.usage);
     attach({ id: `agent:${agent.agentId}`, agent: agent.role ?? agent.agentType ?? "Claude", title: agent.model ?? "",
-      start: Date.parse(agent.firstSeenAt), elapsed: Math.max(0, Date.parse(agent.lastActivityAt) - Date.parse(agent.firstSeenAt)),
-      status: "unknown", tokens: tokens?.tokens ?? null, cacheRead: tokens?.cacheRead ?? 0, external: false }, { agentId: agent.agentId });
+      start: Date.parse(agent.firstSeenAt), elapsed: null, status: "unknown", tokens: null, cacheRead: null, external: false }, { agentId: agent.agentId });
   }
-  for (const [index, run] of (orchestration?.runs ?? []).entries()) {
-    const tokens = externalTokens(run.usage);
-    attach({ id: `external:${run.startedAt}:${index}`, agent: run.role, title: [run.executor, run.model, run.effort].filter(Boolean).join(" · "),
-      start: Date.parse(run.startedAt), elapsed: run.durationMs, status: externalRunStatus(run.outcome),
-      tokens: tokens?.tokens ?? null, cacheRead: tokens?.cacheRead ?? 0, external: true }, { toolUseId: run.toolUseId });
+  const externalIds = new Set<string>();
+  for (const [index, run] of (context?.externalRuns ?? []).entries()) {
+    const id = `external:${run.toolUseId ?? index}`;
+    if (seen.has(id)) continue;
+    seen.add(id);
+    if (run.toolUseId !== undefined) externalIds.add(run.toolUseId);
+    const lanes = (run.stepKey === null ? undefined : view.steps.find(value => value.key === run.stepKey))?.lanes ?? view.now;
+    lanes.push({ id, agent: run.role, title: run.title, start: run.startedAt,
+      elapsed: run.running && run.startedAt !== null ? Math.max(0, unitUntil - run.startedAt) : run.durationMs,
+      status: run.running ? "running" : run.outcome === null ? "unknown" : externalRunStatus(run.outcome),
+      tokens: run.tokens, cacheRead: run.cacheRead, external: true });
   }
-  for (const tool of model?.planTools ?? []) attach({ id: `tool:${tool.id}`, agent: "Claude", title: toolIntentLabel(tool.name, tool.intentInput),
-    start: tool.startedAt, elapsed: Math.max(0, (unit.running ? Math.max(nowMs, unit.end) : unit.end) - tool.startedAt),
-    status: "running", tokens: null, cacheRead: 0, external: false }, { toolUseId: tool.id });
+  for (const tool of model?.planTools ?? []) if (!externalIds.has(tool.id)) attach({ id: `tool:${tool.id}`, agent: "Claude", title: toolIntentLabel(tool.name, tool.intentInput),
+    start: tool.startedAt, elapsed: Math.max(0, unitUntil - tool.startedAt),
+    status: "running", tokens: null, cacheRead: null, external: false }, { toolUseId: tool.id });
   view.external = context?.external ?? null;
+  view.externalRunCount = context?.externalRuns?.length ?? 0;
   return view;
 }

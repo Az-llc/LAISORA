@@ -18,7 +18,8 @@ import {
 } from "./background-activity";
 import { resolveInitialMode, type ConfiguredEffort, type ConfiguredEffortSnapshot } from "./claude-settings";
 import { ClaudeConversation } from "./claudeHost";
-import { isConvRenderableEvent } from "./conv-renderable";
+import { isConvMessageEvent, isConvRenderableEvent } from "./conv-renderable";
+import { welcomeSettings } from "./gateway-host-actions";
 import { releaseConversationHistory } from "./conversation-history";
 import { createEvidenceIndex, type SemanticEvidenceIndex } from "./evidence-index";
 import {
@@ -57,12 +58,12 @@ import {
   SemanticModelPayload,
   SlashCommandInfo,
   TabSnapshot,
+  WelcomeOpen,
   LlmUnavailableReason,
   type LlmAnalysisRunProgress,
   type HandoffSourceSnapshot,
   type HandoffContextMeasurement,
   isInternalSlashCommand,
-  projectWorkModel,
   UNOBSERVED_TIME,
 } from "./protocol";
 import type { ResumeHydration, HydrationJournalEntry, HydrationVerdict } from "./resume-hydration";
@@ -196,6 +197,7 @@ export class Session {
   launchModelCheck: { conversation: ClaudeConversation; requested: string; observed?: string; listSettled: boolean } | undefined;
   defaultEffort: ConfiguredEffort | undefined;
   resumeSessionId: string | undefined;
+  reportedMissingFolder: string | undefined = undefined;
   todoItemId: string | undefined;
   todoTurnStartedAt: number | undefined;
   handoffSource?: HandoffSourceSnapshot;
@@ -209,6 +211,7 @@ export class Session {
   conversationAnchorUuids: string[] = [];
   conversationHistoryGaps: { malformedLineCount: number; droppedWithoutUuidCount: number } | undefined = undefined;
   remoteControl: TabRemoteControl = initialTabRemoteControl();
+  welcome: WelcomeOpen | undefined;
 
   constructor(private readonly store: SessionStore, index: number) {
     this.title = l10n.t("Conversation {0}", index);
@@ -219,6 +222,7 @@ export class Session {
   }
 
   resetLogicalSession(): void {
+    this.welcome = undefined;
     this.startMeasurement?.abandon();
     this.startMeasurement = null;
     void writeHeldChosenTitle(this);
@@ -274,6 +278,7 @@ export class Session {
     this.semantic.clearTranscriptTimeBucketsTimer();
     this.summaryRunner.resetForLogicalSession();
     this.resumeSessionId = undefined;
+    this.reportedMissingFolder = undefined;
     if (this.auth?.sessionId !== undefined) {
       const { sessionId: _clearedSessionId, ...auth } = this.auth;
       this.auth = auth;
@@ -364,8 +369,6 @@ export class Session {
   flushHydrationPosts(h: ResumeHydration): void {
     if (h.workPostDirty) {
       h.workPostDirty = false;
-      this.store.post({ type: "planUsage", tabId: this.tabId,
-        state: this.semantic.projectedPlanUsage() });
       this.store.post({ type: "workModel", tabId: this.tabId, model: this.semantic.projectedWorkModel() });
     }
     if (h.semanticPostDirty) {
@@ -414,6 +417,7 @@ export class Session {
     },
     clientToken?: string
   ): void {
+    if (this.welcome !== undefined && isConvMessageEvent(partial)) this.welcome = undefined;
     const h = this.hydration;
     if (h !== null && h.buffering) {
       this.journalLiveEvent(h, partial, conversationId, meta, clientToken);
@@ -565,7 +569,6 @@ export class Session {
     this.registerHistorySnapshot();
     const semanticView = semanticViewEnabled();
     const semanticModel = semanticView ? this.semantic.semanticModelPostPayload() : undefined;
-    const planUsage = this.semantic.projectedPlanUsage(semanticModel?.timeBuckets?.blocks);
     return {
       tabId: this.tabId,
       title: this.title,
@@ -589,8 +592,8 @@ export class Session {
         resumeSessionId: this.resumeSessionId,
         resumeFilePath: this.resumeFilePath,
         handoffSource: this.handoffSource,
+        ...(this.welcome === undefined || this.handoffSource !== undefined ? {} : { welcome: { ...this.welcome, ...welcomeSettings() } }),
         workModel: this.semantic.projectedWorkModel(),
-        planUsage,
         semanticView,
         semanticModel,
         llmAnalysisEnabled: llmAnalysisEnabled(),
@@ -666,8 +669,7 @@ export class Session {
 
   resumePreviewSnapshot(h: ResumeHydration): TabSnapshot {
     const loading = h.phase !== "failed";
-    const base = projectWorkModel(this.workModel, this.restoredAgents, this.evidenceIndex.timeBuckets.blocks, this.childSpans);
-    this.semantic.attachAgentRoles(base);
+    const base = this.semantic.baseWorkModel();
     const projected = this.hydrationProjected(h);
     return {
       tabId: this.tabId,
@@ -866,6 +868,7 @@ export class Session {
   }
 
   async disposeConversation(): Promise<void> {
+    this.semantic.releaseTranscriptReads();
     while (this.starting) await this.starting;
     await writeHeldChosenTitle(this);
     const conv = this.detachConversation();

@@ -4,11 +4,14 @@ import { getLaisoraConfiguration } from "./claude-settings";
 import { placementSettingsOf } from "./placement-line";
 import { cachedExternalModels, noteRunningExecutorVersion } from "./gateway-host-actions";
 import { noteCliUpdateOpportunity } from "./claude-cli-update";
+import { transcriptRetentionSettings } from "./transcript-retention";
 
 import {
   PERMISSION_MODE_KEY,
   canonicalEffortModel,
+  ConversationFolderMissingError,
   configuredClaudeExecutablePath,
+  launchFolderMissing,
   effortDisplayFromSnapshot,
   invalidateClaudeCodeSettingsCache,
   resolveSessionCwd,
@@ -22,7 +25,7 @@ import { ClaudeConversation, interruptDiscardNotice } from "./claudeHost";
 import { OrchestrationViewPublisher, orchestrationViewForConversation, orchestrationViewFromStartingRoster } from "./orchestration-view";
 import { orchestrationRunsDirectoryOf } from "./orchestration-external";
 import { orchestrationPluginDirectoryOf } from "./orchestration-plugin";
-import { hostTodoStore, noteTodoConversationEvent, postTodoSnapshot, todoBetaEnabled, todoLinkedItemAtStart } from "./todo-surface";
+import { hostTodoStore, noteTodoConversationEvent, postTodoSnapshot, todoFeatureEnabled, todoLinkedItemAtStart } from "./todo-surface";
 import { postAttachments } from "./composer-io";
 import { pendingAttachments } from "./pending-attachments";
 import { flushChosenTitle } from "./session-list-wiring";
@@ -39,7 +42,7 @@ import { normalizeApiKeyPolicy, type ModelInfo, type WebviewToHost } from "./pro
 import { displayTitleFromSummary } from "./session-list";
 import type { SessionStore } from "./store-surfaces";
 import { completionVerdict, numberedLaunchVerdict, resumeVerdict } from "./time-buckets";
-import { isRunningMainLane, knownBackgroundTask } from "./work-model";
+import { isRunningLane, knownBackgroundTask } from "./work-model";
 import { parseLaisoraInput, type LaisoraInput } from "./laisora-input";
 import { flushRemoteControlRecord, noteBridgeState, noteRemoteControlClosed, setRemoteControl, startRemoteControlAtLaunch } from "./remote-control-wiring";
 
@@ -568,7 +571,9 @@ export async function handleConversationMessage(
         await ensureConversation(target!);
       } catch (e) {
         if (target!.unsentSends.delete(reject)) reject();
-        throw e;
+        if (!(e instanceof ConversationFolderMissingError)) throw e;
+        reportLaunchFolderMissing(target!, e, true);
+        break;
       }
       if (!target!.unsentSends.delete(reject)) break;
       if (target!.closed || target!.clearing || target!.conversation === null) {
@@ -602,6 +607,7 @@ export async function handleConversationMessage(
       } else {
         disposition("accepted-nonhuman");
       }
+      target!.welcome = undefined;
       noteAutoHandoffUserSend(target!);
       target!.conversation!.send(msg.text, msg.images, sentAt, false, messageUuid);
       break;
@@ -661,11 +667,18 @@ function noteCliStarted(s: Session): void {
   pendingCliStarts.delete(s);
 }
 
+function reportLaunchFolderMissing(s: Session, missing: ConversationFolderMissingError, userAction: boolean): void {
+  if (s.closed || (!userAction && s.reportedMissingFolder === missing.cwd)) return;
+  s.reportedMissingFolder = missing.cwd;
+  s.pushEvent({ kind: "error", message: missing.message, fatal: false });
+}
+
 export function warmup(s: Session): Promise<void> {
   if ((s.conversation && !s.conversation.isClosed) || s.closed || s.clearing) return Promise.resolve();
-  return ensureConversation(s).catch((e: unknown) =>
-    output.appendLine(`[${s.title}] ${sinceActivation()} warmup失敗: ${String(e)}`)
-  );
+  return ensureConversation(s).catch((e: unknown) => {
+    output.appendLine(`[${s.title}] ${sinceActivation()} warmup失敗: ${String(e)}`);
+    if (e instanceof ConversationFolderMissingError) reportLaunchFolderMissing(s, e, false);
+  });
 }
 
 function refreshEffortFromSettings(st: SessionStore | null | undefined, s: Session, conv: ClaudeConversation): void {
@@ -714,6 +727,9 @@ async function ensureConversationInner(s: Session, requestedAt: number): Promise
     throw new Error(l10n.t("The working directory could not be determined (open a workspace or set laisora.defaultCwd)."));
   }
   s.cwd = cwd;
+  const missingFolder = launchFolderMissing(cwd);
+  if (missingFolder !== undefined) throw missingFolder;
+  s.reportedMissingFolder = undefined;
 
   invalidateClaudeCodeSettingsCache();
   if (s.initialModel === undefined) {
@@ -723,7 +739,7 @@ async function ensureConversationInner(s: Session, requestedAt: number): Promise
   s.effectiveEffort = undefined;
 
   const placementSettings = placementSettingsOf(cfg);
-  const todoEnabled = todoBetaEnabled(cfg);
+  const todoEnabled = todoFeatureEnabled(cfg);
   const todoLinkedItem = todoEnabled ? await todoLinkedItemAtStart(s) : undefined;
   if (s.closed || s.logicalGeneration !== logicalGenerationAtStart) {
     throw new Error(l10n.t("The logical session of this tab changed while the conversation was starting (restore or clear)."));
@@ -737,6 +753,7 @@ async function ensureConversationInner(s: Session, requestedAt: number): Promise
     effort: s.effortOverride ?? undefined,
     permissionMode: launchPermissionMode,
     settingSources,
+    transcriptRetention: transcriptRetentionSettings((key) => cfg.get<unknown>(key)),
     remoteControlAtStartup: cfg.get<boolean>("claude.remoteControlAtStartup")!,
     progressTracking: normalizeProgressTracking(cfg.get<string>("progressTracking")!),
     claudeCodeExecutablePath: configuredClaudeExecutablePath(cfg),
@@ -748,9 +765,9 @@ async function ensureConversationInner(s: Session, requestedAt: number): Promise
     todoLinkedItem,
     planLaunchVerdict: description => numberedLaunchVerdict(s.evidenceIndex.timeBuckets, description),
     planResumeVerdict: (to, namedToolUseId, toolUseId) => resumeVerdict(s.evidenceIndex.timeBuckets, to, namedToolUseId, toolUseId,
-      id => isRunningMainLane(s.workModel, id)),
+      id => isRunningLane(s.workModel, id)),
     planCompletionVerdict: (toolName, input, toolUseId, admittedLaunches) => completionVerdict(s.evidenceIndex.timeBuckets, toolName, input, toolUseId,
-      id => isRunningMainLane(s.workModel, id), admittedLaunches),
+      id => isRunningLane(s.workModel, id), admittedLaunches),
     orchestrationEnabled: cfg.get<boolean>("orchestration.enabled")! === true,
     guardEnabled: placementSettings.guardEnabled,
     memoryBlockProjectType: placementSettings.blockProjectType,

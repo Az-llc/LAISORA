@@ -1,12 +1,15 @@
 import * as l10n from "@vscode/l10n";
 import { closeGlyphButton } from "./close-button";
 import { truncateToolIntent } from "./status-line";
-import type { OrchestrationView, WorkModelPayload } from "../protocol";
+import type { OrchestrationView, PlanContextWork, WorkModelPayload } from "../protocol";
 import { deriveEarlierPlanViews, derivePlanView, planAllStepsDone, planCurrentStep, planLaneRunning, planStepCount, planStepFolds, type PlanLane, type PlanStep, type PlanView } from "./plan-view";
 import { createLoader } from "./loader";
+import { approx, formatDuration } from "./format";
 import { planItemLabel } from "../plan-steps";
 import { goalLabel } from "./ask-view";
 import { todoAgentLabel, todoAgentText } from "./todo-links";
+import { measuredSumNote } from "./term";
+import { MARKS, foldGlyph } from "./marks";
 
 type PlanLaneLabel = (lane: PlanLane) => HTMLElement | null;
 
@@ -20,9 +23,10 @@ function node<K extends keyof HTMLElementTagNameMap>(tag: K, className: string, 
   return element;
 }
 export function planDuration(ms: number | null): string {
-  if (ms === null) return "—";
-  const seconds = Math.max(0, Math.floor(ms / 1000));
-  return `${Math.floor(seconds / 60)}:${String(seconds % 60).padStart(2, "0")}`;
+  return ms === null ? "—" : formatDuration(ms);
+}
+export function planWork(work: PlanContextWork | null): Node {
+  return measuredSumNote(approx(planDuration(work?.ms ?? null), work?.provisional === true && work.ms !== null), work?.partial);
 }
 export function planTokens(value: number | null): string {
   return value === null ? "—" : value >= 1000000 ? `${(value / 1000000).toFixed(1)}M`
@@ -87,7 +91,7 @@ export class PlanPanel {
     this.bar.setAttribute("aria-controls", this.aside.id);
     this.bar.setAttribute("aria-expanded", "false");
     this.bar.setAttribute("aria-haspopup", "dialog");
-    this.bar.append(node("span", "plan-label", "PLAN"), this.barCount, this.barNumber, this.barTitle, this.barStats, this.barRunning, this.waiting, this.barLoader, node("span", "plan-bar-chevron", "▸"));
+    this.bar.append(node("span", "plan-label", "PLAN"), this.barCount, this.barNumber, this.barTitle, this.barStats, this.barRunning, this.waiting, this.barLoader, node("span", "plan-bar-chevron", MARKS.openPanel));
     this.bar.onclick = () => {
       this.returnFocus = document.activeElement instanceof HTMLElement ? document.activeElement : this.bar;
       this.dialog.append(this.aside);
@@ -133,7 +137,8 @@ export class PlanPanel {
     const running = [...view.now, ...view.steps.flatMap(step => step.lanes), ...earlierLanes].filter(planLaneRunning).length;
     this.barRunning.textContent = running ? l10n.t("Working {0}", running) : "";
     this.barLoader.hidden = !planRunning || !(running || current?.status === "in_progress") || !view.steps.length;
-    this.barStats.textContent = view.steps.length ? `${view.elapsedProvisional ? "≈" : ""}${planDuration(view.elapsed)} · ${view.claude ? "≈" : ""}${planTokens(view.claude?.tokens ?? null)}` : "";
+    this.barStats.replaceChildren(...view.steps.length ? [planWork(view.work), " · ",
+      measuredSumNote(approx(planTokens(view.claude?.tokens ?? null), view.claude !== null && view.workProvisional), view.claude?.partial)] : []);
     renderPlanSection(this.section, view, this.nowStatus || l10n.t("Waiting for input"), earlier, this.laneLabel);
   }
 
@@ -145,8 +150,10 @@ function renderLane(lane: PlanLane, slots: { readonly todo?: HTMLElement } = {})
   const row = node("div", "plan-lane");
   row.dataset.laneId = lane.id;
   const name = node("span", "plan-agent", lane.agent);
-  const metric = node("span", "plan-metric", `${status(lane.status)} ${planDuration(lane.elapsed)} · ${planTokens(lane.tokens)}`);
-  metric.title = l10n.t("Cache read: {0} tokens", planTokens(lane.cacheRead));
+  const metric = node("span", "plan-metric", `${status(lane.status)} ${planDuration(lane.elapsed)} · `);
+  metric.append(measuredSumNote(planTokens(lane.tokens), lane.tokensPartial));
+  metric.title = [l10n.t("Cache read: {0} tokens", planTokens(lane.cacheRead)),
+    ...lane.contextTokens === undefined ? [] : [l10n.t("Context at end: {0} tokens", planTokens(lane.contextTokens))]].join("\n");
   row.classList.toggle("plan-failed", lane.status === "failed");
   const text = lane.resumedAt === undefined ? todoAgentText(lane.title) : l10n.t("Resumed {0}: {1}", planClock(lane.resumedAt), todoAgentText(lane.title));
   const title = node("span", "plan-lane-title", truncateToolIntent(text));
@@ -167,8 +174,13 @@ export function renderPlanSection(section: HTMLElement, view: PlanView, nowStatu
   const noPlan = !view.goal && !view.steps.length;
   const earlierPlans = earlier.filter(plan => plan.steps.length);
   const top = node("div", "plan-top");
-  const stats = node("span", "plan-stats", `${view.elapsedProvisional ? "≈" : ""}${planDuration(view.elapsed)} · ${view.claude ? "≈" : ""}${planTokens(view.claude?.tokens ?? null)} Claude · ${planTokens(view.external?.tokens ?? null)} ${l10n.t("External")}`);
-  stats.title = l10n.t("Cache read: Claude {0} · External {1}", planTokens(view.claude?.cacheRead ?? null), planTokens(view.external?.cacheRead ?? null));
+  const stats = node("span", "plan-stats");
+  stats.append(planWork(view.work), " · ",
+    measuredSumNote(approx(planTokens(view.claude?.tokens ?? null), view.claude !== null && view.workProvisional), view.claude?.partial), " Claude");
+  if (view.externalRunCount > 0) stats.append(" · ", measuredSumNote(planTokens(view.external?.tokens ?? null), view.external?.partial), ` ${l10n.t("External")}`);
+  stats.title = view.externalRunCount > 0
+    ? l10n.t("Cache read: Claude {0} · External {1}", planTokens(view.claude?.cacheRead ?? null), planTokens(view.external?.cacheRead ?? null))
+    : l10n.t("Cache read: {0} tokens", planTokens(view.claude?.cacheRead ?? null));
   const count = planStepCount(view, earlierPlans);
   top.append(node("span", "plan-label", count ? `PLAN · ${count.position} / ${count.total}` : "PLAN"), stats);
   const goal = node("h3", "plan-goal", view.goal);
@@ -185,7 +197,7 @@ export function renderPlanSection(section: HTMLElement, view: PlanView, nowStatu
   const doneCount = done.length + earlierPlans.reduce((sum, plan) => sum + plan.steps.filter(planStepFolds).length, 0);
   const collapsed = doneCount > 1 && section.dataset.doneOpen !== "true";
   if (doneCount > 1) {
-    const toggle = node("button", "plan-done-toggle", `✓ ${l10n.t("{0} steps done", String(doneCount))} ${collapsed ? "▸" : "▾"}`);
+    const toggle = node("button", "plan-done-toggle", `✓ ${l10n.t("{0} steps done", String(doneCount))} ${foldGlyph(!collapsed)}`);
     toggle.type = "button";
     toggle.setAttribute("aria-expanded", String(!collapsed));
     toggle.dataset.foldKey = "done";
@@ -244,7 +256,7 @@ function laneFold(lanes: readonly PlanLane[], openLanes: Set<string>, key: strin
   const paint = () => {
     const open = openLanes.has(key);
     list.hidden = !open;
-    toggle.replaceChildren(label, ...failed ? [" · ", node("span", "plan-lane-failed", `${status("failed")} ${failed}`)] : [], ` ${open ? "▾" : "▸"}`);
+    toggle.replaceChildren(label, ...failed ? [" · ", node("span", "plan-lane-failed", `${status("failed")} ${failed}`)] : [], ` ${foldGlyph(open)}`);
     toggle.setAttribute("aria-expanded", String(open));
   };
   toggle.onclick = () => {
@@ -268,8 +280,9 @@ export function renderPlanItem(step: PlanStep, current: PlanStep | undefined, op
   if (step.ahead) title.append(node("span", "plan-mark", "AHEAD"));
   title.append(node("span", "plan-status", step.removed ? l10n.t("Removed") : status(step.status)));
   body.append(title);
-  if (step.elapsed !== null || step.tokens !== null) {
-    const metric = node("div", "plan-step-metric", `${planDuration(step.elapsed)} · ${step.tokens === null ? "—" : `≈${planTokens(step.tokens.tokens)}`}`);
+  if (step.work?.ms != null || step.tokens !== null) {
+    const metric = node("div", "plan-step-metric");
+    metric.append(planWork(step.work), " · ", step.tokens === null ? "—" : measuredSumNote(approx(planTokens(step.tokens.tokens), true), step.tokens.partial));
     metric.title = l10n.t("Approximate time attribution. Cache read: {0} tokens", planTokens(step.tokens?.cacheRead ?? null));
     body.append(metric);
   }

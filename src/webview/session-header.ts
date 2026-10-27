@@ -4,8 +4,13 @@ import { isComposingKey } from "./composing";
 import { createLoader } from "./loader";
 import { ACTIONS_MENU_GLYPH } from "./todo-edit";
 import { remoteControlLabel, remoteControlOn } from "./remote-control-view";
+import { MARKS } from "./marks";
 
 export const SESSION_MENU_ORDER = ["name", "handoff", "export", "remoteControl", "extras"] as const;
+
+export function handoffMenuLabel(): string {
+  return l10n.t("Hand off to a new conversation");
+}
 
 export interface SessionMenuExtra { label: string; icon: string; run: () => void }
 let sessionMenuExtras: (() => SessionMenuExtra[]) | null = null;
@@ -153,7 +158,7 @@ export function createSessionHeader(tabId: string, title: string, send: (message
   nameButton.setAttribute("aria-expanded", "false");
   nameButton.append(document.createTextNode(l10n.t("Session name")));
   const arrow = document.createElement("span");
-  arrow.textContent = "▸";
+  arrow.textContent = MARKS.submenuTriangle;
   arrow.setAttribute("aria-hidden", "true");
   nameButton.append(arrow);
   const submenu = document.createElement("div");
@@ -225,7 +230,7 @@ export function createSessionHeader(tabId: string, title: string, send: (message
     const next = event.key === "Home" ? 0 : event.key === "End" ? items.length - 1 : (index + (event.key === "ArrowDown" ? 1 : -1) + items.length) % items.length;
     items[next]?.focus();
   });
-  const handoff = action(l10n.t("Hand off to a new conversation"), "⇉", () => send({type: "startHandoff", tabId}));
+  const handoff = action(handoffMenuLabel(), "⇉", () => send({type: "startHandoff", tabId}));
   const exportItem = action(l10n.t("Export conversation to Markdown"), "↧", () => send({type: "exportTab", tabId}));
   const remoteSwitch = document.createElement("span");
   remoteSwitch.className = "l-switch";

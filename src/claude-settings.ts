@@ -1,6 +1,7 @@
 import * as vscode from "vscode";
+import * as l10n from "@vscode/l10n";
 
-import { readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { homedir } from "node:os";
 
@@ -272,6 +273,28 @@ export function resolveSessionCwd(s: Session): string | undefined {
   const pinnedByResume = s.resumeFilePath !== undefined && s.cwd.length > 0 ? s.cwd : undefined;
   const cwd = pinnedByResume || configured || s.cwd || homedir() || undefined;
   return cwd === undefined ? undefined : normalizeDriveLetter(cwd);
+}
+
+export class ConversationFolderMissingError extends Error {
+  constructor(readonly cwd: string) {
+    super(l10n.t("The working folder of this conversation was not found: {0}", cwd));
+  }
+
+  backgroundRunNotice(): string {
+    return l10n.t("LAISORA: {0} (LLM analysis and summaries run in the working folder of the conversation.)", this.message);
+  }
+}
+
+export function launchFolderMissing(cwd: string): ConversationFolderMissingError | undefined {
+  return statSync(cwd, { throwIfNoEntry: false })?.isDirectory() === true ? undefined : new ConversationFolderMissingError(cwd);
+}
+
+export function existingFolderOrHome(cwd: string | undefined): string {
+  return cwd !== undefined && launchFolderMissing(cwd) === undefined ? cwd : homedir();
+}
+
+export function sessionBackgroundCwd(s: Session): string {
+  return resolveSessionCwd(s) ?? process.cwd();
 }
 
 export function getLaisoraConfiguration(): vscode.WorkspaceConfiguration {

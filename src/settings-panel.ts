@@ -3,7 +3,7 @@ import * as l10n from "@vscode/l10n";
 import { randomBytes } from "node:crypto";
 import { updateClaudeCodeSettings } from "./claude-settings";
 import { output } from "./host-context";
-import { isSettingsPageToHost, type SettingWriteFailure } from "./protocol";
+import { isSettingsPageToHost, type SettingsRevealTarget, type SettingWriteFailure } from "./protocol";
 import {
   settingsStateMessage,
   projectConductorPreview,
@@ -18,6 +18,7 @@ import {
   writeTodoEnabled,
   writeEditSummaryEnabled,
   writeRemoteControlCard,
+  writeWelcomeSetting,
   writeHandoffAutoSetting,
   writeCliAutoUpdate,
   writeComposerSendKey,
@@ -25,16 +26,19 @@ import {
   writeOrchestrationSetting,
   writeRestoreTabsOnStartup,
   writeEventLimit,
+  writeTranscriptRetentionDays,
   writeInitialModel,
 } from "./gateway-host-actions";
 
 let settingsPanel: vscode.WebviewPanel | null = null;
 const refreshedPages = new WeakSet<vscode.Webview>();
+const pendingReveals = new WeakMap<vscode.Webview, SettingsRevealTarget>();
 
-export function openSettingsPanel(context: vscode.ExtensionContext, detect?: Parameters<typeof refreshExternalDetection>[0]): void {
+export function openSettingsPanel(context: vscode.ExtensionContext, detect?: Parameters<typeof refreshExternalDetection>[0], reveal?: SettingsRevealTarget): void {
   if (settingsPanel) {
     settingsPanel.reveal();
     postSettingsState();
+    if (reveal) void settingsPanel.webview.postMessage({ type: "revealSetting", target: reveal });
     return;
   }
   const panel = vscode.window.createWebviewPanel("laisora.settings", l10n.t("LAISORA Settings"), vscode.ViewColumn.One, {
@@ -45,6 +49,7 @@ export function openSettingsPanel(context: vscode.ExtensionContext, detect?: Par
     ],
   });
   settingsPanel = panel;
+  if (reveal) pendingReveals.set(panel.webview, reveal);
   panel.webview.onDidReceiveMessage((raw: unknown) => void handleSettingsPageMessage(panel.webview, raw, detect));
   panel.webview.html = settingsPageHtml({
     cspSource: panel.webview.cspSource,
@@ -119,6 +124,9 @@ export async function handleSettingsPageMessage(webview: vscode.Webview, raw: un
     case "setEventLimit":
       writeFailure = await writeEventLimit(raw.value);
       break;
+    case "setTranscriptRetentionDays":
+      writeFailure = await writeTranscriptRetentionDays(raw.value);
+      break;
     case "setCliAutoUpdate":
       writeFailure = await writeCliAutoUpdate(raw.executor, raw.enabled);
       break;
@@ -137,6 +145,9 @@ export async function handleSettingsPageMessage(webview: vscode.Webview, raw: un
     case "setRemoteControlCard":
       writeFailure = await writeRemoteControlCard(raw.enabled);
       break;
+    case "setWelcomeSetting":
+      writeFailure = await writeWelcomeSetting(raw.setting, raw.enabled);
+      break;
     case "setHandoffAutoSetting":
       writeFailure = await writeHandoffAutoSetting(raw.setting, raw.value);
       break;
@@ -149,6 +160,9 @@ export async function handleSettingsPageMessage(webview: vscode.Webview, raw: un
   }
   if (raw.type === "settingsPageReady" && settingsPanel?.webview === webview) {
     void webview.postMessage(settingsStateMessage());
+    const reveal = pendingReveals.get(webview);
+    pendingReveals.delete(webview);
+    if (reveal) void webview.postMessage({ type: "revealSetting", target: reveal });
   }
   if (settingsPanel?.webview !== webview) return;
   if (raw.type === "recheckExternalExecutors" || raw.type === "settingsPageReady" && !refreshedPages.has(webview)) {

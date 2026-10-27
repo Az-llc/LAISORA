@@ -1,5 +1,6 @@
 import { UsageLimitResume, SDK_AUTO_CONTINUE_SETTINGS } from "./usage-limit-resume";
 import { readClaudeCodeSettings, onAutoContinueSettingChange } from "./claude-code-settings";
+import type { TranscriptRetentionSettings } from "./transcript-retention";
 import { modelLabelWithVersion } from "./model-display-name";
 export { modelLabelWithVersion } from "./model-display-name";
 import { appendRunRecord, externalDescription, isExternalTimeout, observeAgentRun, runExternal, runFailureReason, type ExternalRow, type OrchestrationRunRecord, type AgentRunRecord } from "./orchestration-external";
@@ -51,7 +52,7 @@ import { PROGRESS_WIRE_TOOL_NAME } from "./artifact-access";
 import { FILE_WRITING_TOOLS } from "./file-writing-tools";
 import { z } from "zod";
 import { ClaudeLiveNormalizer, parseAliases, type RawToolResult } from "./claude-normalizer";
-import { conductorInstruction, orchestrationExternalTargets, orchestrationVariants, resolveOrchestrationRoster, type OrchestrationRow, type ExternalModels } from "./orchestration-roster";
+import { conductorInstruction, handbackGateVerdict, SUBAGENT_HANDBACK_TOOL, orchestrationExternalTargets, orchestrationVariants, resolveOrchestrationRoster, type OrchestrationRow, type ExternalModels } from "./orchestration-roster";
 import { attributeSubagent, injectionOf, MAX_AGENT_STARTS, readRosterEvidence, type AgentStartObservation, type InjectedAgentDefinition, type RosterEvidence, type RosterInjection } from "./roster-evidence";
 import { placementOf, type Placement } from "./placement-line";
 import { laisoraDenialMessage } from "./tool-result-signals";
@@ -200,6 +201,7 @@ export interface ClaudeHostOptions {
   resumeSessionId?: string;
   permissionMode: "default" | "acceptEdits" | "plan" | "bypassPermissions" | "auto" | "dontAsk";
   settingSources: Array<"user" | "project" | "local">;
+  transcriptRetention?: TranscriptRetentionSettings;
   remoteControlAtStartup?: boolean;
   claudeCodeExecutablePath?: string;
   apiKeyPolicy?: ApiKeyPolicy;
@@ -678,7 +680,7 @@ ${ctxJson}`
       cwd: this.opts.cwd,
       permissionMode: this.opts.permissionMode,
       settingSources: this.opts.settingSources,
-      settings: { remoteControlAtStartup: this.opts.remoteControlAtStartup === true, ...SDK_AUTO_CONTINUE_SETTINGS, ultracode: false },
+      settings: { remoteControlAtStartup: this.opts.remoteControlAtStartup === true, ...SDK_AUTO_CONTINUE_SETTINGS, ultracode: false, ...this.opts.transcriptRetention },
       extraArgs: { [REPLAY_USER_MESSAGES_ARG]: null },
       includePartialMessages: true,
       pathToClaudeCodeExecutable: resolvedExecutable.path,
@@ -926,7 +928,21 @@ ${ctxJson}`
         if (isExternalRunTool(input.tool_name) && !this.externalToolUses.some(entry => entry.id === input.tool_use_id)) this.externalToolUses.push({ id: input.tool_use_id, input: input.tool_input as Record<string, unknown> });
         return {};
       };
-      options.hooks = { ...(options.hooks ?? {}), PreToolUse: [...(options.hooks?.PreToolUse ?? []), { hooks: [observeDispatch] }] };
+      const handbackDenials = new Map<string, number>();
+      const handbackGate: ClaudeCodeSdk.HookCallback = async input => {
+        if (input.hook_event_name !== "PreToolUse") return {};
+        const agent = input.agent_id ?? "";
+        const denials = handbackDenials.get(agent) ?? 0;
+        const reason = handbackGateVerdict((input.tool_input as Record<string, unknown> | undefined)?.message, denials);
+        if (!reason) {
+          handbackDenials.delete(agent);
+          return {};
+        }
+        handbackDenials.set(agent, denials + 1);
+        return { hookSpecificOutput: { hookEventName: "PreToolUse", permissionDecision: "deny", permissionDecisionReason: reason } };
+      };
+      options.hooks = { ...(options.hooks ?? {}), PreToolUse: [...(options.hooks?.PreToolUse ?? []), { hooks: [observeDispatch] },
+        { matcher: `^${SUBAGENT_HANDBACK_TOOL}$`, hooks: [handbackGate] }] };
     }
     const preToolUse = options.hooks?.PreToolUse ?? [];
     if (preToolUse.length) {

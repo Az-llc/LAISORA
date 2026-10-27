@@ -1,5 +1,23 @@
 # Changelog
 
+## 1.12.0
+
+- **Welcome.** An empty new conversation shows a greeting, what is new in this version until you
+  close it, and a rotating tip. Hide the news or the tips with `laisora.welcome.showNews` and
+  `laisora.welcome.showTips`.
+- **ToDo is out of beta** and on by default. Turn it off with `laisora.todo.enabled`.
+- **GRAPH** shows the work a delegate started as folded rows under that delegate. Pressing a step
+  row folds it; pressing a member row again opens the Inspector. Delegates whose launch is missing
+  from the record are listed together, and LOG, GRAPH, ROLES and ANALYSIS count the same delegates,
+  calls and failures.
+- A conversation whose working folder no longer exists is not started and says so. Conversations
+  from Claude Desktop continue in their own folder and are listed under Claude Code in History.
+- SUMMARY, ANALYSIS, PLAN and GRAPH show processing time only, measured the same way on every
+  screen. ANALYSIS splits time by role.
+- The transcript retention setting shows the days that apply when it is empty, and applies only to
+  launches that read your Claude settings.
+- Claude Agent SDK 0.3.311 (Claude Code CLI 2.1.311).
+
 ## 1.11.0
 
 - **Remote Control per tab.** Turn Remote Control on or off from the tab menu, or with

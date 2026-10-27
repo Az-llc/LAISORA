@@ -5,12 +5,15 @@
   --l-chart-c3: color-mix(in srgb, var(--laisora-accent) 45%, var(--vscode-editor-background));
   --l-chart-c4: color-mix(in srgb, var(--laisora-accent) 25%, var(--vscode-editor-background));
   --l-chart-tool: color-mix(in srgb, var(--vscode-descriptionForeground) 45%, var(--vscode-editor-background));
-  --l-chart-unobserved: color-mix(in srgb, var(--vscode-descriptionForeground) 22%, var(--vscode-editor-background));
-  --l-chart-wait: color-mix(in srgb, var(--vscode-descriptionForeground) 16%, var(--vscode-editor-background));
   --l-chart-gen: var(--l-chart-c1);
   --l-chart-sub: var(--l-chart-c2);
-  --l-chart-answer: var(--l-chart-c4);
+  --l-chart-subwait: var(--l-chart-c3);
+  --l-chart-bgonly: color-mix(in srgb, var(--vscode-descriptionForeground) 80%, var(--vscode-editor-background));
+  --l-chart-token-new: var(--l-chart-c1);
+  --l-chart-token-cache: var(--l-chart-c3);
+  --l-chart-step: var(--l-chart-c4);
   --l-chart-track: color-mix(in srgb, var(--vscode-descriptionForeground) 12%, var(--vscode-editor-background));
+  --l-chart-track-line: var(--vscode-contrastBorder, color-mix(in srgb, var(--vscode-descriptionForeground) 35%, var(--vscode-editor-background)));
   --l-card-border: var(--vscode-contrastBorder, color-mix(in srgb, var(--vscode-foreground) 20%, var(--vscode-editor-background)));
   --l-card-radius: 2px;
   --l-disabled-opacity: 0.4;

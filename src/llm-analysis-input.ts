@@ -46,9 +46,7 @@ export const INPUT_SOURCE_NOTES = {
 
 export interface TranscriptGapSummary {
   unreadableAgentCount?: number;
-  omittedTranscriptCount?: number;
   hierarchyIncomplete?: true;
-  ancestorUsageUnread?: true;
   historyReadFailed?: true;
   historyMalformedLineCount?: number;
   evidenceFoldErrorCount?: number;
@@ -58,13 +56,9 @@ export function formatTranscriptGapNote(gaps: TranscriptGapSummary | undefined):
   if (gaps === undefined) return undefined;
   const parts: string[] = [];
   if (gaps.unreadableAgentCount !== undefined) {
-    parts.push(l10n.t("{0} subagent records could not be read and are not in the input", gaps.unreadableAgentCount));
-  }
-  if (gaps.omittedTranscriptCount !== undefined) {
-    parts.push(l10n.t("{0} subagent records were not read because of the limit and are not in the input", gaps.omittedTranscriptCount));
+    parts.push(l10n.t("{0} subagent records were not read and are not in the input", gaps.unreadableAgentCount));
   }
   if (gaps.hierarchyIncomplete) parts.push(l10n.t("The subagent list could not be read completely"));
-  if (gaps.ancestorUsageUnread) parts.push(l10n.t("The earlier conversation's records could not be fully read, so child token usage recorded there is not in the input"));
   if (gaps.historyReadFailed) parts.push(l10n.t("Reading the record failed partway through; nothing after that point is in the input"));
   if (gaps.historyMalformedLineCount !== undefined) {
     parts.push(l10n.t("{0} lines of the record are malformed and are not in the input", gaps.historyMalformedLineCount));

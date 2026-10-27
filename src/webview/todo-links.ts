@@ -4,6 +4,7 @@ import { todoAgentItemId } from "../todo-model";
 import { TODO_STATE_LABELS, todoButton, todoEl as el } from "./todo-edit";
 import { todoGroupColor } from "./todo-row-view";
 import { todoItemPath } from "./todo-rows";
+import { MARKS } from "./marks";
 
 export interface TodoLinkHub {
   enabled(): boolean;
@@ -86,7 +87,7 @@ export function todoTabMarks(tabId: string, title: string, extras: { readonly ru
     const children = items.filter(candidate => candidate.id !== item.id && candidate.talk !== undefined && todoItemPath(items, candidate.id)[0]?.id === item.id).length;
     lines.push(l10n.t("Subagents running: {0} · Child conversations: {1}", extras.runningAgents, children));
   }
-  lines.push(l10n.t("ToDo path: {0}", path.map(step => todoItemLabel(step)).join(" › ")));
+  lines.push(l10n.t("ToDo path: {0}", path.map(step => todoItemLabel(step)).join(` ${MARKS.pathSeparator} `)));
   return { color: todoGroupColor(links.groupColorOf(root.group)), child: item.parentId !== null, tooltip: lines.join("\n") };
 }
 
@@ -106,7 +107,7 @@ export function renderTodoCrumbs(container: HTMLElement, tabId: string): void {
   dot.setAttribute("aria-hidden", "true");
   dot.style.setProperty("--todo-gc", todoGroupColor(links.groupColorOf(root.group)));
   container.append(dot, el("span", "todo-crumb-group", root.group ?? l10n.t("No group")));
-  const sep = () => { const node = el("span", "todo-crumb-sep", "›"); node.setAttribute("aria-hidden", "true"); return node; };
+  const sep = () => { const node = el("span", "todo-crumb-sep", MARKS.pathSeparator); node.setAttribute("aria-hidden", "true"); return node; };
   if (item.parentId !== null) {
     container.append(sep(), todoButton("todo-crumb todo-crumb-up", `↑ ${todoItemLabel(root)}`, () => {
       const parentTab = links.tabsOfItem(root.id)[0];
