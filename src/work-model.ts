@@ -2,7 +2,7 @@ import type { ToolIntentInput } from "./tool-intent";
 import { isHistoryEvent, type NormalizedEvent, type ResumeHydrationPhase } from "./protocol";
 import * as l10n from "@vscode/l10n";
 import { isRequestMessage, mainCallTimeKind, MAX_TIME_TOOL_INTERVALS, toolTimeSpans, type UnknownLauncher } from "./time-buckets";
-import { isRejectedBeforeRun, taskNotificationTerminal } from "./tool-result-signals";
+import { isFailedToolResult, isRejectedBeforeRun, taskNotificationTerminal } from "./tool-result-signals";
 import { DELEGATION_TOOL_NAMES, isCountedExternalRunCall, TASK_TOOL_NAMES } from "./claude-tool-names";
 import { isPureCommandWrapper } from "./human-input-vocabulary";
 import { parseMarkdown } from "./markdown-ast";
@@ -2147,17 +2147,19 @@ function handleToolFinish(d: Draft, e: ToolFinishedSignal): void {
   }
   removeRunningAgent(d, e.toolUseId);
   removeRunningTool(d, e.toolUseId);
-  if (e.isError) {
+  const failed = isFailedToolResult(e);
+  const rejectedBeforeRun = isRejectedBeforeRun(e);
+  if (failed) {
     const request = draftRequest(d, placement.requestIndex);
     if (request) request.failCount++;
   }
-  addMainCallTime(d, placement, isRejectedBeforeRun(e), e.timestamp);
+  addMainCallTime(d, placement, rejectedBeforeRun, e.timestamp);
   const segment = draftSegment(d, placement.segmentId);
   if (segment && placement.counted) {
     if (placement.stale) segment.staleCount--;
     else segment.runningCount--;
-    if (e.isError) segment.failCount++;
-  } else if (segment && placement.ownerAgentId !== undefined && e.isError) {
+    if (failed) segment.failCount++;
+  } else if (segment && placement.ownerAgentId !== undefined && failed) {
     segment.childFailCount++;
   }
   const target = draftTotals(d, placement.phaseRef);
@@ -2165,8 +2167,8 @@ function handleToolFinish(d: Draft, e: ToolFinishedSignal): void {
   if (target.phase) target.phase.endedAt = e.timestamp;
   if (target.rollup) target.rollup.endedAt = Math.max(target.rollup.endedAt, e.timestamp);
   if (placement.counted) {
-    if (e.isError) target.totals.failCount++;
-  } else if (placement.ownerAgentId !== undefined && e.isError) {
+    if (failed) target.totals.failCount++;
+  } else if (placement.ownerAgentId !== undefined && failed) {
     target.totals.childFailCount++;
     if (target.phase) {
       const ownerAgent = draftAgent(d, target.phase, placement.ownerAgentId);
@@ -2174,7 +2176,7 @@ function handleToolFinish(d: Draft, e: ToolFinishedSignal): void {
     }
     if (placement.parentToolUseId !== null) countUnknownLauncherCall(d, placement.parentToolUseId, true);
   }
-  if (isCountedExternalRunCall({ toolName: placement.toolName }) && !isCountedExternalRunCall({ toolName: placement.toolName, rejectedBeforeRun: isRejectedBeforeRun(e) })) {
+  if (isCountedExternalRunCall({ toolName: placement.toolName }) && !isCountedExternalRunCall({ toolName: placement.toolName, rejectedBeforeRun })) {
     target.totals.externalRunCount = Math.max(0, (target.totals.externalRunCount ?? 0) - 1);
     const request = draftRequest(d, placement.requestIndex);
     if (request) request.externalRunCount = Math.max(0, (request.externalRunCount ?? 0) - 1);
@@ -2183,7 +2185,7 @@ function handleToolFinish(d: Draft, e: ToolFinishedSignal): void {
 
   if (placement.stale) target.totals.staleCount--;
   else target.totals.runningCount--;
-  if (isRejectedBeforeRun(e)) {
+  if (rejectedBeforeRun) {
     deletePlacement(d, e.toolUseId);
     target.totals.agentCount--;
     const request = draftRequest(d, placement.requestIndex);
@@ -2196,10 +2198,10 @@ function handleToolFinish(d: Draft, e: ToolFinishedSignal): void {
 
   const agent = target.phase ? draftAgent(d, target.phase, placement.agentId) : undefined;
   if (!agent) return;
-  agent.status = e.isError ? "failed" : "completed";
+  agent.status = failed ? "failed" : "completed";
   agent.endedAt = e.timestamp;
   agent.elapsedMs = agentStoppedMs(agent);
-  if (e.isError) agent.failCount++;
+  if (failed) agent.failCount++;
   if (tokens !== undefined) agent.tokens = tokens;
 }
 

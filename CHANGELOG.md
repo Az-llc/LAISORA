@@ -1,5 +1,18 @@
 # Changelog
 
+## 1.13.0
+
+- **ToDo from a reply.** Claude's replies get "Add to ToDo" and "Add to ToDo and start a new
+  conversation" beside Copy. Claude makes the reply's topic one ToDo item with a work memo, places
+  it by the usual rules and says where it went. The buttons follow the ToDo switch.
+- ToDo rows drag from anywhere on the row with a mouse.
+- ToDo counts: group chips count open items only, and done counts include items under a parent
+  marked done, so open plus done equals all items.
+- An empty PC gets a one-time ToDo tutorial item.
+- A tool call interrupted while it ran counts as a run, not a failure.
+- Claude Code started by LAISORA sends no telemetry when VS Code telemetry is off.
+- Claude Agent SDK 0.3.312 (Claude Code CLI 2.1.312).
+
 ## 1.12.0
 
 - **Welcome.** An empty new conversation shows a greeting, what is new in this version until you

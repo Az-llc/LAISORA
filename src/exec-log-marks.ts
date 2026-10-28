@@ -1,4 +1,4 @@
-import { HARNESS_DENIED_TOOL_RESULT_RE, HUMAN_REJECTED_TOOL_RESULT_RE, isHookDenial } from "./tool-result-signals";
+import { HARNESS_DENIED_TOOL_RESULT_RE, isFailedToolResult, isHookDenial } from "./tool-result-signals";
 import type { NormalizedEvent } from "./protocol";
 import * as l10n from "@vscode/l10n";
 
@@ -50,7 +50,6 @@ interface ConventionRule {
 }
 
 const FAILURE_RULES: readonly FailureRule[] = [
-  { anchor: "fail:rejected", get label() { return l10n.t("A human stopped the execution"); }, pattern: HUMAN_REJECTED_TOOL_RESULT_RE },
   { anchor: "fail:guard", get label() { return l10n.t("A guard stopped the execution"); }, pattern: /This agent is isolated in the worktree|Refusing to use|Blocked: / },
   { anchor: "fail:hook", get label() { return l10n.t("A hook denied the execution"); }, pattern: { test: isHookDenial } },
   { anchor: "fail:read-first", get label() { return l10n.t("Tried to modify a file that had not been read"); }, get category() { return l10n.t("Rule"); }, get fixCandidate() { return l10n.t("Read before Edit or Write"); }, pattern: /File has not been read yet/ },
@@ -108,7 +107,7 @@ export function foldExecLogMarks(state: ExecLogMarkState, event: NormalizedEvent
     return next;
   }
   if (event.kind === "tool_call_finished") {
-    if (event.isError !== true) return state;
+    if (!isFailedToolResult(event)) return state;
     const rule = FAILURE_RULES.find((r) => r.pattern.test(event.resultPreview));
     if (rule === undefined) return state;
     return push(state, { toolUseId: event.toolUseId, turnId: event.turnId, family: "failure", label: rule.label, findingAnchor: rule.anchor });

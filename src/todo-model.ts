@@ -120,7 +120,7 @@ export interface TodoItem {
   readonly repeat?: string;
   readonly estimate?: string;
   readonly tags?: string;
-  readonly by?: "claude";
+  readonly by?: TodoItemBy;
   readonly guesses?: TodoGuesses;
   readonly starts?: readonly TodoStart[];
   readonly source?: { readonly sessionId: string };
@@ -153,7 +153,12 @@ export interface TodoDecision {
   readonly carriedFrom?: string;
 }
 
-export const TODO_CAPTURE_VIA = ["user", "claude", "import"] as const;
+export const TODO_LAISORA = "laisora";
+export const TODO_ITEM_BY = ["claude", TODO_LAISORA] as const;
+export type TodoItemBy = typeof TODO_ITEM_BY[number];
+export const todoUserItem = (item: Pick<TodoItem, "by">): boolean => item.by === undefined;
+
+export const TODO_CAPTURE_VIA = ["user", "claude", "import", TODO_LAISORA] as const;
 export interface TodoCaptured {
   readonly text: string;
   readonly at: number;
@@ -301,6 +306,7 @@ export interface TodoChange {
   readonly acknowledged?: true;
   readonly guess?: TodoGuess;
   readonly basis?: TodoPlacementBasis;
+  readonly by?: typeof TODO_LAISORA;
 }
 
 export interface TodoDocument {
@@ -384,6 +390,7 @@ export type TodoOperation =
   | { kind: "dismissAsk"; id: string; message: string; place: TodoAskPlace }
   | { kind: "recordDecisions"; sessionId: string; decisions: readonly TodoDecision[] }
   | { kind: "migrateDecisions" }
+  | { kind: "seedWelcome"; items: readonly TodoAddNode[]; seeded: boolean }
   | { kind: "revert"; mode: "undo"; revision: number }
   | { kind: "revert"; mode: "claude"; changeId: string }
   | { kind: "revert"; mode: "claude"; changeIds: readonly string[] }
@@ -392,7 +399,7 @@ export type TodoOperation =
 type TodoDecisionOperation = Extract<TodoOperation, { kind: "recordDecisions" | "migrateDecisions" }>;
 
 type TodoStepOperation =
-  | Exclude<TodoOperation, { kind: "revert" } | { kind: "acknowledge" } | TodoDecisionOperation | TodoTidyOperation>
+  | Exclude<TodoOperation, { kind: "revert" } | { kind: "acknowledge" } | { kind: "seedWelcome" } | TodoDecisionOperation | TodoTidyOperation>
   | { kind: "tidyStep"; step: TodoTidyStep }
   | { kind: "setGroupBindings"; group: string; folders: readonly TodoGroupFolder[]; aliases: readonly TodoGroupAlias[] }
   | { kind: "setExactState"; id: string; state: TodoState; completion?: TodoCompletion; startedAt?: number | null }
@@ -865,7 +872,7 @@ export function todoConversationFolder(groups: readonly TodoGroup[], files: read
 }
 
 function claudeMayChange(items: readonly TodoItem[], item: TodoItem, session: string | null | undefined): boolean {
-  if (session === undefined || item.by === "claude") return true;
+  if (session === undefined || !todoUserItem(item)) return true;
   const linked = linkedTodoItem(items, session ?? undefined);
   return linked !== undefined && todoScopeIds(items, linked.id).has(item.id);
 }
@@ -1203,7 +1210,7 @@ function step(items: TodoItem[], operation: TodoStepOperation, author: TodoAutho
       if (!before) return { ok: false, error: "not-found" };
       if (operation.kind === "groupColor" && author !== "human") return { ok: false, error: "author-not-allowed" };
       if (operation.kind === "groupDelete") {
-        const mine = author === "claude" ? items.find(entry => entry.deletedAt === undefined && entry.by !== "claude" && rootOf(items, entry.id)?.group === operation.name) : undefined;
+        const mine = author === "claude" ? items.find(entry => entry.deletedAt === undefined && todoUserItem(entry) && rootOf(items, entry.id)?.group === operation.name) : undefined;
         if (mine) return { ok: false, error: "group-has-user-items", detail: { title: mine.title, word: operation.name } };
         const next = items.map(entry => {
           if (entry.group !== operation.name) return entry;
@@ -1761,7 +1768,7 @@ const TODO_ITEM_SHAPE_TABLE = {
   repeat: (value: unknown) => typeof value === "string" && TODO_REPEAT_PATTERN.test(value),
   estimate: (value: unknown) => typeof value === "string" && TODO_ESTIMATE_PATTERN.test(value),
   tags: isTextUpTo(TODO_TAGS_MAX),
-  by: (value: unknown) => value === "claude",
+  by: (value: unknown) => (TODO_ITEM_BY as readonly unknown[]).includes(value),
   guesses: isTodoGuesses,
   captured: isTodoCaptured,
   startedAt: isTodoTime,
@@ -1809,7 +1816,7 @@ export function isTodoChangeRecord(value: unknown): value is TodoChange {
   return isRecord(value) && isTodoId(value.id) && isTodoTime(value.at) && (value.author === "human" || value.author === "claude")
     && (value.itemId === "" || isTodoId(value.itemId)) && typeof value.field === "string" && TODO_CHANGE_FIELDS.includes(value.field)
     && (value.cascade === undefined || value.cascade === true) && (value.acknowledged === undefined || value.acknowledged === true)
-    && (value.basis === undefined || (TODO_PLACEMENT_BASES as readonly unknown[]).includes(value.basis));
+    && (value.basis === undefined || (TODO_PLACEMENT_BASES as readonly unknown[]).includes(value.basis)) && (value.by === undefined || value.by === TODO_LAISORA);
 }
 
 export const TODO_HELD: unique symbol = Symbol("todoHeld");
@@ -2529,6 +2536,14 @@ function hasAncestorIn(items: readonly TodoItem[], id: string, ids: ReadonlySet<
   return false;
 }
 
+export function todoStoreEverWritten(document: Pick<TodoDocument, "revision" | "items">): boolean {
+  return document.revision > 0 || document.items.length > 0;
+}
+
+export function shouldSeedTodoWelcome(state: { readonly written: boolean; readonly seeded: boolean }): boolean {
+  return !state.written && !state.seeded;
+}
+
 export function applyTodoOperation(document: TodoDocument, operation: TodoOperation, context: TodoOperationContext): TodoOperationResult {
   const { author, now } = context;
   const items = pruneDeletedItems(document.items, now);
@@ -2558,6 +2573,18 @@ export function applyTodoOperation(document: TodoDocument, operation: TodoOperat
   }
 
   if (operation.kind === "recordDecisions" || operation.kind === "migrateDecisions") return applyDecisionOperation(document, items, operation);
+
+  if (operation.kind === "seedWelcome") {
+    if (author !== "human") return { ok: false, error: "author-not-allowed" };
+    if (!shouldSeedTodoWelcome({ written: todoStoreEverWritten(document), seeded: operation.seeded })) return { ok: true, document, itemId: "", changed: false };
+    const result = applyTodoOperation(document, { kind: "addMany", parentId: null, items: operation.items }, context);
+    if (!result.ok || !result.changed) return result;
+    const before = new Set(document.items.map(item => item.id));
+    const revision = result.document.revision;
+    return { ...result, document: { ...result.document,
+      items: result.document.items.map(item => before.has(item.id) ? item : { ...item, by: TODO_LAISORA, ...(item.captured ? { captured: { ...item.captured, via: TODO_LAISORA } } : {}) }),
+      changes: result.document.changes.map(change => parseTodoChangeId(change.id).revision === revision ? { ...change, by: TODO_LAISORA } : change) } };
+  }
 
   const proposals = document.tidy ?? [];
   let tidy: readonly TodoTidyRecord[] | undefined;

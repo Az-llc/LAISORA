@@ -3,7 +3,7 @@ import * as l10n from "@vscode/l10n";
 import type * as Sdk from "@anthropic-ai/claude-agent-sdk" with { "resolution-mode": "import" };
 import type { RootGate, RootGateScope } from "./root-gate";
 import {
-  isClaudeOwnChange, linkedTodoItem, liveChildren, memoStaleSince, parseTodoChangeId, TODO_ADD_MANY_MAX, TODO_CLAUDE_DEPTH_MAX, TODO_ADD_PLACEMENT_BASES, TODO_TIDY_KINDS, TODO_TIDY_STEPS_MAX, type TodoAddNode, todoAgentMarker,
+  isClaudeOwnChange, linkedTodoItem, TODO_LAISORA, liveChildren, memoStaleSince, parseTodoChangeId, TODO_ADD_MANY_MAX, TODO_CLAUDE_DEPTH_MAX, TODO_ADD_PLACEMENT_BASES, TODO_TIDY_KINDS, TODO_TIDY_STEPS_MAX, type TodoAddNode, todoAgentMarker,
   todoBindableFolder, todoFailureResultText, TODO_STABLE_TOUCH_MS, TODO_STABLE_PIN_MS, TODO_STABLE_REMOVE_MS,
   todoConversationFolder, todoDoneTwin, todoFinishedIds, todoTidySignals, todoFolderGroup, todoGroupsOf, todoItemNumbers, todoItemPath, todoPlaceOf, todoPlaceText, todoWriteResultText, TODO_DUE_PATTERN, TODO_GROUP_MAX, TODO_GUESS_REASON_MAX, TODO_MEMO_TEXT_MAX,
   TODO_PRIORITIES, TODO_SERVER_NAME, TODO_STATE_BRACKETS, TODO_STATE_CHECKBOXES, TODO_STATE_SEPARATORS, TODO_STATE_TRAILING_WORDS, TODO_STATE_WORDS, TODO_TITLE_PARTICLES, todoTitlePlaceOf, todoTitleRepeat, TODO_TOOL_KINDS, todoToolName, type TodoToolKind, TODO_STATES, TODO_TITLE_MAX, TODO_WRITE_TOOLS, WORK_MEMO_SECTIONS, type WorkMemoSection, type TodoDocument, type TodoItem,
@@ -141,7 +141,7 @@ const TODO_INPUTS = {
 } satisfies Record<TodoToolKind, Record<string, z.ZodType>>;
 
 const TODO_DESCRIPTIONS: Record<TodoToolKind, string> = {
-  list: `Read the TODO list: every group first (display order, open and done counts, empty ones included, the folders bound to it), the conversation context (cwd, the folder of the files this conversation used, the group bound to it, and words learned from the user's corrections with the place they mean), then the open items of the context group as a tree with the numbers the user sees (${TODO_DEPTH_EXAMPLE}); when the conversation has no context group or that group has no open items, the open items of every group, shortened to about ${TODO_LIST_ITEMS_MAX} items with a note, and tidy signals (same titles among siblings, a parent with one child, crowded sibling lists, titles that repeat their group or an ancestor (repeatsPlace), open items waiting in No group: file them with tidy). ${TODO_PATH_READING} Use group, all or done for more. Reading one item also returns its parent id, path, the user's memo, your work memo (with a note when later work may have made it out of date) and the item's references the user attached (links as URL or file path; images as a reference you cannot open). ${TODO_IMPORT_RULES} ${TODO_SCOPE}`,
+  list: `Read the TODO list: every group first (display order, open and done counts, empty ones included, the folders bound to it), the conversation context (cwd, the folder of the files this conversation used, the group bound to it, and words learned from the user's corrections with the place they mean), then the open items of the context group as a tree with the numbers the user sees (${TODO_DEPTH_EXAMPLE}); when the conversation has no context group or that group has no open items, the open items of every group, shortened to about ${TODO_LIST_ITEMS_MAX} items with a note, and tidy signals (same titles among siblings, a parent with one child, crowded sibling lists, titles that repeat their group or an ancestor (repeatsPlace), open items waiting in No group: file them with tidy). Items marked by: ${TODO_LAISORA} are a guide LAISORA added for the user to tick off, not the user's notes: change, complete or delete them when the user asks, and do not tidy them on your own. ${TODO_PATH_READING} Use group, all or done for more. Reading one item also returns its parent id, path, the user's memo, your work memo (with a note when later work may have made it out of date) and the item's references the user attached (links as URL or file path; images as a reference you cannot open). ${TODO_IMPORT_RULES} ${TODO_SCOPE}`,
   add: `Add an item, or several items with their sub-items through items, to the TODO list; the result gives each item's id and path. When adding more than one item, add them all in one call with items rather than one call per item. ${TODO_CASE_RULES} ${TODO_ITEM_RULES} ${TODO_SCOPE} ${TODO_ROOT_ONLY}`,
   update: `Change an item's title, due date, start date, priority or group in the TODO list. ${TODO_TITLE_RULE} ${TODO_ROOT_ONLY}`,
   move: `Move an item under another parent or to the top level of the TODO list; both parents' states are re-evaluated. Giving the same parent without position changes nothing. ${TODO_REPEAT_RULE} ${TODO_MOVE_TITLE_RULE} ${TODO_STABLE_RULE} ${TODO_ROOT_ONLY}`,
@@ -201,7 +201,7 @@ function listView(document: TodoDocument): ListView {
 function itemView(view: ListView, item: TodoItem, detail: boolean, hidden: ReadonlySet<string> = new Set()): Record<string, unknown> {
   const children = liveChildren(view.live, item.id).filter(child => !hidden.has(child.id)).map(child => itemView(view, child, false, hidden));
   return {
-    id: item.id, number: view.numbers.get(item.id) ?? "", title: item.title, state: item.state,
+    id: item.id, number: view.numbers.get(item.id) ?? "", title: item.title, state: item.state, ...(item.by === TODO_LAISORA ? { by: TODO_LAISORA } : {}),
     ...(item.due ? { due: item.due } : {}), ...(item.start ? { start: item.start } : {}), ...(item.priority ? { priority: item.priority } : {}), ...(item.group ? { group: item.group } : {}),
     ...(detail ? {
       path: view.path(item.id),
@@ -265,7 +265,7 @@ function treeView(view: ListView, input: Record<string, unknown>, context: Recor
     total += next;
   }
   const omitted = picked.length - shownRoots.length;
-  const waiting = liveChildren(view.live, null).filter(item => item.group === undefined && !finished.has(item.id)).length;
+  const waiting = liveChildren(view.live, null).filter(item => item.group === undefined && !finished.has(item.id) && item.by !== TODO_LAISORA).length;
   const signals = todoTidySignals(view.live.filter(item => !finished.has(item.id)), shownRoots.filter(item => !finished.has(item.id)), chosen === undefined ? "" : `group:${chosen ?? ""}`);
   const notes = [
     ...(fallback ? [contextGroup !== undefined ? `The context group "${contextGroup}" has no open items, so the open items of every group are shown.` : "This conversation gives no context group, so the open items of every group are shown."] : []),

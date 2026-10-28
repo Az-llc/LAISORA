@@ -15,7 +15,7 @@ import {
   type TodoListItem,
   type WebviewToHost,
 } from "../protocol";
-import { TODO_DOC_LABEL_MAX, TODO_DOC_TARGET_MAX, TODO_ESTIMATE_PATTERN, TODO_IMAGE_EXTENSIONS, TODO_TAGS_MAX, TODO_TIME_UNKNOWN, TODO_TITLE_MAX, TODO_WAITING_MAX, todoDecisionGroups, type TodoDecision, type TodoImageMediaType, type TodoState, type WorkMemoSection } from "../todo-model";
+import { TODO_LAISORA, TODO_DOC_LABEL_MAX, TODO_DOC_TARGET_MAX, TODO_ESTIMATE_PATTERN, TODO_IMAGE_EXTENSIONS, TODO_TAGS_MAX, TODO_TIME_UNKNOWN, TODO_TITLE_MAX, TODO_WAITING_MAX, todoDecisionGroups, todoFinishedIds, type TodoDecision, type TodoImageMediaType, type TodoState, type WorkMemoSection } from "../todo-model";
 import { askAnswerPrefix } from "../ask-parser";
 import { formatDateTime } from "./l10n";
 import {
@@ -53,6 +53,7 @@ import {
   todoTextField,
   todoMenuToggle,
   todoTitleEdit,
+  todoControlPressed,
 } from "./todo-edit";
 import { todoMoveSteps } from "./todo-organize";
 import { localDateKey, todoRootGroup } from "./todo-rows";
@@ -341,7 +342,7 @@ export class TodoDetail {
   private header(item: TodoDetailItem): HTMLElement {
     const head = todoEl("header", "todo-dlg-h");
     head.addEventListener("dblclick", (e) => {
-      if ((e.target as HTMLElement).closest("button, input, .todo-dlg-title")) return;
+      if (todoControlPressed(e.target as HTMLElement)) return;
       this.toggleMaximized();
     });
     const text = todoEl("div", "todo-dlg-ht");
@@ -642,7 +643,8 @@ export class TodoDetail {
   }
 
   private kidsLine(kids: readonly TodoListItem[]): string {
-    const done = kids.filter(kid => kid.state === "done").length;
+    const finished = todoFinishedIds(this.host.items());
+    const done = kids.filter(kid => finished.has(kid.id)).length;
     const starts = kids.flatMap(kid => kid.start ?? kid.due ?? []).sort();
     const ends = kids.flatMap(kid => kid.due ?? kid.start ?? []).sort();
     const waiting = kids.filter(kid => kid.waiting);
@@ -1037,7 +1039,7 @@ export class TodoDetail {
     })));
     field(l10n.t("Tags"), todoTextField(l10n.t("Tags"), item.tags ?? "", TODO_TAGS_MAX, "", () => {},
       text(item.tags, tags => this.edit({ kind: "update", id: item.id, tags }))));
-    field(l10n.t("Source"), todoEl("span", "todo-ro", item.by !== "claude" ? l10n.t("Added by you")
+    field(l10n.t("Source"), todoEl("span", "todo-ro", item.by === TODO_LAISORA ? l10n.t("Added by LAISORA") : item.by !== "claude" ? l10n.t("Added by you")
       : item.source?.title !== undefined ? l10n.t("Added by Claude in the conversation “{0}”", item.source.title)
         : item.source ? l10n.t("Added by Claude in a conversation") : l10n.t("Added by Claude")));
     for (const [label, value] of this.timeRows(item)) field(label, todoEl("span", "todo-ro", value));

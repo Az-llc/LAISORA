@@ -15,6 +15,7 @@ import type {
 import { summarizeToolInput } from "./protocol";
 import { claudeProjectsDir } from "./claude-env";
 import { extractResumeSignals } from "./tool-observation";
+import { isFailedToolResult } from "./tool-result-signals";
 import { withImagePlaceholders } from "./transcript-display";
 
 export const INSPECTOR_TOOL_PAGE_SIZE = 25;
@@ -455,9 +456,10 @@ function toolItems(records: readonly Record<string, unknown>[]): {
       if (value?.type !== "tool_result" || typeof value.tool_use_id !== "string") continue;
       const raw = typeof value.content === "string" ? value.content : JSON.stringify(withImagePlaceholders(value.content)) ?? "";
       const preview = clipUtf8(raw, 4096);
-      const isError = value.is_error === true;
-      const signals = isError ? undefined : extractResumeSignals(toolNames.get(value.tool_use_id), toolResultText(value.content));
+      const text = toolResultText(value.content);
+      const signals = value.is_error === true ? undefined : extractResumeSignals(toolNames.get(value.tool_use_id), text);
       const backgroundLaunch = signals?.backgroundTaskId !== undefined || signals?.asyncLaunchedAgentId !== undefined;
+      const isError = isFailedToolResult({ isError: value.is_error === true, resultPreview: text });
       results.set(value.tool_use_id, { isError, backgroundLaunch, preview, truncated: preview.length !== raw.length });
     }
   }

@@ -1,11 +1,20 @@
-import { todoEl as el } from "./todo-edit";
+import { todoControlPressed, todoEl as el, type TodoPressTarget } from "./todo-edit";
 import { todoDropAt, type TodoDrop, type TodoDropRow } from "./todo-organize";
 
 export interface TodoDragHost {
   list(): HTMLElement;
+  targets(): readonly string[];
   describe(ids: readonly string[], drop: TodoDrop): string;
   drop(ids: readonly string[], drop: TodoDrop): void;
+  begin(): void;
   end(): void;
+}
+
+export const TODO_GRIP_CLASS = "todo-grip";
+
+export function todoRowPressDrags(button: number, target: TodoPressTarget | null, pointerType: string): boolean {
+  if (button !== 0 || todoControlPressed(target)) return false;
+  return pointerType === "mouse" || target!.closest(`.${TODO_GRIP_CLASS}`) !== null;
 }
 
 const DRAG_START_PX = 4;
@@ -21,12 +30,20 @@ function scrollerOf(node: HTMLElement): HTMLElement | null {
   return null;
 }
 
-export function startTodoDrag(host: TodoDragHost, row: HTMLElement, ids: readonly string[], start: PointerEvent): void {
-  const handle = start.target as HTMLElement;
+let running: { readonly pointerId: number; holding(): boolean; abandon(): void } | null = null;
+
+export function startTodoDrag(host: TodoDragHost, rowId: string, start: PointerEvent): void {
+  if (running) {
+    if (running.pointerId !== start.pointerId && running.holding()) return;
+    running.abandon();
+  }
   const list = host.list();
-  const startDepth = Number(row.dataset.depth ?? 0);
-  const moving = new Set(ids);
-  const parents = new Map(Array.from(list.querySelectorAll<HTMLElement>(".todo-row[data-id]")).map(node => [node.dataset.id!, node.dataset.parent ?? null]));
+  let holder: HTMLElement | null = null;
+  let ids: readonly string[] = [];
+  let startDepth = 0;
+  let moving = new Set<string>();
+  let parents = new Map<string, string | null>();
+  let scroller: HTMLElement | null = null;
   const dragged = (id: string) => {
     const seen = new Set<string>();
     for (let at: string | null = id; at !== null && !seen.has(at); at = parents.get(at) ?? null) {
@@ -35,7 +52,6 @@ export function startTodoDrag(host: TodoDragHost, row: HTMLElement, ids: readonl
     }
     return false;
   };
-  const scroller = scrollerOf(list);
   const line = el("div", "todo-drop-line");
   const label = el("span", "todo-drop-label");
   line.append(label);
@@ -77,46 +93,74 @@ export function startTodoDrag(host: TodoDragHost, row: HTMLElement, ids: readonl
     update();
     frame = requestAnimationFrame(scroll);
   };
-  const begin = () => {
+  const begin = (): boolean => {
+    const row = list.querySelector<HTMLElement>(`.todo-row[data-id="${CSS.escape(rowId)}"]`);
+    if (!row) return false;
     active = true;
+    host.begin();
+    ids = host.targets();
+    startDepth = Number(row.dataset.depth ?? 0);
+    moving = new Set(ids);
+    parents = new Map(Array.from(list.querySelectorAll<HTMLElement>(".todo-row[data-id]")).map(node => [node.dataset.id!, node.dataset.parent ?? null]));
+    scroller = scrollerOf(list);
+    holder = row;
+    holder.setPointerCapture(start.pointerId);
     list.classList.add("todo-dragging");
     for (const node of Array.from(list.querySelectorAll<HTMLElement>(".todo-row[data-id]"))) if (dragged(node.dataset.id!)) node.classList.add("todo-dragged");
     list.append(line);
+    return true;
   };
-  const finish = (dropIt: boolean) => {
-    handle.removeEventListener("pointermove", move);
-    handle.removeEventListener("pointerup", up);
-    handle.removeEventListener("pointercancel", cancel);
+  const swallowClick = (e: MouseEvent) => {
+    e.preventDefault();
+    e.stopPropagation();
+  };
+  const suppressClick = () => {
+    window.addEventListener("click", swallowClick, { capture: true, once: true });
+    setTimeout(() => window.removeEventListener("click", swallowClick, true), 0);
+  };
+  const finish = (dropIt: boolean, released: boolean) => {
+    window.removeEventListener("pointermove", move, true);
+    window.removeEventListener("pointerup", up, true);
+    window.removeEventListener("pointercancel", cancel, true);
     window.removeEventListener("keydown", key, true);
+    if (running === session) running = null;
+    if (!active) return;
     if (frame) cancelAnimationFrame(frame);
-    if (handle.hasPointerCapture(start.pointerId)) handle.releasePointerCapture(start.pointerId);
+    if (holder?.hasPointerCapture(start.pointerId)) holder.releasePointerCapture(start.pointerId);
     line.remove();
     clearMarks();
     list.classList.remove("todo-dragging");
     for (const node of Array.from(list.querySelectorAll(".todo-dragged"))) node.classList.remove("todo-dragged");
-    const dropped = dropIt && active ? current : null;
+    const dropped = dropIt ? current : null;
     active = false;
+    if (released) suppressClick();
+    else window.addEventListener("pointerup", suppressClick, { capture: true, once: true });
     host.end();
     if (dropped) host.drop(ids, dropped);
   };
+  const ours = (e: PointerEvent) => e.pointerId === start.pointerId;
   const move = (e: PointerEvent) => {
+    if (!ours(e)) return;
+    if ((e.buttons & 1) === 0) return finish(false, true);
     pointer = { x: e.clientX, y: e.clientY };
     if (!active && Math.hypot(e.clientX - start.clientX, e.clientY - start.clientY) < DRAG_START_PX) return;
-    if (!active) begin();
+    if (!active && !begin()) return finish(false, true);
+    getSelection()?.removeAllRanges();
     update();
     if (!frame) frame = requestAnimationFrame(scroll);
   };
-  const up = () => finish(true);
-  const cancel = () => finish(false);
+  const up = (e: PointerEvent) => { if (ours(e)) finish(true, true); };
+  const cancel = (e: PointerEvent) => { if (ours(e)) finish(false, true); };
   const key = (e: KeyboardEvent) => {
-    if (e.key !== "Escape") return;
+    if (!active || e.key !== "Escape") return;
     e.preventDefault();
     e.stopPropagation();
-    finish(false);
+    finish(false, false);
   };
-  handle.setPointerCapture(start.pointerId);
-  handle.addEventListener("pointermove", move);
-  handle.addEventListener("pointerup", up);
-  handle.addEventListener("pointercancel", cancel);
+  const session = { pointerId: start.pointerId, holding: () => active && holder !== null && holder.hasPointerCapture(start.pointerId), abandon: () => finish(false, true) };
+  running = session;
+  window.addEventListener("pointermove", move, true);
+  window.addEventListener("pointerup", up, true);
+  window.addEventListener("pointercancel", cancel, true);
   window.addEventListener("keydown", key, true);
 }

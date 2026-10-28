@@ -36,6 +36,8 @@ import {
   msUntilNextLocalDay,
   TODO_DUE_FILTERS,
   todoDueCounts,
+  todoGroupChipCounts,
+  todoFinishedCount,
   todoDueFilterShown,
   todoFreshItems,
   todoInsertPosition,
@@ -804,10 +806,10 @@ export class TodoTab {
         () => this.setFilters(view.group, filter), { hint: DUE_HINTS[filter]?.(), alert: filter === "overdue" }))));
     const parts: HTMLElement[] = [];
     if (view.groups.length > 0) {
-      const total = full.sections.reduce((sum, section) => sum + section.count, 0);
+      const groupCounts = todoGroupChipCounts(full.sections);
       const groups = set(l10n.t("Filter by group"), [
-        chip("chip-group:", l10n.t("All"), total, view.group === null, () => this.setFilters(null, this.due)),
-        ...view.groups.map(group => chip(`chip-group:${group.name}`, group.name, full.sections.find(section => section.group === group.name)?.count ?? 0,
+        chip("chip-group:", l10n.t("All"), groupCounts.all, view.group === null, () => this.setFilters(null, this.due)),
+        ...view.groups.map(group => chip(`chip-group:${group.name}`, group.name, groupCounts.of(group.name),
           view.group === group.name, () => this.setFilters(group.name, this.due))),
       ]);
       groups.classList.add("todo-chip-groups");
@@ -824,7 +826,7 @@ export class TodoTab {
       button.append(el("span", "todo-chip-n", String(inbox)));
       parts.push(button);
     }
-    const done = this.groupItems(view.group).filter(item => item.state === "done").length;
+    const done = todoFinishedCount(this.groupItems(view.group));
     this.foldBtn.replaceChildren(document.createTextNode(TODO_STATE_LABELS.done()), el("span", "todo-chip-n", String(done)));
     this.foldBtn.hidden = this.foldDone && done === 0;
     this.foldBtn.title = this.foldDone ? l10n.t("Show the done items") : l10n.t("Fold done items into “Show N done” at the end of each list");
@@ -1048,15 +1050,14 @@ export class TodoTab {
     remove: ids => this.sendSteps(todoSelectionRoots(this.itemsNow, ids, this.groupNames()).map(id => ({ kind: "delete", id }))),
     menu: (id, ids, anchor, point) => openTodoMenu(anchor, this.itemMenu(id, ids), l10n.t("Item menu"),
       { filter: true, ...(point ? { point } : {}), title: ids.length > 1 ? l10n.t("{0} selected", ids.length) : this.titleOf(id) }),
-    drag: (row, ids, event) => {
-      this.dragging = true;
-      startTodoDrag({
-        list: () => this.listEl,
-        describe: (moving, drop) => this.describeDrop(moving, drop),
-        drop: (moving, drop) => this.moveTo(moving, drop.slot, l10n.t("Moved.")),
-        end: () => { this.dragging = false; this.render(); },
-      }, row, ids, event);
-    },
+    drag: (id, targets, event) => startTodoDrag({
+      list: () => this.listEl,
+      targets,
+      describe: (moving, drop) => this.describeDrop(moving, drop),
+      drop: (moving, drop) => this.moveTo(moving, drop.slot, l10n.t("Moved.")),
+      begin: () => { this.dragging = true; },
+      end: () => { this.dragging = false; this.render(); },
+    }, id, event),
     selectionChanged: () => this.renderSelection(),
   };
 

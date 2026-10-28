@@ -11,7 +11,7 @@ import {
   vscode,
 } from "./dom";
 import { EFFORT_ORDER, MODE_LABELS, MODE_ORDER, activeTab, activeTabId, closeUsagePanel } from "./main";
-import type { ComposerSendKey, HostToWebview, ModelInfo } from "../protocol";
+import { type ComposerSendKey, type HostToWebview, type ModelInfo } from "../protocol";
 import { setSessionMenuExtras, type SessionMenuExtra } from "./session-header";
 import type { Tab } from "./tab";
 import { REMOTE_CONTROL_CARD_HIDDEN_CLASS } from "./remote-control-view";
@@ -23,6 +23,11 @@ let sendKey: ComposerSendKey = "enter";
 let askQualityCheck = false;
 let editSummary = false;
 const editSummaryListeners = new Set<() => void>();
+const REPLY_TODO_SHOWN_CLASS = "reply-todo-shown";
+
+export function setTodoAvailable(available: boolean): void {
+  document.body.classList.toggle(REPLY_TODO_SHOWN_CLASS, available);
+}
 
 export function applyUserSettings(msg: Extract<HostToWebview, { type: "userSettings" }>): void {
   sendKey = msg.composerSendKey;

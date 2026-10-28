@@ -25,7 +25,7 @@ import { ClaudeConversation, interruptDiscardNotice } from "./claudeHost";
 import { OrchestrationViewPublisher, orchestrationViewForConversation, orchestrationViewFromStartingRoster } from "./orchestration-view";
 import { orchestrationRunsDirectoryOf } from "./orchestration-external";
 import { orchestrationPluginDirectoryOf } from "./orchestration-plugin";
-import { hostTodoStore, noteTodoConversationEvent, postTodoSnapshot, todoFeatureEnabled, todoLinkedItemAtStart } from "./todo-surface";
+import { hostTodoStore, noteTodoConversationEvent, postTodoSnapshot, settleTodoReplyStart, todoFeatureEnabled, todoLinkedItemAtStart } from "./todo-surface";
 import { postAttachments } from "./composer-io";
 import { pendingAttachments } from "./pending-attachments";
 import { flushChosenTitle } from "./session-list-wiring";
@@ -512,10 +512,10 @@ function launchModel(s: Session): string | null | undefined {
   return s.initialModel ?? undefined;
 }
 
-export async function sendLaisoraInput(s: Session, input: LaisoraInput, text: string): Promise<void> {
+export async function sendLaisoraInput(s: Session, input: LaisoraInput, text: string): Promise<boolean> {
   await ensureConversation(s);
-  if (s.closed || s.clearing || !s.conversation) return;
-  s.conversation.send(text, undefined, Date.now(), input);
+  if (s.closed || s.clearing || !s.conversation) return false;
+  return s.conversation.send(text, undefined, Date.now(), input);
 }
 
 export async function handleConversationMessage(
@@ -808,6 +808,7 @@ async function ensureConversationInner(s: Session, requestedAt: number): Promise
       if (own) noteAutoHandoffEvent(s, ev);
       if (own) settleFallbackRevert(store, s, conv, ev);
       if (own && todoEnabled) noteTodoConversationEvent(s, ev);
+      if (own && TURN_END_KINDS.has(ev.kind)) settleTodoReplyStart(s, ev.kind === "turn_completed");
       if (TURN_END_KINDS.has(ev.kind)) noteCliUpdateOpportunity();
       if (own && TURN_END_KINDS.has(ev.kind) && s.unpersistedChosenTitle !== null) void flushChosenTitle(s);
       if (ev.kind === "auth_status" && conversationId === s.expectedConversationId && ev.auth?.billingRealm === "api") {

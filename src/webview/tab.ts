@@ -47,7 +47,7 @@ import { clock, clockRange, formatDuration, monthDayClock, toolSummary } from ".
 import { uiLocale } from "./l10n";
 import { formatHandoffTime, formatHandoffTokens } from "../handoff-format";
 import { createCopyButton, externalLinkElement, renderMarkdownInto } from "./markdown";
-import { forgetCodeBlockStates } from "./markdown-codeblock";
+import { codeActionIcon, forgetCodeBlockStates } from "./markdown-codeblock";
 import { askHeading, askOptionContent, rejectRenderedAsks, settleUncheckedAsks, updateAskCounters } from "./ask-view";
 import { askOtherChoice } from "../ask-parser";
 import { askQualityCheckEnabled, editSummaryEnabled, onEditSummaryChange } from "./menu";
@@ -56,6 +56,7 @@ import { createYouItems, encodeAskDismissal, encodeAskResolution, youAnchor, typ
 import { findCommitBoundary, joinRecordTexts, prependRecordParts, recordSeparator, withoutRetracted, type RecordTextPart } from "../commit-boundary";
 import { breaksParagraph, cardHome, compareTurnOrder, editSummaryPlace, labelPendingParts, legacyAskKeys, locateInParts, mergedParagraph, paragraphKey, paragraphText, prependTurnLayout, turnLabelModel, type ModelMark, type TurnItem, type TurnOrder, type TurnParagraph } from "./turn-layout";
 import { isConvMessageEvent, isConvRenderableEvent, permissionDeniedTarget } from "../conv-renderable";
+import { isFailedToolResult } from "../tool-result-signals";
 import { MARKS } from "./marks";
 import {
   applyActivityEvent,
@@ -1431,8 +1432,9 @@ export class Tab {
       if (this.pendingTodoFinishes.size > ORPHAN_FINISH_MAX) this.pendingTodoFinishes.delete(this.pendingTodoFinishes.keys().next().value!);
       return;
     }
-    setTodoToolCardResult(card, ev.toolUseId, ev.resultPreview, ev.isError, !isHistoryEvent(ev));
-    if (ev.isError) this.todoCallsFailed.add(ev.toolUseId);
+    const failed = isFailedToolResult(ev);
+    setTodoToolCardResult(card, ev.toolUseId, ev.resultPreview, failed, !isHistoryEvent(ev));
+    if (failed) this.todoCallsFailed.add(ev.toolUseId);
     this.placeTodoCard(card, ev.turnId ?? ev.toolUseId);
   }
 
@@ -1941,6 +1943,8 @@ export class Tab {
   private pastTurnCompletedAt = new Map<string, number>();
   private readonly turnFileEdits = new Map<string, (TurnFileEdit & { order: readonly [number, number] })[]>();
   private readonly editSummarySlots = new Map<string, HTMLElement>();
+  private readonly replyTodoIds = new WeakMap<HTMLButtonElement, { find: () => string | undefined; id?: string }>();
+  private readonly priorGenerationTurns = new Set<string>();
   private readonly editTurnEnds = new Map<string, EditTurnEnd>();
   private readonly turnFrames = new Map<string, HTMLElement>();
   private readonly modelMarks: ModelMark[] = [];
@@ -2821,6 +2825,7 @@ export class Tab {
       this.scheduleLogRefresh();
     }
     this.turnState = state;
+    this.syncReplyTodoButtons();
     this.updateStrip();
     if (activeTabId === this.tabId) refreshChrome();
   }
@@ -3620,6 +3625,7 @@ export class Tab {
     if (isHistoryEvent(ev)) this.noteRestoredRecord(this.frameOf(ev.turnId), ev.uuid);
     this.recordAskDismissals(this.youStore.relabel());
     this.syncTodoClosedAsks();
+    this.syncTurnReplyTodo(ev.turnId);
     this.persistAskResolutions();
     this.closeLiveRecord();
     this.liveRecordOpen = this.assistantRuns.some(run => run.uuid === null && !run.complete);
@@ -4263,7 +4269,7 @@ export class Tab {
     return time;
   }
 
-  private buildReplyFooter(at: number | undefined, source: () => string): HTMLElement {
+  private buildReplyFooter(at: number | undefined, source: () => string, replyId: () => string | undefined): HTMLElement {
     const footer = document.createElement("div");
     footer.className = "reply-footer";
     const { button, status } = createCopyButton("msg-copy-button", l10n.t("Copy reply"), source);
@@ -4272,9 +4278,68 @@ export class Tab {
       time.className = "reply-footer-time";
       footer.appendChild(time);
     }
+    footer.appendChild(this.replyTodoButton("todoAdd", l10n.t("Add to ToDo"), replyId, false));
+    footer.appendChild(this.replyTodoButton("todoStart", l10n.t("Add to ToDo and start a new conversation"), replyId, true));
+    const separator = document.createElement("span");
+    separator.className = "reply-todo-separator";
+    footer.appendChild(separator);
     footer.appendChild(button);
     footer.appendChild(status);
     return footer;
+  }
+
+  private replyTodoButton(icon: "todoAdd" | "todoStart", label: string, replyId: () => string | undefined, start: boolean): HTMLButtonElement {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = "reply-todo-button";
+    button.appendChild(codeActionIcon(icon));
+    button.title = label;
+    button.setAttribute("aria-label", label);
+    this.replyTodoIds.set(button, { find: replyId });
+    this.syncReplyTodoButton(button);
+    button.addEventListener("click", () => {
+      const id = this.replyTodoId(button);
+      if (this.turnState !== "idle" || id === undefined) return;
+      vscode.postMessage({ type: "todoFromReply", tabId: this.tabId, replyId: id, start });
+    });
+    return button;
+  }
+
+  private replyTodoId(button: HTMLButtonElement): string | undefined {
+    const entry = this.replyTodoIds.get(button);
+    if (entry !== undefined && entry.id === undefined) entry.id = entry.find();
+    return entry?.id;
+  }
+
+  private syncReplyTodoButton(button: HTMLButtonElement): void {
+    button.hidden = this.replyTodoId(button) === undefined;
+    button.disabled = this.turnState !== "idle";
+  }
+
+  private syncReplyTodoButtons(scope: ParentNode = this.convEl): void {
+    scope.querySelectorAll<HTMLButtonElement>(".reply-todo-button").forEach((button) => this.syncReplyTodoButton(button));
+  }
+
+  private syncTurnReplyTodo(turnId: string): void {
+    const frame = this.frameOf(turnId);
+    for (const footer of [frame === undefined ? null : this.turnFooter(frame), this.pastConvFooters.get(turnId) ?? null]) {
+      if (footer !== null) this.syncReplyTodoButtons(footer);
+    }
+  }
+
+  private notePriorGenerationText(ev: NormalizedEvent): void {
+    if (ev.kind === "assistant_text_delta" && ev.priorGeneration === true) this.priorGenerationTurns.add(ev.turnId);
+  }
+
+  private turnReplyId(turnId: string): string | undefined {
+    if (this.priorGenerationTurns.has(turnId)) return undefined;
+    const segs = this.convEl.querySelectorAll<HTMLElement>(`.block.assistant-turn[data-turn-id="${CSS.escape(turnId)}"] > .assistant-seg`);
+    const parts = Array.from(segs, (seg) => this.segParts(seg)).flat();
+    for (let i = parts.length - 1; i >= 0; i--) {
+      const uuid = parts[i].uuid;
+      if (uuid !== null) return uuid;
+    }
+    return undefined;
   }
 
   private static applyFooterTime(footer: HTMLElement, at: number | undefined): void {
@@ -4285,8 +4350,8 @@ export class Tab {
     footer.prepend(time);
   }
 
-  private appendReplyFooter(at: number | undefined, source: () => string, anchor: HTMLElement | null = null): void {
-    const footer = this.buildReplyFooter(at, source);
+  private appendReplyFooter(at: number | undefined, source: () => string, replyId: () => string | undefined, anchor: HTMLElement | null = null): void {
+    const footer = this.buildReplyFooter(at, source, replyId);
     if (anchor !== null && anchor.isConnected) anchor.after(footer);
     else this.convEl.appendChild(footer);
     this.latestReplyFooter?.removeAttribute("data-latest");
@@ -4331,6 +4396,7 @@ export class Tab {
     this.eventOrder = [ev.generation, ev.seq];
     this.observeLogEvent(ev);
     this.observeYouEvent(ev);
+    this.notePriorGenerationText(ev);
     const fallback = foldModelFallback(this.modelFallback, ev, this.models);
     if (fallback !== this.modelFallback) {
       this.setModelFallback(fallback);
@@ -4600,7 +4666,7 @@ export class Tab {
     const turnId = ev.turnId;
     const frame = this.frameOf(turnId);
     if (this.replyFooterAnchor === null && frame !== undefined && this.turnFooter(frame) !== null) return;
-    this.appendReplyFooter(ev.timestamp > 0 ? ev.timestamp : undefined, () => this.turnCopyText(turnId), this.replyFooterAnchor ?? frame ?? null);
+    this.appendReplyFooter(ev.timestamp > 0 ? ev.timestamp : undefined, () => this.turnCopyText(turnId), () => this.turnReplyId(turnId), this.replyFooterAnchor ?? frame ?? null);
     this.scrollToBottom("conv");
   }
 
@@ -4680,10 +4746,11 @@ export class Tab {
     const frame = this.frameOf(turnId);
     if (frame !== undefined && this.pastTextTurns.has(turnId) && turnId !== this.currentTurnId && !this.suspendedReplies.has(turnId) &&
       this.turnFooter(frame) === null && frame.querySelector(":scope > .assistant-seg") !== null && !this.turnMayBeRunning(turnId, frame)) {
-      const footer = this.buildReplyFooter(this.pastTurnCompletedAt.get(turnId), () => this.turnCopyText(turnId));
+      const footer = this.buildReplyFooter(this.pastTurnCompletedAt.get(turnId), () => this.turnCopyText(turnId), () => this.turnReplyId(turnId));
       this.pastConvFooters.set(turnId, footer);
       frame.after(footer);
     }
+    this.syncTurnReplyTodo(turnId);
     const slot = this.editSummarySlots.get(turnId);
     if (slot !== undefined) this.fitEditSlot(turnId, slot);
   }
@@ -5005,7 +5072,7 @@ export class Tab {
     }
     this.observeSessionTime(ev.recordedAt ?? ev.sentAt);
     if (ev.role === "user") this.appendUserFoot(block, ev.recordedAt ?? ev.sentAt ?? undefined, ev.text);
-    else if (ev.role === "assistant") this.appendReplyFooter(ev.recordedAt, () => ev.text);
+    else if (ev.role === "assistant") this.appendReplyFooter(ev.recordedAt, () => ev.text, () => ev.uuid || undefined);
     this.scrollToBottom("conv");
   }
 
@@ -5413,10 +5480,11 @@ export class Tab {
     this.toolStartTimes.delete(ev.toolUseId);
     const elapsedMs = startedAt !== undefined ? ev.timestamp - startedAt : 0;
 
+    const failed = isFailedToolResult(ev);
     const data = this.rowData.get(ev.toolUseId);
     if (data) {
-      data.status = ev.isError ? "failed" : "done";
-      data.statusGlyph = ev.isError ? TOOL_STATUS_GLYPH.failed : TOOL_STATUS_GLYPH.done;
+      data.status = failed ? "failed" : "done";
+      data.statusGlyph = failed ? TOOL_STATUS_GLYPH.failed : TOOL_STATUS_GLYPH.done;
       data.metaText = undefined;
       data.resultPreview = ev.resultPreview;
       if (data.kind === "tool" && startedAt !== undefined) data.elapsedLabel = formatDuration(elapsedMs);
@@ -5434,14 +5502,14 @@ export class Tab {
     const row = this.toolCards.get(ev.toolUseId);
     if (row) {
       row.classList.remove("running");
-      row.classList.add(ev.isError ? "failed" : "done");
+      row.classList.add(failed ? "failed" : "done");
       const status = row.querySelector<HTMLElement>(".tool-status");
       if (status) {
-        status.className = `tool-status ${ev.isError ? "failed" : "done"}`;
-        status.textContent = ev.isError ? TOOL_STATUS_GLYPH.failed : TOOL_STATUS_GLYPH.done;
+        status.className = `tool-status ${failed ? "failed" : "done"}`;
+        status.textContent = failed ? TOOL_STATUS_GLYPH.failed : TOOL_STATUS_GLYPH.done;
       }
       const resultPre = document.createElement("pre");
-      resultPre.className = ev.isError ? "tool-result tool-result-error" : "tool-result";
+      resultPre.className = failed ? "tool-result tool-result-error" : "tool-result";
       resultPre.textContent = ev.resultPreview;
       row.appendChild(resultPre);
       const rowSummary = row.querySelector("summary");
@@ -5620,11 +5688,12 @@ export class Tab {
   }
 
   private settleDenialRows(ev: Extract<NormalizedEvent, { kind: "tool_call_finished" }>): void {
-    this.rememberCall(this.finishedCalls, ev.toolUseId, this.finishedCalls.get(ev.toolUseId) === true || !ev.isError);
+    const ran = !isFailedToolResult(ev);
+    this.rememberCall(this.finishedCalls, ev.toolUseId, this.finishedCalls.get(ev.toolUseId) === true || ran);
     const rows = this.denialRows.get(ev.toolUseId);
     if (rows === undefined) return;
     this.denialRows.delete(ev.toolUseId);
-    if (ev.isError) return;
+    if (!ran) return;
     for (const row of rows) this.dropDenialRow(row);
     this.scheduleLogRefresh();
   }
@@ -6063,6 +6132,7 @@ export class Tab {
     turns: PastTurns
   ): "created" | "duplicate" | "continued" | "skipped" {
     this.observeYouEvent(ev);
+    this.notePriorGenerationText(ev);
     if (ev.kind === "tool_call_started" && ev.turnId !== null && !isChildCall(ev.parentToolUseId) && isTodoWriteTool(ev.toolName)) {
       this.placeTodoToolCard(ev, turns);
       return "skipped";
@@ -6146,7 +6216,7 @@ export class Tab {
       }
       frag.appendChild(div);
       if (ev.role === "user") this.appendUserFoot(div, ev.recordedAt ?? ev.sentAt ?? undefined, ev.text);
-      else if (ev.role === "assistant") frag.appendChild(this.buildReplyFooter(ev.recordedAt, () => ev.text));
+      else if (ev.role === "assistant") frag.appendChild(this.buildReplyFooter(ev.recordedAt, () => ev.text, () => uuid || undefined));
       return "created";
     }
     if (ev.kind === "user_message") {
@@ -6270,7 +6340,7 @@ export class Tab {
         }
         frag.appendChild(div);
         if (m.role === "user") this.appendUserFoot(div, m.timestamp, m.text);
-        else if (m.role === "assistant") frag.appendChild(this.buildReplyFooter(m.timestamp, () => m.text));
+        else if (m.role === "assistant") frag.appendChild(this.buildReplyFooter(m.timestamp, () => m.text, () => m.uuid || undefined));
       } catch (error) {
         failed++;
         if (failures.length < 5) failures.push(String(error));

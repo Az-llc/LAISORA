@@ -2,6 +2,7 @@ import * as l10n from "@vscode/l10n";
 import * as vscode from "vscode";
 import { randomBytes } from "node:crypto";
 import { scheduleCliUpdates } from "./claude-cli-update";
+import { setHostTelemetrySource } from "./claude-env";
 import { CLI_AUTO_UPDATE_SETTINGS } from "./cli-update-policy";
 export { handleAnalysisMessage } from "./analysis-messages";
 export { handleConversationMessage } from "./conversation-lifecycle";
@@ -193,6 +194,7 @@ function activateReady(context: vscode.ExtensionContext): void {
   void sweepHandoffForksAtStartup();
   void removeRetiredLearningStore(context.globalStorageUri?.fsPath, (line) => output.appendLine(line));
   void removeRetiredBaselineCache(context.globalState, (line) => output.appendLine(line));
+  setHostTelemetrySource(() => vscode.env.isTelemetryEnabled);
   scheduleCliUpdates(context);
   syncTodoSurface();
   const readOnlyFiles = registerReadOnlyFileProvider();

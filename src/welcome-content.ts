@@ -18,8 +18,12 @@ export interface WelcomeUiNames { menuGlyph: string; handoffItem: string; appear
 
 export function welcomeNews(): Readonly<Record<string, readonly WelcomeNewsItem[]>> {
   return {
+    "1.13.0": [
+      { kind: "new", text: l10n.t("Claude's replies get \"Add to ToDo\" and \"Add to ToDo and start a new conversation\" buttons beside Copy."), setting: "todo" },
+      { kind: "new", text: l10n.t("ToDo rows can be dragged from anywhere on the row.") },
+    ],
     "1.12.0": [
-      { kind: "new", text: l10n.t("The ToDo list is on from the start. Claude can add to it and update it, and every window shares it.") },
+      { kind: "new", text: l10n.t("The ToDo list is on from the start. Claude can add to it and update it, and every window shares it. If you don't need it, you can turn it off in the settings."), setting: "todo" },
       { kind: "new", text: l10n.t("GRAPH shows the work a delegate started as rows folded under that delegate.") },
       { kind: "new", text: l10n.t("Conversations from Claude Desktop continue in their own folder.") },
     ],

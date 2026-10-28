@@ -22,7 +22,7 @@ export { FILE_LINK_TARGET_MAX_LEN } from "./file-link-target";
 import { agentRuns, findToolPlacement, findWorkSegment, phaseStateOf, runningMainPlacement } from "./work-model";
 import { ANALYSIS_TIME_PART_KEYS, MAIN_PROCESSING_BUCKETS, planCurrentSteps } from "./plan-steps";
 import { BACKGROUND_ACTIVITY_LIST_MAX, type BackgroundActivitySnapshot } from "./background-activity";
-import { isTodoAskIdentity, isTodoTime, isTodoDocLabel, isTodoImageName, isTodoGroupName, isTodoFolderPath, TODO_ITEM_SHAPES, TODO_CHANGE_FIELDS, isTodoChangeRecord, isTodoGroupAlias, isTodoBriefText, isTodoDocFields, isTodoGuessReason, isTodoId, isTodoMemoEntry, isTodoMemoText, isTodoSessionId, todoItemFieldValid, TODO_OPERATION_ERRORS, TODO_REVERT_BLOCKS, type TodoPlacementBasis, type TodoChangePlace, type TodoCaptured, TODO_ASK_PLACES, type TodoAskPlace, TODO_ASK_SOURCE_MESSAGES_MAX, TODO_BATCH_MAX, type TodoBatchStep, TODO_GROUP_COLOR_COUNT, TODO_TEMPLATE_NAME_MAX, TODO_ACKNOWLEDGE_MAX, TODO_IMAGE_EXTENSIONS, TODO_TITLE_MAX, WORK_MEMO_SECTIONS, TODO_START_KINDS, type TodoStartKind, type TodoAuthor, type TodoCompletion, type TodoDocKind, type TodoImageMediaType, type TodoOperationError, type TodoPriority, type TodoRevertBlock, type TodoState, type WorkMemoSection, type TodoDecision } from "./todo-model";
+import { isTodoAskIdentity, isTodoTime, isTodoDocLabel, isTodoImageName, isTodoGroupName, isTodoFolderPath, TODO_ITEM_SHAPES, TODO_CHANGE_FIELDS, isTodoChangeRecord, isTodoGroupAlias, isTodoBriefText, isTodoDocFields, isTodoGuessReason, isTodoId, isTodoMemoEntry, isTodoMemoText, isTodoSessionId, todoItemFieldValid, TODO_OPERATION_ERRORS, TODO_REVERT_BLOCKS, type TodoPlacementBasis, type TodoChangePlace, type TodoCaptured, TODO_ASK_PLACES, type TodoAskPlace, TODO_ASK_SOURCE_MESSAGES_MAX, TODO_BATCH_MAX, type TodoBatchStep, TODO_GROUP_COLOR_COUNT, TODO_TEMPLATE_NAME_MAX, TODO_ACKNOWLEDGE_MAX, TODO_IMAGE_EXTENSIONS, TODO_TITLE_MAX, WORK_MEMO_SECTIONS, TODO_START_KINDS, type TodoStartKind, type TodoAuthor, type TodoCompletion, type TodoDocKind, type TodoImageMediaType, type TodoOperationError, type TodoPriority, type TodoRevertBlock, type TodoState, type WorkMemoSection, type TodoDecision, type TodoItemBy, type TodoChange } from "./todo-model";
 export { BACKGROUND_ACTIVITY_LIST_MAX } from "./background-activity";
 export type { BackgroundActivitySnapshot } from "./background-activity";
 import type {
@@ -699,7 +699,7 @@ export function summarizeToolInput(toolName: string, input: unknown): string | n
 export const HOST_ACTIONS = ["openSettings", "addClaudeModel"] as const;
 export type HostAction = (typeof HOST_ACTIONS)[number];
 
-export const SETTINGS_REVEAL_TARGETS = ["handoffAuto", "orchestration", "appearance"] as const;
+export const SETTINGS_REVEAL_TARGETS = ["handoffAuto", "orchestration", "appearance", "todo"] as const;
 export type SettingsRevealTarget = (typeof SETTINGS_REVEAL_TARGETS)[number];
 export function isSettingsRevealTarget(v: unknown): v is SettingsRevealTarget {
   return (SETTINGS_REVEAL_TARGETS as readonly unknown[]).includes(v);
@@ -1193,6 +1193,7 @@ export type WebviewToHost =
   | { type: "todoImageRequest"; name: string }
   | { type: "todoOpenDoc"; itemId: string; docId: string }
   | { type: "todoOpenConversation"; itemId: string; fresh: boolean }
+  | { type: "todoFromReply"; tabId: string; replyId: string; start: boolean }
   | { type: "todoAskSourceRequest"; sessionId: string; requestId: number }
   | { type: "todoAskDismiss"; itemId: string; message: string; place: TodoAskPlace }
   | { type: "todoChangesRequest"; requestId: number; ids: string[]; revisions?: number[][] }
@@ -1259,6 +1260,7 @@ export interface TodoChangeView {
   readonly revert?: "ok" | TodoRevertBlock;
   readonly acknowledged?: true;
   readonly basis?: TodoPlacementBasis;
+  readonly by?: TodoChange["by"];
   readonly from?: TodoChangePlace;
   readonly to?: TodoChangePlace;
 }
@@ -1326,7 +1328,7 @@ export interface TodoDetailItem {
   readonly repeat?: string;
   readonly estimate?: string;
   readonly tags?: string;
-  readonly by?: "claude";
+  readonly by?: TodoItemBy;
   readonly guesses?: TodoGuessView;
   readonly startedAt?: number;
   readonly doneAt?: number;
@@ -3950,7 +3952,7 @@ export interface TodoListItem {
   readonly start?: string;
   readonly priority?: TodoPriority;
   readonly waiting?: string;
-  readonly by?: "claude";
+  readonly by?: TodoItemBy;
   readonly guess?: TodoGuessView;
   readonly marks?: readonly string[];
   readonly markInfo?: readonly TodoMarkInfo[];
@@ -4115,6 +4117,11 @@ export function isWebviewToHost(v: unknown): v is WebviewToHost {
   if (t === "todoOpenConversation") {
     const m = v as Record<string, unknown>;
     return hasOnlyKeys(m, ["type", "itemId", "fresh"]) && isTodoId(m.itemId) && typeof m.fresh === "boolean";
+  }
+  if (t === "todoFromReply") {
+    const m = v as Record<string, unknown>;
+    return hasOnlyKeys(m, ["type", "tabId", "replyId", "start"]) && typeof tabId === "string" && tabId.length > 0 && tabId.length <= 200
+      && isTodoSessionId(m.replyId) && typeof m.start === "boolean";
   }
   if (t === "todoAskSourceRequest") {
     const m = v as Record<string, unknown>;
@@ -5033,7 +5040,7 @@ function isTodoEdit(value: unknown): value is TodoEdit {
 function isTodoChangeView(value: unknown): value is TodoChangeView {
   if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
   const change = value as Record<string, unknown>;
-  return hasOnlyKeys(change, ["id", "at", "author", "itemId", "itemTitle", "field", "before", "after", "cascade", "revert", "acknowledged", "basis", "from", "to"])
+  return hasOnlyKeys(change, ["id", "at", "author", "itemId", "itemTitle", "field", "before", "after", "cascade", "revert", "acknowledged", "basis", "by", "from", "to"])
     && (change.from === undefined || isTodoChangePlace(change.from)) && (change.to === undefined || isTodoChangePlace(change.to))
     && isTodoChangeRecord(change) && typeof change.itemTitle === "string"
     && (change.before === null || typeof change.before === "string") && (change.after === null || typeof change.after === "string")

@@ -170,9 +170,20 @@ export function todoDueCounts(items: readonly TodoCountItem[], today: string): R
   return counts;
 }
 
+export function todoGroupChipCounts(sections: readonly Pick<TodoSectionView, "group" | "open">[]): { readonly all: number; readonly of: (group: string) => number } {
+  return {
+    all: sections.reduce((sum, section) => sum + section.open, 0),
+    of: group => sections.find(section => section.group === group)?.open ?? 0,
+  };
+}
+
 export function todoOpenCount(items: readonly Pick<TodoListItem, "id" | "parentId" | "state" | "completion">[]): number {
   const finished = todoFinishedIds(items);
   return items.filter(item => !finished.has(item.id)).length;
+}
+
+export function todoFinishedCount(items: readonly Pick<TodoListItem, "id" | "parentId" | "state" | "completion">[]): number {
+  return items.length - todoOpenCount(items);
 }
 
 export function todoDueFilterShown(filter: TodoDueFilter, counts: Record<TodoDueFilter, number>, chosen: TodoDueFilter): boolean {
@@ -316,7 +327,7 @@ export function deriveTodoList(items: readonly TodoListItem[], options: TodoList
         held: item.state !== "done" && finished.has(item.id),
         ...(item.talk !== undefined ? { talk: item.talk } : {}), ...(item.markInfo?.length ? { claude: item.markInfo } : {}), ...(item.captured !== undefined ? { captured: item.captured } : {}),
         color, collapsible, collapsed, context: restricted && !hits.has(item.id),
-        ...(depth === 0 && kids.length > 0 ? { children: { done: kids.filter(kid => kid.state === "done").length, total: kids.length } } : {}),
+        ...(depth === 0 && kids.length > 0 ? { children: { done: kids.filter(kid => finished.has(kid.id)).length, total: kids.length } } : {}),
       });
       if (collapsed) return;
       const key = todoSiblingKey(item.id, null);

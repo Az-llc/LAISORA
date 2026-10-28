@@ -14,7 +14,7 @@ import { handleHistoryMessage } from "./history-serving";
 import { output } from "./host-context";
 import { handleInspectorMessage } from "./inspector-wiring";
 import { handleSessionFileMessage } from "./session-list-wiring";
-import { handleTodoMessage, openTodoConversation, setTodoDrawerFocus } from "./todo-surface";
+import { handleTodoMessage, openTodoConversation, setTodoDrawerFocus, todoFromReply } from "./todo-surface";
 import { isWebviewToHost, rejectedTodoEditId } from "./protocol";
 import type { SessionStore } from "./store-surfaces";
 
@@ -138,6 +138,9 @@ export async function handleWebviewMessage(
         break;
       case "todoOpenConversation":
         await openTodoConversation(st, msg, sender);
+        break;
+      case "todoFromReply":
+        await todoFromReply(st, msg, target!);
         break;
       default: {
         const unrouted: never = msg;

@@ -76,6 +76,8 @@ const CODE_ACTION_ICONS = {
   open: "M9 2.5h4.5V7M13.5 2.5 7.5 8.5M11.5 9.5v4h-9v-9h4",
   wrap: "M2 3.5h12M2 7h9a3 3 0 0 1 0 6H8m2-2-2 2 2 2M2 10.5h3",
   nowrap: "M2 3.5h12M2 7h12m-2-2 2 2-2 2M2 10.5h7M15 1.5v13",
+  todoAdd: "M2 3.5h8M2 7h8M2 10.5h5M12.5 9v5M10 11.5h5",
+  todoStart: "M2.5 4.5h7v9h-7zM9 2.5h4.5V7M13.5 2.5 8.5 7.5",
 };
 
 export function codeActionIcon(kind: keyof typeof CODE_ACTION_ICONS): SVGSVGElement {

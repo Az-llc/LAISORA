@@ -369,7 +369,7 @@ export class ClaudeConversation {
   get orchestrationRuns(): readonly OrchestrationRunRecord[] { return Object.freeze([...this.runs]); }
   get observedAgentRuns(): ReadonlyMap<string, AgentRunRecord> { return new Map(this.agentRuns); }
   private async recordRun(unstamped: OrchestrationRunRecord): Promise<OrchestrationRunRecord> {
-    const sessionId = this.authSessionId ?? this.opts.resumeSessionId;
+    const sessionId = this.recordSessionId;
     const runId = unstamped.runId ?? randomUUID();
     const dispatchId = unstamped.dispatchId ?? randomUUID();
     let record: OrchestrationRunRecord = Object.freeze({ ...unstamped, runId, dispatchId,
@@ -559,6 +559,14 @@ export class ClaudeConversation {
 
   get isClosed(): boolean {
     return this.closed;
+  }
+
+  get recordSessionId(): string | undefined {
+    return this.authSessionId ?? this.opts.resumeSessionId;
+  }
+
+  get hasTodoTools(): boolean {
+    return this.opts.todoStore !== undefined;
   }
 
   private loadAgentDef(subagentType: string): AgentDefInfo | undefined {
@@ -812,7 +820,7 @@ ${ctxJson}`
     };
     if (this.opts.todoStore) {
       const gate = this.todoGate = new RootGate(undefined, this.opts.log, TODO_ROOT_SCOPE);
-      options.mcpServers = { ...(options.mcpServers ?? {}), [TODO_SERVER_NAME]: createTodoMcpServer(sdk, this.opts.todoStore, gate, this.opts.log, () => this.authSessionId ?? this.opts.resumeSessionId,
+      options.mcpServers = { ...(options.mcpServers ?? {}), [TODO_SERVER_NAME]: createTodoMcpServer(sdk, this.opts.todoStore, gate, this.opts.log, () => this.recordSessionId,
         () => ({ cwd: this.opts.cwd, files: this.todoFiles, roots: todoWorkspaceRoots(), home: homedir() })) };
       options.allowedTools = [...(options.allowedTools ?? []), ...TODO_TOOL_NAMES];
       addRootGate(gate);
@@ -1079,7 +1087,7 @@ ${ctxJson}`
     return [...this.pendingApprovals.values()].flatMap(p => p.toolUseId === undefined ? [] : [p.toolUseId]);
   }
 
-  send(text: string, images?: ImageAttachment[], sentAt = Date.now(), automatic: LaisoraInput | false = false, uuid?: `${string}-${string}-${string}-${string}-${string}`): void {
+  send(text: string, images?: ImageAttachment[], sentAt = Date.now(), automatic: LaisoraInput | false = false, uuid?: `${string}-${string}-${string}-${string}-${string}`): boolean {
     if (!automatic) this.usageLimitResume.manualSend();
     if (this.closed) {
       this.emit({
@@ -1087,7 +1095,7 @@ ${ctxJson}`
         message: l10n.t("The conversation has ended. Resend your message (a new connection will be started)"),
         fatal: false,
       });
-      return;
+      return false;
     }
     if (this.normalizer.turnState === "interrupting") {
       this.emit({
@@ -1095,7 +1103,7 @@ ${ctxJson}`
         message: l10n.t("Interrupt in progress. Stop first, then send again."),
         fatal: false,
       });
-      return;
+      return false;
     }
     const runningAlready = this.normalizer.turnState !== "idle";
     if (!runningAlready) {
@@ -1117,6 +1125,7 @@ ${ctxJson}`
       { type: "text", text },
     ];
     this.queueUserInput(content, { ...(automatic ? { isMeta: true as const } : {}), uuid: uuid ?? randomUUID() });
+    return true;
   }
 
   async interrupt(): Promise<void> {

@@ -2,8 +2,9 @@ import { isComposingKey } from "./composing";
 import * as l10n from "@vscode/l10n";
 import type { TodoEdit } from "../protocol";
 import { TODO_GROUP_MAX, TODO_TITLE_MAX, type TodoState } from "../todo-model";
-import { formatTodoDay, openTodoMenu, todoCapturedText, todoMarkText, todoRecentMarks, TODO_PRIORITY_LABELS, TODO_STATE_KEYS as STATE_KEYS, TODO_STATE_LABELS, todoButton, todoDateEl, todoPlayButton, todoEl as el, todoGuessMark, todoStateIcon, todoStateMenu, todoMenuToggle, todoTalkMark, todoTitleEdit } from "./todo-edit";
+import { formatTodoDay, openTodoMenu, todoCapturedText, todoMarkText, todoRecentMarks, TODO_PRIORITY_LABELS, TODO_STATE_KEYS as STATE_KEYS, TODO_STATE_LABELS, todoButton, todoControlPressed, todoDateEl, todoPlayButton, todoEl as el, todoGuessMark, todoStateIcon, todoStateMenu, todoMenuToggle, todoTalkMark, todoTitleEdit } from "./todo-edit";
 import { todoAskNoteEl, todoAskRowEl, type TodoAskActions, type TodoAskRow } from "./todo-asks";
+import { TODO_GRIP_CLASS, todoRowPressDrags } from "./todo-drag";
 import { localDateKey, type TodoFamilyView, type TodoRowView, type TodoSectionView } from "./todo-rows";
 
 export const todoGroupColor = (color: number | null) => color === null ? "" : `var(--l-todo-group-${color})`;
@@ -41,7 +42,7 @@ export interface TodoRowOrganize {
   indent(ids: readonly string[], direction: -1 | 1): void;
   remove(ids: readonly string[]): void;
   menu(id: string, ids: readonly string[], anchor: HTMLElement, point?: { x: number; y: number }): void;
-  drag(row: HTMLElement, ids: readonly string[], event: PointerEvent): void;
+  drag(id: string, targets: () => readonly string[], event: PointerEvent): void;
   selectionChanged(): void;
 }
 
@@ -243,7 +244,7 @@ export class TodoRowRenderer {
     fold.setAttribute("aria-expanded", folded ? "false" : "true");
     fold.setAttribute("aria-label", `${name} — ${fold.title}`);
     fold.dataset.focusKey = this.key("group", section.key);
-    head.addEventListener("click", (e) => { if (!(e.target as HTMLElement).closest("button, input")) groups.toggle(section); });
+    head.addEventListener("click", (e) => { if (!todoControlPressed(e.target as HTMLElement)) groups.toggle(section); });
     head.append(fold);
     const group = section.group;
     if (group !== null && groups.renaming() === group) {
@@ -381,7 +382,7 @@ export class TodoRowRenderer {
       node.classList.toggle("selected", this.selected.has(row.id));
     }
     node.addEventListener("click", (e) => {
-      if (e.detail > 1 || (e.target as HTMLElement).closest("button, input")) return;
+      if (e.detail > 1 || todoControlPressed(e.target as HTMLElement)) return;
       if (organize && (e.ctrlKey || e.metaKey)) {
         this.toggleSelected(row.id);
         return;
@@ -404,17 +405,12 @@ export class TodoRowRenderer {
         e.preventDefault();
         organize.menu(row.id, this.targets(row.id), node, { x: e.clientX, y: e.clientY });
       });
-      const grip = el("button", "todo-grip");
-      grip.type = "button";
-      grip.tabIndex = -1;
-      grip.dataset.dragHandle = "";
+      node.addEventListener("pointerdown", (e) => {
+        if (todoRowPressDrags(e.button, e.target as HTMLElement, e.pointerType)) organize.drag(row.id, () => this.targets(row.id), e);
+      });
+      const grip = el("span", TODO_GRIP_CLASS);
       grip.title = l10n.t("Drag to move (with its sub-items)");
       grip.setAttribute("aria-hidden", "true");
-      grip.addEventListener("pointerdown", (e) => {
-        if (e.button !== 0) return;
-        e.preventDefault();
-        organize.drag(node, this.targets(row.id), e);
-      });
       node.append(grip);
     }
     return node;

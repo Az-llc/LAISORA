@@ -1648,6 +1648,7 @@ const REVEAL_TARGETS: Record<SettingsRevealTarget, { category: string; target: (
   handoffAuto: { category: "general", target: () => handoffAutoTexts.enabled.closest<HTMLElement>(".settings-row") ?? handoffAutoTexts.enabled },
   orchestration: { category: "roster", target: () => orchestrationCard },
   appearance: { category: "general", target: () => accentCard.closest<HTMLElement>(".settings-section") ?? accentCard },
+  todo: { category: "general", target: () => todoText.closest<HTMLElement>(".settings-row") ?? todoText },
 };
 let pendingReveal: SettingsRevealTarget | undefined;
 function revealSetting(target: SettingsRevealTarget): void {

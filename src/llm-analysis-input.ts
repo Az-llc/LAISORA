@@ -5,6 +5,7 @@ import { buildCitationAliasTable } from "./llm-citation-alias";
 import type { CitationAliasTable } from "./llm-citation-alias";
 import { redactAbsolutePaths } from "./path-redaction";
 import { renderReferenceEnvelope } from "./llm-context-files";
+import { isFailedToolResult } from "./tool-result-signals";
 import type { ContextFile } from "./llm-context-files";
 
 export const LLM_INPUT_BUDGET_TOKENS = 180_000;
@@ -232,7 +233,7 @@ function buildEventItems(
       }
 
       const started = toolStartedMap.get(toolUseId);
-      const isError = event.isError;
+      const isError = isFailedToolResult(event);
       const durationMs = started ? Math.max(0, event.timestamp - started.timestamp) : 0;
       const durationSec = (durationMs / 1000).toFixed(1);
       const status = isError ? `fail ${durationSec}s` : `ok ${durationSec}s`;
@@ -365,7 +366,7 @@ export function buildNumericFactTable(
         value: durationMs,
         evidenceIds: [event.toolUseId],
         toolName: started?.toolName ?? "Tool",
-        isError: event.isError,
+        isError: isFailedToolResult(event),
       });
     }
   }
@@ -450,7 +451,7 @@ export function buildNumericFactTable(
 
   let wasteSeq = 0;
   for (const event of context.events) {
-    if (event.kind !== "tool_call_finished" || event.isError !== true) continue;
+    if (event.kind !== "tool_call_finished" || !isFailedToolResult(event)) continue;
     const started = startedMap.get(event.toolUseId);
     const eAlias = eventAliasOf.get(event.toolUseId);
     if (started === undefined || eAlias === undefined) continue;

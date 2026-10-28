@@ -6,7 +6,7 @@ import { isLlmAnalysisExecution, type NormalizedEvent } from "./protocol";
 import { createExecLogMarkState, foldExecLogMarks, type ExecLogMark } from "./exec-log-marks";
 import { emptyKeyedLog, keyedGet, keyedSet, keyedValues, launchItemNumber, type KeyedLog } from "./time-buckets";
 import { isExternalRunTool, type ExternalRunOutcome } from "./orchestration-executors";
-import { isRejectedBeforeRun, taskNotificationOutcome, taskNotificationTerminal } from "./tool-result-signals";
+import { isFailedToolResult, isInterruptedWhileRunning, isRejectedBeforeRun, taskNotificationOutcome, taskNotificationTerminal } from "./tool-result-signals";
 import { bookkeepingIntent, MAX_EVICTED_LAUNCHES } from "./work-model";
 
 export interface AnalysisToolRecord {
@@ -55,7 +55,7 @@ function foldExternalRunCalls(log: KeyedLog<ExternalRunCall> | undefined, event:
   if (call !== undefined) {
     if (isRejectedBeforeRun(finished)) return keyedSet(log, call.toolUseId, { ...call, endedAt: event.timestamp, rejectedBeforeRun: true });
     if (finished.backgroundTaskId !== undefined && finished.isError !== true) return keyedSet(log, call.toolUseId, { ...call, backgroundTaskId: finished.backgroundTaskId });
-    return keyedSet(log, call.toolUseId, { ...call, endedAt: event.timestamp, outcome: finished.isError ? "failed" : "ok" });
+    return keyedSet(log, call.toolUseId, { ...call, endedAt: event.timestamp, outcome: isInterruptedWhileRunning(finished) ? "stopped" : finished.isError ? "failed" : "ok" });
   }
   const notified = finished.taskNotification;
   const background = notified === undefined ? undefined : keyedValues(log).find(value => value.backgroundTaskId === notified.agentId && value.outcome === undefined);
@@ -110,7 +110,7 @@ export function foldSessionFacts(
       ...(itemNumber === undefined ? {} : { itemNumber }),
       ...(started !== undefined && bookkeepingIntent(started) !== undefined ? { bookkeeping: true as const } : {}),
       ...(event.kind === "tool_call_started" ? { startedAt: event.timestamp } : { finishedAt: event.timestamp }),
-      failed: event.kind === "tool_call_finished" ? event.isError === true : previous?.failed ?? false,
+      failed: finished !== undefined ? isFailedToolResult(finished) : previous?.failed ?? false,
       marks: event.kind === "tool_call_finished" ? foldExecLogMarks(createExecLogMarkState(), event as NormalizedEvent).marks : previous?.marks ?? [],
     });
   }

@@ -1,6 +1,6 @@
 export type CacheTtl = "5m" | "1h";
 export const PROMPT_CACHE_WRITE_MULTIPLIER: Readonly<Record<CacheTtl, number>> = { "5m": 1.25, "1h": 2 };
-export const PROMPT_CACHE_PRICES_CHECKED_ON = "2026-10-27";
+export const PROMPT_CACHE_PRICES_CHECKED_ON = "2026-10-29";
 export type TokenPrices = { readonly input: number; readonly read: number; readonly output: number };
 export type ClaudeModelPrices = TokenPrices & { readonly overLongPrompt?: TokenPrices & { readonly aboveTokens: number } };
 export const CLAUDE_MODEL_PRICES: Readonly<Record<string, ClaudeModelPrices>> = {

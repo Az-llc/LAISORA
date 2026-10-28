@@ -5,7 +5,7 @@ import { progressSubjectKey } from "./progress-protocol";
 import { isHistoryEvent, isObservedTime, type NormalizedEvent } from "./protocol";
 import { redactAbsolutePaths } from "./path-redaction";
 import { planItemLabel } from "./plan-steps";
-import { HUMAN_REJECTED_TOOL_RESULT_RE } from "./tool-result-signals";
+import { HUMAN_REJECTED_TOOL_RESULT_RE, isInterruptedWhileRunning } from "./tool-result-signals";
 import type { SteeringSignalSummary } from "./steering-envelope";
 import { conductorStopTarget } from "./tool-intent";
 
@@ -353,7 +353,7 @@ function foldEvent(state: GuardrailState, ev: NormalizedEvent): GuardrailState {
     if (usageLimit && state.subjects[`agent:${ev.toolUseId}`]) {
       discardRecoveredFailures(state, `agent:${ev.toolUseId}`, ev.turnId);
     }
-    if (ev.isError && (HUMAN_REJECTED_TOOL_RESULT_RE.test(ev.resultPreview ?? "") || usageLimit)) {
+    if (isInterruptedWhileRunning(ev) || usageLimit) {
       return state;
     }
 

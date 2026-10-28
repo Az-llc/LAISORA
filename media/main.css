@@ -1218,7 +1218,8 @@ details.handoff-row[open] > summary .handoff-row-chev { transform: rotate(90deg)
   bottom: 100%;
   height: 8px;
 }
-.msg-copy-button {
+.msg-copy-button,
+.reply-todo-button {
   display: inline-flex;
   align-items: center;
   justify-content: center;
@@ -1231,7 +1232,8 @@ details.handoff-row[open] > summary .handoff-row-chev { transform: rotate(90deg)
   background: transparent;
   cursor: pointer;
 }
-.msg-copy-button svg {
+.msg-copy-button svg,
+.reply-todo-button svg {
   width: 14px;
   height: 14px;
   fill: none;
@@ -1240,10 +1242,20 @@ details.handoff-row[open] > summary .handoff-row-chev { transform: rotate(90deg)
   stroke-linecap: round;
   stroke-linejoin: round;
 }
-.msg-copy-button:hover { background: var(--vscode-toolbar-hoverBackground, rgba(128,128,128,0.2)); }
-.msg-copy-button:focus-visible { outline: 1px solid var(--vscode-focusBorder); outline-offset: 1px; }
+.msg-copy-button:hover,
+.reply-todo-button:hover { background: var(--vscode-toolbar-hoverBackground, rgba(128,128,128,0.2)); }
+.msg-copy-button:focus-visible,
+.reply-todo-button:focus-visible { outline: 1px solid var(--vscode-focusBorder); outline-offset: 1px; }
 .msg-copy-button[data-copy-state="copied"] { color: var(--vscode-testing-iconPassed, #2d7d46); }
 .msg-copy-button[data-copy-state="failed"] { color: var(--vscode-errorForeground); }
+.reply-todo-button svg { width: 16px; height: 16px; }
+.reply-todo-separator { width: 1px; height: 14px; margin: 0 2px; background: var(--vscode-widget-border, rgba(128,128,128,0.35)); }
+body:not(.reply-todo-shown) .reply-todo-button,
+body:not(.reply-todo-shown) .reply-todo-separator,
+.reply-todo-button[hidden],
+.reply-todo-button[hidden] + .reply-todo-button[hidden] + .reply-todo-separator { display: none; }
+.reply-todo-button:disabled { opacity: 0.4; cursor: default; }
+.reply-todo-button:disabled:hover { background: transparent; }
 
 /* ---------- タイトル右の状態行 ---------- */
 /* sticky は親の .log-head が担うため、ここでは位置指定しない（二重stickyを避ける） */
@@ -4125,10 +4137,10 @@ body:has(.todo-sheet:not([hidden])) .todo-pane.active { margin-right: 380px; }
 @container todo-sheet (max-width: 320px) {
   .todo-sheet-fields { grid-template-columns: minmax(var(--l-text-min), 1fr); }
 }
-.todo-grip { position: absolute; left: 0; top: 10px; width: 12px; height: 20px; padding: 0; border: 0; border-radius: 2px; background: transparent; color: var(--vscode-descriptionForeground); cursor: grab; opacity: 0.45; touch-action: none; }
+.todo-grip { position: absolute; left: 0; top: 10px; width: 12px; height: 20px; color: var(--vscode-descriptionForeground); cursor: grab; opacity: 0.45; user-select: none; touch-action: none; }
 .todo-grip::before { content: "⋮⋮"; font-size: var(--l-label); letter-spacing: -2px; line-height: 20px; }
 .todo-row:is(:hover, :focus-within) > .todo-grip, .todo-row.selected > .todo-grip { opacity: 1; }
-.todo-dragging, .todo-dragging .todo-grip { cursor: grabbing; }
+.todo-dragging, .todo-dragging * { cursor: grabbing; user-select: none; }
 .todo-list { position: relative; }
 .todo-row.todo-dragged { opacity: 0.4; }
 .todo-row.selected { background: var(--vscode-list-inactiveSelectionBackground); }

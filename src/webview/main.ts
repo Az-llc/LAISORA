@@ -64,6 +64,7 @@ import {
   initMenu,
   openAuthPicker,
   renderAuthPicker,
+  setTodoAvailable,
   syncMenuCursor,
 } from "./menu";
 import { closeSuggest, handleFilesResponse, initSuggest, insertFilePaths } from "./suggest";
@@ -2753,6 +2754,7 @@ function initMessageBus(): void {
         const wasShown = todoTab.shown;
         const wasEnabled = todoTab.enabled;
         const { restoreShown } = todoTab.apply(msg);
+        setTodoAvailable(todoTab.enabled);
         if (wasEnabled !== todoTab.enabled) postDrawerKeyFocus();
         if (todoTab.enabled) {
           if (!todoTab.tabBtn.isConnected) tabbarEl.prepend(todoTab.tabBtn);

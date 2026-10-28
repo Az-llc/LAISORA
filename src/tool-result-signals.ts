@@ -3,7 +3,6 @@ import { CLI_USER_INTERRUPTED_TEXTS } from "./human-input-vocabulary";
 import { "Denied by the LAISORA user" as enLaisoraDenial } from "../l10n/bundle.l10n.json";
 import { "Denied by the LAISORA user" as jaLaisoraDenial } from "../l10n/bundle.l10n.ja.json";
 
-// Tool result text the harness writes for calls that were refused, stopped or rejected, used to classify failures.
 export const escapeRegExp = (text: string): string => text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 const TOOL_USE_REJECTED_HEAD = "The user doesn't want to proceed with this tool use";
 export const TOOL_USE_REJECTED_TEXT = `${TOOL_USE_REJECTED_HEAD}. The tool use was rejected (eg. if it was a file edit, the new_string was NOT written to the file). STOP what you are doing and wait for the user to tell you how to proceed.`;
@@ -37,7 +36,7 @@ export const HUMAN_REJECTED_TOOL_RESULT_RE = anchored(PERMISSION_REFUSED, USER_I
 export const HOOK_DENIAL_RE = anchored(HOOK_DENIAL);
 export const HARNESS_DENIED_TOOL_RESULT_RE = new RegExp(HARNESS_DENIED);
 export const INPUT_VALIDATION_TOOL_RESULT_RE = new RegExp(INPUT_VALIDATION);
-const REJECTED_BEFORE_RUN_RE = anchored(HOOK_DENIAL, PERMISSION_REFUSED, HARNESS_DENIED, INPUT_VALIDATION, AUTO_MODE_UNEVALUATED,
+const REJECTED_BEFORE_RUN_RE = anchored(HOOK_DENIAL, HARNESS_DENIED, INPUT_VALIDATION, AUTO_MODE_UNEVALUATED,
   CLASSIFIER_NO_VERDICT, AGENT_TYPE_NOT_FOUND, ISOLATION_WORKTREE_REFUSED, ...LAISORA_DENIALS);
 
 export function stripToolUseErrorTags(text: string): string {
@@ -58,8 +57,18 @@ export function isLaisoraDenialText(text: string): boolean {
   return LAISORA_DENIAL_RE.test(stripToolUseErrorTags(text).trimStart());
 }
 
-export function isRejectedBeforeRun(result: { isError?: boolean; resultPreview: string }): boolean {
+type ToolResultSignal = { isError?: boolean; resultPreview: string };
+
+export function isRejectedBeforeRun(result: ToolResultSignal): boolean {
   return result.isError === true && REJECTED_BEFORE_RUN_RE.test(stripToolUseErrorTags(result.resultPreview).trimStart());
+}
+
+export function isInterruptedWhileRunning(result: ToolResultSignal): boolean {
+  return result.isError === true && HUMAN_REJECTED_TOOL_RESULT_RE.test(stripToolUseErrorTags(result.resultPreview).trimStart());
+}
+
+export function isFailedToolResult(result: ToolResultSignal): boolean {
+  return result.isError === true && !isInterruptedWhileRunning(result);
 }
 
 export type TaskTerminal = "completed" | "failed" | "stale";

@@ -1,6 +1,6 @@
 import * as l10n from "@vscode/l10n";
 import { TODO_GROUP_MAX, type TodoBatchRevert, type TodoChangeView, type TodoMarkInfo, type TodoDeletedView, type TodoEdit, type TodoEditError, type TodoEditResultMessage, type TodoListItem, type WebviewToHost } from "../protocol";
-import { parseTodoChangeId, type TodoCaptured, type TodoPlacementBasis, TODO_CLAUDE_DEPTH_MAX, TODO_RECENT_CLAUDE_MS, TODO_DELETED_RETENTION_MS, TODO_DOC_TARGET_MAX, TODO_PRIORITIES, TODO_STATES, TODO_TITLE_MAX, WORK_MEMO_SECTIONS, type TodoPriority, type TodoRevertBlock, type TodoState, type WorkMemoSection } from "../todo-model";
+import { parseTodoChangeId, TODO_LAISORA, type TodoCaptured, type TodoPlacementBasis, TODO_CLAUDE_DEPTH_MAX, TODO_RECENT_CLAUDE_MS, TODO_DELETED_RETENTION_MS, TODO_DOC_TARGET_MAX, TODO_PRIORITIES, TODO_STATES, TODO_TITLE_MAX, WORK_MEMO_SECTIONS, type TodoPriority, type TodoRevertBlock, type TodoState, type WorkMemoSection } from "../todo-model";
 import { closeGlyphButton } from "./close-button";
 import { isComposingKey } from "./composing";
 import { formatDateTime, uiLocale } from "./l10n";
@@ -38,6 +38,16 @@ export function todoEl<K extends keyof HTMLElementTagNameMap>(tag: K, className:
   node.className = className;
   if (text !== undefined) node.textContent = text;
   return node;
+}
+
+const TODO_CONTROLS = "button, input, textarea, select, a[href], label, [contenteditable]:not([contenteditable='false']), [role='button'], [role='menuitem']";
+
+export interface TodoPressTarget {
+  closest(selectors: string): unknown;
+}
+
+export function todoControlPressed(target: TodoPressTarget | null): boolean {
+  return target === null || target.closest(TODO_CONTROLS) !== null;
 }
 
 export const todoNewTitlePlaceholder = () => l10n.t("Title of the new item");
@@ -810,10 +820,13 @@ export const TODO_BASIS_LABELS: Record<TodoPlacementBasis, () => string> = {
   requested: () => l10n.t("on your request"),
 };
 
+const TODO_LAISORA_NAME = "LAISORA";
+
 const TODO_CAPTURE_LABELS: Record<TodoCaptured["via"], () => string> = {
   user: () => l10n.t("by you"),
   claude: () => l10n.t("by Claude"),
   import: () => l10n.t("from material"),
+  laisora: () => TODO_LAISORA_NAME,
 };
 
 export function todoCapturedText(captured: TodoCaptured): string {
@@ -892,7 +905,7 @@ export function todoChangeRow(change: TodoChangeView, actions: TodoChangeRowActi
   const ids = unit.map(entry => entry.id);
   row.append(
     todoEl("span", "todo-change-at", formatDateTime(change.at)),
-    todoEl("span", "todo-change-who", change.author === "claude" ? "Claude" : l10n.t("By you")),
+    todoEl("span", "todo-change-who", change.author === "claude" ? "Claude" : change.by === TODO_LAISORA ? TODO_LAISORA_NAME : l10n.t("By you")),
   );
   const what = todoEl("span", "todo-change-what");
   if (showItem) {

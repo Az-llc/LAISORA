@@ -392,13 +392,19 @@ export function admitReportSend(
   return { ok: true };
 }
 
+export function admitIdleSend(state: { closed: boolean; turnState: "idle" | "running" | "interrupting" }, what: string): SteeringAdmission {
+  if (state.closed) return { ok: false, reason: "closed", message: `${what}: the conversation has ended`, transient: true };
+  if (state.turnState !== "idle") return { ok: false, reason: "not_idle", message: `${what}: the conversation is not idle`, transient: true };
+  return { ok: true };
+}
+
 export function admitHandoffNoticeSend(
   state: { closed: boolean; turnState: "idle" | "running" | "interrupting" },
   envelopeText: string,
   checkRedaction: (text: string) => { ok: true } | { ok: false; violations: { field: string }[] }
 ): SteeringAdmission {
-  if (state.closed) return { ok: false, reason: "closed", message: "handoff notice: the conversation has ended", transient: true };
-  if (state.turnState !== "idle") return { ok: false, reason: "not_idle", message: "handoff notice: the conversation is not idle", transient: true };
+  const idle = admitIdleSend(state, "handoff notice");
+  if (!idle.ok) return idle;
   const parsed = parseSteeringEnvelope(envelopeText);
   if (!parsed.ok || parsed.body.mode !== "handoff_notice") {
     return { ok: false, reason: "invalid_envelope", message: `handoff notice: invalid envelope (${parsed.ok ? parsed.body.mode : parsed.reason})`, transient: false };

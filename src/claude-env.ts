@@ -39,6 +39,16 @@ export function envValueOf<T>(env: Readonly<Record<string, T>>, name: string, pl
   return key === undefined ? undefined : env[key];
 }
 
+let hostTelemetryEnabled: () => boolean = () => true;
+
+export function setHostTelemetrySource(source: () => boolean): void {
+  hostTelemetryEnabled = source;
+}
+
+export function telemetryOptOutNeeded(env: Readonly<Record<string, unknown>>, telemetryEnabled: boolean, platform: NodeJS.Platform = process.platform): boolean {
+  return !telemetryEnabled && envKeysOf(env, "DISABLE_TELEMETRY", platform).length === 0;
+}
+
 export function buildClaudeEnv(
   source: Readonly<NodeJS.ProcessEnv>,
   apiKeyPolicy: ApiKeyPolicy = "subscriptionOnly",
@@ -63,6 +73,7 @@ export function buildClaudeEnv(
       if (!removed.includes(name)) removed.push(name);
     }
   }
+  if (telemetryOptOutNeeded(env, hostTelemetryEnabled())) env.DISABLE_TELEMETRY = "1";
   if (mcpAutoBackground) {
     env.CLAUDE_AUTO_BACKGROUND_TASKS = "true";
     env.CLAUDE_CODE_MCP_AUTO_BACKGROUND_MS = "1000";

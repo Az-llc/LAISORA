@@ -43,12 +43,17 @@ import { openSessionById } from "./resume-hydration";
 import { normalizeTitleValue } from "./session-display-title";
 import { displayTitleFromSummary } from "./session-list";
 import type { Session } from "./session";
+import type { ClaudeConversation } from "./claudeHost";
 import { openNewConversationTab, type SessionStore } from "./store-surfaces";
-import { TODO_ACKNOWLEDGE_MAX, isTodoGroupName, todoChangeReverted, todoMarkChanges, todoItemNumbers, todoItemPath, todoParentPlace, todoPlaceText, todoRevertUnitBlock, type TodoChangePlace, type TodoRevertBlock, isClaudeOwnChange, TODO_RECENT_CLAUDE_MS, linkedTodoItem, parseTodoChangeId, memoStaleSince, newestConversation, todoChildBriefs, todoScopeIds, todoSessionLinks, todoStartOf, todoTabStart, revertBlock, runClaimedStart, singleFlight, TODO_CONVERSATION_SEEN_REFRESH_MS, todoConversationTarget, todoGroupsOf, todoTemplatesOf, todoTemplateSize, TODO_BRIEF_MAX, TODO_DELETED_RETENTION_MS, TODO_DOC_TARGET_MAX, TODO_IMAGE_EXTENSIONS, conversationLiveElsewhere, todoAskDismissals, todoAsksClosedInTodo, todoDecisionsToMigrate, todoLinkedSessions, todoRecordAskSources, todoTabLinks, type TodoConversationLink, type TodoTabConversation, type TodoDoc, type TodoImageMediaType, WORK_MEMO_SECTIONS, type TodoChange, type TodoDocument, type TodoItem, type TodoMemoSection, type TodoOperation } from "./todo-model";
+import { TODO_ACKNOWLEDGE_MAX, isTodoGroupName, todoChangeReverted, todoMarkChanges, todoItemNumbers, todoItemPath, todoParentPlace, todoPlaceText, todoRevertUnitBlock, type TodoChangePlace, type TodoRevertBlock, isClaudeOwnChange, TODO_RECENT_CLAUDE_MS, linkedTodoItem, parseTodoChangeId, memoStaleSince, newestConversation, todoChildBriefs, todoScopeIds, todoSessionLinks, todoStartOf, todoTabStart, revertBlock, runClaimedStart, singleFlight, TODO_CONVERSATION_SEEN_REFRESH_MS, todoConversationTarget, todoGroupsOf, todoTemplatesOf, todoTemplateSize, TODO_BRIEF_MAX, TODO_DELETED_RETENTION_MS, TODO_DOC_TARGET_MAX, TODO_IMAGE_EXTENSIONS, conversationLiveElsewhere, todoAskDismissals, todoAsksClosedInTodo, todoDecisionsToMigrate, type TodoAddNode, todoLinkedSessions, todoRecordAskSources, todoTabLinks, type TodoConversationLink, type TodoTabConversation, type TodoDoc, type TodoImageMediaType, WORK_MEMO_SECTIONS, type TodoChange, type TodoDocument, type TodoItem, type TodoMemoSection, type TodoOperation } from "./todo-model";
 import { setTodoWorkspaceRoots, type TodoLinkedItem } from "./todo-mcp";
 import { sharedTodoStore, TODO_ENABLED_SETTING, TodoStoreError, type TodoStore } from "./todo-store";
+import { todoFromReplyInstruction, todoItemsAddedInTurn, todoReplyExcerpt, todoReplyText } from "./todo-reply";
+import { readConversationMessages } from "./session-transcript";
+import { admitIdleSend } from "./steering-envelope";
 
 const TODO_SECTION_ORDER_KEY = "laisora.todo.detailSectionOrder";
+const TODO_WELCOME_SEEDED_KEY = "laisora.todo.welcomeSeeded";
 const TODO_DETAIL_CHANGES_MAX = 50;
 const TODO_CLAUDE_CHANGES_MAX = 200;
 const TODO_CHANGE_TEXT_MAX = 400;
@@ -288,6 +293,25 @@ async function prepareDecisionRecords(): Promise<void> {
   await decisionRecorder.sweep([...linked]);
 }
 
+function todoWelcomeItems(): TodoAddNode[] {
+  return [{
+    title: l10n.t("How to use the ToDo (mark each step done once you've read it)"),
+    children: [
+      { title: l10n.t("Ask Claude in a conversation to add things, or press “{0}” under a reply", l10n.t("Add to ToDo")) },
+      { title: l10n.t("“{0}” on an item opens a conversation for it, and “{1}” returns to that conversation", l10n.t("Start"), l10n.t("Continue")) },
+      { title: l10n.t("If you don't need the ToDo, turn off “{0}” in LAISORA settings → {1} → ToDo (laisora.{2})", l10n.t("Enable ToDo"), l10n.t("General"), TODO_ENABLED_SETTING) },
+    ],
+  }];
+}
+
+async function seedTodoWelcome(): Promise<void> {
+  const todoStore = todoFeatureEnabled() ? hostTodoStore() : undefined;
+  if (!extensionContext || !todoStore) return;
+  const seeded = extensionContext.globalState.get<boolean>(TODO_WELCOME_SEEDED_KEY) === true;
+  if (!await applyHostTodoOperation(todoStore, { kind: "seedWelcome", items: todoWelcomeItems(), seeded }, "human") || seeded) return;
+  await Promise.resolve(extensionContext.globalState.update(TODO_WELCOME_SEEDED_KEY, true)).catch(error => output.appendLine(`[todo] could not remember the first-run guide: ${String(error)}`));
+}
+
 async function askSourceMessage(sessionId: string, requestId: number): Promise<TodoAskSourceMessageEnvelope> {
   const file = await askSourceFile(sessionId);
   if (!file) return { type: "todoAskSource", sessionId, requestId, key: null };
@@ -364,6 +388,7 @@ export function syncTodoSurface(): void {
   setTodoWorkspaceRoots(() => (vscode.workspace.workspaceFolders ?? []).map(folder => folder.uri.fsPath));
   if (!todoWatch) {
     void prepareDecisionRecords();
+    void seedTodoWelcome();
     try {
       todoWatch = hostTodoStore()?.watch(revision => {
         output.appendLine(`[todo] store changed (revision ${revision})`);
@@ -486,6 +511,7 @@ function changeView(document: TodoDocument, change: TodoChange, revert?: TodoRev
     ...(block !== undefined ? { revert: revertView(block) } : {}),
     ...(change.acknowledged ? { acknowledged: true as const } : {}),
     ...(basis ? { basis } : {}),
+    ...(change.by ? { by: change.by } : {}),
     ...changePlaces(document, item, change),
   };
 }
@@ -841,6 +867,7 @@ const liveItem = (document: TodoDocument, id: string | null | undefined) =>
 const sessionItems = new Map<string, string | null>();
 
 export function noteTodoSessionEnded(s: Session): void {
+  if (replyStarts.delete(s)) output.appendLine("[todo] todoFromReply: the tab closed or was cleared before the turn ended, so no item is opened");
   const sessionId = sessionRecordId(s);
   if (!sessionId) return;
   const linked = sessionItems.get(sessionId);
@@ -970,4 +997,91 @@ async function openTodoConversationNow(st: SessionStore, msg: Extract<WebviewToH
     return true;
   });
   if (started === "elsewhere") showOpenElsewhere();
+}
+
+const replyStarts = new WeakMap<Session, { sinceRevision: number; st: SessionStore }>();
+const replyRequests = new WeakSet<Session>();
+
+const replySessionId = (s: Session): string | undefined => s.conversation?.recordSessionId ?? sessionRecordId(s);
+
+function liveConversation(s: Session): ClaudeConversation | undefined {
+  return s.conversation !== null && !s.conversation.isClosed ? s.conversation : undefined;
+}
+
+function replyAdmission(s: Session): ReturnType<typeof admitIdleSend> {
+  return admitIdleSend({ closed: s.closed || s.clearing, turnState: liveConversation(s)?.state ?? "idle" }, "todoFromReply");
+}
+
+async function replyTextOf(sessionId: string, replyId: string): Promise<string | "unreadable" | undefined> {
+  const path = lookupSessionFile(sessionId).path;
+  if (!path) return "unreadable";
+  const read = await readConversationMessages(path, isInSessionStore, undefined, sessionId);
+  if (read.readError !== undefined) {
+    output.appendLine(`[todo] todoFromReply could not read the conversation record: ${read.readError}`);
+    return "unreadable";
+  }
+  return todoReplyText(read.messages, replyId);
+}
+
+export async function todoFromReply(st: SessionStore, msg: Extract<WebviewToHost, { type: "todoFromReply" }>, s: Session): Promise<void> {
+  const refuse = (why: string, notice?: string) => {
+    output.appendLine(`[todo] todoFromReply refused: ${why}`);
+    if (notice !== undefined) st.post({ type: "tabNotice", tabId: s.tabId, text: notice });
+  };
+  if (replyRequests.has(s)) return refuse("a request from this tab is still being prepared");
+  const admission = replyAdmission(s);
+  if (!admission.ok) return refuse(admission.message);
+  if (liveConversation(s)?.hasTodoTools === false) {
+    return refuse("the conversation was started without the ToDo tools", l10n.t("This conversation was started while ToDo was off, so Claude has no ToDo tools here. Resume or start the conversation again to use them."));
+  }
+  const sessionId = replySessionId(s);
+  if (!sessionId) return refuse("the conversation has no record", l10n.t("Could not find this reply in the conversation record, so nothing was added to ToDo."));
+  replyRequests.add(s);
+  try {
+    const read = await readTodoDocument("todo from a reply");
+    if (!read) return refuse("ToDo is off or unreadable");
+    const text = await replyTextOf(sessionId, msg.replyId);
+    if (text === "unreadable") return refuse("the conversation record could not be read", l10n.t("Could not read the conversation record, so nothing was added to ToDo."));
+    if (text === undefined) return refuse("the reply is not in the conversation record", l10n.t("Could not find this reply in the conversation record, so nothing was added to ToDo."));
+    const again = replyAdmission(s);
+    if (!again.ok) return refuse(again.message);
+    const linked = liveItem(read.document, linkedTodoItemIdOf(s));
+    const instruction = todoFromReplyInstruction({ excerpt: todoReplyExcerpt(text), ...(linked ? { linked: { id: linked.id, title: linked.title } } : {}), start: msg.start });
+    if (msg.start) replyStarts.set(s, { sinceRevision: read.document.revision, st });
+    else replyStarts.delete(s);
+    let started = false;
+    try {
+      started = await sendLaisoraInput(s, { kind: "todoFromReply", start: msg.start }, instruction);
+    } finally {
+      if (!started && replyStarts.delete(s)) output.appendLine("[todo] todoFromReply: the request did not start a turn, so no item is opened");
+    }
+  } finally {
+    replyRequests.delete(s);
+  }
+}
+
+export function settleTodoReplyStart(s: Session, completed: boolean): void {
+  const pending = replyStarts.get(s);
+  if (!pending) return;
+  replyStarts.delete(s);
+  const sessionId = s.conversation?.recordSessionId;
+  if (!completed || !sessionId) {
+    output.appendLine("[todo] todoFromReply: the turn did not complete, so no item is opened");
+    return;
+  }
+  void (async () => {
+    const read = await readTodoDocument("open the item made from a reply");
+    if (!read) return;
+    const added = todoItemsAddedInTurn(read.document, sessionId, pending.sinceRevision);
+    if (added.length !== 1) {
+      output.appendLine(`[todo] todoFromReply: Claude added ${added.length} top-level items in that turn, so none is opened`);
+      return;
+    }
+    const webview = pending.st.activeWebview;
+    if (!webview) {
+      output.appendLine("[todo] todoFromReply: no LAISORA view is open, so the item is not opened");
+      return;
+    }
+    await openTodoConversation(pending.st, { type: "todoOpenConversation", itemId: added[0], fresh: false }, webview);
+  })().catch(error => output.appendLine(`[todo] todoFromReply could not open the item: ${String(error)}`));
 }

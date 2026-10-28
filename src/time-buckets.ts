@@ -7,7 +7,7 @@ import { foregroundExternalCalls, MAIN_PROCESSING_BUCKETS, planBlockName, planIt
 import type { PlanUsage, PlanTokenTotal } from "./plan-usage";
 import { isExternalRunTool } from "./orchestration-executors";
 import { delegationCount, isCountedExternalRunCall, isDelegationLaunchTool, isDelegationTool } from "./claude-tool-names";
-import { isRejectedBeforeRun, taskNotificationTerminal } from "./tool-result-signals";
+import { isFailedToolResult, isRejectedBeforeRun, taskNotificationTerminal } from "./tool-result-signals";
 import { conductorStopTarget } from "./tool-intent";
 import { callLane, unfinishedCallEnd, launchlessRunSpan, moreRuns, type RecordedRuns, childActivity, childRecordEnd, childUsageCounts, closeRun, currentRunStart, delegationRuns, intersectSpans, measureSpans, memberRunTimes, runElapsedMs, runEnd, runSpans, subtractSpans, unionSpans, type CallLane, type ChildTranscriptSpan, type RunStop, type Span, isChildCall } from "./spans";
 
@@ -968,7 +968,7 @@ export function foldTimeBuckets(state: TimeBucketState, event: NormalizedEvent, 
         toolName: open.toolName,
         start: open.at,
         end: Math.max(open.at, ts),
-        isError: event.isError === true,
+        isError: isFailedToolResult(event),
         turnId: open.turnId,
         ...(isChildCall(open.parentToolUseId) ? { agentId: open.parentToolUseId } : {}),
         ...(isRejectedBeforeRun(event) ? { rejectedBeforeRun: true as const } : {}),
