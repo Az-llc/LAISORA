@@ -5,7 +5,6 @@ import { openFileLink } from "./composer-io";
 import { isInSessionStore, lookupSessionFile } from "./session-files";
 import { sessionRecordId } from "./session-record";
 import { RecordTailReader, TodoAskRecordReader, TodoDecisionRecorder, todoWorkTotal, todoWorkTurnReader, type TodoWorkTurns } from "./todo-ask-record";
-import { parseFileLinkTarget } from "./file-link-target";
 import { getLaisoraConfiguration } from "./claude-settings";
 import { extensionContext, output, store } from "./host-context";
 import {
@@ -18,7 +17,6 @@ import {
   type TodoAskSourceMessageEnvelope,
   type TodoAskSourceRef,
   type TodoAskWhere,
-  type TodoChangeView,
   type TodoDeletedView,
   type TodoDetailItem,
   type TodoDetailSection,
@@ -30,7 +28,6 @@ import {
   type TodoTabItem,
   type TodoTemplateView,
   type TodoTurnRevert,
-  type TodoBatchRevert,
   type TodoWorkView,
   type WebviewToHost,
 } from "./protocol";
@@ -45,8 +42,9 @@ import { displayTitleFromSummary } from "./session-list";
 import type { Session } from "./session";
 import type { ClaudeConversation } from "./claudeHost";
 import { openNewConversationTab, type SessionStore } from "./store-surfaces";
-import { TODO_ACKNOWLEDGE_MAX, isTodoGroupName, todoChangeReverted, todoMarkChanges, todoItemNumbers, todoItemPath, todoParentPlace, todoPlaceText, todoRevertUnitBlock, type TodoChangePlace, type TodoRevertBlock, isClaudeOwnChange, TODO_RECENT_CLAUDE_MS, linkedTodoItem, parseTodoChangeId, memoStaleSince, newestConversation, todoChildBriefs, todoScopeIds, todoSessionLinks, todoStartOf, todoTabStart, revertBlock, runClaimedStart, singleFlight, TODO_CONVERSATION_SEEN_REFRESH_MS, todoConversationTarget, todoGroupsOf, todoTemplatesOf, todoTemplateSize, TODO_BRIEF_MAX, TODO_DELETED_RETENTION_MS, TODO_DOC_TARGET_MAX, TODO_IMAGE_EXTENSIONS, conversationLiveElsewhere, todoAskDismissals, todoAsksClosedInTodo, todoDecisionsToMigrate, type TodoAddNode, todoLinkedSessions, todoRecordAskSources, todoTabLinks, type TodoConversationLink, type TodoTabConversation, type TodoDoc, type TodoImageMediaType, WORK_MEMO_SECTIONS, type TodoChange, type TodoDocument, type TodoItem, type TodoMemoSection, type TodoOperation } from "./todo-model";
+import { todoMarkChanges, todoRevertUnitBlock, isClaudeOwnChange, linkedTodoItem, parseTodoChangeId, memoStaleSince, newestConversation, todoChildBriefs, todoScopeIds, todoSessionLinks, todoStartOf, todoTabStart, runClaimedStart, singleFlight, TODO_CONVERSATION_SEEN_REFRESH_MS, todoConversationTarget, todoGroupsOf, todoTemplatesOf, todoTemplateSize, TODO_BRIEF_MAX, TODO_DELETED_RETENTION_MS, TODO_IMAGE_EXTENSIONS, todoLinkDoc, conversationLiveElsewhere, todoAskDismissals, todoAsksClosedInTodo, todoDecisionsToMigrate, type TodoAddNode, todoLinkedSessions, todoRecordAskSources, todoTabLinks, type TodoConversationLink, type TodoTabConversation, type TodoImageMediaType, WORK_MEMO_SECTIONS, type TodoChange, type TodoDocument, type TodoItem, type TodoOperation } from "./todo-model";
 import { setTodoWorkspaceRoots, type TodoLinkedItem } from "./todo-mcp";
+import { todoChangeView, todoClaudeChanges, todoClaudeRecent, todoRecentClaudeUnits, todoRevertView, todoRevisionChanges, todoRevisionUnitOf } from "./todo-change-view";
 import { sharedTodoStore, TODO_ENABLED_SETTING, TodoStoreError, type TodoStore } from "./todo-store";
 import { todoFromReplyInstruction, todoItemsAddedInTurn, todoReplyExcerpt, todoReplyText } from "./todo-reply";
 import { readConversationMessages } from "./session-transcript";
@@ -55,9 +53,6 @@ import { admitIdleSend } from "./steering-envelope";
 const TODO_SECTION_ORDER_KEY = "laisora.todo.detailSectionOrder";
 const TODO_WELCOME_SEEDED_KEY = "laisora.todo.welcomeSeeded";
 const TODO_DETAIL_CHANGES_MAX = 50;
-const TODO_CLAUDE_CHANGES_MAX = 200;
-const TODO_CHANGE_TEXT_MAX = 400;
-const TODO_MEMO_VERSION_TEXT_MAX = 4000;
 
 export function todoFeatureEnabled(cfg: Pick<vscode.WorkspaceConfiguration, "get"> = getLaisoraConfiguration()): boolean {
   return cfg.get<boolean>(TODO_ENABLED_SETTING) === true;
@@ -73,41 +68,14 @@ function guessView(item: TodoItem): { due?: string; priority?: string } | undefi
   return due || priority ? { ...(due ? { due } : {}), ...(priority ? { priority } : {}) } : undefined;
 }
 
-function recentClaudeChanges(document: TodoDocument): TodoChange[] {
-  const since = Date.now() - TODO_RECENT_CLAUDE_MS;
-  return document.changes.slice(-TODO_CLAUDE_CHANGES_MAX).filter(change => isClaudeOwnChange(change) && change.at >= since);
-}
-
-const revertView = (block: TodoRevertBlock | null): "ok" | TodoRevertBlock => block ?? "ok";
-
-function revisionUnitOf(document: TodoDocument, change: TodoChange): TodoChange[] {
-  const revision = parseTodoChangeId(change.id).revision;
-  return change.itemId === "" ? [change]
-    : document.changes.filter(entry => entry.itemId === change.itemId && parseTodoChangeId(entry.id).revision === revision && isClaudeOwnChange(entry));
-}
-
-function recentClaudeUnits(document: TodoDocument): TodoChange[][] {
-  const units = new Map<string, TodoChange[]>();
-  for (const change of recentClaudeChanges(document)) {
-    const key = change.itemId === "" ? change.id : `${parseTodoChangeId(change.id).revision}:${change.itemId}`;
-    if (!units.has(key)) units.set(key, revisionUnitOf(document, change));
-  }
-  return [...units.values()];
-}
-
 function openClaudeMarks(document: TodoDocument): Map<string, Array<{ change: TodoChange; unit: TodoChange[] }>> {
   const marks = new Map<string, Array<{ change: TodoChange; unit: TodoChange[] }>>();
-  for (const unit of recentClaudeUnits(document)) {
+  for (const unit of todoRecentClaudeUnits(document)) {
     const change = unit[0];
     if (change.itemId === "" || unit.every(entry => entry.acknowledged) || todoRevertUnitBlock(document, unit) !== null) continue;
     marks.set(change.itemId, [...(marks.get(change.itemId) ?? []), { change, unit }]);
   }
   return marks;
-}
-
-export function todoClaudeRecent(document: TodoDocument): number[] {
-  return recentClaudeUnits(document).filter(unit => unit.some(change => !change.field.startsWith("workMemo.") && !todoChangeReverted(document.changes, change)))
-    .map(unit => unit[0].at).slice(-TODO_ACKNOWLEDGE_MAX);
 }
 
 export function todoListItems(document: TodoDocument, running: ReadonlySet<string> = new Set()): TodoListItem[] {
@@ -120,7 +88,7 @@ export function todoListItems(document: TodoDocument, running: ReadonlySet<strin
       ...(item.priority ? { priority: item.priority } : {}), ...(item.waiting ? { waiting: item.waiting } : {}), ...(item.by ? { by: item.by } : {}),
       ...(guess ? { guess } : {}), ...(marks.has(item.id) ? { marks: marks.get(item.id)!.map(entry => entry.change.id), markInfo: marks.get(item.id)!.map(({ change, unit }) => {
         const parts = todoMarkChanges(document.changes, unit).map(entry => {
-          const view = changeView(document, entry);
+          const view = todoChangeView(document, entry);
           return { field: entry.field, before: view.before, after: view.after };
         });
         return { id: change.id, ids: unit.map(entry => entry.id), at: change.at, parts };
@@ -426,96 +394,6 @@ export async function releaseOwnedTodoConversations(): Promise<void> {
   if (todoStore) await applyHostTodoOperation(todoStore, { kind: "releaseOwner", owner: TODO_WINDOW_ID }, "human");
 }
 
-function memoVersionText(section: TodoMemoSection | undefined, version: unknown): string | null {
-  if (typeof version !== "number" || !section) return null;
-  if (section.version === version) return section.text;
-  return section.history.find(entry => entry.version === version)?.text ?? null;
-}
-
-function changeValue(document: TodoDocument, item: TodoItem | undefined, change: TodoChange, value: unknown): string | null {
-  if (value === null || value === undefined) return null;
-  if (typeof value === "string") return value;
-  if (typeof value === "number") return change.field === "deletedAt" ? "deleted" : null;
-  const record = value as Record<string, unknown>;
-  if (change.field === "state") return typeof record.state === "string" ? record.state : null;
-  if (change.field === "item") return typeof record.title === "string" ? record.title : null;
-  if (change.field === "docs") return typeof record.label === "string" && record.label ? record.label : typeof record.target === "string" ? record.target : null;
-  if (change.field === "docLabel") return typeof record.label === "string" ? record.label : null;
-  if (change.field === "groups" || change.field === "templates") return typeof record.name === "string" ? record.name : null;
-  if (change.field === "groupBindings") {
-    const folders = Array.isArray(record.folders) ? record.folders.flatMap(folder => typeof folder?.path === "string" ? [folder.path] : []) : [];
-    const aliases = Array.isArray(record.aliases) ? record.aliases.flatMap(alias => typeof alias?.words === "string" ? [`“${alias.words}”`] : []) : [];
-    return [...folders, ...aliases].join(", ") || null;
-  }
-  if (change.field === "position") {
-    if (record.parentId !== null && typeof record.parentId !== "string") return null;
-    const numbers = numbersOf(document);
-    const group = "placeGroup" in record ? typeof record.placeGroup === "string" ? record.placeGroup : null : typeof record.group === "string" ? record.group : item?.parentId === null ? item.group ?? null : null;
-    return todoPlaceText(todoParentPlace(document.items, { parentId: record.parentId, group: group ?? undefined }, id => numbers.get(id) ?? ""), l10n.t("No group"));
-  }
-  const section = WORK_MEMO_SECTIONS.find(entry => change.field === `workMemo.${entry}`);
-  return section ? memoVersionText(item?.workMemo[section], record.version) : null;
-}
-
-const clipped = (text: string | null, max: number) => text !== null && text.length > max ? `${text.slice(0, max)}…` : text;
-
-const documentNumbers = new WeakMap<TodoDocument, Map<string, string>>();
-
-function numbersOf(document: TodoDocument): Map<string, string> {
-  let numbers = documentNumbers.get(document);
-  if (!numbers) documentNumbers.set(document, numbers = todoItemNumbers(document.items.filter(item => item.deletedAt === undefined), todoGroupsOf(document).map(group => group.name)));
-  return numbers;
-}
-
-const placeGroup = (group: unknown): string | null => isTodoGroupName(group) ? group : null;
-
-function changePlace(document: TodoDocument, parentId: string | null, group: string | null): TodoChangePlace {
-  if (parentId === null) return { group: placeGroup(group), path: [] };
-  const path = todoItemPath(document.items, parentId);
-  return { group: path[0]?.group ?? null, path: path.map(step => ({ id: step.id, title: step.title })) };
-}
-
-function changePlaces(document: TodoDocument, item: TodoItem | undefined, change: TodoChange): { from?: TodoChangePlace; to?: TodoChangePlace } {
-  if (!isClaudeOwnChange(change) || !item) return {};
-  const rootGroup = item.parentId === null ? item.group ?? null : null;
-  const before = isRecord(change.before) ? change.before : undefined, after = isRecord(change.after) ? change.after : undefined;
-  const parentOf = (record: Record<string, unknown> | undefined) => typeof record?.parentId === "string" ? record.parentId : record?.parentId === null ? null : undefined;
-  const groupOf = (record: Record<string, unknown> | undefined, legacy: string | null) => record !== undefined && "placeGroup" in record
-    ? typeof record.placeGroup === "string" ? record.placeGroup : null : legacy;
-  switch (change.field) {
-    case "item": {
-      const parentId = parentOf(after);
-      return parentId === undefined ? {} : { to: changePlace(document, parentId, groupOf(after, rootGroup)) };
-    }
-    case "position": {
-      const from = parentOf(before), to = parentOf(after);
-      return from === undefined || to === undefined ? {} : { from: changePlace(document, from, groupOf(before, typeof before?.group === "string" ? before.group : rootGroup)), to: changePlace(document, to, groupOf(after, rootGroup)) };
-    }
-    case "group": return { from: { group: placeGroup(change.before), path: [] }, to: { group: placeGroup(change.after), path: [] } };
-    case "deletedAt": return change.after !== null ? { from: changePlace(document, item.parentId, item.group ?? null) } : { to: changePlace(document, item.parentId, item.group ?? null) };
-  }
-  return { to: changePlace(document, item.parentId, item.group ?? null) };
-}
-
-const isRecord = (value: unknown): value is Record<string, unknown> => typeof value === "object" && value !== null;
-
-function changeView(document: TodoDocument, change: TodoChange, revert?: TodoRevertBlock | null): TodoChangeView {
-  const item = document.items.find(entry => entry.id === change.itemId);
-  const block = revert !== undefined ? revert : isClaudeOwnChange(change) ? revertBlock(document, change, "claude") : undefined;
-  const max = change.field.startsWith("workMemo.") ? TODO_MEMO_VERSION_TEXT_MAX : TODO_CHANGE_TEXT_MAX;
-  const basis = change.basis ?? (item?.placement && item.placement.at === change.at && (change.field === "item" || change.field === "position" || change.field === "group") ? item.placement.basis : undefined);
-  return {
-    id: change.id, at: change.at, author: change.author, itemId: change.itemId, itemTitle: item?.title ?? "", field: change.field,
-    before: clipped(changeValue(document, item, change, change.before), max), after: clipped(changeValue(document, item, change, change.after), max),
-    ...(change.cascade ? { cascade: true as const } : {}),
-    ...(block !== undefined ? { revert: revertView(block) } : {}),
-    ...(change.acknowledged ? { acknowledged: true as const } : {}),
-    ...(basis ? { basis } : {}),
-    ...(change.by ? { by: change.by } : {}),
-    ...changePlaces(document, item, change),
-  };
-}
-
 function detailItem(document: TodoDocument, id: string): TodoDetailItem | null {
   const item = document.items.find(entry => entry.id === id && entry.deletedAt === undefined);
   if (!item) return null;
@@ -538,7 +416,7 @@ function detailItem(document: TodoDocument, id: string): TodoDetailItem | null {
     ...(item.due ? { due: item.due } : {}), ...(item.start ? { start: item.start } : {}), ...(item.priority ? { priority: item.priority } : {}),
     userMemo: item.userMemo, workMemo, createdAt: item.createdAt, updatedAt: item.updatedAt,
     docs: (item.docs ?? []).map(doc => ({ id: doc.id, kind: doc.kind, target: doc.target, ...(doc.label ? { label: doc.label } : {}), at: doc.at })),
-    changes: changes.map(change => changeView(document, change, isClaudeOwnChange(change) ? todoRevertUnitBlock(document, revisionUnitOf(document, change)) : undefined)),
+    changes: changes.map(change => todoChangeView(document, change, isClaudeOwnChange(change) ? todoRevertUnitBlock(document, todoRevisionUnitOf(document, change)) : undefined)),
     ...(memoStaleSince(item) !== undefined ? { memoStaleSince: memoStaleSince(item) } : {}),
     ...(item.waiting ? { waiting: item.waiting } : {}), ...(item.repeat ? { repeat: item.repeat } : {}),
     ...(item.estimate ? { estimate: item.estimate } : {}), ...(item.tags ? { tags: item.tags } : {}), ...(item.by ? { by: item.by } : {}),
@@ -629,19 +507,6 @@ function todoStartBrief(item: TodoItem, parent: TodoItem | undefined, continued:
   return lines.join("\n").trim().slice(0, TODO_BRIEF_MAX);
 }
 
-function claudeChanges(document: TodoDocument): { changes: TodoChangeView[]; batches: TodoBatchRevert[] } {
-  const own = document.changes.filter(isClaudeOwnChange).slice(-TODO_CLAUDE_CHANGES_MAX);
-  const revisions = new Map<number, TodoChange[]>();
-  for (const change of own) revisions.set(parseTodoChangeId(change.id).revision, [...revisions.get(parseTodoChangeId(change.id).revision) ?? [], change]);
-  const batches = [...revisions].filter(([, changes]) => changes.length > 1).map(([revision]) => ({ revision, revert: revertView(todoRevertUnitBlock(document, revisionChanges(document, [revision]))) }));
-  return { changes: [...own].reverse().map(change => changeView(document, change, todoRevertUnitBlock(document, revisionUnitOf(document, change)))), batches };
-}
-
-function revisionChanges(document: TodoDocument, revisions: readonly number[]): TodoChange[] {
-  const wanted = new Set(revisions);
-  return document.changes.filter(change => wanted.has(parseTodoChangeId(change.id).revision) && isClaudeOwnChange(change));
-}
-
 function deletedItems(document: TodoDocument): TodoDeletedView[] {
   const byId = new Map(document.items.map(item => [item.id, item]));
   const heads = document.items.filter(item => item.deletedAt !== undefined
@@ -667,25 +532,13 @@ function sectionOrder(): TodoDetailSection[] {
   return known;
 }
 
-function linkDoc(target: string, label: string | undefined): Omit<TodoDoc, "id" | "at"> | TodoEditError {
-  const trimmed = target.trim();
-  const labelled = label?.trim() ? { label: label.trim() } : {};
-  if (/^https?:\/\//i.test(trimmed)) {
-    let url: URL;
-    try { url = new URL(trimmed); } catch { return "invalid-doc"; }
-    if (url.protocol !== "http:" && url.protocol !== "https:") return "invalid-doc";
-    return url.href.length > TODO_DOC_TARGET_MAX ? "link-too-long" : { kind: "url", target: url.href, ...labelled };
-  }
-  return parseFileLinkTarget(trimmed, { windows: process.platform === "win32" }) === null ? "invalid-doc" : { kind: "file", target: trimmed, ...labelled };
-}
-
 async function operationOf(edit: TodoEdit, todoStore: TodoStore): Promise<{ operation: TodoOperation; written?: string } | TodoEditError> {
   switch (edit.kind) {
     case "undo": return { operation: { kind: "revert", mode: "undo", revision: edit.revision } };
     case "revertClaude": return { operation: "revisions" in edit ? { kind: "revert", mode: "claude", revisions: edit.revisions }
       : { kind: "revert", mode: "claude", changeIds: "changeIds" in edit ? edit.changeIds : [edit.changeId] } };
     case "addLink": {
-      const doc = linkDoc(edit.target, edit.label);
+      const doc = todoLinkDoc(edit.target, edit.label, process.platform === "win32");
       return typeof doc === "string" ? doc : { operation: { kind: "addDoc", id: edit.id, doc } };
     }
     case "addImage": {
@@ -772,8 +625,8 @@ export async function handleTodoMessage(msg: TodoMessage, sender: vscode.Webview
       const wanted = new Set(msg.ids);
       const revisions = new Set((msg.revisions ?? []).flat());
       const changes = document.changes.filter(change => wanted.has(change.id)
-        || (revisions.has(parseTodoChangeId(change.id).revision) && isClaudeOwnChange(change))).map(change => changeView(document, change));
-      const turns: TodoTurnRevert[] = (msg.revisions ?? []).map(group => ({ revisions: group, revert: revertView(todoRevertUnitBlock(document, revisionChanges(document, group))) }));
+        || (revisions.has(parseTodoChangeId(change.id).revision) && isClaudeOwnChange(change))).map(change => todoChangeView(document, change));
+      const turns: TodoTurnRevert[] = (msg.revisions ?? []).map(group => ({ revisions: group, revert: todoRevertView(todoRevertUnitBlock(document, todoRevisionChanges(document, group))) }));
       for (let start = 0; start === 0 || start < changes.length; start += TODO_CHANGES_REQUEST_MAX) {
         const last = start + TODO_CHANGES_REQUEST_MAX >= changes.length;
         reply({ type: "todoChanges", requestId: msg.requestId, revision: document.revision, changes: changes.slice(start, start + TODO_CHANGES_REQUEST_MAX),
@@ -822,7 +675,7 @@ export async function handleTodoMessage(msg: TodoMessage, sender: vscode.Webview
         reply({ type: "todoWork", id: msg.id, revision: document.revision, ...(work ? { work } : {}) });
       }
     } else if (msg.view === "claude") {
-      reply({ type: "todoLog", view: "claude", revision: document.revision, ...claudeChanges(document) });
+      reply({ type: "todoLog", view: "claude", revision: document.revision, ...todoClaudeChanges(document) });
     } else {
       reply({ type: "todoLog", view: "deleted", revision: document.revision, items: deletedItems(document) });
     }

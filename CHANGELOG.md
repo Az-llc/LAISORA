@@ -1,5 +1,14 @@
 # Changelog
 
+## 1.14.0
+
+- **Claude edits more of the ToDo.** Claude can change everything on an item except your memo:
+  links, waiting-on, repeat, estimate and tags, on items you added too. Adding images stays with you.
+- **Claude takes back its ToDo changes.** Ask Claude to undo what it changed, and it reverts its own
+  changes and restores items it deleted. Your edits, your reverts and items you deleted stay as they are.
+- macOS and Linux are experimental: automated checks run on Apple silicon macOS and x64 Ubuntu after
+  every release.
+
 ## 1.13.0
 
 - **ToDo from a reply.** Claude's replies get "Add to ToDo" and "Add to ToDo and start a new

@@ -22,7 +22,7 @@ export { FILE_LINK_TARGET_MAX_LEN } from "./file-link-target";
 import { agentRuns, findToolPlacement, findWorkSegment, phaseStateOf, runningMainPlacement } from "./work-model";
 import { ANALYSIS_TIME_PART_KEYS, MAIN_PROCESSING_BUCKETS, planCurrentSteps } from "./plan-steps";
 import { BACKGROUND_ACTIVITY_LIST_MAX, type BackgroundActivitySnapshot } from "./background-activity";
-import { isTodoAskIdentity, isTodoTime, isTodoDocLabel, isTodoImageName, isTodoGroupName, isTodoFolderPath, TODO_ITEM_SHAPES, TODO_CHANGE_FIELDS, isTodoChangeRecord, isTodoGroupAlias, isTodoBriefText, isTodoDocFields, isTodoGuessReason, isTodoId, isTodoMemoEntry, isTodoMemoText, isTodoSessionId, todoItemFieldValid, TODO_OPERATION_ERRORS, TODO_REVERT_BLOCKS, type TodoPlacementBasis, type TodoChangePlace, type TodoCaptured, TODO_ASK_PLACES, type TodoAskPlace, TODO_ASK_SOURCE_MESSAGES_MAX, TODO_BATCH_MAX, type TodoBatchStep, TODO_GROUP_COLOR_COUNT, TODO_TEMPLATE_NAME_MAX, TODO_ACKNOWLEDGE_MAX, TODO_IMAGE_EXTENSIONS, TODO_TITLE_MAX, WORK_MEMO_SECTIONS, TODO_START_KINDS, type TodoStartKind, type TodoAuthor, type TodoCompletion, type TodoDocKind, type TodoImageMediaType, type TodoOperationError, type TodoPriority, type TodoRevertBlock, type TodoState, type WorkMemoSection, type TodoDecision, type TodoItemBy, type TodoChange } from "./todo-model";
+import { isTodoAskIdentity, isTodoTime, isTodoDocLabel, isTodoImageName, isTodoGroupName, isTodoFolderPath, isTodoLinkTarget, TODO_ITEM_SHAPES, TODO_CHANGE_FIELDS, isTodoChangeRecord, isTodoGroupAlias, isTodoBriefText, isTodoDocFields, isTodoGuessReason, isTodoId, isTodoMemoEntry, isTodoMemoText, isTodoSessionId, todoItemFieldValid, TODO_OPERATION_ERRORS, TODO_REVERT_BLOCKS, type TodoPlacementBasis, type TodoChangePlace, type TodoCaptured, TODO_ASK_PLACES, type TodoAskPlace, TODO_ASK_SOURCE_MESSAGES_MAX, TODO_BATCH_MAX, type TodoBatchStep, TODO_GROUP_COLOR_COUNT, TODO_TEMPLATE_NAME_MAX, TODO_ACKNOWLEDGE_MAX, TODO_IMAGE_EXTENSIONS, TODO_TITLE_MAX, WORK_MEMO_SECTIONS, TODO_START_KINDS, type TodoStartKind, type TodoAuthor, type TodoCompletion, type TodoDocKind, type TodoImageMediaType, type TodoOperationError, type TodoPriority, type TodoRevertBlock, type TodoState, type WorkMemoSection, type TodoDecision, type TodoItemBy, type TodoChange } from "./todo-model";
 export { BACKGROUND_ACTIVITY_LIST_MAX } from "./background-activity";
 export type { BackgroundActivitySnapshot } from "./background-activity";
 import type {
@@ -5002,8 +5002,7 @@ function isTodoEdit(value: unknown): value is TodoEdit {
           && edit.revisions.every(revision => isRevision(revision) && (revision as number) > 0) && new Set(edit.revisions).size === edit.revisions.length);
     case "addLink":
       return hasOnlyKeys(edit, ["kind", "id", "target", "label"]) && isTodoId(edit.id)
-        && isTodoFolderPath(edit.target) && edit.target.trim().length > 0 && !edit.target.includes("\0")
-        && (edit.label === undefined || isTodoDocLabel(edit.label));
+        && isTodoLinkTarget(edit.target) && (edit.label === undefined || isTodoDocLabel(edit.label));
     case "addImage":
       return hasOnlyKeys(edit, ["kind", "id", "mediaType", "data", "label"]) && isTodoId(edit.id) && isTodoImageMediaType(edit.mediaType)
         && typeof edit.data === "string" && edit.data.length > 0 && edit.data.length <= IMAGE_MAX_BASE64_LEN

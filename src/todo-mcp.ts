@@ -4,12 +4,14 @@ import type * as Sdk from "@anthropic-ai/claude-agent-sdk" with { "resolution-mo
 import type { RootGate, RootGateScope } from "./root-gate";
 import {
   isClaudeOwnChange, linkedTodoItem, TODO_LAISORA, liveChildren, memoStaleSince, parseTodoChangeId, TODO_ADD_MANY_MAX, TODO_CLAUDE_DEPTH_MAX, TODO_ADD_PLACEMENT_BASES, TODO_TIDY_KINDS, TODO_TIDY_STEPS_MAX, type TodoAddNode, todoAgentMarker,
-  todoBindableFolder, todoFailureResultText, TODO_STABLE_TOUCH_MS, TODO_STABLE_PIN_MS, TODO_STABLE_REMOVE_MS,
-  todoConversationFolder, todoDoneTwin, todoFinishedIds, todoTidySignals, todoFolderGroup, todoGroupsOf, todoItemNumbers, todoItemPath, todoPlaceOf, todoPlaceText, todoWriteResultText, TODO_DUE_PATTERN, TODO_GROUP_MAX, TODO_GUESS_REASON_MAX, TODO_MEMO_TEXT_MAX,
+  todoBindableFolder, todoFailureResultText, todoClaudeNeverReverts, TODO_STABLE_TOUCH_MS, TODO_STABLE_PIN_MS, TODO_STABLE_REMOVE_MS,
+  todoConversationFolder, todoDoneTwin, todoLinkDoc, TODO_DOC_LABEL_MAX, TODO_DOC_TARGET_MAX, TODO_ESTIMATE_PATTERN, TODO_REPEAT_PATTERN, TODO_TAGS_MAX, TODO_WAITING_MAX, type TodoLinkProblem, todoFinishedIds, todoTidySignals, todoFolderGroup, todoGroupsOf, todoItemNumbers, todoItemPath, todoPlaceOf, todoPlaceText, todoWriteResultText, TODO_DUE_PATTERN, TODO_GROUP_MAX, TODO_GUESS_REASON_MAX, TODO_MEMO_TEXT_MAX,
   TODO_PRIORITIES, TODO_SERVER_NAME, TODO_STATE_BRACKETS, TODO_STATE_CHECKBOXES, TODO_STATE_SEPARATORS, TODO_STATE_TRAILING_WORDS, TODO_STATE_WORDS, TODO_TITLE_PARTICLES, todoTitlePlaceOf, todoTitleRepeat, TODO_TOOL_KINDS, todoToolName, type TodoToolKind, TODO_STATES, TODO_TITLE_MAX, TODO_WRITE_TOOLS, WORK_MEMO_SECTIONS, type WorkMemoSection, type TodoDocument, type TodoItem,
-  type TodoOperation, type TodoOperationError, type TodoPlacementBasis, type TodoOperationFailure, type TodoOperationResult, type TodoRevertBlock, type TodoTidyStep,
+  type TodoChange, type TodoOperation, type TodoOperationError, type TodoPlacementBasis, type TodoOperationFailure, type TodoOperationResult, type TodoRevertBlock, type TodoTidyStep,
 } from "./todo-model";
 import { TodoStoreError, type TodoStore } from "./todo-store";
+import { TODO_CLAUDE_CHANGES_MAX, todoClaudeChangeUnits, todoClipped } from "./todo-change-view";
+import { TODO_CHANGES_REQUEST_MAX } from "./protocol";
 import { TODO_SPLIT_FENCE_INFO } from "./markdown-ast";
 
 export { TODO_SERVER_NAME } from "./todo-model";
@@ -20,9 +22,13 @@ const TODO_HOUR_MS = 60 * 60_000;
 const TODO_DAY_MS = 24 * TODO_HOUR_MS;
 const span = (ms: number) => ms % TODO_DAY_MS === 0 ? `${ms / TODO_DAY_MS} days` : `${ms / TODO_HOUR_MS} hours`;
 const TODO_DEPTH_EXAMPLE = Array.from({ length: TODO_CLAUDE_DEPTH_MAX }, (_, level) => level === 0 ? "01" : Array.from({ length: level + 1 }, (_, at) => at + 1).join(".")).join(" / ");
-const TODO_STABLE_RULE = `Items in progress (or holding one), items the user changed in the last ${span(TODO_STABLE_TOUCH_MS)} and items the user moved in the last ${span(TODO_STABLE_PIN_MS)} are not moved or retitled; items you moved in the last ${span(TODO_STABLE_REMOVE_MS)} are not moved again unless requested is set because the user explicitly asked for this restructure.`;
-const TODO_REQUESTED = z.literal(true).optional().describe(`Set only when the user explicitly asked for this restructure in this conversation; it lifts only the rule against moving again what you moved in the last ${span(TODO_STABLE_REMOVE_MS)}, and the change shows as done on request.`);
+const TODO_STABLE_RULE = `Items in progress (or holding one), items the user changed in the last ${span(TODO_STABLE_TOUCH_MS)} and items the user moved in the last ${span(TODO_STABLE_PIN_MS)} are not moved or retitled, and items you moved in the last ${span(TODO_STABLE_REMOVE_MS)} are not moved again, when you do it on your own initiative; with requested set because the user explicitly asked for this change, none of these rules apply.`;
+const TODO_REQUESTED = z.literal(true).optional().describe("Set only when the user explicitly asked for this change in this conversation; it lifts every rule that keeps items in place or keeps their titles, and the change shows as done on request.");
 export const TODO_LIST_ITEMS_MAX = 150;
+export const TODO_LIST_CHANGES_MAX = 30;
+const TODO_LIST_CHANGE_TEXT_MAX = 200;
+const TODO_ASKED_REVERT = "Use it only when the user asks you to take back something you did in the ToDo list.";
+const TODO_REVERT_REACH = "It takes back only your own changes; the user's own edits, the user's taking back of your changes and the items the user deleted stay with the user.";
 const TODO_SCOPE = "The user's persistent TODO list: one per PC, shared by every LAISORA window and conversation, kept across restarts. It is not this conversation's plan: use TaskCreate/TaskUpdate (or TodoWrite) for the steps of the current request, and this TODO list only for items the user asks to keep or track beyond this conversation.";
 const TODO_ROOT_ONLY = "Only the main conversation may change the TODO list; a subagent reports to the main conversation, which writes.";
 export const TODO_ROOT_SCOPE: RootGateScope = { tools: TODO_WRITE_TOOL_NAMES, denial: TODO_ROOT_ONLY };
@@ -33,7 +39,7 @@ const TODO_PATH_READING = "Read each item as one line: group › ancestors › t
 const TODO_TITLE_COMPARE = "compared ignoring case, full/half width, spaces, punctuation and symbols";
 const TODO_REPEAT_RULE = `${TODO_PATH_READING} A title adds only what that line does not already say. A title that obviously repeats the line (${TODO_TITLE_COMPARE}, it is its group's name or an ancestor's title, or begins with one followed by a space, punctuation, a symbol or one of ${TODO_TITLE_PARTICLES.join(" ")}) is not refused: the write result lists it under repeats with what to do, and list shows it as the repeatsPlace tidy signal.`;
 const TODO_REPEAT_CHECKED: readonly TodoToolKind[] = ["add", "update", "move", "tidy"];
-const TODO_REPEAT_FIX = "Each item in repeats has a title that its path already says (word = the repeated group name or ancestor title); rename it now (update, or tidy rename for the user's items) so the path reads as one line.";
+const TODO_REPEAT_FIX = "Each item in repeats has a title that its path already says (word = the repeated group name or ancestor title); rename it now (update or tidy rename) so the path reads as one line.";
 const TODO_TITLE_SAME = `the same as another open item's title under the same parent (at the top level, in the same group), ${TODO_TITLE_COMPARE}`;
 const TODO_STATE_MARKERS = `a state marker (case-sensitive): a leading ${TODO_STATE_CHECKBOXES.join(" ")}; ${TODO_STATE_WORDS.join(" ")} between any opening bracket ${TODO_STATE_BRACKETS.map(([open]) => open).join(" ")} and any closing bracket ${TODO_STATE_BRACKETS.map(([, close]) => close).join(" ")} at the start or end; or a trailing ${TODO_STATE_TRAILING_WORDS.join(" ")} after a space or ${TODO_STATE_SEPARATORS.join(" ")}`;
 const TODO_MOVE_TITLE_RULE = `move, update changing a top-level item's group, and tidy move refuse the moved item when its title is ${TODO_TITLE_SAME} at the destination.`;
@@ -92,9 +98,14 @@ const newGroup = z.literal(true).describe("Create the group named in group becau
 const position = z.number().int().min(0).optional().describe("0-based position among the new siblings; omitted = last.");
 const start = z.string().regex(TODO_DUE_PATTERN).describe("Start date, YYYY-MM-DD.");
 const priority = z.enum(TODO_PRIORITIES).describe("Priority: p0 = top, p1 high, p2 medium, p3 low.");
+const waiting = z.string().min(1).max(TODO_WAITING_MAX).describe("Whose reply or what the item waits for.");
+const repeat = z.string().regex(TODO_REPEAT_PATTERN).describe("Repeat mark: daily, weekly-0 to weekly-6 (0 = Sunday), monthly-first or monthly-last. It is only a mark: completing the item does not create the next one.");
+const estimate = z.string().regex(TODO_ESTIMATE_PATTERN).describe("Estimated work time in hours, e.g. 1.5.");
+const tags = z.string().min(1).max(TODO_TAGS_MAX).describe("Tags as free text.");
 const reason = (field: string) => z.string().min(1).max(TODO_GUESS_REASON_MAX)
   .describe(`Set only when you estimated the ${field} yourself instead of being told it: the evidence in one short sentence. The user sees the ${field} marked as estimated with this reason until they change it.`);
 const itemFields = { due: due.optional(), start: start.optional(), priority: priority.optional(),
+  waiting: waiting.optional(), repeat: repeat.optional(), estimate: estimate.optional(), tags: tags.optional(),
   due_reason: reason("due date").optional(), priority_reason: reason("priority").optional(), group: group.optional(), new_group: newGroup.optional(),
   basis: z.enum(TODO_ADD_PLACEMENT_BASES).optional().describe("What decided the place: named = the request names it, linked = this conversation's linked item, files = the files this conversation worked on, folder = a folder binding, alias = words learned from the user's corrections, inbox = no signal (No group)."),
   imported: z.literal(true).optional().describe("Set when the item comes from material such as a ledger, notes or an image."),
@@ -119,14 +130,23 @@ const TODO_INPUTS = {
   list: { id: id.optional().describe("Read one item with its memos and subtree."),
     group: z.string().min(1).max(TODO_GROUP_MAX).optional().describe("Show this group's tree instead of the context group's."),
     all: z.literal(true).optional().describe("Show the tree of every group."),
-    done: z.literal(true).optional().describe("Include done items in the tree.") },
+    done: z.literal(true).optional().describe("Include done items in the tree."),
+    changes: z.literal(true).optional().describe(`Instead of the tree, return your recent changes (newest first, at most ${TODO_LIST_CHANGES_MAX} entries from your last ${TODO_CLAUDE_CHANGES_MAX} changes; with id, only those to that item), each with the revision and change ids that revert takes, the item and its path, what changed (before and after), the reason it was placed, and whether it can still be taken back or what blocks it (your own take-backs show blocked: take-back).`) },
   add: { title: title.optional().describe("Title of the single item to add; omit when items is given."), parent: id.optional().describe("Nest under this item; omitted = top level."), ...itemFields, position,
     items: z.array(addNode).min(1).optional()
       .describe(`Several items to add in this one call, in order, each with optional nested children; instead of title and the single-item fields. At most ${TODO_ADD_MANY_MAX} items in total.`) },
   update: { id, title: title.optional(), due: due.nullable().optional().describe("Due date, YYYY-MM-DD; null clears it."),
     start: start.nullable().optional().describe("Start date, YYYY-MM-DD; null clears it."), priority: priority.nullable().optional().describe("Priority; null clears it."),
     due_reason: reason("due date").optional(), priority_reason: reason("priority").optional(),
-    group: group.nullable().optional().describe("Group name of a top-level item; null clears it."), new_group: newGroup.optional() },
+    group: group.nullable().optional().describe("Group name of a top-level item; null clears it."), new_group: newGroup.optional(), requested: TODO_REQUESTED,
+    waiting: waiting.nullable().optional().describe("Whose reply or what the item waits for; null clears it."), repeat: repeat.nullable().optional().describe("Repeat mark as in add; null clears it."),
+    estimate: estimate.nullable().optional().describe("Estimated work time in hours; null clears it."), tags: tags.nullable().optional().describe("Tags as free text; null clears it."),
+    add_link: z.strictObject({ target: z.string().min(1).max(TODO_DOC_TARGET_MAX).describe("An http or https URL, or a file path (relative paths resolve against the first workspace folder)."),
+      label: z.string().max(TODO_DOC_LABEL_MAX).optional().describe("The name shown instead of the target.") }).optional()
+      .describe("Attach a link to the item's references. Images cannot be added through this tool."),
+    remove_reference: id.optional().describe("Remove the reference (link or image) with this reference id from list."),
+    label_reference: z.strictObject({ id: id.describe("Reference id from list."), label: z.string().max(TODO_DOC_LABEL_MAX).describe("The new name shown; empty clears it.") }).optional()
+      .describe("Rename a reference (link or image).") },
   move: { id, parent: id.nullable().describe("New parent item id; null = top level."), position, requested: TODO_REQUESTED },
   set_state: { id, state: z.enum(TODO_STATES) },
   write_memo: { id, section: z.enum(WORK_MEMO_SECTIONS).optional().describe("The one section to rewrite; omit when sections is given."),
@@ -138,42 +158,56 @@ const TODO_INPUTS = {
     to: z.string().min(1).max(TODO_GROUP_MAX).optional().describe("rename: the new name."),
     position: z.number().int().min(0).optional().describe("move: the group's new 0-based place in the group order.") },
   tidy: { steps: z.array(tidyStep).min(1).max(TODO_TIDY_STEPS_MAX).describe("The tidy-up, applied in this order.") },
+  revert: { revisions: z.array(z.number().int().min(1)).min(1).max(TODO_CHANGES_REQUEST_MAX).optional().describe("Take back every change of yours written in these revisions (a write's revision from list changes or from the write's result); omit when changes is given."),
+    changes: z.array(z.string().regex(/^[0-9]+\.[0-9]+$/)).min(1).max(TODO_CHANGES_REQUEST_MAX).optional().describe("Take back these changes (the ids of one entry of list changes); instead of revisions.") },
 } satisfies Record<TodoToolKind, Record<string, z.ZodType>>;
 
 const TODO_DESCRIPTIONS: Record<TodoToolKind, string> = {
-  list: `Read the TODO list: every group first (display order, open and done counts, empty ones included, the folders bound to it), the conversation context (cwd, the folder of the files this conversation used, the group bound to it, and words learned from the user's corrections with the place they mean), then the open items of the context group as a tree with the numbers the user sees (${TODO_DEPTH_EXAMPLE}); when the conversation has no context group or that group has no open items, the open items of every group, shortened to about ${TODO_LIST_ITEMS_MAX} items with a note, and tidy signals (same titles among siblings, a parent with one child, crowded sibling lists, titles that repeat their group or an ancestor (repeatsPlace), open items waiting in No group: file them with tidy). Items marked by: ${TODO_LAISORA} are a guide LAISORA added for the user to tick off, not the user's notes: change, complete or delete them when the user asks, and do not tidy them on your own. ${TODO_PATH_READING} Use group, all or done for more. Reading one item also returns its parent id, path, the user's memo, your work memo (with a note when later work may have made it out of date) and the item's references the user attached (links as URL or file path; images as a reference you cannot open). ${TODO_IMPORT_RULES} ${TODO_SCOPE}`,
+  list: `Read the TODO list: every group first (display order, open and done counts, empty ones included, the folders bound to it), the conversation context (cwd, the folder of the files this conversation used, the group bound to it, and words learned from the user's corrections with the place they mean), then the open items of the context group as a tree with the numbers the user sees (${TODO_DEPTH_EXAMPLE}); when the conversation has no context group or that group has no open items, the open items of every group, shortened to about ${TODO_LIST_ITEMS_MAX} items with a note, and tidy signals (same titles among siblings, a parent with one child, crowded sibling lists, titles that repeat their group or an ancestor (repeatsPlace), open items waiting in No group: file them with tidy). Items marked by: ${TODO_LAISORA} are a guide LAISORA added for the user to tick off, not the user's notes: change, complete or delete them when the user asks, and do not tidy them on your own. ${TODO_PATH_READING} Use group, all or done for more; changes returns your recent changes for revert. Reading one item also returns its parent id, path, waiting-on, repeat mark, estimate and tags when set, the user's memo, your work memo (with a note when later work may have made it out of date) and the item's references, each with the id that update takes (links as URL or file path; images as a reference you cannot open). ${TODO_IMPORT_RULES} ${TODO_SCOPE}`,
   add: `Add an item, or several items with their sub-items through items, to the TODO list; the result gives each item's id and path. When adding more than one item, add them all in one call with items rather than one call per item. ${TODO_CASE_RULES} ${TODO_ITEM_RULES} ${TODO_SCOPE} ${TODO_ROOT_ONLY}`,
-  update: `Change an item's title, due date, start date, priority or group in the TODO list. ${TODO_TITLE_RULE} ${TODO_ROOT_ONLY}`,
+  update: `Change a TODO item: its title, due date, start date, priority, group, waiting-on, repeat mark, estimate or tags; or, instead of those fields, one change to its references: add a link (add_link), remove a link or image (remove_reference) or rename one (label_reference). Any item can be changed this way, the user's own included; the user sees each change and can take it back. The user's memo on the item is read-only to you. Set the state with set_state. ${TODO_TITLE_RULE} ${TODO_STABLE_RULE} ${TODO_ROOT_ONLY}`,
   move: `Move an item under another parent or to the top level of the TODO list; both parents' states are re-evaluated. Giving the same parent without position changes nothing. ${TODO_REPEAT_RULE} ${TODO_MOVE_TITLE_RULE} ${TODO_STABLE_RULE} ${TODO_ROOT_ONLY}`,
-  set_state: `Set a TODO item's state (todo, doing, done). Set done directly only items under the item this conversation is linked to; for other finished items use tidy with foldDone. A child that starts makes not-started ancestors doing; when every child is done the parent becomes done, and it reopens when a child reopens unless it was set done directly. ${TODO_ROOT_ONLY}`,
+  set_state: `Set a TODO item's state (todo, doing, done). Set done when the work on the item is finished; finished items found while tidying can also be folded away with tidy foldDone. A child that starts makes not-started ancestors doing; when every child is done the parent becomes done, and it reopens when a child reopens unless it was set done directly. ${TODO_ROOT_ONLY}`,
   write_memo: `Rewrite one section of a TODO item's work memo, your own notes for the item (current = where the work stands, next = next steps, decisions = what was decided, open = unresolved points, files = files involved). The previous text goes to the section history. When rewriting more than one section, give them all in one call with sections rather than one call per section. The user's memo on the item is separate and read-only to you. ${TODO_ROOT_ONLY}`,
-  delete: `Delete a TODO item together with all its sub-items, only when the user asks for it. They move to the user's recently deleted list, from which the user can restore them, and the user can take the deletion back from the conversation. ${TODO_ROOT_ONLY}`,
-  group: `Create, rename, delete or reorder a group (a case). Create only when the request names a case that matches no existing group. Delete only a group that holds no item the user added (it is refused otherwise); its items move to No group. The colour is the user's. Each change shows in the conversation and the user can take it back. ${TODO_ROOT_ONLY}`,
-  tidy: `Tidy the TODO list now, as one change the user sees in the conversation as a before/after tree and can take back in one step: file items into their case and parent (move), rewrite rough titles as outcomes (rename; the original wording is kept), break an item down (add), merge duplicates (merge), fold a single-child parent (flatten) and set finished work done (foldDone). Use it when list shows tidy signals, especially items waiting in No group, and for changes to the user's own items outside this conversation's linked item. ${TODO_STABLE_RULE} Running the same steps again changes nothing; a move to the parent an item already has, with no position, changes nothing. Sub-items with the same title as one in the item that stays are merged into it. Done items are never merged away; a merged item goes to recently deleted. ${TODO_TITLE_RULE} ${TODO_TIDY_ADD_FOLD} ${TODO_ROOT_ONLY}`,
+  delete: `Delete a TODO item together with all its sub-items, only when the user asks for it. They move to the user's recently deleted list, from which the user can restore them, and the user can take the deletion back from the conversation; when the user asks you to bring them back, use revert. ${TODO_ROOT_ONLY}`,
+  group: `Create, rename, delete or reorder a group (a case). Create only when the request names a case that matches no existing group. A deleted group's items move to No group. The colour is the user's. Each change shows in the conversation and the user can take it back. ${TODO_ROOT_ONLY}`,
+  tidy: `Tidy the TODO list now, as one change the user sees in the conversation as a before/after tree and can take back in one step: file items into their case and parent (move), rewrite rough titles as outcomes (rename; the original wording is kept), break an item down (add), merge duplicates (merge), fold a single-child parent (flatten) and set finished work done (foldDone). Use it when list shows tidy signals, especially items waiting in No group. ${TODO_STABLE_RULE} Running the same steps again changes nothing; a move to the parent an item already has, with no position, changes nothing. Sub-items with the same title as one in the item that stays are merged into it. Done items are never merged away; a merged item goes to recently deleted. ${TODO_TITLE_RULE} ${TODO_TIDY_ADD_FOLD} ${TODO_ROOT_ONLY}`,
+  revert: `Take back your own earlier ToDo changes, as the user taking them back would: a whole write by revisions, or one entry of list changes by its change ids. ${TODO_ASKED_REVERT} Taking back a deletion of yours, a tidy merge included, brings the item back from recently deleted with its sub-items, memos, references and conversations. ${TODO_REVERT_REACH} A change a later change has replaced, one already taken back, and a take-back itself are refused with the reason. The take-back is itself your change: it shows on the conversation's ToDo card and in the user's history, and the user can take it back. ${TODO_ROOT_ONLY}`,
 };
 
-const OPERATION_ERRORS: Record<Exclude<TodoOperationError, TodoRevertBlock>, string> = {
+const REVERT_ERRORS: Record<TodoRevertBlock, string> = {
+  "not-target": `That is not a change of yours, so it is not taken back. ${TODO_REVERT_REACH}`,
+  unrevertible: "That change can no longer be taken back: the earlier version is no longer kept.",
+  reverted: "That change was already taken back.",
+  gone: "That change can no longer be taken back: the change, its item or its former place is no longer kept; read list with changes for the current ones.",
+  superseded: "A later change to the same thing is in the way (the user's edit, or a change that replaced it), so nothing was taken back; tell the user.",
+  "in-use": "The group that change created holds items now, so it is not removed.",
+};
+
+const TODO_TAKE_BACK_BLOCK = "take-back";
+const TODO_TAKE_BACK_REFUSED = "That is one of your take-backs, and a take-back is not taken back again here: redoing what you took back stays with the user, who takes back your take-back. After the user has done that, you may take back the original change again when the user asks.";
+
+const OPERATION_ERRORS: Record<TodoOperationError, string> = {
   "not-found": "No TODO item has that id; call list to get current ids.",
   deleted: "That TODO item is already deleted.",
   "invalid-parent": "The parent id does not name a live TODO item.",
   cycle: "An item cannot be moved under itself or its own descendant.",
   "empty-title": "The title is empty.",
   "title-too-long": `The title is longer than ${TODO_TITLE_MAX} characters; put details in the work memo.`,
-  "author-not-allowed": "That field is not writable through this tool.",
+  "author-not-allowed": "Only the user writes that; leave it to the user.",
+  "doc-not-found": "That item has no reference with that id; read the item with list (id) for its current reference ids.",
   "group-exists": "A group with that name already exists.",
   "invalid-name": "The name is empty or too long.",
   "too-many": `At most ${TODO_ADD_MANY_MAX} items can be added in one call, and a tidy-up has at most ${TODO_TIDY_STEPS_MAX} steps; split them over several calls.`,
   "too-deep": `Items are at most ${TODO_CLAUDE_DEPTH_MAX} levels deep (${TODO_DEPTH_EXAMPLE}); put this detail in the work memo of its parent instead.`,
   "duplicate-title": "An item with the same title is already there; update or reuse it instead of adding another.",
   "title-state": `The title carries ${TODO_STATE_MARKERS}; set the state with set_state instead.`,
-  "outside-linked": "Set done directly only items under the item this conversation is linked to; use tidy with foldDone for others.",
-  "user-item": "The user added this item; outside this conversation's linked item you change the user's items only through tidy (move, rename, add sub-items, merge, foldDone), which the user sees and can take back.",
   "unknown-group": "No group has that name. Use an existing group, or pass new_group only when the request names a case that matches none.",
   "near-group": "The name is close to an existing group; use that group. A name this close is not created even with new_group.",
   "merge-done": "A done item is never merged away; done items stay and fold in the list.",
   "not-single-child": "flatten applies only to an item with exactly one sub-item.",
   "unstable": `${TODO_STABLE_RULE} Leave it where it is.`,
-  "group-has-user-items": "The group holds items the user added; Claude deletes only a group without the user's items. Move your own items out or leave the group.",
+  ...REVERT_ERRORS,
 };
 
 const STORE_ERRORS: Record<TodoStoreError["code"], string> = {
@@ -205,6 +239,7 @@ function itemView(view: ListView, item: TodoItem, detail: boolean, hidden: Reado
     ...(item.due ? { due: item.due } : {}), ...(item.start ? { start: item.start } : {}), ...(item.priority ? { priority: item.priority } : {}), ...(item.group ? { group: item.group } : {}),
     ...(detail ? {
       path: view.path(item.id),
+      ...Object.fromEntries((["waiting", "repeat", "estimate", "tags"] as const).flatMap(field => item[field] ? [[field, item[field]]] : [])),
       ...(item.parentId !== null ? { parentId: item.parentId } : {}),
       userMemo: item.userMemo,
       workMemo: Object.fromEntries(WORK_MEMO_SECTIONS.flatMap(section => {
@@ -212,7 +247,7 @@ function itemView(view: ListView, item: TodoItem, detail: boolean, hidden: Reado
         return memo ? [[section, { text: memo.text, writtenAt: new Date(memo.at).toISOString() }]] : [];
       })),
       ...(memoStaleSince(item) !== undefined ? { workMemoNote: TODO_MEMO_STALE_NOTE } : {}),
-      ...(item.docs?.length ? { references: item.docs.map(doc => ({
+      ...(item.docs?.length ? { references: item.docs.map(doc => ({ id: doc.id,
         ...(doc.kind === "url" ? { url: doc.target } : doc.kind === "file" ? { path: doc.target } : { image: doc.target }),
         ...(doc.label ? { label: doc.label } : {}),
       })) } : {}),
@@ -279,11 +314,39 @@ function treeView(view: ListView, input: Record<string, unknown>, context: Recor
   };
 }
 
+function changeUnitsView(document: TodoDocument, view: ListView, itemId: string | undefined): Record<string, unknown> {
+  const units = todoClaudeChangeUnits(document).filter(unit => itemId === undefined || unit.changes[0].itemId === itemId);
+  const shown = units.slice(0, TODO_LIST_CHANGES_MAX);
+  const text = (value: string | null) => todoClipped(value, TODO_LIST_CHANGE_TEXT_MAX);
+  return {
+    changes: shown.map(unit => {
+      const first = unit.changes[0];
+      const raw = unit.changes.flatMap(entry => document.changes.find(change => change.id === entry.id) ?? []);
+      const takesBack = raw.flatMap(change => change.revertOf ?? []);
+      const claudeBlock = (block: string, takeBack: boolean) => block === "ok" && takeBack ? TODO_TAKE_BACK_BLOCK : block;
+      const revert = claudeBlock(unit.revert, raw.some(todoClaudeNeverReverts));
+      const write = unit.write === undefined ? undefined
+        : claudeBlock(unit.write, document.changes.some(change => parseTodoChangeId(change.id).revision === unit.revision && isClaudeOwnChange(change) && todoClaudeNeverReverts(change)));
+      const basis = unit.changes.find(entry => entry.basis !== undefined)?.basis;
+      return {
+        revision: unit.revision, ids: unit.changes.map(entry => entry.id), at: new Date(first.at).toISOString(),
+        ...(first.itemId === "" ? {} : view.live.some(entry => entry.id === first.itemId) ? { item: first.itemId, path: view.path(first.itemId) } : { item: first.itemId, title: first.itemTitle, deleted: true }),
+        fields: unit.changes.map(entry => ({ field: entry.field, before: text(entry.before), after: text(entry.after) })),
+        ...(basis ? { basis } : {}), ...(takesBack.length ? { takesBack } : {}),
+        ...(revert === "ok" ? { revertible: true } : { blocked: revert }),
+        ...(write !== undefined ? { wholeWrite: write === "ok" ? "revertible" : write } : {}),
+      };
+    }),
+    ...(units.length > shown.length ? { omitted: units.length - shown.length, note: `Older units were left out; read one item's units with id. Only your last ${TODO_CLAUDE_CHANGES_MAX} changes are listed, with or without id.` } : {}),
+  };
+}
+
 type AddInput = { readonly title?: string; readonly group?: string; readonly children?: readonly AddInput[] };
 
 function addNodeOf(input: Record<string, unknown>, sessionId: string | undefined, placedFrom: string | undefined): TodoAddNode {
   const value = input as Record<string, never>;
   return { title: value.title, group: value.group, due: value.due, start: value.start, priority: value.priority,
+    waiting: value.waiting, repeat: value.repeat, estimate: value.estimate, tags: value.tags,
     ...(value.new_group === true ? { newGroup: true } : {}), ...(placedFrom ? { placedFrom } : {}), ...(value.case_words !== undefined ? { caseWords: value.case_words } : {}), ...(value.basis !== undefined ? { basis: value.basis } : {}), ...(value.imported === true ? { imported: true } : {}),
     ...(sessionId ? { sourceSession: sessionId } : {}), ...(value.due_reason !== undefined ? { dueReason: value.due_reason } : {}), ...(value.priority_reason !== undefined ? { priorityReason: value.priority_reason } : {}),
     ...(Array.isArray(input.children) ? { children: (input.children as Record<string, unknown>[]).map(child => addNodeOf(child, sessionId, placedFrom)) } : {}) };
@@ -316,7 +379,7 @@ function groupInputError(input: Record<string, unknown>): string | undefined {
 function tidyInputError(input: Record<string, unknown>): string | undefined {
   const steps = input.steps as ReadonlyArray<Record<string, unknown>>;
   for (const [index, entry] of steps.entries()) {
-    const fields = entry.kind === "move" ? ["parent", "group", "position", "requested"] : entry.kind === "merge" ? ["into", "requested"] : entry.kind === "flatten" ? ["requested"] : entry.kind === "rename" ? ["title"] : entry.kind === "add" ? ["items"] : [];
+    const fields = entry.kind === "move" ? ["parent", "group", "position", "requested"] : entry.kind === "merge" ? ["into", "requested"] : entry.kind === "flatten" ? ["requested"] : entry.kind === "rename" ? ["title", "requested"] : entry.kind === "add" ? ["items"] : [];
     const extra = ["parent", "group", "position", "into", "title", "items", "requested"].filter(field => entry[field] !== undefined && !fields.includes(field));
     if (extra.length) return `Step ${index + 1} (${String(entry.kind)}) takes no ${extra.join(", ")}.`;
     if (entry.kind === "move" && entry.parent === undefined) return `Step ${index + 1} (move) needs parent (null = top level).`;
@@ -335,7 +398,7 @@ function tidyStepOf(input: Record<string, unknown>): TodoTidyStep {
     case "merge": return { kind: "merge", id: value.id, into: value.into, ...(value.requested === true ? { requested: true } : {}) };
     case "flatten": return { kind: "flatten", id: value.id, ...(value.requested === true ? { requested: true } : {}) };
     case "foldDone": return { kind: "foldDone", id: value.id };
-    case "rename": return { kind: "rename", id: value.id, title: value.title };
+    case "rename": return { kind: "rename", id: value.id, title: value.title, ...(value.requested === true ? { requested: true } : {}) };
     case "add": return { kind: "add", id: value.id, items: value.items };
   }
 }
@@ -351,15 +414,23 @@ function operationOf(kind: Exclude<TodoToolKind, "list">, input: Record<string, 
     case "add": return Array.isArray(input.items)
       ? { kind: "addMany", parentId: value.parent ?? null, items: (input.items as Record<string, unknown>[]).map(node => addNodeOf(grouped(node), sessionId, placedFrom)) }
       : { kind: "add", parentId: value.parent ?? null, position: value.position, ...addNodeOf(grouped({ ...input, children: undefined }), sessionId, placedFrom) };
-    case "update": return { kind: "update", id: value.id, title: value.title, group: value.group, due: value.due, start: value.start, priority: value.priority,
-      ...(value.new_group === true ? { newGroup: true } : {}), session: sessionId ?? null,
-      ...(value.due_reason !== undefined ? { dueReason: value.due_reason } : {}), ...(value.priority_reason !== undefined ? { priorityReason: value.priority_reason } : {}) };
-    case "move": return { kind: "move", id: value.id, parentId: value.parent ?? null, position: value.position, session: sessionId ?? null, ...(value.requested === true ? { basis: "requested" } : {}) };
-    case "set_state": return { kind: "setState", id: value.id, state: value.state, session: sessionId ?? null };
+    case "update": {
+      const link = linkOf(input);
+      const labelled = input.label_reference as { readonly id: string; readonly label: string } | undefined;
+      if (link !== undefined && typeof link !== "string") return { kind: "addDoc", id: value.id, doc: link };
+      if (typeof input.remove_reference === "string") return { kind: "removeDoc", id: value.id, docId: input.remove_reference };
+      if (labelled) return { kind: "docLabel", id: value.id, docId: labelled.id, label: labelled.label };
+      return { kind: "update", id: value.id, title: value.title, group: value.group, due: value.due, start: value.start, priority: value.priority,
+        waiting: value.waiting, repeat: value.repeat, estimate: value.estimate, tags: value.tags, ...(value.new_group === true ? { newGroup: true } : {}),
+        ...(value.due_reason !== undefined ? { dueReason: value.due_reason } : {}), ...(value.priority_reason !== undefined ? { priorityReason: value.priority_reason } : {}),
+        ...(value.requested === true ? { basis: "requested" } : {}) };
+    }
+    case "move": return { kind: "move", id: value.id, parentId: value.parent ?? null, position: value.position, ...(value.requested === true ? { basis: "requested" } : {}) };
+    case "set_state": return { kind: "setState", id: value.id, state: value.state };
     case "write_memo": return input.sections !== undefined
       ? { kind: "writeWorkMemos", id: value.id, sections: input.sections as Partial<Record<WorkMemoSection, string>> }
       : { kind: "writeWorkMemo", id: value.id, section: value.section, text: value.text };
-    case "delete": return { kind: "delete", id: value.id, session: sessionId ?? null };
+    case "delete": return { kind: "delete", id: value.id };
     case "group": switch (value.action as string) {
       case "create": return { kind: "groupCreate", name: value.name };
       case "rename": return { kind: "groupRename", name: value.name, to: value.to };
@@ -367,6 +438,7 @@ function operationOf(kind: Exclude<TodoToolKind, "list">, input: Record<string, 
       default: return { kind: "groupDelete", name: value.name };
     }
     case "tidy": return { kind: "tidy", steps: (input.steps as Record<string, unknown>[]).map(tidyStepOf) };
+    case "revert": return Array.isArray(input.revisions) ? { kind: "revert", mode: "claude", revisions: input.revisions as number[] } : { kind: "revert", mode: "claude", changeIds: input.changes as string[] };
   }
 }
 
@@ -375,7 +447,7 @@ function failureReply(failure: TodoOperationFailure, document: TodoDocument | un
 }
 
 function failureText(failure: TodoOperationFailure, document: TodoDocument | undefined): string {
-  const base = OPERATION_ERRORS[failure.error as keyof typeof OPERATION_ERRORS] ?? STORE_ERRORS.io;
+  const base = failure.detail?.takeBack ? TODO_TAKE_BACK_REFUSED : OPERATION_ERRORS[failure.error] ?? STORE_ERRORS.io;
   const detail = failure.detail;
   const view = document ? listView(document) : undefined;
   const parts = [
@@ -387,6 +459,11 @@ function failureText(failure: TodoOperationFailure, document: TodoDocument | und
     ...(detail?.itemId !== undefined && view ? [`Existing item: ${view.path(detail.itemId)} (id ${detail.itemId}).`] : []),
   ];
   return parts.join(" ");
+}
+
+function addedReference(own: readonly TodoChange[]): { reference?: string } {
+  const after = own.find(change => change.field === "docs" && change.before === null)?.after as { readonly id?: unknown } | undefined;
+  return typeof after?.id === "string" ? { reference: after.id } : {};
 }
 
 function operationReply(kind: TodoToolKind, result: TodoOperationResult, input: Record<string, unknown>, document: TodoDocument | undefined): Reply {
@@ -416,14 +493,48 @@ function operationReply(kind: TodoToolKind, result: TodoOperationResult, input: 
     : many ? { items: added.map(placed), ...repeatPart }
     : kind === "add" && item ? { id: item.id, ...placed(item), ...repeatPart }
     : kind === "group" ? { ok: true, groups: todoGroupsOf(result.document).map(entry => entry.name) }
+    : kind === "revert" ? { ok: true, takenBack: new Set(own.flatMap(change => change.revertOf ?? [])).size, ...(result.skipped ? { skipped: result.skipped } : {}),
+      items: [...new Set(own.map(change => change.itemId).filter(Boolean))].map(itemId => view.live.some(entry => entry.id === itemId) ? { id: itemId, path: view.path(itemId) } : { id: itemId, deleted: true }),
+      notice: "Taken back as one change of yours. The user sees it on the conversation's ToDo card and can take it back; tell them in one line what came back." }
     : kind === "delete" ? { ok: true, id: result.itemId, deleted: result.document.changes.filter(change => parseTodoChangeId(change.id).revision === result.document.revision && change.field === "deletedAt").length }
-    : { ok: true, id: result.itemId, ...(item ? { path: view.path(item.id), ...((kind === "update" || kind === "move") ? twinWarning(item) : {}) } : {}), ...repeatPart };
+    : { ok: true, id: result.itemId, ...(item ? { path: view.path(item.id), ...((kind === "update" || kind === "move") ? twinWarning(item) : {}) } : {}), ...repeatPart, ...addedReference(own) };
   return reply(todoWriteResultText(result.changed ? result.document.revision : null, groupIgnored ? { ...body, notice: TODO_CHILD_GROUP_NOTE } : body));
+}
+
+const TODO_REFERENCE_CHANGES = ["add_link", "remove_reference", "label_reference"] as const;
+
+function linkOf(input: Record<string, unknown>): ReturnType<typeof todoLinkDoc> | undefined {
+  const link = input.add_link as { readonly target: string; readonly label?: string } | undefined;
+  return link ? todoLinkDoc(link.target, link.label, process.platform === "win32") : undefined;
+}
+const TODO_LINK_PROBLEMS: Record<TodoLinkProblem, string> = {
+  "invalid-doc": "add_link takes an http or https URL, or a file path.",
+  "link-too-long": `The link is longer than ${TODO_DOC_TARGET_MAX} characters.`,
+};
+
+function updateInputError(input: Record<string, unknown>): string | undefined {
+  const references = TODO_REFERENCE_CHANGES.filter(field => input[field] !== undefined);
+  const fields = Object.keys(input).filter(field => field !== "id" && input[field] !== undefined && !(TODO_REFERENCE_CHANGES as readonly string[]).includes(field));
+  if (references.length > 1 || (references.length === 1 && fields.length > 0)) return `Give either the item's fields or one reference change (${TODO_REFERENCE_CHANGES.join(", ")}) in one call, not both (${[...references, ...fields].join(", ")}).`;
+  const link = linkOf(input);
+  return typeof link === "string" ? TODO_LINK_PROBLEMS[link] : undefined;
+}
+
+function revertInputError(input: Record<string, unknown>): string | undefined {
+  return (input.revisions === undefined) === (input.changes === undefined) ? "Give either revisions or changes." : undefined;
+}
+
+function listInputError(input: Record<string, unknown>): string | undefined {
+  const extra = ["group", "all", "done"].filter(field => input[field] !== undefined);
+  return input.changes === true && extra.length ? `changes takes only id, not ${extra.join(", ")}.` : undefined;
 }
 
 function inputError(kind: TodoToolKind, input: Record<string, unknown>): string | undefined {
   switch (kind) {
+    case "list": return listInputError(input);
+    case "revert": return revertInputError(input);
     case "add": return addInputError(input);
+    case "update": return updateInputError(input);
     case "write_memo": return memoInputError(input);
     case "group": return groupInputError(input);
     case "tidy": return tidyInputError(input);
@@ -471,6 +582,7 @@ export function createTodoMcpServer(sdk: Pick<typeof Sdk, "createSdkMcpServer" |
       }
       const document = await store.read();
       const view = listView(document);
+      if (input.changes === true) return reply(JSON.stringify(changeUnitsView(document, view, typeof input.id === "string" ? input.id : undefined)));
       if (typeof input.id !== "string") {
         const noGroupNames = [l10n.t("No group"), "No group"];
         const names = todoGroupsOf(document).map(entry => entry.name);

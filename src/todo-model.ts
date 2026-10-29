@@ -1,5 +1,6 @@
 import { AskAnswerTitles, askAnswerBody, askAnswerChoices, askAnswerParts, askOptionLetter, otherReplyAsksBack } from "./ask-parser";
 import { ASK_FENCE_INFO, askBlocksIn } from "./markdown-ast";
+import { parseFileLinkTarget } from "./file-link-target";
 
 export const TODO_STATES = ["todo", "doing", "done"] as const;
 export type TodoState = typeof TODO_STATES[number];
@@ -9,7 +10,7 @@ export const WORK_MEMO_SECTIONS = ["current", "next", "decisions", "open", "file
 export type WorkMemoSection = typeof WORK_MEMO_SECTIONS[number];
 
 export const TODO_SERVER_NAME = "laisora_todo";
-export const TODO_TOOL_KINDS = ["list", "add", "update", "move", "set_state", "write_memo", "delete", "group", "tidy"] as const;
+export const TODO_TOOL_KINDS = ["list", "add", "update", "move", "set_state", "write_memo", "delete", "group", "tidy", "revert"] as const;
 export type TodoToolKind = typeof TODO_TOOL_KINDS[number];
 export const todoToolName = (kind: TodoToolKind) => `mcp__${TODO_SERVER_NAME}__${kind}`;
 export const TODO_WRITE_TOOLS = TODO_TOOL_KINDS.filter(kind => kind !== "list").map(todoToolName);
@@ -156,7 +157,6 @@ export interface TodoDecision {
 export const TODO_LAISORA = "laisora";
 export const TODO_ITEM_BY = ["claude", TODO_LAISORA] as const;
 export type TodoItemBy = typeof TODO_ITEM_BY[number];
-export const todoUserItem = (item: Pick<TodoItem, "by">): boolean => item.by === undefined;
 
 export const TODO_CAPTURE_VIA = ["user", "claude", "import", TODO_LAISORA] as const;
 export interface TodoCaptured {
@@ -225,7 +225,7 @@ export const TODO_TIDY_KINDS = ["move", "merge", "flatten", "foldDone", "rename"
 export interface TodoTidyNode { readonly title: string; readonly children?: readonly TodoTidyNode[] }
 type TodoTidyAsked = { readonly requested?: true };
 export type TodoTidyStep =
-  | { readonly kind: "rename"; readonly id: string; readonly title: string }
+  | ({ readonly kind: "rename"; readonly id: string; readonly title: string } & TodoTidyAsked)
   | { readonly kind: "add"; readonly id: string; readonly items: readonly TodoTidyNode[] }
   | ({ readonly kind: "move"; readonly id: string; readonly parentId: string | null; readonly group?: string; readonly position?: number } & TodoTidyAsked)
   | ({ readonly kind: "merge"; readonly id: string; readonly into: string; readonly flattened?: true } & TodoTidyAsked)
@@ -326,10 +326,10 @@ export interface TodoDocument {
 
 export type TodoGuessReasons = { dueReason?: string; priorityReason?: string };
 export type TodoUpdateOperation = { kind: "update"; basis?: TodoPlacementBasis; id: string; title?: string; group?: string | null; due?: string | null; start?: string | null; priority?: TodoPriority | null; userMemo?: string; state?: TodoState;
-  waiting?: string | null; repeat?: string | null; estimate?: string | null; tags?: string | null; newGroup?: boolean; session?: string | null } & TodoGuessReasons;
-export type TodoMoveOperation = { kind: "move"; id: string; parentId: string | null; position?: number; before?: string | null; restoreGroup?: string; session?: string | null; basis?: TodoPlacementBasis; allowTwin?: true; targetGroup?: string };
-export type TodoSetStateOperation = { kind: "setState"; id: string; state: TodoState; session?: string | null };
-export type TodoDeleteOperation = { kind: "delete"; id: string; session?: string | null };
+  waiting?: string | null; repeat?: string | null; estimate?: string | null; tags?: string | null; newGroup?: boolean } & TodoGuessReasons;
+export type TodoMoveOperation = { kind: "move"; id: string; parentId: string | null; position?: number; before?: string | null; restoreGroup?: string; basis?: TodoPlacementBasis; allowTwin?: true; targetGroup?: string };
+export type TodoSetStateOperation = { kind: "setState"; id: string; state: TodoState };
+export type TodoDeleteOperation = { kind: "delete"; id: string };
 export type TodoBatchStep = TodoUpdateOperation | TodoMoveOperation | TodoSetStateOperation | TodoDeleteOperation;
 export const TODO_BATCH_MAX = 500;
 export type TodoAddOperation = { kind: "add"; parentId: string | null; title: string; group?: string; due?: string; start?: string; priority?: TodoPriority; state?: TodoState; userMemo?: string; position?: number; templateId?: string;
@@ -414,7 +414,24 @@ export const TODO_REVERT_BLOCKS = ["not-target", "unrevertible", "reverted", "go
 export type TodoRevertBlock = typeof TODO_REVERT_BLOCKS[number];
 
 export const TODO_OPERATION_ERRORS = ["not-found", "deleted", "invalid-parent", "cycle", "empty-title", "title-too-long", "author-not-allowed", "group-exists", "invalid-name", "too-many",
-  "too-deep", "duplicate-title", "title-state", "outside-linked", "user-item", "unknown-group", "near-group", "merge-done", "not-single-child", "unstable", "group-has-user-items", ...TODO_REVERT_BLOCKS] as const;
+  "too-deep", "duplicate-title", "title-state", "doc-not-found", "unknown-group", "near-group", "merge-done", "not-single-child", "unstable", ...TODO_REVERT_BLOCKS] as const;
+
+export const TODO_CLAUDE_NEVER_WRITES = {
+  operations: ["batch", "templateSave", "groupColor", "groupFolderAdd", "groupFolderRemove", "groupAliasRemove", "restoreWorkMemo", "putDoc", "acknowledge", "seedWelcome", "restore"],
+  fields: ["userMemo", "templateId"],
+  docKinds: ["image"],
+  revertModes: ["undo"],
+} as const satisfies { operations: ReadonlyArray<TodoOperation["kind"] | TodoStepOperation["kind"]>; fields: readonly string[]; docKinds: readonly TodoDocKind[]; revertModes: readonly TodoRevertMode[] };
+
+export const todoClaudeNeverReverts = (change: Pick<TodoChange, "revertOf">) => change.revertOf !== undefined;
+
+export function todoClaudeNeverWrites(operation: TodoOperation | TodoStepOperation): boolean {
+  const fields = operation as unknown as Readonly<Record<string, unknown>>;
+  return (TODO_CLAUDE_NEVER_WRITES.operations as readonly string[]).includes(operation.kind)
+    || TODO_CLAUDE_NEVER_WRITES.fields.some(field => fields[field] !== undefined)
+    || (operation.kind === "addDoc" && (TODO_CLAUDE_NEVER_WRITES.docKinds as readonly string[]).includes(operation.doc.kind))
+    || (operation.kind === "revert" && (TODO_CLAUDE_NEVER_WRITES.revertModes as readonly string[]).includes(operation.mode));
+}
 export type TodoOperationError = typeof TODO_OPERATION_ERRORS[number];
 
 export interface TodoOperationDetail {
@@ -423,6 +440,7 @@ export interface TodoOperationDetail {
   readonly near?: readonly string[];
   readonly step?: number;
   readonly title?: string;
+  readonly takeBack?: true;
 }
 
 export type TodoOperationFailure = { readonly ok: false; readonly error: TodoOperationError; readonly detail?: TodoOperationDetail };
@@ -483,8 +501,8 @@ export function todoTemplatesOf(document: Pick<TodoDocument, "templates">): Todo
 function groupRecord(groups: readonly TodoGroup[], name: string): TodoGroupRecord | null {
   const index = groups.findIndex(group => group.name === name);
   if (index < 0) return null;
-  const folders = groups[index].folders;
-  return { name, color: groups[index].color, ...(folders?.length ? { folders } : {}), index };
+  const { folders, aliases } = groups[index];
+  return { name, color: groups[index].color, ...(folders?.length ? { folders } : {}), ...(aliases?.length ? { aliases } : {}), index };
 }
 
 function withNewGroup(groups: readonly TodoGroup[], name: string, log: ChangeLog): TodoGroup[] {
@@ -503,7 +521,7 @@ function isGroupBindings(value: unknown): value is Record<string, unknown> & Pic
 
 function isGroupRecord(value: unknown): value is TodoGroupRecord {
   return isRecord(value) && typeof value.name === "string" && validColor(value.color) && typeof value.index === "number" && Number.isSafeInteger(value.index) && value.index >= 0
-    && (value.folders === undefined || isGroupFolders(value.folders));
+    && (value.folders === undefined || isGroupFolders(value.folders)) && (value.aliases === undefined || (Array.isArray(value.aliases) && value.aliases.every(isTodoGroupAlias)));
 }
 
 function isTodoTemplate(value: unknown): value is TodoTemplate {
@@ -620,7 +638,9 @@ function siblingPosition(items: readonly TodoItem[], item: TodoItem): number {
 type MemoKept = { readonly itemId: string; readonly field: string; readonly versions: ReadonlySet<number> };
 type LogExtra = { readonly guess?: TodoGuess; readonly cascade?: true; readonly basis?: TodoPlacementBasis };
 type ChangeLog = (itemId: string, field: string, before: unknown, after: unknown, extra?: LogExtra) => void;
-type StepMeta = { readonly groups: readonly TodoGroup[]; readonly templates: readonly TodoTemplate[]; readonly history?: readonly TodoChange[] };
+
+const requestedLog = (log: ChangeLog): ChangeLog => (itemId, field, before, after, extra) => log(itemId, field, before, after, { ...extra, basis: extra?.basis ?? "requested" });
+type StepMeta = { readonly groups: readonly TodoGroup[]; readonly templates: readonly TodoTemplate[]; readonly history?: readonly TodoChange[]; readonly reverting?: true };
 type StepResult =
   | { readonly ok: true; readonly items: TodoItem[]; readonly itemId: string; readonly reevaluate: Array<string | null>; readonly memoKept?: readonly MemoKept[]; readonly unlogged?: true; readonly meta?: StepMeta }
   | TodoOperationFailure;
@@ -871,21 +891,14 @@ export function todoConversationFolder(groups: readonly TodoGroup[], files: read
   return { ...(folder ? { folder } : {}), ...(group ? { group } : {}) };
 }
 
-function claudeMayChange(items: readonly TodoItem[], item: TodoItem, session: string | null | undefined): boolean {
-  if (session === undefined || !todoUserItem(item)) return true;
-  const linked = linkedTodoItem(items, session ?? undefined);
-  return linked !== undefined && todoScopeIds(items, linked.id).has(item.id);
-}
-
-const userItem = (item: TodoItem): TodoOperationFailure => ({ ok: false, error: "user-item", detail: { title: item.title } });
-
 export type TodoUnstableReason = "doing" | "touched" | "pinned" | "moved";
 
 export function todoUnstable(items: readonly TodoItem[], history: readonly TodoChange[], item: TodoItem, now: number, moving: boolean, requested = false): TodoUnstableReason | undefined {
+  if (requested) return undefined;
   if ([...todoScopeIds(items, item.id)].some(id => items.find(entry => entry.id === id && entry.deletedAt === undefined)?.state === "doing")) return "doing";
   if (history.some(change => change.itemId === item.id && change.author === "human" && !change.cascade && change.field !== "item" && now - change.at < TODO_STABLE_TOUCH_MS)) return "touched";
   if (moving && item.pinnedAt !== undefined && now - item.pinnedAt < TODO_STABLE_PIN_MS) return "pinned";
-  if (moving && !requested && history.some(change => change.itemId === item.id && isClaudeOwnChange(change) && (change.field === "position" || change.field === "group") && now - change.at < TODO_STABLE_REMOVE_MS)) return "moved";
+  if (moving && history.some(change => change.itemId === item.id && isClaudeOwnChange(change) && (change.field === "position" || change.field === "group") && now - change.at < TODO_STABLE_REMOVE_MS)) return "moved";
   return undefined;
 }
 
@@ -1057,10 +1070,11 @@ function step(items: TodoItem[], operation: TodoStepOperation, author: TodoAutho
       memoKept: [{ itemId: item.id, field, versions: new Set([...written.history.map(entry => entry.version), written.version]) }],
       items: items.map(entry => entry.id === item.id ? { ...entry, workMemo: { ...entry.workMemo, [section]: written }, updatedAt: now } : entry) };
   };
+  const judged = author === "claude" && meta.reverting !== true;
 
+  if (judged && todoClaudeNeverWrites(operation)) return { ok: false, error: "author-not-allowed" };
   switch (operation.kind) {
     case "batch": {
-      if (author !== "human") return { ok: false, error: "author-not-allowed" };
       let current = items;
       let first: string | undefined;
       const reevaluate: Array<string | null> = [];
@@ -1102,8 +1116,6 @@ function step(items: TodoItem[], operation: TodoStepOperation, author: TodoAutho
       if (!title) return { ok: false, error: "empty-title" };
       if (title.length > TODO_TITLE_MAX) return { ok: false, error: "title-too-long" };
       if (!liveParentIn(items, operation.parentId)) return { ok: false, error: "invalid-parent" };
-      if (operation.userMemo && author !== "human") return { ok: false, error: "author-not-allowed" };
-      if (operation.templateId !== undefined && author !== "human") return { ok: false, error: "author-not-allowed" };
       if ((operation.dueReason !== undefined || operation.priorityReason !== undefined || operation.sourceSession !== undefined || operation.placedFrom !== undefined || operation.caseWords !== undefined || operation.basis !== undefined || operation.imported !== undefined) && author !== "claude") return { ok: false, error: "author-not-allowed" };
       const template = operation.templateId === undefined ? undefined : meta.templates.find(entry => entry.id === operation.templateId);
       if (operation.templateId !== undefined && !template) return { ok: false, error: "not-found" };
@@ -1154,7 +1166,6 @@ function step(items: TodoItem[], operation: TodoStepOperation, author: TodoAutho
       return { ok: true, items: next, itemId, reevaluate: [operation.parentId], ...(nextMeta !== meta ? { meta: nextMeta } : {}) };
     }
     case "templateSave": {
-      if (author !== "human") return { ok: false, error: "author-not-allowed" };
       const item = find(operation.id);
       if (!item) return { ok: false, error: "not-found" };
       if (item.deletedAt !== undefined) return { ok: false, error: "deleted" };
@@ -1181,7 +1192,6 @@ function step(items: TodoItem[], operation: TodoStepOperation, author: TodoAutho
       return setGroups(withNewGroup(meta.groups, name, log));
     }
     case "groupFolderAdd": {
-      if (author !== "human") return { ok: false, error: "author-not-allowed" };
       const path = operation.path.trim();
       if (!path || path.length > TODO_DOC_TARGET_MAX) return { ok: false, error: "invalid-name" };
       if (!meta.groups.some(entry => entry.name === operation.name)) return { ok: false, error: "not-found" };
@@ -1192,7 +1202,6 @@ function step(items: TodoItem[], operation: TodoStepOperation, author: TodoAutho
     case "groupFolderRemove":
     case "groupAliasRemove":
     case "setGroupBindings": {
-      if (operation.kind !== "setGroupBindings" && author !== "human") return { ok: false, error: "author-not-allowed" };
       const group = meta.groups.find(entry => entry.name === (operation.kind === "setGroupBindings" ? operation.group : operation.name));
       if (!group) return { ok: false, error: "not-found" };
       const next = operation.kind === "setGroupBindings" ? withAliases(withFolders(group, operation.folders), operation.aliases)
@@ -1208,10 +1217,7 @@ function step(items: TodoItem[], operation: TodoStepOperation, author: TodoAutho
     case "groupDelete": {
       const before = groupRecord(meta.groups, operation.name);
       if (!before) return { ok: false, error: "not-found" };
-      if (operation.kind === "groupColor" && author !== "human") return { ok: false, error: "author-not-allowed" };
       if (operation.kind === "groupDelete") {
-        const mine = author === "claude" ? items.find(entry => entry.deletedAt === undefined && todoUserItem(entry) && rootOf(items, entry.id)?.group === operation.name) : undefined;
-        if (mine) return { ok: false, error: "group-has-user-items", detail: { title: mine.title, word: operation.name } };
         const next = items.map(entry => {
           if (entry.group !== operation.name) return entry;
           log(entry.id, "group", operation.name, null);
@@ -1268,12 +1274,11 @@ function step(items: TodoItem[], operation: TodoStepOperation, author: TodoAutho
       return { ok: true, itemId: item.id, reevaluate: [], items: items.map(entry => entry.id === item.id ? { ...rest, ...(target !== null ? { group: target } : {}), updatedAt: now } : entry) };
     }
     case "docLabel": {
-      if (author !== "human") return { ok: false, error: "author-not-allowed" };
       const item = find(operation.id);
       if (!item) return { ok: false, error: "not-found" };
       if (item.deletedAt !== undefined) return { ok: false, error: "deleted" };
       const doc = item.docs?.find(entry => entry.id === operation.docId);
-      if (!doc) return { ok: false, error: "not-found" };
+      if (!doc) return { ok: false, error: "doc-not-found" };
       const label = operation.label.trim().slice(0, TODO_DOC_LABEL_MAX);
       if ((doc.label ?? "") === label) return unchanged(item.id);
       log(item.id, "docLabel", { docId: doc.id, label: doc.label ?? null }, { docId: doc.id, label: label || null });
@@ -1296,14 +1301,12 @@ function step(items: TodoItem[], operation: TodoStepOperation, author: TodoAutho
       const item = find(operation.id);
       if (!item) return { ok: false, error: "not-found" };
       if (item.deletedAt !== undefined) return { ok: false, error: "deleted" };
-      if (operation.userMemo !== undefined && author !== "human") return { ok: false, error: "author-not-allowed" };
       if ((operation.dueReason !== undefined || operation.priorityReason !== undefined) && author !== "claude") return { ok: false, error: "author-not-allowed" };
-      if (author === "claude" && !claudeMayChange(items, item, operation.session)) return userItem(item);
       const title = operation.title?.trim();
       if (operation.title !== undefined && !title) return { ok: false, error: "empty-title" };
       if (title !== undefined && title.length > TODO_TITLE_MAX) return { ok: false, error: "title-too-long" };
       let nextMeta = meta;
-      if (author === "claude") {
+      if (judged) {
         const regroup = item.parentId === null && typeof operation.group === "string" && operation.group.trim() !== "" && operation.group.trim() !== item.group ? operation.group.trim() : undefined;
         const problem = (regroup !== undefined ? claudeGroupProblem(meta.groups, regroup, operation.newGroup) : undefined)
           ?? (title !== undefined && title !== item.title ? todoTitleProblem(items, { title, parentId: item.parentId, group: regroup ?? item.group ?? null, self: item.id })
@@ -1318,7 +1321,8 @@ function step(items: TodoItem[], operation: TodoStepOperation, author: TodoAutho
       const set = (field: TodoTextField, value: string | null | undefined) => {
         if (value === undefined || (updated[field] || null) === (value || null)) return;
         const guess = author === "human" && (field === "due" || field === "priority") ? updated.guesses?.[field] : undefined;
-        log(item.id, field, updated[field] || null, value || null, { ...(guess ? { guess } : {}), ...(field === "group" && author === "claude" ? { basis: operation.basis ?? "named" } : {}) });
+        log(item.id, field, updated[field] || null, value || null, { ...(guess ? { guess } : {}),
+          ...(author === "claude" && (field === "group" || operation.basis === "requested") ? { basis: operation.basis ?? "named" } : {}) });
         touched = true;
         const { [field]: _old, ...rest } = updated;
         updated = { ...rest, ...(value ? { [field]: value } : field === "userMemo" ? { userMemo: "" } : {}) } as TodoItem;
@@ -1354,9 +1358,8 @@ function step(items: TodoItem[], operation: TodoStepOperation, author: TodoAutho
       if (item.deletedAt !== undefined) return { ok: false, error: "deleted" };
       if (!liveParentIn(items, operation.parentId)) return { ok: false, error: "invalid-parent" };
       if (isDescendant(items, operation.parentId, item.id)) return { ok: false, error: "cycle" };
-      if (author === "claude" && !claudeMayChange(items, item, operation.session)) return userItem(item);
-      if (author === "claude" && operation.parentId === item.parentId && operation.position === undefined && operation.before === undefined) return unchanged(item.id);
-      if (author === "claude" && operation.parentId !== item.parentId) {
+      if (judged && operation.parentId === item.parentId && operation.position === undefined && operation.before === undefined) return unchanged(item.id);
+      if (judged && operation.parentId !== item.parentId) {
         if (depthOf(items, operation.parentId) + subtreeHeight(items, item.id) > TODO_CLAUDE_DEPTH_MAX) return { ...tooDeep, detail: { title: item.title } };
         const problem = todoPlaceProblem(items, { title: item.title, parentId: operation.parentId, group: operation.targetGroup ?? item.group ?? null, self: item.id });
         if (problem && !(operation.allowTwin && problem.error === "duplicate-title")) return { ...problem, detail: { ...problem.detail, title: item.title } };
@@ -1376,7 +1379,7 @@ function step(items: TodoItem[], operation: TodoStepOperation, author: TodoAutho
         ...(item.parentId === null ? { placeGroup: heldGroup ?? null } : {}) };
       const after = { parentId: moved.parentId, position: siblingPosition(next, moved), ...(moved.parentId === null ? { placeGroup: moved.group ?? null } : {}) };
       if (before.parentId === after.parentId && before.position === after.position) return unchanged(item.id);
-      if (author === "claude") {
+      if (judged) {
         const unstable = unstableFailure(items, meta, item, now, true, operation.basis === "requested");
         if (unstable) return unstable;
       }
@@ -1389,10 +1392,6 @@ function step(items: TodoItem[], operation: TodoStepOperation, author: TodoAutho
       const item = find(operation.id);
       if (!item) return { ok: false, error: "not-found" };
       if (item.deletedAt !== undefined) return { ok: false, error: "deleted" };
-      if (author === "claude" && operation.kind === "setState" && operation.state === "done" && operation.session !== undefined) {
-        const linked = linkedTodoItem(items, operation.session ?? undefined);
-        if (!linked || !todoScopeIds(items, linked.id).has(item.id)) return { ok: false, error: "outside-linked", detail: { title: item.title } };
-      }
       const completion = operation.state !== "done" ? undefined : operation.kind === "setExactState" ? operation.completion ?? "manual" : "manual" as const;
       const after = { state: operation.state, completion };
       if (after.state === item.state && after.completion === item.completion) return unchanged(item.id);
@@ -1422,7 +1421,6 @@ function step(items: TodoItem[], operation: TodoStepOperation, author: TodoAutho
       return { ok: true, items: current, itemId: operation.id, reevaluate: [], ...(kept.length ? { memoKept: kept } : {}) };
     }
     case "restoreWorkMemo": {
-      if (author !== "human") return { ok: false, error: "author-not-allowed" };
       const item = find(operation.id);
       if (!item) return { ok: false, error: "not-found" };
       if (item.deletedAt !== undefined) return { ok: false, error: "deleted" };
@@ -1435,7 +1433,6 @@ function step(items: TodoItem[], operation: TodoStepOperation, author: TodoAutho
       const item = find(operation.id);
       if (!item) return { ok: false, error: "not-found" };
       if (item.deletedAt !== undefined) return { ok: false, error: "deleted" };
-      if (author === "claude" && !claudeMayChange(items, item, operation.session)) return userItem(item);
       const ids = subtreeIds(items, item.id);
       const next = items.map(entry => {
         if (!ids.has(entry.id) || entry.deletedAt !== undefined) return entry;
@@ -1543,10 +1540,11 @@ function step(items: TodoItem[], operation: TodoStepOperation, author: TodoAutho
     case "tidyStep": {
       if (author !== "claude") return { ok: false, error: "author-not-allowed" };
       const tidy = operation.step;
-      const sub = (entries: TodoItem[], next: TodoStepOperation, nextMeta: StepMeta = meta) => step(entries, next, author, now, newId, log, nextMeta);
+      const stepLog = "requested" in tidy && tidy.requested ? requestedLog(log) : log;
+      const sub = (entries: TodoItem[], next: TodoStepOperation, nextMeta: StepMeta = meta) => step(entries, next, author, now, newId, stepLog, nextMeta);
       if (find(tidy.id)?.deletedAt !== undefined) return unchanged(tidy.id);
       if (tidy.kind === "foldDone") return sub(items, { kind: "setState", id: tidy.id, state: "done" });
-      if (tidy.kind === "rename") return sub(items, { kind: "update", id: tidy.id, title: tidy.title });
+      if (tidy.kind === "rename") return sub(items, { kind: "update", id: tidy.id, title: tidy.title, ...(tidy.requested ? { basis: "requested" as const } : {}) });
       if (tidy.kind === "add") {
         let current = items;
         let currentMeta = meta;
@@ -1619,7 +1617,7 @@ function step(items: TodoItem[], operation: TodoStepOperation, author: TodoAutho
       if (source.userMemo.trim()) {
         const before = current.find(entry => entry.id === into.id)!.userMemo;
         const after = carried(before, source.userMemo);
-        log(into.id, "userMemo", before || null, after);
+        stepLog(into.id, "userMemo", before || null, after);
         current = current.map(entry => entry.id === into.id ? { ...entry, userMemo: after, updatedAt: now } : entry);
       }
       const failed = take(sub(current, { kind: "delete", id: source.id }));
@@ -1629,7 +1627,6 @@ function step(items: TodoItem[], operation: TodoStepOperation, author: TodoAutho
     case "addDoc":
     case "putDoc":
     case "removeDoc": {
-      if (operation.kind !== "removeDoc" && author !== "human") return { ok: false, error: "author-not-allowed" };
       const item = find(operation.id);
       if (!item) return { ok: false, error: "not-found" };
       if (item.deletedAt !== undefined) return { ok: false, error: "deleted" };
@@ -1637,7 +1634,7 @@ function step(items: TodoItem[], operation: TodoStepOperation, author: TodoAutho
       let next: readonly TodoDoc[];
       if (operation.kind === "removeDoc") {
         const doc = docs.find(entry => entry.id === operation.docId);
-        if (!doc) return unchanged(item.id);
+        if (!doc) return judged ? { ok: false, error: "doc-not-found" } : unchanged(item.id);
         next = docs.filter(entry => entry !== doc);
         log(item.id, "docs", doc, null);
       } else {
@@ -1677,7 +1674,7 @@ export function isTodoTidyStep(value: unknown): value is TodoTidyStep {
     case "move": return (value.parentId === null || typeof value.parentId === "string") && (value.group === undefined || typeof value.group === "string")
       && (value.position === undefined || (Number.isSafeInteger(value.position) && (value.position as number) >= 0)) && (value.requested === undefined || value.requested === true);
     case "merge": return typeof value.into === "string" && value.into.length > 0 && (value.requested === undefined || value.requested === true) && (value.flattened === undefined || value.flattened === true);
-    case "rename": return typeof value.title === "string" && value.title.trim().length > 0 && value.title.length <= TODO_TITLE_MAX;
+    case "rename": return typeof value.title === "string" && value.title.trim().length > 0 && value.title.length <= TODO_TITLE_MAX && (value.requested === undefined || value.requested === true);
     case "add": return Array.isArray(value.items) && value.items.length > 0 && value.items.every(isTidyNode);
     case "flatten": return value.requested === undefined || value.requested === true;
     case "foldDone": return true;
@@ -1705,6 +1702,24 @@ export const isTodoGroupName = (value: unknown): value is string => typeof value
 const isTextUpTo = (max: number) => (value: unknown): value is string => typeof value === "string" && value.length <= max;
 export const isTodoFolderPath = (value: unknown): value is string => typeof value === "string" && value.length > 0 && value.length <= TODO_DOC_TARGET_MAX;
 export const isTodoDocLabel = isTextUpTo(TODO_DOC_LABEL_MAX);
+
+export type TodoLinkProblem = "invalid-doc" | "link-too-long";
+
+export const isTodoLinkTarget = (value: unknown): value is string => isTodoFolderPath(value) && value.trim().length > 0 && !value.includes("\0");
+
+export function todoLinkDoc(target: string, label: string | undefined, windows: boolean): Omit<TodoDoc, "id" | "at"> | TodoLinkProblem {
+  const trimmed = target.trim();
+  if (target.length > TODO_DOC_TARGET_MAX) return "link-too-long";
+  if (!isTodoLinkTarget(target) || (label !== undefined && !isTodoDocLabel(label))) return "invalid-doc";
+  const labelled = label?.trim() ? { label: label.trim() } : {};
+  if (/^https?:\/\//i.test(trimmed)) {
+    let url: URL;
+    try { url = new URL(trimmed); } catch { return "invalid-doc"; }
+    if (url.protocol !== "http:" && url.protocol !== "https:") return "invalid-doc";
+    return url.href.length > TODO_DOC_TARGET_MAX ? "link-too-long" : { kind: "url", target: url.href, ...labelled };
+  }
+  return parseFileLinkTarget(trimmed, { windows }) === null ? "invalid-doc" : { kind: "file", target: trimmed, ...labelled };
+}
 export const isTodoImageName = (value: unknown): value is string => typeof value === "string" && TODO_IMAGE_FILE.test(value);
 export const isTodoMemoText = (value: unknown): value is string => typeof value === "string";
 export const isTodoGuessReason = isTextUpTo(TODO_GUESS_REASON_MAX);
@@ -2390,6 +2405,12 @@ function matchesAfter(item: TodoItem, change: TodoChange): boolean {
   return false;
 }
 
+function docRefOf(change: TodoChange): string | undefined {
+  if (change.field === "docLabel") return isRecord(change.before) && typeof change.before.docId === "string" ? change.before.docId : undefined;
+  if (change.field !== "docs") return undefined;
+  return isTodoDoc(change.after) ? change.after.id : isTodoDoc(change.before) ? change.before.id : undefined;
+}
+
 function isReverted(changes: readonly TodoChange[], index: number): boolean {
   const id = changes[index].id;
   for (let at = index + 1; at < changes.length; at++) {
@@ -2432,9 +2453,10 @@ export function revertBlock(document: TodoRevertDocument, change: TodoChange, mo
   }
   const item = document.items.find(entry => entry.id === change.itemId);
   if (!item) return "gone";
-  const coveredLater = later.some(entry => batch.has(entry.id) && entry.itemId === change.itemId && entry.field === change.field);
+  const sameTarget = (entry: TodoChange) => entry.itemId === change.itemId && entry.field === change.field && docRefOf(entry) === docRefOf(change);
+  const coveredLater = later.some(entry => batch.has(entry.id) && sameTarget(entry));
   if (!coveredLater && !matchesAfter(item, change)) return "superseded";
-  if (later.some(entry => entry.itemId === change.itemId && entry.field === change.field && byOther(entry) && !(mode === "claude" && entry.cascade))) return "superseded";
+  if (later.some(entry => sameTarget(entry) && byOther(entry) && !(mode === "claude" && entry.cascade))) return "superseded";
   if (inverseOperation(change)?.kind === "delete") {
     const subtree = subtreeIds(document.items, change.itemId);
     if (later.some(entry => subtree.has(entry.itemId) && byOther(entry))) return "superseded";
@@ -2495,19 +2517,22 @@ function revertibleCascades(changes: readonly TodoChange[], reverted: readonly T
   });
 }
 
-function revertTargets(changes: readonly TodoChange[], operation: Extract<TodoOperation, { kind: "revert" }>): TodoChange[] | TodoRevertBlock {
+function revertTargets(changes: readonly TodoChange[], operation: Extract<TodoOperation, { kind: "revert" }>, author: TodoAuthor): TodoChange[] | TodoRevertBlock | TodoOperationFailure {
+  const claudeTakesBack = (targets: TodoChange[]): TodoChange[] | TodoOperationFailure =>
+    author === "claude" && targets.some(todoClaudeNeverReverts) ? { ok: false, error: "not-target", detail: { takeBack: true } } : targets;
   if (operation.mode === "claude" && "revisions" in operation) {
     const revisions = new Set(operation.revisions);
-    const own = changes.filter(entry => revisions.has(parseTodoChangeId(entry.id).revision) && isClaudeOwnChange(entry));
+    const written = changes.filter(entry => revisions.has(parseTodoChangeId(entry.id).revision));
+    const own = written.filter(isClaudeOwnChange);
     const open = todoRevertOpen(changes, own);
-    return own.length === 0 ? "gone" : open.length ? open : own;
+    return own.length === 0 ? written.some(entry => !entry.cascade) ? "not-target" : "gone" : claudeTakesBack(open.length ? open : own);
   }
   if (operation.mode === "claude") {
     const ids = "changeIds" in operation ? operation.changeIds : [operation.changeId];
     const found = ids.map(id => changes.find(entry => entry.id === id));
     if (found.length === 0 || found.some(change => change === undefined)) return "gone";
     const open = todoRevertOpen(changes, found as TodoChange[]);
-    return open.length ? open : found as TodoChange[];
+    return claudeTakesBack(open.length ? open : found as TodoChange[]);
   }
   const written = changes.filter(entry => parseTodoChangeId(entry.id).revision === operation.revision);
   if (written.length === 0) return "gone";
@@ -2559,8 +2584,8 @@ export function applyTodoOperation(document: TodoDocument, operation: TodoOperat
   let unlogged = false;
   let meta: StepMeta = { groups: todoGroupsOf(document), templates: todoTemplatesOf(document), history: document.changes };
 
+  if (author === "claude" && todoClaudeNeverWrites(operation)) return { ok: false, error: "author-not-allowed" };
   if (operation.kind === "acknowledge") {
-    if (author !== "human") return { ok: false, error: "author-not-allowed" };
     const ids = new Set(operation.changeIds);
     let marked = false;
     const acknowledged = document.changes.map(change => {
@@ -2575,7 +2600,6 @@ export function applyTodoOperation(document: TodoDocument, operation: TodoOperat
   if (operation.kind === "recordDecisions" || operation.kind === "migrateDecisions") return applyDecisionOperation(document, items, operation);
 
   if (operation.kind === "seedWelcome") {
-    if (author !== "human") return { ok: false, error: "author-not-allowed" };
     if (!shouldSeedTodoWelcome({ written: todoStoreEverWritten(document), seeded: operation.seeded })) return { ok: true, document, itemId: "", changed: false };
     const result = applyTodoOperation(document, { kind: "addMany", parentId: null, items: operation.items }, context);
     if (!result.ok || !result.changed) return result;
@@ -2612,9 +2636,9 @@ export function applyTodoOperation(document: TodoDocument, operation: TodoOperat
       tidy = [...proposals, { id: itemId, at: now, steps, revision: document.revision + 1 }].slice(-TODO_TIDY_KEPT);
     }
   } else if (operation.kind === "revert") {
-    if (author !== "human") return { ok: false, error: "author-not-allowed" };
-    const found = revertTargets(document.changes, operation);
+    const found = revertTargets(document.changes, operation, author);
     if (typeof found === "string") return { ok: false, error: found };
+    if (!Array.isArray(found)) return found;
     const current = { items, changes: document.changes, groups: meta.groups, templates: meta.templates };
     const purged = (change: TodoChange) => change.itemId !== "" && !items.some(item => item.id === change.itemId);
     const deletesGroup = found.some(change => change.field === "groups" && isGroupRecord(change.before) && change.after === null);
@@ -2631,6 +2655,17 @@ export function applyTodoOperation(document: TodoDocument, operation: TodoOperat
     const applied: TodoChange[] = [];
     const ordered = [...open].reverse();
     const bringsGroupBack = (entry: TodoChange) => entry.field === "groups" && isGroupRecord(entry.before);
+    const asked = author === "claude";
+    if (asked) meta = { ...meta, reverting: true };
+    const revertLog = (id: string) => asked ? requestedLog(logTo(id)) : logTo(id);
+    const cascadeLog = (id: string): ChangeLog => {
+      const log = revertLog(id);
+      return asked ? (itemId, field, before, after, extra) => log(itemId, field, before, after, { ...extra, cascade: true }) : log;
+    };
+    const inverseOf = (change: TodoChange): TodoStepOperation => {
+      const inverse = inverseOperation(change)!;
+      return asked && (inverse.kind === "move" || inverse.kind === "update") ? { ...inverse, basis: "requested" } : inverse;
+    };
     const middle = ordered.filter(entry => createdGroupOf(entry) === undefined && !bringsGroupBack(entry));
     for (const change of [...ordered.filter(bringsGroupBack), ...middle, ...ordered.filter(entry => createdGroupOf(entry) !== undefined)]) {
       if (change.field === "deletedAt" && hasAncestorIn(items, change.itemId, deleting)) { applied.push(change); continue; }
@@ -2641,7 +2676,7 @@ export function applyTodoOperation(document: TodoDocument, operation: TodoOperat
         skipped++;
         continue;
       }
-      const result = step(next, inverseOperation(change)!, author, now, context.newId, logTo(change.id), meta);
+      const result = step(next, inverseOf(change), author, now, context.newId, revertLog(change.id), meta);
       if (!result.ok && whole) return result;
       if (!result.ok) { failure ??= result.error; skipped++; continue; }
       applied.push(change);
@@ -2652,7 +2687,7 @@ export function applyTodoOperation(document: TodoDocument, operation: TodoOperat
     }
     if (changes.length === 0) return { ok: false, error: failure ?? "superseded" };
     for (const cascade of revertibleCascades(document.changes, applied, items, next).reverse()) {
-      const result = step(next, exactStateOf(cascade.itemId, cascade.before as Record<string, unknown>), author, now, context.newId, logTo(cascade.id), meta);
+      const result = step(next, exactStateOf(cascade.itemId, cascade.before as Record<string, unknown>), author, now, context.newId, cascadeLog(cascade.id), meta);
       if (!result.ok) continue;
       next = result.items;
       reevaluate.push(cascade.itemId, ...result.reevaluate);

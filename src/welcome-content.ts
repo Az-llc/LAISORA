@@ -18,6 +18,10 @@ export interface WelcomeUiNames { menuGlyph: string; handoffItem: string; appear
 
 export function welcomeNews(): Readonly<Record<string, readonly WelcomeNewsItem[]>> {
   return {
+    "1.14.0": [
+      { kind: "new", text: l10n.t("Claude can change everything on a ToDo item except your memo: links, waiting-on, repeat, estimate and tags."), setting: "todo" },
+      { kind: "new", text: l10n.t("Ask Claude to undo its ToDo changes, and it takes them back and restores items it deleted. Your own edits stay as they are.") },
+    ],
     "1.13.0": [
       { kind: "new", text: l10n.t("Claude's replies get \"Add to ToDo\" and \"Add to ToDo and start a new conversation\" buttons beside Copy."), setting: "todo" },
       { kind: "new", text: l10n.t("ToDo rows can be dragged from anywhere on the row.") },

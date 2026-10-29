@@ -86,7 +86,7 @@ If it rewords an item you wrote, your original title is kept.
 
 - The Claude Code CLI, installed and signed in with your own account. LAISORA runs `claude` from your PATH, or the path in `laisora.claude.executablePath`. If your Claude Code uses a JavaScript entry point, Node.js is also required.
 - VS Code 1.90 or later, in a local, trusted window. WSL, Remote SSH, Dev Containers, untrusted workspaces, and virtual workspaces are not supported.
-- Windows is the tested platform. macOS and Linux have not been verified yet.
+- Windows is the tested platform. macOS and Linux are experimental: automated checks run on Apple silicon macOS and x64 Ubuntu after every release, but conversations with the real Claude and delegation to Antigravity or Codex have not been verified there.
 
 If `ANTHROPIC_API_KEY` is set in your environment, Claude Code uses it, and usage is billed to the API rather than your subscription; LAISORA tells you so in the conversation. See [Authentication and API keys](#authentication-and-api-keys) to change this.
 

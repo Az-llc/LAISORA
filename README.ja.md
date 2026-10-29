@@ -86,7 +86,7 @@ PLANとの違い: PLANは1つの会話の中でのClaudeの手順です。ToDo�
 
 - Claude CodeのCLIをインストールし、自分のアカウントでログインしていること。LAISORAは、PATHにある`claude`か、`laisora.claude.executablePath`に指定したものを起動します。Claude CodeがJavaScript形式の起動ファイルを使う場合は、Node.jsも必要です。
 - VS Code 1.90以降を、ローカルの信頼済みのウィンドウで使っていること。WSL、Remote SSH、Dev Containers、信頼していないワークスペース、仮想ワークスペースには対応していません。
-- 動作検証の対象はWindowsです。macOS・Linuxはまだ検証していません。
+- 動作検証の対象はWindowsです。macOS・Linuxは試験的な対応です。公開のたびに、AppleシリコンのmacOSとx64のUbuntuで自動検査を回していますが、実際のClaudeとの会話と、Antigravity・Codexへの委任はまだ確かめていません。
 
 環境変数`ANTHROPIC_API_KEY`が設定されていると、Claude Codeはそのキーを使い、利用料はサブスクリプションではなくAPIの料金として請求されます。このときLAISORAは会話でそのことを知らせます。変え方は、後述の「認証とAPIキー」を見てください。
 
