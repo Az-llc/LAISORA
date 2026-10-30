@@ -1,6 +1,12 @@
 export const MEMORY_BLOCK_PROJECT_TYPE_SETTING = "memory.blockProjectType";
 export const GUARD_ENABLED_SETTING = "guard.enabled";
 export const MODEL_NOTES_RULE = "Notes about specific models (a model or executor name with an effort level or a claim about what it is good or bad at, or a model name or version) are refused in instruction files and memory because they go stale with model generations";
+export const DELEGATE_CONTROL_RULE = "only the conductor changes instruction, settings and hook files";
+export const DELEGATE_MEMORY_RULE = "only the conductor writes memory";
+export const DELEGATE_PROPOSAL = "return a proposed change in the reply instead";
+const DELEGATE_RULES = `In this conversation ${DELEGATE_CONTROL_RULE}, and ${DELEGATE_MEMORY_RULE}`;
+export const DELEGATE_PLACEMENT_NOTICE = `${DELEGATE_RULES}. As a delegate, your writes to them are refused, and git or shell commands that could rewrite them, including deleting a folder that contains them, are stopped before they run; ${DELEGATE_PROPOSAL}.`;
+export const CONDUCTOR_CONTROL_LINE = `${DELEGATE_RULES}: make those changes yourself and do not delegate them.`;
 
 export interface PlacementSettings {
   readonly guardEnabled: boolean;

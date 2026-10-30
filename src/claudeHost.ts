@@ -54,7 +54,7 @@ import { z } from "zod";
 import { ClaudeLiveNormalizer, parseAliases, type RawToolResult } from "./claude-normalizer";
 import { conductorInstruction, handbackGateVerdict, SUBAGENT_HANDBACK_TOOL, orchestrationExternalTargets, orchestrationVariants, resolveOrchestrationRoster, type OrchestrationRow, type ExternalModels } from "./orchestration-roster";
 import { attributeSubagent, injectionOf, MAX_AGENT_STARTS, readRosterEvidence, type AgentStartObservation, type InjectedAgentDefinition, type RosterEvidence, type RosterInjection } from "./roster-evidence";
-import { placementOf, type Placement } from "./placement-line";
+import { placementOf, DELEGATE_PLACEMENT_NOTICE, type Placement } from "./placement-line";
 import { laisoraDenialMessage } from "./tool-result-signals";
 import { failClosedGuard } from "./guard-evaluation";
 import { isShellTool } from "./shell-tools";
@@ -106,12 +106,18 @@ export const ASK_DECIDE_FORMAT = () => [
   l10n.t("```laisora-ask\nkind: decide\ntitle: What should we choose?\nwhy: Observed: 3 of 5 runs failed (run.log). Question: retry or skip? You decide because it changes your workflow.\noptions:\n  - label: First choice\n    effect: What changes on your screen or in your work; the fact behind the recommendation.\n    pros: Benefit versus the others, including other features.\n    cons: Drawback versus the others, including other features.\n    recommended: true\n  - label: Second choice\n    effect: What changes for you.\n    pros: Benefit versus the first.\n    cons: Drawback versus the first.\ndefault: Without an answer, I will continue with A.\n```"),
 ].join("\n");
 
+const PLAN_IN_PROGRESS_FIRST = "mark the step in_progress with TaskUpdate first, either in an earlier message or earlier in the same message";
+const PLAN_RESUMED_AGENT_PLACE = "A resumed agent stays on the step it started on";
+const PLAN_COMPLETION_WAIT = "wait for them to finish or stop them with TaskStop";
+
 export const PLAN_INSTRUCTION = [
   "Only for a clear work instruction (the user asks you to change, build, investigate or produce something), write a laisora-plan block with the goal as you understand it before your first tool call, then the TaskCreate steps; do not restate the user's words.",
   "For such work, use TaskCreate before starting: one task per step, subject as the step title, and activeForm set. Mark the first task in_progress before the first other tool call. A question, a conversation, a confirmation or feedback on earlier work is not a work instruction: answer it without a laisora-plan block or new tasks.",
   "Use TaskUpdate to mark each step in_progress when starting and completed when done. Add new steps at the end with TaskCreate.",
+  `Do not mark a step completed while an agent or external run placed on it is still running: first ${PLAN_COMPLETION_WAIT}; otherwise the update is rejected before it runs.`,
   "Put an action that waits for the user's approval (such as merging or publishing) in its own step, separate from work you can finish yourself, and do not mark it in_progress until the user answers.",
-  "While TaskCreate steps exist, start the description of every Agent call and external run with the number of the step it serves exactly as the PLAN panel shows it (the task id, zero-padded to at least two digits) followed by a space, as in \"03 Remove model research\". A delegation without a valid step number, or for a step that is not in progress, is rejected before it runs: mark the step in_progress with TaskUpdate before the delegation, either in an earlier message or earlier in the same message.",
+  `While TaskCreate steps exist, start the description of every Agent call and external run with the number of the step it serves exactly as the PLAN panel shows it (the task id, zero-padded to at least two digits) followed by a space, as in "03 Remove model research". A delegation without a valid step number, or for a step that is not in progress, is rejected before it runs: before the delegation, ${PLAN_IN_PROGRESS_FIRST}.`,
+  `${PLAN_RESUMED_AGENT_PLACE}: before resuming with SendMessage an agent placed on a completed step, ${PLAN_IN_PROGRESS_FIRST}; otherwise the SendMessage is rejected before it runs.`,
   "When you need the user's decision or a real-machine check, do not bury it in prose. Write a ```laisora-ask block (format below) at the point you ask.",
   "Before asking, check earlier decisions (ledger, contracts, earlier answers here) instead of re-asking, and investigate first if the current state is unknown.",
   "In every decision (laisora-ask or AskUserQuestion): why = what you observed (facts, numbers, sources) + the exact question + why the user, not you, must decide; never restate the title. effect = the concrete change to the user's screen, operation or work; never restate the label. pros/cons = compared with the other options, including effects on other features and operations. Give technical reasons, not history; explain terms the user may not share. For LAISORA's own behaviour, state the current behaviour and its technical reason from contracts or facts, or 理由の記録なし.",
@@ -157,13 +163,13 @@ export function planLaunchDenial(verdict: NumberedLaunchVerdict): string | undef
 
 export function planResumeDenial(verdict: ResumeVerdict): string | undefined {
   if (verdict.kind === "allow") return undefined;
-  return `Rejected before running: this message would resume an agent placed on PLAN step ${planItemLabel(verdict.number)}, which is completed. ${planStepInProgressFix(verdict)}`;
+  return `Rejected before running: this message would resume an agent placed on PLAN step ${planItemLabel(verdict.number)}, which is completed. ${PLAN_RESUMED_AGENT_PLACE}. ${planStepInProgressFix(verdict)}`;
 }
 
 export function planCompletionDenial(verdict: CompletionVerdict): string | undefined {
   if (verdict.kind === "allow") return undefined;
   const steps = verdict.steps.map(entry => `${planItemLabel(entry.number)} (${entry.lanes.join("; ")})`).join(", ");
-  return `Rejected before running: agents placed on PLAN step ${steps} are still running. Wait for them to finish or stop them (TaskStop), then send the same call again.`;
+  return `Rejected before running: agents placed on PLAN step ${steps} are still running. First ${PLAN_COMPLETION_WAIT}, then send the same call again.`;
 }
 
 export const ASK_QUALITY_REWRITE_LIMIT = 2;
@@ -878,7 +884,10 @@ ${ctxJson}`
             permissionDecisionReason: memoryDecision?.blocked ? memoryGuardReason(memoryDecision, this.placement) : delegate ? DELEGATE_CONTROL_REFUSAL : unchecked ? PLACEMENT_UNREADABLE_REFUSAL : PLACEMENT_GUARD_REFUSAL } };
         }, this.opts.log);
       };
-      options.hooks = { ...(options.hooks ?? {}), PreToolUse: [{ hooks: [guard] }, ...(options.hooks?.PreToolUse ?? [])] };
+      const delegateNotice: ClaudeCodeSdk.HookCallback = async input => input.hook_event_name === "SubagentStart"
+        ? { hookSpecificOutput: { hookEventName: "SubagentStart" as const, additionalContext: DELEGATE_PLACEMENT_NOTICE } } : {};
+      options.hooks = { ...(options.hooks ?? {}), PreToolUse: [{ hooks: [guard] }, ...(options.hooks?.PreToolUse ?? [])],
+        SubagentStart: [...(options.hooks?.SubagentStart ?? []), { hooks: [delegateNotice] }] };
     }
     const planInstruction = this.opts.planInstruction !== false;
     const planLaunchVerdict = planInstruction ? this.opts.planLaunchVerdict : undefined;

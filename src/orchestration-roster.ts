@@ -1,4 +1,5 @@
 import { configurationDefault } from "./configuration-defaults";
+import { CONDUCTOR_CONTROL_LINE } from "./placement-line";
 import { EXECUTORS, EXTERNAL_EXECUTORS, CLAUDE_EFFORTS, CODEX_EFFORTS, canonicalExecutorEfforts, isOrchestrationEffort, claudeAgentName,
   executorModelList, isExecutorId, isExternalExecutorId, isExternalModel, rowComplete,
   type ExecutorId, type ExecutorRow, type ExternalExecutorId, type ExternalModel, type ExternalModels, type ExternalDetection, type OrchestrationEffort } from "./orchestration-executors";
@@ -274,7 +275,7 @@ export function conductorInstruction(roster: readonly OrchestrationRow[], policy
   ].join("\n");
   return [
     `<roster>\n${generated}\n</roster>`,
-    placementLine ? `<knowledge_placement>\n${placementLine}\n</knowledge_placement>` : "",
+    placementLine ? `<knowledge_placement>\n${placementLine}\n${CONDUCTOR_CONTROL_LINE}\n</knowledge_placement>` : "",
     policy.trim() ? `<conductor_policy>\n${renderedPolicy}\n</conductor_policy>` : "",
   ].filter(Boolean).join("\n\n");
 }

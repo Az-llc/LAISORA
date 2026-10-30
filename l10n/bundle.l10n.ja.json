@@ -1668,6 +1668,8 @@
   "ToDo rows can be dragged from anywhere on the row.": "ToDo の行は、行のどこからでもドラッグできます。",
   "Claude can change everything on a ToDo item except your memo: links, waiting-on, repeat, estimate and tags.": "Claude が ToDo の項目を、あなたのメモ以外すべて変えられます（リンク・待ち・繰り返し・見積もり・タグ）。",
   "Ask Claude to undo its ToDo changes, and it takes them back and restores items it deleted. Your own edits stay as they are.": "Claude に ToDo の変更を戻すよう頼むと、自分の変更を取り消し、消した項目を戻します。あなたの編集はそのまま残ります。",
+  "Claude is told up front the rules the step tracking and file guards enforce, so fewer of its actions are stopped and retried.": "作業の段の管理とファイルの見張りが守らせる決まりを、Claude に先に伝えます。止められてやり直す操作が減ります。",
+  "When Claude adds several ToDo items at once, the group it names applies to every item.": "Claude が ToDo へ項目をまとめて足すとき、指定したグループがすべての項目に効きます。",
   "Conversations from Claude Desktop continue in their own folder.": "Claude Desktop の会話も、元のフォルダーのまま続けられます。",
   "Turn Remote Control on or off for each conversation from the tab menu or `/rc`.":"タブのメニューか `/rc` で、会話ごとに Remote Control をオン・オフできます。",
   "Automatic handoff: when a conversation grows large, it moves to a new conversation while it is waiting (turned off at first).": "自動の引き継ぎ。会話が大きくなったら、待ちの間に新しい会話へ移ります（最初はオフ）。",

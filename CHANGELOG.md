@@ -1,5 +1,15 @@
 # Changelog
 
+## 1.14.1
+
+- Claude is told up front the rules that step tracking and the file guards enforce: reopen a finished
+  step before resuming its agent, keep a step open while its agent or external run is still working,
+  and leave instruction, settings, hook and memory files to the main conversation. Fewer actions are
+  stopped and retried.
+- When Claude adds several ToDo items at once, the group and placement it names apply to every item
+  instead of the request being refused.
+- Claude Agent SDK 0.3.314 (Claude Code 2.1.314).
+
 ## 1.14.0
 
 - **Claude edits more of the ToDo.** Claude can change everything on an item except your memo:

@@ -111,6 +111,8 @@ const itemFields = { due: due.optional(), start: start.optional(), priority: pri
   imported: z.literal(true).optional().describe("Set when the item comes from material such as a ledger, notes or an image."),
   case_words: z.string().min(1).max(TODO_GROUP_MAX).optional().describe("The words of the request you took as naming the case or scope, as the user wrote them (e.g. \"laisora のバグ\"); when the user moves the item elsewhere, these words are remembered for that place.") };
 const TODO_SINGLE_ADD_FIELDS = [...Object.keys(itemFields), "position"] as const;
+export const TODO_ADD_PLACE_FIELDS = ["group", "new_group", "basis", "case_words"] as const satisfies readonly (keyof typeof itemFields)[];
+export const TODO_ADD_SHARED_FIELDS = [...TODO_ADD_PLACE_FIELDS, "imported"] as const satisfies readonly (keyof typeof itemFields)[];
 const addNode: z.ZodType = z.strictObject({ title, ...itemFields,
   get children() { return z.array(addNode).min(1).optional().describe("Sub-items of this item, in order."); } });
 const tidyNode: z.ZodType = z.strictObject({ title, get children() { return z.array(tidyNode).min(1).optional(); } });
@@ -134,7 +136,7 @@ const TODO_INPUTS = {
     changes: z.literal(true).optional().describe(`Instead of the tree, return your recent changes (newest first, at most ${TODO_LIST_CHANGES_MAX} entries from your last ${TODO_CLAUDE_CHANGES_MAX} changes; with id, only those to that item), each with the revision and change ids that revert takes, the item and its path, what changed (before and after), the reason it was placed, and whether it can still be taken back or what blocks it (your own take-backs show blocked: take-back).`) },
   add: { title: title.optional().describe("Title of the single item to add; omit when items is given."), parent: id.optional().describe("Nest under this item; omitted = top level."), ...itemFields, position,
     items: z.array(addNode).min(1).optional()
-      .describe(`Several items to add in this one call, in order, each with optional nested children; instead of title and the single-item fields. At most ${TODO_ADD_MANY_MAX} items in total.`) },
+      .describe(`Several items to add in this one call, in order, each with optional nested children; instead of title and the single-item fields; ${TODO_ADD_SHARED_FIELDS.join(", ")} given beside items apply to each top-level item that does not set them, except that an item with its own group takes none of ${TODO_ADD_PLACE_FIELDS.join(", ")} from beside items. At most ${TODO_ADD_MANY_MAX} items in total.`) },
   update: { id, title: title.optional(), due: due.nullable().optional().describe("Due date, YYYY-MM-DD; null clears it."),
     start: start.nullable().optional().describe("Start date, YYYY-MM-DD; null clears it."), priority: priority.nullable().optional().describe("Priority; null clears it."),
     due_reason: reason("due date").optional(), priority_reason: reason("priority").optional(),
@@ -350,6 +352,15 @@ function addNodeOf(input: Record<string, unknown>, sessionId: string | undefined
     ...(value.new_group === true ? { newGroup: true } : {}), ...(placedFrom ? { placedFrom } : {}), ...(value.case_words !== undefined ? { caseWords: value.case_words } : {}), ...(value.basis !== undefined ? { basis: value.basis } : {}), ...(value.imported === true ? { imported: true } : {}),
     ...(sessionId ? { sourceSession: sessionId } : {}), ...(value.due_reason !== undefined ? { dueReason: value.due_reason } : {}), ...(value.priority_reason !== undefined ? { priorityReason: value.priority_reason } : {}),
     ...(Array.isArray(input.children) ? { children: (input.children as Record<string, unknown>[]).map(child => addNodeOf(child, sessionId, placedFrom)) } : {}) };
+}
+
+export function addInputWithSharedFields(input: Record<string, unknown>): Record<string, unknown> {
+  const shared = TODO_ADD_SHARED_FIELDS.filter(field => input[field] !== undefined);
+  if (!Array.isArray(input.items) || shared.length === 0) return input;
+  const rest = Object.fromEntries(Object.entries(input).filter(([field]) => !(shared as readonly string[]).includes(field)));
+  return { ...rest, items: (input.items as Record<string, unknown>[]).map(item => ({ ...item, ...Object.fromEntries(shared
+    .filter(field => item[field] === undefined && !(item.group !== undefined && (TODO_ADD_PLACE_FIELDS as readonly string[]).includes(field)))
+    .map(field => [field, input[field]])) })) };
 }
 
 function addInputError(input: Record<string, unknown>): string | undefined {
@@ -570,8 +581,9 @@ export function createTodoMcpServer(sdk: Pick<typeof Sdk, "createSdkMcpServer" |
   };
   return sdk.createSdkMcpServer({ name: TODO_SERVER_NAME, tools: TODO_TOOL_KINDS.map(kind => sdk.tool(kind, TODO_DESCRIPTIONS[kind],
     TODO_INPUTS[kind] as Record<string, z.ZodType>,
-    async (input: Record<string, unknown>, extra: unknown) => run(async () => {
+    async (given: Record<string, unknown>, extra: unknown) => run(async () => {
       if (kind !== "list" && !gate.consume(extra)) return reply(todoFailureResultText("root-only", TODO_ROOT_ONLY), true);
+      const input = kind === "add" ? addInputWithSharedFields(given) : given;
       const invalid = inputError(kind, input);
       if (invalid !== undefined) return reply(todoFailureResultText("input", invalid), true);
       if (kind !== "list") {

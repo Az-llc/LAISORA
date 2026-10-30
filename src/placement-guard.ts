@@ -8,11 +8,11 @@ import { realPathOrNearestSync, resolveNearestRealPathSync, expandHomePath } fro
 export type ProtectedKind = "memory" | "CLAUDE.md" | "AGENTS.md" | "rules";
 export type GuardReason = "cooccurrence" | "model-name" | "shell";
 
-import { MODEL_NOTES_RULE, type Placement } from "./placement-line";
+import { MODEL_NOTES_RULE, DELEGATE_CONTROL_RULE, DELEGATE_MEMORY_RULE, DELEGATE_PROPOSAL, type Placement } from "./placement-line";
 export { placementOf } from "./placement-line";
 
 export const PLACEMENT_GUARD_REASON_PREFIX = "LAISORA placement guard:";
-export const DELEGATE_CONTROL_REFUSAL = `${PLACEMENT_GUARD_REASON_PREFIX} only the conductor changes instruction, settings and hook files; return a proposed change in the reply instead.`;
+export const DELEGATE_CONTROL_REFUSAL = `${PLACEMENT_GUARD_REASON_PREFIX} ${DELEGATE_CONTROL_RULE}; ${DELEGATE_PROPOSAL}.`;
 export const PLACEMENT_UNREADABLE_REFUSAL = `${PLACEMENT_GUARD_REASON_PREFIX} the current content of this protected file could not be read, so the edit cannot be checked. Retry once the file is readable.`;
 export const PLACEMENT_GUARD_REFUSAL = `${PLACEMENT_GUARD_REASON_PREFIX} this write targets persistent instructions. Session-only instructions are not persisted; keep them in this conversation. ${MODEL_NOTES_RULE}; standing model choices belong in roster or conductor policy settings. Please do not retry by removing or paraphrasing names. Please use Write or Edit for shell writes so the content can be checked.`;
 
@@ -338,7 +338,7 @@ export function judgeMemoryWrite(tool: string, input: unknown, current: string |
 }
 
 export function memoryGuardReason(decision: MemoryDecision, placement: Placement): string {
-  const reason = decision.reasons.includes("delegate") ? "only the conductor writes memory; delegates must not write memory" : "this memory write has an invalid topic type or index entry";
+  const reason = decision.reasons.includes("delegate") ? `${DELEGATE_MEMORY_RULE}; delegates must not write memory` : "this memory write has an invalid topic type or index entry";
   return `${PLACEMENT_GUARD_REASON_PREFIX} ${reason}. ${placement.memoryDestination}. Topic frontmatter must contain only single-line key: value lines (top level, or indented two spaces under metadata:) with one plain type in [${placement.memoryTypes.join(", ")}]; index additions must link to existing, typed topic files in the same directory. Do not retry by changing the type.`;
 }
 
