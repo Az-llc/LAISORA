@@ -1,5 +1,6 @@
 import * as l10n from "@vscode/l10n";
 import { closeGlyphButton } from "./close-button";
+import { IMPROVEMENT_VERDICTS_FENCE } from "../improvement-brief";
 
 export const COLLAPSE_LINE_LIMIT = 12;
 export const PREVIEW_LINE_COUNT = 8;
@@ -95,9 +96,16 @@ function lineCountText(count: number): string {
   return count === 1 ? l10n.t("1 line") : l10n.t("{0} lines", count);
 }
 
+function fenceDisplayName(lang: string | undefined): { name: string | undefined; note?: string } {
+  return lang === IMPROVEMENT_VERDICTS_FENCE
+    ? { name: l10n.t("Verdicts carried to the next analysis"), note: l10n.t("LAISORA reads this record in the next analysis; you do not need to read it.") }
+    : { name: lang };
+}
+
 function blockLabel(lang: string | undefined, lineCount: number | undefined): string {
-  const parts = [lang ?? "", lineCount === undefined ? "" : lineCountText(lineCount)].filter((p) => p !== "");
-  return parts.join(" · ");
+  const { name, note } = fenceDisplayName(lang);
+  const parts = [name ?? "", lineCount === undefined ? "" : lineCountText(lineCount)].filter((p) => p !== "");
+  return note === undefined ? parts.join(" · ") : `${parts.join(" · ")} — ${note}`;
 }
 
 export const MAX_REMEMBERED_CODE_WRAPS = 2000;
@@ -193,6 +201,7 @@ export function assembleCodeBlock(
   const label = document.createElement("span");
   label.className = "l-label codeblock-lang";
   label.textContent = blockLabel(lang, collapsed ? lineCount : undefined);
+  label.title = label.textContent;
   head.appendChild(label);
 
   const wrap = wrapToggle(pre, deps, options.key);
@@ -326,6 +335,7 @@ class CodeReader {
     this.copySlot.replaceChildren(button, status);
     const lineCount = renderCodeLines(this.code, content, "code-reader-line");
     this.label.textContent = blockLabel(lang, lineCount);
+    this.label.title = this.label.textContent;
     this.code.style.setProperty("--code-reader-digits", String(String(lineCount).length));
     this.setWrapped(wrapped);
     this.setMaximized(false);

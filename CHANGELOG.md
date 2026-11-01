@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.15.1
+
+- The verdicts block that ends an LLM improvement analysis is labelled as the record the next
+  analysis reads, with a note that you do not need to read it, instead of its raw block name. The
+  line count stays visible when the block is collapsed.
+
 ## 1.15.0
 
 - **Claude in Chrome.** Conversations start with the Claude in Chrome browser tools, so Claude can
@@ -9,6 +15,10 @@
   counts recurring stops and failures across all local Claude Code conversations and opens a new
   conversation where Claude groups the findings by owner and proposes fixes you can choose. Hide
   the menu item in the settings.
+- **Removed: the LLM Analysis tab.** The improvement analysis above replaces the per-conversation
+  LLM analysis in ANALYSIS. Its tab, the Script/LLM switch and the `laisora.workLog.llmAnalysis`
+  settings are gone, and saved LLM analyses are deleted when LAISORA starts. The script analysis in
+  ANALYSIS stays.
 - The status line shows a question waiting for you first, and keeps background tasks and delegates
   after an interrupted or failed turn.
 - A question you leave unanswered reaches Claude as skipped, or as answered in the chat, instead of
