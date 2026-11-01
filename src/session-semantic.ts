@@ -1,5 +1,4 @@
 import { getLaisoraConfiguration } from "./claude-settings";
-import { isChildCall } from "./spans";
 import { projectPlanUsage, summarizeMainTokens, type PlanUsage } from "./plan-usage";
 import * as l10n from "@vscode/l10n";
 import { deriveExecLogFindings, deriveFailureSummary } from "./exec-log-marks";
@@ -22,13 +21,9 @@ import {
 import { projectAnalysisFactsView, projectSummaryAnalysis } from "./analysis-facts-view";
 import { type SemanticEvidenceIndex } from "./evidence-index";
 import { output } from "./host-context";
-import { deriveL3 } from "./l3-analysis";
 import { deriveDivergences, type DivergenceReport } from "./l3-divergence";
-import type { LlmDiagnosticsAudience } from "./llm-report";
-import { projectDivergences, projectSemanticModel } from "./projection";
+import { projectSemanticModel } from "./projection";
 import {
-  type AnalysisPanelView,
-  type L3ReportPayload,
   type PlanContext,
   type RestoredAgent,
   type SemanticModelPayload,
@@ -40,15 +35,15 @@ import {
   withSubagentModels,
 } from "./protocol";
 import { deriveSemanticModel, type SemanticModel } from "./semantic-model";
-import { deriveSessionFacts, type ExternalRunCall, type SessionFacts, type SessionFactsAccumulator } from "./session-facts";
+import { deriveSessionFacts, type ExternalRunCall, type SessionFactsAccumulator } from "./session-facts";
 import { isInSessionStore, sessionTranscriptRef } from "./session-files";
 import type { Session } from "./extension";
 import type { SessionStore } from "./store-surfaces";
-import { currentWorkBlock, deriveTimeBuckets, keyedValues, overlayLiveTimeBucketState, projectWorkBlockTokens, webviewTimeBuckets, type ChildTranscriptSpan, type TimeBucketState, type TimeBucketView } from "./time-buckets";
+import { currentWorkBlock, deriveTimeBuckets, keyedValues, liveAhead, overlayLiveTimeBucketState, projectWorkBlockTokens, webviewTimeBuckets, withCurrentBlockOpen, type ChildTranscriptSpan, type TimeBucketState, type TimeBucketView } from "./time-buckets";
 import { planContextOf, planRowPeriods } from "./plan-steps";
 import { readTranscriptTimeBucketsWithCoverage, transcriptTimeBucketsOf } from "./transcript-time-buckets";
 import { foldDeferredChildCoverage, openUsageScanOwner, readDeferredChildUsage, releaseUsageScanOwner, transcriptReadStillCurrent, type DeferredChildUsage, type DeferredChildUsageRead, type SessionHistoryRead, type SubagentRestore, type UsageScanOwner } from "./session-transcript";
-import { childSpansChangeRuns, findToolPlacement, type WorkCoverage, type WorkModelState } from "./work-model";
+import { childSpansChangeRuns, liveWorkToolUseIds, requestActivity, type RequestActivity, type WorkCoverage, type WorkModelState } from "./work-model";
 
 export const SEMANTIC_MODEL_POST_INTERVAL_MS = 1000;
 const WORK_MODEL_POST_INTERVAL_MS = 120;
@@ -62,28 +57,6 @@ export function semanticViewEnabled(): boolean {
     );
   } catch {
     return true;
-  }
-}
-
-export function llmAnalysisEnabled(): boolean {
-  try {
-    return (
-      getLaisoraConfiguration().get<boolean>("workLog.llmAnalysis")! ===
-      true
-    );
-  } catch {
-    return false;
-  }
-}
-
-export function llmDiagnosticsAudience(): LlmDiagnosticsAudience {
-  try {
-    return getLaisoraConfiguration()
-      .get<boolean>("workLog.llmAnalysisDiagnostics")! === true
-      ? "opt-in-diagnostics"
-      : "off";
-  } catch {
-    return "off";
   }
 }
 
@@ -115,21 +88,6 @@ function mergeExternalRuns(first: readonly ExternalRunRecord[], second: readonly
     out.push(run);
   }
   return out;
-}
-
-function deriveL3Payload(
-  model: SemanticModel,
-  evidence: SemanticEvidenceIndex,
-  divergenceReport: DivergenceReport,
-  facts?: SessionFacts
-): L3ReportPayload {
-  const analysis = deriveL3(model, evidence);
-  const divergences = projectDivergences(divergenceReport);
-  return {
-    analysis,
-    divergences,
-    ...(facts !== undefined ? { facts: projectAnalysisFactsView(facts, divergenceReport) } : {}),
-  };
 }
 
 interface DerivationFailure {
@@ -321,7 +279,9 @@ export class SessionSemantic {
   projectedWorkModel(): WorkModelPayload {
     const model = this.baseWorkModel();
     // The displayed view, so the PLAN panel shows what GRAPH and ANALYSIS show, whether or not the semantic view is on.
-    const displayed = this.displayedTimeBuckets();
+    const activity = this.requestActivity();
+    if (activity.open) model.requestOpen = true;
+    const displayed = this.currentTimeBuckets(activity);
     const time = displayed === undefined ? undefined : projectWorkBlockTokens(displayed, this.projectedPlanUsage(displayed.blocks));
     const block = time === undefined ? undefined : currentWorkBlock(time);
     const tools = this.host.sessionFacts.analysisTools;
@@ -341,52 +301,8 @@ export class SessionSemantic {
       if (externalRuns.length > 0) model.externalRuns = externalRuns;
     }
     if (time && block && placementOf) {
-      const state = this.host.workModel;
-      const approvalToolIds = this.host.conversation?.pendingApprovalToolUseIds ?? [];
-      const approvalTools = new Set(approvalToolIds);
-      const liveIds = new Set([...state.runningToolUseIds, ...state.runningAgentToolUseIds,
-        ...Object.values(state.backgroundTasks).filter(task => task.terminal === undefined).map(task => task.toolUseId)]);
-      const children = new Map<string, string[]>();
-      for (const id of liveIds) {
-        const tool = findToolPlacement(state, id);
-        if (tool && !tool.stale && tool.background === undefined && isChildCall(tool.parentToolUseId)) {
-          const siblings = children.get(tool.parentToolUseId) ?? [];
-          siblings.push(id);
-          children.set(tool.parentToolUseId, siblings);
-        }
-      }
-      const runnableById = new Map<string, boolean>();
-      const runnable = (id: string): boolean => {
-        const cached = runnableById.get(id);
-        if (cached !== undefined) return cached;
-        runnableById.set(id, false);
-        const tool = findToolPlacement(state, id);
-        const liveChildren = children.get(id) ?? [];
-        const running = tool !== undefined && !tool.stale && tool.toolName !== "AskUserQuestion" && !approvalTools?.has(id) &&
-          (tool.agentId === undefined || liveChildren.length === 0 || liveChildren.some(runnable));
-        runnableById.set(id, running);
-        return running;
-      };
-      const blocksForeground = (id: string): boolean => {
-        const seen = new Set<string>();
-        let tool = findToolPlacement(state, id);
-        while (tool && !seen.has(tool.toolUseId)) {
-          if (tool.background !== undefined) return false;
-          seen.add(tool.toolUseId);
-          tool = !isChildCall(tool.parentToolUseId) ? undefined : findToolPlacement(state, tool.parentToolUseId);
-        }
-        return true;
-      };
-      const detachedApprovals = approvalToolIds.filter(id => !blocksForeground(id)).length;
-      const waiting = model.phases.reduce((count, phase) => count + phase.pendingApprovalCount, 0) > detachedApprovals ||
-        approvalToolIds.some(blocksForeground) || [...liveIds].some(id => {
-          const tool = findToolPlacement(state, id);
-          return tool !== undefined && !tool.stale && tool.toolName === "AskUserQuestion" && blocksForeground(id);
-        });
-      const runningWork = [...liveIds].some(runnable);
       const periods = planRowPeriods(time);
-      const context = planContextOf(block, time.lastAt ?? block.start, state.turnActive && !waiting ||
-        this.host.streamOpen() && runningWork, periods);
+      const context = planContextOf(block, time.lastAt ?? block.start, activity.running, periods);
       model.planContext = placedPlanContext(context, placementOf(block.blockId));
       const earlierPlans = time.blocks.filter(value => value !== block && value.kind === "plan" && value.steps?.length)
         .map(value => placedPlanContext(planContextOf(value, value.end, false, periods), placementOf(value.blockId)));
@@ -417,10 +333,19 @@ export class SessionSemantic {
 
   private planUsageMemo: { facts: SessionFactsAccumulator; partition: string; usage: PlanUsage } | undefined;
   private displayedTimeMemo: { generation: number; state: TimeBucketState; transcript: TimeBucketView | undefined;
-    streamOpen: boolean; liveDelegationRev: number; childSpans: readonly ChildTranscriptSpan[]; view: TimeBucketView } | undefined;
+    streamOpen: boolean; liveDelegationRev: number; childSpans: readonly ChildTranscriptSpan[]; view: TimeBucketView; ahead: boolean } | undefined;
 
   private generationBoundaryAt(): number | undefined {
     return this.displayedTimeBuckets()?.generationBoundaryAt ?? this.host.evidenceIndex.timeBuckets.generationBoundaryAt;
+  }
+
+  private requestActivity(): RequestActivity {
+    return requestActivity(this.host.workModel, this.host.conversation?.pendingApprovalToolUseIds ?? [], this.host.streamOpen());
+  }
+
+  private currentTimeBuckets(activity: RequestActivity): TimeBucketView | undefined {
+    const view = this.displayedTimeBuckets();
+    return view === undefined ? undefined : withCurrentBlockOpen(view, activity.open, this.displayedTimeMemo?.generation === this.host.logicalGeneration && this.displayedTimeMemo.ahead);
   }
 
   private displayedTimeBuckets(): TimeBucketView | undefined {
@@ -437,7 +362,7 @@ export class SessionSemantic {
       const measured = memo?.generation === generation && memo.transcript === this.transcriptTimeBuckets ? memo.view : this.transcriptTimeBuckets;
       const view = this.transcriptTimeBuckets === undefined || measured === undefined ? live : overlayLiveTimeBucketState(measured, live);
       this.displayedTimeMemo = { generation, state, transcript: this.transcriptTimeBuckets, streamOpen,
-        liveDelegationRev: this.host.liveDelegationRev, childSpans: this.host.childSpans, view };
+        liveDelegationRev: this.host.liveDelegationRev, childSpans: this.host.childSpans, view, ahead: liveAhead(this.transcriptTimeBuckets, live) };
       return view;
     } catch (error) {
       output.appendLine(`[${this.host.title}] displayed time buckets failed: ${String(error)}`);
@@ -509,10 +434,8 @@ export class SessionSemantic {
       try {
         const evidence = this.host.evidenceIndex;
         divergenceReport = deriveDivergences(model);
-        const facts = deriveSessionFacts(this.host.sessionFacts, evidence, {
-          eventLogTrimmed: (this.host.workModel.coverage.droppedEventCount ?? 0) > 0,
-        });
-        payload = { ...payload, l3: deriveL3Payload(model, evidence, divergenceReport, facts),
+        const facts = deriveSessionFacts(evidence);
+        payload = { ...payload, l3: { facts: projectAnalysisFactsView(facts) },
           execLogFindings: deriveExecLogFindings(evidence.execLogMarks.marks) };
       } catch (error) {
         derivationError = { stage: "metrics", detail: String(error) };
@@ -550,7 +473,7 @@ export class SessionSemantic {
 
   semanticModelPayload(): SemanticModelPayload | undefined {
     const base = this.semanticBasePayload();
-    const timeBuckets = base === undefined ? undefined : this.displayedTimeBuckets();
+    const timeBuckets = base === undefined ? undefined : this.currentTimeBuckets(this.requestActivity());
     const overlaid = base !== undefined && timeBuckets !== undefined ? { ...base, timeBuckets } : base;
     const withCoverage =
       overlaid !== undefined && this.transcriptTimeBucketsCoverage !== undefined
@@ -558,7 +481,7 @@ export class SessionSemantic {
         : overlaid;
     const withUsage = withCoverage?.timeBuckets ? { ...withCoverage, timeBuckets: projectWorkBlockTokens(withCoverage.timeBuckets,
       this.projectedPlanUsage(withCoverage.timeBuckets.blocks)) } : withCoverage;
-    const payload = this.attachLlm(withUsage, base);
+    const payload = withUsage;
     if (payload === undefined) return undefined;
     const generationBoundaryAt = this.generationBoundaryAt();
     const work = projectWorkModel(this.host.workModel, this.host.restoredAgents, this.host.evidenceIndex.timeBuckets.blocks, this.host.childSpans);
@@ -583,7 +506,7 @@ export class SessionSemantic {
         generationBoundaryAt,
       }),
       failureSummary: deriveFailureSummary(payload.execLogFindings ?? [], work.phases),
-      summaryAnalysis: projectSummaryAnalysis(payload.execLogFindings, payload.l3?.llm),
+      summaryAnalysis: projectSummaryAnalysis(payload.execLogFindings),
       mainTokens: summarizeMainTokens(this.host.sessionFacts.planUsage),
     };
   }
@@ -608,7 +531,7 @@ export class SessionSemantic {
     const knownByToolUseId = new Map(known.flatMap(run => run.toolUseId === undefined ? [] : [[run.toolUseId, run] as const]));
     const recorded = this.externalRunsCache?.byToolUseId;
     const state = this.host.workModel;
-    const live = new Set([...state.runningToolUseIds, ...Object.values(state.backgroundTasks).filter(task => task.terminal === undefined).map(task => task.toolUseId)]);
+    const live = liveWorkToolUseIds(state);
     const externalRuns: ExternalRunRecord[] = [];
     const externalRunCalls: (ExternalRunCall & { running: boolean })[] = [];
     const calls = this.host.sessionFacts.externalRunCalls;
@@ -742,44 +665,15 @@ export class SessionSemantic {
     if (!this.semanticDerivationFailedLast || last === undefined || last.logicalGeneration !== this.host.logicalGeneration) {
       return undefined;
     }
-    const llm = this.attachLlm(last.payload, last.payload)?.l3?.llm;
-    const attached = llm && "attached" in llm ? llm.attached : undefined;
-    const staleLlm = attached && llm ? { ...llm, attached: { ...attached, freshness: "stale" as const } } : llm;
     return {
       ...last.payload,
-      summaryAnalysis: projectSummaryAnalysis(undefined, staleLlm),
+      summaryAnalysis: projectSummaryAnalysis(undefined),
       coverage: { ...last.payload.coverage, base: { ...last.payload.coverage.base, semanticDerivationFailed: "stale" } },
     };
   }
 
   private hasLastGoodSemanticForThisGeneration(): boolean {
     return this.lastGoodSemanticPayload?.logicalGeneration === this.host.logicalGeneration;
-  }
-
-  private attachLlm(
-    base: SemanticModelPayload | undefined,
-    freshnessBase: SemanticModelPayload | undefined
-  ): SemanticModelPayload | undefined {
-    if (base?.l3 === undefined || freshnessBase === undefined) return base;
-    if (!llmAnalysisEnabled()) {
-      return { ...base, l3: { ...base.l3, llm: { state: "disabled" } } };
-    }
-    let panelView: AnalysisPanelView;
-    if (this.host.llmRun !== null) {
-      const attached = this.host.analysisStore.buildAttachedAnalysisView(freshnessBase);
-      panelView = attached ? { state: "running", attached } : { state: "running" };
-    } else if (this.host.lastAttemptFailedReason !== null) {
-      const attached = this.host.analysisStore.buildAttachedAnalysisView(freshnessBase);
-      panelView = attached
-        ? { state: "attemptFailed", reason: this.host.lastAttemptFailedReason, attached }
-        : { state: "attemptFailed", reason: this.host.lastAttemptFailedReason };
-    } else if (this.host.persistedArtifacts.length > 0) {
-      const attached = this.host.analysisStore.buildAttachedAnalysisView(freshnessBase);
-      panelView = attached ? { state: "attached", attached } : { state: "idle" };
-    } else {
-      panelView = { state: "idle" };
-    }
-    return { ...base, l3: { ...base.l3, llm: panelView } };
   }
 
   scheduleSemanticModelPost(): void {

@@ -1,3 +1,5 @@
+import { redactAbsolutePaths } from "./path-redaction";
+
 export const CLAUDE_EFFORTS = ["low", "medium", "high", "xhigh", "max"] as const;
 export type OrchestrationEffort = typeof CLAUDE_EFFORTS[number];
 export function isOrchestrationEffort(value: unknown): value is OrchestrationEffort { return (CLAUDE_EFFORTS as readonly unknown[]).includes(value); }
@@ -87,7 +89,7 @@ export interface ExecutorDefinition {
   localPath?: readonly string[];
   preamble?: string;
   argv?: (model: string, effort: string | undefined, cwd: string, minutes: number, prompt: string, role: string) => string[];
-  parseOutput?: (output: string, exitCode: number | null) => { outcome: "ok" | "failed" | "refused"; answer: string; usage?: TokenUsage };
+  parseOutput?: (output: string, exitCode: number | null, stderr?: string) => { outcome: "ok" | "failed" | "refused"; answer: string; reason?: string; usage?: TokenUsage };
   detect?: (probe: ExecutorProbe) => Promise<ExternalDetection>;
   listModels?: (probe: ExecutorProbe) => Promise<ExternalModelList>;
 }
@@ -111,13 +113,70 @@ async function detectVersion(probe: ExecutorProbe): Promise<ExternalDetection> {
   if (result.spawnCode) return { state: "failed", path: probe.path, reason: `spawn-error:${result.spawnCode}` };
   return reason ? { state: "found", path: probe.path, versionNote: reason } : { state: "found", path: probe.path, version: result.output.trim() };
 }
-function executorResult(output: string, code: number | null, read: (value: string) => { answer: string; completed: boolean; failed: boolean; refused?: boolean; usage?: TokenUsage }) {
-  let value: ReturnType<typeof read>;
+export const EXTERNAL_TIMEOUT_SETTING_KEY = "orchestration.externalTimeoutMinutes";
+export const EXTERNAL_TIMEOUT_SETTING = `laisora.${EXTERNAL_TIMEOUT_SETTING_KEY}`;
+export const EXTERNAL_TIMEOUT_DEFAULT_MINUTES = 10;
+export const EXTERNAL_FAILURE_DETAIL_MAX = 300;
+export const EXTERNAL_STDERR_TAIL_MAX = 8192;
+export const CODEX_SANDBOX_SETUP_ERROR = "helper_unknown_error";
+export const CODEX_SANDBOX_EXEC_FAILED = "exec_command failed:";
+export const CODEX_SANDBOX_PROCESS_REJECTED = "Failed to create unified exec process";
+const REDACTED = "[redacted]";
+const SECRET_KEY = String.raw`(?:[A-Za-z0-9]+[_-])*(?:api[_-]?key|apikey|secret|password|passwd|token|authorization|cookie|credentials?|private[_-]?key|access[_-]?key)(?![A-Za-z0-9_-])`;
+const SECRET_SCHEME = String.raw`(?:(?:Bearer|Basic|Token|Digest)\s+)?`;
+const SECRET_ANY_VALUE = String.raw`(?:"[^"]*"|'[^']*'|[^\s"',;]+)`;
+const CREDENTIAL_PATTERNS: ReadonlyArray<readonly [RegExp, string]> = [
+  [/([a-z][a-z0-9+.-]*:\/\/)[^\s/@]+@/gi, `$1${REDACTED}@`],
+  [/(?<![\w/@:.-])[A-Za-z0-9._%+-]+:[^\s@/]+@(?=[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+|localhost\b)/g, `${REDACTED}@`],
+  [new RegExp(String.raw`(--?${SECRET_KEY}(?:\s+|=)${SECRET_SCHEME})${SECRET_ANY_VALUE}`, "gi"), `$1${REDACTED}`],
+  [new RegExp(String.raw`((?<![A-Za-z0-9_-])${SECRET_KEY}["']?\s*[=:]\s*${SECRET_SCHEME})${SECRET_ANY_VALUE}`, "gi"), `$1${REDACTED}`],
+  [/\b(Bearer|Basic|Token)\s+[A-Za-z0-9._~+/=-]{16,}/g, `$1 ${REDACTED}`],
+  [/\b(?:gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|sk-[A-Za-z0-9_-]{8,}|sk_(?:live|test)_[A-Za-z0-9]{10,}|xox[bpas]-[A-Za-z0-9-]{10,}|AKIA[0-9A-Z]{16}|AIza[0-9A-Za-z_-]{30,}|eyJ[A-Za-z0-9_-]{5,}\.[A-Za-z0-9_-]{5,}\.[A-Za-z0-9_-]*)/g, REDACTED],
+];
+export function withoutCredentials(text: string): string {
+  return CREDENTIAL_PATTERNS.reduce((value, [pattern, replacement]) => value.replace(pattern, replacement), text);
+}
+export function externalFailureDetail(text: string | undefined, pick: "first" | "last"): string | undefined {
+  const lines = (text ?? "").split(/\r?\n/).map((entry) => entry.trim()).filter(Boolean);
+  const line = pick === "first" ? lines[0] : lines.at(-1);
+  if (!line) return undefined;
+  const masked = redactAbsolutePaths(withoutCredentials(line));
+  return masked.length > EXTERNAL_FAILURE_DETAIL_MAX ? `${masked.slice(0, EXTERNAL_FAILURE_DETAIL_MAX)}…` : masked;
+}
+export function externalFailureRecordReason(code: number | null): string {
+  return `R-ORC-13: external executor failed (exit code ${code ?? "none"}).`;
+}
+export const EXTERNAL_REFUSED_REASON = "R-ORC-13: external executor refused the run.";
+function withDetails(reason: string, reported: readonly (string | undefined)[], stderr: string | undefined): string {
+  const details = [...reported.map((text) => externalFailureDetail(text, "first")),
+    ...[externalFailureDetail(stderr, "last")].filter(Boolean).map((line) => `stderr: ${line}`)].filter(Boolean);
+  return `${reason}${details.length ? ` ${details.join("; ")}` : ""}`;
+}
+export function externalFailureReason(code: number | null, reported: readonly (string | undefined)[], stderr: string | undefined): string {
+  return withDetails(externalFailureRecordReason(code), reported, stderr);
+}
+export function externalTimeoutHint(minutes: number): string {
+  return `The limit is ${EXTERNAL_TIMEOUT_SETTING} = ${minutes} minutes.`;
+}
+export function externalUnknownTargetReason(targets: readonly string[]): string {
+  return `R-ORC-10: target is not in the conversation snapshot. Accepted targets: ${targets.length ? targets.join(", ") : "none"}.`;
+}
+type ExecutorRead = { answer: string; completed: boolean; failed: boolean; refused?: boolean; errors?: readonly (string | undefined)[]; usage?: TokenUsage };
+function executorResult(output: string, code: number | null, stderr: string | undefined, read: (value: string) => ExecutorRead) {
+  let value: ExecutorRead;
   try { value = read(output); }
   catch { value = { answer: "", completed: false, failed: true }; }
+  if (value.refused) return { outcome: "refused" as const, answer: withDetails(EXTERNAL_REFUSED_REASON, value.errors ?? [], stderr), reason: EXTERNAL_REFUSED_REASON, usage: value.usage };
   const ok = code === 0 && value.completed && !value.failed && !!value.answer.trim();
-  return { outcome: value.refused ? "refused" as const : ok ? "ok" as const : "failed" as const,
-    answer: ok ? value.answer : "External executor failed.", usage: value.usage };
+  return ok ? { outcome: "ok" as const, answer: value.answer, usage: value.usage }
+    : { outcome: "failed" as const, answer: externalFailureReason(code, value.errors ?? [], stderr), reason: externalFailureRecordReason(code), usage: value.usage };
+}
+type CodexCommandItem = { type?: unknown; status?: unknown; exit_code?: unknown; aggregated_output?: unknown };
+export function codexCommandSandboxState(item: CodexCommandItem | undefined): "sandbox-failed" | "ran" | undefined {
+  if (item?.type !== "command_execution") return undefined;
+  const output = typeof item.aggregated_output === "string" ? item.aggregated_output.trimStart() : "";
+  if (output.startsWith(CODEX_SANDBOX_EXEC_FAILED) && (output.includes(CODEX_SANDBOX_SETUP_ERROR) || output.includes(CODEX_SANDBOX_PROCESS_REJECTED))) return "sandbox-failed";
+  return typeof item.exit_code === "number" ? "ran" : undefined;
 }
 export function tokenUsage(raw: unknown): TokenUsage | undefined {
   if (!raw || typeof raw !== "object") return undefined;
@@ -185,10 +244,11 @@ export const EXECUTORS: Record<ExecutorId, ExecutorDefinition> = {
     localPath: ["agy", "bin"], detect: detectVersion,
     preamble: "You are a read-only reviewer. The command tool is unavailable and fails immediately. Do not list or search directories. Read only the absolute file paths listed below.",
     argv: (model, effort, cwd, minutes, prompt) => ["--add-dir", cwd, "--print-timeout", `${minutes}m`, "--output-format", "json", "--model", `${model}${effort ? `-${effort}` : ""}`, `--print=${prompt}`],
-    parseOutput: (output, code) => executorResult(output, code, (text) => {
+    parseOutput: (output, code, stderr) => executorResult(output, code, stderr, (text) => {
       const value = JSON.parse(text);
       return { completed: typeof value.status === "string" && value.status.toUpperCase() === "SUCCESS", failed: !!value.error,
         refused: value.status === "refused" || value.status === "permission_denied",
+        errors: [typeof value.error === "string" ? value.error : typeof value.error?.message === "string" ? value.error.message : undefined],
         answer: [value.result, value.response, value.answer, value.text, value.output].find((entry) => typeof entry === "string") ?? "", usage: tokenUsage(value.usage) };
     }),
     listModels: async (probe) => {
@@ -206,15 +266,19 @@ export const EXECUTORS: Record<ExecutorId, ExecutorDefinition> = {
     localPath: ["Programs", "OpenAI", "Codex", "bin"], detect: detectVersion,
     preamble: "You are a read-only reviewer. Review the supplied task and files without modifying files.",
     argv: (model, effort, _cwd, _minutes, prompt, role) => ["exec", "--skip-git-repo-check", "-s", role === "worker" ? "workspace-write" : "read-only", "-m", model, "-c", `model_reasoning_effort=${effort}`, "--json", prompt],
-    parseOutput: (output, code) => executorResult(output, code, (text) => {
-      let answer = "", completed = false, failed = false, usage: TokenUsage | undefined;
+    parseOutput: (output, code, stderr) => executorResult(output, code, stderr, (text) => {
+      let answer = "", completed = false, failed = false, error: string | undefined, sandboxFailed = false, usage: TokenUsage | undefined;
       for (const line of text.split(/\r?\n/).filter((line) => line.trim())) {
         const value = JSON.parse(line);
         if (value.type === "turn.completed") { completed = true; usage = tokenUsage(value.usage); }
-        if (value.type === "turn.failed") failed = true;
+        if (value.type === "turn.failed") { failed = true; if (typeof value.error?.message === "string") error = value.error.message; }
+        if (value.type === "error" && typeof value.message === "string") error = value.message;
+        const command = value.type === "item.completed" ? codexCommandSandboxState(value.item) : undefined;
+        if (command) sandboxFailed = command === "sandbox-failed";
         if (value.type === "item.completed" && value.item?.type === "agent_message") answer = typeof value.item.text === "string" ? value.item.text : "";
       }
-      return { answer, completed, failed, usage };
+      return { answer, completed, failed: failed || sandboxFailed, usage,
+        errors: [error, sandboxFailed ? "Codex could not start commands in its sandbox" : undefined] };
     }),
     listModels: (probe) => probe.rpc(["app-server"], { method: "initialize", params: { clientInfo: { name: "laisora", title: "LAISORA", version: probe.version } } }, { method: "initialized" }, "model/list", parseCodexModels),
   },

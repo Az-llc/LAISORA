@@ -193,3 +193,34 @@ export function childUsageCounts(stoppedAt: number | undefined, woke: boolean, a
 export function isChildCall(parentToolUseId: string | null | undefined): parentToolUseId is string {
   return callLane(parentToolUseId) === "sub";
 }
+
+export function resumedRunStop(run: { background: boolean; backgroundStoppedAt: number | undefined; foregroundEndedAt: number | undefined }): number | undefined {
+  return run.background ? run.backgroundStoppedAt : run.foregroundEndedAt;
+}
+
+export function descendantStopAt(stopAt: number, subtreeLastActivity: number | undefined, startedAt: number): number {
+  return Math.max(startedAt, Math.min(stopAt, subtreeLastActivity ?? stopAt));
+}
+
+export function launcherOwning(parentToolUseId: string | null | undefined, parentOf: (toolUseId: string) => string | null | undefined, launcher: string,
+  ackedBackground: (toolUseId: string) => boolean): boolean {
+  let owner: string | undefined;
+  launchedUnder(parentToolUseId, parentOf, id => {
+    if (id !== launcher && !ackedBackground(id)) return false;
+    owner = id;
+    return true;
+  });
+  return owner === launcher;
+}
+
+export function launchedUnder(parentToolUseId: string | null | undefined, parentOf: (toolUseId: string) => string | null | undefined,
+  launcher: (toolUseId: string) => boolean): boolean {
+  const seen = new Set<string>();
+  let parent = parentToolUseId;
+  while (isChildCall(parent) && !seen.has(parent)) {
+    if (launcher(parent)) return true;
+    seen.add(parent);
+    parent = parentOf(parent);
+  }
+  return false;
+}

@@ -16,8 +16,8 @@ export function claudeProjectsDir(): string {
   return join(claudeConfigDir(), "projects");
 }
 
-export function claudeSettingsFiles(projectDir?: string): string[] {
-  const directory = projectDir === undefined ? claudeConfigDir() : join(projectDir, ".claude");
+export function claudeSettingsFiles(projectDir?: string, configDir: string = claudeConfigDir()): string[] {
+  const directory = projectDir === undefined ? configDir : join(projectDir, ".claude");
   return [join(directory, "settings.json"), ...(projectDir === undefined ? [] : [join(directory, "settings.local.json")])];
 }
 
@@ -49,12 +49,23 @@ export function telemetryOptOutNeeded(env: Readonly<Record<string, unknown>>, te
   return !telemetryEnabled && envKeysOf(env, "DISABLE_TELEMETRY", platform).length === 0;
 }
 
+export const WINDOWS_DEFAULT_LOCALE = "C.UTF-8";
+
+export function withWindowsDefaultLocale(
+  env: Readonly<Record<string, string | undefined>>,
+  platform: NodeJS.Platform = process.platform
+): Record<string, string | undefined> {
+  const isSet = (name: string) => !!envValueOf(env, name, platform);
+  if (platform !== "win32" || isSet("LANG") || isSet("LC_ALL")) return { ...env };
+  return { ...env, [envKeysOf(env, "LANG", platform)[0] ?? "LANG"]: WINDOWS_DEFAULT_LOCALE };
+}
+
 export function buildClaudeEnv(
   source: Readonly<NodeJS.ProcessEnv>,
   apiKeyPolicy: ApiKeyPolicy = "subscriptionOnly",
   mcpAutoBackground = false
 ): SanitizedClaudeEnv {
-  const env: Record<string, string | undefined> = { ...source };
+  const env = withWindowsDefaultLocale(source);
   const removed: string[] = [];
   for (const key of Object.keys(env)) {
     const name = envNameKey(key);

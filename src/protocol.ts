@@ -10,8 +10,9 @@ import type { FailureSummaryView } from "./exec-log-marks";
 import type { HandoffCompactStats } from "./handoff-envelope";
 import type { HandoffNoticeFacts } from "./steering-envelope";
 import type { AnalysisPlansView, RoleSummaryView } from "./role-summary";
-import { EXECUTORS, isExecutorId, isExternalRunOutcome, type ExecutorId } from "./orchestration-executors";
+import { EXECUTORS, externalRunStatus, isExecutorId, isExternalRunOutcome, type ExecutorId, type ExternalRunOutcome } from "./orchestration-executors";
 import { isDelegationTool } from "./claude-tool-names";
+import { isAskUnansweredKind, type AskUnansweredKind } from "./ask-unanswered";
 import { isExternalTimeout, isExternalDetection, isExternalModels, type ExternalModels, type ExternalDetection } from "./orchestration-roster";
 import { isOrchestrationSettingRoster, type OrchestrationSettingRow, type RecommendedRosterChange } from "./orchestration-roster";
 import { isOrchestrationView, type OrchestrationView } from "./orchestration-view";
@@ -40,15 +41,7 @@ import type { EffectCoverage, ProjectedArtifactAccess } from "./artifact-access"
 import type { AgentSpanView, TimeBucket, TimeBucketView } from "./time-buckets";
 import { currentRunStart, launchlessRunSpan, memberRunTimes, runElapsedMs, type ChildTranscriptSpan, type Span } from "./spans";
 import type { AnalysisFactsView, SummaryAnalysisView } from "./analysis-facts-view";
-import type { Coverage, ExecutionAttemptNode, SemanticModel, SemanticNode } from "./semantic-model";
-import type { L3Report, SerializationClassification } from "./l3-analysis";
-import type {
-  DivergenceKind,
-  DivergenceKindReport,
-  DivergenceRecord,
-  DivergenceReport,
-} from "./l3-divergence";
-import type { LlmAnalysisProvenance, RejectedFinding } from "./llm-finding-verify";
+import type { ExecutionAttemptNode, SemanticModel, SemanticNode } from "./semantic-model";
 import type { HandoffDecisionEntry, HandoffDecisions } from "./handoff-envelope";
 
 export const PROTOCOL_VERSION = 5;
@@ -291,7 +284,7 @@ export function isObservedTime(at: number | undefined): at is number {
 export type NormalizedEventBody =
   (
     | { kind: "conversation_opened"; cwd: string; model?: string }
-    | { kind: "conversation_closed"; reason: string }
+    | { kind: "conversation_closed"; reason: string; stopped?: true }
     | { kind: "turn_started"; turnId: string; cliInserted?: true; laisoraInput?: true }
     | { kind: "auto_resume"; state: "pending"; at: number }
     | { kind: "auto_resume"; state: "cancelled" | "fired" | "exhausted" }
@@ -398,6 +391,7 @@ export type NormalizedEventBody =
         behavior: "allow" | "deny" | "withdrawn";
         resolvedBy: string;
         answers?: Record<string, string>;
+        unanswered?: AskUnansweredKind;
       }
     | { kind: "permission_denied"; turnId: string | null; toolName: string; toolUseId?: string; inDelegate?: true; reason: string; classifierUnavailable?: boolean }
     | { kind: "usage_update"; scope: "turn" | "conversation"; turnId: string | null; usage: UsageSnapshot }
@@ -445,10 +439,6 @@ export function isGuardrailOnlyEventKind(kind: NormalizedEventBody["kind"]): boo
   return GUARDRAIL_ONLY_EVENT_KINDS.has(kind);
 }
 
-export function isLlmAnalysisExecution<E extends { kind: string }>(event: E): event is Extract<E, { kind: "tool_call_finished" }> {
-  return event.kind === "tool_call_finished";
-}
-
 export interface AskUserQuestionOption {
   label: string;
   description?: string;
@@ -469,8 +459,11 @@ export interface RestoredApprovalCard {
   inputJson: string;
   questions?: AskUserQuestionSpec;
   answers?: Record<string, string>;
-  resolution: "answered" | "allowed" | "denied" | "withdrawn" | "failed" | "unknown";
+  resolution: typeof RESTORED_APPROVAL_RESOLUTIONS[number];
+  unanswered?: AskUnansweredKind;
 }
+
+export const RESTORED_APPROVAL_RESOLUTIONS = ["answered", "allowed", "denied", "withdrawn", "unanswered", "failed", "unknown"] as const;
 
 export interface AssistantUsage {
   inputTokens?: number;
@@ -802,7 +795,7 @@ export function normalizeComposerSendKey(v: unknown): ComposerSendKey {
   return v === "shiftEnter" ? "shiftEnter" : "enter";
 }
 
-export const FILE_LINK_BOOLEAN_SETTINGS = ["fileLinkInstruction", "planInstruction", "revealInExplorer", "allowOutsideWorkspace", "confirmOutsideWorkspace", "openOutsideReadOnly"] as const;
+export const FILE_LINK_BOOLEAN_SETTINGS = ["fileLinkInstruction", "planInstruction", "chromeIntegration", "revealInExplorer", "allowOutsideWorkspace", "confirmOutsideWorkspace", "openOutsideReadOnly"] as const;
 export const FILE_LINK_SETTINGS = [...FILE_LINK_BOOLEAN_SETTINGS, "openWithSystemApp"] as const;
 export type FileLinkBooleanSetting = (typeof FILE_LINK_BOOLEAN_SETTINGS)[number];
 export type FileLinkSetting = (typeof FILE_LINK_SETTINGS)[number];
@@ -893,6 +886,7 @@ export type SettingsPageToHost =
   | { type: "setTodoEnabled"; requestId: number; enabled: boolean }
   | { type: "setEditSummaryEnabled"; requestId: number; enabled: boolean }
   | { type: "setRemoteControlCard"; requestId: number; enabled: boolean }
+  | { type: "setImprovementMenu"; requestId: number; enabled: boolean }
   | { type: "setWelcomeSetting"; requestId: number; setting: WelcomeSetting; enabled: boolean }
   | { type: "setHandoffAutoSetting"; requestId: number; setting: HandoffAutoSettingName; value: boolean | number | string }
   | { type: "setOrchestrationSetting"; requestId: number; setting: "enabled" | "agents" | "conductorPolicy" | "externalTimeoutMinutes"; value: unknown }
@@ -924,7 +918,7 @@ export type HostToSettingsPage =
   | { type: "conductorPreview"; requestId: number; text: string; tokens: number }
   | { type: "recommendedRoster"; revision: string; changes: RecommendedRosterChange[] }
   | { type: "revealSetting"; target: SettingsRevealTarget }
-  | ({ type: "settingsState"; appearance?: AccentSettings; displayName?: string; eventLimit?: number; transcriptRetentionDays?: number; transcriptRetentionFallback: TranscriptRetentionFallback; composerSendKey: ComposerSendKey; apiKeyPolicy: ApiKeyPolicy; restoreTabsOnStartup: boolean; cliAutoUpdate: Record<ExecutorId, boolean>; initialModel?: string; autoContinueAtUsageLimit: boolean; guardEnabled: boolean; memoryBlockProjectType: boolean; todoEnabled: boolean; editSummaryEnabled: boolean; remoteControlCard: boolean; welcome?: WelcomeSettings; handoffAuto?: HandoffAutoSettings; reloadNeeded: boolean; replyTo?: number; writeFailure?: SettingWriteFailure }
+  | ({ type: "settingsState"; appearance?: AccentSettings; displayName?: string; eventLimit?: number; transcriptRetentionDays?: number; transcriptRetentionFallback: TranscriptRetentionFallback; composerSendKey: ComposerSendKey; apiKeyPolicy: ApiKeyPolicy; restoreTabsOnStartup: boolean; cliAutoUpdate: Record<ExecutorId, boolean>; initialModel?: string; autoContinueAtUsageLimit: boolean; guardEnabled: boolean; memoryBlockProjectType: boolean; todoEnabled: boolean; editSummaryEnabled: boolean; remoteControlCard: boolean; improvementMenu: boolean; welcome?: WelcomeSettings; handoffAuto?: HandoffAutoSettings; reloadNeeded: boolean; replyTo?: number; writeFailure?: SettingWriteFailure }
     & SettingsProfileProjection & Record<FileLinkBooleanSetting, boolean> & { openWithSystemApp: string[] } & { orchestrationEnabled: boolean; orchestrationAgents: OrchestrationSettingRow[]; orchestrationDefaults: OrchestrationSettingRow[]; conductorPolicy: string; conductorPolicyDefault: string; externalTimeoutMinutes: number; externalDetection: Record<ExecutorId, ExternalDetection>; externalModels: ExternalModels });
 
 function isSettingsRequestId(v: unknown): v is number {
@@ -966,7 +960,7 @@ export function isSettingsPageToHost(v: unknown): v is SettingsPageToHost {
     return isSettingsRequestId(m.requestId)
       && (API_KEY_POLICIES as readonly string[]).includes(m.policy as string) && hasOnlyKeys(m, ["type", "requestId", "policy"]);
   }
-  if (t === "setAutoContinueAtUsageLimit" || t === "setRestoreTabsOnStartup" || t === "setGuardEnabled" || t === "setMemoryBlockProjectType" || t === "setTodoEnabled" || t === "setEditSummaryEnabled" || t === "setRemoteControlCard") {
+  if (t === "setAutoContinueAtUsageLimit" || t === "setRestoreTabsOnStartup" || t === "setGuardEnabled" || t === "setMemoryBlockProjectType" || t === "setTodoEnabled" || t === "setEditSummaryEnabled" || t === "setRemoteControlCard" || t === "setImprovementMenu") {
     return isSettingsRequestId(m.requestId) && typeof m.enabled === "boolean" && hasOnlyKeys(m, ["type", "requestId", "enabled"]);
   }
   if (t === "setWelcomeSetting") {
@@ -1047,7 +1041,7 @@ export function isHostToSettingsPage(v: unknown): v is HostToSettingsPage {
       && typeof m.restoreTabsOnStartup === "boolean" && isCliAutoUpdate(m.cliAutoUpdate)
       && (m.initialModel === undefined || typeof m.initialModel === "string")
       && typeof m.autoContinueAtUsageLimit === "boolean" && typeof m.guardEnabled === "boolean" && typeof m.memoryBlockProjectType === "boolean" && typeof m.todoEnabled === "boolean"
-      && typeof m.editSummaryEnabled === "boolean" && typeof m.remoteControlCard === "boolean" && typeof m.reloadNeeded === "boolean"
+      && typeof m.editSummaryEnabled === "boolean" && typeof m.remoteControlCard === "boolean" && typeof m.improvementMenu === "boolean" && typeof m.reloadNeeded === "boolean"
       && (m.welcome === undefined || isWelcomeSettings(m.welcome))
       && (m.handoffAuto === undefined || isHandoffAutoSettings(m.handoffAuto))
       && typeof m.orchestrationEnabled === "boolean" && typeof m.conductorPolicy === "string"
@@ -1058,7 +1052,7 @@ export function isHostToSettingsPage(v: unknown): v is HostToSettingsPage {
       && Array.isArray(m.openWithSystemApp) && m.openWithSystemApp.every((item) => typeof item === "string")
       && (m.replyTo === undefined || isSettingsRequestId(m.replyTo))
       && (m.writeFailure === undefined || m.replyTo !== undefined && isSettingWriteFailure(m.writeFailure))
-      && hasOnlyKeys(m, ["type", "initialModel", "appearance", "displayName", "eventLimit", "transcriptRetentionDays", "transcriptRetentionFallback", "composerSendKey", "apiKeyPolicy", "restoreTabsOnStartup", "cliAutoUpdate", "autoContinueAtUsageLimit", "guardEnabled", "memoryBlockProjectType", "todoEnabled", "editSummaryEnabled", "remoteControlCard", "welcome", "handoffAuto", "reloadNeeded", ...FILE_LINK_SETTINGS, "orchestrationEnabled", "orchestrationAgents", "orchestrationDefaults", "conductorPolicy", "conductorPolicyDefault", "externalTimeoutMinutes", "externalDetection", "externalModels", "replyTo", "writeFailure", "conductorPreview", "recommendedRosterSame"]);
+      && hasOnlyKeys(m, ["type", "initialModel", "appearance", "displayName", "eventLimit", "transcriptRetentionDays", "transcriptRetentionFallback", "composerSendKey", "apiKeyPolicy", "restoreTabsOnStartup", "cliAutoUpdate", "autoContinueAtUsageLimit", "guardEnabled", "memoryBlockProjectType", "todoEnabled", "editSummaryEnabled", "remoteControlCard", "improvementMenu", "welcome", "handoffAuto", "reloadNeeded", ...FILE_LINK_SETTINGS, "orchestrationEnabled", "orchestrationAgents", "orchestrationDefaults", "conductorPolicy", "conductorPolicyDefault", "externalTimeoutMinutes", "externalDetection", "externalModels", "replyTo", "writeFailure", "conductorPreview", "recommendedRosterSame"]);
   }
   t satisfies never;
   return false;
@@ -1096,6 +1090,7 @@ export type WebviewToHost =
   | { type: "openEditDiff"; tabId: string; firstToolUseId: string; lastToolUseId: string }
   | { type: "copyFilePath"; tabId: string; target: string; reqId: number }
   | { type: "exportTab"; tabId: string }
+  | { type: "startImprovementAnalysis" }
   | { type: "setRemoteControl"; tabId: string; enabled?: boolean }
   | { type: "renameTab"; tabId: string; title: string }
   | { type: "listSessions"; source?: "laisora" | "claude"; cursor?: string; showHidden?: boolean }
@@ -1157,26 +1152,6 @@ export type WebviewToHost =
       lang: "html" | "svg";
       content: string;
       artifactId?: string;
-    }
-  | { type: "llmAnalysisRequest"; tabId: string }
-  | { type: "setLlmAnalysisEnabled"; enabled: boolean }
-  | {
-      type: "startFindingSession";
-      tabId: string;
-      findingId: string;
-      analysisRunId: string;
-      semanticHash: string;
-    }
-  | {
-      type: "prepareHistoricalDraft";
-      tabId: string;
-      artifactId: string;
-      findingId: string;
-    }
-  | {
-      type: "selectAnalysisArtifact";
-      tabId: string;
-      artifactId: string;
     }
   | {
       type: "webviewDiagnostic";
@@ -1437,6 +1412,7 @@ export interface WorkAgentNode {
   effortDeclared?: string;
   effortMeasured?: string;
   status: WorkStatus;
+  stopped?: true;
   startedAt?: number;
   endedAt?: number;
   elapsedMs: number;
@@ -1670,12 +1646,23 @@ export interface WorkAgentStateView {
   earlierRuns?: Span[];
   toolUseId: string;
   status: WorkStatus;
+  stopped?: true;
   childCount: number;
   failCount: number;
   elapsedMs: number;
   tokens?: number;
   modelMeasured?: string;
   revision: number;
+}
+
+export type WorkEndStatus = WorkStatus | "stopped";
+
+export function workEndStatus(agent: { status: WorkStatus; stopped?: true }): WorkEndStatus {
+  return agent.status === "stale" && agent.stopped === true ? "stopped" : agent.status;
+}
+
+export function externalRunEndStatus(run: { running: boolean; outcome: ExternalRunOutcome | null }): WorkEndStatus {
+  return run.running ? "running" : run.outcome === null ? "stale" : externalRunStatus(run.outcome);
 }
 
 type AgentRunFields = Pick<WorkAgentStateView, "elapsedMs" | "status" | "runStartedAt" | "earlierRuns"> & { startedAt?: number };
@@ -1714,6 +1701,7 @@ export interface WorkEventInfo {
   taskTotals?: WorkTaskTotalsView[];
   tasks?: WorkTaskItemView[];
   staled?: string[];
+  reopened?: Array<{ toolUseId: string; agentId: string }>;
   pendingApprovalCount?: number;
   turnToolCount?: number;
 }
@@ -1736,7 +1724,11 @@ export interface PlanContextExternalRun {
 }
 
 // stepKey null: the lane is not on a step of this PLAN. agentId names a delegation's subagent for lanes known only by it.
-export interface PlanContextPlacement { toolUseId: string; agentId?: string; stepKey: string | null }
+// resumes and tokens: present when a resume moved runs to another item (src/time-buckets.ts#RunPlacement). resumes lists
+// only the resumes whose runs belong to this PLAN's block, each with its step or null; a resume it does not list is placed
+// in another block. tokens are the lane's own runs' (the launch's for the placement, the resume's for an entry).
+export interface PlanContextPlacement { toolUseId: string; agentId?: string; stepKey: string | null; tokens?: PlanContextTokens | null;
+  resumes?: { at: number; stepKey: string | null; tokens: PlanContextTokens | null }[] }
 
 export interface PlanContext {
   blockId: string; start: number; end: number; durationMs?: number | null; workEndedAt?: number; provisional?: boolean; blockRunning?: boolean; text: string; goal?: string; running: boolean; steps?: PlanContextStep[];
@@ -1754,6 +1746,7 @@ export interface WorkModelPayload {
   planHistoryTruncated?: boolean;
   planHistoryLostThrough?: number;
   planContext?: PlanContext;
+  requestOpen?: true;
   earlierPlans?: PlanContext[];
   blockTotals?: import("./role-summary").BlockTokenTotals[];
   unknownLaunchers?: Array<{ turnId: string; toolUseIds: string[] }>;
@@ -1779,124 +1772,9 @@ export type SemanticAttemptNodeView = Omit<ExecutionAttemptNode, "artifacts"> & 
 
 export type SemanticNodeView = Exclude<SemanticNode, ExecutionAttemptNode> | SemanticAttemptNodeView;
 
-export type DivergenceRecordView = Omit<DivergenceRecord, "coverage"> & {
-  detectionInputCoverage: Coverage;
-};
-
-export type DivergenceKindReportView = Omit<DivergenceKindReport, "records"> & {
-  records: DivergenceRecordView[];
-};
-
-export type DivergenceReportView = Omit<DivergenceReport, "kinds"> & {
-  kinds: Record<DivergenceKind, DivergenceKindReportView>;
-};
-
 export interface L3ReportPayload {
   facts?: AnalysisFactsView;
-  analysis: L3Report;
-  divergences: DivergenceReportView;
-  llm?: LlmFindingReportView;
 }
-
-export type LlmUnavailableReason =
-  | "not_configured"
-  | "model_unresolved"
-  | "client_error"
-  | "timeout"
-  | "parse_failed"
-  | "internal_error";
-
-export type PersistenceState = "pending" | "saved" | "rejected" | "failed";
-
-export interface AttachedEvidenceChip {
-  alias: string;
-  kind: "event" | "user" | "metric" | "divergence" | "guardrail" | "file";
-  label: string;
-  navigateToolUseId?: string;
-}
-
-export type FindingAction =
-  | { kind: "startCurrentFinding"; label: string }
-  | { kind: "prepareHistoricalDraft"; label: string }
-  | { kind: "none"; label: string };
-
-export interface AttachedFindingView {
-  findingId: string;
-  numberLabel: string;
-  numberDigits?: string;
-  title: string;
-  observed: string;
-  impactLabel: string;
-  destinationLabel: string;
-  actionKindLabel: string;
-  actionLine: string;
-  steps: string[];
-  target?: string;
-  confidence: "high" | "medium" | "low";
-  action: FindingAction;
-  evidence: AttachedEvidenceChip[];
-}
-
-export interface HistoryOption {
-  artifactId: string;
-  label: string;
-  generatedAtLabel?: string;
-  findingsCount?: number;
-  requestedModel?: string;
-  requestedEffort?: string;
-  executedModels?: string;
-  freshnessLabel?: string;
-}
-
-export interface AttachedAnalysisView {
-  artifactId: string;
-  freshness: "current" | "stale" | "restored-unverifiable";
-  freshnessLabel: string;
-  generatedAtLabel: string;
-  requestedModelLabel: string;
-  executedModelsLabel: string;
-  persistence: PersistenceState;
-  persistenceLabel: string;
-  summaryLabel: string;
-  findingsCount?: number;
-  rejectedCount?: number;
-  modelsLabel?: string;
-  tokensLabel?: string | null;
-  slicesCount?: number;
-  emptyStateLabel?: string;
-  inputCoverageLabel?: string;
-  historyOptions: HistoryOption[];
-  selectedArtifactId: string;
-  findings: AttachedFindingView[];
-}
-
-export type LlmFindingReportView =
-  | { state: "disabled" }
-  | { state: "idle" }
-  | { state: "running"; attached?: AttachedAnalysisView }
-  | { state: "attemptFailed"; reason: LlmUnavailableReason; attached?: AttachedAnalysisView }
-  | { state: "attached"; attached: AttachedAnalysisView };
-
-export type AnalysisPanelView = LlmFindingReportView;
-
-export type LlmFindingDiagnosticsPayload =
-  | { state: "unavailable"; reason: string }
-  | {
-      state: "completed";
-      specVersion: number;
-      provenance: LlmAnalysisProvenance;
-      cacheState: "hit" | "miss";
-      rejected: RejectedFinding[];
-      counts: {
-        candidate: number;
-        schemaRejected: number;
-        schemaByReason: Record<string, number>;
-        verified: number;
-        accepted: number;
-        rejected: number;
-        byReason: Record<string, number>;
-      };
-    };
 
 export interface SemanticModelPayload extends Omit<SemanticModel, "nodes" | "progress"> {
   nodes: SemanticNodeView[];
@@ -2124,6 +2002,7 @@ export function projectWorkModel(
         effortDeclared: agent.effortDeclared,
         effortMeasured: restored?.effortMeasured,
         status: agent.status,
+        ...(agent.stopped ? { stopped: true as const } : {}),
         ...agentRuns(agent, childOf.get(agent.toolUseId)),
         startedAt: agent.startedAt,
         endedAt: agent.endedAt,
@@ -2296,6 +2175,7 @@ export function projectWorkEvent(
         ...agentRuns(agent, (childOf ??= childSpanIndex(childSpans)).get(agent.toolUseId)),
         toolUseId: agent.toolUseId,
         status: agent.status,
+        ...(agent.stopped ? { stopped: true as const } : {}),
         childCount: agent.childCount,
         failCount: agent.failCount,
         tokens: agent.tokens,
@@ -2330,6 +2210,15 @@ export function projectWorkEvent(
   if (staled.length > 0) {
     info.staled = staled;
     touched = true;
+  }
+
+  if (event.kind === "tool_call_finished" && event.resumedAgentId !== undefined && event.isError !== true) {
+    const before = previousState.backgroundTasks[event.resumedAgentId];
+    const after = nextState.backgroundTasks[event.resumedAgentId];
+    if (after !== undefined && after.terminal === undefined && (before === undefined || before.terminal !== undefined)) {
+      info.reopened = [{ toolUseId: after.toolUseId, agentId: event.resumedAgentId }];
+      touched = true;
+    }
   }
 
   if (event.kind === "approval_request" || event.kind === "approval_resolved") {
@@ -2443,6 +2332,7 @@ function isWorkAgentNode(v: unknown, depth = 0): v is WorkAgentNode {
     effortDeclared: () => isOptionalString(a.effortDeclared),
     effortMeasured: () => isOptionalString(a.effortMeasured),
     status: () => WORK_STATUSES.includes(a.status as string),
+    stopped: () => a.stopped === undefined || a.stopped === true,
     runStartedAt: () => a.runStartedAt === undefined || isNumber(a.runStartedAt),
     earlierRuns: () => a.earlierRuns === undefined || isSpanList(a.earlierRuns),
     startedAt: () => a.startedAt === undefined || isNumber(a.startedAt),
@@ -2518,6 +2408,7 @@ export function isWorkModelPayload(v: unknown): v is WorkModelPayload {
     planHistoryTruncated: () => m.planHistoryTruncated === undefined || typeof m.planHistoryTruncated === "boolean",
     planHistoryLostThrough: () => m.planHistoryLostThrough === undefined || isNumber(m.planHistoryLostThrough),
     planContext: () => m.planContext === undefined || isPlanContext(m.planContext),
+    requestOpen: () => m.requestOpen === undefined || m.requestOpen === true,
     earlierPlans: () => m.earlierPlans === undefined || isArrayOf(m.earlierPlans, isPlanContext),
     blockTotals: () => m.blockTotals === undefined || isArrayOf(m.blockTotals, isBlockTokenTotals),
     unknownLaunchers: () => m.unknownLaunchers === undefined || isArrayOf(m.unknownLaunchers, value => typeof value === "object" && value !== null
@@ -2606,7 +2497,11 @@ function isPlanContextPlacement(value: unknown): boolean {
   if (!value || typeof value !== "object") return false;
   const row = value as Record<string, unknown>;
   return typeof row.toolUseId === "string" && (row.agentId === undefined || typeof row.agentId === "string")
-    && (row.stepKey === null || typeof row.stepKey === "string");
+    && (row.stepKey === null || typeof row.stepKey === "string")
+    && (row.tokens === undefined || row.tokens === null || isPlanContextTokens(row.tokens))
+    && (row.resumes === undefined || isArrayOf(row.resumes, resume => typeof resume === "object" && resume !== null && isNumber((resume as Record<string, unknown>).at)
+      && ((resume as Record<string, unknown>).stepKey === null || typeof (resume as Record<string, unknown>).stepKey === "string")
+      && ((resume as Record<string, unknown>).tokens === null || isPlanContextTokens((resume as Record<string, unknown>).tokens))));
 }
 
 function isPlanContext(value: unknown): boolean {
@@ -2655,11 +2550,6 @@ const SEMANTIC_IDENTITY_STABILITIES = ["stable", "content-derived", "unknown"];
 const SEMANTIC_OWNER_STATES = ["structural", "active-task", "undetermined"];
 const SEMANTIC_DEFINITION_STATES = ["recorded", "undetermined"];
 const SEMANTIC_DEFINITION_STATUSES = ["planned", "active", "completed", "cancelled", "unknown"];
-const L3_SERIALIZATION_CLASSIFICATIONS: readonly SerializationClassification[] = [
-  "required",
-  "independent-serial",
-  "undetermined",
-];
 
 function isSemanticDerivation(v: unknown): boolean {
   if (typeof v !== "object" || v === null) return false;
@@ -2860,398 +2750,21 @@ function isSemanticReworkCandidate(v: unknown): boolean {
   );
 }
 
-function isNumberRecord(v: unknown): boolean {
-  if (typeof v !== "object" || v === null || Array.isArray(v)) return false;
-  return Object.values(v as Record<string, unknown>).every(isNumber);
-}
-
-function isL3Basis(v: unknown): boolean {
-  if (typeof v !== "object" || v === null) return false;
-  const b = v as Record<string, unknown>;
-  return (
-    isStringArray(b.nodeIds) &&
-    isStringArray(b.edgeIds) &&
-    isArrayOf(b.evidence, isSemanticEvidenceRef)
-  );
-}
-
-function isL3Metric(v: unknown): boolean {
-  if (typeof v !== "object" || v === null) return false;
-  const m = v as Record<string, unknown>;
-  if (typeof m.metricId !== "string") return false;
-  if (!isL3Basis(m.basis) || !isSemanticCoverage(m.coverage)) return false;
-  if (m.counts !== undefined && !isNumberRecord(m.counts)) return false;
-  if (m.state === "observed") return isNumber(m.value);
-  if (m.state === "unavailable") return typeof m.reason === "string";
-  return false;
-}
-
-function isL3TaskMetricSet(v: unknown): boolean {
-  if (typeof v !== "object" || v === null) return false;
-  const t = v as Record<string, unknown>;
-  return (
-    typeof t.taskId === "string" &&
-    isL3Metric(t.taskDurationMs) &&
-    isL3Metric(t.attemptCount)
-  );
-}
-
-function isSerializationPair(v: unknown): boolean {
-  if (typeof v !== "object" || v === null) return false;
-  const p = v as Record<string, unknown>;
-  return (
-    typeof p.taskAId === "string" &&
-    typeof p.taskBId === "string" &&
-    L3_SERIALIZATION_CLASSIFICATIONS.includes(p.classification as SerializationClassification) &&
-    isL3Basis(p.basis)
-  );
-}
-
-function isSerializationAttemptPair(v: unknown): boolean {
-  if (typeof v !== "object" || v === null) return false;
-  const p = v as Record<string, unknown>;
-  return (
-    typeof p.pairId === "string" &&
-    typeof p.attemptAId === "string" &&
-    typeof p.attemptBId === "string" &&
-    L3_SERIALIZATION_CLASSIFICATIONS.includes(p.classification as SerializationClassification) &&
-    isL3Basis(p.basis)
-  );
-}
-
-function isL3SerializationProfile(v: unknown): boolean {
-  if (typeof v !== "object" || v === null) return false;
-  const s = v as Record<string, unknown>;
-  return (
-    isArrayOf(s.pairs, isSerializationPair) &&
-    isNumberRecord(s.counts) &&
-    (s.attemptPairs === undefined || isArrayOf(s.attemptPairs, isSerializationAttemptPair)) &&
-    (s.attemptPairCounts === undefined || isNumberRecord(s.attemptPairCounts)) &&
-    isL3Basis(s.basis) &&
-    isSemanticCoverage(s.coverage) &&
-    (s.state === "observed" || s.state === "unavailable") &&
-    isOptionalString(s.reason)
-  );
-}
-
-function isL3ParallelizationEstimate(v: unknown): boolean {
-  if (typeof v !== "object" || v === null) return false;
-  const p = v as Record<string, unknown>;
-  return (
-    (p.valueMs === undefined || isNumber(p.valueMs)) &&
-    (p.estimateType === undefined || p.estimateType === "upper_bound" || p.estimateType === "model_estimate") &&
-    (p.assumptions === undefined || isStringArray(p.assumptions)) &&
-    (p.basis === undefined || isL3Basis(p.basis)) &&
-    (p.coverage === undefined || SEMANTIC_COVERAGES.includes(p.coverage as string)) &&
-    isNumber(p.undeterminedPairCount) &&
-    isNumber(p.undeterminedTaskCount) &&
-    isNumberRecord(p.excludedPairCounts) &&
-    (p.state === "estimated" || p.state === "unavailable") &&
-    isOptionalString(p.reason)
-  );
-}
-
-function isL3Report(v: unknown): boolean {
-  if (typeof v !== "object" || v === null) return false;
-  const r = v as Record<string, unknown>;
-  const metrics = r.metrics as Record<string, unknown> | undefined;
-  return (
-    isNumber(r.specVersion) &&
-    typeof r.semanticHash === "string" &&
-    isArrayOf(r.taskMetrics, isL3TaskMetricSet) &&
-    isL3Metrics(metrics) &&
-    isL3SerializationProfile(r.serializationProfile) &&
-    isL3Estimates(r.estimates)
-  );
-}
-
-const DIVERGENCE_KIND_KEYS: Record<DivergenceKind, true> = {
-  serialization: true,
-  unsupported_completion: true,
-  progress_stagnation: true,
-  declared_state_conflict: true,
-};
-
-function isDivergenceRecordView(v: unknown): boolean {
-  if (typeof v !== "object" || v === null) return false;
-  const r = v as Record<string, unknown>;
-  return (
-    typeof r.divergenceId === "string" &&
-    r.divergenceId.length > 0 &&
-    typeof r.kind === "string" &&
-    r.kind in DIVERGENCE_KIND_KEYS &&
-    isStringArray(r.subjectIds) &&
-    (r.magnitude === undefined || isNumber(r.magnitude)) &&
-    isArrayOf(r.evidence, isSemanticEvidenceRef) &&
-    SEMANTIC_COVERAGES.includes(r.detectionInputCoverage as string)
-  );
-}
-
-function isDivergenceKindReportView(v: unknown): boolean {
-  if (typeof v !== "object" || v === null) return false;
-  const k = v as Record<string, unknown>;
-  return (
-    typeof k.kind === "string" &&
-    k.kind in DIVERGENCE_KIND_KEYS &&
-    (k.state === "observed" || k.state === "undetermined") &&
-    isOptionalString(k.reason) &&
-    isArrayOf(k.records, isDivergenceRecordView) &&
-    isNumberRecord(k.counts) &&
-    isSemanticCoverage(k.coverage)
-  );
-}
-
-function isDivergenceReportView(v: unknown): boolean {
-  if (typeof v !== "object" || v === null) return false;
-  const d = v as Record<string, unknown>;
-  const kinds = d.kinds as Record<string, unknown> | undefined;
-  return (
-    isNumber(d.specVersion) &&
-    typeof d.semanticHash === "string" &&
-    isSemanticCoverage(d.coverage) &&
-    isDivergenceKinds(kinds) &&
-    isNumber(d.recordCount) &&
-    isNumber(d.droppedRecordCount) &&
-    (d.segmentAnchoredIdCount === undefined || isNumber(d.segmentAnchoredIdCount))
-  );
-}
-
-
-function isLlmAnalysisProvenance(v: unknown): boolean {
-  if (typeof v !== "object" || v === null) return false;
-  const p = v as Record<string, unknown>;
-  return (
-    isNumber(p.semanticRevision) &&
-    typeof p.semanticHash === "string" &&
-    isNumber(p.analysisGeneratedAt) &&
-    typeof p.modelId === "string" &&
-    typeof p.promptVersion === "string"
-  );
-}
-
-function isHistoryOption(v: unknown): v is HistoryOption {
-  if (typeof v !== "object" || v === null) return false;
-  const h = v as Record<string, unknown>;
-  const checks: { [K in keyof HistoryOption]-?: () => boolean } = {
-    artifactId: () => (typeof h.artifactId === "string") && (h.artifactId.length > 0) && (h.artifactId.length <= 200),
-    label: () => (typeof h.label === "string") && (h.label.length > 0),
-    generatedAtLabel: () => isOptionalString(h.generatedAtLabel),
-    findingsCount: () => h.findingsCount === undefined || isNumber(h.findingsCount),
-    requestedModel: () => isOptionalString(h.requestedModel),
-    requestedEffort: () => isOptionalString(h.requestedEffort),
-    executedModels: () => isOptionalString(h.executedModels),
-    freshnessLabel: () => isOptionalString(h.freshnessLabel),
-  };
-  return Object.values(checks).every(check => check());
-}
-
-function isAttachedEvidenceChip(v: unknown): v is AttachedEvidenceChip {
-  if (typeof v !== "object" || v === null) return false;
-  const c = v as Record<string, unknown>;
-  return (
-    typeof c.alias === "string" &&
-    c.alias.length > 0 &&
-    ["event", "user", "metric", "divergence", "guardrail", "file"].includes(c.kind as string) &&
-    typeof c.label === "string" &&
-    c.label.length > 0 &&
-    (c.navigateToolUseId === undefined ||
-      (typeof c.navigateToolUseId === "string" &&
-        c.navigateToolUseId.length > 0 &&
-        c.navigateToolUseId.length <= 200))
-  );
-}
-
-function isFindingAction(v: unknown): v is FindingAction {
-  if (typeof v !== "object" || v === null) return false;
-  const a = v as Record<string, unknown>;
-  return (
-    ["startCurrentFinding", "prepareHistoricalDraft", "none"].includes(a.kind as string) &&
-    typeof a.label === "string" &&
-    a.label.length > 0
-  );
-}
-
-function isAttachedFindingView(v: unknown): v is AttachedFindingView {
-  if (typeof v !== "object" || v === null) return false;
-  const f = v as Record<string, unknown>;
-  if ("verdict" in f || "rejections" in f) return false;
-  return (
-    typeof f.findingId === "string" &&
-    f.findingId.length > 0 &&
-    f.findingId.length <= 64 &&
-    typeof f.numberLabel === "string" &&
-    f.numberLabel.length > 0 &&
-    isOptionalString(f.numberDigits) &&
-    typeof f.title === "string" &&
-    f.title.length > 0 &&
-    typeof f.observed === "string" &&
-    f.observed.length > 0 &&
-    typeof f.impactLabel === "string" &&
-    f.impactLabel.length > 0 &&
-    typeof f.destinationLabel === "string" &&
-    f.destinationLabel.length > 0 &&
-    typeof f.actionKindLabel === "string" &&
-    f.actionKindLabel.length > 0 &&
-    typeof f.actionLine === "string" &&
-    f.actionLine.length > 0 &&
-    isStringArray(f.steps) &&
-    isOptionalString(f.target) &&
-    (f.confidence === "high" || f.confidence === "medium" || f.confidence === "low") &&
-    isFindingAction(f.action) &&
-    isArrayOf(f.evidence, isAttachedEvidenceChip)
-  );
-}
-
-function isAttachedAnalysisView(v: unknown): v is AttachedAnalysisView {
-  if (typeof v !== "object" || v === null) return false;
-  const a = v as Record<string, unknown>;
-  return (
-    typeof a.artifactId === "string" &&
-    a.artifactId.length > 0 &&
-    a.artifactId.length <= 200 &&
-    ["current", "stale", "restored-unverifiable"].includes(a.freshness as string) &&
-    typeof a.freshnessLabel === "string" &&
-    a.freshnessLabel.length > 0 &&
-    typeof a.generatedAtLabel === "string" &&
-    a.generatedAtLabel.length > 0 &&
-    typeof a.requestedModelLabel === "string" &&
-    a.requestedModelLabel.length > 0 &&
-    typeof a.executedModelsLabel === "string" &&
-    a.executedModelsLabel.length > 0 &&
-    ["pending", "saved", "rejected", "failed"].includes(a.persistence as string) &&
-    typeof a.persistenceLabel === "string" &&
-    a.persistenceLabel.length > 0 &&
-    typeof a.summaryLabel === "string" &&
-    a.summaryLabel.length > 0 &&
-    (a.findingsCount === undefined || isNumber(a.findingsCount)) &&
-    (a.rejectedCount === undefined || isNumber(a.rejectedCount)) &&
-    isOptionalString(a.modelsLabel) &&
-    (a.tokensLabel === null || isOptionalString(a.tokensLabel)) &&
-    (a.slicesCount === undefined || isNumber(a.slicesCount)) &&
-    (a.emptyStateLabel === undefined ||
-    (typeof a.emptyStateLabel === "string" && a.emptyStateLabel.length > 0)) &&
-    (a.inputCoverageLabel === undefined ||
-    (typeof a.inputCoverageLabel === "string" && a.inputCoverageLabel.length > 0)) &&
-    isArrayOf(a.historyOptions, isHistoryOption) &&
-    typeof a.selectedArtifactId === "string" &&
-    isArrayOf(a.findings, isAttachedFindingView) &&
-    (a.historyOptions as HistoryOption[]).some((opt) => opt.artifactId === a.selectedArtifactId)
-  );
-}
-
-function isActionFinding(v: unknown): boolean {
-  if (typeof v !== "object" || v === null) return false;
-  const f = v as Record<string, unknown>;
-  return (
-    typeof f.title === "string" &&
-    typeof f.observed === "string" &&
-    isActionFindingImpact(f.impact) &&
-    isActionFindingAction(f.action) &&
-    isStringArray(f.evidenceIds) &&
-    (f.confidence === "high" || f.confidence === "medium" || f.confidence === "low")
-  );
-}
-
-const LLM_REPORT_BANNED_KEYS = [
-  "rejected",
-  "byReason",
-  "diagnostics",
-  "candidateCount",
-];
-
-const LLM_REASON_CODE_RE = /^[a-z][a-z0-9_]{0,63}$/;
-
-export function isAnalysisPanelView(v: unknown): v is AnalysisPanelView {
-  if (typeof v !== "object" || v === null) return false;
-  const r = v as Record<string, unknown>;
-  const state = r.state;
-  if (!["disabled", "idle", "running", "attemptFailed", "attached"].includes(state as string)) return false;
-  if (LLM_REPORT_BANNED_KEYS.some((k) => k in r)) return false;
-  if (state === "disabled" || state === "idle") return !("attached" in r);
-  if (state === "running") {
-    return r.attached === undefined || isAttachedAnalysisView(r.attached);
-  }
-  if (state === "attemptFailed") {
-    return (
-      typeof r.reason === "string" &&
-      LLM_REASON_CODE_RE.test(r.reason) &&
-      (r.attached === undefined || isAttachedAnalysisView(r.attached))
-    );
-  }
-  if (state === "attached") {
-    return isAttachedAnalysisView(r.attached);
-  }
-  return false;
-}
-
-export function isLlmFindingReportView(v: unknown): v is LlmFindingReportView {
-  return isAnalysisPanelView(v);
-}
-
-function isFindingRejectionView(v: unknown): boolean {
-  if (typeof v !== "object" || v === null) return false;
-  const r = v as Record<string, unknown>;
-  const detail = r.detail;
-  return (
-    typeof r.check === "string" &&
-    typeof r.reason === "string" &&
-    isStringArray(r.subjectIds) &&
-    (detail === undefined ||
-      (typeof detail === "object" &&
-        detail !== null &&
-        !Array.isArray(detail) &&
-        Object.values(detail as Record<string, unknown>).every(
-          (x) => typeof x === "string" || isNumber(x)
-        )))
-  );
-}
-
-function isRejectedFindingView(v: unknown): boolean {
-  if (typeof v !== "object" || v === null) return false;
-  const r = v as Record<string, unknown>;
-  return (
-    r.verdict === "rejected" &&
-    isActionFinding(r.finding) &&
-    isArrayOf(r.rejections, isFindingRejectionView) &&
-    (r.rejections as unknown[]).length > 0
-  );
-}
-
-export function isLlmFindingDiagnosticsPayload(v: unknown): v is LlmFindingDiagnosticsPayload {
-  if (typeof v !== "object" || v === null) return false;
-  const p = v as Record<string, unknown>;
-  if (p.state === "unavailable") return typeof p.reason === "string";
-  if (p.state !== "completed") return false;
-  const counts = p.counts as Record<string, unknown> | undefined;
-  return (
-    isNumber(p.specVersion) &&
-    isLlmAnalysisProvenance(p.provenance) &&
-    (p.cacheState === "hit" || p.cacheState === "miss") &&
-    isArrayOf(p.rejected, isRejectedFindingView) &&
-    isLlmFindingDiagnosticsCounts(counts)
-  );
-}
 
 function isAnalysisFactsView(v: unknown): boolean {
   if (typeof v !== "object" || v === null || Array.isArray(v)) return false;
   const f = v as Record<string, unknown>;
   const checks: { [K in keyof AnalysisFactsView]-?: () => boolean } = {
-    llmTargets: () => isAnalysisLlmTargets(f.llmTargets),
     coverageNote: () => isOptionalString(f.coverageNote),
   };
   return Object.values(checks).every(check => check()) &&
-    (hasOnlyKeys(f, ["llmTargets", "coverageNote"]));
+    (hasOnlyKeys(f, ["coverageNote"]));
 }
 
 export function isL3ReportPayload(v: unknown): v is L3ReportPayload {
   if (typeof v !== "object" || v === null) return false;
   const p = v as Record<string, unknown>;
-  return (
-    isL3Report(p.analysis) &&
-    isDivergenceReportView(p.divergences) &&
-    (p.facts === undefined || isAnalysisFactsView(p.facts)) &&
-    (p.llm === undefined || isLlmFindingReportView(p.llm))
-  );
+  return (p.facts === undefined || isAnalysisFactsView(p.facts)) && hasOnlyKeys(p, ["facts"]);
 }
 
 export function isSemanticModelPayload(v: unknown): v is SemanticModelPayload {
@@ -3298,16 +2811,9 @@ function isSummaryAnalysisView(v: unknown): boolean {
   const count = (n: unknown) => n === null || (Number.isSafeInteger(n) && (n as number) >= 0);
   const percent = (n: unknown) => isNumber(n) && (n as number) >= 0 && (n as number) <= 100;
   return (
-    count(s.improvableCount) &&
     count(s.scriptFindingCount) &&
     count(s.scriptCandidateCount) &&
-    (s.scriptCandidatePercent === null || percent(s.scriptCandidatePercent)) &&
-    (s.llmExecutionState === "idle" || s.llmExecutionState === "running" || s.llmExecutionState === "attemptFailed" || s.llmExecutionState === "disabled" || s.llmExecutionState === "attached") &&
-    (s.llmState === "current" || s.llmState === "not-run" || s.llmState === "stale") &&
-    count(s.llmFindingCount) &&
-    count(s.rejectedCount) &&
-    isOptionalString(s.generatedAtLabel) &&
-    isArrayOf(s.llmAreas, isSummaryLlmAreaView)
+    (s.scriptCandidatePercent === null || percent(s.scriptCandidatePercent))
   );
 }
 
@@ -3536,6 +3042,8 @@ function isPlanBlockStep(v: unknown): boolean {
     at(step.end) &&
     at(step.durationMs) &&
     (step.activeSpans === undefined || isArrayOf(step.activeSpans, isPlanSpan)) &&
+    (step.settles === undefined || isArrayOf(step.settles, change => typeof change === "object" && change !== null && isNumber((change as Record<string, unknown>).at)
+      && ((change as Record<string, unknown>).settled === undefined || (change as Record<string, unknown>).settled === true))) &&
     (step.carriedTo === undefined || typeof step.carriedTo === "string") &&
     (step.startedAt === null || step.end === null || (step.end as number) >= (step.startedAt as number))
   );
@@ -3565,7 +3073,11 @@ function isRoleRunView(v: unknown): boolean {
     (r.count === undefined || Number.isSafeInteger(r.count) && (r.count as number) > 0) &&
     (r.kinds === undefined || isArrayOf(r.kinds, kind => typeof kind === "object" && kind !== null &&
       isNullableNumber((kind as Record<string, unknown>).ms) && isNullableNumber((kind as Record<string, unknown>).percent)) &&
-      (r.kinds as unknown[]).length === MAIN_PROCESSING_BUCKETS.length)
+      (r.kinds as unknown[]).length === MAIN_PROCESSING_BUCKETS.length) &&
+    (r.parts === undefined || isArrayOf(r.parts, part => typeof part === "object" && part !== null && isNullableNumber((part as Record<string, unknown>).from)
+      && isNullableNumber((part as Record<string, unknown>).durationMs) && isNullableNumber((part as Record<string, unknown>).tokens)
+      && isNullableNumber((part as Record<string, unknown>).cacheRead) && isNullableNumber((part as Record<string, unknown>).outputTokens)
+      && ((part as Record<string, unknown>).tokensPartial === undefined || typeof (part as Record<string, unknown>).tokensPartial === "boolean")))
   );
 }
 
@@ -3705,15 +3217,6 @@ export interface ResumeHydrationSendDisposition {
   disposition: "accepted-human" | "accepted-nonhuman" | "rejected";
 }
 
-export interface LlmAnalysisRunProgress {
-  stage?: "slice" | "merge";
-  sliceIndex?: number;
-  sliceCount?: number;
-  callIndex: number;
-  plannedCalls: number;
-  elapsedMs: number;
-}
-
 export type HostToWebview =
   | { type: "orchestrationView"; tabId: string; state: OrchestrationView }
   | { type: "init"; protocolVersion: number; tabs: TabSnapshot[]; hostWindows?: boolean; systemAppExtensions?: string[] }
@@ -3802,34 +3305,15 @@ export type HostToWebview =
   | { type: "sessionHiddenChanged"; sessionId: string; hidden: boolean }
   | { type: "sessionListChanged" }
   | { type: "sessionListActionFailed"; sessionId: string; action: SessionListAction; reason: string; requestId?: string }
-  | { type: "analysisFailed"; kind: "action"; tabId: string; reason: string }
-  | { type: "composerPrefill"; tabId: string; text: string }
   | { type: "editorContext"; path: string; startLine: number; endLine: number }
   | { type: "workModel"; tabId: string; model: WorkModelPayload }
   | { type: "semanticModel"; tabId: string; model: SemanticModelPayload }
-  | { type: "llmAnalysisSetting"; enabled: boolean }
-  | { type: "userSettings"; appearance?: AccentSettings; displayName?: string; composerSendKey: ComposerSendKey; askQualityCheck?: boolean; editSummaryEnabled: boolean; remoteControlCard?: boolean; welcome?: WelcomeState }
+  | { type: "userSettings"; appearance?: AccentSettings; displayName?: string; composerSendKey: ComposerSendKey; askQualityCheck?: boolean; editSummaryEnabled: boolean; remoteControlCard?: boolean; improvementMenu?: boolean; welcome?: WelcomeState }
   | { type: "remoteControlState"; tabId: string; state: RemoteControlView }
   | { type: "tabNotice"; tabId: string; text: string }
-  | {
-      type: "llmAnalysisRunState";
-      tabId: string;
-      running: boolean;
-      progress?: LlmAnalysisRunProgress;
-      failure?: {
-        reason: string;
-        limit?: "per_call" | "total";
-        elapsedMs: number;
-        attemptedCalls: number;
-        completedCalls: number;
-        plannedCalls: number;
-      };
-      refusal?: string;
-    }
   | { type: "sessionSummary"; tabId: string; running: boolean; summary?: { text: string; model: string }; saveFailed?: boolean; failure?: string }
   | { type: "sessionNameSuggestion"; tabId: string; title: string }
   | { type: "sessionNameSuggestion"; tabId: string; reason: string }
-  | { type: "llmFindingDiagnostics"; tabId: string; payload: LlmFindingDiagnosticsPayload }
   | {
       type: "agentInspectorResult";
       tabId: string;
@@ -3903,13 +3387,6 @@ export type HostToWebview =
       reason: "not-found" | "read-failed" | "invalid-request";
     }
   | ({ type: "accountUsage"; replyTo: string } & AccountUsageSnapshot)
-  | {
-      type: "analysisPersistenceState";
-      tabId: string;
-      artifactId: string;
-      persistence: PersistenceState;
-      persistenceLabel: string;
-    }
   | { type: "todoSnapshot"; seq: number; enabled: false }
   | { type: "todoSnapshot"; seq: number; enabled: true; revision: number; items: TodoListItem[]; groups: TodoGroupColor[]; templates: TodoTemplateView[]; tabItems: TodoTabItem[]; askSources: TodoAskSourceRef[]; askDismissals: string[]; askClosedInTodo: string[];
       deletedTabs: string[]; sessions: TodoSessionLinkView[]; claudeRecent: number[] }
@@ -4059,12 +3536,8 @@ export interface ConversationSnapshot {
   workModel?: WorkModelPayload;
   semanticView?: boolean;
   semanticModel?: SemanticModelPayload;
-  llmAnalysisEnabled?: boolean;
-  llmAnalysisRunning?: boolean;
-  llmAnalysisProgress?: LlmAnalysisRunProgress;
   sessionSummary?: { text: string; model: string };
   sessionSummaryRunning?: boolean;
-  llmDiagnostics?: boolean;
   headOmitted?: { count: number; hasConvEvent: boolean };
   backgroundActivity?: BackgroundActivitySnapshot;
   autoResumeAt?: number | null;
@@ -4205,6 +3678,7 @@ export function isWebviewToHost(v: unknown): v is WebviewToHost {
       isToolUseIdRef(message.firstToolUseId) && isToolUseIdRef(message.lastToolUseId);
   }
   if (t === "exportTab") return typeof tabId === "string";
+  if (t === "startImprovementAnalysis") return hasOnlyKeys(v as Record<string, unknown>, ["type"]);
   if (t === "setRemoteControl") {
     const m = v as Record<string, unknown>;
     return typeof tabId === "string" && (m.enabled === undefined || typeof m.enabled === "boolean") && hasOnlyKeys(m, ["type", "tabId", "enabled"]);
@@ -4297,24 +3771,6 @@ export function isWebviewToHost(v: unknown): v is WebviewToHost {
       return isHistoryRequestAnchor(message.anchor);
     }
     return true;
-  }
-  if (t === "llmAnalysisRequest") {
-    const message = v as Record<string, unknown>;
-    const allowed = new Set(["type", "tabId"]);
-    return (
-      Object.keys(message).every((key) => allowed.has(key)) &&
-      typeof message.tabId === "string" &&
-      message.tabId.length > 0 &&
-      message.tabId.length <= TAB_ID_MAX
-    );
-  }
-  if (t === "setLlmAnalysisEnabled") {
-    const message = v as Record<string, unknown>;
-    const allowed = new Set(["type", "enabled"]);
-    return (
-      Object.keys(message).every((key) => allowed.has(key)) &&
-      typeof message.enabled === "boolean"
-    );
   }
   if (t === "conversationHistoryRequest") {
     const message = v as Record<string, unknown>;
@@ -4517,36 +3973,6 @@ export function isWebviewToHost(v: unknown): v is WebviewToHost {
         val.length <= 10_000
     );
   }
-  if (t === "startFindingSession") {
-    const message = v as Record<string, unknown>;
-    const allowed = new Set(["type", "tabId", "findingId", "analysisRunId", "semanticHash"]);
-    return (
-      Object.keys(message).every((key) => allowed.has(key)) &&
-      typeof message.tabId === "string" && message.tabId.length > 0 && message.tabId.length <= TAB_ID_MAX &&
-      typeof message.findingId === "string" && message.findingId.length > 0 && message.findingId.length <= 200 &&
-      typeof message.analysisRunId === "string" && message.analysisRunId.length > 0 && message.analysisRunId.length <= 200 &&
-      typeof message.semanticHash === "string" && message.semanticHash.length > 0 && message.semanticHash.length <= 200
-    );
-  }
-  if (t === "prepareHistoricalDraft") {
-    const message = v as Record<string, unknown>;
-    const allowed = new Set(["type", "tabId", "artifactId", "findingId"]);
-    return (
-      Object.keys(message).every((key) => allowed.has(key)) &&
-      typeof message.tabId === "string" && message.tabId.length > 0 && message.tabId.length <= TAB_ID_MAX &&
-      typeof message.artifactId === "string" && message.artifactId.length > 0 && message.artifactId.length <= 200 &&
-      typeof message.findingId === "string" && message.findingId.length > 0 && message.findingId.length <= 200
-    );
-  }
-  if (t === "selectAnalysisArtifact") {
-    const message = v as Record<string, unknown>;
-    const allowed = new Set(["type", "tabId", "artifactId"]);
-    return (
-      Object.keys(message).every((key) => allowed.has(key)) &&
-      typeof message.tabId === "string" && message.tabId.length > 0 && message.tabId.length <= TAB_ID_MAX &&
-      typeof message.artifactId === "string" && message.artifactId.length > 0 && message.artifactId.length <= 200
-    );
-  }
   t satisfies never;
   return false;
 }
@@ -4687,7 +4113,8 @@ function isRestoredApprovalCard(value: unknown): boolean {
     !!card.requestId &&
     typeof card.toolName === "string" &&
     typeof card.inputJson === "string" &&
-    ["answered", "allowed", "denied", "withdrawn", "failed", "unknown"].includes(String(card.resolution)) &&
+    (RESTORED_APPROVAL_RESOLUTIONS as readonly unknown[]).includes(card.resolution) &&
+    (card.resolution === "unanswered" ? isAskUnansweredKind(card.unanswered) : card.unanswered === undefined) &&
     (card.answers === undefined || typeof card.answers === "object" && card.answers !== null && !Array.isArray(card.answers) && Object.values(card.answers).every(answer => typeof answer === "string")) &&
     (card.questions === undefined || isRestoredQuestionSpec(card.questions))
   );
@@ -4756,6 +4183,8 @@ export function isWorkEventInfo(v: unknown): v is WorkEventInfo {
     isOptionalArrayOf(info.taskTotals, isWorkTaskTotalsView) &&
     isOptionalArrayOf(info.tasks, isWorkTaskItemView) &&
     isOptionalArrayOf(info.staled, (item) => typeof item === "string") &&
+    isOptionalArrayOf(info.reopened, (item) => typeof item === "object" && item !== null &&
+      typeof (item as { toolUseId?: unknown }).toolUseId === "string" && typeof (item as { agentId?: unknown }).agentId === "string") &&
     (info.pendingApprovalCount === undefined || isNumber(info.pendingApprovalCount)) &&
     (info.turnToolCount === undefined || isNumber(info.turnToolCount))
   );
@@ -5196,19 +4625,6 @@ function isTabSnapshotShape(x: unknown): x is TabSnapshot {
   );
 }
 
-function isLlmAnalysisRunProgress(value: unknown): value is LlmAnalysisRunProgress {
-  if (typeof value !== "object" || value === null) return false;
-  const progress = value as Record<string, unknown>;
-  return (
-    typeof progress.callIndex === "number" &&
-    typeof progress.plannedCalls === "number" &&
-    (progress.stage === undefined || progress.stage === "slice" || progress.stage === "merge") &&
-    (progress.sliceIndex === undefined || (Number.isInteger(progress.sliceIndex) && (progress.sliceIndex as number) >= 1)) &&
-    (progress.sliceCount === undefined || (Number.isInteger(progress.sliceCount) && (progress.sliceCount as number) >= 1)) &&
-    typeof progress.elapsedMs === "number"
-  );
-}
-
 function isNonNegativeInt(v: unknown): boolean {
   return typeof v === "number" && Number.isInteger(v) && v >= 0;
 }
@@ -5563,17 +4979,6 @@ export function isHostToWebview(v: unknown): v is HostToWebview {
       )
     );
   }
-  if (t === "composerPrefill") {
-    return typeof tabId === "string" && typeof (v as { text?: unknown }).text === "string" && (v as { text: string }).text.length <= 20_000;
-  }
-  if (t === "analysisFailed") {
-    const m = v as Record<string, unknown>;
-    const allowed = new Set(["type", "kind", "tabId", "reason"]);
-    if (!Object.keys(m).every((key) => allowed.has(key))) return false;
-    if (m.kind !== "action") return false;
-    if (typeof tabId !== "string" || tabId.length === 0 || tabId.length > TAB_ID_MAX) return false;
-    return typeof m.reason === "string" && m.reason.length > 0;
-  }
   if (t === "editorContext") {
     return (
       typeof (v as { path?: unknown }).path === "string" &&
@@ -5587,9 +4992,6 @@ export function isHostToWebview(v: unknown): v is HostToWebview {
   if (t === "semanticModel") {
     return typeof tabId === "string" && isSemanticModelPayload((v as { model?: unknown }).model);
   }
-  if (t === "llmAnalysisSetting") {
-    return typeof (v as { enabled?: unknown }).enabled === "boolean";
-  }
   if (t === "userSettings") {
     const appearance = (v as { appearance?: unknown }).appearance;
     const displayName = (v as { displayName?: unknown }).displayName;
@@ -5599,6 +5001,7 @@ export function isHostToWebview(v: unknown): v is HostToWebview {
       && [undefined, true, false].includes((v as { askQualityCheck?: unknown }).askQualityCheck as boolean | undefined)
       && typeof (v as { editSummaryEnabled?: unknown }).editSummaryEnabled === "boolean"
       && [undefined, true, false].includes((v as { remoteControlCard?: unknown }).remoteControlCard as boolean | undefined)
+      && [undefined, true, false].includes((v as { improvementMenu?: unknown }).improvementMenu as boolean | undefined)
       && ((v as { welcome?: unknown }).welcome === undefined || isWelcomeState((v as { welcome?: unknown }).welcome));
   }
   if (t === "remoteControlState") {
@@ -5672,30 +5075,6 @@ export function isHostToWebview(v: unknown): v is HostToWebview {
     const text = (v as { text?: unknown }).text;
     return typeof tabId === "string" && tabId.length > 0 && typeof text === "string" && text.length > 0;
   }
-  if (t === "llmAnalysisRunState") {
-    const m = v as Record<string, unknown>;
-    const progress = m.progress;
-    const failure = m.failure as
-      | {
-        reason?: unknown;
-        limit?: unknown;
-        elapsedMs?: unknown;
-        attemptedCalls?: unknown;
-        completedCalls?: unknown;
-        plannedCalls?: unknown;
-      }
-      | undefined;
-    const refusal = m.refusal;
-    return (
-      typeof tabId === "string" &&
-      typeof m.running === "boolean" &&
-      (progress === undefined || isLlmAnalysisRunProgress(progress)) &&
-      (failure === undefined ||
-        isLlmAnalysisRunFailure(failure)) &&
-      (refusal === undefined ||
-        (typeof refusal === "string" && refusal.length > 0 && m.running === false && failure === undefined))
-    );
-  }
   if (t === "sessionNameSuggestion") {
     const message = v as { title?: unknown; reason?: unknown };
     return typeof tabId === "string" && Object.keys(v).every(key => ["type", "tabId", "title", "reason"].includes(key)) &&
@@ -5715,12 +5094,6 @@ export function isHostToWebview(v: unknown): v is HostToWebview {
       (failure === undefined || (typeof failure === "string" && failure.length > 0 && running === false)) &&
       (summary === undefined ||
         isSessionSummaryResult(summary))
-    );
-  }
-  if (t === "llmFindingDiagnostics") {
-    return (
-      typeof tabId === "string" &&
-      isLlmFindingDiagnosticsPayload((v as { payload?: unknown }).payload)
     );
   }
   if (t === "agentInspectorResult") {
@@ -5812,16 +5185,6 @@ export function isHostToWebview(v: unknown): v is HostToWebview {
       (m.state === "ok" || m.rows.length === 0)
     );
   }
-  if (t === "analysisPersistenceState") {
-    const p = (v as { persistence?: unknown }).persistence;
-    return (
-      typeof tabId === "string" &&
-      typeof (v as { artifactId?: unknown }).artifactId === "string" &&
-      (p === "pending" || p === "saved" || p === "rejected" || p === "failed") &&
-      typeof (v as { persistenceLabel?: unknown }).persistenceLabel === "string"
-    );
-  }
-
   t satisfies never;
   return false;
 }
@@ -5865,23 +5228,10 @@ function isWorkPlanHistoryEntry(entry: unknown): boolean {
     items: () => row.kind !== "todos" || isArrayOf(row.items, isWorkTaskItemView),
     agentId: () => row.kind !== "resume" || typeof row.agentId === "string",
     description: () => row.kind !== "resume" || typeof row.description === "string",
-    status: () => row.kind !== "resume" || WORK_STATUSES.includes(row.status as string),
+    status: () => row.kind !== "resume" || WORK_STATUSES.includes(row.status as string) || row.status === "stopped",
     endedAt: () => row.kind !== "resume" || row.endedAt === undefined || isNumber(row.endedAt),
   };
   return Object.values(checks).every(check => check());
-}
-
-function isSummaryLlmAreaView(value: unknown): boolean {
-  if (typeof value !== "object" || value === null) return false;
-  const area = value as Record<string, unknown>;
-  const count = (n: unknown) => n === null || (Number.isSafeInteger(n) && (n as number) >= 0);
-  const percent = (n: unknown) => isNumber(n) && (n as number) >= 0 && (n as number) <= 100;
-  return (
-    typeof area.label === "string" &&
-    area.count !== null &&
-    count(area.count) &&
-    percent(area.percent)
-  );
 }
 
 function isRoleView(role: unknown): boolean {
@@ -5937,6 +5287,7 @@ function isWorkAgentStateView(item: unknown): boolean {
     (agent.runStartedAt === undefined || isNumber(agent.runStartedAt)) &&
     (agent.earlierRuns === undefined || isSpanList(agent.earlierRuns)) &&
     (WORK_STATUSES as string[]).includes(agent.status as string) &&
+    (agent.stopped === undefined || agent.stopped === true) &&
     isNumber(agent.childCount) &&
     isNumber(agent.failCount) &&
     isNumber(agent.elapsedMs) &&
@@ -6032,12 +5383,9 @@ function isConversationSnapshot(value: unknown): boolean {
     appliedEffort: () => s.appliedEffort === undefined || s.appliedEffort === null ||
       (typeof s.appliedEffort === "string" && ["low", "medium", "high", "xhigh", "max"].includes(s.appliedEffort)),
     recordedModel: () => s.recordedModel === undefined || typeof s.recordedModel === "string",
-    llmAnalysisEnabled: () => s.llmAnalysisEnabled === undefined || typeof s.llmAnalysisEnabled === "boolean",
-    llmAnalysisRunning: () => s.llmAnalysisRunning === undefined || typeof s.llmAnalysisRunning === "boolean",
     sessionSummary: () => s.sessionSummary === undefined ||
       isSessionSummarySnapshot(s.sessionSummary),
     sessionSummaryRunning: () => s.sessionSummaryRunning === undefined || typeof s.sessionSummaryRunning === "boolean",
-    llmDiagnostics: () => s.llmDiagnostics === undefined || typeof s.llmDiagnostics === "boolean",
     resumeHydration: () => s.resumeHydration === undefined || isResumeHydrationSnapshotState(s.resumeHydration),
     headOmitted: () => s.headOmitted === undefined || isHeadOmitted(s.headOmitted),
     backgroundActivity: () => s.backgroundActivity === undefined || isBackgroundActivitySnapshot(s.backgroundActivity),
@@ -6053,8 +5401,6 @@ function isConversationSnapshot(value: unknown): boolean {
     modelOverride: () => true,
     resumeSessionId: () => true,
     resumeFilePath: () => true,
-    llmAnalysisProgress: () => s.llmAnalysisProgress === undefined ||
-      (s.llmAnalysisRunning === true && isLlmAnalysisRunProgress(s.llmAnalysisProgress)),
   };
   return Object.values(checks).every(check => check());
 }
@@ -6085,46 +5431,6 @@ function isBackgroundDelegationSnapshot(value: unknown): boolean {
     typeof row.running === "boolean" &&
     typeof row.background === "boolean" &&
     hasOnlyKeys(row, ["toolUseId", "label", "agentId", "running", "background"])
-  );
-}
-
-function isAnalysisLlmTargets(value: unknown): boolean {
-  if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
-  const row = value as Record<string, unknown>;
-  return (
-    isNumber(row.toolCalls) &&
-    typeof row.label === "string" &&
-    hasOnlyKeys(row, ["toolCalls", "label"])
-  );
-}
-
-function isActionFindingCalculation(value: unknown): boolean {
-  if (typeof value !== "object" || value === null) return false;
-  const row = value as Record<string, unknown>;
-  return (
-    ["identity", "sum", "cardinality"].includes(row.op as string) &&
-    isStringArray(row.factIds)
-  );
-}
-
-function isActionFindingImpact(value: unknown): boolean {
-  if (typeof value !== "object" || value === null) return false;
-  const row = value as Record<string, unknown>;
-  return (
-    (row.unit === "ms" || row.unit === "count") &&
-    isNumber(row.value) &&
-    isActionFindingCalculation(row.calculation)
-  );
-}
-
-function isActionFindingAction(value: unknown): boolean {
-  if (typeof value !== "object" || value === null) return false;
-  const row = value as Record<string, unknown>;
-  return (
-    typeof row.kind === "string" &&
-    typeof row.destination === "string" &&
-    isStringArray(row.steps) &&
-    isOptionalString(row.target)
   );
 }
 
@@ -6160,6 +5466,12 @@ function isTimeAgentView(value: unknown): boolean {
     end: () => true,
     earlierRuns: () => row.earlierRuns === undefined || isSpanList(row.earlierRuns),
     resumedAt: () => row.resumedAt === undefined || isNumber(row.resumedAt),
+    runPlacements: () => row.runPlacements === undefined || isArrayOf(row.runPlacements, placement => typeof placement === "object" && placement !== null
+      && isNumber((placement as Record<string, unknown>).from) && isOptionalString((placement as Record<string, unknown>).blockId)
+      && isOptionalString((placement as Record<string, unknown>).stepKey)),
+    runMeasures: () => row.runMeasures === undefined || isArrayOf(row.runMeasures, measure => typeof measure === "object" && measure !== null
+      && ["toolCount", "failCount", "toolMs", "generateMs"].every(key => isNumber((measure as Record<string, unknown>)[key]))),
+    runSliceKey: () => row.runSliceKey === undefined || typeof row.runSliceKey === "string",
     open: () => true,
     isBackground: () => true,
     description: () => true,
@@ -6354,20 +5666,6 @@ function isSemanticResult(value: unknown): boolean {
   );
 }
 
-function isLlmFindingDiagnosticsCounts(value: unknown): boolean {
-  if (typeof value !== "object" || value === null) return false;
-  const row = value as Record<string, unknown>;
-  return (
-    isNumber(row.candidate) &&
-    isNumber(row.schemaRejected) &&
-    isNumberRecord(row.schemaByReason) &&
-    isNumber(row.verified) &&
-    isNumber(row.accepted) &&
-    isNumber(row.rejected) &&
-    isNumberRecord(row.byReason)
-  );
-}
-
 function isHandoffStatusProgress(value: unknown): boolean {
   if (typeof value !== "object" || value === null) return false;
   const row = value as Record<string, unknown>;
@@ -6394,19 +5692,6 @@ function isHandoffStatusFork(value: unknown): boolean {
     typeof row.sessionId === "string" &&
     typeof row.tabId === "string" &&
     typeof row.title === "string"
-  );
-}
-
-function isLlmAnalysisRunFailure(value: unknown): boolean {
-  if (typeof value !== "object" || value === null) return false;
-  const row = value as Record<string, unknown>;
-  return (
-    typeof row.reason === "string" &&
-    (row.limit === undefined || row.limit === "per_call" || row.limit === "total") &&
-    typeof row.elapsedMs === "number" &&
-    typeof row.attemptedCalls === "number" &&
-    typeof row.completedCalls === "number" &&
-    typeof row.plannedCalls === "number"
   );
 }
 
@@ -6497,34 +5782,3 @@ function isInlineSessionImage(value: unknown): boolean {
   );
 }
 
-function isL3Metrics(value: unknown): boolean {
-  if (typeof value !== "object" || value === null) return false;
-  const row = value as Record<string, unknown>;
-  return (
-    isL3Metric(row.longGapMs) &&
-    isL3Metric(row.longGapCount) &&
-    isL3Metric(row.failureCount) &&
-    isL3Metric(row.actualConcurrency) &&
-    isL3Metric(row.fileWriteConflictCount) &&
-    isL3Metric(row.resourceDependencyCount) &&
-    isL3Metric(row.unknownEffectRatio) &&
-    isL3Metric(row.observedConstraintChainMs)
-  );
-}
-
-function isL3Estimates(value: unknown): boolean {
-  if (typeof value !== "object" || value === null) return false;
-  const row = value as Record<string, unknown>;
-  return isL3ParallelizationEstimate(row.parallelizationUpperBound);
-}
-
-function isDivergenceKinds(value: unknown): boolean {
-  if (typeof value !== "object" || value === null) return false;
-  const row = value as Record<string, unknown>;
-  return (
-    isDivergenceKindReportView(row.serialization) &&
-    isDivergenceKindReportView(row.unsupported_completion) &&
-    isDivergenceKindReportView(row.progress_stagnation) &&
-    isDivergenceKindReportView(row.declared_state_conflict)
-  );
-}

@@ -2,7 +2,7 @@ import { redactAbsolutePaths } from "./path-redaction";
 import { isExternalRunTool } from "./orchestration-executors";
 import { isDelegationTool } from "./claude-tool-names";
 
-const INTENT_FIELDS = ["description", "subagent_type", "agent_key", "effort", "target", "prompt", "file_path", "pattern", "url", "query"] as const;
+const INTENT_FIELDS = ["description", "subagent_type", "agent_key", "effort", "target", "prompt", "file_path", "pattern", "url", "query", "summary"] as const;
 export type ToolIntentInput = Partial<Record<typeof INTENT_FIELDS[number], string>>;
 
 export function isToolIntentInput(value: unknown): value is ToolIntentInput {
@@ -19,6 +19,7 @@ export function isToolIntentInput(value: unknown): value is ToolIntentInput {
     (!Object.prototype.propertyIsEnumerable.call(input, "pattern") || typeof input.pattern === "string") &&
     (!Object.prototype.propertyIsEnumerable.call(input, "url") || typeof input.url === "string") &&
     (!Object.prototype.propertyIsEnumerable.call(input, "query") || typeof input.query === "string") &&
+    (!Object.prototype.propertyIsEnumerable.call(input, "summary") || typeof input.summary === "string") &&
     Object.keys(input).every(key => (INTENT_FIELDS as readonly string[]).includes(key))
   );
 }
@@ -35,7 +36,7 @@ export function captureToolIntentInput(name: string, input: unknown): ToolIntent
     : name === "Bash" || name === "PowerShell" ? ["description"]
     : name === "Read" || name === "Edit" || name === "Write" ? ["file_path"]
     : name === "Grep" || name === "Glob" ? ["pattern"]
-    : name === "WebFetch" ? ["url"] : name === "WebSearch" ? ["query"] : [];
+    : name === "WebFetch" ? ["url"] : name === "WebSearch" ? ["query"] : name === "SendMessage" ? ["summary"] : [];
   const result: ToolIntentInput = {};
   for (const key of fields) {
     const value = source[key];
@@ -45,6 +46,8 @@ export function captureToolIntentInput(name: string, input: unknown): ToolIntent
   }
   return Object.keys(result).length ? result : undefined;
 }
+
+export const resumeSummary = (input: unknown): string | undefined => captureToolIntentInput("SendMessage", input)?.summary;
 
 export function conductorStopTarget(toolName: string, inputPreview: string): string | undefined {
   if (toolName !== "TaskStop") return undefined;

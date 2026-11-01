@@ -34,6 +34,7 @@ import {
   ORPHANS_KEY,
   handoffForkState,
   heldForkTabAction,
+  heldForkTabNotice,
   heldTabInsertIndex,
   holdForkTab,
   isHandoffForkHidden,
@@ -170,7 +171,19 @@ export function postSessionListChanged(): void {
   store?.post({ type: "sessionListChanged" });
 }
 
-export async function sweepHandoffForksAtStartup(): Promise<void> {
+let startupSweep: Promise<void> | undefined;
+
+export function sweepHandoffForksAtStartup(): Promise<void> {
+  startupSweep ??= sweepHandoffForks();
+  return startupSweep;
+}
+
+export async function settleHeldForkTabsAfterSweep(post: (message: string) => void = noticeInFirstTab): Promise<void> {
+  await startupSweep;
+  settleHeldForkTabs(post);
+}
+
+async function sweepHandoffForks(): Promise<void> {
   try {
     const result = await HandoffRunner.sweepOrphans(
       { fs: handoffFs, persist: handoffPersist(), readRecords: readHandoffRecords, log: (line) => output.appendLine(line) },
@@ -180,17 +193,17 @@ export async function sweepHandoffForksAtStartup(): Promise<void> {
   } catch (error) {
     output.appendLine(`[startup] handoff の孤児回収に失敗: ${errText(error)}`);
   }
-  settleHeldForkTabs();
 }
 
 let heldForkTabs: HeldForkTab<PersistedOpenTab>[] = [];
+const settledForkTabs = new Set<string>();
 const reopeningForkTabs = new Set<string>();
 
-export function holdHandoffForkTab(entry: PersistedOpenTab): void {
+export function holdHandoffForkTab(entry: PersistedOpenTab, state: HandoffForkState): void {
   const preceding = readPersistedOpenTabs()
     .filter((tab) => tab.order < entry.order && tab.sessionId !== entry.sessionId)
     .map((tab) => tab.sessionId);
-  heldForkTabs = holdForkTab(heldForkTabs, entry, preceding);
+  heldForkTabs = holdForkTab(heldForkTabs, entry, preceding, state);
   void persistOpenTabs();
 }
 
@@ -215,25 +228,28 @@ export function unfinishedHandoffTabNotice(label: string, state: HandoffForkStat
   }
 }
 
-function dropHeldForkTab(tab: PersistedOpenTab, message: string): void {
+function dropHeldForkTab(tab: PersistedOpenTab, message: string, post: (message: string) => void = noticeInFirstTab): void {
   noteHandoffForkTab({ kind: "settled", sessionId: tab.sessionId, action: "drop" });
   void persistOpenTabs();
-  noticeInFirstTab(message);
+  post(message);
 }
 
-function settleHeldForkTabs(): void {
-  if (heldForkTabs.length === 0) return;
+function settleHeldForkTabs(post: (message: string) => void): void {
   for (const held of heldForkTabs) {
     const tab = held.tab;
-    if (reopeningForkTabs.has(tab.sessionId)) continue;
+    if (reopeningForkTabs.has(tab.sessionId) || settledForkTabs.has(tab.sessionId)) continue;
+    settledForkTabs.add(tab.sessionId);
     const state = handoffForkStateOf(tab.sessionId, Date.now());
     const lookup = state === undefined ? lookupSessionFile(tab.sessionId) : undefined;
     const action = heldForkTabAction(
       state,
       lookup === undefined || lookup.reason === "scan_failed" ? "unknown" : lookup.path !== null ? "present" : "missing"
     );
-    if (action === "drop") dropHeldForkTab(tab, unfinishedHandoffTabNotice(tab.title ?? tab.sessionId, state));
+    const notice = heldForkTabNotice(action, state, held.state);
+    const message = notice.notice ? unfinishedHandoffTabNotice(tab.title ?? tab.sessionId, notice.state) : undefined;
+    if (action === "drop") dropHeldForkTab(tab, message!, post);
     else if (action === "reopen" && lookup?.path) reopenHeldForkTab(held, lookup.path);
+    else if (message !== undefined) post(message);
   }
 }
 

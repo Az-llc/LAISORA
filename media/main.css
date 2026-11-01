@@ -1049,6 +1049,8 @@ details.handoff-row[open] > summary .handoff-row-chev { transform: rotate(90deg)
 }
 .block.worklog-approval-ref.allow { border-left-color: var(--vscode-testing-iconPassed, #2d7d46); }
 .block.worklog-approval-ref.deny { border-left-color: var(--vscode-errorForeground); }
+.block.worklog-approval-ref.withdrawn,
+.block.worklog-approval-ref.unanswered { border-left-color: var(--vscode-panel-border, var(--vscode-descriptionForeground)); }
 
 /* 返信フッター（R-CNV-15）。`.block` は付けない（会話面の行を数える検査と
    `.block` の余白規則に返信フッターが混ざる）。常時表示は最新の返信だけで、
@@ -1924,6 +1926,11 @@ hr.md-hr {
 }
 .block.approval.approved { border-color: var(--vscode-testing-iconPassed, #2d7d46); }
 .block.approval.denied { border-color: var(--vscode-errorForeground); }
+.block.approval.withdrawn,
+.block.approval.unanswered {
+  border-color: var(--vscode-panel-border, var(--vscode-descriptionForeground));
+  background: transparent;
+}
 .block.approval pre:not(.codeblock) {
   max-height: 200px;
   overflow: auto;
@@ -2799,190 +2806,7 @@ button:disabled { opacity: var(--l-disabled-opacity); cursor: default; }
   margin-bottom: 8px;
 }
 
-/* LLM 区画（検証通過分のみ）と診断面（棄却分・オプトイン）。
-   診断面は4タブの外の要素で、既定では生成されない */
-.llm-entry {
-  align-items: center;
-  display: flex;
-  flex-wrap: wrap;
-  gap: 8px 16px;
-}
-.llm-entry > .llm-toggle { margin-inline-start: auto; }
-.llm-findings {
-  display: flex;
-  flex-direction: column;
-  gap: 4px;
-  margin-top: 8px;
-}
-.llm-history {
-  color: var(--vscode-descriptionForeground);
-  display: flex;
-  flex-wrap: wrap;
-  font-size: 11.5px;
-  font-variant-numeric: tabular-nums;
-  gap: 2px 17px;
-  line-height: 18px;
-  list-style: none;
-  margin: 0;
-  /* 折り返した行頭の区切りは左の余白ごと切り落とす。padding を 0 にすると行頭のフォーカス枠も切れる */
-  overflow: hidden;
-  padding: 2px 0 2px 3px;
-}
-.llm-history-item { flex: 0 1 auto; min-width: 0; position: relative; }
-.llm-history-freshness::before {
-  content: "·" / "";
-  margin: 0 6px;
-  opacity: 0.6;
-}
-.llm-history-item + .llm-history-item::before {
-  content: "|" / "";
-  inset-inline-start: -11px;
-  opacity: 0.6;
-  position: absolute;
-}
-.llm-history-btn {
-  background: none;
-  border: 0;
-  color: inherit;
-  cursor: pointer;
-  font: inherit;
-  padding: 0;
-}
-.llm-history-btn:hover { color: var(--vscode-foreground); }
-.llm-history-btn:focus-visible { outline: 1px solid var(--vscode-focusBorder); outline-offset: 1px; }
-.llm-history-btn[aria-current="true"] { cursor: default; }
-.llm-history-current {
-  border-bottom: 2px solid var(--laisora-accent);
-  color: var(--vscode-foreground);
-  font-weight: 600;
-}
-.llm-completion {
-  color: var(--vscode-descriptionForeground);
-  font-size: 11.5px;
-  font-variant-numeric: tabular-nums;
-  line-height: 18px;
-}
-.llm-completion > * + *::before {
-  content: "·" / "";
-  margin: 0 8px;
-  opacity: 0.6;
-}
-.llm-head {
-  font-size: 14px;
-  font-weight: 700;
-  line-height: 20px;
-  margin-top: 16px;
-}
-.llm-toggle {
-  align-items: center;
-  background: var(--vscode-button-secondaryBackground, var(--vscode-badge-background));
-  border: 1px solid var(--vscode-panel-border, rgba(128, 128, 128, 0.3));
-  border-radius: 12px;
-  color: var(--vscode-button-secondaryForeground, var(--vscode-badge-foreground));
-  cursor: pointer;
-  display: inline-flex;
-  font-size: 11.5px;
-  gap: 6px;
-  padding: 2px 8px 2px 6px;
-  user-select: none;
-  white-space: nowrap;
-}
-.llm-toggle:hover:enabled { filter: brightness(1.15); }
-.llm-toggle:focus-visible { outline: 1px solid var(--vscode-focusBorder); outline-offset: 1px; }
-.llm-toggle::before {
-  background: var(--vscode-descriptionForeground);
-  border-radius: 50%;
-  content: "";
-  display: inline-block;
-  height: 10px;
-  transition: transform 0.15s ease, background 0.15s ease;
-  width: 10px;
-}
-.llm-toggle[aria-checked="true"]::before {
-  background: var(--vscode-testing-iconPassed, #4caf50);
-  box-shadow: 0 0 4px var(--vscode-testing-iconPassed, #4caf50);
-}
-.llm-toggle[aria-checked="false"]::before {
-  background: var(--vscode-descriptionForeground);
-  opacity: 0.6;
-}
-.llm-toggle[aria-busy="true"] {
-  cursor: wait;
-  opacity: 0.6;
-}
-
-.llm-run[data-run-state="in-flight"] .llm-run-btn {
-  cursor: progress;
-}
-
-.llm-none {
-  color: var(--vscode-descriptionForeground);
-  font-size: 13px;
-}
-.llm-finding { display: flex; flex-wrap: wrap; gap: 6px; font-size: 12px; }
-.llm-run {
-  align-items: center;
-  display: flex;
-  flex-wrap: wrap;
-  gap: 8px 12px;
-}
-.llm-run-btn {
-  background: var(--vscode-button-background);
-  border: none;
-  border-radius: 2px;
-  color: var(--vscode-button-foreground);
-  cursor: pointer;
-  flex: 0 0 auto;
-  font-size: 13px;
-  padding: 3px 12px;
-  white-space: nowrap;
-}
-.llm-run-btn:hover:enabled { background: var(--vscode-button-hoverBackground); }
-.llm-run-btn:focus-visible { outline: 1px solid var(--vscode-focusBorder); outline-offset: 1px; }
-.llm-run-btn:disabled { cursor: default; opacity: var(--l-disabled-opacity); }
-.llm-run-note { color: var(--vscode-descriptionForeground); font-size: 11.5px; }
-.llm-run-note.llm-run-refusal { color: var(--vscode-editorWarning-foreground); }
-.llm-run-note.analysis-failure { display: block; color: var(--vscode-errorForeground); margin-top: 6px; white-space: pre-wrap; overflow-wrap: anywhere; }
-.llm-diagnostics {
-  background: var(--vscode-editorWidget-background, var(--vscode-editor-background));
-  border: 1px solid var(--vscode-panel-border, rgba(128, 128, 128, 0.3));
-  border-radius: 6px;
-  bottom: 12px;
-  display: flex;
-  flex-direction: column;
-  gap: 4px;
-  font-size: 12px;
-  max-height: 40vh;
-  max-width: 420px;
-  overflow: auto;
-  padding: 8px 10px;
-  position: fixed;
-  right: 12px;
-  z-index: var(--l-z-popover);
-}
-.llmdiag-head { display: flex; align-items: center; gap: 8px; justify-content: space-between; }
-.llmdiag-title { font-weight: 600; }
-.llmdiag-close { background: none; border: none; color: inherit; cursor: pointer; }
-.llmdiag-item { display: flex; flex-direction: column; gap: 2px; }
-.llmdiag-kind { font-weight: 600; }
-.llmdiag-rejection { color: var(--vscode-descriptionForeground); }
-
-/* OS側の強制配色（Windows ハイコントラスト等） */
-@media (forced-colors: active) {
-  .llm-toggle {
-    border: 1px solid CanvasText;
-    background: Canvas;
-    color: CanvasText;
-  }
-  .llm-toggle[aria-checked="true"]::before {
-    background: Highlight;
-  }
-  .llm-toggle[aria-checked="false"]::before {
-    background: CanvasText;
-  }
-}
-
-/* ---------- LLM Action Finding Cards ---------- */
+/* ---------- Finding Cards ---------- */
 .llm-finding-cards {
   display: flex;
   flex-direction: column;
@@ -3025,42 +2849,12 @@ button:disabled { opacity: var(--l-disabled-opacity); cursor: default; }
   overflow-wrap: anywhere;
 }
 
-.llm-finding-observed,
 .llm-finding-action {
   color: var(--vscode-foreground);
   font-size: 13px;
   line-height: 1.7;
   margin: 0 0 8px;
   overflow-wrap: anywhere;
-}
-
-.llm-finding-footer {
-  align-items: center;
-  display: flex;
-  flex-wrap: wrap;
-  gap: 8px 12px;
-  margin-top: 12px;
-}
-
-.llm-start-session-btn {
-  background: var(--vscode-button-secondaryBackground, var(--vscode-badge-background));
-  border: 1px solid var(--vscode-button-border, transparent);
-  border-radius: 2px;
-  color: var(--vscode-button-secondaryForeground, var(--vscode-badge-foreground));
-  cursor: pointer;
-  font-size: 13px;
-  padding: 4px 12px;
-}
-
-.llm-start-session-btn:hover {
-  background: var(--vscode-button-secondaryHoverBackground, var(--vscode-toolbar-hoverBackground));
-}
-
-.llm-start-session-btn:focus-visible { outline: 1px solid var(--vscode-focusBorder); outline-offset: 1px; }
-
-.llm-start-session-note {
-  color: var(--vscode-descriptionForeground);
-  font-size: 11.5px;
 }
 
 .llm-finding-margin {
@@ -3079,20 +2873,6 @@ button:disabled { opacity: var(--l-disabled-opacity); cursor: default; }
   font-variant-numeric: tabular-nums;
   font-weight: 200;
   line-height: 32px;
-  overflow-wrap: anywhere;
-}
-
-.llm-finding-impact-caption {
-  font-size: 10px;
-  font-weight: 600;
-  letter-spacing: 0.08em;
-  line-height: 16px;
-  margin: 4px 0 12px;
-}
-
-.llm-finding-destination,
-.llm-finding-target {
-  margin-top: 4px;
   overflow-wrap: anywhere;
 }
 
@@ -3299,16 +3079,13 @@ button.llm-evidence-chip:focus-visible { outline: 1px solid var(--vscode-focusBo
 @media (prefers-reduced-motion: reduce) { .wg-row.running .wg-seg { animation: none; } }
 @media (max-width: 640px) { .wg-body { grid-template-columns: minmax(0, 1fr); } }
 
-/* 分析タブ: サブタブ（スクリプト分析 / LLM 分析）・分析の指標・スクリプト分析の所見（R-TAB-06） */
-.wa-tabs { display: flex; gap: 2px; margin: 0 0 12px; border-bottom: 1px solid var(--vscode-editorWidget-border, var(--vscode-panel-border)); }
-.wa-tab { font-size: 12.5px; padding: 6px 14px; border: none; border-bottom: 2px solid transparent; background: none; color: var(--vscode-descriptionForeground); cursor: pointer; }
-.wa-tab:hover { color: var(--vscode-foreground); }
-.wa-tab.active { color: var(--vscode-foreground); font-weight: 600; border-bottom-color: var(--laisora-accent); }
-.wa-tab:focus-visible { outline: 1px solid var(--vscode-focusBorder); outline-offset: -1px; }
-.wa-sub[hidden] { display: none; }
+/* 分析タブ: 分析の指標・スクリプト分析の所見（R-TAB-06） */
 .wa-findings { display: flex; flex-direction: column; gap: 28px; margin: 4px 0 28px; }
 .wa-findings[hidden] { display: none; }
 .wa-fsec > .wa-code { margin-bottom: 4px; }
+.wa-origin { display: flex; align-items: baseline; flex-wrap: wrap; gap: 4px 10px; margin-bottom: -12px; padding-top: 16px; border-top: 1px solid var(--vscode-panel-border); }
+.wa-origin-tag { flex: none; padding: 0 6px; border: 1px solid var(--vscode-panel-border); border-radius: 2px; font-size: 10px; line-height: 16px; font-weight: 600; letter-spacing: .04em; color: var(--vscode-foreground); }
+.wa-origin-note { font-size: 11px; line-height: 16px; color: var(--vscode-descriptionForeground); }
 .wa-sec-h { cursor: help; }
 .wa-sec-h:focus-visible { outline: 1px solid var(--vscode-focusBorder); outline-offset: 1px; }
 /* 分析の指標（TIME / ROLES / ERR）。役割とトークンは時間の区分と別の token で塗る（R-CNV-36） */
@@ -3479,7 +3256,6 @@ button.llm-evidence-chip:focus-visible { outline: 1px solid var(--vscode-focusBo
   .llm-finding-card.wa-find { grid-template-columns: 44px minmax(var(--l-text-min), 1fr); }
 }
 .wa-fsec-empty { font-size: 11.5px; line-height: 1.6; color: var(--vscode-descriptionForeground); }
-.af-llm-section { margin-top: 10px; padding-top: 10px; border-top: 1px solid var(--vscode-editorWidget-border, var(--vscode-panel-border)); }
 @media (forced-colors: active) {
   .wl-tag > button, .wo-hud-group { border: 1px solid CanvasText; forced-color-adjust: none; background: Canvas; color: CanvasText; }
   .wg-row:focus-visible .wg-row-bg { stroke: Highlight; }

@@ -18,6 +18,11 @@ export interface WelcomeUiNames { menuGlyph: string; handoffItem: string; appear
 
 export function welcomeNews(): Readonly<Record<string, readonly WelcomeNewsItem[]>> {
   return {
+    "1.15.0": [
+      { kind: "new", text: l10n.t("Claude in LAISORA conversations can use the Claude in Chrome extension. You can turn it off in the settings.") },
+      { kind: "new", text: l10n.t("The conversation menu has \"Start LLM improvement analysis\": it finds recurring failures across your Claude Code conversations and opens a conversation that proposes fixes.") },
+      { kind: "new", text: l10n.t("The status line shows a question waiting for you first, and keeps showing background tasks.") },
+    ],
     "1.14.1": [
       { kind: "new", text: l10n.t("Claude is told up front the rules the step tracking and file guards enforce, so fewer of its actions are stopped and retried.") },
       { kind: "new", text: l10n.t("When Claude adds several ToDo items at once, the group it names applies to every item.") },

@@ -15,7 +15,7 @@ In short:
 - **CHAT and LOG:** Claude's replies stay readable; every command and file operation is listed in LOG, grouped by your request.
 - **ToDo:** a list of your work that Claude keeps in order, with a memo on each item so a new conversation can start from where things stand.
 - **Requests for you in one place:** approvals, decisions, and checks collected in YOU, beside the conversation.
-- **Where the time and tokens went, and what to change next:** time and tokens by model, by role and by subagent, plus failures, counted from the work log. When you want more, an LLM analysis proposes concrete improvements.
+- **Where the time and tokens went, and what to change next:** time and tokens by model, by role and by subagent, plus failures, counted from the work log. When you want more, an LLM improvement analysis looks for failures that keep recurring across your conversations and proposes concrete fixes.
 - **Tabs:** several conversations side by side.
 - **Handoff:** continue a long conversation in a fresh one without losing your messages or decisions.
 - **Agent orchestration (off by default):** let Claude hand parts of the work to other agents with roles you set.
@@ -157,15 +157,11 @@ When the claude.ai usage limit stops a conversation, LAISORA can resume it autom
 
 ### See where time and tokens went, then get improvements to make next
 
-**Why:** the finished result does not show where the time and tokens went, or where the agent struggled or repeated itself. And numbers alone leave the real question open: so what do I change? LAISORA has a model read the work log for you (the latest part, if the log is long), so you get an answer instead of a log to read.
+**Why:** the finished result does not show where the time and tokens went, or where the agent struggled or repeated itself. And numbers alone leave the real question open: so what do I change? LAISORA counts the failures that keep coming back and hands them to Claude, so you get an answer instead of a log to read.
 
 **First, the numbers.** ANALYSIS shows time by model and in tool calls, time and tokens by role (worker, reviewer, and so on), with each run's executor (the agent or CLI that ran it), model, and effort, failures by kind, and each plan step's figures. Its script analysis runs fixed rules locally: it classifies failures and flags operations that match a rule table of conventions, even when they succeeded. GRAPH shows the same work over time, by subagent.
 
-**Then, what to change.** The **LLM Analysis** tab asks a model to read the work log and propose concrete changes to your workflow, instructions, and settings. Each proposal links back to the records behind it, and you can start a new conversation to act on the ones you agree with. Saved analyses can be reopened after a restart.
-
-An LLM analysis runs only when you start it, with the model and effort selected for the conversation. LAISORA tells you before it runs that it uses tokens. Turn it off with `laisora.workLog.llmAnalysis`. Proposals are model interpretations. LAISORA checks that the records and numbers they cite match the work log, but the overall judgment can still be wrong, so look at the evidence behind a proposal.
-
-<img src="media/screenshots/llm-analysis.png" alt="ANALYSIS on the LLM Analysis tab, with a saved analysis and its first finding, the improvement area, and links to the records behind it" width="734">
+**Then, what to change.** **Start LLM improvement analysis** in a conversation's ☰ menu opens a new conversation, counts the failures that recur across all your local Claude Code conversations, and then has Claude analyse them there and propose changes to your workflow, instructions, and settings. It runs only when you start it, and the conversation uses your plan or API key like any other. Proposals are model interpretations, so look at the records behind them. Hide the menu item with `laisora.improvementAnalysis.showMenuItem`.
 
 ### Delegate work to subagents and other CLIs (agent orchestration)
 
@@ -234,9 +230,9 @@ Changing the permission mode in LAISORA does not rewrite Claude Code's shared de
 
 ### Where data is stored and where it is sent
 
-- **Stored locally:** LAISORA reads Claude Code's local conversation records to show history and the work log, and saves its state, the ToDo, and analysis results in its VS Code extension storage.
+- **Stored locally:** LAISORA reads Claude Code's local conversation records to show history and the work log, and saves its state, the ToDo, and the improvement analysis scan results in its VS Code extension storage.
 - **Computed locally:** the figures in SUMMARY, GRAPH, ANALYSIS, and LOG, and script analysis, without calling a model.
-- **What uses your plan or API key:** chat, LLM analysis, the SUMMARY summary, session-name suggestions, handoff, and Add to ToDo. Each sends the content it needs through Claude Code. The SUMMARY summary and session-name suggestions use a small model, whatever model the conversation uses; session-name suggestions work even when LLM analysis is turned off. What Claude reads from the ToDo, which can include items from other groups, goes only where the conversation already goes.
+- **What uses your plan or API key:** chat, the LLM improvement analysis conversation, the SUMMARY summary, session-name suggestions, handoff, and Add to ToDo. Each sends the content it needs through Claude Code. The SUMMARY summary and session-name suggestions use a small model, whatever model the conversation uses. What Claude reads from the ToDo, which can include items from other groups, goes only where the conversation already goes.
 - **Sent to other CLIs:** with agent orchestration, work handed to Codex or Antigravity goes to those CLIs.
 - **Updates:** to keep the CLIs current, LAISORA runs each CLI's own updater, and before updating Codex it asks OpenAI's release server and GitHub for the latest version number. These requests carry no conversation content. Background updates can be turned off per CLI on the settings page.
 - **Usage statistics:** when VS Code telemetry is off, the Claude Code that LAISORA starts sends no usage statistics, unless you set `DISABLE_TELEMETRY` yourself. A change applies to Claude Code processes started afterwards.
@@ -247,7 +243,7 @@ Your Claude Code settings, hooks, and configured tools affect execution and exte
 
 - **Cannot start a conversation:** run `claude` in a terminal and check that it starts and is signed in. Then see **View → Output → LAISORA**.
 - **No working directory:** open a folder or set `laisora.defaultCwd`. A conversation resumes in the folder where it was started; if the project has moved, move it back to that path or start a new conversation.
-- **Usage limit or analysis failure:** check the reported error and your Claude account. A failed analysis does not mean the conversation had no problems.
+- **Usage limit or analysis failure:** check the reported error and your Claude account. A failed analysis does not mean your conversations had no problems.
 - **An instruction did not take effect immediately:** read the continuing conversation before resending it. Delivery and the model's response are separate steps.
 
 ## How LAISORA came about

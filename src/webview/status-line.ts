@@ -52,6 +52,7 @@ export type StatusLine =
   | { kind: "conductor"; tool: string | null; intentInput?: ToolIntentInput; since: number | null; declared: string | null }
   | { kind: "limit"; at: number }
   | { kind: "delegated"; count: number; since: number | null; declared: string | null }
+  | { kind: "background"; count: number; since: number | null }
   | { kind: "waiting"; count: number }
   | { kind: "none" };
 
@@ -63,14 +64,17 @@ export interface StatusLineInput {
   runningTool: string | null;
   intentInput?: ToolIntentInput;
   runningDelegations: readonly string[];
+  runningBackgroundTasks: readonly (string | undefined)[];
   workModel: WorkModelPayload | undefined;
   openYouCount: number;
+  pendingApprovals: number;
   viewHasYouCount: boolean;
   declared: string | null;
 }
 
-function agentStarts(model: WorkModelPayload | undefined, now: number): Map<string, number> {
+function runStarts(model: WorkModelPayload | undefined, now: number): Map<string, number> {
   const starts = new Map<string, number>();
+  for (const tool of model?.planTools ?? []) if (tool.startedAt > 0) starts.set(tool.id, tool.startedAt);
   for (const agent of flattenAgents(model?.phases ?? [], model?.unlinkedAgents)) {
     const start = agent.status === "running" && agentRunStart(agent) !== undefined ? now - agentElapsedMs(agent, now) : agent.startedAt;
     if (start !== undefined && start > 0) starts.set(agent.toolUseId, start);
@@ -78,28 +82,37 @@ function agentStarts(model: WorkModelPayload | undefined, now: number): Map<stri
   return starts;
 }
 
+function earliestStart(ids: Iterable<string | undefined>, starts: ReadonlyMap<string, number>): number | null {
+  let since: number | null = null;
+  for (const id of ids) {
+    const start = id === undefined ? undefined : starts.get(id);
+    if (start !== undefined && (since === null || start < since)) since = start;
+  }
+  return since;
+}
+
 export function deriveStatusLine(input: StatusLineInput): StatusLine {
+  const waitCount = Math.max(input.openYouCount, input.pendingApprovals);
+  const waiting = waitCount > 0 && !input.viewHasYouCount ? { kind: "waiting" as const, count: waitCount } : undefined;
+  if (waiting && input.pendingApprovals > 0) return waiting;
   if (input.turnState !== "idle") {
     return { kind: "conductor", tool: input.runningTool, ...(input.intentInput ? { intentInput: input.intentInput } : {}), since: input.turnStartedAt, declared: input.declared };
   }
   if (input.autoResumeAt != null && input.now < input.autoResumeAt) {
     return { kind: "limit", at: input.autoResumeAt };
   }
-  const delegates = new Map(input.runningDelegations.map(id => [id, null as number | null]));
-  for (const tool of input.workModel?.planTools ?? []) {
-    if (isExternalRunTool(tool.name)) delegates.set(tool.id, tool.startedAt > 0 ? tool.startedAt : null);
-  }
+  const delegates = new Set(input.runningDelegations);
   if (delegates.size > 0) {
-    const starts = agentStarts(input.workModel, input.now);
-    let since: number | null = null;
-    for (const [id, toolStart] of delegates) {
-      const start = starts.get(id) ?? toolStart;
-      if (start !== null && (since === null || start < since)) since = start;
-    }
-    return { kind: "delegated", count: delegates.size, since, declared: input.declared };
+    return { kind: "delegated", count: delegates.size, since: earliestStart(delegates, runStarts(input.workModel, input.now)), declared: input.declared };
   }
-  if (input.openYouCount > 0 && !input.viewHasYouCount) return { kind: "waiting", count: input.openYouCount };
-  return { kind: "none" };
+  if (input.runningBackgroundTasks.length > 0) {
+    return { kind: "background", count: input.runningBackgroundTasks.length, since: earliestStart(input.runningBackgroundTasks, runStarts(input.workModel, input.now)) };
+  }
+  return waiting ?? { kind: "none" };
+}
+
+export function delegatedRunsText(count: number): string {
+  return count === 1 ? l10n.t("1 delegated run in progress") : l10n.t("{0} delegated runs in progress", count);
 }
 
 export function statusLineText(line: StatusLine): string {
@@ -107,9 +120,11 @@ export function statusLineText(line: StatusLine): string {
     case "conductor":
       return line.tool === null ? l10n.t("Generating") : toolIntentLabel(line.tool, line.intentInput);
     case "delegated":
-      return line.count === 1 ? l10n.t("1 delegated run in progress") : l10n.t("{0} delegated runs in progress", line.count);
+      return delegatedRunsText(line.count);
     case "limit":
       return l10n.t("Waiting for usage limit reset · resumes at {0}", monthDayClock(line.at));
+    case "background":
+      return line.count === 1 ? l10n.t("1 background task running") : l10n.t("{0} background tasks running", line.count);
     case "waiting":
       return l10n.t("Waiting for your decision: {0}", line.count);
     case "none":

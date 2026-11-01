@@ -1,3 +1,4 @@
+import { EXTERNAL_TIMEOUT_SETTING_KEY } from "./orchestration-executors";
 import * as l10n from "@vscode/l10n";
 import * as vscode from "vscode";
 import { randomBytes } from "node:crypto";
@@ -14,9 +15,11 @@ import { TODO_ENABLED_SETTING } from "./todo-store";
 import { disposeTodoSurface, releaseOwnedTodoConversations, syncTodoSurface, toggleTodoDrawer } from "./todo-surface";
 import { EDIT_SUMMARY_SETTING } from "./edit-summary";
 import { TRANSCRIPT_RETENTION_DAYS_KEY } from "./transcript-retention";
+import { CHROME_INTEGRATION_SETTING_KEY } from "./chrome-integration";
 import { REMOTE_CONTROL_CARD_SETTING } from "./remote-control";
+import { IMPROVEMENT_MENU_SETTING } from "./improvement-brief";
 import { GUARD_ENABLED_SETTING, MEMORY_BLOCK_PROJECT_TYPE_SETTING } from "./placement-line";
-import { removeRetiredBaselineCache, removeRetiredLearningStore } from "./retired-storage";
+import { removeRetiredAnalysisResults, removeRetiredBaselineCache, removeRetiredLearningStore } from "./retired-storage";
 import { registerEditDiffProvider } from "./edit-diff-host";
 export { reduceWorkModelSafely, trimEventLog } from "./event-fold";
 export type { EventFoldDraft, FoldEffect, FoldEventResult } from "./event-fold";
@@ -33,22 +36,20 @@ import {
   store,
 } from "./host-context";
 import { initHostL10n } from "./l10n";
-import {
-  llmAnalysisEnabled,
-  llmDiagnosticsAudience,
-  semanticViewEnabled,
-} from "./session-semantic";
 import { SessionStore, tabLimit } from "./store-surfaces";
 export { createStartMeasurement } from "./handoff-wiring";
 import { PROTOCOL_VERSION, isSettingsRevealTarget } from "./protocol";
 import { hostCpuMs, openResumedSession as resumePersistedTab, startLoopLagProbe } from "./resume-hydration";
 import { lookupSessionFile } from "./session-files";
+import { isHandoffForkHidden } from "./handoff-runner";
+import type { Session } from "./session";
 import {
   disposeAccountUsage,
   persistOpenTabs,
   readPersistedOpenTabs,
   releaseAccountUsageWaiter,
   restoreTabsOnStartupEnabled,
+  settleHeldForkTabsAfterSweep,
   sweepHandoffForksAtStartup,
   unfinishedHandoffTabNotice,
   writeHeldChosenTitle,
@@ -124,24 +125,36 @@ async function restorePersistedTabs(st: SessionStore, entries: PersistedOpenTab[
       }),
     });
   }
+  const firstTab = (): Session | undefined => st.sessions.values().next().value;
+  let flushed = false;
+  void settleHeldForkTabsAfterSweep((message) => {
+    const first = flushed ? firstTab() : undefined;
+    if (first) first.pushEvent({ kind: "error", message, fatal: false });
+    else notices.push(message);
+  });
   if (skippedByLimit > 0) {
     notices.push(l10n.t("{0} tab(s) were not restored because the tab limit ({1}) was reached.", skippedByLimit, tabLimit()));
   }
   let restored = 0;
-  for (const item of started) {
-    const opened = await item.outcome;
-    if (opened.handoffFork !== undefined) {
-      notices.push(unfinishedHandoffTabNotice(item.label, opened.handoffFork));
-    } else if (opened.session === undefined) {
-      notices.push(l10n.t("Could not restore the tab \"{0}\" (session {1}).", item.label, item.sessionId));
-    } else {
-      restored++;
+  try {
+    for (const item of started) {
+      const opened = await item.outcome;
+      if (opened.handoffFork !== undefined) {
+        if (!isHandoffForkHidden(opened.handoffFork)) notices.push(unfinishedHandoffTabNotice(item.label, opened.handoffFork));
+      } else if (opened.session === undefined) {
+        notices.push(l10n.t("Could not restore the tab \"{0}\" (session {1}).", item.label, item.sessionId));
+      } else {
+        restored++;
+      }
     }
-  }
-  if (st.sessions.size === 0) st.createSession().welcome = openWelcome();
-  const first = st.sessions.values().next().value;
-  if (first) {
-    for (const message of notices) first.pushEvent({ kind: "error", message, fatal: false });
+  } finally {
+    if (st.sessions.size === 0) st.createSession().welcome = openWelcome();
+    const first = firstTab();
+    if (first) {
+      for (const message of notices) first.pushEvent({ kind: "error", message, fatal: false });
+    }
+    notices.length = 0;
+    flushed = true;
   }
   lagProbe.stop();
   output.appendLine(
@@ -193,6 +206,7 @@ function activateReady(context: vscode.ExtensionContext): void {
   sampleStartupLoopLag(activatedAt);
   void sweepHandoffForksAtStartup();
   void removeRetiredLearningStore(context.globalStorageUri?.fsPath, (line) => output.appendLine(line));
+  void removeRetiredAnalysisResults(context.globalStorageUri?.fsPath, (line) => output.appendLine(line));
   void removeRetiredBaselineCache(context.globalState, (line) => output.appendLine(line));
   setHostTelemetrySource(() => vscode.env.isTelemetryEnabled);
   scheduleCliUpdates(context);
@@ -218,7 +232,7 @@ function activateReady(context: vscode.ExtensionContext): void {
         if (cacheTtlSetting) session.semantic.scheduleSemanticModelPost();
       }
     }
-    if (affectsProductConfiguration(e, "composer.sendKey") || affectsProductConfiguration(e, "appearance") || affectsProductConfiguration(e, "claude.askQualityCheck") || affectsProductConfiguration(e, EDIT_SUMMARY_SETTING) || affectsProductConfiguration(e, REMOTE_CONTROL_CARD_SETTING) || welcomeSettingChanged((key) => affectsProductConfiguration(e, key))) store?.post(userSettingsMessage());
+    if (affectsProductConfiguration(e, "composer.sendKey") || affectsProductConfiguration(e, "appearance") || affectsProductConfiguration(e, "claude.askQualityCheck") || affectsProductConfiguration(e, EDIT_SUMMARY_SETTING) || affectsProductConfiguration(e, REMOTE_CONTROL_CARD_SETTING) || affectsProductConfiguration(e, IMPROVEMENT_MENU_SETTING) || welcomeSettingChanged((key) => affectsProductConfiguration(e, key))) store?.post(userSettingsMessage());
     if (
       affectsProductConfiguration(e, "appearance") ||
       affectsProductConfiguration(e, "composer.sendKey") ||
@@ -227,7 +241,7 @@ function activateReady(context: vscode.ExtensionContext): void {
       affectsProductConfiguration(e, "restoreTabsOnStartup") ||
       affectsProductConfiguration(e, TODO_ENABLED_SETTING) ||
       affectsProductConfiguration(e, EDIT_SUMMARY_SETTING) ||
-      affectsProductConfiguration(e, REMOTE_CONTROL_CARD_SETTING) ||
+      affectsProductConfiguration(e, REMOTE_CONTROL_CARD_SETTING) || affectsProductConfiguration(e, IMPROVEMENT_MENU_SETTING) ||
       welcomeSettingChanged((key) => affectsProductConfiguration(e, key)) ||
       affectsProductConfiguration(e, GUARD_ENABLED_SETTING) ||
       affectsProductConfiguration(e, MEMORY_BLOCK_PROJECT_TYPE_SETTING) ||
@@ -237,6 +251,7 @@ function activateReady(context: vscode.ExtensionContext): void {
       affectsProductConfiguration(e, "claude.settingSources") ||
       affectsProductConfiguration(e, "claude.fileLinkInstruction") ||
       affectsProductConfiguration(e, "claude.planInstruction") ||
+      affectsProductConfiguration(e, CHROME_INTEGRATION_SETTING_KEY) ||
       affectsProductConfiguration(e, "fileLinks.openWithSystemApp") ||
       affectsProductConfiguration(e, "fileLinks.revealInExplorer") ||
       affectsProductConfiguration(e, "fileLinks.allowOutsideWorkspace") ||
@@ -244,31 +259,14 @@ function activateReady(context: vscode.ExtensionContext): void {
       affectsProductConfiguration(e, "fileLinks.openOutsideReadOnly") ||
       affectsProductConfiguration(e, "orchestration.enabled") ||
       affectsProductConfiguration(e, "orchestration.agents") ||
-      affectsProductConfiguration(e, "orchestration.externalTimeoutMinutes") ||
+      affectsProductConfiguration(e, EXTERNAL_TIMEOUT_SETTING_KEY) ||
       affectsProductConfiguration(e, "orchestration.conductorPolicy") ||
       affectsProductConfiguration(e, "handoff")
     ) {
       postSettingsState();
     }
-    const llmAnalysis = affectsProductConfiguration(e, "workLog.llmAnalysis");
-    const semanticView = affectsProductConfiguration(e, "workLog.semanticView");
-    const llmDiagnostics = affectsProductConfiguration(e, "workLog.llmAnalysisDiagnostics");
-    const affects = llmAnalysis || semanticView || llmDiagnostics;
-    if (!affects) return;
+    if (!affectsProductConfiguration(e, "workLog.semanticView")) return;
     if (!store) return;
-    if (llmAnalysis && !llmAnalysisEnabled()) {
-      for (const s of store.sessions.values()) s.abortLlmAnalysisRun();
-    }
-    if (llmAnalysis && !semanticView && !llmDiagnostics && llmDiagnosticsAudience() === "off") {
-      const enabled = llmAnalysisEnabled();
-      store.post({ type: "llmAnalysisSetting", enabled });
-      for (const s of store.sessions.values()) {
-        if (semanticViewEnabled()) {
-          s.semantic.scheduleSemanticModelPost();
-        }
-      }
-      return;
-    }
     store.post({ type: "init", protocolVersion: PROTOCOL_VERSION, tabs: store.snapshotAll(), hostWindows: process.platform === "win32", systemAppExtensions: configuredSystemAppExtensions() });
   });
   if (displayConfigSub) context.subscriptions.push(displayConfigSub);
@@ -511,7 +509,6 @@ async function settleForShutdown(): Promise<void> {
       s.semantic.clearSemanticModelPostTimer();
       s.guardrailRunner.clearGuardrailRefreshTimer();
       s.guardrailRunner.clearGuardrailTickTimer();
-      s.discardLlmAnalysis();
       s.startMeasurement?.abandon();
       clearAutoHandoff(s);
     }
@@ -523,5 +520,3 @@ async function settleForShutdown(): Promise<void> {
   ]);
   setArtifactServer(null);
 }
-
-export { buildFindingSessionPrompt } from "./llm-report";

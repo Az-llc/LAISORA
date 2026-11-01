@@ -22,6 +22,7 @@ export const CLI_USER_INTERRUPTED_TEXTS: readonly string[] = [
 const CLI_SYNTHETIC_EXACT_TEXTS: readonly string[] = [
   ...CLI_USER_INTERRUPTED_TEXTS,
   "[Request interrupted: the session ended before this agent finished. Nobody asked it to stop.]",
+  "[Agent call interrupted: the process running this conversation stopped before this agent finished, so it returned no result. Nobody asked it to stop.]",
   "[Tool call did not complete: the turn was ended to deliver the message that follows. Nothing refused it; re-run it if still needed.]",
   "[Tool call interrupted: the session ended before this call's result was recorded, so its outcome is unknown. Check whether it took effect before relying on it or running it again.]",
   "[Tool call result not in this copy: this session was copied from another session before that session recorded this call's result. The call may have finished there, may still be running there, or may never have run. Check whether it took effect before relying on it or running it again.]",
@@ -66,8 +67,16 @@ export function isNonHumanCommandName(name: string | undefined): boolean {
   return name !== undefined && NON_HUMAN_COMMAND_NAMES.has(name.toLowerCase());
 }
 
+function commandNameOfInput(text: string): string | undefined {
+  return RAW_COMMAND_NAME_RE.exec(text.trim())?.[1];
+}
+
+export function isCommandInput(text: string): boolean {
+  return commandNameOfInput(text) !== undefined;
+}
+
 export function isNonHumanCommandInput(text: string): boolean {
-  return isNonHumanCommandName(RAW_COMMAND_NAME_RE.exec(text.trim())?.[1]);
+  return isNonHumanCommandName(commandNameOfInput(text));
 }
 
 export function joinTextBlocks(content: unknown): string {

@@ -1,6 +1,6 @@
 import * as l10n from "@vscode/l10n";
 import { ROW_H } from "./row-frame";
-import { foregroundExternalCalls, viewTimeProvisional, planConductorRunning, planMemberDelegationCount, planFrame, planLive, planMemberEnd, planNow, planMainIntervals, planWaitSpans, timePartShown, type ShownTimePartKey, planRowIndexAt, planRowPeriod, planRowProvisional, UNMEASURED_LABEL, type PlanFrameMembers, type PlanRowPeriod, type PlanSpan } from "../plan-steps";
+import { foregroundExternalCalls, viewTimeProvisional, planConductorRunning, planMemberDelegationCount, planFrame, planLive, planMemberEnd, planMemberKey, planNow, planMainIntervals, planWaitSpans, timePartShown, type ShownTimePartKey, planRowIndexAt, planRowPeriod, planRowProvisional, UNMEASURED_LABEL, type PlanFrameMembers, type PlanRowPeriod, type PlanSpan } from "../plan-steps";
 import { agentElapsedMs, displayedAncestorUsageGap, subagentDetailUnreadCount, type SemanticModelPayload, type TimeBucketsCoverage, type WorkAgentNode, type WorkModelPayload } from "../protocol";
 import type { AgentSpanView, BackgroundTaskSpanView, ConductorModel, ExternalRunCallView, PlanBlockStepView, RequestBlockView, TimeBucket, TimeBucketInterval, TimeBucketView } from "../time-buckets";
 import type { AgentInspector, InspectorAxis, InspectorTarget } from "./agent-inspector";
@@ -529,7 +529,6 @@ export class WorkGraph {
   private readonly timelineEl: HTMLElement;
   private visible = false;
   private dirty = false;
-  private running = false;
   private lastTickMs: number | undefined;
   private renderCount = 0;
   private rafId: number | undefined;
@@ -683,16 +682,10 @@ export class WorkGraph {
     if (this.visible) this.scheduleRender();
   }
 
-  setRunning(running: boolean): void {
-    if (this.running === running) return;
-    this.running = running;
-    this.dirty = true;
-    if (this.visible) this.scheduleRender();
-  }
-
   tick(nowMs: number): void {
     this.lastTickMs = nowMs;
-    if (!this.visible || !this.running) return;
+    const view = this.activeView();
+    if (!this.visible || view === undefined || !planLive(view)) return;
     this.dirty = true;
     this.scheduleRender();
   }
@@ -704,13 +697,19 @@ export class WorkGraph {
 
   openAgentByWorkAgentId(agentId: string): boolean {
     const agent = this.findWorkAgent(agentId);
-    const item = agent === undefined ? undefined
-      : this.rows.find((r) => r.kind === "item" && (r.members?.agents.some((a) => a.toolUseId === agent.toolUseId)
-        || r.members?.nested?.some((entry) => entry.agent?.toolUseId === agent.toolUseId) || r.members?.unknown?.some((a) => a.toolUseId === agent.toolUseId)));
+    const placed = agent === undefined ? [] : this.rows.filter((r) => r.kind === "item").flatMap((r) =>
+      [...r.members?.agents ?? [], ...(r.members?.nested ?? []).flatMap((entry) => entry.agent ?? []), ...r.members?.unknown ?? []]
+        .filter((member) => member.toolUseId === agent.toolUseId).map((member) => ({ item: r, member })));
+    const target = placed.reduce<(typeof placed)[number] | undefined>((latest, entry) => latest === undefined || entry.member.start > latest.member.start ? entry : latest, undefined);
+    const item = target?.item;
     const nested = item?.members?.nested ?? [];
+    const rowKeyOf = (toolUseId: string): RowKey => {
+      const root = item?.members?.agents.find((a) => a.toolUseId === toolUseId);
+      return `agent:${root === undefined ? toolUseId : planMemberKey(root)}`;
+    };
     const above: RowKey[] = [];
     for (let id = nested.find((entry) => entry.agent?.toolUseId === agent?.toolUseId)?.parentToolUseId; id !== undefined;
-      id = nested.find((entry) => entry.agent?.toolUseId === id)?.parentToolUseId) above.push(`agent:${id}`);
+      id = nested.find((entry) => entry.agent?.toolUseId === id)?.parentToolUseId) above.push(rowKeyOf(id));
     if (item?.members?.unknown?.some((a) => a.toolUseId === agent?.toolUseId)) above.push(`unknown:${item.key}`);
     const keys = item === undefined ? [] : [item.key, ...above].filter((key) => !this.expandedItems.has(key));
     if (keys.length > 0) {
@@ -720,7 +719,9 @@ export class WorkGraph {
       this.dirty = true;
       if (this.visible) this.render();
     }
-    const row = this.rows.find((r) => r.kind === "agent" && r.agent !== undefined && agent !== undefined && r.agent.toolUseId === agent.toolUseId);
+    const targetKey = target === undefined ? undefined : `agent:${planMemberKey(target.member)}`;
+    const row = this.rows.find((r) => r.kind === "agent" && r.agent !== undefined && agent !== undefined
+      && (targetKey === undefined ? r.agent.toolUseId === agent.toolUseId : r.key === targetKey));
     if (row !== undefined) {
       this.openRow(row);
       return true;
@@ -833,7 +834,7 @@ export class WorkGraph {
   }
 
   private windowEnd(view: TimeBucketView): number {
-    return planNow(view, this.lastTickMs, this.running);
+    return planNow(view, this.lastTickMs);
   }
 
   private buildRows(view: TimeBucketView, now = this.windowEnd(view)): GraphRow[] {
@@ -880,7 +881,7 @@ export class WorkGraph {
       for (const entry of nested.slice(range.start, range.start + range.count)) {
         if (entry.parentToolUseId !== toolUseId) continue;
         if (entry.agent !== undefined) {
-          const row: GraphRow = { key: `agent:${entry.agent.toolUseId}`, kind: "agent", agent: entry.agent, parentBlock, parentItem, depth: entry.depth + offset,
+          const row: GraphRow = { key: `agent:${planMemberKey(entry.agent)}`, kind: "agent", agent: entry.agent, parentBlock, parentItem, depth: entry.depth + offset,
             ...below(entry.agent.toolUseId), ...period(entry.agent) };
           rows.push(row);
           pushBelow(entry.agent.toolUseId, row.key, offset);
@@ -890,7 +891,7 @@ export class WorkGraph {
       }
     };
     for (const agent of members.agents) {
-      const key = `agent:${agent.toolUseId}`;
+      const key = `agent:${planMemberKey(agent)}`;
       rows.push({ key, kind: "agent", agent, parentBlock, parentItem, depth: 0, ...below(agent.toolUseId), ...period(agent) });
       pushBelow(agent.toolUseId, key);
     }
@@ -1190,7 +1191,7 @@ export class WorkGraph {
         titled(seg, approx(segTitle(l10n.t("Background only"), s, e), provisional));
         g.appendChild(seg);
       }
-      if (running && shownBucket(tail.main) && !this.hiddenCategories.has(bucketClass(tail.main)) && this.running && end > tailFrom && tailFrom < range.end) {
+      if (running && shownBucket(tail.main) && !this.hiddenCategories.has(bucketClass(tail.main)) && planLive(view) && end > tailFrom && tailFrom < range.end) {
         if (tail.main !== "generate" || view.fidelity === "record") {
           const lastAtVal = tailFrom;
           const extX0 = scale.x(Math.max(lastAtVal, range.start));

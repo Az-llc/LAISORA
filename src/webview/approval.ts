@@ -1,6 +1,7 @@
 import * as l10n from "@vscode/l10n";
 import { renderMarkdownInto } from "./markdown";
-import type { RestoredApprovalCard } from "../protocol";
+import type { NormalizedEvent, RestoredApprovalCard } from "../protocol";
+import { APPROVAL_RESOLVED_BY, type AskUnansweredKind } from "../ask-unanswered";
 import { isDelegationTool } from "../claude-tool-names";
 import { askHeading, askOptionContent } from "./ask-view";
 import { youAnchor } from "./you-items";
@@ -49,14 +50,58 @@ export function buildRestoredApprovalCard(card: RestoredApprovalCard, tabId: str
   }
   const verdict = document.createElement("div");
   verdict.className = "approval-verdict";
-  verdict.textContent = card.resolution === "answered" ? l10n.t("Answered (recorded)")
-    : card.resolution === "allowed" ? l10n.t("✔ Allowed")
-    : card.resolution === "denied" ? l10n.t("✕ Denied")
-    : card.resolution === "withdrawn" ? l10n.t("Withdrawn")
+  const recorded: ApprovalVerdict | undefined = card.resolution === "allowed" ? "allow"
+    : card.resolution === "denied" ? "deny"
+    : card.resolution === "withdrawn" ? "withdrawn"
+    : card.resolution === "unanswered" ? card.unanswered
+    : undefined;
+  const toned = recorded ?? (card.resolution === "answered" ? "allow" : undefined);
+  if (toned !== undefined) {
+    div.classList.add(approvalCardTone(toned));
+    verdict.classList.add(approvalVerdictTone(toned));
+  }
+  verdict.textContent = recorded !== undefined ? approvalVerdictLabel(recorded)
+    : card.resolution === "answered" ? l10n.t("Answered (recorded)")
     : card.resolution === "failed" ? l10n.t("Recorded tool result is an error; approval outcome is unknown")
     : l10n.t("The approval outcome could not be recovered from the transcript");
   div.append(verdict);
   return div;
+}
+
+export function approvalCardTone(verdict: ApprovalVerdict): "approved" | "denied" | "withdrawn" | "unanswered" {
+  const tone = approvalVerdictTone(verdict);
+  return tone === "allow" ? "approved" : tone === "deny" ? "denied" : tone;
+}
+
+export type ApprovalVerdict = "allow" | "deny" | "withdrawn" | AskUnansweredKind;
+
+export function approvalVerdict(ev: Pick<Extract<NormalizedEvent, { kind: "approval_resolved" }>, "behavior" | "resolvedBy" | "unanswered">): ApprovalVerdict {
+  if (ev.behavior === "withdrawn" || ev.resolvedBy === APPROVAL_RESOLVED_BY.withdrawn) return "withdrawn";
+  return ev.unanswered ?? ev.behavior;
+}
+
+export function approvalVerdictTone(verdict: ApprovalVerdict): "allow" | "deny" | "withdrawn" | "unanswered" {
+  return verdict === "allow" || verdict === "deny" || verdict === "withdrawn" ? verdict : "unanswered";
+}
+
+export function approvalVerdictLabel(verdict: ApprovalVerdict): string {
+  switch (verdict) {
+    case "allow": return l10n.t("✔ Allowed");
+    case "deny": return l10n.t("✕ Denied");
+    case "withdrawn": return l10n.t("Withdrawn");
+    case "skipped": return l10n.t("Question skipped");
+    case "replied_in_chat": return l10n.t("Question answered in chat");
+    case "dismissed": return l10n.t("Question closed without an answer");
+  }
+}
+
+export function approvalRefSuffix(verdict: ApprovalVerdict): string {
+  switch (verdict) {
+    case "allow": return l10n.t(" (Allowed)");
+    case "deny": return l10n.t(" (Denied)");
+    case "withdrawn": return l10n.t(" (Withdrawn)");
+    default: return l10n.t(" ({0})", approvalVerdictLabel(verdict));
+  }
 }
 
 function approvalField(label: string, value: string, mono = false): HTMLElement {

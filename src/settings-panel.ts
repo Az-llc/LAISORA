@@ -18,6 +18,7 @@ import {
   writeTodoEnabled,
   writeEditSummaryEnabled,
   writeRemoteControlCard,
+  writeImprovementMenu,
   writeWelcomeSetting,
   writeHandoffAutoSetting,
   writeCliAutoUpdate,
@@ -144,6 +145,9 @@ export async function handleSettingsPageMessage(webview: vscode.Webview, raw: un
       break;
     case "setRemoteControlCard":
       writeFailure = await writeRemoteControlCard(raw.enabled);
+      break;
+    case "setImprovementMenu":
+      writeFailure = await writeImprovementMenu(raw.enabled);
       break;
     case "setWelcomeSetting":
       writeFailure = await writeWelcomeSetting(raw.setting, raw.enabled);

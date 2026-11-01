@@ -8,8 +8,8 @@ import { onTodoAsksClosedInTodo, todoAsksClosedInTodo } from "./todo-asks";
 import { addTodoToolCall, isTodoWriteTool, renderTodoHead, setTodoToolCardResult, todoToolCard } from "./todo-chat";
 import { renderTodoCrumbs, todoAgentLabel, todoAgentText, todoLinkHub, todoTabMarks } from "./todo-links";
 import { PlanPanel } from "./plan-panel";
-import { agentElapsedMs, applyFallbackModel, fallbackNoticeOriginal, fallbackNoticeOutcome, flattenAgents, foldModelFallback, isHistoryEvent, resolveFallbackByChoice } from "../protocol";
-import type { ModelFallbackState, WelcomeTab, WorkAgentNode } from "../protocol";
+import { agentElapsedMs, applyFallbackModel, fallbackNoticeOriginal, fallbackNoticeOutcome, flattenAgents, foldModelFallback, isHistoryEvent, resolveFallbackByChoice, workEndStatus } from "../protocol";
+import type { ModelFallbackState, WelcomeTab, WorkAgentNode, WorkEndStatus } from "../protocol";
 import { YouList } from "./you-list";
 import { bindUserLabel, onUserLabelChange } from "./user-label";
 import type { YouItem } from "./you-items";
@@ -42,7 +42,7 @@ import type { HandoffCompactStats, HandoffContextUsage, HandoffDecisionEntry } f
 import * as l10n from "@vscode/l10n";
 import { inputEl, logsEl, tabbarEl, usagePanelEl, sessionActionsEl, vscode } from "./dom";
 import { closeGlyphButton } from "./close-button";
-import { buildApprovalBody, buildRestoredApprovalCard } from "./approval";
+import { approvalCardTone, approvalRefSuffix, approvalVerdict, approvalVerdictLabel, approvalVerdictTone, buildApprovalBody, buildRestoredApprovalCard } from "./approval";
 import { clock, clockRange, formatDuration, monthDayClock, toolSummary } from "./format";
 import { uiLocale } from "./l10n";
 import { formatHandoffTime, formatHandoffTokens } from "../handoff-format";
@@ -56,13 +56,13 @@ import { createYouItems, encodeAskDismissal, encodeAskResolution, youAnchor, typ
 import { findCommitBoundary, joinRecordTexts, prependRecordParts, recordSeparator, withoutRetracted, type RecordTextPart } from "../commit-boundary";
 import { breaksParagraph, cardHome, compareTurnOrder, editSummaryPlace, labelPendingParts, legacyAskKeys, locateInParts, mergedParagraph, paragraphKey, paragraphText, prependTurnLayout, turnLabelModel, type ModelMark, type TurnItem, type TurnOrder, type TurnParagraph } from "./turn-layout";
 import { isConvMessageEvent, isConvRenderableEvent, permissionDeniedTarget } from "../conv-renderable";
-import { isFailedToolResult } from "../tool-result-signals";
+import { isFailedToolResult, taskNotificationOutcome } from "../tool-result-signals";
 import { MARKS } from "./marks";
 import {
   applyActivityEvent,
   backgroundActivityFromSnapshot,
   createBackgroundActivityState,
-  hasRunningDelegation,
+  conversationWorking,
   liveBackgroundTasks,
   notePastLifecycle,
   runningDelegationIds,
@@ -596,13 +596,18 @@ interface WorkRowData {
   childIds?: string[];
 }
 
-const AGENT_STATUS_WORD: Record<WorkAgentStateView["status"], string> = {
+const AGENT_STATUS_WORD: Record<WorkEndStatus, string> = {
   running: l10n.t("Running"),
   completed: l10n.t("Completed"),
   failed: l10n.t("Failed"),
   stale: l10n.t("Tracking stopped"),
+  stopped: l10n.t("Stopped"),
   unknown: l10n.t("Unknown"),
 };
+
+function notifiedStaleText(status: string | undefined): string {
+  return taskNotificationOutcome(status) === "stopped" ? l10n.t("Stopped") : l10n.t("Tracking stopped (completion could not be confirmed)");
+}
 
 function permissionDeniedText(ev: { toolName: string; reason: string; classifierUnavailable?: boolean }): string {
   if (ev.classifierUnavailable) return l10n.t("Could not evaluate: {0} — safety classifier unavailable", ev.toolName);
@@ -1231,14 +1236,23 @@ export class Tab {
     this.unreadEl.title = l10n.t("Replies finished while you were away: {0}", this.unreadReplies);
   }
 
-  private runningAgentCount(): number {
-    return [...this.agentStates.values()].filter(state => state.status === "running").length;
-  }
 
   rightRail(): HTMLElement | null {
     const rail = this.planPanel.aside;
     if (!rail.isConnected || !rail.parentElement?.classList.contains("plan-chat") || getComputedStyle(rail).display === "none") return null;
     return rail.getBoundingClientRect().width > 0 ? rail : null;
+  }
+
+  private paintedRunningAgents: number | undefined;
+
+  private paintTodoMarks(): void {
+    const runningAgents = runningDelegationIds(this.activity).length;
+    this.paintedRunningAgents = runningAgents;
+    const marks = todoTabMarks(this.tabId, this.title, { runningAgents });
+    this.todoTabDotEl.hidden = !marks?.color;
+    if (marks?.color) this.todoTabDotEl.style.setProperty("--todo-gc", marks.color);
+    this.todoChildEl.hidden = !marks?.child;
+    this.paintTabTooltip(marks?.tooltip ?? this.title);
   }
 
   private paintTabTooltip(text: string): void {
@@ -1249,11 +1263,7 @@ export class Tab {
   refreshTodo(): void {
     if (this.tabBtn === undefined) return;
     this.planPanel.refreshTodo();
-    const marks = todoTabMarks(this.tabId, this.title, { runningAgents: this.runningAgentCount() });
-    this.todoTabDotEl.hidden = !marks?.color;
-    if (marks?.color) this.todoTabDotEl.style.setProperty("--todo-gc", marks.color);
-    this.todoChildEl.hidden = !marks?.child;
-    this.paintTabTooltip(marks?.tooltip ?? this.title);
+    this.paintTodoMarks();
     renderTodoCrumbs(this.todoCrumbsEl, this.tabId);
     if (!this.todoHeadEl.isConnected) this.convEl.insertBefore(this.todoHeadEl, this.convEl.firstChild);
     renderTodoHead(this.todoHeadEl, this.tabId);
@@ -2753,8 +2763,10 @@ export class Tab {
       runningTool: runningTool?.name ?? null,
       intentInput: runningTool?.intentInput,
       runningDelegations: runningDelegationIds(this.activity),
+      runningBackgroundTasks: liveBackgroundTasks(this.activity).map(task => this.bgTaskIdToToolUseId.get(task.id)),
       workModel: this.workModel,
       openYouCount: this.openYouCount,
+      pendingApprovals: this.pendingApprovalCount,
       viewHasYouCount: this.viewMode === "conv" || this.workView === "summary",
       declared: this.taskItems.find(item => item.status === "in_progress")?.activeForm ?? null,
     });
@@ -2765,18 +2777,13 @@ export class Tab {
     this.stripTextEl.title = label;
     this.planPanel.setStatus(truncateToolIntent(label));
     this.stripNoteEl.textContent = line.kind === "conductor" || line.kind === "delegated" ? line.declared ?? "" : "";
-    this.stripSince = line.kind === "conductor" || line.kind === "delegated" ? line.since : null;
+    this.stripSince = line.kind === "conductor" || line.kind === "delegated" || line.kind === "background" ? line.since : null;
     this.updateStripElapsed();
     this.syncHeadLayout();
   }
 
   private isTabActive(): boolean {
-    return (
-      this.turnState !== "idle" ||
-      liveBackgroundTasks(this.activity).length > 0 ||
-      hasRunningDelegation(this.activity) ||
-      this.runningChildTools.size > 0
-    );
+    return conversationWorking(this.turnState !== "idle", this.activity);
   }
 
   replaceBackgroundActivity(snap: BackgroundActivitySnapshot | undefined): void {
@@ -2786,6 +2793,7 @@ export class Tab {
   }
 
   private syncTabDot(): void {
+    if (this.paintedRunningAgents !== undefined && this.paintedRunningAgents !== runningDelegationIds(this.activity).length) this.paintTodoMarks();
     const active = this.isTabActive();
     this.tabBtn.classList.toggle("running", active);
     if (this.notifiedActive !== active) {
@@ -3436,7 +3444,7 @@ export class Tab {
     if (state.status !== "running") entry.statusEl.textContent = state.status === "failed" ? "✗" : state.status === "completed" ? "✓" : TOOL_STATUS_GLYPH.stale;
     const elapsed = agentElapsedMs(state, Date.now());
     entry.metaEl.textContent = l10n.t("{0} calls · {1}", state.childCount, formatDuration(elapsed));
-    entry.metaEl.title = AGENT_STATUS_WORD[state.status];
+    entry.metaEl.title = AGENT_STATUS_WORD[workEndStatus(state)];
     if (state.modelMeasured) {
       setRowChip(data, "model", state.modelMeasured);
       fillChips(entry.chipsEl, data, this.models);
@@ -4148,8 +4156,7 @@ export class Tab {
       }
       if (repeated) setTextIfChanged(repeated, totals && totals.turnIds.length > 1 ? l10n.t("Same command {0} times", totals.turnIds.length) : "");
       const startedAt = Number(anchor.dataset.startedAt);
-      const current = this.currentTurnId;
-      const running = current !== null && request.turns.has(current) && !this.logTurnEnds.has(current) && this.turnState !== "idle";
+      const running = id === this.logLatestRequest && this.workModel?.requestOpen === true;
       let end = running ? undefined : this.logTurnEnds.get(id);
       if (!running) {
         for (const turn of request.turns) {
@@ -4533,7 +4540,7 @@ export class Tab {
     this.runningChildTools.clear();
     this.runningMainTools.clear();
     this.stripStartedAt = null;
-    this.addBlock("system", l10n.t("Conversation ended: {0}", ev.reason));
+    if (ev.stopped !== true) this.addBlock("system", l10n.t("Conversation ended: {0}", ev.reason));
     this.setTurnState("idle");
     this.updateStrip();
   }
@@ -5217,6 +5224,10 @@ export class Tab {
 
   applyWorkModel(model: WorkModelPayload | undefined): void {
     this.planPanel.setModel(model);
+    if (model?.requestOpen !== this.workModel?.requestOpen && this.logLatestRequest !== undefined) {
+      this.logDirty.add(this.logLatestRequest);
+      this.scheduleLogRefresh();
+    }
     this.workModel = model;
     this.applyLogModel(model);
     if (model?.runningMainTools !== undefined) {
@@ -5355,7 +5366,7 @@ export class Tab {
       if (data) {
         data.status = finalStatus;
         data.statusGlyph = finalGlyph;
-        data.metaText = finalStatus === "stale" ? l10n.t("Tracking stopped (completion could not be confirmed)") : undefined;
+        data.metaText = finalStatus === "stale" ? notifiedStaleText(notifStatus) : undefined;
         if (ev.resultPreview) data.resultPreview = ev.resultPreview;
         if (data.kind === "tool" && startedAt !== undefined) {
           data.elapsedLabel = formatDuration(elapsedMs);
@@ -5396,7 +5407,7 @@ export class Tab {
               if (elapsed) rowSummary.insertBefore(metaEl, elapsed);
               else rowSummary.appendChild(metaEl);
             }
-            metaEl.textContent = l10n.t("Tracking stopped (completion could not be confirmed)");
+            metaEl.textContent = notifiedStaleText(notifStatus);
           } else if (metaEl) {
             metaEl.remove();
           }
@@ -5723,16 +5734,16 @@ export class Tab {
     if (el) {
       el.querySelectorAll("button").forEach((b) => ((b as HTMLButtonElement).disabled = true));
       el.querySelectorAll("input").forEach((i) => ((i as HTMLInputElement).disabled = true));
-      const withdrawn = ev.behavior === "withdrawn" || ev.resolvedBy === "withdrawn";
-      el.classList.add(withdrawn ? "withdrawn" : ev.behavior === "allow" ? "approved" : "denied");
+      const verdict = approvalVerdict(ev);
+      const tone = approvalVerdictTone(verdict);
+      el.classList.add(approvalCardTone(verdict));
       const det = el.querySelector<HTMLDetailsElement>("details.approval-det");
       const titleEl = det?.querySelector<HTMLElement>("summary.approval-title");
       if (titleEl && !titleEl.querySelector(".approval-verdict")) {
-        const verdict = document.createElement("span");
-        verdict.className = `approval-verdict ${withdrawn ? "withdrawn" : ev.behavior}`;
-        verdict.textContent = withdrawn ? l10n.t("Withdrawn")
-          : ev.behavior === "allow" ? l10n.t("✔ Allowed") : l10n.t("✕ Denied");
-        titleEl.appendChild(verdict);
+        const verdictEl = document.createElement("span");
+        verdictEl.className = `approval-verdict ${tone}`;
+        verdictEl.textContent = approvalVerdictLabel(verdict);
+        titleEl.appendChild(verdictEl);
       }
       if (det) det.open = false;
       if (ev.answers && Object.keys(ev.answers).length > 0 && !el.querySelector(".askq-answers-summary")) {
@@ -6616,12 +6627,9 @@ export class Tab {
   ): boolean {
     const refRow = this.approvalRefs.get(ev.requestId);
     if (!refRow || refRow.classList.contains("resolved")) return false;
-    const withdrawn = ev.behavior === "withdrawn" || ev.resolvedBy === "withdrawn";
-    refRow.classList.add("resolved", withdrawn ? "withdrawn" : ev.behavior);
-    refRow.textContent =
-      (refRow.textContent?.replace(APPROVAL_REF_SUFFIX, "") ?? "") +
-      (withdrawn ? l10n.t(" (Withdrawn)")
-        : ev.behavior === "allow" ? l10n.t(" (Allowed)") : l10n.t(" (Denied)"));
+    const verdict = approvalVerdict(ev);
+    refRow.classList.add("resolved", approvalVerdictTone(verdict));
+    refRow.textContent = (refRow.textContent?.replace(APPROVAL_REF_SUFFIX, "") ?? "") + approvalRefSuffix(verdict);
     return true;
   }
 

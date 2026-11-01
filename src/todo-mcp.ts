@@ -91,7 +91,8 @@ export function todoLinkedInstruction(item: TodoLinkedItem): string {
 
 const id = z.string().min(1).describe("Item id as shown by list.");
 const title = z.string().min(1).max(TODO_TITLE_MAX);
-const memoText = z.string().max(TODO_MEMO_TEXT_MAX, `A work memo section holds at most ${TODO_MEMO_TEXT_MAX} characters; keep the memo to what the next conversation needs.`);
+const memoPlainText = z.string().max(TODO_MEMO_TEXT_MAX, `A work memo section holds at most ${TODO_MEMO_TEXT_MAX} characters; keep the memo to what the next conversation needs.`);
+const memoText = z.union([memoPlainText, z.object({ text: memoPlainText })]);
 const due = z.string().regex(TODO_DUE_PATTERN).describe("Due date, YYYY-MM-DD.");
 const group = z.string().min(1).max(TODO_GROUP_MAX).describe("Name of an existing group (the case); sub-items follow the group of their top-level item.");
 const newGroup = z.literal(true).describe("Create the group named in group because the request names a case that matches no existing group. A name close to an existing group is refused even with this.");
@@ -363,6 +364,20 @@ export function addInputWithSharedFields(input: Record<string, unknown>): Record
     .map(field => [field, input[field]])) })) };
 }
 
+export function addInputWithoutRepeatedTitle(input: Record<string, unknown>): Record<string, unknown> {
+  const first = Array.isArray(input.items) ? (input.items[0] as { readonly title?: unknown } | undefined) : undefined;
+  if (typeof input.title !== "string" || typeof first?.title !== "string" || first.title.trim() !== input.title.trim()) return input;
+  return Object.fromEntries(Object.entries(input).filter(([field]) => field !== "title"));
+}
+
+const memoPlain = (value: unknown): unknown => value !== null && typeof value === "object" && typeof (value as { text?: unknown }).text === "string" ? (value as { text: string }).text : value;
+
+export function memoInputWithPlainText(input: Record<string, unknown>): Record<string, unknown> {
+  const sections = input.sections as Record<string, unknown> | undefined;
+  return { ...input, ...(input.text !== undefined ? { text: memoPlain(input.text) } : {}),
+    ...(sections !== undefined && sections !== null && typeof sections === "object" ? { sections: Object.fromEntries(Object.entries(sections).map(([section, text]) => [section, memoPlain(text)])) } : {}) };
+}
+
 function addInputError(input: Record<string, unknown>): string | undefined {
   const items = input.items as readonly AddInput[] | undefined;
   if (items === undefined) return input.title === undefined ? "Give title for one item, or items for several." : undefined;
@@ -583,7 +598,7 @@ export function createTodoMcpServer(sdk: Pick<typeof Sdk, "createSdkMcpServer" |
     TODO_INPUTS[kind] as Record<string, z.ZodType>,
     async (given: Record<string, unknown>, extra: unknown) => run(async () => {
       if (kind !== "list" && !gate.consume(extra)) return reply(todoFailureResultText("root-only", TODO_ROOT_ONLY), true);
-      const input = kind === "add" ? addInputWithSharedFields(given) : given;
+      const input = kind === "add" ? addInputWithSharedFields(addInputWithoutRepeatedTitle(given)) : kind === "write_memo" ? memoInputWithPlainText(given) : given;
       const invalid = inputError(kind, input);
       if (invalid !== undefined) return reply(todoFailureResultText("input", invalid), true);
       if (kind !== "list") {

@@ -547,7 +547,7 @@ eventLimitInput.max = String(EVENT_LIMIT_MAX);
 eventLimitInput.step = "1";
 eventLimitInput.required = true;
 eventLimitInput.disabled = true;
-const eventLimitText = row(chatCard, l10n.t("Events kept per conversation"), l10n.t("The official Claude Code VS Code extension keeps about 600 chat rows. LAISORA keeps more because SUMMARY, ANALYSIS and LLM analysis read the log. Higher values use more memory and make long conversations slower. Events older than the limit drop out of the live log."), eventLimitInput);
+const eventLimitText = row(chatCard, l10n.t("Events kept per conversation"), l10n.t("The official Claude Code VS Code extension keeps about 600 chat rows. LAISORA keeps more because SUMMARY and ANALYSIS read the log. Higher values use more memory and make long conversations slower. Events older than the limit drop out of the live log."), eventLimitInput);
 let pendingEventLimit: number | null = null;
 eventLimitInput.addEventListener("change", () => {
   const value = eventLimitInput.valueAsNumber;
@@ -588,10 +588,14 @@ retentionDaysInput.addEventListener("change", () => {
 
 const autoContinueSwitch = switchButton("setting-auto-continue-usage-limit");
 row(chatCard, l10n.t("Resume automatically when the usage limit resets"), l10n.t("When the claude.ai usage limit stops a conversation, continue it automatically after the limit resets. The same setting is used by Claude Code in the terminal."), autoContinueSwitch);
+const chromeIntegrationSwitch = switchButton("setting-chrome-integration");
+row(chatCard, l10n.t("Use Claude in Chrome"), l10n.t("Let Claude use the Claude in Chrome extension, which acts in your Chrome. Needs the extension installed and connected. Applies to conversations started or resumed afterwards; running conversations are not changed."), chromeIntegrationSwitch);
 const editSummarySwitch = switchButton("setting-edit-summary-enabled");
 const editSummaryText = row(chatCard, l10n.t("Show edited files after each reply"), l10n.t("At the end of each reply, list the files Claude edited in that turn with the lines added and removed. Click a file to compare it before and after the turn."), editSummarySwitch);
 const remoteControlCardSwitch = switchButton("setting-remote-control-card");
 const remoteControlCardText = row(chatCard, l10n.t("Show the Remote Control card"), l10n.t("When Remote Control turns on for a conversation, show a card in the conversation with the claude.ai link, the connection state and when the session is reachable. The card also shows when Remote Control turns off."), remoteControlCardSwitch);
+const improvementMenuSwitch = switchButton("setting-improvement-menu");
+const improvementMenuText = row(chatCard, l10n.t("Show “Start LLM improvement analysis” in the ☰ menu"), l10n.t("The item in each conversation's ☰ menu that counts recurring failures across all local Claude Code conversations and starts a new conversation where Claude analyses them."), improvementMenuSwitch);
 const welcomeSwitches: Record<WelcomeSetting, HTMLButtonElement> = {
   showNews: switchButton("setting-welcome-show-news"),
   showTips: switchButton("setting-welcome-show-tips"),
@@ -649,6 +653,7 @@ const fileLinkCard = section(fileCategory, l10n.t("File links"));
 const fileLinkSwitches: Record<FileLinkBooleanSetting, HTMLButtonElement> = {
   fileLinkInstruction: switchButton("setting-file-link-instruction"),
   planInstruction: switchButton("setting-plan-instruction"),
+  chromeIntegration: chromeIntegrationSwitch,
   revealInExplorer: switchButton("setting-file-link-reveal-in-explorer"),
   allowOutsideWorkspace: switchButton("setting-file-link-allow-outside"),
   confirmOutsideWorkspace: switchButton("setting-file-link-confirm-outside"),
@@ -1393,11 +1398,12 @@ generalCategory.appendChild(footer);
 let current: SettingsState | null = null;
 let requestSerial = 0;
 const nextRequestId = (): number => ++requestSerial;
-const pending: { autoContinue: number | null; restore: number | null; apiKey: number | null; guard: number | null; memoryBlockProjectType: number | null; todo: number | null; editSummary: number | null; remoteControlCard: number | null } = { autoContinue: null, restore: null, apiKey: null, guard: null, memoryBlockProjectType: null, todo: null, editSummary: null, remoteControlCard: null };
+const pending: { autoContinue: number | null; restore: number | null; apiKey: number | null; guard: number | null; memoryBlockProjectType: number | null; todo: number | null; editSummary: number | null; remoteControlCard: number | null; improvementMenu: number | null } = { autoContinue: null, restore: null, apiKey: null, guard: null, memoryBlockProjectType: null, todo: null, editSummary: null, remoteControlCard: null, improvementMenu: null };
 const pendingAutoUpdate = new Map<ExecutorId, number>();
 const pendingFileLink: Record<FileLinkBooleanSetting, number | null> = {
   fileLinkInstruction: null,
   planInstruction: null,
+  chromeIntegration: null,
   revealInExplorer: null,
   allowOutsideWorkspace: null,
   confirmOutsideWorkspace: null,
@@ -1428,6 +1434,7 @@ function writeAnchor(message: SettingsPageToHost): HTMLElement | undefined {
     case "setTodoEnabled": return todoText;
     case "setEditSummaryEnabled": return editSummaryText;
     case "setRemoteControlCard": return remoteControlCardText;
+    case "setImprovementMenu": return improvementMenuText;
     case "setWelcomeSetting": return welcomeTexts[message.setting];
     case "setHandoffAutoSetting": return handoffAutoTexts[message.setting];
     case "setApiKeyPolicy": return apiKeyText;
@@ -1519,6 +1526,9 @@ function render(state: SettingsState): void {
   if (pending.remoteControlCard === state.replyTo) pending.remoteControlCard = null;
   remoteControlCardSwitch.setAttribute("aria-checked", String(state.remoteControlCard));
   remoteControlCardSwitch.disabled = pending.remoteControlCard !== null;
+  if (pending.improvementMenu === state.replyTo) pending.improvementMenu = null;
+  improvementMenuSwitch.setAttribute("aria-checked", String(state.improvementMenu));
+  improvementMenuSwitch.disabled = pending.improvementMenu !== null;
   renderWelcomeSettings(state);
   renderHandoffAuto(state);
   if (pending.restore === state.replyTo) pending.restore = null;
@@ -1529,6 +1539,7 @@ function render(state: SettingsState): void {
   }
   fileLinkSwitches.fileLinkInstruction.disabled = false;
   fileLinkSwitches.planInstruction.disabled = false;
+  fileLinkSwitches.chromeIntegration.disabled = false;
   fileLinkSwitches.revealInExplorer.disabled = false;
   fileLinkSwitches.allowOutsideWorkspace.disabled = false;
   for (const child of outsideChildren) {
@@ -1632,6 +1643,13 @@ remoteControlCardSwitch.addEventListener("click", () => {
   pending.remoteControlCard = requestId;
   remoteControlCardSwitch.disabled = true;
   post({ type: "setRemoteControlCard", requestId, enabled: !current.remoteControlCard });
+});
+improvementMenuSwitch.addEventListener("click", () => {
+  if (current === null || pending.improvementMenu !== null) return;
+  const requestId = nextRequestId();
+  pending.improvementMenu = requestId;
+  improvementMenuSwitch.disabled = true;
+  post({ type: "setImprovementMenu", requestId, enabled: !current.improvementMenu });
 });
 for (const key of FILE_LINK_BOOLEAN_SETTINGS) {
   const control = fileLinkSwitches[key];

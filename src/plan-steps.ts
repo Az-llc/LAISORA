@@ -1,7 +1,7 @@
 import * as l10n from "@vscode/l10n";
 import type { TaskStatus } from "./work-model";
 import type { PlanContext } from "./protocol";
-import type { AgentSpanView, BackgroundTaskSpanView, ConductorModel, ExternalRunCallView, MainModelSpan, PlanBlockStepView, RequestBlockView, TimeBucketInterval, TimeBucketView } from "./time-buckets";
+import type { AgentSpanView, BackgroundTaskSpanView, ConductorModel, ExternalRunCallView, MainModelSpan, PlanBlockStepView, RequestBlockView, RunMeasure, RunPlacement, TimeBucketInterval, TimeBucketView } from "./time-buckets";
 import { measureSpans, memberRunTimes, runSpans, subtractSpans, unionSpans, type Span } from "./spans";
 import { delegationCount } from "./claude-tool-names";
 
@@ -22,6 +22,44 @@ export function foregroundExternalCalls(view: Pick<TimeBucketView, "externalRunC
   return (view.externalRunCalls ?? []).filter(call => !backgrounded.has(call.toolUseId));
 }
 
+export function planRunPlacementAt(member: { runPlacements?: readonly RunPlacement[] }, at: number): RunPlacement | undefined {
+  return member.runPlacements?.filter(placement => placement.from <= at).at(-1);
+}
+
+export function planMemberPlacementAt(member: { blockId?: string; stepKey?: string; runPlacements?: readonly RunPlacement[] }, at: number): { blockId?: string; stepKey?: string } {
+  const placed = planRunPlacementAt(member, at) ?? member;
+  return { ...(placed.blockId === undefined ? {} : { blockId: placed.blockId }), ...(placed.stepKey === undefined ? {} : { stepKey: placed.stepKey }) };
+}
+
+export const planMemberKey = (member: { toolUseId: string; runSliceKey?: string }): string =>
+  member.runSliceKey === undefined ? member.toolUseId : `${member.toolUseId}@${member.runSliceKey}`;
+
+export function planMemberSlices<T extends AgentSpanView>(member: T): T[] {
+  if (member.runPlacements === undefined) return [member];
+  const runs = runSpans(memberRunTimes(member));
+  const measured = member.runMeasures?.length === runs.length ? member.runMeasures : undefined;
+  const groups = new Map<string, { key: string; launch: boolean; place: { blockId?: string; stepKey?: string }; runs: Span[]; current: boolean; measures: RunMeasure }>();
+  runs.forEach((run, index) => {
+    const place = planMemberPlacementAt(member, run[0]);
+    const key = JSON.stringify([place.blockId ?? null, place.stepKey ?? null]);
+    const group = groups.get(key) ?? { key, launch: index === 0, place, runs: [], current: false, measures: { toolCount: 0, failCount: 0, toolMs: 0, generateMs: 0 } };
+    group.runs.push(run);
+    group.current ||= index === runs.length - 1;
+    const own: RunMeasure = measured?.[index] ?? (index === runs.length - 1 ? member : { toolCount: 0, failCount: 0, toolMs: 0, generateMs: 0 });
+    group.measures = { toolCount: group.measures.toolCount + own.toolCount, failCount: group.measures.failCount + own.failCount,
+      toolMs: group.measures.toolMs + own.toolMs, generateMs: group.measures.generateMs + own.generateMs };
+    groups.set(key, group);
+  });
+  if (groups.size === 1) return [member];
+  return [...groups.values()].map(group => {
+    const { runMeasures: _measures, blockId: _blockId, stepKey: _stepKey, earlierRuns: _earlierRuns, resumedAt: _resumedAt, runSliceKey: _sliceKey, ...rest } = member;
+    const last = group.runs.at(-1)!;
+    return { ...rest, ...group.place, ...group.measures, start: group.runs[0][0], end: last[1], open: member.open && group.current,
+      ...(group.runs.length > 1 ? { earlierRuns: group.runs.slice(0, -1), resumedAt: last[0] } : {}),
+      ...(group.launch ? {} : { runSliceKey: group.key }) } as T;
+  });
+}
+
 export function planNestedMembers(view: Pick<TimeBucketView, "nestedAgents" | "nestedExternalRuns">):
   (roots: readonly AgentSpanView[]) => { nested: PlanNestedMember[]; nestedRanges: Map<string, PlanNestedRange> } {
   const children = new Map<string, { agent?: AgentSpanView; extRun?: ExternalRunCallView; start: number }[]>();
@@ -34,18 +72,20 @@ export function planNestedMembers(view: Pick<TimeBucketView, "nestedAgents" | "n
   return roots => {
     const nested: PlanNestedMember[] = [];
     const nestedRanges = new Map<string, PlanNestedRange>();
-    const visit = (parentToolUseId: string, depth: number): void => {
+    const visit = (parentToolUseId: string, depth: number, slice?: { blockId?: string; stepKey?: string }): void => {
       if (nestedRanges.has(parentToolUseId)) return;
       const range = { start: nested.length, count: 0 };
       nestedRanges.set(parentToolUseId, range);
       for (const child of children.get(parentToolUseId) ?? []) {
+        const placed = child.agent ?? child.extRun!;
+        if (slice !== undefined && (placed.blockId !== slice.blockId || placed.stepKey !== slice.stepKey)) continue;
         nested.push({ ...(child.agent ? { agent: child.agent } : { extRun: child.extRun }), parentToolUseId, depth });
         if (child.agent) visit(child.agent.toolUseId, depth + 1);
       }
       range.count = nested.length - range.start;
       if (range.count === 0) nestedRanges.delete(parentToolUseId);
     };
-    for (const root of roots) visit(root.toolUseId, 1);
+    for (const root of roots) visit(root.toolUseId, 1, root.runPlacements === undefined ? undefined : root);
     return { nested, nestedRanges };
   };
 }
@@ -202,13 +242,14 @@ export function planFrame(view: Pick<TimeBucketView, "blocks" | "agents" | "back
   const rows: PlanFrameRow[] = [];
   const placed = new Set<string>();
   const nestedUnder = planNestedMembers(view);
+  const sliced = (view.agents ?? []).flatMap(planMemberSlices);
   const take = (pick: (owner: { blockId?: string; stepKey?: string }) => boolean): PlanFrameMembers => {
-    const fresh = <T extends { toolUseId: string; blockId?: string; stepKey?: string }>(members: readonly T[] | undefined): T[] => {
-      const taken = (members ?? []).filter(member => !placed.has(member.toolUseId) && pick(member));
-      for (const member of taken) placed.add(member.toolUseId);
+    const fresh = <T extends { toolUseId: string; blockId?: string; stepKey?: string; runSliceKey?: string }>(members: readonly T[] | undefined): T[] => {
+      const taken = (members ?? []).filter(member => !placed.has(planMemberKey(member)) && pick(member));
+      for (const member of taken) placed.add(planMemberKey(member));
       return taken;
     };
-    const agents = fresh(view.agents);
+    const agents = fresh(sliced);
     const bgTasks = fresh(view.backgroundTasks);
     const externalRuns = fresh(foregroundExternalCalls(view));
     return { agents, bgTasks, externalRuns, ...nestedUnder(agents) };
@@ -268,9 +309,6 @@ export function planLive(view: Pick<TimeBucketView, "blocks" | "agents" | "backg
     .some(member => member.open);
 }
 
-// One "now" for GRAPH and ANALYSIS: it follows the clock while the screen's conversation turn runs (the webview learns a
-// turn's state before the time view catches up), or, without a screen, while the view is live; otherwise it stops at the
-// last observation.
 export function planNow(view: Pick<TimeBucketView, "blocks" | "agents" | "backgroundTasks" | "lastAt">, clockMs?: number,
   running = planLive(view)): number {
   const lastAt = view.lastAt ?? -Infinity;
@@ -565,14 +603,18 @@ export function planItemNumberOf(description: string | undefined): number | unde
   return digits === undefined ? undefined : Number(digits);
 }
 
-// The item a numbered launch names: the newest block open at the launch that holds that number.
-export function planNumberedStep<S extends { number: number }>(blocks: readonly { start: number; steps?: readonly S[] }[],
-  number: number, at: number): { blockIndex: number; step: S } | undefined {
+// The item a numbered launch or resume names, for the gate (src/time-buckets.ts#numberedLaunchVerdict) and placement
+// alike: any step of the block current at `at`; of an earlier block only a TaskCreate step not settled at `at`, whose
+// task id stays unique in the session while TodoWrite numbers repeat. Judged at `at`, a past call keeps its answer.
+export function planNumberedStep<S extends { number: number; key: string; transitions?: readonly PlanStepSettle[]; settles?: readonly PlanStepSettle[] }>(
+  blocks: readonly { start: number; steps?: readonly S[] }[], number: number, at: number): { blockIndex: number; step: S } | undefined {
+  let current = true;
   for (let blockIndex = blocks.length - 1; blockIndex >= 0; blockIndex--) {
-    const block = blocks[blockIndex];
-    if (block.start > at) continue;
-    const step = block.steps?.filter(value => value.number === number).at(-1);
+    if (blocks[blockIndex].start > at) continue;
+    const step = blocks[blockIndex].steps?.filter(value => value.number === number
+      && (current || planStepTaskKey(value.key) !== undefined && !planStepSettledAt(value.transitions ?? value.settles ?? [], at))).at(-1);
     if (step !== undefined) return { blockIndex, step };
+    current = false;
   }
   return undefined;
 }
@@ -590,7 +632,7 @@ export function planSuccessorStep<S extends { key: string; carriedTo?: string }>
   return current;
 }
 
-export function planPlacedStep<S extends { number: number; key: string; carriedTo?: string }>(blocks: readonly { blockId: string; start: number; steps?: readonly S[] }[],
+export function planPlacedStep<S extends { number: number; key: string; transitions?: readonly PlanStepSettle[]; settles?: readonly PlanStepSettle[]; carriedTo?: string }>(blocks: readonly { blockId: string; start: number; steps?: readonly S[] }[],
   number: number, at: number): { blockIndex: number; step: S } | undefined {
   const found = planNumberedStep(blocks, number, at);
   return found === undefined ? undefined : planSuccessorStep(blocks, found);
@@ -600,7 +642,13 @@ export interface PlanStepTiming {
   key: string; title: string; status: TaskStatus; removed: boolean;
   startedAt: number | null; endedAt: number | null;
 }
-export interface PlanStepTransition { at: number; active: boolean; order: number }
+// settled: from this transition on the step is completed or removed.
+export interface PlanStepTransition { at: number; active: boolean; order: number; settled?: true }
+export type PlanStepSettle = Pick<PlanStepTransition, "at" | "settled">;
+
+export function planStepSettledAt(changes: readonly PlanStepSettle[], at: number): boolean {
+  return changes.filter(change => change.at <= at).at(-1)?.settled === true;
+}
 
 export function transitionPlanStep(step: PlanStepTiming, at: number, status: TaskStatus, removed = false): boolean {
   if (removed) {

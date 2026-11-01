@@ -4,12 +4,6 @@ import { randomUUID } from "node:crypto";
 
 import * as l10n from "@vscode/l10n";
 import {
-  type OwnerState,
-  type PersistedAnalysisArtifact,
-  type PersistenceReason,
-  type PersistenceState,
-} from "./analysis-persistence";
-import {
   backgroundActivitySnapshotOf,
   createBackgroundActivityState,
   emptyBackgroundActivitySnapshot,
@@ -41,7 +35,6 @@ import {
   releaseHistoryWindow,
 } from "./history-window";
 import { output } from "./host-context";
-import { LlmFindingCache } from "./llm-analysis-client";
 import {
   AuthStatus,
   EventProvenance,
@@ -55,28 +48,21 @@ import {
   RestoredAgent,
   ResumeHydrationSnapshotState,
   ResumePreviewMessage,
-  SemanticModelPayload,
   SlashCommandInfo,
   TabSnapshot,
   WelcomeOpen,
-  LlmUnavailableReason,
-  type LlmAnalysisRunProgress,
   type HandoffSourceSnapshot,
   type HandoffContextMeasurement,
   isInternalSlashCommand,
   UNOBSERVED_TIME,
 } from "./protocol";
 import type { ResumeHydration, HydrationJournalEntry, HydrationVerdict } from "./resume-hydration";
-import { SessionAnalysisStore } from "./session-analysis-store";
 import { initialSessionFacts, type SessionFactsAccumulator } from "./session-facts";
 import { SessionGuardrail } from "./session-guardrail";
-import { SessionLlm } from "./session-llm";
 import { displayTitleFromSummary } from "./session-list";
 import { refreshTabTitle, writeHeldChosenTitle } from "./session-list-wiring";
 import {
   SessionSemantic,
-  llmAnalysisEnabled,
-  llmDiagnosticsAudience,
   semanticViewEnabled,
 } from "./session-semantic";
 import { SessionSummaryWiring } from "./session-summary-wiring";
@@ -101,6 +87,11 @@ const RESUME_DISPLAY_BYPASS_KINDS: ReadonlySet<string> = new Set([
   "rate_limit",
 ]);
 
+export type OwnerState =
+  | { kind: "unresolved" }
+  | { kind: "pinned"; ownerId: string; logicalGeneration: number; source: "resume" | "auth" }
+  | { kind: "conflicted"; ownerId: string; logicalGeneration: number; reason: string };
+
 export interface StartMeasurement {
   readonly pending: boolean;
   readonly result: Promise<HandoffContextMeasurement | null | undefined>;
@@ -121,8 +112,6 @@ export class Session {
   liveGuardrailSignalIds = new Set<string>();
   readonly guardrailRunner = new SessionGuardrail(this, () => this.semantic.semanticDerivation());
   readonly semantic: SessionSemantic;
-  readonly analysisStore: SessionAnalysisStore;
-  readonly llmRunner: SessionLlm;
   readonly summaryRunner: SessionSummaryWiring;
   sessionFacts: SessionFactsAccumulator = initialSessionFacts();
   liveDelegationAgentIds = new Set<string>();
@@ -131,31 +120,10 @@ export class Session {
   timestampContractViolations = 0;
   lastEventTimestamp?: number;
   carriedGapBoundaries: number[] = [];
-  readonly llmCache = new LlmFindingCache();
-  llmRun: {
-    base: SemanticModelPayload;
-    abort: AbortController;
-    progress?: { value: LlmAnalysisRunProgress; observedAtMs: number };
-  } | null = null;
   sessionSummary: { text: string; model: string } | null = null;
   summaryRun: AbortController | null = null;
-  llmResult: {
-    base: SemanticModelPayload;
-    view: {
-      analysisRunId: string;
-    };
-    generatedAt: number;
-  } | null = null;
   logicalGeneration = 1;
   ownerState: OwnerState = { kind: "unresolved" };
-  baseRefByArtifactId = new Map<string, SemanticModelPayload>();
-  inputCoverageLabelByArtifactId = new Map<string, string>();
-  pendingPersistence: Array<{ artifact: PersistedAnalysisArtifact; logicalGeneration: number; seq: number }> = [];
-  pendingSeqCounter = 0;
-  persistedArtifacts: PersistedAnalysisArtifact[] = [];
-  persistenceStateByArtifactId = new Map<string, { state: PersistenceState; reason?: PersistenceReason | "conflicted" }>();
-  selectedArtifactId: string | null = null;
-  lastAttemptFailedReason: LlmUnavailableReason | null = null;
   seq = 0;
   generation = 1;
   conversation: ClaudeConversation | null = null;
@@ -172,6 +140,7 @@ export class Session {
   auth: AuthStatus | null = null;
   lastContextTotalTokens: number | null = null;
 
+  awaitingLaisoraInput = false;
   autoTitled = false;
   unpersistedChosenTitle: { title: string; failedAttempts: number } | null = null;
   titleRefreshed = false;
@@ -216,8 +185,6 @@ export class Session {
   constructor(private readonly store: SessionStore, index: number) {
     this.title = l10n.t("Conversation {0}", index);
     this.semantic = new SessionSemantic(this, store);
-    this.analysisStore = new SessionAnalysisStore(this, store);
-    this.llmRunner = new SessionLlm(this, store);
     this.summaryRunner = new SessionSummaryWiring(this, store);
   }
 
@@ -239,14 +206,6 @@ export class Session {
     this.generation += 1;
     this.logicalGeneration += 1;
     this.ownerState = { kind: "unresolved" };
-    this.baseRefByArtifactId.clear();
-    this.inputCoverageLabelByArtifactId.clear();
-    this.pendingPersistence = [];
-    this.pendingSeqCounter = 0;
-    this.persistedArtifacts = [];
-    this.persistenceStateByArtifactId.clear();
-    this.selectedArtifactId = null;
-    this.lastAttemptFailedReason = null;
     this.events = [];
     this.seq = 0;
     this.lastEventTimestamp = undefined;
@@ -306,8 +265,6 @@ export class Session {
     this.guardrailRunner.generationSentSignalIds.clear();
     this.guardrailRunner.clearGuardrailRefreshTimer();
     this.guardrailRunner.clearGuardrailTickTimer();
-    this.discardLlmAnalysis();
-    this.llmCache.clear();
   }
 
   beginResumePreparation(): NonNullable<Session["resumePreparation"]> {
@@ -336,13 +293,16 @@ export class Session {
     this.effectiveEffort = undefined;
   }
 
-  discardLlmAnalysis(): void {
-    this.abortLlmAnalysisRun();
-    this.llmResult = null;
-  }
-
-  abortLlmAnalysisRun(): void {
-    this.llmRun?.abort.abort();
+  resolveOwnerFromAuthStatus(sessionId: string, generation: number): void {
+    if (generation !== this.logicalGeneration) return;
+    if (this.ownerState.kind === "unresolved") {
+      this.ownerState = { kind: "pinned", ownerId: sessionId, logicalGeneration: this.logicalGeneration, source: "auth" };
+      this.semantic.loadExternalRuns(this.conversation);
+      this.semantic.scheduleSemanticModelPost();
+    } else if (this.ownerState.kind === "pinned" && this.ownerState.ownerId !== sessionId) {
+      output.appendLine(`[${this.title}] owner mismatch (pinned=${this.ownerState.ownerId} received=${sessionId})`);
+      this.ownerState = { kind: "conflicted", ownerId: this.ownerState.ownerId, logicalGeneration: this.logicalGeneration, reason: "owner mismatch" };
+    }
   }
 
   registerHistorySnapshot(): void {
@@ -380,8 +340,6 @@ export class Session {
         }
       }
     }
-    for (const msg of h.persistencePosts.values()) this.store.post(msg);
-    h.persistencePosts.clear();
   }
 
   backgroundActivitySnapshot(): BackgroundActivitySnapshot {
@@ -527,7 +485,7 @@ export class Session {
           this.store.post({ type: "commands", tabId: effect.tabId, commands: effect.commands });
           break;
         case "resolve_owner":
-          this.analysisStore.resolveOwnerFromAuthStatus(effect.sessionId, effect.logicalGeneration);
+          this.resolveOwnerFromAuthStatus(effect.sessionId, effect.logicalGeneration);
           break;
         case "refresh_tab_title":
           void refreshTabTitle(this);
@@ -546,23 +504,6 @@ export class Session {
           break;
       }
     }
-  }
-
-  private llmAnalysisSnapshotFields(): {
-    llmAnalysisRunning: boolean;
-    llmAnalysisProgress?: LlmAnalysisRunProgress;
-  } {
-    const run = this.llmRun;
-    if (run === null) return { llmAnalysisRunning: false };
-    const observed = run.progress;
-    if (observed === undefined) return { llmAnalysisRunning: true };
-    return {
-      llmAnalysisRunning: true,
-      llmAnalysisProgress: {
-        ...observed.value,
-        elapsedMs: observed.value.elapsedMs + Math.max(0, Date.now() - observed.observedAtMs),
-      },
-    };
   }
 
   snapshot(): TabSnapshot {
@@ -596,11 +537,8 @@ export class Session {
         workModel: this.semantic.projectedWorkModel(),
         semanticView,
         semanticModel,
-        llmAnalysisEnabled: llmAnalysisEnabled(),
-        ...this.llmAnalysisSnapshotFields(),
         sessionSummary: this.summaryRunner.hydratedSessionSummary() ?? undefined,
         sessionSummaryRunning: this.summaryRun !== null,
-        llmDiagnostics: llmDiagnosticsAudience() !== "off" && llmAnalysisEnabled(),
         backgroundActivity: this.backgroundActivitySnapshot(),
         autoResumeAt: this.conversation?.pendingAutoResumeAt ?? null,
         remoteControl: remoteControlView(this),
@@ -705,11 +643,8 @@ export class Session {
           },
         },
         semanticView: semanticViewEnabled(),
-        llmAnalysisEnabled: llmAnalysisEnabled(),
-        ...this.llmAnalysisSnapshotFields(),
         sessionSummary: this.summaryRunner.hydratedSessionSummary() ?? undefined,
         sessionSummaryRunning: this.summaryRun !== null,
-        llmDiagnostics: llmDiagnosticsAudience() !== "off" && llmAnalysisEnabled(),
         backgroundActivity: this.backgroundActivitySnapshot(),
         autoResumeAt: this.conversation?.pendingAutoResumeAt ?? null,
         remoteControl: remoteControlView(this),
@@ -745,11 +680,8 @@ export class Session {
         resumeFilePath: this.resumeFilePath,
         handoffSource: this.handoffSource,
         semanticView: semanticViewEnabled(),
-        llmAnalysisEnabled: llmAnalysisEnabled(),
-        ...this.llmAnalysisSnapshotFields(),
         sessionSummary: this.summaryRunner.hydratedSessionSummary() ?? undefined,
         sessionSummaryRunning: this.summaryRun !== null,
-        llmDiagnostics: llmDiagnosticsAudience() !== "off" && llmAnalysisEnabled(),
         backgroundActivity: this.backgroundActivitySnapshot(),
         autoResumeAt: this.conversation?.pendingAutoResumeAt ?? null,
         remoteControl: remoteControlView(this),

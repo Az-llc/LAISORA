@@ -1,5 +1,4 @@
 import { createHash } from "node:crypto";
-import type { SerializationClassification } from "./l3-analysis";
 import { progressSubjectKey } from "./progress-protocol";
 import type {
   Coverage,
@@ -12,6 +11,8 @@ import type {
 } from "./semantic-model";
 
 export const L3_DIVERGENCE_SPEC_VERSION = 2;
+
+type SerializationClassification = "required" | "independent-serial" | "undetermined";
 
 export type DivergenceKind =
   | "serialization"

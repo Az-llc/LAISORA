@@ -13,7 +13,6 @@ import type {
   AccountUsageSnapshot,
   ConversationHistoryErrorReason,
   HistoryChunkPagePayload,
-  HostToWebview,
   ImageAttachment,
   ImageRefInfo,
   NormalizedEvent,
@@ -87,7 +86,6 @@ import {
 import { isConvRenderableEvent } from "../conv-renderable";
 import { WorkOverview, type WorkViewMode } from "./work-overview";
 import type { CoverageBackfillHint } from "./work-graph";
-import { renderLlmDiagnosticsView } from "./llm-diagnostics-view";
 import { closeFindBar, findNext, initFindBar, isFindBarOpen, openFindBar, refreshFind } from "./find-bar";
 import { uiLocale } from "./l10n";
 import { isComposingKey } from "./composing";
@@ -292,7 +290,6 @@ export function persistState(): void {
   if (activeTabId) drafts.set(activeTabId, inputEl.value);
   const views: Record<string, ViewMode> = { ...(vscode.getState()?.views ?? {}) };
   const workViews: Record<string, WorkViewMode> = { ...(vscode.getState()?.workViews ?? {}) };
-  const analysisViews: Record<string, "script" | "ai"> = { ...(vscode.getState()?.analysisViews ?? {}) };
   const scrollAnchors = { ...savedScrollAnchors() };
   const askChecks = { ...(vscode.getState()?.askChecks ?? {}) };
   const askDismissed = { ...(vscode.getState()?.askDismissed ?? {}) };
@@ -301,7 +298,6 @@ export function persistState(): void {
   for (const id of forgottenTabIds) {
     delete views[id];
     delete workViews[id];
-    delete analysisViews[id];
     delete askChecks[id];
     delete askDismissed[id];
     delete askResolved[id];
@@ -310,10 +306,9 @@ export function persistState(): void {
   }
   for (const [id, t] of tabs) views[id] = t.viewMode;
   for (const [id, t] of tabs) workViews[id] = t.workViewMode;
-  for (const [id, overview] of overviews) analysisViews[id] = overview.analysisSubtab;
   for (const [id, t] of tabs) scrollAnchors[id] = t.captureScrollCarry(false);
   const { askDismissedMessages, askResolvedMessages, askCheckedMessages, codeWrap } = vscode.getState() ?? {};
-  const next: PersistedState = { activeTabId: activeTabId ?? todoReturnTabId, drafts: out, views, workViews, analysisViews, scrollAnchors, askChecks, askDismissed, askDismissedMessages, askResolved, askResolvedMessages, askCheckedMessages, codeWrap, todo: todoTab.viewState() };
+  const next: PersistedState = { activeTabId: activeTabId ?? todoReturnTabId, drafts: out, views, workViews, scrollAnchors, askChecks, askDismissed, askDismissedMessages, askResolved, askResolvedMessages, askCheckedMessages, codeWrap, todo: todoTab.viewState() };
   vscode.setState(next);
   reportComposerDrafts();
 }
@@ -482,14 +477,6 @@ export function findTabBySessionId(sessionId: string): Tab | undefined {
     if (t.auth?.sessionId === sessionId || t.resumeSessionId === sessionId) return t;
   }
   return undefined;
-}
-
-function showAnalysisFailure(msg: Extract<HostToWebview, { type: "analysisFailed" }>): void {
-  const tab = tabs.get(msg.tabId);
-  if (!tab) return;
-  tab.withViewChange(() => {
-    overviews.get(msg.tabId)?.showAnalysisFailure(msg.reason);
-  });
 }
 
 export function activeTab(): Tab | null {
@@ -795,29 +782,6 @@ function initUsagePanel(): void {
       closeUsagePanel();
     }
   });
-}
-
-let llmDiagnosticsEl: HTMLElement | undefined;
-let llmDiagnosticsAllowed: boolean | undefined;
-
-function llmDiagnosticsPanel(): HTMLElement {
-  if (llmDiagnosticsEl === undefined) {
-    llmDiagnosticsEl = document.createElement("div");
-    llmDiagnosticsEl.className = "llm-diagnostics";
-    llmDiagnosticsEl.setAttribute("role", "region");
-    llmDiagnosticsEl.setAttribute("aria-label", l10n.t("Rejected LLM findings (diagnostics)"));
-    document.body.appendChild(llmDiagnosticsEl);
-  }
-  return llmDiagnosticsEl;
-}
-
-function applyLlmDiagnosticsMode(mode: boolean | undefined): void {
-  llmDiagnosticsAllowed = mode;
-  if (mode !== false) return;
-  if (llmDiagnosticsEl !== undefined) {
-    llmDiagnosticsEl.remove();
-    llmDiagnosticsEl = undefined;
-  }
 }
 
 const REPLAY_MAX = 1500;
@@ -2046,7 +2010,6 @@ function withHeadOmitted(
 }
 
 function addTab(snap: TabSnapshot, scrollCarry?: ScrollCarry): Tab {
-  applyLlmDiagnosticsMode(snap.state.llmDiagnostics);
   hostDroppedAtInstall.set(snap.tabId, snap.state.workModel?.coverage.droppedEventCount ?? 0);
   if (snap.state.workModel === undefined) lastWorkModels.delete(snap.tabId);
   lastSemanticModels.delete(snap.tabId);
@@ -2176,7 +2139,6 @@ function addTab(snap: TabSnapshot, scrollCarry?: ScrollCarry): Tab {
   if (scrollCarry === undefined) t.resetScrollPosition();
   let restoringWorkView = true;
   const savedWorkView = vscode.getState()?.workViews?.[snap.tabId];
-  const savedAnalysisView = vscode.getState()?.analysisViews?.[snap.tabId];
   const overview = new WorkOverview(t.workEl, snap.tabId, {
     has: (toolUseId) => t.hasToolEvidence(toolUseId),
     navigate: (toolUseId) => t.navigateToToolEvidence(toolUseId),
@@ -2189,9 +2151,7 @@ function addTab(snap: TabSnapshot, scrollCarry?: ScrollCarry): Tab {
   }, {
     has: (turnId) => t.hasConversationTurn(turnId),
     navigate: (turnId) => t.navigateToConversationTurn(turnId),
-  }, t.graphScrollPort(), () => {
-    if (!restoringWorkView) t.persistViewState();
-  }, (moveFocus) => t.syncViewTabs(moveFocus), (action) => t.withViewChange(action), (model) => t.modelDisplayName(model));
+  }, t.graphScrollPort(), (moveFocus) => t.syncViewTabs(moveFocus), (action) => t.withViewChange(action), (model) => t.modelDisplayName(model));
   t.setWorkViewMode = (mode) => overview.setMode(mode);
   t.syncWorkVisibility = () => overview.syncVisibility();
   t.setWorkViewVisible = (visible) => overview.setVisible(visible);
@@ -2202,14 +2162,9 @@ function addTab(snap: TabSnapshot, scrollCarry?: ScrollCarry): Tab {
   overview.update(displayWorkModel(snap.tabId, snap.state.workModel));
   lastSemanticModels.set(snap.tabId, { model: snap.state.semanticModel, view: snap.state.semanticView });
   overview.updateSemantic(displaySemanticModel(snap.tabId, snap.state.semanticModel), snap.state.semanticView);
-  overview.setLlmAnalysisEnabled(snap.state.llmAnalysisEnabled);
   overviews.set(snap.tabId, overview);
   overview.setActive(t.isActive());
-  overview.setLlmRunning(snap.state.llmAnalysisRunning === true, snap.state.llmAnalysisProgress);
   overview.setSessionSummary(snap.state.sessionSummaryRunning === true, snap.state.sessionSummary);
-  if (savedAnalysisView === "script" || savedAnalysisView === "ai") {
-    overview.setAnalysisSub(savedAnalysisView);
-  }
   if (savedWorkView === "summary" || savedWorkView === "graph" || savedWorkView === "analysis" || savedWorkView === "log") {
     overview.setMode(savedWorkView);
   }
@@ -2460,12 +2415,6 @@ function initMessageBus(): void {
         overviews.get(msg.tabId)?.updateSemantic(displaySemanticModel(msg.tabId, msg.model), true);
         break;
       }
-      case "llmAnalysisSetting": {
-        for (const ov of overviews.values()) {
-          ov.setLlmAnalysisEnabled(msg.enabled);
-        }
-        break;
-      }
       case "userSettings": {
         applyAccent(msg.appearance);
         setDisplayName(msg.displayName ?? "");
@@ -2484,18 +2433,6 @@ function initMessageBus(): void {
       }
       case "sessionSummary": {
         overviews.get(msg.tabId)?.setSessionSummary(msg.running, msg.summary, msg.saveFailed === true, msg.failure);
-        break;
-      }
-      case "llmAnalysisRunState": {
-        overviews.get(msg.tabId)?.setLlmRunning(msg.running, msg.progress, msg.failure, msg.refusal);
-        break;
-      }
-      case "llmFindingDiagnostics": {
-        if (llmDiagnosticsAllowed === false) {
-          console.warn("[drop] llm diagnostics while disabled", msg.tabId);
-          break;
-        }
-        renderLlmDiagnosticsView(llmDiagnosticsPanel(), msg.tabId, msg.payload);
         break;
       }
       case "conversationHistoryResult": {
@@ -2715,20 +2652,6 @@ function initMessageBus(): void {
         applySessionListActionFailed(msg.reason, msg.sessionId, msg.action, msg.requestId);
         break;
       }
-      case "analysisFailed": {
-        showAnalysisFailure(msg);
-        break;
-      }
-      case "composerPrefill": {
-        drafts.set(msg.tabId, msg.text);
-        if (activeTabId === msg.tabId) {
-          inputEl.value = msg.text;
-          autosizeComposer();
-          inputEl.focus();
-        }
-        persistState();
-        break;
-      }
       case "accountUsage": {
         if (msg.replyTo !== accountUsageRequestId) break;
         accountUsageRequestId = null;
@@ -2740,14 +2663,6 @@ function initMessageBus(): void {
       case "editorContext": {
         editorContext = { path: msg.path, startLine: msg.startLine, endLine: msg.endLine };
         renderCtxChip();
-        break;
-      }
-      case "analysisPersistenceState": {
-        const badge = document.querySelector(`.llm-persistence-badge[data-artifact-id="${msg.artifactId}"]`);
-        if (badge) {
-          badge.textContent = msg.persistenceLabel;
-          badge.setAttribute("data-persistence", msg.persistence);
-        }
         break;
       }
       case "todoSnapshot": {

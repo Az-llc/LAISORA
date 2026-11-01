@@ -5,6 +5,7 @@
 !dist/extension.js
 !dist/webview.js
 !dist/settings.js
+!dist/improvement.mjs
 dist/test-harness.*
 dist/probe-*
 **/*.map

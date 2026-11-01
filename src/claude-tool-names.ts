@@ -19,6 +19,10 @@ export function isCountedExternalRunCall(call: { toolName: string; rejectedBefor
   return isExternalRunTool(call.toolName) && call.rejectedBeforeRun !== true;
 }
 
+export function isMainExternalRun(call: { toolName: string; parentToolUseId: string | null; rejectedBeforeRun?: boolean }): boolean {
+  return call.parentToolUseId === null && isCountedExternalRunCall(call);
+}
+
 export function delegationCount(counts: { agentCount: number; externalRunCount?: number }): number {
   return counts.agentCount + (counts.externalRunCount ?? 0);
 }

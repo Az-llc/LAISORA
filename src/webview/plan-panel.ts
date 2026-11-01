@@ -41,7 +41,8 @@ function status(value: string): string {
     case "completed": return "✓";
     case "pending": return l10n.t("Pending");
     case "failed": return `✗ ${l10n.t("Failed")}`;
-    case "stale": case "stopped": return l10n.t("Stopped");
+    case "stopped": return l10n.t("Stopped");
+    case "stale": return l10n.t("Tracking stopped");
     default: return "—";
   }
 }

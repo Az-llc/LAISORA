@@ -1,4 +1,4 @@
-import { HARNESS_DENIED_TOOL_RESULT_RE, isFailedToolResult, isHookDenial } from "./tool-result-signals";
+import { classifyToolFailure, HARNESS_DENIED_TOOL_RESULT_RE, isFailedToolResult, type ToolFailure } from "./tool-result-signals";
 import type { NormalizedEvent } from "./protocol";
 import * as l10n from "@vscode/l10n";
 
@@ -37,7 +37,7 @@ interface FailureRule {
   label: string;
   category?: string;
   fixCandidate?: string;
-  pattern: Pick<RegExp, "test">;
+  matches(text: string, failure: ToolFailure): boolean;
 }
 
 interface ConventionRule {
@@ -49,18 +49,20 @@ interface ConventionRule {
   matches(input: string): boolean;
 }
 
+const textMatches = (pattern: RegExp) => (text: string): boolean => pattern.test(text);
+
 const FAILURE_RULES: readonly FailureRule[] = [
-  { anchor: "fail:guard", get label() { return l10n.t("A guard stopped the execution"); }, pattern: /This agent is isolated in the worktree|Refusing to use|Blocked: / },
-  { anchor: "fail:hook", get label() { return l10n.t("A hook denied the execution"); }, pattern: { test: isHookDenial } },
-  { anchor: "fail:read-first", get label() { return l10n.t("Tried to modify a file that had not been read"); }, get category() { return l10n.t("Rule"); }, get fixCandidate() { return l10n.t("Read before Edit or Write"); }, pattern: /File has not been read yet/ },
-  { anchor: "fail:edit", get label() { return l10n.t("The Edit target did not match the actual file"); }, pattern: /String to replace not found|old_string and new_string are exactly the same/ },
-  { anchor: "fail:script", get label() { return l10n.t("A script failed with a runtime error"); }, pattern: /Traceback \(most recent call last\)/ },
-  { anchor: "fail:syntax", get label() { return l10n.t("The executed code had a syntax error"); }, get category() { return l10n.t("Rule"); }, get fixCandidate() { return l10n.t("How shell arguments are written (quoting, heredocs)"); }, pattern: /unexpected EOF while looking for matching|unterminated|SyntaxError/ },
-  { anchor: "fail:permission", get label() { return l10n.t("The harness denied the execution"); }, get category() { return l10n.t("Settings"); }, get fixCandidate() { return l10n.t("permissions.allow in settings.json"); }, pattern: HARNESS_DENIED_TOOL_RESULT_RE },
-  { anchor: "fail:limit", get label() { return l10n.t("Could not read because the tool limit was exceeded"); }, pattern: /File content \([^)]*\) exceeds maximum/ },
-  { anchor: "fail:input", get label() { return l10n.t("The tool input did not match the expected format"); }, pattern: /InputValidationError/ },
-  { anchor: "fail:path", get label() { return l10n.t("The specified path was not found"); }, get category() { return l10n.t("Project"); }, get fixCandidate() { return l10n.t("The working directory description in CLAUDE.md"); }, pattern: /File does not exist|current working directory is/ },
-  { anchor: "fail:env", get label() { return l10n.t("Unrecoverable (environment)"); }, pattern: /ECONNRESET|ETIMEDOUT|ECONNREFUSED|ENOTFOUND|socket hang up|certificate has expired|curl: \(\d+\)|is not installed\.|Command timed out after|search timed out after|auto mode cannot determine|EPERM|Permission denied/ },
+  { anchor: "fail:guard", get label() { return l10n.t("A guard stopped the execution"); }, matches: textMatches(/This agent is isolated in the worktree|Refusing to use|Blocked: /) },
+  { anchor: "fail:hook", get label() { return l10n.t("A hook denied the execution"); }, matches: (_text, failure) => failure.kind === "hook_denial" },
+  { anchor: "fail:read-first", get label() { return l10n.t("Tried to modify a file that had not been read"); }, get category() { return l10n.t("Rule"); }, get fixCandidate() { return l10n.t("Read before Edit or Write"); }, matches: textMatches(/File has not been read yet/) },
+  { anchor: "fail:edit", get label() { return l10n.t("The Edit target did not match the actual file"); }, matches: textMatches(/String to replace not found|old_string and new_string are exactly the same/) },
+  { anchor: "fail:script", get label() { return l10n.t("A script failed with a runtime error"); }, matches: textMatches(/Traceback \(most recent call last\)/) },
+  { anchor: "fail:syntax", get label() { return l10n.t("The executed code had a syntax error"); }, get category() { return l10n.t("Rule"); }, get fixCandidate() { return l10n.t("How shell arguments are written (quoting, heredocs)"); }, matches: textMatches(/unexpected EOF while looking for matching|unterminated|SyntaxError/) },
+  { anchor: "fail:permission", get label() { return l10n.t("The harness denied the execution"); }, get category() { return l10n.t("Settings"); }, get fixCandidate() { return l10n.t("permissions.allow in settings.json"); }, matches: (text, failure) => failure.kind === "classifier_denial" || HARNESS_DENIED_TOOL_RESULT_RE.test(text) },
+  { anchor: "fail:limit", get label() { return l10n.t("Could not read because the tool limit was exceeded"); }, matches: textMatches(/File content \([^)]*\) exceeds maximum/) },
+  { anchor: "fail:input", get label() { return l10n.t("The tool input did not match the expected format"); }, matches: textMatches(/InputValidationError/) },
+  { anchor: "fail:path", get label() { return l10n.t("The specified path was not found"); }, get category() { return l10n.t("Project"); }, get fixCandidate() { return l10n.t("The working directory description in CLAUDE.md"); }, matches: textMatches(/File does not exist|current working directory is/) },
+  { anchor: "fail:env", get label() { return l10n.t("Unrecoverable (environment)"); }, matches: (text, failure) => failure.kind === "classifier_unavailable" || /ECONNRESET|ETIMEDOUT|ECONNREFUSED|ENOTFOUND|socket hang up|certificate has expired|curl: \(\d+\)|is not installed\.|Command timed out after|search timed out after|auto mode cannot determine|EPERM|Permission denied/.test(text) },
 ];
 
 const CONVENTION_RULES: readonly ConventionRule[] = [
@@ -108,7 +110,9 @@ export function foldExecLogMarks(state: ExecLogMarkState, event: NormalizedEvent
   }
   if (event.kind === "tool_call_finished") {
     if (!isFailedToolResult(event)) return state;
-    const rule = FAILURE_RULES.find((r) => r.pattern.test(event.resultPreview));
+    const failure = classifyToolFailure(event.resultPreview, undefined);
+    if (failure.kind === "user_rejected") return state;
+    const rule = FAILURE_RULES.find((r) => r.matches(event.resultPreview, failure));
     if (rule === undefined) return state;
     return push(state, { toolUseId: event.toolUseId, turnId: event.turnId, family: "failure", label: rule.label, findingAnchor: rule.anchor });
   }

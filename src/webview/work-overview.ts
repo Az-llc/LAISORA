@@ -1,11 +1,12 @@
 import type { AnalysisPlanView, AnalysisPlansView, AnalysisTimeView, TokenDisplay, RoleRunView, RoleSummaryView, RoleView } from "../role-summary";
 import type { RoleCacheTtlView } from "../cache-ttl-cost";
 import { deriveEarlierPlanViews, derivePlanView, planStepCounted } from "./plan-view";
-import { ANALYSIS_TIME_PART_KEYS, MAIN_PROCESSING_BUCKETS, timePartShown, viewTimePartValues, type ShownTimePartKey, viewTimeProvisional, planContextOf, timeWindowMeasured, planNow, planRowPeriods, planPeriodEnd, UNMEASURED_LABEL } from "../plan-steps";
+import { ANALYSIS_TIME_PART_KEYS, MAIN_PROCESSING_BUCKETS, timePartShown, viewTimePartValues, type ShownTimePartKey, viewTimeProvisional, planContextOf, timeWindowMeasured, planLive, planNow, planRowPeriods, planPeriodEnd, UNMEASURED_LABEL } from "../plan-steps";
 import { renderPlanSection, planTokens, planWork } from "./plan-panel";
 import { createLoader } from "./loader";
 import { EXECUTORS, externalRunStatus } from "../orchestration-executors";
 import { delegationCount } from "../claude-tool-names";
+import { externalRunEndStatus } from "../protocol";
 import type {
   HostToWebview,
   OrchestrationView,
@@ -28,22 +29,15 @@ import { AgentInspector } from "./agent-inspector";
 import * as l10n from "@vscode/l10n";
 import { noRecordReason } from "../session-record";
 
-type LlmRunStateMessage = Extract<HostToWebview, { type: "llmAnalysisRunState" }>;
-type LlmRunProgress = NonNullable<LlmRunStateMessage["progress"]>;
-type LlmRunFailure = NonNullable<LlmRunStateMessage["failure"]>;
-
-function llmElapsedText(ms: number): string {
-  const total = Math.max(0, Math.round(ms / 1000));
-  return total < 60 ? l10n.t("{0}s", total) : l10n.t("{0}m {1}s", Math.floor(total / 60), total % 60);
-}
-
 
 export type WorkViewMode = "summary" | "graph" | "analysis" | "log";
 
 const EARLIER_LIMIT = 3;
 const NO_FINDINGS_TEXT = l10n.t(
-  "Script analysis found no classifiable failures and no operations matching the rule table. This does not mean LLM analysis would find no candidates either; a script can only count events that fit predefined patterns."
+  "Script analysis found no classifiable failures and no operations matching the rule table. This does not mean there were no problems; a script can only count events that fit predefined patterns."
 );
+const SCRIPT_ORIGIN_LABEL = l10n.t("Script analysis");
+const SCRIPT_ORIGIN_NOTE = l10n.t("Counted mechanically from events that fit predefined patterns. Problems outside those patterns are not listed.");
 
 const FINDING_SECTIONS: readonly { family: "failure" | "convention"; code: string; title: string; note: string }[] = [
   {
@@ -100,9 +94,7 @@ function timePartListed(key: TimePartKey, ms: number | null | undefined): boolea
 }
 const RUN_TIME_TONE: ChartTone = "sub";
 
-type AnalysisSubtab = "script" | "ai";
 type FoldArea = "roles" | "plans";
-const ANALYSIS_SUBTABS: readonly AnalysisSubtab[] = ["script", "ai"];
 
 export function earlierStepCount(block: TimeBucketView["blocks"][number], model: WorkModelPayload | undefined, last: boolean): string {
   if (block.kind === "plan") return String((block.steps ?? []).filter(planStepCounted).length);
@@ -142,22 +134,7 @@ export class WorkOverview {
   private payload: WorkModelPayload | undefined;
   private semanticPayload: SemanticModelPayload | undefined;
   private semanticView: boolean | undefined;
-  private llmAnalysisEnabled: boolean | undefined;
   private turnRunning = false;
-  private analysisSub: AnalysisSubtab = "script";
-  get analysisSubtab(): AnalysisSubtab { return this.analysisSub; }
-  private readonly subTabs: Record<AnalysisSubtab, HTMLButtonElement>;
-  private readonly subSwitchEl: HTMLElement;
-  private readonly scriptEl: HTMLElement;
-  private readonly llmEl: HTMLElement;
-  private readonly l3LlmEl: HTMLElement;
-  private llmRunning = false;
-  private llmProgress: (LlmRunProgress & { receivedAt: number | undefined }) | undefined;
-  private llmFailure: LlmRunFailure | undefined;
-  private llmRunLineEl: HTMLElement | undefined;
-  private llmRefusal: string | undefined;
-  private analysisFailure: string | undefined;
-  private analysisFailureEl: HTMLElement | undefined;
   private summaryDirty = false;
   private summaryRenderCount = 0;
   private l3Dirty = false;
@@ -192,7 +169,6 @@ export class WorkOverview {
       navigate(turnId: string): void;
     },
     private readonly graphScrollPort?: GraphScrollPort,
-    private readonly onAnalysisSubChange?: () => void,
     private readonly onModeApplied?: (moveFocus: boolean) => void,
     private readonly onViewChange: (action: () => void) => void = (action) => action(),
     modelDisplayName?: (model: string) => string | undefined
@@ -217,28 +193,7 @@ export class WorkOverview {
     this.measuredEl = div("wa-head");
     this.findingsEl = div("wa-findings");
     this.l3El = div("l3-view");
-    this.l3LlmEl = div("l3-view l3-view-llm");
-    this.subSwitchEl = document.createElement("div");
-    this.subSwitchEl.className = "wa-tabs";
-    this.subSwitchEl.setAttribute("role", "tablist");
-    this.subSwitchEl.setAttribute("aria-label", l10n.t("Analysis type"));
-    this.scriptEl = div("wa-sub");
-    this.scriptEl.id = `wa-sub-script-${this.tabId}`;
-    this.scriptEl.setAttribute("role", "tabpanel");
-    this.llmEl = div("wa-sub");
-    this.llmEl.id = `wa-sub-ai-${this.tabId}`;
-    this.llmEl.setAttribute("role", "tabpanel");
-    this.subTabs = {
-      script: this.buildSubTab("script", l10n.t("Script analysis"), this.scriptEl.id),
-      ai: this.buildSubTab("ai", l10n.t("LLM Analysis"), this.llmEl.id),
-    };
-    this.scriptEl.setAttribute("aria-labelledby", this.subTabs.script.id);
-    this.llmEl.setAttribute("aria-labelledby", this.subTabs.ai.id);
-    this.subSwitchEl.append(this.subTabs.script, this.subTabs.ai);
-    this.scriptEl.append(this.findingsEl, this.l3El);
-    this.llmEl.append(this.l3LlmEl);
-    this.analysisEl.append(this.measuredEl, this.subSwitchEl, this.scriptEl, this.llmEl);
-    this.applyAnalysisSub();
+    this.analysisEl.append(this.measuredEl, this.findingsEl, this.l3El);
 
     this.logHeadEl = div("wl-head");
     this.logSumEl = div("wl-sum");
@@ -252,157 +207,12 @@ export class WorkOverview {
       .laisoraSetExecLogMarks = (marks) => this.setExecLogMarks(marks);
   }
 
-  private buildSubTab(sub: AnalysisSubtab, label: string, controls: string): HTMLButtonElement {
-    const btn = document.createElement("button");
-    btn.type = "button";
-    btn.className = "wa-tab";
-    btn.id = `watab-${sub}-${this.tabId}`;
-    btn.setAttribute("role", "tab");
-    btn.setAttribute("aria-controls", controls);
-    btn.textContent = label;
-    btn.onclick = () => this.setAnalysisSub(sub);
-    btn.addEventListener("keydown", (e) => {
-      const at = ANALYSIS_SUBTABS.indexOf(this.analysisSub);
-      if (e.key === "ArrowRight" || e.key === "ArrowLeft") {
-        e.preventDefault();
-        const step = e.key === "ArrowRight" ? 1 : ANALYSIS_SUBTABS.length - 1;
-        this.setAnalysisSub(ANALYSIS_SUBTABS[(at + step) % ANALYSIS_SUBTABS.length], true);
-      } else if (e.key === "Home") {
-        e.preventDefault();
-        this.setAnalysisSub(ANALYSIS_SUBTABS[0], true);
-      } else if (e.key === "End") {
-        e.preventDefault();
-        this.setAnalysisSub(ANALYSIS_SUBTABS[ANALYSIS_SUBTABS.length - 1], true);
-      }
-    });
-    return btn;
-  }
-
-  setAnalysisSub(sub: AnalysisSubtab, moveFocus = false): void {
-    const changed = this.analysisSub !== sub;
-    this.analysisSub = sub;
-    this.applyAnalysisSub();
-    if (moveFocus) this.subTabs[sub].focus();
-    if (changed) this.onAnalysisSubChange?.();
-  }
-
-  private applyAnalysisSub(): void {
-    for (const sub of ANALYSIS_SUBTABS) {
-      const btn = this.subTabs[sub];
-      btn.classList.toggle("active", sub === this.analysisSub);
-      btn.setAttribute("aria-selected", String(sub === this.analysisSub));
-      btn.tabIndex = sub === this.analysisSub ? 0 : -1;
-    }
-    this.scriptEl.hidden = this.analysisSub !== "script";
-    this.llmEl.hidden = this.analysisSub !== "ai";
-  }
-
   mount(): void {
     this.workEl.insertBefore(this.logHeadEl, this.workEl.firstChild);
     this.workEl.insertBefore(this.rootEl, this.logHeadEl.nextSibling);
     this.workEl.insertBefore(this.graph.rootEl, this.rootEl.nextSibling);
     this.workEl.insertBefore(this.analysisEl, this.graph.rootEl.nextSibling);
     this.applyMode();
-  }
-
-  setLlmRunning(running: boolean, progress?: LlmRunProgress, failure?: LlmRunFailure, refusal?: string): void {
-    this.llmRunning = running;
-    if (running) {
-      this.llmFailure = undefined;
-      this.llmRefusal = undefined;
-      this.analysisFailure = undefined;
-      if (progress !== undefined) this.llmProgress = { ...progress, receivedAt: Date.now() };
-    } else {
-      this.llmProgress = undefined;
-      this.llmFailure = failure;
-      this.llmRefusal = refusal;
-    }
-    this.l3Dirty = true;
-    if (this.mode === "analysis") this.renderAnalysisPanel();
-  }
-
-  showAnalysisFailure(reason: string): void {
-    this.analysisFailure = reason;
-    this.setAnalysisSub("ai");
-    this.setMode("analysis");
-    this.l3Dirty = true;
-    this.renderAnalysisPanel();
-  }
-
-  private llmRunLineText(): { text: string; live: boolean; place: "run" | "tail" } | null {
-    if (this.llmRefusal !== undefined) {
-      return { live: true, place: "run", text: l10n.t("Not run: {0}", this.llmRefusal) };
-    }
-    const failure = this.llmFailure;
-    if (failure !== undefined) {
-      const elapsed = llmElapsedText(failure.elapsedMs);
-      if (failure.limit === undefined) {
-        return {
-          live: true,
-          place: "tail",
-          text: l10n.t(
-            "Stopped at call {0}/{1} — elapsed {2} · {3} completed",
-            failure.attemptedCalls,
-            failure.plannedCalls,
-            elapsed,
-            failure.completedCalls
-          ),
-        };
-      }
-      const limit =
-        failure.limit === "per_call" ? l10n.t("LLM response inactivity timeout") : l10n.t("total timeout");
-      return {
-        live: true,
-        place: "tail",
-        text: l10n.t(
-          "Stopped at call {0}/{1} — {2} · elapsed {3} · {4} completed",
-          failure.attemptedCalls,
-          failure.plannedCalls,
-          limit,
-          elapsed,
-          failure.completedCalls
-        ),
-      };
-    }
-    const progress = this.llmProgress;
-    if (progress === undefined) return null;
-    const since =
-      progress.receivedAt === undefined || this.lastTickMs === undefined
-        ? 0
-        : Math.max(0, this.lastTickMs - progress.receivedAt);
-    const elapsed = llmElapsedText(progress.elapsedMs + since);
-    const text = progress.stage === "merge"
-      ? l10n.t("Combining analysis results · Elapsed {0}", elapsed)
-      : progress.stage === "slice" && progress.sliceCount !== undefined && progress.sliceCount > 1 && progress.sliceIndex !== undefined
-        ? l10n.t("Analyzing log sections · {0}/{1} · Elapsed {2}", progress.sliceIndex, progress.sliceCount, elapsed)
-        : l10n.t("Analyzing log · Elapsed {0}", elapsed);
-    return { live: false, place: "run", text };
-  }
-
-  private renderLlmRunLine(): void {
-    this.llmRunLineEl?.remove();
-    this.llmRunLineEl = undefined;
-    const line = this.llmRunLineText();
-    if (line === null) return;
-    const el = document.createElement("span");
-    el.className = this.llmRefusal !== undefined ? "llm-run-note llm-run-progress llm-run-refusal" : "llm-run-note llm-run-progress";
-    if (line.live) el.setAttribute("role", "status");
-    el.textContent = line.text;
-    const box = line.place === "run" ? this.l3LlmEl.getElementsByClassName("llm-run")[0] : undefined;
-    (box ?? this.l3LlmEl).appendChild(el);
-    this.llmRunLineEl = el;
-  }
-
-  private renderAnalysisFailureLine(): void {
-    this.analysisFailureEl?.remove();
-    this.analysisFailureEl = undefined;
-    if (this.analysisFailure === undefined) return;
-    const el = document.createElement("div");
-    el.className = "llm-run-note analysis-failure";
-    el.setAttribute("role", "alert");
-    el.textContent = this.analysisFailure;
-    this.l3LlmEl.appendChild(el);
-    this.analysisFailureEl = el;
   }
 
   setTurnState(state: "idle" | "running" | "interrupting"): void {
@@ -414,7 +224,6 @@ export class WorkOverview {
     this.turnRunning = running;
     this.l3Dirty = true;
     this.summaryDirty = true;
-    this.graph.setRunning(running);
     if (this.mode === "analysis") this.renderAnalysisPanel();
     if (this.mode === "summary") this.render();
   }
@@ -426,29 +235,7 @@ export class WorkOverview {
   noteRecordChanged(): void {
     if (this.renderedRecord === this.hasRecord()) return;
     this.summaryDirty = true;
-    this.l3Dirty = true;
     if (this.mode === "summary") this.render();
-    if (this.mode === "analysis") this.renderAnalysisPanel();
-  }
-
-  setLlmAnalysisEnabled(enabled: boolean | undefined): void {
-    if (this.llmAnalysisEnabled === enabled) {
-      this.l3El.querySelector('button[role="switch"]')?.removeAttribute("aria-busy");
-      return;
-    }
-    this.llmAnalysisEnabled = enabled;
-    this.l3Dirty = true;
-    if (this.mode === "analysis") {
-      const activeEl = document.activeElement;
-      const hadFocus =
-        activeEl !== null &&
-        this.l3El.contains(activeEl) &&
-        activeEl.getAttribute("role") === "switch";
-      this.renderAnalysisPanel();
-      if (hadFocus) {
-        this.l3El.querySelector<HTMLButtonElement>('button[role="switch"]')?.focus();
-      }
-    }
   }
 
   setYou(element: HTMLElement): void { this.youSection.replaceChildren(element); }
@@ -458,11 +245,11 @@ export class WorkOverview {
     this.planSection.className = "plan-section";
     const time = this.activeSemantic()?.timeBuckets;
     const block = time?.blocks.at(-1);
-    const context = this.payload?.planContext ?? (block ? planContextOf(block, block.end, this.turnRunning, planRowPeriods(time!)) : undefined);
+    const context = this.payload?.planContext ?? (block ? planContextOf(block, block.end, block.running, planRowPeriods(time!)) : undefined);
     const view = derivePlanView(this.payload, this.planOrchestration, this.lastTickMs ?? 0, context);
     for (const agent of time?.agents ?? []) {
       if (this.payload?.planTools !== undefined) continue;
-      if (!agent.open || !this.turnRunning) continue;
+      if (!agent.open) continue;
       const lanes = [...view.now, ...view.steps.flatMap(step => step.lanes)];
       if (lanes.some(lane => lane.id === `agent:${agent.transcriptAgentId ?? agent.toolUseId}`)) continue;
       view.now.push({ id: `agent:${agent.toolUseId}`, agent: agent.subagentType ?? "Claude", title: agent.description,
@@ -470,7 +257,7 @@ export class WorkOverview {
     }
     for (const task of time?.backgroundTasks ?? []) {
       if (this.payload?.planTools !== undefined) continue;
-      if (!task.open || !this.turnRunning) continue;
+      if (!task.open) continue;
       view.now.push({ id: `background:${task.taskId}`, agent: "Claude", title: task.description,
         start: task.start, elapsed: (this.nowMs(time) ?? task.end) - task.start, status: "running", tokens: null, cacheRead: null, external: false });
     }
@@ -570,7 +357,6 @@ export class WorkOverview {
     this.graph.tick(nowMs);
     if (this.mode === "analysis") this.refreshPlanPeriods();
     if (this.mode === "summary") this.renderPlan();
-    if (this.mode === "analysis" && this.llmProgress !== undefined) this.renderLlmRunLine();
   }
 
   handleInspectorResult(message: Extract<HostToWebview, { type: "agentInspectorResult" }>): void {
@@ -627,27 +413,13 @@ export class WorkOverview {
       this.execLogFindingsEmptyLabel,
       this.execLogMarks,
       semantic?.l3,
-      this.llmAnalysisEnabled,
-      this.hasRecord(),
       this.turnRunning,
-      this.llmRunning,
-      this.llmProgress,
-      this.llmFailure,
-      this.llmRefusal,
-      this.analysisFailure,
     ]);
   }
 
   private analysisEvidenceKey(): string {
     const ids = new Set<string>();
     for (const mark of this.execLogMarks ?? []) ids.add(mark.toolUseId);
-    const llm = this.activeL3()?.llm;
-    const attached = llm !== undefined && "attached" in llm ? llm.attached : undefined;
-    for (const finding of attached?.findings ?? []) {
-      for (const evidence of finding.evidence) {
-        if (evidence.navigateToolUseId !== undefined) ids.add(evidence.navigateToolUseId);
-      }
-    }
     return JSON.stringify(
       Array.from(ids).sort().map((id) => [id, this.toolEvidence?.has(id) === true])
     );
@@ -666,34 +438,7 @@ export class WorkOverview {
 
   private renderL3(): void {
     this.l3Dirty = false;
-    this.renderedRecord = this.hasRecord();
-    const l3 = this.activeL3();
-    const evidenceNavigation = this.toolEvidence
-      ? {
-          has: (toolUseId: string) => this.toolEvidence?.has(toolUseId) === true,
-          navigate: (toolUseId: string) => {
-            if (this.toolEvidence?.has(toolUseId) === true) {
-              this.onViewChange(() => {
-                this.setMode("log");
-                this.toolEvidence?.navigate(toolUseId);
-              });
-            }
-          },
-        }
-      : undefined;
-    renderAnalysisFactsView(
-      this.l3El,
-      l3,
-      this.tabId,
-      this.llmAnalysisEnabled,
-      this.turnRunning,
-      this.llmRunning,
-      evidenceNavigation,
-      this.l3LlmEl,
-      this.hasRecord()
-    );
-    this.renderLlmRunLine();
-    this.renderAnalysisFailureLine();
+    renderAnalysisFactsView(this.l3El, this.activeL3());
   }
 
   private activeSemantic(): SemanticModelPayload | undefined {
@@ -865,7 +610,7 @@ export class WorkOverview {
 
   private renderPlansModule(summary: AnalysisPlansView): HTMLElement {
     const time = this.activeSemantic()?.timeBuckets;
-    const now = time === undefined ? -Infinity : planNow(time, this.lastTickMs, this.turnRunning);
+    const now = time === undefined ? -Infinity : planNow(time, this.lastTickMs);
     const mod = div("wa-plans");
     mod.style.setProperty("--l-row-h", `${ROW_H}px`);
     const toolbar = div("wa-rows-toolbar");
@@ -1129,6 +874,9 @@ export class WorkOverview {
       box.appendChild(span("wa-quiet", NO_FINDINGS_TEXT));
       return;
     }
+    const origin = div("wa-origin");
+    origin.append(span("wa-origin-tag", SCRIPT_ORIGIN_LABEL), span("wa-origin-note", SCRIPT_ORIGIN_NOTE));
+    box.appendChild(origin);
     for (const { family, code, title, note } of FINDING_SECTIONS) {
       const rows = findings.filter((f) => f.family === family);
       const section = document.createElement("section");
@@ -1224,7 +972,6 @@ export class WorkOverview {
   private revealFinding(anchor: string): void {
     this.onViewChange(() => {
       this.setMode("analysis", true);
-      this.setAnalysisSub("script");
       for (const old of Array.from(this.findingsEl.querySelectorAll<HTMLElement>(".wa-find.wa-hit"))) old.classList.remove("wa-hit");
       const target = this.findingsEl.querySelector<HTMLElement>(`.wa-find[data-finding-anchor="${CSS.escape(anchor)}"]`);
       if (target === null) return;
@@ -1313,7 +1060,8 @@ export class WorkOverview {
     this.rosterRunsKey = JSON.stringify(this.payload?.externalRuns ?? []);
     const roleRuns = [...this.payload?.externalRuns ?? []].sort((a, b) => (b.run.startedAt ?? 0) - (a.run.startedAt ?? 0)).slice(0, 50);
     for (const { label, run } of roleRuns) {
-      const outcome = run.running ? l10n.t("Running") : run.outcome === null ? unknown : run.outcome === "ok" ? l10n.t("Succeeded") : run.outcome === "failed" ? l10n.t("Failed")
+      const end = externalRunEndStatus(run);
+      const outcome = end === "running" ? l10n.t("Running") : end === "stale" ? l10n.t("Tracking stopped") : run.outcome === "ok" ? l10n.t("Succeeded") : run.outcome === "failed" ? l10n.t("Failed")
         : run.outcome === "timeout" ? l10n.t("Timed out") : run.outcome === "stopped" ? l10n.t("Stopped") : l10n.t("Refused");
       const numbers = `${outcome} · ${this.hudDuration(run.durationMs).textContent} · ${planTokens(run.tokens)} · ${l10n.t("Cache read")} ${planTokens(run.cacheRead)}` + (run.cwd ? ` · ${run.cwd}` : "");
       const failed = run.outcome !== null && externalRunStatus(run.outcome) === "failed";
@@ -1410,7 +1158,7 @@ export class WorkOverview {
   }
 
   private nowMs(view: TimeBucketView | undefined): number | undefined {
-    if (!this.turnRunning) return undefined;
+    if (view === undefined || !planLive(view)) return undefined;
     if (this.lastTickMs !== undefined && view?.lastAt !== null && view !== undefined && this.lastTickMs > view.lastAt) return this.lastTickMs;
     return undefined;
   }
@@ -1622,9 +1370,7 @@ export class WorkOverview {
     const group = this.hudGroup("analysis", l10n.t("04 ANALYSIS"), l10n.t("Analysis"), l10n.t("Open ANALYSIS (improvement candidates)"));
     const figures = div("wo-hud-figures");
     const count = (n: number | null | undefined) => n == null ? "—" : String(n);
-    figures.append(this.hudFigure("improvable", view?.llmState === "current" ? l10n.t("Improvement candidates") : l10n.t("Improvement candidates (script analysis only)"), count(view?.improvableCount)),
-      this.hudFigure("script", l10n.t("Script analysis findings"), count(view?.scriptFindingCount), true));
-    if (view?.llmState === "current") figures.appendChild(this.hudFigure("llm", l10n.t("LLM analysis findings"), count(view.llmFindingCount), true));
+    figures.append(this.hudFigure("script", l10n.t("Script analysis findings"), count(view?.scriptFindingCount)));
     const breakdown = div("wo-hud-breakdown");
     const row = (label: string, n: number | null, percent: number | null) => {
       const item = div("wo-hud-breakdown-row");
@@ -1638,17 +1384,6 @@ export class WorkOverview {
     };
     breakdown.appendChild(span("wo-hud-breakdown-head", l10n.t("Script analysis · Findings with candidates")));
     row(l10n.t("With candidates (of {0} total)", count(view?.scriptFindingCount)), view?.scriptCandidateCount ?? null, view?.scriptCandidatePercent ?? null);
-    breakdown.appendChild(span("wo-hud-breakdown-head", view?.llmState === "current"
-      ? l10n.t("LLM analysis · {0} · By improvement area · Rejected {1}", view.generatedAtLabel ?? "—", count(view.rejectedCount))
-      : l10n.t("LLM Analysis")));
-    const executionText = view?.llmExecutionState === "running" ? l10n.t("LLM analysis running")
-      : view?.llmExecutionState === "attemptFailed" ? l10n.t("LLM analysis failed")
-      : view?.llmExecutionState === "disabled" ? l10n.t("LLM analysis disabled") : undefined;
-    if (executionText) breakdown.appendChild(span("wo-hud-status", executionText));
-    for (const area of view?.llmAreas ?? []) row(area.label, area.count, area.percent);
-    if (view?.llmState !== "current") breakdown.appendChild(span("wo-hud-none", view === undefined ? l10n.t("Not measured") : view.llmState === "stale"
-      ? l10n.t("Results are out of date · Run again to see counts by improvement area")
-      : executionText ? l10n.t("Counts unavailable") : l10n.t("Not run · Run to see counts by improvement area")));
     group.append(figures, breakdown);
     return group;
   }
@@ -1690,13 +1425,13 @@ export class WorkOverview {
       const stats = span("earlier-stats", "");
       stats.append(at, ` · ${l10n.t("{0} steps", count)} · `, measuredSumNote(l10n.t("{0} tokens", planTokens(usage?.tokens ?? null)), usage?.partial));
       const duration = span("earlier-duration", "");
-      if (block.running && this.turnRunning) duration.append(l10n.t("Running"), " ");
+      if (block.running) duration.append(l10n.t("Running"), " ");
       duration.appendChild(elapsed);
       stats.title = l10n.t("Cache read: {0} tokens", planTokens(usage?.cacheRead ?? null));
       const title = span("earlier-title", block.text.split(/\r?\n/, 1)[0]);
       if (/[\u3040-\u30ff\u3400-\u9fff]/.test(title.textContent ?? "")) title.lang = "ja";
       const number = span("earlier-number", block.requestNumber ?? "—");
-      if (block.running && this.turnRunning) number.classList.add("current");
+      if (block.running) number.classList.add("current");
       row.append(number, title, duration, stats);
       row.onclick = () => {
         const turn = this.reachableTurn(block.turnIds);
@@ -1726,7 +1461,7 @@ export class WorkOverview {
   private refreshPlanPeriods(): void {
     const time = this.activeSemantic()?.timeBuckets;
     if (time === undefined) return;
-    const now = planNow(time, this.lastTickMs, this.turnRunning);
+    const now = planNow(time, this.lastTickMs);
     for (const el of Array.from(this.measuredEl.querySelectorAll<HTMLElement>(".wa-live-period"))) {
       el.textContent = planPeriodText(Number(el.dataset.start), Number(el.dataset.end), true, now);
     }

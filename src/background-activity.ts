@@ -1,4 +1,5 @@
 import { isHistoryEvent, type NormalizedEvent } from "./protocol";
+import { isDelegationLaunchTool, isMainExternalRun } from "./claude-tool-names";
 
 export const BACKGROUND_ACTIVITY_LIST_MAX = 256;
 
@@ -128,7 +129,9 @@ export function applyActivityEvent(state: BackgroundActivityState, ev: Normalize
       if (
         !isHistoryEvent(ev) &&
         ev.work?.placement !== undefined &&
-        ev.work.agents?.some((agent) => agent.toolUseId === ev.toolUseId) === true
+        isDelegationLaunchTool(ev.toolName) &&
+        (ev.work.agents?.some((agent) => agent.toolUseId === ev.toolUseId) === true ||
+          isMainExternalRun(ev))
       ) {
         state.delegations.set(ev.toolUseId, {
           label: ev.inputSummary ?? ev.toolName,
@@ -140,9 +143,10 @@ export function applyActivityEvent(state: BackgroundActivityState, ev: Normalize
       break;
     case "tool_call_finished": {
       const d = state.delegations.get(ev.toolUseId);
+      const launchedTaskId = ev.asyncLaunchedAgentId ?? ev.backgroundTaskId;
       if (d !== undefined) {
-        if (ev.asyncLaunchedAgentId !== undefined && !ev.isError) {
-          d.agentId = ev.asyncLaunchedAgentId;
+        if (launchedTaskId !== undefined && !ev.isError) {
+          d.agentId = launchedTaskId;
           changed = true;
         } else {
           changed = d.running;
@@ -159,17 +163,19 @@ export function applyActivityEvent(state: BackgroundActivityState, ev: Normalize
         state.lifecycleSeenIds.add(id);
       }
       if (ev.resumedAgentId !== undefined && !ev.isError) {
-        changed = setDelegationRunning(state, ev.resumedAgentId, true) || changed;
+        if (!isHistoryEvent(ev)) {
+          for (const reopened of ev.work?.reopened ?? []) {
+            const known = state.delegations.get(reopened.toolUseId);
+            if (known === undefined) state.delegations.set(reopened.toolUseId, { label: reopened.toolUseId, agentId: reopened.agentId, running: true, background: true });
+            else Object.assign(known, { agentId: reopened.agentId, running: true, background: true });
+            changed = true;
+          }
+        }
         if (state.finishedTaskIds.delete(ev.resumedAgentId)) changed = true;
         state.lifecycleSeenIds.add(ev.resumedAgentId);
       }
       break;
     }
-    case "turn_interrupted":
-    case "turn_failed":
-      changed = state.delegations.size > 0;
-      state.delegations.clear();
-      break;
     case "conversation_closed":
     case "conversation_opened":
       changed = clearProcessActivity(state);
@@ -215,6 +221,10 @@ export function liveBackgroundTasks(state: BackgroundActivityState): BackgroundT
 export function hasRunningDelegation(state: BackgroundActivityState): boolean {
   for (const d of state.delegations.values()) if (d.running) return true;
   return false;
+}
+
+export function conversationWorking(turnRunning: boolean, state: BackgroundActivityState): boolean {
+  return turnRunning || liveBackgroundTasks(state).length > 0 || hasRunningDelegation(state);
 }
 
 export function runningDelegationIds(state: BackgroundActivityState): string[] {

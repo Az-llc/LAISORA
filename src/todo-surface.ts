@@ -4,6 +4,7 @@ import { join } from "node:path";
 import { openFileLink } from "./composer-io";
 import { isInSessionStore, lookupSessionFile } from "./session-files";
 import { sessionRecordId } from "./session-record";
+import { conversationWorking } from "./background-activity";
 import { RecordTailReader, TodoAskRecordReader, TodoDecisionRecorder, todoWorkTotal, todoWorkTurnReader, type TodoWorkTurns } from "./todo-ask-record";
 import { getLaisoraConfiguration } from "./claude-settings";
 import { extensionContext, output, store } from "./host-context";
@@ -105,8 +106,12 @@ export function todoTemplateViews(document: TodoDocument): TodoTemplateView[] {
 
 function openTabs(): TodoTabConversation[] {
   return [...(store?.sessions.values() ?? [])].filter(s => !s.closed).map(s => ({
-    tabId: s.tabId, itemId: s.todoItemId, sessionId: sessionRecordId(s), running: (s.conversation?.state ?? "idle") !== "idle",
+    tabId: s.tabId, itemId: s.todoItemId, sessionId: sessionRecordId(s), running: sessionWorking(s),
   }));
+}
+
+function sessionWorking(s: Session): boolean {
+  return conversationWorking((s.conversation?.state ?? "idle") !== "idle", s.backgroundActivity);
 }
 
 const TODO_ASK_STAT_PARALLEL = 4;
@@ -758,6 +763,7 @@ export async function todoLinkedItemAtStart(s: Session): Promise<TodoLinkedItem 
 }
 
 const linkedSessions = new WeakMap<Session, string>();
+const postedWorking = new WeakMap<Session, boolean>();
 
 export function noteTodoConversationEvent(s: Session, ev: { kind: string; auth?: { sessionId?: string } | null }): void {
   if (!todoFeatureEnabled()) return;
@@ -770,12 +776,18 @@ export function noteTodoConversationEvent(s: Session, ev: { kind: string; auth?:
     if (todoStore) void applyHostTodoOperation(todoStore, { kind: "linkConversation", id: s.todoItemId, sessionId, owner: TODO_WINDOW_ID, tab: todoTabKey(s.tabId) }, "human");
     return;
   }
+  const working = sessionWorking(s);
+  const workingChanged = postedWorking.get(s) !== working;
+  postedWorking.set(s, working);
   if (ev.kind === "turn_started") {
     s.todoTurnStartedAt = Date.now();
     if (cachedItemOf(s) !== undefined) postTodoSnapshot();
     return;
   }
-  if (ev.kind !== "turn_completed" && ev.kind !== "turn_failed" && ev.kind !== "turn_interrupted") return;
+  if (ev.kind !== "turn_completed" && ev.kind !== "turn_failed" && ev.kind !== "turn_interrupted") {
+    if (workingChanged && cachedItemOf(s) !== undefined) postTodoSnapshot();
+    return;
+  }
   const startedAt = s.todoTurnStartedAt;
   s.todoTurnStartedAt = undefined;
   if (cachedItemOf(s) === undefined) return;

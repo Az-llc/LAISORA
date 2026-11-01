@@ -10,6 +10,7 @@ import { compactBoundaryTime } from "./time-buckets";
 import { extractResumeSignals, extractStage0ToolFields, isResumeSignalToolName, parseTaskNotification } from "./tool-observation";
 import { redactAbsolutePaths, redactOptional } from "./path-redaction";
 import { advanceRunRoot, countFileEdit, singleToolUseResult, type RunRootState } from "./edit-summary";
+import { askUnansweredOf, askUnansweredQuestions, isAskUnansweredKind, type AskUnansweredKind } from "./ask-unanswered";
 import { isFileWritingTool } from "./file-writing-tools";
 import { fileIdentityOf, sameFileIdentity, type FileIdentity } from "./path-containment";
 import {
@@ -2840,6 +2841,7 @@ interface ApprovalResultRecord {
   behavior?: "allow" | "deny" | "withdrawn";
   isError?: boolean;
   detailText?: string;
+  unanswered?: AskUnansweredKind;
 }
 
 function stringAnswers(value: unknown): Record<string, string> | undefined {
@@ -2877,6 +2879,7 @@ export function restoredApprovalResolution(
   answers: Record<string, string> | undefined,
   followUp: ApprovalFollowUp | undefined
 ): RestoredApprovalCard["resolution"] {
+  if (result?.unanswered !== undefined) return "unanswered";
   if (result?.behavior === "allow") return "allowed";
   if (result?.behavior === "deny" || isLaisoraDeniedResult(result)) return "denied";
   if (result?.behavior === "withdrawn") return "withdrawn";
@@ -2920,7 +2923,8 @@ function settleFollowedApprovals(index: ApprovalRestoreIndex, record: Record<str
 function addApprovalResults(results: Map<string, ApprovalResultRecord>, record: Record<string, any>): void {
   if (record.isSidechain === true) return;
   if (record.type === APPROVAL_RESOLVED_TYPE && typeof record.requestId === "string") {
-    results.set(record.requestId, { text: "", answers: stringAnswers(record.answers), behavior: approvalBehavior(record.behavior) });
+    const unanswered = isAskUnansweredKind(record.unanswered) ? record.unanswered : undefined;
+    results.set(record.requestId, { text: "", answers: stringAnswers(record.answers), behavior: approvalBehavior(record.behavior), ...(unanswered ? { unanswered } : {}) });
   }
   if (record.type !== "user") return;
   const content = asRecord(record.message)?.content;
@@ -2928,6 +2932,7 @@ function addApprovalResults(results: Map<string, ApprovalResultRecord>, record: 
   const single = content.filter((block) => asRecord(block)?.type === TOOL_RESULT_TYPE).length === 1;
   const detail = single ? asRecord(record.toolUseResult) : null;
   const detailText = single && typeof record.toolUseResult === "string" ? record.toolUseResult : undefined;
+  const unanswered = single ? askUnansweredOf(record.toolUseResult) : undefined;
   for (const block of content) {
     const result = asRecord(block);
     if (result?.type !== TOOL_RESULT_TYPE || typeof result.tool_use_id !== "string") continue;
@@ -2937,6 +2942,7 @@ function addApprovalResults(results: Map<string, ApprovalResultRecord>, record: 
       behavior: approvalBehavior(detail?.behavior),
       isError: result.is_error === true,
       ...(detailText !== undefined ? { detailText } : {}),
+      ...(unanswered !== undefined ? { unanswered } : {}),
     });
   }
 }
@@ -3006,12 +3012,13 @@ function extractRestoredApprovalMessages(
       try { input = JSON.parse(input); } catch { input = { recordedInput: input }; }
     }
     const questions = use.name === "AskUserQuestion" ? restoredQuestions(asRecord(input) ?? {}) : undefined;
-    let answers = result?.answers;
-    if (!answers && questions && result?.text) answers = recordedQuestionAnswers(result.text, questions);
+    const unanswered = result?.unanswered;
+    let answers = unanswered ? undefined : result?.answers;
+    if (!answers && !unanswered && questions && result?.text) answers = recordedQuestionAnswers(result.text, questions);
     const resolution = restoredApprovalResolution(result, answers, undefined);
     const restoredApproval = redactCardValue({
       requestId: use.id, toolName: use.name, inputJson: JSON.stringify(redactCardValue(input ?? {})),
-      ...(questions ? { questions } : {}), ...(answers ? { answers } : {}), resolution,
+      ...(questions ? { questions } : {}), ...(answers ? { answers } : {}), resolution, ...(unanswered ? { unanswered } : {}),
     }) as RestoredApprovalCard;
     if (result === undefined || (isCliRejectedResult(result) && !result.behavior)) {
       const messageId = record.type === "assistant" ? asRecord(record.message)?.id : undefined;
@@ -3140,10 +3147,13 @@ export function extractVerbatimUserUtterances(
         ? (toolUseResult as Record<string, unknown>).answers
         : undefined;
     if (typeof answers === "object" && answers !== null && !Array.isArray(answers)) {
-      const entries = Object.entries(answers as Record<string, unknown>);
+      let entries = Object.entries(answers as Record<string, unknown>);
       if (!entries.every(([question, answer]) => typeof question === "string" && typeof answer === "string")) {
         throw new TypeError("AskUserQuestion answers must contain only string keys and values");
       }
+      const unanswered = askUnansweredQuestions(toolUseResult);
+      entries = entries.filter(([question]) => !unanswered.has(question));
+      if (entries.length === 0) continue;
       utterances.push({
         n: utterances.length + 1,
         at: lastAt,

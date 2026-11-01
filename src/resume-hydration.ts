@@ -28,7 +28,6 @@ import { extensionContext, output } from "./host-context";
 import {
   EventProvenance,
   HandoffContextUsage,
-  HostToWebview,
   isHandoffContextMeasurement,
   isObservedTime,
   NormalizedEventBody,
@@ -54,7 +53,7 @@ import {
   sessionSummaryOf,
   type PersistedOpenTab,
 } from "./session-list-wiring";
-import { currentGenerationRecords, seedUnknownLaunchers, timeBucketLastActivity, unknownLaunchers } from "./time-buckets";
+import { currentGenerationRecords, markTimeBucketsUnconfirmed, seedUnknownLaunchers, timeBucketLastActivity, unknownLaunchers } from "./time-buckets";
 import {
   captureResumeReadSet,
   claimParentParseTurn,
@@ -258,7 +257,6 @@ export interface ResumeHydration {
   titleAtResolve?: ResumeTitleState;
   workPostDirty: boolean;
   semanticPostDirty: boolean;
-  persistencePosts: Map<string, Extract<HostToWebview, { type: "analysisPersistenceState" }>>;
 }
 
 interface ResumeOpenOutcome {
@@ -320,7 +318,7 @@ export async function openResumedSession(
   if (forkState !== undefined) {
     output.appendLine(`[drop] resume of a handoff copy (${forkState}): ${req.sessionId}`);
     if (req.restoreEntry !== undefined) {
-      if (isHandoffForkHidden(forkState)) holdHandoffForkTab(req.restoreEntry);
+      if (isHandoffForkHidden(forkState)) holdHandoffForkTab(req.restoreEntry, forkState);
     } else {
       void vscode.window.showWarningMessage(forkState === "handing_off"
         ? l10n.t("LAISORA: This conversation is still being handed off. Open it after the handoff finishes.")
@@ -336,7 +334,7 @@ export async function openResumedSession(
     return { tabPosted, session: undefined };
   }
   const reuse = req.intoTabId ? st.sessions.get(req.intoTabId) : undefined;
-  const canReuse = !!reuse && isUnusedSession(reuse);
+  const canReuse = !!reuse && !reuse.awaitingLaisoraInput && isUnusedSession(reuse);
   if (!canReuse && st.sessions.size >= tabLimit()) {
     warnTabLimit();
     return { tabPosted, session: undefined };
@@ -382,8 +380,7 @@ export async function openResumedSession(
       source: "resume",
     };
     s.semantic.loadExternalRuns(s.conversation);
-    s.analysisStore.loadPersistedArtifactsFromStore();
-    s.analysisStore.flushPendingPersistence();
+    s.semantic.scheduleSemanticModelPost();
     if (canReuse) {
       void s
         .disposeDetachedConversation(detached)
@@ -438,7 +435,6 @@ export async function openResumedSession(
       summary: titleRequest.pending,
       workPostDirty: false,
       semanticPostDirty: false,
-      persistencePosts: new Map(),
     };
     s.hydration = hydration;
     s.hydrationCoverageUnconfirmed = false;
@@ -769,6 +765,12 @@ export async function foldHistoryEvents(
 
 export function hydrationLastActivity(draft: Pick<EventFoldDraft, "evidenceIndex" | "lastEventTimestamp">): number {
   return timeBucketLastActivity(draft.evidenceIndex.timeBuckets) ?? draft.lastEventTimestamp ?? Date.now();
+}
+
+export function markHydrationEnd(draft: Pick<EventFoldDraft, "evidenceIndex" | "lastEventTimestamp" | "workModel">): void {
+  const lastActivity = hydrationLastActivity(draft);
+  draft.workModel = markHydrationUnconfirmed(draft.workModel, lastActivity);
+  draft.evidenceIndex = { ...draft.evidenceIndex, timeBuckets: markTimeBucketsUnconfirmed(draft.evidenceIndex.timeBuckets, lastActivity) };
 }
 
 export function earliestRecordedTime(
@@ -1172,7 +1174,7 @@ async function runResumeHydrationStages(
   stage("evidence");
 
   draft.workModel = markRestoredSubagentGaps(draft.workModel, history, restored);
-  draft.workModel = markHydrationUnconfirmed(draft.workModel, hydrationLastActivity(draft));
+  markHydrationEnd(draft);
 
   const anchors = messages
     .map((m) => m.uuid)
@@ -1267,7 +1269,7 @@ async function runResumeHydrationStages(
   if (sink.guardrailRefresh) s.guardrailRunner.scheduleGuardrailRefresh();
   if (sink.guardrailTick) s.guardrailRunner.scheduleGuardrailTick();
   if (sink.resolveOwner !== null) {
-    s.analysisStore.resolveOwnerFromAuthStatus(sink.resolveOwner.sessionId, sink.resolveOwner.logicalGeneration);
+    s.resolveOwnerFromAuthStatus(sink.resolveOwner.sessionId, sink.resolveOwner.logicalGeneration);
   }
   s.semantic.seedTranscriptTimeBuckets(h.filePath, h.sessionId, history, restored);
   s.semantic.scheduleTranscriptTimeBuckets();

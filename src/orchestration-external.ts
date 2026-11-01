@@ -13,7 +13,7 @@ import type { ApiKeyPolicy } from "./protocol";
 
 export { isExternalRows, isExternalTimeout } from "./orchestration-roster";
 export type { ExternalRow } from "./orchestration-roster";
-import { EXECUTORS, EXTERNAL_EXECUTORS, isExternalExecutorId, isExternalModel, isExternalRunOutcome, tokenUsage, type ExternalRunOutcome, type TokenUsage, type ExecutorProbe } from "./orchestration-executors";
+import { EXECUTORS, EXTERNAL_EXECUTORS, EXTERNAL_STDERR_TAIL_MAX, externalTimeoutHint, isExternalExecutorId, isExternalModel, isExternalRunOutcome, tokenUsage, type ExternalRunOutcome, type TokenUsage, type ExecutorProbe } from "./orchestration-executors";
 export { tokenUsage, parseAgyModels, parseCodexModels } from "./orchestration-executors";
 export type { TokenUsage } from "./orchestration-executors";
 export const WINDOWS_COMMAND_LINE_UTF16_LIMIT = 32767;
@@ -236,8 +236,8 @@ export function externalArgv(row: ExternalRow, cwd: string, minutes: number, pro
   if (!isExternalRows([row]) || !isExternalTimeout(minutes) || !isAbsolute(cwd)) throw new Error("R-ORC-12: invalid executor settings");
   return EXECUTORS[row.executor].argv!(row.model, row.effort, cwd, minutes, prompt, row.role);
 }
-export function parseExternalOutput(executor: ExternalRow["executor"], output: string, exitCode: number | null): { outcome: ExternalRunRecord["outcome"]; answer: string; usage?: TokenUsage } {
-  return EXECUTORS[executor].parseOutput!(output, exitCode);
+export function parseExternalOutput(executor: ExternalRow["executor"], output: string, exitCode: number | null, stderr?: string): { outcome: ExternalRunRecord["outcome"]; answer: string; reason?: string; usage?: TokenUsage } {
+  return EXECUTORS[executor].parseOutput!(output, exitCode, stderr);
 }
 
 export async function killExternalTree(pid: number, spawnChild: ExternalSpawn = spawn, platform = process.platform, killGroup = process.kill): Promise<void> {
@@ -296,8 +296,8 @@ export async function observeCodexSession(output: string, started: number, ended
 }
 
 async function capture(executable: string, args: string[], cwd: string | undefined, env: NodeJS.ProcessEnv, limit: number, deps: ExternalDependencies, maxOutput = Infinity) {
-  return new Promise<{ output: string; code: number | null; timeout: boolean; status: "exited" | "timeout" | "stopped" | "failed"; reason?: string; spawnCode?: string }>((resolve) => {
-    let output = "", settled = false, terminating = false, exited = false;
+  return new Promise<{ output: string; code: number | null; timeout: boolean; status: "exited" | "timeout" | "stopped" | "failed"; reason?: string; spawnCode?: string; stderr: string }>((resolve) => {
+    let output = "", stderr = "", settled = false, terminating = false, exited = false;
     let spawnCode: string | undefined;
     const captureSpawnCode = (error: unknown) => {
       const code = (error as NodeJS.ErrnoException)?.code;
@@ -314,7 +314,7 @@ async function capture(executable: string, args: string[], cwd: string | undefin
       deps.signal?.removeEventListener("abort", onAbort);
       child?.stdout?.destroy();
       child?.stderr?.destroy();
-      resolve({ output, code, timeout: status === "timeout", status, reason, spawnCode });
+      resolve({ output, code, timeout: status === "timeout", status, reason, spawnCode, stderr });
     };
     const terminate = (status: "timeout" | "stopped") => {
       if (settled || terminating || exited) return;
@@ -340,7 +340,8 @@ async function capture(executable: string, args: string[], cwd: string | undefin
     } catch (error) { captureSpawnCode(error); finish(null, "failed", runFailureReason("R-ORC-13: external executor launch failed", error)); return; }
     child.stdout?.setEncoding("utf8");
     child.stdout?.on("data", (data) => { output = (output + data.toString()).slice(0, maxOutput); });
-    child.stderr?.on("data", () => {});
+    child.stderr?.setEncoding("utf8");
+    child.stderr?.on("data", (data) => { stderr = (stderr + data.toString()).slice(-EXTERNAL_STDERR_TAIL_MAX); });
     child.once("error", (error) => { if (!terminating) { captureSpawnCode(error); finish(null, "failed", runFailureReason("R-ORC-13: external executor process failed", error)); } });
     child.once("exit", (code) => {
       if (terminating || settled) return;
@@ -785,35 +786,52 @@ async function compareControlFiles(snapshot: Awaited<ReturnType<typeof snapshotC
     for (const path of enumeration.files) paths.add(path);
   } catch { incomplete = true; }
   const states = await controlStates(paths, cache, budget);
+  let unverified = 0;
   for (const [path, current] of states) {
     if (controlExpired(budget)) break;
     try {
-      const before = snapshot.states.get(path);
-      let kind: "modified" | "created" | "deleted" | "modified via link" | "link changed" | "kind changed" | undefined;
-      if (current.exists === undefined || before && before.exists === undefined) { incomplete = true; continue; }
-      if (before && (before.link !== current.link || before.linked !== current.linked
-        || before.canonical && current.canonical && before.canonical !== current.canonical)
-        || !before && !current.exists && current.link) kind = "link changed";
-      else if (before?.exists && !current.exists) kind = "deleted";
-      else if (current.kindChanged || before?.kindChanged || current.type === "other" || before?.exists && current.exists && before.type !== current.type) kind = "kind changed";
-      else if (!before?.exists && current.exists) kind = "created";
-      else if (current.type === "file" && (current.tooLarge || before?.tooLarge)) {
-        if (current.size !== before?.size || current.mtimeMs !== before?.mtimeMs) kind = current.linked ? "modified via link" : "modified";
-      }
-      else if (current.type === "file") {
-        const hash = current.hash;
-        if (hash === undefined && budget.incomplete || before?.hash === undefined) incomplete = true;
-        else if (hash !== before.hash) kind = hash === undefined ? "deleted" : current.linked ? "modified via link" : "modified";
-      }
-      if (current.tooLarge || before?.tooLarge) changes.push("- " + label(path) + " (too large to compare; size+mtime identity)");
-      if (kind) changes.push("- " + label(path) + " (" + kind + ")");
+      const verdict = controlVerdict(snapshot.states.get(path), current, snapshot.incomplete, budget.incomplete);
+      if (verdict.incomplete) incomplete = true;
+      if (verdict.unverified) unverified++;
+      if (verdict.tooLarge) changes.push("- " + label(path) + " (too large to compare; size+mtime identity)");
+      if (verdict.kind) changes.push("- " + label(path) + " (" + verdict.kind + ")");
     } catch { incomplete = true; }
   }
   incomplete ||= budget.incomplete;
-  return changes.length || incomplete
-    ? ["Control files changed during the run:", ...changes, ...(incomplete ? ["control-file snapshot incomplete."] : []),
-      "Delegates may not change these files. The conductor must review and revert unwanted changes before committing."].join("\n")
-    : undefined;
+  return controlReport(changes, unverified, incomplete);
+}
+
+type ControlState = ControlIdentity & ControlContent;
+type ControlChangeKind = "modified" | "created" | "deleted" | "modified via link" | "link changed" | "kind changed";
+interface ControlVerdict { kind?: ControlChangeKind; tooLarge?: boolean; unverified?: boolean; incomplete?: boolean }
+
+export function controlVerdict(before: ControlState | undefined, current: ControlState, snapshotIncomplete: boolean, comparisonIncomplete: boolean): ControlVerdict {
+  if (current.exists === undefined || before && before.exists === undefined) return { incomplete: true };
+  if (!before && snapshotIncomplete) return current.exists || current.link ? { unverified: true, incomplete: true } : {};
+  const tooLarge = current.tooLarge || before?.tooLarge ? true : undefined;
+  if (before && (before.link !== current.link || before.linked !== current.linked
+    || before.canonical && current.canonical && before.canonical !== current.canonical)
+    || !before && !current.exists && current.link) return { kind: "link changed", tooLarge };
+  if (before?.exists && !current.exists) return { kind: "deleted", tooLarge };
+  if (current.kindChanged || before?.kindChanged || current.type === "other" || before?.exists && current.exists && before.type !== current.type) return { kind: "kind changed", tooLarge };
+  if (!before?.exists && current.exists) return { kind: "created", tooLarge };
+  if (current.type !== "file") return { tooLarge };
+  const modified = current.linked ? "modified via link" : "modified";
+  if (tooLarge) return { tooLarge, kind: current.size !== before?.size || current.mtimeMs !== before?.mtimeMs ? modified : undefined };
+  const hash = current.hash;
+  if (hash === undefined && comparisonIncomplete || before?.hash === undefined) return { incomplete: true };
+  if (hash !== before.hash) return { kind: hash === undefined ? "deleted" : modified };
+  return {};
+}
+
+export function controlReport(changes: readonly string[], unverified: number, incomplete: boolean): string | undefined {
+  if (!changes.length && !incomplete) return undefined;
+  return [
+    ...(changes.length ? ["Control files changed during the run:", ...changes] : []),
+    ...(unverified ? [`${unverified} control files were absent from the incomplete pre-run snapshot; whether they were created during the run is unverified.`] : []),
+    ...(incomplete ? ["control-file snapshot incomplete."] : []),
+    "Delegates may not change these files. The conductor must review and revert unwanted changes before committing.",
+  ].join("\n");
 }
 
 let activeExternalRuns = 0;
@@ -939,7 +957,7 @@ export async function runExternal(...args: Parameters<typeof runExternalUntracke
   try {
     const waitResult = await waitForExecutorUpdate(row.executor, deps.signal, started + totalMs);
     if (waitResult === "stopped") return externalRunOutcome(row, started, { outcome: "stopped", answer: EXTERNAL_STOPPED }, {});
-    if (waitResult === "timeout") return externalRunOutcome(row, started, { outcome: "timeout", answer: EXTERNAL_UPDATE_WAIT_TIMEOUT }, {});
+    if (waitResult === "timeout") return externalRunOutcome(row, started, { outcome: "timeout", answer: `${EXTERNAL_UPDATE_WAIT_TIMEOUT} ${externalTimeoutHint(options.timeoutMinutes)}` }, {});
     const waited = Date.now() - started;
     activeExternalRuns++;
     try {
@@ -994,9 +1012,9 @@ async function runExternalUntracked(row: ExternalRow, input: ExternalInput, opti
       const result = await capture(executable, args, cwd, buildClaudeEnv(process.env, options.apiKeyPolicy).env,
         deps.timeoutMs ?? options.timeoutMinutes * 60_000, deps);
       if (row.executor === "codex") attestation = await observeCodexSession(result.output, started, Date.now(), deps.codexHome);
-      parsed = result.status === "timeout" ? { outcome: "timeout", answer: result.reason ?? "External executor timed out." }
+      parsed = result.status === "timeout" ? { outcome: "timeout", answer: `${result.reason ?? "External executor timed out."} ${externalTimeoutHint(options.timeoutMinutes)}` }
         : result.status === "stopped" ? { outcome: "stopped", answer: result.reason ?? "External executor stopped." }
-        : result.reason ? { outcome: "failed", answer: result.reason } : parseExternalOutput(row.executor, result.output, result.code);
+        : result.reason ? { outcome: "failed", answer: result.reason } : parseExternalOutput(row.executor, result.output, result.code, result.stderr);
     } else return completedRun();
   } catch (error) {
     parsed = { outcome: "failed", answer: runFailureReason("R-ORC-13: external executor failed.", error) };
@@ -1019,6 +1037,6 @@ function externalRunOutcome(row: ExternalRow, started: number, parsed: ReturnTyp
     requestedModel: row.model || "unknown", requestedEffort: row.effort ?? "none", observedModel: attestation?.model ?? "unknown", observedEffort: attestation?.effort ?? "unknown",
     ...(attestation ? { attestation } : {}),
     ...(row.effort === undefined ? {} : { effort: row.effort }), startedAt: new Date(started).toISOString(), endedAt: new Date(ended).toISOString(), durationMs: ended - started,
-    outcome: parsed.outcome, reason: parsed.outcome === "ok" ? undefined : parsed.answer, usage: parsed.usage });
+    outcome: parsed.outcome, reason: parsed.outcome === "ok" ? undefined : parsed.reason ?? parsed.answer, usage: parsed.usage });
   return { record, result: { isError: parsed.outcome !== "ok", content: [{ type: "text" as const, text: parsed.answer + (controlWarning ? `\n${controlWarning}` : "") }] } };
 }

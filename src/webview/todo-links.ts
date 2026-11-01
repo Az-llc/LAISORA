@@ -1,3 +1,4 @@
+import { delegatedRunsText } from "./status-line";
 import * as l10n from "@vscode/l10n";
 import type { TodoEdit, TodoListItem, TodoSessionLinkView, TodoTabItem, WebviewToHost } from "../protocol";
 import { todoAgentItemId } from "../todo-model";
@@ -85,7 +86,8 @@ export function todoTabMarks(tabId: string, title: string, extras: { readonly ru
     lines.push(l10n.t("Parent conversation: {0}", parentConversationTitle(links, root)));
   } else {
     const children = items.filter(candidate => candidate.id !== item.id && candidate.talk !== undefined && todoItemPath(items, candidate.id)[0]?.id === item.id).length;
-    lines.push(l10n.t("Subagents running: {0} · Child conversations: {1}", extras.runningAgents, children));
+    if (extras.runningAgents > 0) lines.push(delegatedRunsText(extras.runningAgents));
+    lines.push(l10n.t("Child conversations: {0}", children));
   }
   lines.push(l10n.t("ToDo path: {0}", path.map(step => todoItemLabel(step)).join(` ${MARKS.pathSeparator} `)));
   return { color: todoGroupColor(links.groupColorOf(root.group)), child: item.parentId !== null, tooltip: lines.join("\n") };

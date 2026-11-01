@@ -304,6 +304,13 @@ export function heldForkTabAction(
   return forkFile === "missing" ? "drop" : "keep";
 }
 
+export type HeldForkTabNotice = { notice: false } | { notice: true; state: HandoffForkState | undefined };
+
+export function heldForkTabNotice(action: HeldForkTabAction, settled: HandoffForkState | undefined, held: HandoffForkState): HeldForkTabNotice {
+  if (action === "reopen") return { notice: false };
+  return { notice: true, state: action === "keep" ? settled ?? held : settled };
+}
+
 export type HeldForkTabEvent =
   | { kind: "opened" | "closed"; sessionId: string }
   | { kind: "settled"; sessionId: string; action: HeldForkTabAction };
@@ -311,15 +318,17 @@ export type HeldForkTabEvent =
 export interface HeldForkTab<T> {
   tab: T;
   preceding: readonly string[];
+  state: HandoffForkState;
 }
 
 export function holdForkTab<T extends { sessionId: string }>(
   held: readonly HeldForkTab<T>[],
   tab: T,
-  preceding: readonly string[]
+  preceding: readonly string[],
+  state: HandoffForkState
 ): HeldForkTab<T>[] {
   const existing = held.find((h) => h.tab.sessionId === tab.sessionId);
-  return [...held.filter((h) => h !== existing), { tab, preceding: existing?.preceding ?? preceding }];
+  return [...held.filter((h) => h !== existing), { tab, preceding: existing?.preceding ?? preceding, state }];
 }
 
 export function releaseHeldForkTab<T extends { sessionId: string }>(

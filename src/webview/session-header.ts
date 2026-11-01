@@ -6,7 +6,7 @@ import { ACTIONS_MENU_GLYPH } from "./todo-edit";
 import { remoteControlLabel, remoteControlOn } from "./remote-control-view";
 import { MARKS } from "./marks";
 
-export const SESSION_MENU_ORDER = ["name", "handoff", "export", "remoteControl", "extras"] as const;
+export const SESSION_MENU_ORDER = ["name", "handoff", "export", "remoteControl", "improvement", "extras"] as const;
 
 export function handoffMenuLabel(): string {
   return l10n.t("Hand off to a new conversation");
@@ -14,6 +14,8 @@ export function handoffMenuLabel(): string {
 
 export interface SessionMenuExtra { label: string; icon: string; run: () => void }
 let sessionMenuExtras: (() => SessionMenuExtra[]) | null = null;
+let improvementMenuShown = true;
+export function setImprovementMenuShown(shown: boolean): void { improvementMenuShown = shown; }
 export function setSessionMenuExtras(provider: (() => SessionMenuExtra[]) | null): void { sessionMenuExtras = provider; }
 
 export function sessionNameMenuPlacement(left: number, right: number, width: number, viewport: number): "right" | "left" | "inline" {
@@ -225,13 +227,14 @@ export function createSessionHeader(tabId: string, title: string, send: (message
   for (const surface of [panel, submenu, dropdown]) surface.addEventListener("keydown", event => {
     if (!["ArrowDown", "ArrowUp", "Home", "End"].includes(event.key)) return;
     event.preventDefault(); event.stopPropagation();
-    const items = Array.from(surface.querySelectorAll<HTMLButtonElement>('[role^="menuitem"]')).filter(item => item.closest('[role="menu"]') === surface && !item.disabled);
+    const items = Array.from(surface.querySelectorAll<HTMLButtonElement>('[role^="menuitem"]')).filter(item => item.closest('[role="menu"]') === surface && !item.disabled && !item.hidden);
     const index = items.indexOf(document.activeElement as HTMLButtonElement);
     const next = event.key === "Home" ? 0 : event.key === "End" ? items.length - 1 : (index + (event.key === "ArrowDown" ? 1 : -1) + items.length) % items.length;
     items[next]?.focus();
   });
   const handoff = action(handoffMenuLabel(), "⇉", () => send({type: "startHandoff", tabId}));
   const exportItem = action(l10n.t("Export conversation to Markdown"), "↧", () => send({type: "exportTab", tabId}));
+  const improvement = action(l10n.t("Start LLM improvement analysis"), "✧", () => send({type: "startImprovementAnalysis"}));
   const remoteSwitch = document.createElement("span");
   remoteSwitch.className = "l-switch";
   remoteSwitch.setAttribute("aria-hidden", "true");
@@ -256,7 +259,7 @@ export function createSessionHeader(tabId: string, title: string, send: (message
   };
   const extras = document.createElement("div");
   extras.className = "session-actions-extras";
-  const menuItems: Record<(typeof SESSION_MENU_ORDER)[number], HTMLElement> = { name: nameItem, handoff, export: exportItem, remoteControl, extras };
+  const menuItems: Record<(typeof SESSION_MENU_ORDER)[number], HTMLElement> = { name: nameItem, handoff, export: exportItem, remoteControl, improvement, extras };
   panel.append(...SESSION_MENU_ORDER.map(key => menuItems[key]));
   menu.addEventListener("keydown", event => {
     if (event.key === "Escape") { event.preventDefault(); event.stopPropagation(); closeSubmenu(); menu.open = false; toggle.focus(); }
@@ -270,6 +273,7 @@ export function createSessionHeader(tabId: string, title: string, send: (message
     toggle.setAttribute("aria-expanded", String(menu.open));
     if (!menu.open) { closeSubmenu(); return; }
     closeDropdown();
+    improvement.hidden = !improvementMenuShown;
     extras.replaceChildren();
     for (const extra of sessionMenuExtras?.() ?? []) action(extra.label, extra.icon, extra.run, extras);
     panel.style.top = getComputedStyle(panel).position === "fixed" ? `${toggle.getBoundingClientRect().bottom + 2}px` : "100%";

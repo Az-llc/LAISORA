@@ -250,6 +250,7 @@ export const HANDBACK_OMITTED_MARKER = "Omitted:";
 export const HANDBACK_DENIAL_LIMIT = 2;
 const HANDBACK_OMITTED_INDEX = `a line starting "${HANDBACK_OMITTED_MARKER}" that names what it left out (details, raw output), one line each, or "${HANDBACK_OMITTED_MARKER} none"`;
 export const HANDBACK_INDEX_INSTRUCTION = `Tell every delegate to end its reply with ${HANDBACK_OMITTED_INDEX}.`;
+export const HANDBACK_DELEGATE_NOTICE = `End your final report with ${HANDBACK_OMITTED_INDEX}.`;
 export function handbackIndexDenial(message: string): string | undefined {
   return message.split(/\r?\n/).some((line) => line.replace(/^[\s>#*-]*/, "").startsWith(HANDBACK_OMITTED_MARKER)) ? undefined
     : `End the report with ${HANDBACK_OMITTED_INDEX}, then call ${SUBAGENT_HANDBACK_TOOL} again with the full report.`;

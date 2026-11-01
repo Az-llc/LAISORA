@@ -1,5 +1,22 @@
 # Changelog
 
+## 1.15.0
+
+- **Claude in Chrome.** Conversations start with the Claude in Chrome browser tools, so Claude can
+  act in your Chrome when the extension is installed and connected. Turn it off with the new switch
+  on the settings page (takes effect for conversations started or resumed after the change).
+- **LLM improvement analysis.** The conversation menu gets "Start LLM improvement analysis". It
+  counts recurring stops and failures across all local Claude Code conversations and opens a new
+  conversation where Claude groups the findings by owner and proposes fixes you can choose. Hide
+  the menu item in the settings.
+- The status line shows a question waiting for you first, and keeps background tasks and delegates
+  after an interrupted or failed turn.
+- A question you leave unanswered reaches Claude as skipped, or as answered in the chat, instead of
+  leaving Claude waiting.
+- When Claude resumes an agent, the agent moves to the plan step named in the message.
+- On Windows the Claude Code CLI runs with a UTF-8 locale.
+- Claude Agent SDK 0.3.316 (Claude Code 2.1.316).
+
 ## 1.14.1
 
 - Claude is told up front the rules that step tracking and the file guards enforce: reopen a finished

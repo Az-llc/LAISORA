@@ -12,7 +12,7 @@ import {
 } from "./dom";
 import { EFFORT_ORDER, MODE_LABELS, MODE_ORDER, activeTab, activeTabId, closeUsagePanel } from "./main";
 import { type ComposerSendKey, type HostToWebview, type ModelInfo } from "../protocol";
-import { setSessionMenuExtras, type SessionMenuExtra } from "./session-header";
+import { setImprovementMenuShown, setSessionMenuExtras, type SessionMenuExtra } from "./session-header";
 import type { Tab } from "./tab";
 import { REMOTE_CONTROL_CARD_HIDDEN_CLASS } from "./remote-control-view";
 import { MARKS } from "./marks";
@@ -33,6 +33,7 @@ export function applyUserSettings(msg: Extract<HostToWebview, { type: "userSetti
   sendKey = msg.composerSendKey;
   askQualityCheck = msg.askQualityCheck === true;
   document.body.classList.toggle(REMOTE_CONTROL_CARD_HIDDEN_CLASS, msg.remoteControlCard === false);
+  setImprovementMenuShown(msg.improvementMenu !== false);
   const nextEditSummary = msg.editSummaryEnabled === true;
   if (nextEditSummary === editSummary) return;
   editSummary = nextEditSummary;

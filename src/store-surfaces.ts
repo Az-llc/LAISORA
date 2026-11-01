@@ -3,8 +3,6 @@ import { configuredSystemAppExtensions, openWelcome } from "./gateway-host-actio
 import * as vscode from "vscode";
 import * as l10n from "@vscode/l10n";
 
-import { createAnalysisFileStorage } from "./analysis-file-storage";
-import type { AnalysisStorage } from "./analysis-persistence";
 import { ClaudeConversation } from "./claudeHost";
 import { postAttachments } from "./composer-io";
 import { releaseConversationHistory } from "./conversation-history";
@@ -45,38 +43,17 @@ interface WebviewSurface {
 
 export class SessionStore {
   readonly sessions = new Map<string, Session>();
-  readonly analysisStorage: AnalysisStorage;
   readonly rosterEvidenceDirectory: string | undefined;
   readonly orchestrationRunsDirectory: string | undefined;
   activeWebview: vscode.Webview | null = null;
   panel: vscode.WebviewPanel | null = null;
   private tabCounter = 0;
 
-  constructor(storage?: AnalysisStorage) {
-    const inMemory = new Map<string, unknown>();
-    const fallback: AnalysisStorage =
-      storage ??
-      (extensionContext?.globalState
-        ? {
-            get: (k) => extensionContext!.globalState.get(k),
-            update: async (k, v) => {
-              await extensionContext!.globalState.update(k, v);
-            },
-          }
-        : {
-            get: (k) => inMemory.get(k),
-            update: async (k, v) => {
-              if (v === undefined) inMemory.delete(k);
-              else inMemory.set(k, v);
-            },
-          });
-    this.analysisStorage = !storage && extensionContext?.globalStorageUri?.fsPath
-      ? createAnalysisFileStorage(vscode.Uri.joinPath(extensionContext.globalStorageUri, "analysis-results").fsPath, (line) => output.appendLine(line))
-      : fallback;
-    this.rosterEvidenceDirectory = !storage && extensionContext?.globalStorageUri?.fsPath
+  constructor() {
+    this.rosterEvidenceDirectory = extensionContext?.globalStorageUri?.fsPath
       ? vscode.Uri.joinPath(extensionContext.globalStorageUri, "roster-evidence").fsPath
       : undefined;
-    this.orchestrationRunsDirectory = !storage ? orchestrationRunsDirectoryOf(extensionContext?.globalStorageUri?.fsPath) : undefined;
+    this.orchestrationRunsDirectory = orchestrationRunsDirectoryOf(extensionContext?.globalStorageUri?.fsPath);
   }
 
   private readonly surfaces = new Map<vscode.Webview, WebviewSurface>();
@@ -318,11 +295,6 @@ export class SessionStore {
     return [...this.sessions.values()].map((s) => s.snapshotForSurface());
   }
 
-  llmAnalysisInFlightCount(): number {
-    let count = 0;
-    for (const s of this.sessions.values()) if (s.llmRun !== null) count++;
-    return count;
-  }
 }
 
 export function warnTabLimit(): void {
@@ -417,7 +389,6 @@ export async function handleSurfaceMessage(
       clearAutoHandoff(target!);
       target!.semantic.clearSemanticModelPostTimer();
       target!.guardrailRunner.clearGuardrailRefreshTimer();
-      target!.discardLlmAnalysis();
       releaseHistoryWindow(historyScopeKey(target!));
       releaseHistoryWindow(historyTranscriptScopeKey(target!));
       releaseConversationHistory(historyScopeKey(target!));

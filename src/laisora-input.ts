@@ -5,9 +5,10 @@ export const USAGE_LIMIT_RESET_NOTICE = "Your claude.ai usage limit has reset.";
 export type LaisoraInput =
   | { readonly kind: "resume" }
   | { readonly kind: "todo"; readonly title: string }
-  | { readonly kind: "todoFromReply"; readonly start: boolean };
+  | { readonly kind: "todoFromReply"; readonly start: boolean }
+  | { readonly kind: "improvement" };
 
-const LAISORA_INPUT_HEAD = /^\[LAISORA:(resume|todo|todoFromReply)\](?: ([^\n]*))?\n/;
+const LAISORA_INPUT_HEAD = /^\[LAISORA:(resume|todo|todoFromReply|improvement)\](?: ([^\n]*))?\n/;
 const TODO_FROM_REPLY_START = "start";
 
 function laisoraInputLabel(input: LaisoraInput): string {
@@ -26,6 +27,7 @@ export function parseLaisoraInput(recorded: string): { input: LaisoraInput; text
   if (!head) return undefined;
   const input: LaisoraInput = head[1] === "todo" ? { kind: "todo", title: head[2] ?? "" }
     : head[1] === "todoFromReply" ? { kind: "todoFromReply", start: head[2] === TODO_FROM_REPLY_START }
+    : head[1] === "improvement" ? { kind: "improvement" }
     : { kind: "resume" };
   return { input, text: trimmed.slice(head[0].length) };
 }
@@ -41,5 +43,6 @@ export function laisoraInputLine(input: LaisoraInput): string | undefined {
       ? l10n.t("LAISORA: Add to ToDo and start a new conversation (the topic of this reply)")
       : l10n.t("LAISORA: Add to ToDo (the topic of this reply)");
   }
+  if (input.kind === "improvement") return l10n.t("LAISORA sent Claude the brief for the LLM improvement analysis.");
   return undefined;
 }

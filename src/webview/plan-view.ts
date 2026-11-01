@@ -1,13 +1,12 @@
 import { toolIntentLabel } from "./status-line";
-import { agentElapsedMs, flattenAgents, type OrchestrationView, type PlanContext, type PlanContextStep, type PlanContextTokens, type PlanContextWork, type WorkAgentNode, type WorkModelPayload } from "../protocol";
-import { externalRunStatus } from "../orchestration-executors";
-import type { TaskStatus, WorkStatus } from "../work-model";
+import { agentElapsedMs, externalRunEndStatus, flattenAgents, workEndStatus, type OrchestrationView, type PlanContext, type PlanContextStep, type PlanContextTokens, type PlanContextWork, type WorkAgentNode, type WorkEndStatus, type WorkModelPayload } from "../protocol";
+import type { TaskStatus } from "../work-model";
 import { planHeading, planItemNumber, planStepKey, transitionPlanStep } from "../plan-steps";
 export { normalizePlanContent, planStepKey } from "../plan-steps";
 
 export interface PlanLane {
   id: string; agent: string; title: string; start: number | null; elapsed: number | null;
-  status: WorkStatus | "stopped"; tokens: number | null; tokensPartial?: boolean; cacheRead: number | null; contextTokens?: number; external: boolean;
+  status: WorkEndStatus; tokens: number | null; tokensPartial?: boolean; cacheRead: number | null; contextTokens?: number; external: boolean;
   resumedAt?: number; description?: string;
 }
 export interface PlanStep {
@@ -130,7 +129,7 @@ export function derivePlanView(model: WorkModelPayload | undefined, orchestratio
       return step;
     });
   }
-  const resumes = new Map<string, Array<{ at: number; status: WorkStatus; endedAt?: number }>>();
+  const resumes = new Map<string, Array<{ at: number; status: WorkEndStatus; endedAt?: number }>>();
   if (view.steps.length) for (const entry of model?.planHistory ?? []) {
     if (entry.kind === "resume") resumes.set(entry.agentId, [...resumes.get(entry.agentId) ?? [], { at: entry.at, status: entry.status, endedAt: entry.endedAt }]);
   }
@@ -139,12 +138,17 @@ export function derivePlanView(model: WorkModelPayload | undefined, orchestratio
   const shownEarlier = new Set((context?.blockId === latest?.blockId ? model?.earlierPlans ?? [] : []).flatMap(earlier =>
     (earlier.placements ?? []).filter(placement => placement.stepKey !== null)
       .map(placement => placement.toolUseId)));
+  const resumeSteps = new Map((context?.placements ?? []).flatMap(placement => placement.resumes === undefined ? []
+    : [[placement.toolUseId, new Map(placement.resumes.map(resume => [resume.at, resume]))] as const]));
+  const launchTokens = new Map((context?.placements ?? []).flatMap(placement => placement.tokens === undefined ? [] : [[placement.toolUseId, placement.tokens] as const]));
+  const laneTokens = (tokens: PlanContextTokens | null): Pick<PlanLane, "tokens" | "tokensPartial" | "cacheRead"> =>
+    ({ tokens: tokens?.tokens ?? null, ...(tokens?.partial ? { tokensPartial: true } : {}), cacheRead: tokens?.cacheRead ?? null });
   const agents = flattenAgents(model?.phases ?? [], model?.unlinkedAgents);
   const nodes = new Map(agents.map(agent => [agent.agentId, agent]));
-  const segmentEnd = (agentId: string, position: number): { status: WorkStatus; endedAt?: number } => {
+  const segmentEnd = (agentId: string, position: number): { status: WorkEndStatus; endedAt?: number } => {
     const next = resumes.get(agentId)![position + 1];
     const node = nodes.get(agentId);
-    return next ?? (node ? { status: node.status, endedAt: node.endedAt } : { status: "unknown" });
+    return next ?? (node ? { status: workEndStatus(node), endedAt: node.endedAt } : { status: "unknown" });
   };
   // The Host places every lane and allocates step tokens (src/role-summary.ts#derivePlanPlacement); a lane it did not
   // place is not on a step.
@@ -175,13 +179,15 @@ export function derivePlanView(model: WorkModelPayload | undefined, orchestratio
   const counted = context?.counted === undefined ? undefined : new Set(context.counted);
   const visit = (agent: WorkAgentNode): void => {
     const measures = counted === undefined || counted.has(agent.toolUseId) ? agent.roleRun : undefined;
+    const split = agent.toolUseId === undefined ? undefined : launchTokens.get(agent.toolUseId);
     const lane: PlanLane = { id: `agent:${agent.transcriptAgentId ?? agent.agentId}`, agent: agent.role ?? agent.agentType ?? agent.modelMeasured ?? agent.modelDeclared ?? "Claude",
       title: agent.status === "running" && agent.intentInput ? toolIntentLabel("Agent", agent.intentInput) : agent.description, start: agent.startedAt ?? null,
       elapsed: agent.status === "running" && agent.startedAt !== undefined && (context === undefined || unit.running)
         ? agentElapsedMs(agent, nowMs)
         : agent.status === "running" ? agent.elapsedMs : agent.roleRun?.elapsedMs ?? null,
-      status: agent.status, tokens: measures?.tokens ?? null, ...(measures?.tokensPartial ? { tokensPartial: true } : {}),
-      cacheRead: measures?.cacheRead ?? null, ...(agent.tokens === undefined ? {} : { contextTokens: agent.tokens }), external: false,
+      status: workEndStatus(agent), ...(split !== undefined ? laneTokens(split)
+        : { tokens: measures?.tokens ?? null, ...(measures?.tokensPartial ? { tokensPartial: true } : {}), cacheRead: measures?.cacheRead ?? null }),
+      ...(agent.tokens === undefined ? {} : { contextTokens: agent.tokens }), external: false,
       ...(agent.description ? { description: agent.description } : {}) };
     const resumed = resumes.get(agent.agentId);
     const owner = { toolUseId: agent.toolUseId, agentId: agent.transcriptAgentId ?? agent.agentId };
@@ -191,15 +197,21 @@ export function derivePlanView(model: WorkModelPayload | undefined, orchestratio
       const placed = attach({ ...lane, title: agent.description, status: first.status,
         elapsed: first.endedAt === undefined || agent.startedAt === undefined ? null : Math.max(0, first.endedAt - agent.startedAt) }, owner);
       const elsewhere = placed === undefined && agent.toolUseId !== undefined && shownEarlier.has(agent.toolUseId);
-      if (!elsewhere) resumed.forEach(({ at }, position) => {
+      const own = agent.toolUseId === undefined ? undefined : resumeSteps.get(agent.toolUseId);
+      resumed.forEach(({ at }, position) => {
+        if (own === undefined ? elsewhere : !own.has(at)) return;
+        const ownResume = own?.get(at);
+        const ownKey = ownResume?.stepKey;
+        const lanes = own === undefined ? placed : ownKey == null ? undefined : view.steps.find(value => value.key === ownKey)?.lanes;
         const id = `${lane.id}:resume:${at}`;
         const end = segmentEnd(agent.agentId, position);
         const until = end.status === "running" ? runningUntil : end.endedAt;
         const segment: PlanLane = { ...lane, id, title: agent.description, start: at, resumedAt: at, status: end.status,
-          elapsed: until === undefined ? null : Math.max(0, until - at), tokens: null, tokensPartial: false, cacheRead: null, contextTokens: undefined };
-        if (seen.has(id) || placed === undefined && !inWindow(segment)) return;
+          elapsed: until === undefined ? null : Math.max(0, until - at), tokens: null, tokensPartial: false, cacheRead: null, contextTokens: undefined,
+          ...(ownResume === undefined ? {} : laneTokens(ownResume.tokens)) };
+        if (seen.has(id) || lanes === undefined && !inWindow(segment)) return;
         seen.add(id);
-        (placed ?? view.now).push(segment);
+        (lanes ?? view.now).push(segment);
       });
     }
   };
@@ -217,7 +229,7 @@ export function derivePlanView(model: WorkModelPayload | undefined, orchestratio
     const lanes = (run.stepKey === null ? undefined : view.steps.find(value => value.key === run.stepKey))?.lanes ?? view.now;
     lanes.push({ id, agent: run.role, title: run.title, start: run.startedAt,
       elapsed: run.running && run.startedAt !== null ? Math.max(0, unitUntil - run.startedAt) : run.durationMs,
-      status: run.running ? "running" : run.outcome === null ? "unknown" : externalRunStatus(run.outcome),
+      status: externalRunEndStatus(run),
       tokens: run.tokens, cacheRead: run.cacheRead, external: true });
   }
   for (const tool of model?.planTools ?? []) if (!externalIds.has(tool.id)) attach({ id: `tool:${tool.id}`, agent: "Claude", title: toolIntentLabel(tool.name, tool.intentInput),

@@ -161,17 +161,6 @@ const progressProtocolCtx = await esbuild.context({
   sourcemap: false,
   logLevel: "info",
 });
-const llmReportCtx = await esbuild.context({
-  entryPoints: ["src/llm-report.ts"],
-  bundle: true,
-  platform: "node",
-  format: "esm",
-  banner: ESM_NODE_BANNER,
-  target: "node20",
-  outfile: "dist/llm-report.mjs",
-  sourcemap: false,
-  logLevel: "info",
-});
 const projectionCtx = await esbuild.context({
   entryPoints: ["src/projection.ts"],
   bundle: true,
@@ -330,18 +319,6 @@ const sessionTranscriptCtx = await esbuild.context({
   sourcemap: false,
   logLevel: "info",
 });
-// dist/l3-analysis.mjs は検査が読む。src と同じビルドで毎回作り直す（古いままだと検査が古い実装を検証する）
-const l3AnalysisCtx = await esbuild.context({
-  entryPoints: ["src/l3-analysis.ts"],
-  bundle: true,
-  platform: "node",
-  format: "esm",
-  banner: ESM_NODE_BANNER,
-  target: "node20",
-  outfile: "dist/l3-analysis.mjs",
-  sourcemap: false,
-  logLevel: "info",
-});
 const l3DivergenceCtx = await esbuild.context({
   entryPoints: ["src/l3-divergence.ts"],
   bundle: true,
@@ -375,92 +352,16 @@ const guardrailCtx = await esbuild.context({
   sourcemap: false,
   logLevel: "info",
 });
-const llmCitationAliasCtx = await esbuild.context({
-  entryPoints: ["src/llm-citation-alias.ts"],
+const improvementCtx = await esbuild.context({
+  entryPoints: ["src/improvement-cli.ts"],
   bundle: true,
   platform: "node",
   format: "esm",
   banner: ESM_NODE_BANNER,
   target: "node20",
-  outfile: "dist/llm-citation-alias.mjs",
+  outfile: "dist/improvement.mjs",
   sourcemap: false,
-  logLevel: "info",
-});
-const llmFindingVerifyCtx = await esbuild.context({
-  entryPoints: ["src/llm-finding-verify.ts"],
-  bundle: true,
-  platform: "node",
-  format: "esm",
-  banner: ESM_NODE_BANNER,
-  target: "node20",
-  outfile: "dist/llm-finding-verify.mjs",
-  sourcemap: false,
-  logLevel: "info",
-});
-const llmAnalysisClientCtx = await esbuild.context({
-  entryPoints: ["src/llm-analysis-client.ts"],
-  bundle: true,
-  platform: "node",
-  format: "esm",
-  banner: ESM_NODE_BANNER,
-  target: "node20",
-  outfile: "dist/llm-analysis-client.mjs",
-  sourcemap: false,
-  logLevel: "info",
-});
-const llmAnalysisPromptCtx = await esbuild.context({
-  entryPoints: ["src/llm-analysis-prompt.ts"],
-  bundle: true,
-  platform: "node",
-  format: "esm",
-  banner: ESM_NODE_BANNER,
-  target: "node20",
-  outfile: "dist/llm-analysis-prompt.mjs",
-  sourcemap: false,
-  logLevel: "info",
-});
-const llmAnalysisSdkClientCtx = await esbuild.context({
-  entryPoints: ["src/llm-analysis-sdk-client.ts"],
-  bundle: true,
-  platform: "node",
-  format: "esm",
-  banner: ESM_NODE_BANNER,
-  target: "node20",
-  outfile: "dist/llm-analysis-sdk-client.mjs",
-  sourcemap: false,
-  logLevel: "info",
-});
-const llmActionPolicyCtx = await esbuild.context({
-  entryPoints: ["src/llm-action-policy.ts"],
-  bundle: true,
-  platform: "node",
-  format: "esm",
-  banner: ESM_NODE_BANNER,
-  target: "node20",
-  outfile: "dist/llm-action-policy.mjs",
-  sourcemap: false,
-  logLevel: "info",
-});
-const llmContextFilesCtx = await esbuild.context({
-  entryPoints: ["src/llm-context-files.ts"],
-  bundle: true,
-  platform: "node",
-  format: "esm",
-  banner: ESM_NODE_BANNER,
-  target: "node20",
-  outfile: "dist/llm-context-files.mjs",
-  sourcemap: false,
-  logLevel: "info",
-});
-const llmAnalysisInputCtx = await esbuild.context({
-  entryPoints: ["src/llm-analysis-input.ts"],
-  bundle: true,
-  platform: "node",
-  format: "esm",
-  banner: ESM_NODE_BANNER,
-  target: "node20",
-  outfile: "dist/llm-analysis-input.mjs",
-  sourcemap: false,
+  metafile: true,
   logLevel: "info",
 });
 const previewSupportCtx = await esbuild.context({
@@ -475,15 +376,17 @@ const previewSupportCtx = await esbuild.context({
   logLevel: "info",
 });
 if (watch) {
-  await Promise.all([extensionCtx.watch(), harnessCtx?.watch(), webviewCtx.watch(), workModelCtx.watch(), eventWindowCtx.watch(), historyWindowCtx.watch(), conversationHistoryCtx.watch(), progressProtocolCtx.watch(), llmReportCtx.watch(), projectionCtx.watch(), handoffEnvelopeCtx.watch(), handoffAcceptCtx.watch(), handoffRunnerCtx.watch(), sendBoundaryCtx.watch(), humanVocabCtx.watch(), handoffCapsuleCtx.watch(), artifactAccessCtx.watch(), toolObservationCtx.watch(), protocolCtx.watch(), evidenceIndexCtx.watch(), claudeNormalizerCtx.watch(), semanticModelCtx.watch(), sessionTranscriptCtx.watch(), l3AnalysisCtx.watch(), l3DivergenceCtx.watch(), guardrailCtx.watch(), steeringEnvelopeCtx.watch(), llmCitationAliasCtx.watch(), llmFindingVerifyCtx.watch(), llmAnalysisClientCtx.watch(), llmAnalysisSdkClientCtx.watch(), llmAnalysisPromptCtx.watch(), llmActionPolicyCtx.watch(), llmContextFilesCtx.watch(), llmAnalysisInputCtx.watch(), previewSupportCtx.watch(), settingsPageCtx.watch()]);
+  await Promise.all([extensionCtx.watch(), harnessCtx?.watch(), webviewCtx.watch(), workModelCtx.watch(), eventWindowCtx.watch(), historyWindowCtx.watch(), conversationHistoryCtx.watch(), progressProtocolCtx.watch(), projectionCtx.watch(), handoffEnvelopeCtx.watch(), handoffAcceptCtx.watch(), handoffRunnerCtx.watch(), sendBoundaryCtx.watch(), humanVocabCtx.watch(), handoffCapsuleCtx.watch(), artifactAccessCtx.watch(), toolObservationCtx.watch(), protocolCtx.watch(), evidenceIndexCtx.watch(), claudeNormalizerCtx.watch(), semanticModelCtx.watch(), sessionTranscriptCtx.watch(), l3DivergenceCtx.watch(), guardrailCtx.watch(), steeringEnvelopeCtx.watch(), previewSupportCtx.watch(), settingsPageCtx.watch(), improvementCtx.watch()]);
 } else {
-  // dist/*.meta.json list the packages inside the three shipped bundles (third-party notices are enumerated from them)
+  // dist/*.meta.json list the packages inside the shipped bundles; the third-party notices are enumerated from them
   const settingsRebuild = settingsPageCtx.rebuild();
-  const [extensionResult, , webviewResult] = await Promise.all([extensionCtx.rebuild(), harnessCtx?.rebuild(), webviewCtx.rebuild(), workModelCtx.rebuild(), eventWindowCtx.rebuild(), historyWindowCtx.rebuild(), conversationHistoryCtx.rebuild(), progressProtocolCtx.rebuild(), llmReportCtx.rebuild(), projectionCtx.rebuild(), handoffEnvelopeCtx.rebuild(), handoffAcceptCtx.rebuild(), handoffRunnerCtx.rebuild(), sendBoundaryCtx.rebuild(), humanVocabCtx.rebuild(), handoffCapsuleCtx.rebuild(), artifactAccessCtx.rebuild(), toolObservationCtx.rebuild(), protocolCtx.rebuild(), evidenceIndexCtx.rebuild(), claudeNormalizerCtx.rebuild(), semanticModelCtx.rebuild(), sessionTranscriptCtx.rebuild(), l3AnalysisCtx.rebuild(), l3DivergenceCtx.rebuild(), guardrailCtx.rebuild(), steeringEnvelopeCtx.rebuild(), llmCitationAliasCtx.rebuild(), llmFindingVerifyCtx.rebuild(), llmAnalysisClientCtx.rebuild(), llmAnalysisSdkClientCtx.rebuild(), llmAnalysisPromptCtx.rebuild(), llmActionPolicyCtx.rebuild(), llmContextFilesCtx.rebuild(), llmAnalysisInputCtx.rebuild(), previewSupportCtx.rebuild(), settingsRebuild]);
+  const improvementRebuild = improvementCtx.rebuild();
+  const [extensionResult, , webviewResult] = await Promise.all([extensionCtx.rebuild(), harnessCtx?.rebuild(), webviewCtx.rebuild(), workModelCtx.rebuild(), eventWindowCtx.rebuild(), historyWindowCtx.rebuild(), conversationHistoryCtx.rebuild(), progressProtocolCtx.rebuild(), projectionCtx.rebuild(), handoffEnvelopeCtx.rebuild(), handoffAcceptCtx.rebuild(), handoffRunnerCtx.rebuild(), sendBoundaryCtx.rebuild(), humanVocabCtx.rebuild(), handoffCapsuleCtx.rebuild(), artifactAccessCtx.rebuild(), toolObservationCtx.rebuild(), protocolCtx.rebuild(), evidenceIndexCtx.rebuild(), claudeNormalizerCtx.rebuild(), semanticModelCtx.rebuild(), sessionTranscriptCtx.rebuild(), l3DivergenceCtx.rebuild(), guardrailCtx.rebuild(), steeringEnvelopeCtx.rebuild(), previewSupportCtx.rebuild(), settingsRebuild, improvementRebuild]);
   writeFileSync("dist/extension.meta.json", JSON.stringify(extensionResult.metafile));
   writeFileSync("dist/webview.meta.json", JSON.stringify(webviewResult.metafile));
   writeFileSync("dist/settings.meta.json", JSON.stringify((await settingsRebuild).metafile));
-  await Promise.all([extensionCtx.dispose(), harnessCtx?.dispose(), webviewCtx.dispose(), workModelCtx.dispose(), eventWindowCtx.dispose(), historyWindowCtx.dispose(), conversationHistoryCtx.dispose(), progressProtocolCtx.dispose(), llmReportCtx.dispose(), projectionCtx.dispose(), handoffEnvelopeCtx.dispose(), handoffAcceptCtx.dispose(), handoffRunnerCtx.dispose(), sendBoundaryCtx.dispose(), humanVocabCtx.dispose(), handoffCapsuleCtx.dispose(), artifactAccessCtx.dispose(), toolObservationCtx.dispose(), protocolCtx.dispose(), evidenceIndexCtx.dispose(), claudeNormalizerCtx.dispose(), semanticModelCtx.dispose(), sessionTranscriptCtx.dispose(), l3AnalysisCtx.dispose(), l3DivergenceCtx.dispose(), guardrailCtx.dispose(), steeringEnvelopeCtx.dispose(), llmCitationAliasCtx.dispose(), llmFindingVerifyCtx.dispose(), llmAnalysisClientCtx.dispose(), llmAnalysisSdkClientCtx.dispose(), llmAnalysisPromptCtx.dispose(), llmActionPolicyCtx.dispose(), llmContextFilesCtx.dispose(), llmAnalysisInputCtx.dispose(), previewSupportCtx.dispose(), settingsPageCtx.dispose()]);
+  writeFileSync("dist/improvement.meta.json", JSON.stringify((await improvementRebuild).metafile));
+  await Promise.all([extensionCtx.dispose(), harnessCtx?.dispose(), webviewCtx.dispose(), workModelCtx.dispose(), eventWindowCtx.dispose(), historyWindowCtx.dispose(), conversationHistoryCtx.dispose(), progressProtocolCtx.dispose(), projectionCtx.dispose(), handoffEnvelopeCtx.dispose(), handoffAcceptCtx.dispose(), handoffRunnerCtx.dispose(), sendBoundaryCtx.dispose(), humanVocabCtx.dispose(), handoffCapsuleCtx.dispose(), artifactAccessCtx.dispose(), toolObservationCtx.dispose(), protocolCtx.dispose(), evidenceIndexCtx.dispose(), claudeNormalizerCtx.dispose(), semanticModelCtx.dispose(), sessionTranscriptCtx.dispose(), l3DivergenceCtx.dispose(), guardrailCtx.dispose(), steeringEnvelopeCtx.dispose(), previewSupportCtx.dispose(), settingsPageCtx.dispose(), improvementCtx.dispose()]);
 }
 
   // The SDK embeds model IDs such as `claude-…@2025…`. Encode the at-sign in

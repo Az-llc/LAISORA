@@ -4,7 +4,7 @@ import { createHash } from "node:crypto";
 import { redactAbsolutePaths } from "./path-redaction";
 import { conductorInstruction, estimateTokens, resolveOrchestrationRoster, orchestrationExternalTargets } from "./orchestration-roster";
 import { listClaudeModels, detectClaudeExecutor, relabelRememberedClaudeModels } from "./orchestration-claude";
-import { EXECUTORS, executorMap, type ExecutorId } from "./orchestration-executors";
+import { EXECUTORS, EXTERNAL_TIMEOUT_DEFAULT_MINUTES, EXTERNAL_TIMEOUT_SETTING_KEY, executorMap, type ExecutorId } from "./orchestration-executors";
 import { systemAppExtensions } from "./file-link-open-mode";
 import { CLI_AUTO_UPDATE_SETTINGS, cliAutoUpdateEnabled } from "./cli-update-policy";
 import { compareSemVer, parseSemVer } from "./semver";
@@ -37,6 +37,7 @@ import * as l10n from "@vscode/l10n";
 import { configuredClaudeExecutablePath, configuredDisplayName, configuredEventLimit, existingFolderOrHome, getLaisoraConfiguration, readClaudeCodeSettings } from "./claude-settings";
 import { isEventLimit } from "./event-limits";
 import { TRANSCRIPT_RETENTION_DAYS_KEY, configuredTranscriptRetentionDays, isTranscriptRetentionDays, transcriptRetentionFallback } from "./transcript-retention";
+import { CHROME_INTEGRATION_SETTING_KEY, chromeIntegrationEnabled } from "./chrome-integration";
 import { isDisplayName } from "./display-name";
 import { extensionContext, output, store } from "./host-context";
 import { ADDITIONAL_MODELS_KEY, CLAUDE_VERSION_ID, additionalClaudeModelIds, recomputeModelRows, modelsMessage } from "./gateway-models";
@@ -45,12 +46,17 @@ import { TODO_ENABLED_SETTING } from "./todo-store";
 import { todoFeatureEnabled } from "./todo-surface";
 import { EDIT_SUMMARY_SETTING } from "./edit-summary";
 import { REMOTE_CONTROL_CARD_SETTING } from "./remote-control";
+import { IMPROVEMENT_MENU_SETTING } from "./improvement-brief";
 import { GUARD_ENABLED_SETTING, MEMORY_BLOCK_PROJECT_TYPE_SETTING, placementOf, placementSettingsOf } from "./placement-line";
 import { welcomeNews, welcomeTips } from "./welcome-content";
 import { laterWelcomeVersion, nextWelcomeTip, welcomeNewsVersion } from "./welcome-rules";
 
 export function editSummarySettingEnabled(): boolean {
   return getLaisoraConfiguration().get<boolean>(EDIT_SUMMARY_SETTING) === true;
+}
+
+export function improvementMenuEnabled(): boolean {
+  return getLaisoraConfiguration().get<boolean>(IMPROVEMENT_MENU_SETTING) !== false;
 }
 
 export function remoteControlCardEnabled(): boolean {
@@ -142,6 +148,7 @@ export function userSettingsMessage(): Extract<HostToWebview, { type: "userSetti
     askQualityCheck: getLaisoraConfiguration().get<boolean>("claude.askQualityCheck") === true,
     editSummaryEnabled: editSummarySettingEnabled(),
     remoteControlCard: remoteControlCardEnabled(),
+    improvementMenu: improvementMenuEnabled(),
     welcome: welcomeState(),
   };
 }
@@ -150,6 +157,7 @@ const FILE_LINK_SETTING_KEYS: Record<FileLinkSetting, string> = {
   openWithSystemApp: "fileLinks.openWithSystemApp",
   fileLinkInstruction: "claude.fileLinkInstruction",
   planInstruction: "claude.planInstruction",
+  chromeIntegration: CHROME_INTEGRATION_SETTING_KEY,
   revealInExplorer: "fileLinks.revealInExplorer",
   allowOutsideWorkspace: "fileLinks.allowOutsideWorkspace",
   confirmOutsideWorkspace: "fileLinks.confirmOutsideWorkspace",
@@ -286,7 +294,7 @@ export function projectConductorPreview(policy?: string): { text: string; tokens
 export function settingsStateMessage(): Extract<HostToSettingsPage, { type: "settingsState" }> {
   loadRememberedModelLists();
   const cfg = getLaisoraConfiguration();
-  const timeout = cfg.get<number>("orchestration.externalTimeoutMinutes")!;
+  const timeout = cfg.get<number>(EXTERNAL_TIMEOUT_SETTING_KEY)!;
   const placementSettings = placementSettingsOf(cfg);
   const claudeCodeSettings = readClaudeCodeSettings(true);
   return {
@@ -296,7 +304,7 @@ export function settingsStateMessage(): Extract<HostToSettingsPage, { type: "set
     appearance: accentSettings(),
     displayName: configuredDisplayName(),
     openWithSystemApp: configuredSystemAppExtensions(),
-    externalTimeoutMinutes: isExternalTimeout(timeout) ? timeout : 10,
+    externalTimeoutMinutes: isExternalTimeout(timeout) ? timeout : EXTERNAL_TIMEOUT_DEFAULT_MINUTES,
     externalDetection: structuredClone(externalDetection),
     externalModels: cachedExternalModels(),
     orchestrationEnabled: cfg.get<boolean>("orchestration.enabled")! === true,
@@ -306,6 +314,7 @@ export function settingsStateMessage(): Extract<HostToSettingsPage, { type: "set
     reloadNeeded: settingsReloadNeeded(cfg),
     editSummaryEnabled: editSummarySettingEnabled(),
     remoteControlCard: remoteControlCardEnabled(),
+    improvementMenu: improvementMenuEnabled(),
     welcome: welcomeSettings(),
     handoffAuto: resolveHandoffAutoSettings((key) => cfg.get<unknown>(key)),
     orchestrationAgents: readRoster(cfg.get<unknown>("orchestration.agents")),
@@ -323,6 +332,7 @@ export function settingsStateMessage(): Extract<HostToSettingsPage, { type: "set
     autoContinueAtUsageLimit: claudeCodeSettings.autoContinueAtUsageLimit !== false,
     fileLinkInstruction: cfg.get<boolean>(FILE_LINK_SETTING_KEYS.fileLinkInstruction)! !== false,
     planInstruction: cfg.get<boolean>(FILE_LINK_SETTING_KEYS.planInstruction)! !== false,
+    chromeIntegration: chromeIntegrationEnabled((key) => cfg.get<unknown>(key)),
     revealInExplorer: cfg.get<boolean>(FILE_LINK_SETTING_KEYS.revealInExplorer)! !== false,
     allowOutsideWorkspace: cfg.get<boolean>(FILE_LINK_SETTING_KEYS.allowOutsideWorkspace)! === true,
     confirmOutsideWorkspace: cfg.get<boolean>(FILE_LINK_SETTING_KEYS.confirmOutsideWorkspace)! !== false,
@@ -418,6 +428,10 @@ export async function writeTodoEnabled(enabled: boolean): Promise<SettingWriteFa
 
 export async function writeEditSummaryEnabled(enabled: boolean): Promise<SettingWriteFailure | undefined> {
   return updateUserSetting(EDIT_SUMMARY_SETTING, enabled);
+}
+
+export async function writeImprovementMenu(enabled: boolean): Promise<SettingWriteFailure | undefined> {
+  return updateUserSetting(IMPROVEMENT_MENU_SETTING, enabled);
 }
 
 export async function writeRemoteControlCard(enabled: boolean): Promise<SettingWriteFailure | undefined> {

@@ -15,7 +15,9 @@
     "noImplicitOverride": true,
     "isolatedModules": true,
     "noUnusedParameters": true,
-    "noUnusedLocals": true
+    "noUnusedLocals": true,
+    "incremental": true,
+    "tsBuildInfoFile": "artifacts/tsc/tsconfig.tsbuildinfo"
   },
   "include": ["src/**/*.ts"]
 }

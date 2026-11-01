@@ -2,7 +2,7 @@ import { foldPlanUsage, type PlanUsageAccumulator } from "./plan-usage";
 import { isChildCall } from "./spans";
 import type { AssistantUsage } from "./protocol";
 import type { SemanticEvidenceIndex } from "./evidence-index";
-import { isLlmAnalysisExecution, type NormalizedEvent } from "./protocol";
+import type { NormalizedEvent } from "./protocol";
 import { createExecLogMarkState, foldExecLogMarks, type ExecLogMark } from "./exec-log-marks";
 import { emptyKeyedLog, keyedGet, keyedSet, keyedValues, launchItemNumber, type KeyedLog } from "./time-buckets";
 import { isExternalRunTool, type ExternalRunOutcome } from "./orchestration-executors";
@@ -34,7 +34,6 @@ export interface SessionFactsAccumulator {
   analysisTools?: KeyedLog<AnalysisToolRecord>;
   taskLaunches?: ReadonlyMap<string, string>;
   externalRunCalls?: KeyedLog<ExternalRunCall>;
-  toolCalls: number;
 }
 
 function notifiedOutcome(status: string | undefined): ExternalRunOutcome | undefined {
@@ -64,9 +63,7 @@ function foldExternalRunCalls(log: KeyedLog<ExternalRunCall> | undefined, event:
 }
 
 export function initialSessionFacts(): SessionFactsAccumulator {
-  return {
-    toolCalls: 0,
-  };
+  return {};
 }
 
 export function foldSessionFacts(
@@ -119,7 +116,6 @@ export function foldSessionFacts(
     analysisTools,
     taskLaunches,
     externalRunCalls: foldExternalRunCalls(acc.externalRunCalls, event),
-    toolCalls: acc.toolCalls + (isLlmAnalysisExecution(event) ? 1 : 0),
     planUsage: event.kind === "assistant_usage" && !isChildCall(event.parentToolUseId as string | null | undefined) && typeof event.messageId === "string" && typeof event.timestamp === "number"
       ? foldPlanUsage(acc.planUsage, event.messageId, event.timestamp, (event.usage ?? {}) as AssistantUsage)
       : acc.planUsage,
@@ -127,22 +123,14 @@ export function foldSessionFacts(
 }
 
 export interface SessionFacts {
-  toolCalls: number;
   coverage: {
-    eventLogTrimmed: boolean;
     longGapsDropped: number;
   };
 }
 
-export function deriveSessionFacts(
-  acc: SessionFactsAccumulator,
-  evidence: SemanticEvidenceIndex,
-  options?: { eventLogTrimmed?: boolean }
-): SessionFacts {
+export function deriveSessionFacts(evidence: SemanticEvidenceIndex): SessionFacts {
   return {
-    toolCalls: acc.toolCalls,
     coverage: {
-      eventLogTrimmed: options?.eventLogTrimmed ?? false,
       longGapsDropped: evidence.coverage.longGaps,
     },
   };

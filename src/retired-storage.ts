@@ -2,6 +2,7 @@ import { lstat, rm } from "node:fs/promises";
 import { basename, dirname, join, resolve } from "node:path";
 
 export const RETIRED_LEARNING_DIRECTORY = "laisora-learning";
+export const RETIRED_ANALYSIS_RESULTS_DIRECTORY = "analysis-results";
 export const RETIRED_BASELINE_CACHE_KEY = "laisora.analysis.personalBaseline.v1";
 
 interface RetiredKeyStore {
@@ -24,11 +25,11 @@ export async function removeRetiredBaselineCache(globalState: RetiredKeyStore | 
   }
 }
 
-export async function removeRetiredLearningStore(globalStorage: string | undefined, log: (line: string) => void): Promise<void> {
+async function removeRetiredDirectory(globalStorage: string | undefined, name: string, label: string, log: (line: string) => void): Promise<void> {
   if (!globalStorage) return;
   const root = resolve(globalStorage);
-  const target = resolve(join(root, RETIRED_LEARNING_DIRECTORY));
-  if (dirname(target) !== root || basename(target) !== RETIRED_LEARNING_DIRECTORY) return;
+  const target = resolve(join(root, name));
+  if (dirname(target) !== root || basename(target) !== name) return;
   try {
     const entry = await lstat(target).catch((error: NodeJS.ErrnoException) => {
       if (error.code === "ENOENT") return undefined;
@@ -36,8 +37,16 @@ export async function removeRetiredLearningStore(globalStorage: string | undefin
     });
     if (!entry) return;
     await rm(target, { recursive: entry.isDirectory() && !entry.isSymbolicLink(), force: true });
-    log("[startup] removed the retired learning store");
+    log(`[startup] removed the retired ${label}`);
   } catch (error) {
-    log(`[startup] could not remove the retired learning store${errorCodeSuffix(error)}`);
+    log(`[startup] could not remove the retired ${label}${errorCodeSuffix(error)}`);
   }
+}
+
+export function removeRetiredLearningStore(globalStorage: string | undefined, log: (line: string) => void): Promise<void> {
+  return removeRetiredDirectory(globalStorage, RETIRED_LEARNING_DIRECTORY, "learning store", log);
+}
+
+export function removeRetiredAnalysisResults(globalStorage: string | undefined, log: (line: string) => void): Promise<void> {
+  return removeRetiredDirectory(globalStorage, RETIRED_ANALYSIS_RESULTS_DIRECTORY, "analysis results", log);
 }

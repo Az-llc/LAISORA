@@ -1,4 +1,5 @@
 import { UsageLimitResume, SDK_AUTO_CONTINUE_SETTINGS } from "./usage-limit-resume";
+import { resumeSummary } from "./tool-intent";
 import { readClaudeCodeSettings, onAutoContinueSettingChange } from "./claude-code-settings";
 import type { TranscriptRetentionSettings } from "./transcript-retention";
 import { modelLabelWithVersion } from "./model-display-name";
@@ -52,18 +53,18 @@ import { PROGRESS_WIRE_TOOL_NAME } from "./artifact-access";
 import { FILE_WRITING_TOOLS } from "./file-writing-tools";
 import { z } from "zod";
 import { ClaudeLiveNormalizer, parseAliases, type RawToolResult } from "./claude-normalizer";
-import { conductorInstruction, handbackGateVerdict, SUBAGENT_HANDBACK_TOOL, orchestrationExternalTargets, orchestrationVariants, resolveOrchestrationRoster, type OrchestrationRow, type ExternalModels } from "./orchestration-roster";
+import { conductorInstruction, handbackGateVerdict, HANDBACK_DELEGATE_NOTICE, SUBAGENT_HANDBACK_TOOL, orchestrationExternalTargets, orchestrationVariants, resolveOrchestrationRoster, type OrchestrationRow, type ExternalModels } from "./orchestration-roster";
 import { attributeSubagent, injectionOf, MAX_AGENT_STARTS, readRosterEvidence, type AgentStartObservation, type InjectedAgentDefinition, type RosterEvidence, type RosterInjection } from "./roster-evidence";
 import { placementOf, DELEGATE_PLACEMENT_NOTICE, type Placement } from "./placement-line";
-import { laisoraDenialMessage } from "./tool-result-signals";
+import { APPROVAL_RESOLVED_BY, approvalPermission, questionsRepliedInChat } from "./ask-unanswered";
 import { failClosedGuard } from "./guard-evaluation";
 import { isShellTool } from "./shell-tools";
-import { compileVocabulary, PLACEMENT_EFFORT_WORDS, placementPath, protectedDestination, isControlFile, DELEGATE_CONTROL_REFUSAL, judgeFileWrite, judgeMemoryWrite, memoryGuardReason, type MemoryDecision, judgeShellWrite, PLACEMENT_GUARD_REFUSAL, PLACEMENT_UNREADABLE_REFUSAL } from "./placement-guard";
+import { compileVocabulary, PLACEMENT_EFFORT_WORDS, placementPath, protectedDestination, isControlFile, delegateControlRefusal, judgeFileWrite, judgeMemoryWrite, memoryGuardReason, type MemoryDecision, judgeShellWrite, PLACEMENT_GUARD_REFUSAL, PLACEMENT_UNREADABLE_REFUSAL } from "./placement-guard";
 import { RootGate } from "./root-gate";
 import { laisoraInputLine, markLaisoraInput, type LaisoraInput } from "./laisora-input";
 import { createTodoMcpServer, TODO_ROOT_SCOPE, TODO_SERVER_NAME, TODO_TOOL_NAMES, todoLinkedInstruction, todoWorkspaceRoots, type TodoLinkedItem } from "./todo-mcp";
 import type { TodoStore } from "./todo-store";
-import { claudeModelIdLabel, isExternalRunTool } from "./orchestration-executors";
+import { claudeModelIdLabel, EXTERNAL_TIMEOUT_DEFAULT_MINUTES, externalUnknownTargetReason, isExternalRunTool } from "./orchestration-executors";
 import { isDelegationLaunchTool, isDelegationTool } from "./claude-tool-names";
 import type { CompletionVerdict, NumberedLaunchVerdict, ResumeVerdict } from "./time-buckets";
 import { planItemLabel, type PlanStepUpdate } from "./plan-steps";
@@ -90,8 +91,16 @@ type PermissionResult = ClaudeCodePermissionResult;
 type InterruptReceipt = { still_queued?: string[]; cancelled?: string[] };
 
 const CAP_INTERRUPT_CANCEL_QUEUED = "interrupt_cancel_queued_v1";
+const CAP_ASK_USER_QUESTION_UNANSWERED = "ask_user_question_unanswered_v1";
 const TODO_RECENT_FILES = 20;
 export const REPLAY_USER_MESSAGES_ARG = "replay-user-messages";
+export const CHROME_ARG = "chrome";
+
+export function conversationExtraArgs(chromeIntegration: boolean): Record<string, null> {
+  return chromeIntegration
+    ? { [REPLAY_USER_MESSAGES_ARG]: null, [CHROME_ARG]: null }
+    : { [REPLAY_USER_MESSAGES_ARG]: null };
+}
 
 export const FILE_LINK_INSTRUCTION = (cwd = ""): string => {
   const base = cwd
@@ -107,7 +116,8 @@ export const ASK_DECIDE_FORMAT = () => [
 ].join("\n");
 
 const PLAN_IN_PROGRESS_FIRST = "mark the step in_progress with TaskUpdate first, either in an earlier message or earlier in the same message";
-const PLAN_RESUMED_AGENT_PLACE = "A resumed agent stays on the step it started on";
+const PLAN_RESUME_NUMBER = "start the SendMessage summary with the number of the step the new work serves and a space, as in an Agent description; the resumed run is then placed on that step";
+const PLAN_RESUMED_AGENT_PLACE = "Without a number, a resumed agent stays on the step it started on";
 const PLAN_COMPLETION_WAIT = "wait for them to finish or stop them with TaskStop";
 
 export const PLAN_INSTRUCTION = [
@@ -117,7 +127,7 @@ export const PLAN_INSTRUCTION = [
   `Do not mark a step completed while an agent or external run placed on it is still running: first ${PLAN_COMPLETION_WAIT}; otherwise the update is rejected before it runs.`,
   "Put an action that waits for the user's approval (such as merging or publishing) in its own step, separate from work you can finish yourself, and do not mark it in_progress until the user answers.",
   `While TaskCreate steps exist, start the description of every Agent call and external run with the number of the step it serves exactly as the PLAN panel shows it (the task id, zero-padded to at least two digits) followed by a space, as in "03 Remove model research". A delegation without a valid step number, or for a step that is not in progress, is rejected before it runs: before the delegation, ${PLAN_IN_PROGRESS_FIRST}.`,
-  `${PLAN_RESUMED_AGENT_PLACE}: before resuming with SendMessage an agent placed on a completed step, ${PLAN_IN_PROGRESS_FIRST}; otherwise the SendMessage is rejected before it runs.`,
+  `When you resume a finished agent with SendMessage, ${PLAN_RESUME_NUMBER}. That step must be a step of the current PLAN in progress, as for a delegation. ${PLAN_RESUMED_AGENT_PLACE}: resuming without a number an agent placed on a completed step is rejected before it runs unless you first ${PLAN_IN_PROGRESS_FIRST}.`,
   "When you need the user's decision or a real-machine check, do not bury it in prose. Write a ```laisora-ask block (format below) at the point you ask.",
   "Before asking, check earlier decisions (ledger, contracts, earlier answers here) instead of re-asking, and investigate first if the current state is unknown.",
   "In every decision (laisora-ask or AskUserQuestion): why = what you observed (facts, numbers, sources) + the exact question + why the user, not you, must decide; never restate the title. effect = the concrete change to the user's screen, operation or work; never restate the label. pros/cons = compared with the other options, including effects on other features and operations. Give technical reasons, not history; explain terms the user may not share. For LAISORA's own behaviour, state the current behaviour and its technical reason from contracts or facts, or 理由の記録なし.",
@@ -162,8 +172,10 @@ export function planLaunchDenial(verdict: NumberedLaunchVerdict): string | undef
 }
 
 export function planResumeDenial(verdict: ResumeVerdict): string | undefined {
-  if (verdict.kind === "allow") return undefined;
-  return `Rejected before running: this message would resume an agent placed on PLAN step ${planItemLabel(verdict.number)}, which is completed. ${PLAN_RESUMED_AGENT_PLACE}. ${planStepInProgressFix(verdict)}`;
+  if (verdict.kind !== "step-completed") return planLaunchDenial(verdict);
+  const step = planItemLabel(verdict.number);
+  const numbered = verdict.numberable ? `If the new work serves a step in progress, ${PLAN_RESUME_NUMBER}, then send it again. ${PLAN_RESUMED_AGENT_PLACE}; to continue step ${step} itself: ` : "";
+  return `Rejected before running: this message would resume an agent placed on PLAN step ${step}, which is completed. ${numbered}${planStepInProgressFix(verdict)}`;
 }
 
 export function planCompletionDenial(verdict: CompletionVerdict): string | undefined {
@@ -209,6 +221,7 @@ export interface ClaudeHostOptions {
   settingSources: Array<"user" | "project" | "local">;
   transcriptRetention?: TranscriptRetentionSettings;
   remoteControlAtStartup?: boolean;
+  chromeIntegration?: boolean;
   claudeCodeExecutablePath?: string;
   apiKeyPolicy?: ApiKeyPolicy;
   fileLinkInstruction?: boolean;
@@ -217,7 +230,7 @@ export interface ClaudeHostOptions {
   todoStore?: TodoStore;
   todoLinkedItem?: TodoLinkedItem;
   planLaunchVerdict?: (description: string | undefined) => NumberedLaunchVerdict;
-  planResumeVerdict?: (to: string, namedToolUseId: string | undefined, toolUseId: string) => ResumeVerdict;
+  planResumeVerdict?: (to: string, namedToolUseId: string | undefined, toolUseId: string, summary: string | undefined) => ResumeVerdict;
   planCompletionVerdict?: (toolName: string, input: Record<string, unknown> | undefined, toolUseId: string, admittedLaunches: ReadonlySet<string>) => CompletionVerdict;
   orchestrationEnabled?: boolean;
   orchestrationAgents?: unknown;
@@ -414,7 +427,7 @@ export class ClaudeConversation {
     return { enabled: options.orchestrationEnabled === true, agents: options.orchestrationAgents ?? [],
       guardEnabled: options.guardEnabled !== false,
       memoryBlockProjectType: options.memoryBlockProjectType === true,
-      timeout: options.externalTimeoutMinutes ?? 10,
+      timeout: options.externalTimeoutMinutes ?? EXTERNAL_TIMEOUT_DEFAULT_MINUTES,
       policy: options.conductorPolicy ?? "" };
   }
 
@@ -475,6 +488,8 @@ export class ClaudeConversation {
   private inputQueue: SDKUserMessage[] = [];
   private inputWaiter: (() => void) | null = null;
   private closed = false;
+  private closedEmitted = false;
+  private killedForStop = false;
   private q: QueryHandle | null = null;
   private contextUsageInFlight: Promise<HandoffContextMeasurement | null> | null = null;
   private contextUsagePending = false;
@@ -492,6 +507,7 @@ export class ClaudeConversation {
   }
   private abortController = new AbortController();
   private pendingApprovals = new Map<string, PendingApproval>();
+  private questionRequests = new Set<string>();
   private runLoopDone: Promise<void> | null = null;
   private inputGen: AsyncGenerator<SDKUserMessage> | null = null;
   private interruptTimer: ReturnType<typeof setTimeout> | null = null;
@@ -520,7 +536,7 @@ export class ClaudeConversation {
     const resolved = resolveOrchestrationRoster(this.orchestrationEnabled ? opts.orchestrationAgents : []);
     this.roster = resolved.roster;
     this.externalRows = orchestrationExternalTargets(this.roster, opts.externalModels, opts.log);
-    this.externalTimeoutMinutes = isExternalTimeout(opts.externalTimeoutMinutes) ? opts.externalTimeoutMinutes : 10;
+    this.externalTimeoutMinutes = isExternalTimeout(opts.externalTimeoutMinutes) ? opts.externalTimeoutMinutes : EXTERNAL_TIMEOUT_DEFAULT_MINUTES;
     this.conductorPolicy = opts.conductorPolicy ?? "";
     this.placement = placementOf({ guardEnabled: opts.guardEnabled !== false, blockProjectType: opts.memoryBlockProjectType === true });
     for (const dropped of resolved.droppedRows) opts.log(dropped);
@@ -546,7 +562,7 @@ export class ClaudeConversation {
           clearTimeout(this.interruptTimer);
           this.interruptTimer = null;
         }
-        for (const requestId of this.pendingApprovals.keys()) this.resolveApproval(requestId, "deny", undefined, "turn-end");
+        for (const requestId of this.pendingApprovals.keys()) this.resolveApproval(requestId, "deny", undefined, APPROVAL_RESOLVED_BY.turnEnd);
         this.turnsEnded += 1;
         void this.requestContextUsage();
       },
@@ -661,10 +677,11 @@ ${ctxJson}`
       const rootGate = self.todoGate?.scope.tools.includes(toolName) ? self.todoGate : undefined;
       const rootCall = ctx.toolUseID;
       rootGate?.hold(rootCall);
+      if (questions) self.questionRequests.add(requestId);
       const pendingDecision = self.opts.onApprovalRequest({ requestId, toolName, toolUseId: ctx.toolUseID, rawInputJson });
       const onAbort = (): void => {
         rootGate?.revoke(rootCall);
-        self.resolveApproval(requestId, "withdrawn", undefined, "withdrawn");
+        self.resolveApproval(requestId, "withdrawn", undefined, APPROVAL_RESOLVED_BY.withdrawn);
       };
       ctx.signal.addEventListener("abort", onAbort, { once: true });
       if (ctx.signal.aborted) onAbort();
@@ -673,21 +690,20 @@ ${ctxJson}`
         decision = await pendingDecision;
       } finally {
         ctx.signal.removeEventListener("abort", onAbort);
+        self.questionRequests.delete(requestId);
       }
       if (ctx.signal.aborted || decision.behavior === "withdrawn") {
         rootGate?.revoke(rootCall);
-        self.emit({ kind: "approval_resolved", requestId, behavior: "withdrawn", resolvedBy: "withdrawn" });
+        self.emit({ kind: "approval_resolved", requestId, behavior: "withdrawn", resolvedBy: APPROVAL_RESOLVED_BY.withdrawn });
         return null;
       }
-      if (decision.behavior === "deny") rootGate?.revoke(rootCall);
+      const { permission, unanswered } = approvalPermission(input, questions,
+        { behavior: decision.behavior, answers: decision.answers, resolvedBy: decision.resolvedBy }, self.answersUnanswered);
+      if (permission.behavior === "deny") rootGate?.revoke(rootCall);
       else rootGate?.release(rootCall);
-      self.emit({ kind: "approval_resolved", requestId, behavior: decision.behavior, resolvedBy: decision.resolvedBy ?? "user", answers: decision.answers });
-      if (decision.behavior === "deny") {
-        return { behavior: "deny", message: laisoraDenialMessage() };
-      }
-      return decision.answers
-        ? { behavior: "allow", updatedInput: { ...input, answers: decision.answers } }
-        : { behavior: "allow", updatedInput: input };
+      self.emit({ kind: "approval_resolved", requestId, behavior: permission.behavior, resolvedBy: decision.resolvedBy ?? APPROVAL_RESOLVED_BY.user,
+        ...(unanswered ? { unanswered } : { answers: decision.answers }) });
+      return permission;
     };
 
     const options: ClaudeCodeOptions = {
@@ -695,7 +711,7 @@ ${ctxJson}`
       permissionMode: this.opts.permissionMode,
       settingSources: this.opts.settingSources,
       settings: { remoteControlAtStartup: this.opts.remoteControlAtStartup === true, ...SDK_AUTO_CONTINUE_SETTINGS, ultracode: false, ...this.opts.transcriptRetention },
-      extraArgs: { [REPLAY_USER_MESSAGES_ARG]: null },
+      extraArgs: conversationExtraArgs(this.opts.chromeIntegration === true),
       includePartialMessages: true,
       pathToClaudeCodeExecutable: resolvedExecutable.path,
       canUseTool,
@@ -785,7 +801,7 @@ ${ctxJson}`
           target: z.string(), prompt: z.string(), description: z.string().optional(), files: z.array(z.string()).optional().describe("Files must be absolute paths."), diff: z.string().optional(), cwd: z.string().optional(),
         }, async (input, extra) => {
           const row = this.externalRows.find((entry) => entry.target === input.target);
-          if (!row) return { isError: true, content: [{ type: "text" as const, text: "R-ORC-10: target is not in the conversation snapshot." }] };
+          if (!row) return { isError: true, content: [{ type: "text" as const, text: externalUnknownTargetReason(this.externalRows.map((entry) => entry.target)) }] };
           const controller = new AbortController();
           const requestSignal = (extra as { signal?: AbortSignal } | undefined)?.signal;
           const conversationSignal = this.abortController.signal;
@@ -804,7 +820,7 @@ ${ctxJson}`
             const record = await this.recordRun({ ...run.record, runId, dispatchId, recipient,
               ...(toolUse ? { toolUseId: toolUse.id } : typeof suppliedId === "string" ? { toolUseId: suppliedId } : {}) });
             const result = record.outcome !== "ok" && record.reason !== run.record.reason
-              ? { isError: true, content: [{ type: "text" as const, text: record.reason! }] } : run.result;
+              ? { isError: true, content: [...run.result.content, { type: "text" as const, text: record.reason! }] } : run.result;
             return { ...result, content: [...result.content, { type: "text" as const, text: `Run: ${record.runId}` }] };
           })();
           this.activeExternalRuns.add(pending);
@@ -881,13 +897,16 @@ ${ctxJson}`
           const destination = memoryDecision?.blocked ? "memory" : decision.destination;
           if ((!memoryDecision?.blocked && !decision.blocked && !unchecked) || !destination) return {};
           return { hookSpecificOutput: { hookEventName: "PreToolUse", permissionDecision: "deny",
-            permissionDecisionReason: memoryDecision?.blocked ? memoryGuardReason(memoryDecision, this.placement) : delegate ? DELEGATE_CONTROL_REFUSAL : unchecked ? PLACEMENT_UNREADABLE_REFUSAL : PLACEMENT_GUARD_REFUSAL } };
+            permissionDecisionReason: memoryDecision?.blocked ? memoryGuardReason(memoryDecision, this.placement) : delegate ? delegateControlRefusal(decision.refusal) : unchecked ? PLACEMENT_UNREADABLE_REFUSAL : PLACEMENT_GUARD_REFUSAL } };
         }, this.opts.log);
       };
+      options.hooks = { ...(options.hooks ?? {}), PreToolUse: [{ hooks: [guard] }, ...(options.hooks?.PreToolUse ?? [])] };
+    }
+    const delegateContext = [this.placement.guardEnabled ? DELEGATE_PLACEMENT_NOTICE : "", this.orchestrationEnabled ? HANDBACK_DELEGATE_NOTICE : ""].filter(Boolean).join("\n");
+    if (delegateContext) {
       const delegateNotice: ClaudeCodeSdk.HookCallback = async input => input.hook_event_name === "SubagentStart"
-        ? { hookSpecificOutput: { hookEventName: "SubagentStart" as const, additionalContext: DELEGATE_PLACEMENT_NOTICE } } : {};
-      options.hooks = { ...(options.hooks ?? {}), PreToolUse: [{ hooks: [guard] }, ...(options.hooks?.PreToolUse ?? [])],
-        SubagentStart: [...(options.hooks?.SubagentStart ?? []), { hooks: [delegateNotice] }] };
+        ? { hookSpecificOutput: { hookEventName: "SubagentStart" as const, additionalContext: delegateContext } } : {};
+      options.hooks = { ...(options.hooks ?? {}), SubagentStart: [...(options.hooks?.SubagentStart ?? []), { hooks: [delegateNotice] }] };
     }
     const planInstruction = this.opts.planInstruction !== false;
     const planLaunchVerdict = planInstruction ? this.opts.planLaunchVerdict : undefined;
@@ -905,7 +924,8 @@ ${ctxJson}`
         if (!launch && to === undefined && !completion) return {};
         return failClosedGuard(() => {
           const reason = launch ? planLaunchVerdict && planLaunchDenial(planLaunchVerdict(typeof value?.description === "string" ? value.description : undefined))
-            : to !== undefined ? planResumeVerdict && planResumeDenial(planResumeVerdict(to, launchByName.get(to), input.tool_use_id))
+            : to !== undefined ? planResumeVerdict && planResumeDenial(planResumeVerdict(to, launchByName.get(to), input.tool_use_id,
+              resumeSummary(value)))
             : planCompletionVerdict && planCompletionDenial(planCompletionVerdict(input.tool_name, value, input.tool_use_id, admittedLaunches));
           if (reason) return { hookSpecificOutput: { hookEventName: "PreToolUse", permissionDecision: "deny", permissionDecisionReason: reason } };
           if (launch) admittedLaunches.add(input.tool_use_id);
@@ -1153,12 +1173,12 @@ ${ctxJson}`
         fatal: false,
       });
     }
-    for (const requestId of this.pendingApprovals.keys()) this.resolveApproval(requestId, "deny", undefined, "interrupt");
+    for (const requestId of this.pendingApprovals.keys()) this.resolveApproval(requestId, "deny", undefined, APPROVAL_RESOLVED_BY.interrupt);
     const timeoutMs = this.opts.interruptForceKillTimeoutMs;
     this.interruptTimer = setTimeout(() => {
       if (this.normalizer.turnState === "interrupting" && this.normalizer.currentTurnId === turnId) {
         this.opts.log(`interrupt timeout (${timeoutMs}ms) → abort (force-kill fallback)`);
-        this.abortController.abort();
+        this.killForStop();
         this.endTurn("turn_interrupted");
         this.closed = true;
       }
@@ -1175,7 +1195,7 @@ ${ctxJson}`
         this.opts.log(
           `interrupt: queued input may survive (${CAP_INTERRUPT_CANCEL_QUEUED}=${honorsCancelQueued}, still_queued=${survivors}) → abort (force-kill)`
         );
-        this.abortController.abort();
+        this.killForStop();
         if (this.normalizer.turnState === "interrupting" && this.normalizer.currentTurnId === turnId) {
           this.endTurn("turn_interrupted");
         }
@@ -1183,7 +1203,7 @@ ${ctxJson}`
       }
     } catch (e) {
       this.opts.log(`interrupt() error: ${String(e)} → abort fallback`);
-      this.abortController.abort();
+      this.killForStop();
       if (this.normalizer.turnState === "interrupting" && this.normalizer.currentTurnId === turnId) {
         this.endTurn("turn_interrupted");
         this.closed = true;
@@ -1242,10 +1262,7 @@ ${ctxJson}`
           { reason: "backend_lost" }
         );
       }
-      if (!this.closed) {
-        this.closed = true;
-        this.emit({ kind: "conversation_closed", reason: "backend_exited" });
-      }
+      this.emitConversationClosed("backend_exited");
     } catch (e) {
       const aborted = this.abortController.signal.aborted;
       if (this.normalizer.turnState !== "idle") {
@@ -1253,17 +1270,23 @@ ${ctxJson}`
           reason: aborted ? undefined : String(e),
         });
       }
-      if (!this.closed) {
-        this.closed = true;
-        this.emit({
-          kind: "conversation_closed",
-          reason: aborted ? "aborted" : `error: ${String(e)}`,
-        });
-      }
+      this.emitConversationClosed(aborted ? "aborted" : `error: ${String(e)}`);
     } finally {
       await Promise.allSettled([...this.activeExternalRuns]);
       await this.attribution.close();
     }
+  }
+
+  private emitConversationClosed(reason: string): void {
+    this.closed = true;
+    if (this.closedEmitted) return;
+    this.closedEmitted = true;
+    this.emit({ kind: "conversation_closed", reason, ...(this.killedForStop ? { stopped: true as const } : {}) });
+  }
+
+  private killForStop(): void {
+    this.killedForStop = true;
+    this.abortController.abort();
   }
 
   private handleMessage(msg: any): void {
@@ -1322,7 +1345,7 @@ ${ctxJson}`
       clearTimeout(this.interruptTimer);
       this.interruptTimer = null;
     }
-    for (const requestId of this.pendingApprovals.keys()) this.resolveApproval(requestId, "deny", undefined, "dispose");
+    for (const requestId of this.pendingApprovals.keys()) this.resolveApproval(requestId, "deny", undefined, APPROVAL_RESOLVED_BY.dispose);
     this.inputWaiter?.();
     this.inputWaiter = null;
     try {
@@ -1470,12 +1493,23 @@ ${ctxJson}`
     }
   }
 
-  resolveApproval(requestId: string, behavior: ApprovalDecision["behavior"], answers?: Record<string, string>, resolvedBy = "user"): void {
+  resolveApproval(requestId: string, behavior: ApprovalDecision["behavior"], answers?: Record<string, string>, resolvedBy: string = APPROVAL_RESOLVED_BY.user): void {
     const p = this.pendingApprovals.get(requestId);
     if (p) {
       this.pendingApprovals.delete(requestId);
       const useAnswers = behavior === "allow" && p.toolName === "AskUserQuestion" ? answers : undefined;
       p.resolve({ behavior, resolvedBy, ...(useAnswers ? { answers: useAnswers } : {}) });
+    }
+  }
+
+  get answersUnanswered(): boolean {
+    return this.cliCapabilities?.includes(CAP_ASK_USER_QUESTION_UNANSWERED) === true;
+  }
+
+  answerPendingQuestionsInChat(text: string): void {
+    const pending = [...this.pendingApprovals.values()].map((p) => ({ requestId: p.requestId, question: this.questionRequests.has(p.requestId) }));
+    for (const requestId of questionsRepliedInChat(text, this.answersUnanswered, pending)) {
+      this.resolveApproval(requestId, "deny", undefined, APPROVAL_RESOLVED_BY.chat);
     }
   }
 

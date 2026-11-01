@@ -1,15 +1,15 @@
 import type { ToolIntentInput } from "./tool-intent";
-import { isHistoryEvent, type NormalizedEvent, type ResumeHydrationPhase } from "./protocol";
+import { isHistoryEvent, workEndStatus, type NormalizedEvent, type ResumeHydrationPhase, type WorkEndStatus } from "./protocol";
 import * as l10n from "@vscode/l10n";
 import { isRequestMessage, mainCallTimeKind, MAX_TIME_TOOL_INTERVALS, toolTimeSpans, type UnknownLauncher } from "./time-buckets";
-import { isFailedToolResult, isRejectedBeforeRun, taskNotificationTerminal } from "./tool-result-signals";
-import { DELEGATION_TOOL_NAMES, isCountedExternalRunCall, TASK_TOOL_NAMES } from "./claude-tool-names";
+import { isFailedToolResult, isRejectedBeforeRun, taskNotificationOutcome, taskNotificationTerminal } from "./tool-result-signals";
+import { DELEGATION_TOOL_NAMES, isCountedExternalRunCall, isMainExternalRun, TASK_TOOL_NAMES } from "./claude-tool-names";
 import { isPureCommandWrapper } from "./human-input-vocabulary";
 import { parseMarkdown } from "./markdown-ast";
 import { appendRecordPart, findCommitBoundary, joinRecordTexts, type RecordTextPart } from "./commit-boundary";
 import { redactAbsolutePaths, redactOptional } from "./path-redaction";
 import { planStepKey, planWorkTaskKey, TASK_KEY_PREFIX, TASK_PENDING_KEY_PREFIX, TODO_KEY_PREFIX } from "./plan-steps";
-import { childActivity, childUsageCounts, isChildCall, unfinishedCallEnd, closeRun, currentRunStart, delegationRuns, insertSpan, measureSpans, runElapsedMs, runEnd, unionSpans,
+import { childActivity, childUsageCounts, descendantStopAt, isChildCall, launchedUnder, launcherOwning, resumedRunStop, unfinishedCallEnd, closeRun, currentRunStart, delegationRuns, insertSpan, measureSpans, runElapsedMs, runEnd, unionSpans,
   moreRuns, type ChildTranscriptSpan, type RecordedRuns, type RunStop, type Span } from "./spans";
 
 export const MAX_PHASES = 256;
@@ -117,6 +117,7 @@ export interface WorkAgent {
   notifiedEndedAt?: number;
   woke?: true;
   lostAt?: number;
+  stopped?: true;
   elapsedMs: number;
   tokens?: number;
   childCount: number;
@@ -223,6 +224,7 @@ export interface BackgroundTaskEntry {
   kind: "agent" | "tool";
   terminal?: "completed" | "failed" | "stale";
   pendingStale?: true;
+  pendingStaleAt?: number;
 }
 
 export interface ToolPlacementIndex {
@@ -367,7 +369,7 @@ function reconcileRequestCommands(d: Draft, turnId: string, text: string): void 
 export type PlanHistoryEntry = { at: number; kind: "user" } | {
   at: number; kind: "todos"; source?: "tasks"; created?: boolean; removed?: boolean; items: Extract<TaskIntent, { kind: "todo" }>["items"];
 } | {
-  at: number; kind: "resume"; agentId: string; description: string; status: WorkStatus; endedAt?: number;
+  at: number; kind: "resume"; agentId: string; description: string; status: WorkEndStatus; endedAt?: number;
 };
 export type WorkSignal = Readonly<NormalizedEvent>;
 
@@ -1403,7 +1405,7 @@ function removeRunningTool(d: Draft, toolUseId: string): void {
   d.next.runningToolUseIds = draftRunningTools(d).filter((id) => id !== toolUseId);
 }
 
-function markToolStale(d: Draft, toolUseId: string, timestamp: number, isAgent: boolean): void {
+function markToolStale(d: Draft, toolUseId: string, timestamp: number, isAgent: boolean, stopEventAt = timestamp): void {
   const current = findToolPlacement(d.next, toolUseId);
   if (!current || current.stale === true) return;
   const placement = draftPlacement(d, toolUseId)!;
@@ -1417,15 +1419,19 @@ function markToolStale(d: Draft, toolUseId: string, timestamp: number, isAgent: 
   if (placement.background !== undefined) settleBackgroundStale(d, placement);
   if (!isAgent) return;
   const target = draftTotals(d, placement.phaseRef);
-  if (!target) return;
-  target.totals.runningCount--;
-  target.totals.staleCount++;
-  const agent = target.phase ? draftAgent(d, target.phase, placement.agentId) : undefined;
-  if (!agent || agent.status !== "running") return;
-  agent.status = "stale";
-  agent.endedAt = timestamp;
-  if (placement.background !== undefined) agent.lostAt = timestamp;
-  agent.elapsedMs = agentStoppedMs(agent);
+  if (target) {
+    target.totals.runningCount--;
+    target.totals.staleCount++;
+    const agent = target.phase ? draftAgent(d, target.phase, placement.agentId) : undefined;
+    if (agent && agent.status === "running") {
+      agent.status = "stale";
+      agent.endedAt = timestamp;
+      agent.stopped = undefined;
+      if (placement.background !== undefined) agent.lostAt = timestamp;
+      agent.elapsedMs = agentStoppedMs(agent);
+    }
+  }
+  closeLaunchedBy(d, toolUseId, stopEventAt);
 }
 
 function trackRunningTool(d: Draft, toolUseId: string): void {
@@ -1720,7 +1726,8 @@ function finishBackground(
   d: Draft,
   placement: WorkTool,
   timestamp: number,
-  status: "completed" | "failed" | "stale"
+  status: "completed" | "failed" | "stale",
+  stopped: boolean
 ): void {
   if (status === "failed") {
     const request = draftRequest(d, placement.requestIndex);
@@ -1757,6 +1764,7 @@ function finishBackground(
         agent.status = status;
         agent.endedAt = timestamp;
         agent.notifiedEndedAt = timestamp;
+        agent.stopped = stopped ? true : undefined;
         agent.elapsedMs = agentStoppedMs(agent);
         if (status === "failed") agent.failCount++;
       }
@@ -1766,6 +1774,7 @@ function finishBackground(
   }
   removeRunningAgent(d, placement.toolUseId);
   removeRunningTool(d, placement.toolUseId);
+  if (placement.agentId !== undefined) closeLaunchedBy(d, placement.toolUseId, timestamp);
   if (placement.agentId === undefined) {
     deletePlacement(d, placement.toolUseId);
   } else {
@@ -1800,7 +1809,7 @@ function closeBackgroundByNotification(
     const terminal = taskNotificationTerminal(status);
     draftBackgroundTasks(d)[taskId] = { toolUseId: entry.toolUseId, kind: entry.kind, terminal };
     const placement = findToolPlacement(d.next, entry.toolUseId);
-    if (placement) finishBackground(d, placement, timestamp, terminal);
+    if (placement) finishBackground(d, placement, timestamp, terminal, taskNotificationOutcome(status) === "stopped");
   } else if (entry.kind === "agent") closeLateRun(d, taskId, entry.toolUseId, status, timestamp);
   if (entry.kind === "agent" && tokens !== undefined) recordNotifiedTokens(d, entry.toolUseId, tokens);
 }
@@ -1839,12 +1848,30 @@ function closeLateRun(d: Draft, taskId: string, toolUseId: string, status: strin
   agent.notifiedEndedAt = timestamp;
   agent.woke = undefined;
   agent.lostAt = undefined;
+  agent.stopped = taskNotificationOutcome(status) === "stopped" ? true : undefined;
+  closeLaunchedBy(d, toolUseId, timestamp);
   agent.elapsedMs = agentStoppedMs(agent);
 }
 
+function agentLaunchOf(state: WorkModelState, agentId: string): WorkAgent | undefined {
+  for (const phase of state.phases) for (const agent of phase.agents) if (agent.transcriptAgentId === agentId) return agent;
+  return undefined;
+}
+
 function reopenBackground(d: Draft, taskId: string, timestamp: number): void {
-  const entry = d.next.backgroundTasks[taskId];
-  if (entry === undefined || entry.kind !== "agent" || entry.terminal === undefined) return;
+  let entry = d.next.backgroundTasks[taskId];
+  const foreground = entry === undefined ? agentLaunchOf(d.next, taskId) : undefined;
+  const stop = resumedRunStop({ background: entry !== undefined, backgroundStoppedAt: entry?.terminal === undefined ? undefined : timestamp,
+    foregroundEndedAt: foreground === undefined || foreground.status === "running" ? undefined : foreground.endedAt });
+  if (stop === undefined) return;
+  if (entry === undefined) {
+    const launch = draftPlacement(d, foreground!.toolUseId);
+    if (launch === undefined || launch.agentId === undefined) return;
+    launch.background = { taskId };
+    launch.launchOnly = undefined;
+    entry = draftBackgroundTasks(d)[taskId] = { toolUseId: launch.toolUseId, kind: "agent", terminal: "completed" };
+  }
+  if (entry.kind !== "agent") return;
   const placement = draftPlacement(d, entry.toolUseId);
   if (!placement) {
     const coverage = draftCoverage(d);
@@ -1868,7 +1895,7 @@ function reopenBackground(d: Draft, taskId: string, timestamp: number): void {
     const agent = target.phase ? draftAgent(d, target.phase, placement.agentId) : undefined;
     if (agent) {
       recordPlanHistory(d, { kind: "resume", at: timestamp, agentId: agent.agentId, description: agent.description,
-        status: agent.status, ...(agent.endedAt === undefined ? {} : { endedAt: agent.endedAt }) });
+        status: workEndStatus(agent), ...(agent.endedAt === undefined ? {} : { endedAt: agent.endedAt }) });
       if (agent.endedAt !== undefined) agent.earlierRuns = closeRun(agent.earlierRuns, agentRunStart(agent), agent.endedAt, agent.lastChildAt, timestamp);
       agent.status = "running";
       agent.runStartedAt = timestamp;
@@ -1876,17 +1903,18 @@ function reopenBackground(d: Draft, taskId: string, timestamp: number): void {
       agent.notifiedEndedAt = undefined;
       agent.woke = undefined;
       agent.lostAt = undefined;
+      agent.stopped = undefined;
     }
   }
   if (!d.next.runningAgentToolUseIds.includes(placement.toolUseId)) draftRunningAgents(d).push(placement.toolUseId);
 }
 
-function notePendingStale(d: Draft, tasks: ReadonlyArray<{ id: string; ambient?: true }>): void {
+function notePendingStale(d: Draft, tasks: ReadonlyArray<{ id: string; ambient?: true }>, timestamp: number): void {
   const alive = new Set(tasks.filter((t) => t.ambient !== true).map((t) => t.id));
   for (const [taskId, entry] of Object.entries(d.next.backgroundTasks)) {
     if (entry.terminal !== undefined) continue;
     const gone = !alive.has(taskId);
-    if (gone && entry.pendingStale !== true) draftBackgroundTasks(d)[taskId] = { ...entry, pendingStale: true };
+    if (gone && entry.pendingStale !== true) draftBackgroundTasks(d)[taskId] = { ...entry, pendingStale: true, pendingStaleAt: timestamp };
     else if (!gone && entry.pendingStale === true) draftBackgroundTasks(d)[taskId] = { toolUseId: entry.toolUseId, kind: entry.kind };
   }
 }
@@ -1896,7 +1924,7 @@ function settlePendingStale(d: Draft, timestamp: number): void {
     if (entry.terminal !== undefined || entry.pendingStale !== true) continue;
     const placement = findToolPlacement(d.next, entry.toolUseId);
     if (placement) {
-      markToolStale(d, entry.toolUseId, timestamp, placement.agentId !== undefined);
+      markToolStale(d, entry.toolUseId, timestamp, placement.agentId !== undefined, entry.pendingStaleAt ?? timestamp);
       removeRunningAgent(d, entry.toolUseId);
       removeRunningTool(d, entry.toolUseId);
     } else {
@@ -1924,11 +1952,10 @@ export function knownBackgroundTask(state: WorkModelState, hydration: { phase: R
   return hydration === null || hydration.phase === "complete" ? state.backgroundTasks[taskId]?.kind : "unconfirmed";
 }
 
-export function backgroundAgentDispatch(state: WorkModelState, taskId: string): { description: string; launchedAt: number; resumedAt?: number } | undefined {
+export function backgroundAgentDispatch(state: WorkModelState, taskId: string): { toolUseId: string; description: string; launchedAt: number } | undefined {
   const entry = state.backgroundTasks[taskId];
   const placement = entry?.kind === "agent" ? findToolPlacement(state, entry.toolUseId) : undefined;
-  return placement === undefined ? undefined : { description: placement.description, launchedAt: placement.startedAt,
-    ...(placement.resumedAt === undefined ? {} : { resumedAt: placement.resumedAt }) };
+  return placement === undefined || entry === undefined ? undefined : { toolUseId: entry.toolUseId, description: placement.description, launchedAt: placement.startedAt };
 }
 
 type CallTimeContainer = { toolSpans: Span[]; confirmSpans: Span[]; trimmedToolMs: number; trimmedUntil: number; elapsedMs: number };
@@ -2205,11 +2232,106 @@ function handleToolFinish(d: Draft, e: ToolFinishedSignal): void {
   if (tokens !== undefined) agent.tokens = tokens;
 }
 
+export interface RequestActivity {
+  open: boolean;
+  running: boolean;
+}
+
+export function liveWorkToolUseIds(state: WorkModelState): Set<string> {
+  const dropped = new Set<string>();
+  for (const task of Object.values(state.backgroundTasks)) {
+    if (task.terminal !== undefined || task.pendingStale !== true || task.kind === "agent") continue;
+    const placement = findToolPlacement(state, task.toolUseId);
+    if (placement === undefined || !isMainExternalRun(placement)) dropped.add(task.toolUseId);
+  }
+  return new Set([...state.runningToolUseIds, ...state.runningAgentToolUseIds,
+    ...Object.values(state.backgroundTasks).filter(task => task.terminal === undefined).map(task => task.toolUseId)].filter(id => !dropped.has(id)));
+}
+
+export function requestActivity(state: WorkModelState, approvalToolIds: readonly string[], streamOpen: boolean): RequestActivity {
+  const approvalTools = new Set(approvalToolIds);
+  const liveIds = liveWorkToolUseIds(state);
+  const children = new Map<string, string[]>();
+  for (const id of liveIds) {
+    const tool = findToolPlacement(state, id);
+    if (tool && !tool.stale && tool.background === undefined && isChildCall(tool.parentToolUseId)) {
+      const siblings = children.get(tool.parentToolUseId) ?? [];
+      siblings.push(id);
+      children.set(tool.parentToolUseId, siblings);
+    }
+  }
+  const runnableById = new Map<string, boolean>();
+  const runnable = (id: string): boolean => {
+    const cached = runnableById.get(id);
+    if (cached !== undefined) return cached;
+    runnableById.set(id, false);
+    const tool = findToolPlacement(state, id);
+    const liveChildren = children.get(id) ?? [];
+    const running = tool !== undefined && !tool.stale && tool.toolName !== "AskUserQuestion" && !approvalTools.has(id) &&
+      (tool.agentId === undefined || liveChildren.length === 0 || liveChildren.some(runnable));
+    runnableById.set(id, running);
+    return running;
+  };
+  const blocksForeground = (id: string): boolean => {
+    const seen = new Set<string>();
+    let tool = findToolPlacement(state, id);
+    while (tool && !seen.has(tool.toolUseId)) {
+      if (tool.background !== undefined) return false;
+      seen.add(tool.toolUseId);
+      tool = !isChildCall(tool.parentToolUseId) ? undefined : findToolPlacement(state, tool.parentToolUseId);
+    }
+    return true;
+  };
+  const detachedApprovals = approvalToolIds.filter(id => !blocksForeground(id)).length;
+  const waiting = state.phases.reduce((count, phase) => count + phase.pendingApprovalCount, 0) > detachedApprovals ||
+    approvalToolIds.some(blocksForeground) || [...liveIds].some(id => {
+      const tool = findToolPlacement(state, id);
+      return tool !== undefined && !tool.stale && tool.toolName === "AskUserQuestion" && blocksForeground(id);
+    });
+  const runningWork = [...liveIds].some(runnable);
+  const liveWork = [...liveIds].some(id => findToolPlacement(state, id)?.stale !== true);
+  return { open: state.turnActive || streamOpen && liveWork, running: state.turnActive && !waiting || streamOpen && runningWork };
+}
+
+export function launchedByAny(state: WorkModelState, toolUseId: string, launchers: ReadonlySet<string>): boolean {
+  return launchedUnder(findToolPlacement(state, toolUseId)?.parentToolUseId, id => findToolPlacement(state, id)?.parentToolUseId, id => launchers.has(id));
+}
+
+function subtreeLastActivity(state: WorkModelState, toolUseId: string): number | undefined {
+  const launcher = new Set([toolUseId]);
+  let last: number | undefined;
+  for (const phase of state.phases) for (const agent of phase.agents) {
+    if (agent.lastChildAt === undefined || (agent.toolUseId !== toolUseId && !launchedByAny(state, agent.toolUseId, launcher))) continue;
+    last = Math.max(last ?? agent.lastChildAt, agent.lastChildAt);
+  }
+  return last;
+}
+
+function closeLaunchedBy(d: Draft, toolUseId: string, stopAt: number): void {
+  const parentOf = (id: string) => findToolPlacement(d.next, id)?.parentToolUseId;
+  const ackedBackground = (id: string) => findToolPlacement(d.next, id)?.background !== undefined;
+  const closes = (id: string) => !ackedBackground(id) && launcherOwning(parentOf(id), parentOf, toolUseId, ackedBackground);
+  const background = ackedBackground(toolUseId);
+  const subtreeLast = background ? subtreeLastActivity(d.next, toolUseId) : undefined;
+  const closedAt = (id: string) => background ? descendantStopAt(stopAt, subtreeLast, findToolPlacement(d.next, id)?.startedAt ?? stopAt) : stopAt;
+  const closed = [
+    ...d.next.runningAgentToolUseIds.filter(closes).map(id => ({ id, agent: true })),
+    ...d.next.runningToolUseIds.filter(closes).map(id => ({ id, agent: false })),
+  ];
+  for (const { id, agent } of closed) {
+    markToolStale(d, id, closedAt(id), agent);
+    if (agent) removeRunningAgent(d, id);
+    else removeRunningTool(d, id);
+  }
+}
+
 function markRunningWorkStale(d: Draft, timestamp: number, includeBackground: boolean, keepTool: (toolUseId: string) => boolean = () => false): void {
-  const isBackground = (toolUseId: string): boolean => findToolPlacement(d.next, toolUseId)?.background !== undefined;
+  const runningBackground = new Set(includeBackground ? [] : d.next.runningAgentToolUseIds.filter(toolUseId => findToolPlacement(d.next, toolUseId)?.background !== undefined));
+  const isBackground = (toolUseId: string): boolean => !includeBackground &&
+    (findToolPlacement(d.next, toolUseId)?.background !== undefined || launchedByAny(d.next, toolUseId, runningBackground));
   const keptAgents: string[] = [];
   for (const toolUseId of d.next.runningAgentToolUseIds) {
-    if (!includeBackground && isBackground(toolUseId)) {
+    if (isBackground(toolUseId)) {
       keptAgents.push(toolUseId);
       continue;
     }
@@ -2217,18 +2339,21 @@ function markRunningWorkStale(d: Draft, timestamp: number, includeBackground: bo
   }
   const keptTools: string[] = [];
   for (const toolUseId of d.next.runningToolUseIds) {
-    if (!includeBackground && isBackground(toolUseId) || keepTool(toolUseId)) {
+    if (isBackground(toolUseId) || keepTool(toolUseId)) {
       keptTools.push(toolUseId);
       continue;
     }
     markToolStale(d, toolUseId, timestamp, false);
   }
-  if (d.next.runningAgentToolUseIds.length !== keptAgents.length) {
-    d.next.runningAgentToolUseIds = keptAgents;
+  const live = (toolUseId: string): boolean => findToolPlacement(d.next, toolUseId)?.stale !== true;
+  const agents = keptAgents.filter(live);
+  const tools = keptTools.filter(live);
+  if (d.next.runningAgentToolUseIds.length !== agents.length) {
+    d.next.runningAgentToolUseIds = agents;
     d.runningAgentsCopied = true;
   }
-  if (d.next.runningToolUseIds.length !== keptTools.length) {
-    d.next.runningToolUseIds = keptTools;
+  if (d.next.runningToolUseIds.length !== tools.length) {
+    d.next.runningToolUseIds = tools;
     d.runningToolsCopied = true;
   }
 }
@@ -2346,7 +2471,7 @@ function applySignal(d: Draft, signal: WorkSignal): void {
     case "turn_failed":
       d.next.turnActive = false;
       closeSegment(d, signal.timestamp);
-      markRunningWorkStale(d, signal.timestamp, true);
+      markRunningWorkStale(d, signal.timestamp, false);
       return;
     case "turn_started":
       startRequest(d, signal);
@@ -2362,7 +2487,7 @@ function applySignal(d: Draft, signal: WorkSignal): void {
       markRunningWorkStale(d, signal.timestamp, true);
       return;
     case "background_tasks":
-      notePendingStale(d, signal.tasks);
+      notePendingStale(d, signal.tasks, signal.timestamp);
       return;
     case "user_message":
       d.next.requestHeadline = { turnId: signal.turnId, text: signal.text.split("\n").find(line => line.trim().length > 0)?.trim() ?? "" };

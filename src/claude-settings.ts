@@ -281,7 +281,7 @@ export class ConversationFolderMissingError extends Error {
   }
 
   backgroundRunNotice(): string {
-    return l10n.t("LAISORA: {0} (LLM analysis and summaries run in the working folder of the conversation.)", this.message);
+    return l10n.t("LAISORA: {0} (Summaries and session-name suggestions run in the working folder of the conversation.)", this.message);
   }
 }
 

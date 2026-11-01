@@ -11,6 +11,7 @@ import { handleSurfaceMessage, reorderSessionTabs } from "./store-surfaces";
 import { runHostActionMessage, userSettingsMessage, welcomeActionMessage } from "./gateway-host-actions";
 
 import { handleHistoryMessage } from "./history-serving";
+import { startImprovementAnalysis } from "./improvement-analysis";
 import { output } from "./host-context";
 import { handleInspectorMessage } from "./inspector-wiring";
 import { handleSessionFileMessage } from "./session-list-wiring";
@@ -106,14 +107,9 @@ export async function handleWebviewMessage(
       case "welcomeAction":
         await welcomeActionMessage(msg);
         break;
-      case "llmAnalysisRequest":
       case "suggestSessionName":
       case "summarizeSession":
-      case "setLlmAnalysisEnabled":
-      case "startFindingSession":
-      case "prepareHistoricalDraft":
-      case "selectAnalysisArtifact":
-        await handleAnalysisMessage(st, msg, sender, target);
+        await handleAnalysisMessage(msg, target);
         break;
       case "resumeSession":
       case "resumeHydrationRetry":
@@ -141,6 +137,9 @@ export async function handleWebviewMessage(
         break;
       case "todoFromReply":
         await todoFromReply(st, msg, target!);
+        break;
+      case "startImprovementAnalysis":
+        await startImprovementAnalysis(st);
         break;
       default: {
         const unrouted: never = msg;

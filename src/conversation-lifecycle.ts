@@ -1,3 +1,4 @@
+import { EXTERNAL_TIMEOUT_SETTING_KEY } from "./orchestration-executors";
 import { applyFallbackModel, fallbackCoalesces, fallbackOriginalModel, fallbackTurnKey, fallbackUnresolved, reportedPermissionMode, resolveFallbackByChoice, type EventProvenance, type FallbackRevertOutcome, type NormalizedEventBody, type PermissionModeId, type PermissionModeRequest } from "./protocol";
 import { randomUUID } from "node:crypto";
 import { getLaisoraConfiguration } from "./claude-settings";
@@ -5,6 +6,7 @@ import { placementSettingsOf } from "./placement-line";
 import { cachedExternalModels, noteRunningExecutorVersion } from "./gateway-host-actions";
 import { noteCliUpdateOpportunity } from "./claude-cli-update";
 import { transcriptRetentionSettings } from "./transcript-retention";
+import { chromeIntegrationEnabled } from "./chrome-integration";
 
 import {
   PERMISSION_MODE_KEY,
@@ -69,7 +71,7 @@ export function postOrchestrationView(s: Session): void {
         guardEnabled: placementSettings.guardEnabled,
         memoryBlockProjectType: placementSettings.blockProjectType,
         orchestrationAgents: current.get<unknown>("orchestration.agents"),
-        externalTimeoutMinutes: current.get<number>("orchestration.externalTimeoutMinutes")!,
+        externalTimeoutMinutes: current.get<number>(EXTERNAL_TIMEOUT_SETTING_KEY)!,
         conductorPolicy: current.get<string>("orchestration.conductorPolicy")!,
       }, (agent) => conv.attributedRole(agent, evidence));
     }, (state) => store?.post({ type: "orchestrationView", tabId: s.tabId, state }));
@@ -515,7 +517,9 @@ function launchModel(s: Session): string | null | undefined {
 export async function sendLaisoraInput(s: Session, input: LaisoraInput, text: string): Promise<boolean> {
   await ensureConversation(s);
   if (s.closed || s.clearing || !s.conversation) return false;
-  return s.conversation.send(text, undefined, Date.now(), input);
+  const sent = s.conversation.send(text, undefined, Date.now(), input);
+  s.awaitingLaisoraInput = false;
+  return sent;
 }
 
 export async function handleConversationMessage(
@@ -552,6 +556,15 @@ export async function handleConversationMessage(
           message: l10n.t(
             "Input that starts with a reserved tag (<laisora-…>, <system-reminder>, [LAISORA:…], etc.) cannot be sent. Add text before it or wrap the tag in a code block."
           ),
+          fatal: false,
+        });
+        disposition("rejected");
+        break;
+      }
+      if (target!.awaitingLaisoraInput) {
+        target!.pushEvent({
+          kind: "error",
+          message: l10n.t("LAISORA has not sent its first message to this conversation yet. Send yours after it appears."),
           fatal: false,
         });
         disposition("rejected");
@@ -596,6 +609,7 @@ export async function handleConversationMessage(
       msg.images = images;
       const messageUuid = randomUUID();
       const sentAt = Date.now();
+      target!.conversation!.answerPendingQuestionsInChat(msg.text);
       if (!isNonHumanCommandInput(msg.text)) {
         disposition("accepted-human");
         target!.pushEvent(
@@ -755,6 +769,7 @@ async function ensureConversationInner(s: Session, requestedAt: number): Promise
     settingSources,
     transcriptRetention: transcriptRetentionSettings((key) => cfg.get<unknown>(key)),
     remoteControlAtStartup: cfg.get<boolean>("claude.remoteControlAtStartup")!,
+    chromeIntegration: chromeIntegrationEnabled((key) => cfg.get<unknown>(key)),
     progressTracking: normalizeProgressTracking(cfg.get<string>("progressTracking")!),
     claudeCodeExecutablePath: configuredClaudeExecutablePath(cfg),
     apiKeyPolicy: normalizeApiKeyPolicy(cfg.get<string>("claude.apiKeyPolicy")!),
@@ -764,8 +779,8 @@ async function ensureConversationInner(s: Session, requestedAt: number): Promise
     todoStore: todoEnabled ? hostTodoStore() : undefined,
     todoLinkedItem,
     planLaunchVerdict: description => numberedLaunchVerdict(s.evidenceIndex.timeBuckets, description),
-    planResumeVerdict: (to, namedToolUseId, toolUseId) => resumeVerdict(s.evidenceIndex.timeBuckets, to, namedToolUseId, toolUseId,
-      id => isRunningLane(s.workModel, id)),
+    planResumeVerdict: (to, namedToolUseId, toolUseId, summary) => resumeVerdict(s.evidenceIndex.timeBuckets, to, namedToolUseId, toolUseId,
+      id => isRunningLane(s.workModel, id), summary),
     planCompletionVerdict: (toolName, input, toolUseId, admittedLaunches) => completionVerdict(s.evidenceIndex.timeBuckets, toolName, input, toolUseId,
       id => isRunningLane(s.workModel, id), admittedLaunches),
     orchestrationEnabled: cfg.get<boolean>("orchestration.enabled")! === true,
@@ -773,7 +788,7 @@ async function ensureConversationInner(s: Session, requestedAt: number): Promise
     memoryBlockProjectType: placementSettings.blockProjectType,
     orchestrationAgents: cfg.get<unknown>("orchestration.agents"),
     externalModels: cachedExternalModels(),
-    externalTimeoutMinutes: cfg.get<number>("orchestration.externalTimeoutMinutes")!,
+    externalTimeoutMinutes: cfg.get<number>(EXTERNAL_TIMEOUT_SETTING_KEY)!,
     orchestrationRunsDirectory: orchestrationRunsDirectoryOf(extensionContext?.globalStorageUri?.fsPath),
     orchestrationPluginDirectory: orchestrationPluginDirectoryOf(extensionContext?.globalStorageUri?.fsPath),
     rosterEvidenceDirectory: store?.rosterEvidenceDirectory,
