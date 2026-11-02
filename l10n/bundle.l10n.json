@@ -7,7 +7,6 @@
   "Task {0}": "Task {0}",
   "Initial work": "Initial work",
   "Untitled task": "Untitled task",
-  "The verdicts block at the end of an improvement analysis says what it is: the record the next analysis reads, which you do not need to read.": "The verdicts block at the end of an improvement analysis says what it is: the record the next analysis reads, which you do not need to read.",
   "Claude in LAISORA conversations can use the Claude in Chrome extension. You can turn it off in the settings.": "Claude in LAISORA conversations can use the Claude in Chrome extension. You can turn it off in the settings.",
   "The conversation menu has \"Start LLM improvement analysis\": it finds recurring failures across your Claude Code conversations and opens a conversation that proposes fixes.": "The conversation menu has \"Start LLM improvement analysis\": it finds recurring failures across your Claude Code conversations and opens a conversation that proposes fixes.",
   "The status line shows a question waiting for you first, and keeps showing background tasks.": "The status line shows a question waiting for you first, and keeps showing background tasks.",

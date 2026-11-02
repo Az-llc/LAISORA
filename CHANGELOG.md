@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.15.2
+
+- The news on a new conversation shows the 1.15.0 features again. 1.15.1 showed a fix there
+  instead, which the news does not list.
+
 ## 1.15.1
 
 - The verdicts block that ends an LLM improvement analysis is labelled as the record the next
