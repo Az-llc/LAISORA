@@ -13,6 +13,7 @@ import type { AnalysisPlansView, RoleSummaryView } from "./role-summary";
 import { EXECUTORS, externalRunStatus, isExecutorId, isExternalRunOutcome, type ExecutorId, type ExternalRunOutcome } from "./orchestration-executors";
 import { isDelegationTool } from "./claude-tool-names";
 import { isAskUnansweredKind, type AskUnansweredKind } from "./ask-unanswered";
+import { ELICITATION_CONTENT_LIMITS, elicitationTextLength, type ElicitationAction, type ElicitationSpec, type ElicitationValue } from "./elicitation";
 import { isExternalTimeout, isExternalDetection, isExternalModels, type ExternalModels, type ExternalDetection } from "./orchestration-roster";
 import { isOrchestrationSettingRoster, type OrchestrationSettingRow, type RecommendedRosterChange } from "./orchestration-roster";
 import { isOrchestrationView, type OrchestrationView } from "./orchestration-view";
@@ -384,6 +385,7 @@ export type NormalizedEventBody =
         inputSummary?: string;
         expiresAt: number | null;
         questions?: AskUserQuestionSpec;
+        elicitation?: ElicitationSpec;
       }
     | {
         kind: "approval_resolved";
@@ -392,6 +394,7 @@ export type NormalizedEventBody =
         resolvedBy: string;
         answers?: Record<string, string>;
         unanswered?: AskUnansweredKind;
+        elicitation?: { mode: ElicitationSpec["mode"]; action: ElicitationAction };
       }
     | { kind: "permission_denied"; turnId: string | null; toolName: string; toolUseId?: string; inDelegate?: true; reason: string; classifierUnavailable?: boolean }
     | { kind: "usage_update"; scope: "turn" | "conversation"; turnId: string | null; usage: UsageSnapshot }
@@ -642,11 +645,16 @@ export function isInternalSlashCommand(cmd: SlashCommandInfo): boolean {
   return INTERNAL_COMMAND_DESC_HINTS.some((re) => re.test(cmd.description));
 }
 
+export const TOOL_SUMMARY_MAX = 60;
+
+export function clipSummary(s: string, n = TOOL_SUMMARY_MAX): string {
+  return s.length > n ? `${s.slice(0, n)}…` : s;
+}
+
 export function summarizeToolInput(toolName: string, input: unknown): string | null {
   if (typeof input !== "object" || input === null) return null;
   const obj = input as Record<string, unknown>;
   const str = (v: unknown): string | null => (typeof v === "string" && v.length > 0 ? v : null);
-  const clip = (s: string, n = 60): string => (s.length > n ? `${s.slice(0, n)}…` : s);
   const baseName = (fp: string): string => {
     const parts = fp.split(/[\\/]/);
     return parts[parts.length - 1] || fp;
@@ -655,14 +663,14 @@ export function summarizeToolInput(toolName: string, input: unknown): string | n
     const desc = str(obj.description) ?? str(obj.subject);
     if (desc) return desc;
     const prompt = str(obj.prompt);
-    return prompt ? clip(prompt) : null;
+    return prompt ? clipSummary(prompt) : null;
   }
   switch (toolName) {
     case "Bash": {
       const desc = str(obj.description);
       if (desc) return desc;
       const cmd = str(obj.command);
-      return cmd ? clip(cmd) : null;
+      return cmd ? clipSummary(cmd) : null;
     }
     case "Read":
     case "Write":
@@ -795,7 +803,7 @@ export function normalizeComposerSendKey(v: unknown): ComposerSendKey {
   return v === "shiftEnter" ? "shiftEnter" : "enter";
 }
 
-export const FILE_LINK_BOOLEAN_SETTINGS = ["fileLinkInstruction", "planInstruction", "chromeIntegration", "revealInExplorer", "allowOutsideWorkspace", "confirmOutsideWorkspace", "openOutsideReadOnly"] as const;
+export const FILE_LINK_BOOLEAN_SETTINGS = ["fileLinkInstruction", "planInstruction", "chromeIntegration", "mcpElicitation", "revealInExplorer", "allowOutsideWorkspace", "confirmOutsideWorkspace", "openOutsideReadOnly"] as const;
 export const FILE_LINK_SETTINGS = [...FILE_LINK_BOOLEAN_SETTINGS, "openWithSystemApp"] as const;
 export type FileLinkBooleanSetting = (typeof FILE_LINK_BOOLEAN_SETTINGS)[number];
 export type FileLinkSetting = (typeof FILE_LINK_SETTINGS)[number];
@@ -1075,6 +1083,7 @@ export type WebviewToHost =
       requestId: string;
       behavior: "allow" | "deny";
       answers?: Record<string, string>;
+      content?: Record<string, ElicitationValue>;
     }
   | { type: "newTab" }
   | { type: "composerFocus"; focused: boolean }
@@ -3311,6 +3320,7 @@ export type HostToWebview =
   | { type: "userSettings"; appearance?: AccentSettings; displayName?: string; composerSendKey: ComposerSendKey; askQualityCheck?: boolean; editSummaryEnabled: boolean; remoteControlCard?: boolean; improvementMenu?: boolean; welcome?: WelcomeState }
   | { type: "remoteControlState"; tabId: string; state: RemoteControlView }
   | { type: "tabNotice"; tabId: string; text: string }
+  | { type: "elicitationOpenFailed"; tabId: string; requestId: string }
   | { type: "sessionSummary"; tabId: string; running: boolean; summary?: { text: string; model: string }; saveFailed?: boolean; failure?: string }
   | { type: "sessionNameSuggestion"; tabId: string; title: string }
   | { type: "sessionNameSuggestion"; tabId: string; reason: string }
@@ -3952,11 +3962,12 @@ export function isWebviewToHost(v: unknown): v is WebviewToHost {
   if (t === "cancelAutoResume") return typeof tabId === "string" && hasOnlyKeys(v as Record<string, unknown>, ["type", "tabId"]);
   if (t === "interrupt") return typeof tabId === "string";
   if (t === "approvalDecision") {
-    const m = v as { requestId?: unknown; behavior?: unknown; answers?: unknown };
+    const m = v as { requestId?: unknown; behavior?: unknown; answers?: unknown; content?: unknown };
     if (
       typeof tabId !== "string" ||
       typeof m.requestId !== "string" ||
-      (m.behavior !== "allow" && m.behavior !== "deny")
+      (m.behavior !== "allow" && m.behavior !== "deny") ||
+      (m.content !== undefined && !isElicitationContentMessage(m.content))
     ) {
       return false;
     }
@@ -4104,6 +4115,16 @@ export function isImageRefInfoArray(v: unknown): v is ImageRefInfo[] {
 
 const CONVERSATION_TEXT_MAX = 20000;
 const CONVERSATION_ITEMS_MAX = 500;
+
+function isElicitationContentMessage(value: unknown): boolean {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
+  const entries = Object.entries(value as Record<string, unknown>);
+  const limits = ELICITATION_CONTENT_LIMITS;
+  const shortText = (item: unknown): boolean => typeof item === "string" && elicitationTextLength(item) <= limits.textLength;
+  return entries.length <= limits.fields && entries.every(([key, item]) => key.length > 0 && key.length <= limits.keyLength && (
+    shortText(item) || typeof item === "boolean" || (typeof item === "number" && Number.isFinite(item))
+    || (Array.isArray(item) && item.length <= limits.picks && item.every(shortText))));
+}
 
 function isRestoredApprovalCard(value: unknown): boolean {
   if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
@@ -5070,6 +5091,11 @@ export function isHostToWebview(v: unknown): v is HostToWebview {
     if (m.view === "claude") return hasOnlyKeys(m, ["type", "view", "revision", "changes", "batches"]) && Array.isArray(m.changes) && m.changes.every(isTodoChangeView)
       && Array.isArray(m.batches) && m.batches.every(isTodoBatchRevert);
     return m.view === "deleted" && hasOnlyKeys(m, ["type", "view", "revision", "items"]) && Array.isArray(m.items) && m.items.every(isTodoDeletedView);
+  }
+  if (t === "elicitationOpenFailed") {
+    const requestId = (v as { requestId?: unknown }).requestId;
+    return typeof tabId === "string" && tabId.length > 0 && typeof requestId === "string" && requestId.length > 0
+      && hasOnlyKeys(v as Record<string, unknown>, ["type", "tabId", "requestId"]);
   }
   if (t === "tabNotice") {
     const text = (v as { text?: unknown }).text;

@@ -43,7 +43,7 @@ import { displayTitleFromSummary } from "./session-list";
 import type { Session } from "./session";
 import type { ClaudeConversation } from "./claudeHost";
 import { openNewConversationTab, type SessionStore } from "./store-surfaces";
-import { todoMarkChanges, todoRevertUnitBlock, isClaudeOwnChange, linkedTodoItem, parseTodoChangeId, memoStaleSince, newestConversation, todoChildBriefs, todoScopeIds, todoSessionLinks, todoStartOf, todoTabStart, runClaimedStart, singleFlight, TODO_CONVERSATION_SEEN_REFRESH_MS, todoConversationTarget, todoGroupsOf, todoTemplatesOf, todoTemplateSize, TODO_BRIEF_MAX, TODO_DELETED_RETENTION_MS, TODO_IMAGE_EXTENSIONS, todoLinkDoc, conversationLiveElsewhere, todoAskDismissals, todoAsksClosedInTodo, todoDecisionsToMigrate, type TodoAddNode, todoLinkedSessions, todoRecordAskSources, todoTabLinks, type TodoConversationLink, type TodoTabConversation, type TodoImageMediaType, WORK_MEMO_SECTIONS, type TodoChange, type TodoDocument, type TodoItem, type TodoOperation } from "./todo-model";
+import { todoMarkChanges, todoRevertUnitBlock, isClaudeOwnChange, linkedTodoItem, parseTodoChangeId, memoStaleSince, newestConversation, todoChildBriefs, todoScopeIds, todoSessionLinks, todoStartOf, todoTabStart, runClaimedStart, singleFlight, TODO_CONVERSATION_SEEN_REFRESH_MS, todoConversationTarget, todoGroupsOf, todoTemplatesOf, todoTemplateSize, TODO_BRIEF_MAX, TODO_DELETED_RETENTION_MS, TODO_IMAGE_EXTENSIONS, todoLinkDoc, conversationLiveElsewhere, todoAskDismissals, todoAsksClosedInTodo, todoDecisionsToMigrate, type TodoAddNode, todoLinkedSessions, todoRecordAskSources, todoTabLinks, todoAskSourceKept, type TodoAskSourceShown, type TodoConversationLink, type TodoTabConversation, type TodoImageMediaType, WORK_MEMO_SECTIONS, type TodoChange, type TodoDocument, type TodoItem, type TodoOperation } from "./todo-model";
 import { setTodoWorkspaceRoots, type TodoLinkedItem } from "./todo-mcp";
 import { todoChangeView, todoClaudeChanges, todoClaudeRecent, todoRecentClaudeUnits, todoRevertView, todoRevisionChanges, todoRevisionUnitOf } from "./todo-change-view";
 import { sharedTodoStore, TODO_ENABLED_SETTING, TodoStoreError, type TodoStore } from "./todo-store";
@@ -106,23 +106,26 @@ export function todoTemplateViews(document: TodoDocument): TodoTemplateView[] {
 
 function openTabs(): TodoTabConversation[] {
   return [...(store?.sessions.values() ?? [])].filter(s => !s.closed).map(s => ({
-    tabId: s.tabId, itemId: s.todoItemId, sessionId: sessionRecordId(s), running: sessionWorking(s),
+    tabId: s.tabId, itemId: s.todoItemId, sessionId: sessionRecordId(s), running: sessionWorking(s), turnRunning: turnRunning(s),
   }));
 }
 
+function turnRunning(s: Session): boolean {
+  return (s.conversation?.state ?? "idle") !== "idle";
+}
+
 function sessionWorking(s: Session): boolean {
-  return conversationWorking((s.conversation?.state ?? "idle") !== "idle", s.backgroundActivity);
+  return conversationWorking(turnRunning(s), s.backgroundActivity);
 }
 
 const TODO_ASK_STAT_PARALLEL = 4;
 const TODO_ASK_MISSING_RECHECK_MS = 5 * 60_000;
 const askSourcePaths = new Map<string, string>();
 const askSourceMissing = new Map<string, number>();
-const TODO_ASK_OTHER_WINDOW_READ_MS = 10_000;
 const askSourceCache = new Map<string, { key: string; size: number; endedAt: number; messages: TodoAskSourceMessage[] }>();
 const askSourceReads = new Map<string, Promise<{ endedAt: number; messages: TodoAskSourceMessage[] } | undefined>>();
 const askSourceReaders = new Map<string, TodoAskRecordReader>();
-const askSourceShown = new Map<string, { key: string; at: number }>();
+const askSourceShown = new Map<string, TodoAskSourceShown>();
 const TODO_DECISION_CURSOR_PREFIX = "laisora.todo.decisionCursor.";
 
 const decisionRecorder = new TodoDecisionRecorder({
@@ -217,11 +220,10 @@ async function askSourceRefs(document: TodoDocument, tabs: readonly TodoTabConve
     const sessionId = source.link.sessionId;
     const where = askSourceWhere(source.link, tabs, now);
     const shown = askSourceShown.get(sessionId);
-    const running = tabs.some(tab => tab.sessionId === sessionId && tab.running);
-    if (shown && where === "here" && running) return { itemId: source.itemId, sessionId, key: shown.key, where };
-    if (shown && where !== "here" && now - shown.at < TODO_ASK_OTHER_WINDOW_READ_MS) {
-      laterIn = Math.min(laterIn ?? Infinity, shown.at + TODO_ASK_OTHER_WINDOW_READ_MS - now);
-      return { itemId: source.itemId, sessionId, key: shown.key, where };
+    const kept = todoAskSourceKept(shown, sessionId, where === "here", tabs, now);
+    if (kept) {
+      if (kept.readAt !== undefined) laterIn = Math.min(laterIn ?? Infinity, kept.readAt - now);
+      return { itemId: source.itemId, sessionId, key: kept.key, where };
     }
     const file = await askSourceFile(sessionId, where === "here");
     const key = file?.key ?? null;
@@ -826,7 +828,7 @@ async function openTodoConversationNow(st: SessionStore, msg: Extract<WebviewToH
   const read = await readTodoDocument("open a conversation");
   const item = read ? liveItem(read.document, msg.itemId) : undefined;
   if (!read || !item) return;
-  const tabs = [...st.sessions.values()].filter(s => !s.closed).map(s => ({ tabId: s.tabId, itemId: s.todoItemId, sessionId: sessionRecordId(s), running: false }));
+  const tabs = [...st.sessions.values()].filter(s => !s.closed).map(s => ({ tabId: s.tabId, itemId: s.todoItemId, sessionId: sessionRecordId(s), running: false, turnRunning: false }));
   const target = todoConversationTarget(read.document.items, item.id, tabs, msg.fresh, { owner: TODO_WINDOW_ID, now: Date.now() });
   if (target.kind === "elsewhere") {
     showOpenElsewhere();

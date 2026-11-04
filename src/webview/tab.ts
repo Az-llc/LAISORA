@@ -42,7 +42,8 @@ import type { HandoffCompactStats, HandoffContextUsage, HandoffDecisionEntry } f
 import * as l10n from "@vscode/l10n";
 import { inputEl, logsEl, tabbarEl, usagePanelEl, sessionActionsEl, vscode } from "./dom";
 import { closeGlyphButton } from "./close-button";
-import { approvalCardTone, approvalRefSuffix, approvalVerdict, approvalVerdictLabel, approvalVerdictTone, buildApprovalBody, buildRestoredApprovalCard } from "./approval";
+import { approvalCardTone, approvalRefSuffix, approvalTitle, approvalVerdict, approvalVerdictLabel, approvalVerdictTone, buildApprovalBody, buildRestoredApprovalCard } from "./approval";
+import { buildElicitationCard, enableElicitationOpen } from "./elicitation-form";
 import { clock, clockRange, formatDuration, monthDayClock, toolSummary } from "./format";
 import { uiLocale } from "./l10n";
 import { formatHandoffTime, formatHandoffTokens } from "../handoff-format";
@@ -5733,7 +5734,7 @@ export class Tab {
     const el = this.approvalCards.get(ev.requestId);
     if (el) {
       el.querySelectorAll("button").forEach((b) => ((b as HTMLButtonElement).disabled = true));
-      el.querySelectorAll("input").forEach((i) => ((i as HTMLInputElement).disabled = true));
+      el.querySelectorAll("input, select").forEach((i) => ((i as HTMLInputElement | HTMLSelectElement).disabled = true));
       const verdict = approvalVerdict(ev);
       const tone = approvalVerdictTone(verdict);
       el.classList.add(approvalCardTone(verdict));
@@ -5742,7 +5743,7 @@ export class Tab {
       if (titleEl && !titleEl.querySelector(".approval-verdict")) {
         const verdictEl = document.createElement("span");
         verdictEl.className = `approval-verdict ${tone}`;
-        verdictEl.textContent = approvalVerdictLabel(verdict);
+        verdictEl.textContent = approvalVerdictLabel(verdict, ev.elicitation?.mode);
         titleEl.appendChild(verdictEl);
       }
       if (det) det.open = false;
@@ -5798,7 +5799,17 @@ export class Tab {
     det.open = true;
     const title = document.createElement("summary");
     title.className = "approval-title";
-    title.textContent = questions ? l10n.t("Question: {0}", toolName) : l10n.t("Approval request: {0}", toolName);
+    title.textContent = approvalTitle(toolName, questions !== undefined, ev.elicitation?.mode);
+
+    if (ev.elicitation) {
+      div.classList.add("elicitation-approval");
+      const parts = buildElicitationCard(ev.elicitation, rawInputJson, `elicit-${this.tabId}-${requestId}`, (decision) =>
+        vscode.postMessage({ type: "approvalDecision", tabId: this.tabId, requestId, ...decision }));
+      det.append(title, ...parts.body, parts.actions);
+      div.append(det);
+      this.placeApprovalCard(div, ev);
+      return;
+    }
 
     const denyBtn = document.createElement("button");
     denyBtn.className = "danger";
@@ -5921,6 +5932,15 @@ export class Tab {
       det.append(title, ...body, detail, actions);
       div.append(det);
     }
+    this.placeApprovalCard(div, ev);
+  }
+
+  reopenElicitation(requestId: string): void {
+    const card = this.approvalCards.get(requestId);
+    if (card !== undefined) enableElicitationOpen(card);
+  }
+
+  private placeApprovalCard(div: HTMLElement, ev: Extract<NormalizedEvent, { kind: "approval_request" }>): void {
     this.convEl.appendChild(div);
     const ref = this.buildApprovalRefRow(ev);
     this.registerLogMember(ref, ev.turnId ?? undefined);
@@ -5936,7 +5956,7 @@ export class Tab {
     ref.dataset.approvalRef = ev.requestId;
     this.approvalRefs.set(ev.requestId, ref);
     ref.textContent =
-      (ev.questions ? l10n.t("Question: {0}", ev.toolName) : l10n.t("Approval request: {0}", ev.toolName)) +
+      approvalTitle(ev.toolName, ev.questions !== undefined, ev.elicitation?.mode) +
       (ev.inputSummary ? ` — ${ev.inputSummary}` : "") +
       APPROVAL_REF_SUFFIX;
     return ref;
@@ -6629,7 +6649,7 @@ export class Tab {
     if (!refRow || refRow.classList.contains("resolved")) return false;
     const verdict = approvalVerdict(ev);
     refRow.classList.add("resolved", approvalVerdictTone(verdict));
-    refRow.textContent = (refRow.textContent?.replace(APPROVAL_REF_SUFFIX, "") ?? "") + approvalRefSuffix(verdict);
+    refRow.textContent = (refRow.textContent?.replace(APPROVAL_REF_SUFFIX, "") ?? "") + approvalRefSuffix(verdict, ev.elicitation?.mode);
     return true;
   }
 

@@ -18,6 +18,7 @@ export interface WelcomeUiNames { menuGlyph: string; handoffItem: string; appear
 
 export function welcomeNews(): Readonly<Record<string, readonly WelcomeNewsItem[]>> {
   return {
+    "1.15.3": [],
     "1.15.2": [],
     "1.15.1": [],
     "1.15.0": [

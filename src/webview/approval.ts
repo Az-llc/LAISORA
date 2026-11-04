@@ -5,6 +5,7 @@ import { APPROVAL_RESOLVED_BY, type AskUnansweredKind } from "../ask-unanswered"
 import { isDelegationTool } from "../claude-tool-names";
 import { askHeading, askOptionContent } from "./ask-view";
 import { youAnchor } from "./you-items";
+import type { ElicitationSpec } from "../elicitation";
 
 export function buildRestoredApprovalCard(card: RestoredApprovalCard, tabId: string): HTMLElement {
   const div = document.createElement("div");
@@ -16,7 +17,7 @@ export function buildRestoredApprovalCard(card: RestoredApprovalCard, tabId: str
   det.open = card.resolution === "unknown";
   const title = document.createElement("summary");
   title.className = "approval-title";
-  title.textContent = card.questions ? l10n.t("Question: {0}", card.toolName) : l10n.t("Approval request: {0}", card.toolName);
+  title.textContent = approvalTitle(card.toolName, card.questions !== undefined, undefined);
   det.append(title);
   if (card.questions) {
     div.classList.add("askq-approval");
@@ -73,10 +74,11 @@ export function approvalCardTone(verdict: ApprovalVerdict): "approved" | "denied
   return tone === "allow" ? "approved" : tone === "deny" ? "denied" : tone;
 }
 
-export type ApprovalVerdict = "allow" | "deny" | "withdrawn" | AskUnansweredKind;
+export type ApprovalVerdict = "allow" | "deny" | "withdrawn" | "cancelled" | AskUnansweredKind;
 
-export function approvalVerdict(ev: Pick<Extract<NormalizedEvent, { kind: "approval_resolved" }>, "behavior" | "resolvedBy" | "unanswered">): ApprovalVerdict {
+export function approvalVerdict(ev: Pick<Extract<NormalizedEvent, { kind: "approval_resolved" }>, "behavior" | "resolvedBy" | "unanswered" | "elicitation">): ApprovalVerdict {
   if (ev.behavior === "withdrawn" || ev.resolvedBy === APPROVAL_RESOLVED_BY.withdrawn) return "withdrawn";
+  if (ev.elicitation?.action === "cancel") return "cancelled";
   return ev.unanswered ?? ev.behavior;
 }
 
@@ -84,18 +86,28 @@ export function approvalVerdictTone(verdict: ApprovalVerdict): "allow" | "deny" 
   return verdict === "allow" || verdict === "deny" || verdict === "withdrawn" ? verdict : "unanswered";
 }
 
-export function approvalVerdictLabel(verdict: ApprovalVerdict): string {
+export function approvalTitle(toolName: string, question: boolean, elicitation: ElicitationSpec["mode"] | undefined): string {
+  if (elicitation !== undefined) return l10n.t("Input request: {0}", toolName);
+  return question ? l10n.t("Question: {0}", toolName) : l10n.t("Approval request: {0}", toolName);
+}
+
+export function approvalVerdictLabel(verdict: ApprovalVerdict, elicitation?: ElicitationSpec["mode"]): string {
+  if (elicitation !== undefined && verdict === "allow") return elicitation === "url" ? l10n.t("✔ Opened") : l10n.t("✔ Sent");
+  if (elicitation !== undefined && verdict === "deny") return l10n.t("✕ Declined");
   switch (verdict) {
     case "allow": return l10n.t("✔ Allowed");
     case "deny": return l10n.t("✕ Denied");
     case "withdrawn": return l10n.t("Withdrawn");
+    case "cancelled": return l10n.t("Cancelled");
     case "skipped": return l10n.t("Question skipped");
     case "replied_in_chat": return l10n.t("Question answered in chat");
     case "dismissed": return l10n.t("Question closed without an answer");
   }
 }
 
-export function approvalRefSuffix(verdict: ApprovalVerdict): string {
+export function approvalRefSuffix(verdict: ApprovalVerdict, elicitation?: ElicitationSpec["mode"]): string {
+  if (elicitation !== undefined && verdict === "allow") return elicitation === "url" ? l10n.t(" (Opened)") : l10n.t(" (Sent)");
+  if (elicitation !== undefined && verdict === "deny") return l10n.t(" (Declined)");
   switch (verdict) {
     case "allow": return l10n.t(" (Allowed)");
     case "deny": return l10n.t(" (Denied)");
@@ -104,7 +116,7 @@ export function approvalRefSuffix(verdict: ApprovalVerdict): string {
   }
 }
 
-function approvalField(label: string, value: string, mono = false): HTMLElement {
+export function approvalField(label: string, value: string, mono = false): HTMLElement {
   const wrap = document.createElement("div");
   wrap.className = "approval-field";
   const l = document.createElement("div");
@@ -117,7 +129,7 @@ function approvalField(label: string, value: string, mono = false): HTMLElement 
   return wrap;
 }
 
-function approvalLead(text: string): HTMLElement {
+export function approvalLead(text: string): HTMLElement {
   const el = document.createElement("div");
   el.className = "approval-lead";
   el.textContent = text;

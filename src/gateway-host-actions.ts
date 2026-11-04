@@ -38,6 +38,7 @@ import { configuredClaudeExecutablePath, configuredDisplayName, configuredEventL
 import { isEventLimit } from "./event-limits";
 import { TRANSCRIPT_RETENTION_DAYS_KEY, configuredTranscriptRetentionDays, isTranscriptRetentionDays, transcriptRetentionFallback } from "./transcript-retention";
 import { CHROME_INTEGRATION_SETTING_KEY, chromeIntegrationEnabled } from "./chrome-integration";
+import { MCP_ELICITATION_SETTING_KEY, mcpElicitationEnabled } from "./elicitation";
 import { isDisplayName } from "./display-name";
 import { extensionContext, output, store } from "./host-context";
 import { ADDITIONAL_MODELS_KEY, CLAUDE_VERSION_ID, additionalClaudeModelIds, recomputeModelRows, modelsMessage } from "./gateway-models";
@@ -153,11 +154,12 @@ export function userSettingsMessage(): Extract<HostToWebview, { type: "userSetti
   };
 }
 
-const FILE_LINK_SETTING_KEYS: Record<FileLinkSetting, string> = {
+export const FILE_LINK_SETTING_KEYS: Record<FileLinkSetting, string> = {
   openWithSystemApp: "fileLinks.openWithSystemApp",
   fileLinkInstruction: "claude.fileLinkInstruction",
   planInstruction: "claude.planInstruction",
   chromeIntegration: CHROME_INTEGRATION_SETTING_KEY,
+  mcpElicitation: MCP_ELICITATION_SETTING_KEY,
   revealInExplorer: "fileLinks.revealInExplorer",
   allowOutsideWorkspace: "fileLinks.allowOutsideWorkspace",
   confirmOutsideWorkspace: "fileLinks.confirmOutsideWorkspace",
@@ -333,6 +335,7 @@ export function settingsStateMessage(): Extract<HostToSettingsPage, { type: "set
     fileLinkInstruction: cfg.get<boolean>(FILE_LINK_SETTING_KEYS.fileLinkInstruction)! !== false,
     planInstruction: cfg.get<boolean>(FILE_LINK_SETTING_KEYS.planInstruction)! !== false,
     chromeIntegration: chromeIntegrationEnabled((key) => cfg.get<unknown>(key)),
+    mcpElicitation: mcpElicitationEnabled((key) => cfg.get<unknown>(key)),
     revealInExplorer: cfg.get<boolean>(FILE_LINK_SETTING_KEYS.revealInExplorer)! !== false,
     allowOutsideWorkspace: cfg.get<boolean>(FILE_LINK_SETTING_KEYS.allowOutsideWorkspace)! === true,
     confirmOutsideWorkspace: cfg.get<boolean>(FILE_LINK_SETTING_KEYS.confirmOutsideWorkspace)! !== false,

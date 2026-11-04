@@ -1,5 +1,17 @@
 # Changelog
 
+## 1.15.3
+
+- When an MCP server asks for your input or asks you to open a page, the conversation shows a card
+  where you answer, decline or cancel, instead of LAISORA declining the request. A switch on the
+  settings page turns it off (takes effect for conversations started or resumed after the change).
+- Links in decision and check cards get copy buttons, like links in Claude's replies.
+- The record block that ends an LLM improvement analysis stays collapsed to its first line, also
+  while it streams. Other long code blocks fold past their preview lines.
+- A ToDo decision row closes when the conversation answers it, also while background work runs.
+- A delegate that starts a background agent waits for its result instead of handing back early.
+- Updated the Claude Agent SDK to 0.3.318 (Claude Code 2.1.318).
+
 ## 1.15.2
 
 - The news on a new conversation shows the 1.15.0 features again. 1.15.1 showed a fix there

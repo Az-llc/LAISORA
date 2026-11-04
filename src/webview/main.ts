@@ -2427,6 +2427,10 @@ function initMessageBus(): void {
         tabs.get(msg.tabId)?.addBlock("system", msg.text);
         break;
       }
+      case "elicitationOpenFailed": {
+        tabs.get(msg.tabId)?.reopenElicitation(msg.requestId);
+        break;
+      }
       case "sessionNameSuggestion": {
         tabs.get(msg.tabId)?.receiveSessionNameSuggestion(msg);
         break;

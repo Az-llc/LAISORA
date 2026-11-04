@@ -1524,6 +1524,9 @@ hr.md-hr {
   overflow: hidden;
   mask-image: linear-gradient(to bottom, #000 calc(100% - var(--codeblock-fade)), transparent);
 }
+.codeblock.is-head-only > .codeblock-head {
+  border-block-end: 0;
+}
 .codeblock-more {
   position: absolute;
   inset-inline: 0;
@@ -1955,6 +1958,7 @@ hr.md-hr {
 }
 .approval-det[open] > .approval-title::before { transform: rotate(90deg); }
 .approval-verdict { font-size: 11px; font-weight: 600; }
+.approval-title > .approval-verdict { flex: none; white-space: nowrap; }
 .approval-verdict.allow { color: var(--vscode-testing-iconPassed, #2d7d46); }
 .approval-verdict.deny { color: var(--vscode-errorForeground); }
 /* 内側の details（原データJSON）は控えめに */
@@ -1996,6 +2000,32 @@ hr.md-hr {
   background: var(--vscode-textCodeBlock-background);
   border-radius: 4px;
 }
+.elicit-title { font-weight: 600; margin: 6px 0 2px; }
+.elicit-message { white-space: pre-wrap; word-break: break-word; }
+.elicit-form { display: flex; flex-direction: column; gap: 10px; margin: 8px 0; }
+.elicit-field { display: flex; flex-direction: column; gap: 3px; min-width: 0; }
+.elicit-label { font-weight: 600; padding: 0; }
+.elicit-required { color: var(--vscode-errorForeground); margin-left: 2px; }
+.elicit-desc, .elicit-note { font-size: 11px; color: var(--vscode-descriptionForeground); word-break: break-word; }
+.elicit-input {
+  width: 100%;
+  max-width: 100%;
+  box-sizing: border-box;
+  padding: 4px 6px;
+  border: 1px solid var(--vscode-input-border, transparent);
+  border-radius: 4px;
+  background: var(--vscode-input-background);
+  color: var(--vscode-input-foreground);
+  font: inherit;
+  font-size: 12px;
+}
+.elicit-input[aria-invalid="true"] { border-color: var(--vscode-inputValidation-errorBorder, var(--vscode-errorForeground)); }
+.elicit-choices { border: none; margin: 0; padding: 0; min-width: 0; display: flex; flex-direction: column; gap: 3px; }
+.elicit-check-line { display: flex; align-items: center; gap: 6px; }
+.elicit-check { margin: 0; flex: none; }
+.elicit-option { font-weight: normal; }
+.elicit-error { font-size: 11px; color: var(--vscode-errorForeground); }
+.elicit-error:empty { display: none; }
 .approval-plan > *:first-child { margin-top: 0; }
 .approval-plan > *:last-child { margin-bottom: 0; }
 

@@ -48,6 +48,7 @@
   "config.laisora.antigravity.autoUpdate.description": "Update the Antigravity CLI from its own installer in the background once a conversation is ready and no turn or external run is running.",
   "config.laisora.claude.remoteControlAtStartup.description": "Turn Remote Control on when a LAISORA conversation starts. It applies each time Claude starts in a new, restored or reopened tab; turn it on or off per tab from the tab menu or /remote-control. Does not change the shared Claude Code settings file.",
   "config.laisora.claude.chromeIntegration.description": "Let Claude in LAISORA conversations use the Claude in Chrome extension (browser tools that act in your Chrome). Needs the extension installed and connected. Takes effect for conversations started or resumed after the change.",
+  "config.laisora.claude.mcpElicitation.description": "When an MCP server asks for your input or asks you to open a page, show a card in the LAISORA conversation to answer it. When off, these requests are declined automatically. Takes effect for conversations started or resumed after the change.",
   "config.laisora.orchestration.enabled.description": "Enable agent orchestration; takes effect from the next session.",
   "config.laisora.orchestration.agents.description": "Agent roster used by the conductor; takes effect from the next session.",
   "config.laisora.orchestration.conductorPolicy.description": "Additional user policy appended after the generated conductor instruction; takes effect from the next session.",

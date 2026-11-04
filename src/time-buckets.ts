@@ -6,7 +6,7 @@ import { bookkeepingIntent, foldPlanDeclarationText, observedTaskIntent, taskCre
 import { foregroundExternalCalls, MAIN_PROCESSING_BUCKETS, planBlockName, planMemberPlacementAt, planItemNumber, planItemNumberOf, planNumberedStep, planPlacedStep, planStepActiveSpans, planStepKey, planStepTaskKey, planSuccessorStep, planWorkEnd, TASK_KEY_PREFIX, TASK_PENDING_KEY_PREFIX, transitionPlanStep, type PlanSpan, type PlanStepSettle, type PlanStepTiming, type PlanStepTransition, type PlanStepUpdate } from "./plan-steps";
 import type { PlanUsage, PlanTokenTotal } from "./plan-usage";
 import { isExternalRunTool } from "./orchestration-executors";
-import { delegationCount, isCountedExternalRunCall, isDelegationLaunchTool, isDelegationTool } from "./claude-tool-names";
+import { declaredBackgroundLaunch, delegationCount, isCountedExternalRunCall, isDelegationLaunchTool, isDelegationTool } from "./claude-tool-names";
 import { isFailedToolResult, isRejectedBeforeRun, taskNotificationTerminal } from "./tool-result-signals";
 import { conductorStopTarget } from "./tool-intent";
 import { callLane, unfinishedCallEnd, launchlessRunSpan, moreRuns, type RecordedRuns, childActivity, childRecordEnd, childUsageCounts, closeRun, currentRunStart, delegationRuns, intersectSpans, measureSpans, memberRunTimes, runElapsedMs, runEnd, runSpans, subtractSpans, unionSpans, type CallLane, type ChildTranscriptSpan, type RunStop, type RunTimes, type Span, isChildCall, launchedUnder, launcherOwning, descendantStopAt, resumedRunStop } from "./spans";
@@ -682,7 +682,7 @@ function launchedDelegation(event: Extract<NormalizedEvent, { kind: "tool_call_s
     toolUseId: event.toolUseId,
     turnId: event.turnId,
     startedAt: at,
-    isBackground: event.isBackground === true || event.delegation?.isBackground === true,
+    isBackground: declaredBackgroundLaunch(event),
     description: redactAbsolutePaths(event.delegation?.description ?? "").slice(0, 200),
     subagentType: event.delegation?.subagentType ?? event.subagentType,
     model: event.delegation?.subagentModel ?? event.subagentModel,

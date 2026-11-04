@@ -47,17 +47,39 @@ export function recordAskStore(sessionId: string, messages: readonly TodoAskSour
 
 const isDeclaredAsk = (item: YouItem): boolean => item.anchor.approvalRef === undefined && item.resolution !== "historical";
 
-export interface TodoAskRecordView {
-  readonly keys: ReadonlySet<string>;
+export interface TodoAskTabView {
+  readonly items: readonly YouItem[];
+  messageOf(item: YouItem): string | undefined;
+}
+
+export interface TodoAskRecordView extends TodoAskTabView {
   readonly endedAt: number;
 }
 
-export function todoAskTabAdditions(items: readonly YouItem[], record: TodoAskRecordView | undefined, messageOf: (item: YouItem) => string | undefined): YouItem[] {
-  return items.filter(item => {
-    if (!isDeclaredAsk(item) || record === undefined) return true;
-    const key = messageOf(item);
-    return key !== undefined ? !record.keys.has(key) : item.createdAt > record.endedAt;
+function withTabState(item: YouItem, tab: YouItem): YouItem {
+  const { resolvedAt: _resolvedAt, resolution: _resolution, awaitingDetail: _awaitingDetail, ...rest } = item;
+  return { ...rest, ...(tab.resolvedAt !== undefined ? { resolvedAt: tab.resolvedAt } : {}), ...(tab.resolution !== undefined ? { resolution: tab.resolution } : {}),
+    ...(tab.awaitingDetail ? { awaitingDetail: true as const } : {}) };
+}
+
+export function todoAskTabMerge(record: TodoAskRecordView | undefined, tabs: readonly TodoAskTabView[]): { record: YouItem[]; tabs: YouItem[][] } {
+  if (record === undefined) return { record: [], tabs: tabs.map(tab => [...tab.items]) };
+  const keys = new Set(record.items.flatMap(item => record.messageOf(item) ?? []));
+  const shown = new Map<string, YouItem>();
+  const added = tabs.map(tab => tab.items.filter(item => {
+    if (!isDeclaredAsk(item)) return true;
+    const key = tab.messageOf(item);
+    if (key === undefined) return item.createdAt > record.endedAt;
+    if (!keys.has(key)) return true;
+    shown.set(key, item);
+    return false;
+  }));
+  const merged = record.items.map(item => {
+    const key = record.messageOf(item);
+    const tab = key === undefined ? undefined : shown.get(key);
+    return tab === undefined ? item : withTabState(item, tab);
   });
+  return { record: merged, tabs: added };
 }
 
 export type TodoAskOrigin =
@@ -305,15 +327,15 @@ export class TodoAskBoard {
       const record = ref ? this.records.get(ref.sessionId) : undefined;
       const itemTabs = tabsOf.get(itemId) ?? [];
       const entries: TodoAskEntry[] = [];
-      let view: TodoAskRecordView | undefined;
-      if (ref && record) {
-        const store = record.store;
-        const items = store.reader.get();
-        view = { endedAt: record.endedAt, keys: new Set(items.flatMap(item => store.messageOf(item.anchor.id) ?? [])) };
+      const store = ref && record ? record.store : undefined;
+      const message = (item: YouItem) => store?.messageOf(item.anchor.id);
+      const merged = todoAskTabMerge(store && record ? { items: store.reader.get(), endedAt: record.endedAt, messageOf: message } : undefined,
+        itemTabs.map(tab => ({ items: tab.reader.get(), messageOf: (item: YouItem) => tab.messageOf(item) })));
+      if (ref && store) {
         entries.push({ origin: { kind: "record", sessionId: ref.sessionId, where: ref.where, ...(itemTabs[0] && ref.where === "here" ? { title: itemTabs[0].title } : {}) },
-          items, message: item => store.messageOf(item.anchor.id) });
+          items: merged.record, message });
       }
-      for (const tab of itemTabs) entries.push({ origin: { kind: "tab", tabId: tab.tabId, title: tab.title }, items: todoAskTabAdditions(tab.reader.get(), view, item => tab.messageOf(item)) });
+      itemTabs.forEach((tab, index) => entries.push({ origin: { kind: "tab", tabId: tab.tabId, title: tab.title }, items: merged.tabs[index] }));
       sources.push({ itemId, entries, unreadable: ref !== undefined && ref.where !== "here" && this.failed.has(ref.sessionId) });
     }
     return todoAskRows(sources, now);

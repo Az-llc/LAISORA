@@ -19,6 +19,8 @@ import { handleTodoMessage, openTodoConversation, setTodoDrawerFocus, todoFromRe
 import { isWebviewToHost, rejectedTodoEditId } from "./protocol";
 import type { SessionStore } from "./store-surfaces";
 
+const openingElicitations = new Set<string>();
+
 export async function handleWebviewMessage(
   st: SessionStore,
   raw: unknown,
@@ -47,10 +49,30 @@ export async function handleWebviewMessage(
         await handleSurfaceMessage(st, msg, sender, target);
         if (msg.type === "ready") void st.postTo(sender, userSettingsMessage());
         break;
+      case "approvalDecision": {
+        const url = msg.behavior === "allow" ? target!.conversation?.elicitationUrlToOpen(msg.requestId) : undefined;
+        if (url !== undefined) {
+          if (openingElicitations.has(msg.requestId)) break;
+          openingElicitations.add(msg.requestId);
+          let opened = false;
+          try {
+            opened = await vscode.env.openExternal(url as unknown as vscode.Uri);
+          } catch (error) {
+            output.appendLine(`[elicitation] open failed: ${String(error)}`);
+          } finally {
+            openingElicitations.delete(msg.requestId);
+          }
+          if (!opened) {
+            st.post({ type: "elicitationOpenFailed", tabId: msg.tabId, requestId: msg.requestId });
+            break;
+          }
+        }
+        await handleConversationMessage(st, msg, target);
+        break;
+      }
       case "send":
       case "cancelAutoResume":
       case "interrupt":
-      case "approvalDecision":
       case "setMode":
       case "setEffort":
       case "setModel":

@@ -35,7 +35,7 @@ import type {
   NormalizedEventBody,
   UsageSnapshot,
 } from "./protocol";
-import { summarizeToolInput, type ApiKeyPolicy, type BridgeConnection } from "./protocol";
+import { clipSummary, summarizeToolInput, type ApiKeyPolicy, type BridgeConnection } from "./protocol";
 import { bridgeStateOf, enableRemoteControl, type RemoteControlSession } from "./remote-control";
 import { resolveClaudeCodeExecutable } from "./claudeCliResolver";
 import {
@@ -65,12 +65,13 @@ import { laisoraInputLine, markLaisoraInput, type LaisoraInput } from "./laisora
 import { createTodoMcpServer, TODO_ROOT_SCOPE, TODO_SERVER_NAME, TODO_TOOL_NAMES, todoLinkedInstruction, todoWorkspaceRoots, type TodoLinkedItem } from "./todo-mcp";
 import type { TodoStore } from "./todo-store";
 import { claudeModelIdLabel, EXTERNAL_TIMEOUT_DEFAULT_MINUTES, externalUnknownTargetReason, isExternalRunTool } from "./orchestration-executors";
-import { isDelegationLaunchTool, isDelegationTool } from "./claude-tool-names";
+import { delegateForegroundInput, isDelegationLaunchTool, isDelegationTool } from "./claude-tool-names";
 import type { CompletionVerdict, NumberedLaunchVerdict, ResumeVerdict } from "./time-buckets";
 import { planItemLabel, type PlanStepUpdate } from "./plan-steps";
 import { AgentAttribution } from "./orchestration-attribution";
 import type { NormalizedOutMeta } from "./claude-normalizer";
 import { askQualityDenial, rejectedAskTitles } from "./markdown-ast";
+import { elicitationAnswer, elicitationSpecOf, type ElicitationSpec } from "./elicitation";
 
 type UserContentBlock =
   | { type: "text"; text: string }
@@ -222,6 +223,7 @@ export interface ClaudeHostOptions {
   transcriptRetention?: TranscriptRetentionSettings;
   remoteControlAtStartup?: boolean;
   chromeIntegration?: boolean;
+  mcpElicitation?: boolean;
   claudeCodeExecutablePath?: string;
   apiKeyPolicy?: ApiKeyPolicy;
   fileLinkInstruction?: boolean;
@@ -265,8 +267,11 @@ export interface ClaudeHostOptions {
 export interface ApprovalDecision {
   behavior: "allow" | "deny" | "withdrawn";
   answers?: Record<string, string>;
+  content?: Record<string, unknown>;
   resolvedBy?: string;
 }
+
+type SettledDecision = Omit<ApprovalDecision, "behavior"> & { behavior: "allow" | "deny" };
 
 interface PendingApproval {
   requestId: string;
@@ -508,6 +513,7 @@ export class ClaudeConversation {
   private abortController = new AbortController();
   private pendingApprovals = new Map<string, PendingApproval>();
   private questionRequests = new Set<string>();
+  private elicitations = new Map<string, ElicitationSpec>();
   private runLoopDone: Promise<void> | null = null;
   private inputGen: AsyncGenerator<SDKUserMessage> | null = null;
   private interruptTimer: ReturnType<typeof setTimeout> | null = null;
@@ -562,7 +568,9 @@ export class ClaudeConversation {
           clearTimeout(this.interruptTimer);
           this.interruptTimer = null;
         }
-        for (const requestId of this.pendingApprovals.keys()) this.resolveApproval(requestId, "deny", undefined, APPROVAL_RESOLVED_BY.turnEnd);
+        for (const requestId of this.pendingApprovals.keys()) {
+          if (!this.elicitations.has(requestId)) this.resolveApproval(requestId, "deny", undefined, APPROVAL_RESOLVED_BY.turnEnd);
+        }
         this.turnsEnded += 1;
         void this.requestContextUsage();
       },
@@ -678,25 +686,9 @@ ${ctxJson}`
       const rootCall = ctx.toolUseID;
       rootGate?.hold(rootCall);
       if (questions) self.questionRequests.add(requestId);
-      const pendingDecision = self.opts.onApprovalRequest({ requestId, toolName, toolUseId: ctx.toolUseID, rawInputJson });
-      const onAbort = (): void => {
-        rootGate?.revoke(rootCall);
-        self.resolveApproval(requestId, "withdrawn", undefined, APPROVAL_RESOLVED_BY.withdrawn);
-      };
-      ctx.signal.addEventListener("abort", onAbort, { once: true });
-      if (ctx.signal.aborted) onAbort();
-      let decision: ApprovalDecision;
-      try {
-        decision = await pendingDecision;
-      } finally {
-        ctx.signal.removeEventListener("abort", onAbort);
-        self.questionRequests.delete(requestId);
-      }
-      if (ctx.signal.aborted || decision.behavior === "withdrawn") {
-        rootGate?.revoke(rootCall);
-        self.emit({ kind: "approval_resolved", requestId, behavior: "withdrawn", resolvedBy: APPROVAL_RESOLVED_BY.withdrawn });
-        return null;
-      }
+      const decision = await self.awaitDecision({ requestId, toolName, toolUseId: ctx.toolUseID, rawInputJson }, ctx.signal,
+        () => rootGate?.revoke(rootCall), () => self.questionRequests.delete(requestId));
+      if (decision === undefined) return null;
       const { permission, unanswered } = approvalPermission(input, questions,
         { behavior: decision.behavior, answers: decision.answers, resolvedBy: decision.resolvedBy }, self.answersUnanswered);
       if (permission.behavior === "deny") rootGate?.revoke(rootCall);
@@ -704,6 +696,31 @@ ${ctxJson}`
       self.emit({ kind: "approval_resolved", requestId, behavior: permission.behavior, resolvedBy: decision.resolvedBy ?? APPROVAL_RESOLVED_BY.user,
         ...(unanswered ? { unanswered } : { answers: decision.answers }) });
       return permission;
+    };
+
+    const onElicitation: NonNullable<ClaudeCodeOptions["onElicitation"]> = async (request, { signal }) => {
+      const requestId = randomUUID();
+      const elicitation = elicitationSpecOf(request);
+      const rawInputJson = JSON.stringify(request, null, 2);
+      self.elicitations.set(requestId, elicitation);
+      self.emit({
+        kind: "approval_request",
+        turnId: self.normalizer.currentTurnId,
+        requestId,
+        toolName: elicitation.server,
+        rawInputJson,
+        inputSummary: clipSummary(elicitation.message),
+        expiresAt: null,
+        elicitation,
+      });
+      const decision = await self.awaitDecision({ requestId, toolName: elicitation.server, rawInputJson }, signal,
+        undefined, () => self.elicitations.delete(requestId));
+      if (decision === undefined) return null;
+      const answer = elicitationAnswer(elicitation, decision);
+      if (decision.behavior === "allow" && answer.action !== "accept") self.opts.log(`elicitation ${requestId}: answer not accepted (${answer.action})`);
+      self.emit({ kind: "approval_resolved", requestId, behavior: answer.action === "accept" ? "allow" : "deny",
+        resolvedBy: decision.resolvedBy ?? APPROVAL_RESOLVED_BY.user, elicitation: { mode: elicitation.mode, action: answer.action } });
+      return answer;
     };
 
     const options: ClaudeCodeOptions = {
@@ -715,6 +732,7 @@ ${ctxJson}`
       includePartialMessages: true,
       pathToClaudeCodeExecutable: resolvedExecutable.path,
       canUseTool,
+      ...(this.opts.mcpElicitation === true ? { onElicitation } : {}),
       abortController: this.abortController,
       env,
       stderr: (data: string) => this.opts.log(`[claude stderr] ${data}`),
@@ -981,6 +999,12 @@ ${ctxJson}`
       options.hooks = { ...(options.hooks ?? {}), PreToolUse: [...(options.hooks?.PreToolUse ?? []), { hooks: [observeDispatch] },
         { matcher: `^${SUBAGENT_HANDBACK_TOOL}$`, hooks: [handbackGate] }] };
     }
+    const delegateForeground: ClaudeCodeSdk.HookCallback = async input => {
+      if (input.hook_event_name !== "PreToolUse" || !isDelegationTool(input.tool_name)) return {};
+      const updatedInput = delegateForegroundInput(input.agent_id, input.tool_input);
+      return updatedInput ? { hookSpecificOutput: { hookEventName: "PreToolUse", updatedInput } } : {};
+    };
+    options.hooks = { ...(options.hooks ?? {}), PreToolUse: [...(options.hooks?.PreToolUse ?? []), { hooks: [delegateForeground] }] };
     const preToolUse = options.hooks?.PreToolUse ?? [];
     if (preToolUse.length) {
       options.hooks = { ...(options.hooks ?? {}), PreToolUse: [{ hooks: [async (input, id, context) => {
@@ -1493,13 +1517,48 @@ ${ctxJson}`
     }
   }
 
-  resolveApproval(requestId: string, behavior: ApprovalDecision["behavior"], answers?: Record<string, string>, resolvedBy: string = APPROVAL_RESOLVED_BY.user): void {
+  resolveApproval(requestId: string, behavior: ApprovalDecision["behavior"], answers?: Record<string, string>, resolvedBy: string = APPROVAL_RESOLVED_BY.user, content?: Record<string, unknown>): void {
     const p = this.pendingApprovals.get(requestId);
     if (p) {
       this.pendingApprovals.delete(requestId);
       const useAnswers = behavior === "allow" && p.toolName === "AskUserQuestion" ? answers : undefined;
-      p.resolve({ behavior, resolvedBy, ...(useAnswers ? { answers: useAnswers } : {}) });
+      const useContent = behavior === "allow" ? content : undefined;
+      p.resolve({ behavior, resolvedBy, ...(useAnswers ? { answers: useAnswers } : {}), ...(useContent ? { content: useContent } : {}) });
     }
+  }
+
+  elicitationUrlToOpen(requestId: string): string | undefined {
+    const spec = this.pendingApprovals.has(requestId) ? this.elicitations.get(requestId) : undefined;
+    return spec?.mode === "url" && spec.urlHost !== undefined ? spec.url : undefined;
+  }
+
+  private async awaitDecision(
+    req: { requestId: string; toolName: string; toolUseId?: string; rawInputJson: string },
+    signal: AbortSignal,
+    onWithdrawn: (() => void) | undefined,
+    onSettled: () => void
+  ): Promise<SettledDecision | undefined> {
+    const pendingDecision = this.opts.onApprovalRequest(req);
+    const onAbort = (): void => {
+      onWithdrawn?.();
+      this.resolveApproval(req.requestId, "withdrawn", undefined, APPROVAL_RESOLVED_BY.withdrawn);
+    };
+    signal.addEventListener("abort", onAbort, { once: true });
+    if (signal.aborted) onAbort();
+    let decision: ApprovalDecision;
+    try {
+      decision = await pendingDecision;
+    } finally {
+      signal.removeEventListener("abort", onAbort);
+      onSettled();
+    }
+    const behavior = decision.behavior;
+    if (signal.aborted || behavior === "withdrawn") {
+      onWithdrawn?.();
+      this.emit({ kind: "approval_resolved", requestId: req.requestId, behavior: "withdrawn", resolvedBy: APPROVAL_RESOLVED_BY.withdrawn });
+      return undefined;
+    }
+    return { ...decision, behavior };
   }
 
   get answersUnanswered(): boolean {

@@ -161,6 +161,16 @@ export function renderMarkdownInto(container: HTMLElement, src: string, tabId?: 
 
   const nodes = parseMarkdown(src);
 
+  function renderAskInline(text: string, target: HTMLElement): void {
+    text.split("\n").forEach((line, index) => {
+      if (index > 0) target.append("\n");
+      const parsed = parseMarkdown(line);
+      const only = parsed.length === 1 ? parsed[0] : undefined;
+      if (only?.type === "paragraph") for (const child of only.children) renderNode(child, target);
+      else target.append(line);
+    });
+  }
+
   function renderNode(node: MdNode, target: HTMLElement): void {
     switch (node.type) {
       case "plan": {
@@ -169,7 +179,7 @@ export function renderMarkdownInto(container: HTMLElement, src: string, tabId?: 
         break;
       }
       case "ask": {
-        target.appendChild(renderAsk(node.ask, node.offset, askContext, node.rejected === true));
+        target.appendChild(renderAsk(node.ask, node.offset, askContext, node.rejected === true, renderAskInline));
         fencedIndex++;
         break;
       }
@@ -241,7 +251,8 @@ export function renderMarkdownInto(container: HTMLElement, src: string, tabId?: 
         actions.appendChild(copy);
         actions.appendChild(status);
         assembleCodeBlock(pre, codeEl, actions, lang, content, codeDeps, {
-          collapsible: collapseCode && node.closed,
+          collapsible: collapseCode,
+          closed: node.closed,
           key: codeReply === undefined ? undefined : codeBlockKey(codeReply.tabId, codeReply.replyId, codeReply.offset + node.offset),
         });
 

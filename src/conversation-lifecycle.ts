@@ -7,6 +7,7 @@ import { cachedExternalModels, noteRunningExecutorVersion } from "./gateway-host
 import { noteCliUpdateOpportunity } from "./claude-cli-update";
 import { transcriptRetentionSettings } from "./transcript-retention";
 import { chromeIntegrationEnabled } from "./chrome-integration";
+import { mcpElicitationEnabled } from "./elicitation";
 
 import {
   PERMISSION_MODE_KEY,
@@ -638,7 +639,7 @@ export async function handleConversationMessage(
       break;
     }
     case "approvalDecision":
-      target!.conversation?.resolveApproval(msg.requestId, msg.behavior, msg.answers);
+      target!.conversation?.resolveApproval(msg.requestId, msg.behavior, msg.answers, undefined, msg.content);
       break;
     case "setMode":
       await requestPermissionMode(st, target!, msg.mode, target!.permissionMode);
@@ -770,6 +771,7 @@ async function ensureConversationInner(s: Session, requestedAt: number): Promise
     transcriptRetention: transcriptRetentionSettings((key) => cfg.get<unknown>(key)),
     remoteControlAtStartup: cfg.get<boolean>("claude.remoteControlAtStartup")!,
     chromeIntegration: chromeIntegrationEnabled((key) => cfg.get<unknown>(key)),
+    mcpElicitation: mcpElicitationEnabled((key) => cfg.get<unknown>(key)),
     progressTracking: normalizeProgressTracking(cfg.get<string>("progressTracking")!),
     claudeCodeExecutablePath: configuredClaudeExecutablePath(cfg),
     apiKeyPolicy: normalizeApiKeyPolicy(cfg.get<string>("claude.apiKeyPolicy")!),

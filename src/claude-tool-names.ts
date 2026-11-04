@@ -1,10 +1,21 @@
 import { isExternalRunTool } from "./orchestration-executors";
+import { isChildCall } from "./spans";
 
 export const DELEGATION_TOOL_NAMES: ReadonlySet<string> = new Set(["Agent", "Task"]);
 export const TASK_TOOL_NAMES: ReadonlySet<string> = new Set(["TodoWrite", "TaskCreate", "TaskUpdate"]);
 
 export function isDelegationTool(toolName: string): boolean {
   return DELEGATION_TOOL_NAMES.has(toolName);
+}
+
+export function delegateForegroundInput(agentId: string | undefined, toolInput: unknown): Record<string, unknown> | undefined {
+  if (!agentId || !toolInput || typeof toolInput !== "object" || Array.isArray(toolInput)) return undefined;
+  const input = toolInput as Record<string, unknown>;
+  return input.run_in_background === true ? { ...input, run_in_background: false } : undefined;
+}
+
+export function declaredBackgroundLaunch(event: { parentToolUseId?: string | null; isBackground?: boolean; delegation?: { isBackground?: boolean } }): boolean {
+  return !isChildCall(event.parentToolUseId) && (event.isBackground === true || event.delegation?.isBackground === true);
 }
 
 export function isDelegationLaunchTool(toolName: string): boolean {

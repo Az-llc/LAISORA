@@ -297,8 +297,15 @@ export function createYouItems(tabId: string, saved: SavedAskDismissals = {}, lo
     refresh();
     notify();
   };
+  const reorderAfter = (moved: AskPosition): void => {
+    for (const [other, position] of positions) {
+      if (position.replyId === moved.replyId && position.offset > moved.offset && messageKeys.has(other) && locate?.(position.replyId, position.offset) !== undefined) messageKeys.delete(other);
+    }
+  };
   const drop = (id: string): void => {
+    const dropped = positions.get(id);
     positions.delete(id);
+    if (dropped) reorderAfter(dropped);
     messageKeys.delete(id);
     unlink(id);
     anchors.delete(asks.get(id)!.anchor.id);
@@ -394,6 +401,7 @@ export function createYouItems(tabId: string, saved: SavedAskDismissals = {}, lo
       const previous = positions.get(id);
       if (previous) position = previous;
       positions.set(id, position);
+      if (!previous) reorderAfter(position);
       const content = contentKey(ask);
       const known = asks.get(id);
       if (known !== undefined && contents.get(id) === content) {

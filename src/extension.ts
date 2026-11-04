@@ -15,11 +15,9 @@ import { TODO_ENABLED_SETTING } from "./todo-store";
 import { disposeTodoSurface, releaseOwnedTodoConversations, syncTodoSurface, toggleTodoDrawer } from "./todo-surface";
 import { EDIT_SUMMARY_SETTING } from "./edit-summary";
 import { TRANSCRIPT_RETENTION_DAYS_KEY } from "./transcript-retention";
-import { CHROME_INTEGRATION_SETTING_KEY } from "./chrome-integration";
 import { REMOTE_CONTROL_CARD_SETTING } from "./remote-control";
 import { IMPROVEMENT_MENU_SETTING } from "./improvement-brief";
 import { GUARD_ENABLED_SETTING, MEMORY_BLOCK_PROJECT_TYPE_SETTING } from "./placement-line";
-import { removeRetiredAnalysisResults, removeRetiredBaselineCache, removeRetiredLearningStore } from "./retired-storage";
 import { registerEditDiffProvider } from "./edit-diff-host";
 export { reduceWorkModelSafely, trimEventLog } from "./event-fold";
 export type { EventFoldDraft, FoldEffect, FoldEventResult } from "./event-fold";
@@ -55,7 +53,7 @@ import {
   writeHeldChosenTitle,
   type PersistedOpenTab,
 } from "./session-list-wiring";
-import { configuredSystemAppExtensions, openWelcome, userSettingsMessage, welcomeSettingChanged } from "./gateway-host-actions";
+import { configuredSystemAppExtensions, FILE_LINK_SETTING_KEYS, openWelcome, userSettingsMessage, welcomeSettingChanged } from "./gateway-host-actions";
 export { settingsStateMessage, setExternalDetectorForTest } from "./gateway-host-actions";
 import { openSettingsPanel, postSettingsState } from "./settings-panel";
 import { postOrchestrationView } from "./conversation-lifecycle";
@@ -205,9 +203,6 @@ function activateReady(context: vscode.ExtensionContext): void {
   output.appendLine(`[startup] ${sinceActivation()} activate at ${localIsoTime(activatedAt)}`);
   sampleStartupLoopLag(activatedAt);
   void sweepHandoffForksAtStartup();
-  void removeRetiredLearningStore(context.globalStorageUri?.fsPath, (line) => output.appendLine(line));
-  void removeRetiredAnalysisResults(context.globalStorageUri?.fsPath, (line) => output.appendLine(line));
-  void removeRetiredBaselineCache(context.globalState, (line) => output.appendLine(line));
   setHostTelemetrySource(() => vscode.env.isTelemetryEnabled);
   scheduleCliUpdates(context);
   syncTodoSurface();
@@ -249,14 +244,7 @@ function activateReady(context: vscode.ExtensionContext): void {
       affectsProductConfiguration(e, "history.eventLimit") ||
       affectsProductConfiguration(e, TRANSCRIPT_RETENTION_DAYS_KEY) ||
       affectsProductConfiguration(e, "claude.settingSources") ||
-      affectsProductConfiguration(e, "claude.fileLinkInstruction") ||
-      affectsProductConfiguration(e, "claude.planInstruction") ||
-      affectsProductConfiguration(e, CHROME_INTEGRATION_SETTING_KEY) ||
-      affectsProductConfiguration(e, "fileLinks.openWithSystemApp") ||
-      affectsProductConfiguration(e, "fileLinks.revealInExplorer") ||
-      affectsProductConfiguration(e, "fileLinks.allowOutsideWorkspace") ||
-      affectsProductConfiguration(e, "fileLinks.confirmOutsideWorkspace") ||
-      affectsProductConfiguration(e, "fileLinks.openOutsideReadOnly") ||
+      Object.values(FILE_LINK_SETTING_KEYS).some((key) => affectsProductConfiguration(e, key)) ||
       affectsProductConfiguration(e, "orchestration.enabled") ||
       affectsProductConfiguration(e, "orchestration.agents") ||
       affectsProductConfiguration(e, EXTERNAL_TIMEOUT_SETTING_KEY) ||

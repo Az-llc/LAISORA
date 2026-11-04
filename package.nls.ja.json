@@ -48,6 +48,7 @@
   "config.laisora.antigravity.autoUpdate.description": "専用のインストーラーで入れた Antigravity CLI を、会話の準備ができてターンも外部の実行も動いていないときに背景で更新します。",
   "config.laisora.claude.remoteControlAtStartup.description": "LAISORAで会話を始めるときにRemote Controlをオンにします。新しいタブ・復元したタブ・開き直したタブでClaudeが起動するたびに使い、タブごとにタブのメニューか /remote-control でオン・オフを切り替えられます。Claude Code共通の設定ファイルは変更しません。",
   "config.laisora.claude.chromeIntegration.description": "LAISORAの会話でClaudeがClaude in Chrome拡張機能（お使いのChromeを操作するブラウザーのツール）を使えるようにします。拡張機能のインストールと接続が必要です。変更は、このあと始める会話と再開する会話から有効になります。",
+  "config.laisora.claude.mcpElicitation.description": "MCPサーバーが入力やページを開くことを求めてきたとき、LAISORAの会話にカードを出して答えられるようにします。オフにすると、これらの求めは自動で断ります。変更は、このあと始める会話と再開する会話から有効になります。",
   "config.laisora.orchestration.enabled.description": "エージェントのオーケストレーションを有効にします。次のセッションから有効。",
   "config.laisora.orchestration.agents.description": "コンダクターが使うエージェント構成。次のセッションから有効。",
   "config.laisora.orchestration.conductorPolicy.description": "生成されたコンダクター指示の後に追加する利用者の方針。次のセッションから有効。",

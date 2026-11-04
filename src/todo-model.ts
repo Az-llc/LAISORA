@@ -2226,6 +2226,20 @@ export interface TodoTabConversation {
   readonly itemId?: string;
   readonly sessionId?: string;
   readonly running: boolean;
+  readonly turnRunning: boolean;
+}
+
+export const TODO_ASK_OTHER_WINDOW_READ_MS = 10_000;
+
+export interface TodoAskSourceShown {
+  readonly key: string;
+  readonly at: number;
+}
+
+export function todoAskSourceKept(shown: TodoAskSourceShown | undefined, sessionId: string, here: boolean, tabs: readonly TodoTabConversation[], now: number): { key: string; readAt?: number } | undefined {
+  if (shown === undefined) return undefined;
+  if (here) return tabs.some(tab => tab.sessionId === sessionId && tab.turnRunning) ? { key: shown.key } : undefined;
+  return now - shown.at < TODO_ASK_OTHER_WINDOW_READ_MS ? { key: shown.key, readAt: shown.at + TODO_ASK_OTHER_WINDOW_READ_MS } : undefined;
 }
 
 export function todoTabLinks(items: readonly TodoItem[], tabs: readonly TodoTabConversation[]): { tabItems: Array<{ tabId: string; itemId: string }>; running: Set<string>; deleted: string[] } {

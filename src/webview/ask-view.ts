@@ -80,7 +80,15 @@ function hideRejected(block: HTMLElement): void {
   pendingReveals.add(block);
 }
 
-export function renderAsk(ask: AskBlock, offset: number, context?: AskRenderContext, marked = false): HTMLElement {
+export type AskInlineRenderer = (text: string, target: HTMLElement) => void;
+
+export function renderAsk(ask: AskBlock, offset: number, context?: AskRenderContext, marked = false, inline?: AskInlineRenderer): HTMLElement {
+  const rich = (tag: "div" | "span", cls: string, text: string): HTMLElement => {
+    if (!inline) return part(tag, cls, text);
+    const el = part(tag, cls);
+    inline(text, el);
+    return el;
+  };
   const block = part("section", `laisora-ask ask-${ask.kind}`);
   const position = offset + (context?.offset ?? 0);
   const key = `${context?.replyId ?? ""}:${position}`;
@@ -103,10 +111,10 @@ export function renderAsk(ask: AskBlock, offset: number, context?: AskRenderCont
     block.classList.add("ask-unchecked");
     pendingReveals.add(block);
   }
-  block.append(...askHeading(ask.kind, ask.title, ""), ...(marked ? [uncheckedNote()] : []), part("div", "ask-why", ask.why));
+  block.append(...askHeading(ask.kind, ask.title, ""), ...(marked ? [uncheckedNote()] : []), rich("div", "ask-why", ask.why));
   if (ask.details) {
     const toggle = part("button", "ask-more-toggle", l10n.t("Full explanation"));
-    const body = part("div", "ask-more-body", ask.details);
+    const body = rich("div", "ask-more-body", ask.details);
     toggle.type = "button";
     toggle.setAttribute("aria-expanded", "false");
     body.hidden = true;
@@ -137,12 +145,12 @@ export function renderAsk(ask: AskBlock, offset: number, context?: AskRenderCont
       input.disabled = !context;
       input.checked = id !== undefined && context?.checked(id, index) === true;
       input.onchange = () => { if (id) context?.check(id, index, input.checked); };
-      label.append(input, part("span", "ask-do", step.do), part("span", "ask-look", step.look));
+      label.append(input, rich("span", "ask-do", step.do), rich("span", "ask-look", step.look));
       steps.append(label);
     });
     block.append(steps);
   }
-  block.append(part("div", "ask-default", ask.default));
+  block.append(rich("div", "ask-default", ask.default));
   return block;
 }
 
@@ -162,6 +170,7 @@ export function rejectRenderedAsks(root: HTMLElement, turnId: string, titles: re
     if (el.dataset.askTurnId !== turnId || ask === undefined || !isRejectedAsk(ask, titles)) return;
     hideRejected(el);
     rejected(el.dataset.askKey!, el.id);
+    el.removeAttribute("id");
   });
 }
 

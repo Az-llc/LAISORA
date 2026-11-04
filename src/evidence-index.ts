@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { declaredBackgroundLaunch } from "./claude-tool-names";
 import { isChildCall } from "./spans";
 import type { NormalizedEvent, ProgressState } from "./protocol";
 import { progressSubjectKey } from "./progress-protocol";
@@ -602,7 +603,7 @@ function foldEvidenceBody(
       activeTaskKeyAtStart,
       activeAmbiguousAtStart,
       startedAt: timestamp,
-      ...(event.delegation?.isBackground === true ? { isBackground: true as const } : {}),
+      ...(declaredBackgroundLaunch(event) ? { isBackground: true as const } : {}),
       evidence: {
         toolUseId,
         seq,

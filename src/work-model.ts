@@ -3,7 +3,7 @@ import { isHistoryEvent, workEndStatus, type NormalizedEvent, type ResumeHydrati
 import * as l10n from "@vscode/l10n";
 import { isRequestMessage, mainCallTimeKind, MAX_TIME_TOOL_INTERVALS, toolTimeSpans, type UnknownLauncher } from "./time-buckets";
 import { isFailedToolResult, isRejectedBeforeRun, taskNotificationOutcome, taskNotificationTerminal } from "./tool-result-signals";
-import { DELEGATION_TOOL_NAMES, isCountedExternalRunCall, isMainExternalRun, TASK_TOOL_NAMES } from "./claude-tool-names";
+import { declaredBackgroundLaunch, DELEGATION_TOOL_NAMES, isCountedExternalRunCall, isMainExternalRun, TASK_TOOL_NAMES } from "./claude-tool-names";
 import { isPureCommandWrapper } from "./human-input-vocabulary";
 import { parseMarkdown } from "./markdown-ast";
 import { appendRecordPart, findCommitBoundary, joinRecordTexts, type RecordTextPart } from "./commit-boundary";
@@ -1688,7 +1688,7 @@ function handleToolStart(d: Draft, e: ToolStartedSignal): void {
     agentId,
     ownerAgentId: owner?.agentId,
     spawnDepth,
-    ...(e.isBackground === true || e.delegation?.isBackground === true ? { declaredBackground: true as const } : {}),
+    ...(declaredBackgroundLaunch(e) ? { declaredBackground: true as const } : {}),
   });
 }
 

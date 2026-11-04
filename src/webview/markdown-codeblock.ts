@@ -2,8 +2,8 @@ import * as l10n from "@vscode/l10n";
 import { closeGlyphButton } from "./close-button";
 import { IMPROVEMENT_VERDICTS_FENCE } from "../improvement-brief";
 
-export const COLLAPSE_LINE_LIMIT = 12;
 export const PREVIEW_LINE_COUNT = 8;
+export const COLLAPSE_LINE_LIMIT = PREVIEW_LINE_COUNT;
 export const TAB_SIZE = 4;
 
 export function codeLines(content: string): string[] {
@@ -60,6 +60,7 @@ export interface CodeBlockDeps {
 
 export interface CodeBlockOptions {
   collapsible: boolean;
+  closed: boolean;
   key: string | undefined;
 }
 
@@ -96,8 +97,17 @@ function lineCountText(count: number): string {
   return count === 1 ? l10n.t("1 line") : l10n.t("{0} lines", count);
 }
 
+function isCarriedRecord(lang: string | undefined): boolean {
+  return lang === IMPROVEMENT_VERDICTS_FENCE;
+}
+
+export function collapsedPreviewLines(lang: string | undefined, lineCount: number, closed: boolean): number | undefined {
+  if (isCarriedRecord(lang)) return 0;
+  return closed && lineCount > COLLAPSE_LINE_LIMIT ? PREVIEW_LINE_COUNT : undefined;
+}
+
 function fenceDisplayName(lang: string | undefined): { name: string | undefined; note?: string } {
-  return lang === IMPROVEMENT_VERDICTS_FENCE
+  return isCarriedRecord(lang)
     ? { name: l10n.t("Verdicts carried to the next analysis"), note: l10n.t("LAISORA reads this record in the next analysis; you do not need to read it.") }
     : { name: lang };
 }
@@ -194,7 +204,8 @@ export function assembleCodeBlock(
 ): void {
   if (options.key !== undefined) pre.dataset.codeKey = options.key;
   const lineCount = renderCodeLines(codeEl, content, "code-line");
-  const collapsed = options.collapsible && lineCount > COLLAPSE_LINE_LIMIT;
+  const previewLines = options.collapsible ? collapsedPreviewLines(lang, lineCount, options.closed) : undefined;
+  const collapsed = previewLines !== undefined;
 
   const head = document.createElement("div");
   head.className = "codeblock-head";
@@ -218,7 +229,7 @@ export function assembleCodeBlock(
 
   if (collapsed) {
     pre.classList.add("is-collapsed");
-    pre.style.setProperty("--codeblock-preview-lines", String(PREVIEW_LINE_COUNT));
+    pre.style.setProperty("--codeblock-preview-lines", String(previewLines));
     open.append(openTitle, codeActionIcon("open"));
     head.append(open, actions, wrap);
     pre.tabIndex = 0;
@@ -228,6 +239,11 @@ export function assembleCodeBlock(
         show();
       }
     });
+    if (previewLines === 0) {
+      pre.classList.add("is-head-only");
+      pre.append(head);
+      return;
+    }
     const more = document.createElement("button");
     more.type = "button";
     more.className = "codeblock-more";

@@ -590,6 +590,8 @@ const autoContinueSwitch = switchButton("setting-auto-continue-usage-limit");
 row(chatCard, l10n.t("Resume automatically when the usage limit resets"), l10n.t("When the claude.ai usage limit stops a conversation, continue it automatically after the limit resets. The same setting is used by Claude Code in the terminal."), autoContinueSwitch);
 const chromeIntegrationSwitch = switchButton("setting-chrome-integration");
 row(chatCard, l10n.t("Use Claude in Chrome"), l10n.t("Let Claude use the Claude in Chrome extension, which acts in your Chrome. Needs the extension installed and connected. Applies to conversations started or resumed afterwards; running conversations are not changed."), chromeIntegrationSwitch);
+const mcpElicitationSwitch = switchButton("setting-mcp-elicitation");
+row(chatCard, l10n.t("Show input requests from MCP servers"), l10n.t("When an MCP server asks you for input or to open a page, show a card in the conversation to answer it. Off declines these requests automatically. Applies to conversations started or resumed afterwards; running conversations are not changed."), mcpElicitationSwitch);
 const editSummarySwitch = switchButton("setting-edit-summary-enabled");
 const editSummaryText = row(chatCard, l10n.t("Show edited files after each reply"), l10n.t("At the end of each reply, list the files Claude edited in that turn with the lines added and removed. Click a file to compare it before and after the turn."), editSummarySwitch);
 const remoteControlCardSwitch = switchButton("setting-remote-control-card");
@@ -654,6 +656,7 @@ const fileLinkSwitches: Record<FileLinkBooleanSetting, HTMLButtonElement> = {
   fileLinkInstruction: switchButton("setting-file-link-instruction"),
   planInstruction: switchButton("setting-plan-instruction"),
   chromeIntegration: chromeIntegrationSwitch,
+  mcpElicitation: mcpElicitationSwitch,
   revealInExplorer: switchButton("setting-file-link-reveal-in-explorer"),
   allowOutsideWorkspace: switchButton("setting-file-link-allow-outside"),
   confirmOutsideWorkspace: switchButton("setting-file-link-confirm-outside"),
@@ -1404,6 +1407,7 @@ const pendingFileLink: Record<FileLinkBooleanSetting, number | null> = {
   fileLinkInstruction: null,
   planInstruction: null,
   chromeIntegration: null,
+  mcpElicitation: null,
   revealInExplorer: null,
   allowOutsideWorkspace: null,
   confirmOutsideWorkspace: null,
@@ -1540,6 +1544,7 @@ function render(state: SettingsState): void {
   fileLinkSwitches.fileLinkInstruction.disabled = false;
   fileLinkSwitches.planInstruction.disabled = false;
   fileLinkSwitches.chromeIntegration.disabled = false;
+  fileLinkSwitches.mcpElicitation.disabled = false;
   fileLinkSwitches.revealInExplorer.disabled = false;
   fileLinkSwitches.allowOutsideWorkspace.disabled = false;
   for (const child of outsideChildren) {
