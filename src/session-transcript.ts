@@ -17,7 +17,8 @@ import {
   formatRefusalMessage,
   extractAssistantTextBlocks,
   isApiErrorFrame,
-  isRefusalErrorProse,
+  isReplacedErrorProse,
+  accountErrorEvent,
   parseRefusalNotice,
   refusalFallbackEvent,
   parseRefusalStop,
@@ -63,7 +64,7 @@ export interface SessionTranscript {
 export type TranscriptMessage = Omit<ConversationMessage, "uuid"> & { uuid?: string };
 
 const REPLAY_MESSAGE_MAX = 80;
-const PRIOR_GENERATION_KINDS: ReadonlySet<NormalizedEventBody["kind"]> = new Set(["compact_boundary", "local_command_output", "user_message", "assistant_text_delta", "model_observed", "tool_call_started", "tool_call_finished"]);
+const PRIOR_GENERATION_KINDS: ReadonlySet<NormalizedEventBody["kind"]> = new Set(["compact_boundary", "local_command_output", "user_message", "assistant_text_delta", "model_observed", "tool_call_started", "tool_call_finished", "account_error"]);
 export const MAX_SUBAGENT_TRANSCRIPT_BYTES = 8 * 1024 * 1024;
 const RESUME_TAIL_MAX_BYTES = 1024 * 1024;
 const RESUME_TAIL_MAX_RECORDS = 1500;
@@ -918,7 +919,7 @@ export async function readResumePreviewTail(
       if (!uuid) continue;
       const message = asRecord(obj.message);
       const text = extractAssistantRecordText(message?.content, obj.narration_block_indexes);
-      if (text && !isRefusalErrorProse(obj, message)) {
+      if (text && !isReplacedErrorProse(obj, message)) {
         const rawModel = message?.model;
         const model = typeof rawModel === "string" && rawModel.length > 0 && !isSyntheticModel(rawModel) ? rawModel : undefined;
         messages.push({ uuid, role: "assistant", text, ...(model ? { model } : {}) });
@@ -1547,6 +1548,7 @@ async function readHistory(
         const refusalStop = parseRefusalStop(message);
         const refusalIsErrorProse = refusalStop !== null && isApiErrorFrame(obj);
         const turnId = currentTurnId ?? "replay-turn-1";
+        const accountError = accountErrorEvent(obj, turnId);
         const messageId = typeof message?.id === "string" && message.id.length > 0 ? message.id : null;
         if (messageId && !seenAssistantUsageMessageIds.has(messageId)) {
           if (typeof message?.usage === "object" && message.usage !== null) {
@@ -1593,7 +1595,15 @@ async function readHistory(
             fileOrder: parentOrderCounter++,
           });
         }
-        if (text && !refusalIsErrorProse) {
+        if (accountError !== undefined) {
+          rawEvents.push({
+            body: { ...accountError, provenance: { path: "history" } },
+            timestamp: recordTime,
+            sourcePriority: 0,
+            fileOrder: parentOrderCounter++,
+          });
+        }
+        if (text && !refusalIsErrorProse && accountError === undefined) {
           lastTurnActivityTimestamp = recordTime;
           rawEvents.push({
             body: {
@@ -2408,7 +2418,7 @@ function createConversationRecordParser(sessionId?: string, keep?: (message: Con
         } else if (obj.type === "assistant") {
           const message = asRecord(obj.message);
           const body = extractAssistantRecordText(message?.content, obj.narration_block_indexes);
-          if (!body || isRefusalErrorProse(obj, message)) {
+          if (!body || isReplacedErrorProse(obj, message)) {
             messages.push(...approvalMessages);
             continue;
           }
@@ -2568,7 +2578,7 @@ export async function readSessionTranscript(
           const recordText = assistantRecordText(content, obj.narration_block_indexes);
           const text = obj.isSidechain === true || (recordText.narration && !acceptNarrationRecord(obj))
             ? "" : recordText.text;
-          if (text && !isRefusalErrorProse(obj, message)) {
+          if (text && !isReplacedErrorProse(obj, message)) {
             const rawModel = message?.model;
             const model = typeof rawModel === "string" && rawModel.length > 0 && !isSyntheticModel(rawModel) ? rawModel : undefined;
             messages.push({

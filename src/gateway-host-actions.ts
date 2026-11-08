@@ -12,6 +12,7 @@ import { detectExternalExecutor, listExternalModels } from "./orchestration-exte
 import { externalExecutorName, isExternalModels, isExternalTimeout, type ExternalDetection, type ExternalModels, type ExternalModelsState } from "./orchestration-roster";
 import { DEFAULT_ORCHESTRATION_ROSTER, buildRecommendedClaudeRoster, isOrchestrationSettingRoster, orchestrationSettingRows, recommendedOrchestrationRoster, recommendedRosterChanges, type OrchestrationSettingRow } from "./orchestration-roster";
 import * as vscode from "vscode";
+import { openSignInTerminal } from "./claude-sign-in";
 import { resolveHandoffAutoSettings } from "./handoff-auto";
 import {
   HANDOFF_AUTO_SETTING_KEYS,
@@ -34,11 +35,12 @@ import {
   type WebviewToHost,
 } from "./protocol";
 import * as l10n from "@vscode/l10n";
-import { configuredClaudeExecutablePath, configuredDisplayName, configuredEventLimit, existingFolderOrHome, getLaisoraConfiguration, readClaudeCodeSettings } from "./claude-settings";
+import { configuredClaudeExecutablePath, configuredDisplayName, configuredEventLimit, existingFolderOrHome, getLaisoraConfiguration, readClaudeCodeSettings, writesLostNoticeOn } from "./claude-settings";
 import { isEventLimit } from "./event-limits";
 import { TRANSCRIPT_RETENTION_DAYS_KEY, configuredTranscriptRetentionDays, isTranscriptRetentionDays, transcriptRetentionFallback } from "./transcript-retention";
 import { CHROME_INTEGRATION_SETTING_KEY, chromeIntegrationEnabled } from "./chrome-integration";
 import { MCP_ELICITATION_SETTING_KEY, mcpElicitationEnabled } from "./elicitation";
+import { WRITES_LOST_NOTICE_SETTING_KEY } from "./session-writes-lost";
 import { isDisplayName } from "./display-name";
 import { extensionContext, output, store } from "./host-context";
 import { ADDITIONAL_MODELS_KEY, CLAUDE_VERSION_ID, additionalClaudeModelIds, recomputeModelRows, modelsMessage } from "./gateway-models";
@@ -160,6 +162,7 @@ export const FILE_LINK_SETTING_KEYS: Record<FileLinkSetting, string> = {
   planInstruction: "claude.planInstruction",
   chromeIntegration: CHROME_INTEGRATION_SETTING_KEY,
   mcpElicitation: MCP_ELICITATION_SETTING_KEY,
+  writesLostNotice: WRITES_LOST_NOTICE_SETTING_KEY,
   revealInExplorer: "fileLinks.revealInExplorer",
   allowOutsideWorkspace: "fileLinks.allowOutsideWorkspace",
   confirmOutsideWorkspace: "fileLinks.confirmOutsideWorkspace",
@@ -336,6 +339,7 @@ export function settingsStateMessage(): Extract<HostToSettingsPage, { type: "set
     planInstruction: cfg.get<boolean>(FILE_LINK_SETTING_KEYS.planInstruction)! !== false,
     chromeIntegration: chromeIntegrationEnabled((key) => cfg.get<unknown>(key)),
     mcpElicitation: mcpElicitationEnabled((key) => cfg.get<unknown>(key)),
+    writesLostNotice: writesLostNoticeOn(),
     revealInExplorer: cfg.get<boolean>(FILE_LINK_SETTING_KEYS.revealInExplorer)! !== false,
     allowOutsideWorkspace: cfg.get<boolean>(FILE_LINK_SETTING_KEYS.allowOutsideWorkspace)! === true,
     confirmOutsideWorkspace: cfg.get<boolean>(FILE_LINK_SETTING_KEYS.confirmOutsideWorkspace)! !== false,
@@ -506,8 +510,10 @@ export async function writeRestoreTabsOnStartup(enabled: boolean): Promise<Setti
   }
 }
 
-export async function runHostActionMessage(msg: Extract<WebviewToHost, { type: "runHostAction" }>): Promise<void> {
+export async function runHostActionMessage(msg: Extract<WebviewToHost, { type: "runHostAction" }>, sender?: vscode.Webview): Promise<void> {
+  if (msg.action === "openSettings" && sender) store?.requestSettingsFrom(sender);
   if (msg.action === "openSettings") await vscode.commands.executeCommand("laisora.openSettings", ...(msg.target === undefined ? [] : [msg.target]));
+  if (msg.action === "signInAgain") await openSignInTerminal(store?.sessions.get(msg.tabId));
   if (msg.action === "addClaudeModel") {
     const target = store?.sessions.get(msg.tabId);
     if (!target) return;

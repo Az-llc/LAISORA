@@ -13,6 +13,7 @@ import { TodoStoreError, type TodoStore } from "./todo-store";
 import { TODO_CLAUDE_CHANGES_MAX, todoClaudeChangeUnits, todoClipped } from "./todo-change-view";
 import { TODO_CHANGES_REQUEST_MAX } from "./protocol";
 import { TODO_SPLIT_FENCE_INFO } from "./markdown-ast";
+import { MIGRATION_CATEGORIES } from "./migration-categories";
 
 export { TODO_SERVER_NAME } from "./todo-model";
 export const TODO_WRITE_TOOL_NAMES: readonly string[] = TODO_WRITE_TOOLS;
@@ -31,7 +32,8 @@ const TODO_ASKED_REVERT = "Use it only when the user asks you to take back somet
 const TODO_REVERT_REACH = "It takes back only your own changes; the user's own edits, the user's taking back of your changes and the items the user deleted stay with the user.";
 const TODO_SCOPE = "The user's persistent TODO list: one per PC, shared by every LAISORA window and conversation, kept across restarts. It is not this conversation's plan: use TaskCreate/TaskUpdate (or TodoWrite) for the steps of the current request, and this TODO list only for items the user asks to keep or track beyond this conversation.";
 const TODO_ROOT_ONLY = "Only the main conversation may change the TODO list; a subagent reports to the main conversation, which writes.";
-export const TODO_ROOT_SCOPE: RootGateScope = { tools: TODO_WRITE_TOOL_NAMES, denial: TODO_ROOT_ONLY };
+const TODO_MIGRATION_TOOL_KINDS = ["export_migration", "import_migration", "rebind_migrated_folder"] as const;
+export const TODO_ROOT_SCOPE: RootGateScope = { tools: [...TODO_WRITE_TOOL_NAMES, ...TODO_MIGRATION_TOOL_KINDS.map(kind => `mcp__${TODO_SERVER_NAME}__${kind}`)], denial: TODO_ROOT_ONLY };
 const TODO_CHILD_GROUP_NOTE = "The group was not set: a sub-item follows the group of its top-level item. Set the group on the top-level item instead.";
 const TODO_MEMO_STALE_NOTE = "A conversation linked to this item worked after the work memo was last written, so the memo may be out of date; check it against the current state and rewrite the sections that changed.";
 const TODO_CASE_RULES = "A group is one case with its own lifetime (a product, a client case, a household area); words for a kind of list or work (roadmap, bugs, research, ideas) are never groups but top-level items inside the case. The case comes from, in this order: a case word in the request (and the aliases list returns in context), the group of the item this conversation is linked to, what the conversation is about and the folder of the files it read or edited (list's context). With any of these signals, place the item in the most likely case and tell the user in one line in their language with the path the result returns, e.g. \"<path> に入れました。違ったら言ってください\"; do not stop to ask. Use No group only when there is no signal at all. Items the user added themselves are often quick captures to be organized, not a structure to copy. In a conversation about several topics, only sub-tasks of the linked work go under the linked item; other cases go to their own group.";
@@ -568,8 +570,18 @@ function inputError(kind: TodoToolKind, input: Record<string, unknown>): string 
   }
 }
 
+export interface TodoMigrationTools {
+  export(input: { categories?: readonly string[]; output: string }): Promise<{ text: string; isError: boolean }>;
+  import(path: string): Promise<{ text: string; isError: boolean }>;
+  rebind(input: { dirName: string; newCwd: string; oldCwd?: string }, runningCwd?: string): Promise<{ text: string; isError: boolean }>;
+}
+
+const MIGRATION_EXPORT_DESCRIPTION = "Write the user's LAISORA migration ZIP, the same export as the Migration tab of LAISORA's settings: the latest ToDo with its images, the LAISORA settings the user set, the Claude environment (CLAUDE.md, rules, hooks, skills, agents, commands, output-styles, plugins, settings.json, settings.local.json, keybindings.json and the user's MCP servers of ~/.claude.json, never login credentials), the conversation records of every work folder and Claude's memory of every work folder. Use it only when the user asks to export or move to another PC; the user confirms the destination and categories in a VS Code dialog first. The result lists what went in, the size of the conversation records and memory and a warning naming (never showing) the MCP servers and settings entries that look like keys and went in; tell the user. The ZIP holds LAISORA-MIGRATION.md, which explains the import and what to finish by hand on the new PC.";
+const MIGRATION_IMPORT_DESCRIPTION = "Import a LAISORA migration ZIP the user names (the Migration tab's import starts a conversation that uses this tool): the user confirms in a VS Code dialog listing the categories and counts before anything is placed. Use it only when the user asks to import that ZIP. The result lists what was placed and kept, the backup folder of replaced files, the path of the archive's LAISORA-MIGRATION.md copied to this PC (guide) and the work folders not found on this PC (unresolved; their records and memory stay under the old folder name). Re-bind each with rebind_migrated_folder after asking the user where it is now.";
+const MIGRATION_REBIND_DESCRIPTION = "Re-bind one work folder that import_migration reported as not found on this PC (its unresolved list) to the folder where the project is now: moves its conversation records and memory from ~/.claude/projects/<dirName> to the place Claude Code reads for newCwd (never overwriting files already there), adds the new work folder to each moved record, changes LAISORA ToDo group bindings from the old folder to newCwd, and checks that each moved conversation now belongs to newCwd. It refuses a folder that already belongs to an existing work folder and the folder of this conversation; if it fails midway the result says what was moved and calling it again with the same arguments finishes the move. The user confirms in a VS Code dialog first. Ask the user for newCwd; do not guess it.";
+
 export function createTodoMcpServer(sdk: Pick<typeof Sdk, "createSdkMcpServer" | "tool">, store: TodoStore, gate: RootGate, log: (message: string) => void,
-  sessionOf: () => string | undefined = () => undefined, contextOf: () => TodoConversationContext | undefined = () => undefined) {
+  sessionOf: () => string | undefined = () => undefined, contextOf: () => TodoConversationContext | undefined = () => undefined, migration?: TodoMigrationTools) {
   const run = async (body: () => Promise<Reply>): Promise<Reply> => {
     try { return await body(); }
     catch (error) {
@@ -594,7 +606,32 @@ export function createTodoMcpServer(sdk: Pick<typeof Sdk, "createSdkMcpServer" |
     const basis: TodoPlacementBasis = linkedGroup ? "linked" : bound?.groupFrom === "files" ? "files" : "folder";
     return { ...(folder ? { folder } : {}), ...(group ? { group, basis, reason: linkedGroup ? "the group of the item this conversation is linked to" : "the group bound to this conversation's folder" } : {}) };
   };
-  return sdk.createSdkMcpServer({ name: TODO_SERVER_NAME, tools: TODO_TOOL_KINDS.map(kind => sdk.tool(kind, TODO_DESCRIPTIONS[kind],
+  const migrationTools = migration ? [
+    sdk.tool(TODO_MIGRATION_TOOL_KINDS[0], MIGRATION_EXPORT_DESCRIPTION, {
+      categories: z.array(z.enum(MIGRATION_CATEGORIES)).min(1).optional().describe("What to export; omitted = all. conversations = the conversation records and memory = Claude's memory, each of every work folder under ~/.claude/projects."),
+      output: z.string().min(1).describe("Absolute path of the ZIP to write; must not exist yet."),
+    }, async (input: { categories?: string[]; output: string }, extra: unknown) => {
+      if (!gate.consume(extra)) return reply(todoFailureResultText("root-only", TODO_ROOT_ONLY), true);
+      const result = await migration.export(input);
+      return reply(result.text, result.isError);
+    }),
+    sdk.tool(TODO_MIGRATION_TOOL_KINDS[1], MIGRATION_IMPORT_DESCRIPTION, { path: z.string().min(1).describe("Absolute path of the migration ZIP.") },
+      async (input: { path: string }, extra: unknown) => {
+        if (!gate.consume(extra)) return reply(todoFailureResultText("root-only", TODO_ROOT_ONLY), true);
+        const result = await migration.import(input.path);
+        return reply(result.text, result.isError);
+      }),
+    sdk.tool(TODO_MIGRATION_TOOL_KINDS[2], MIGRATION_REBIND_DESCRIPTION, {
+      dirName: z.string().min(1).describe("The dirName of an unresolved entry in the import_migration result."),
+      newCwd: z.string().min(1).describe("Absolute path of the existing folder where the project is now on this PC."),
+      oldCwd: z.string().min(1).optional().describe("The cwd of the same unresolved entry; lets the tool re-bind ToDo groups even when called again after a partial move."),
+    }, async (input: { dirName: string; newCwd: string; oldCwd?: string }, extra: unknown) => {
+      if (!gate.consume(extra)) return reply(todoFailureResultText("root-only", TODO_ROOT_ONLY), true);
+      const result = await migration.rebind(input, contextOf()?.cwd);
+      return reply(result.text, result.isError);
+    }),
+  ] : [];
+  return sdk.createSdkMcpServer({ name: TODO_SERVER_NAME, tools: [...migrationTools, ...TODO_TOOL_KINDS.map(kind => sdk.tool(kind, TODO_DESCRIPTIONS[kind],
     TODO_INPUTS[kind] as Record<string, z.ZodType>,
     async (given: Record<string, unknown>, extra: unknown) => run(async () => {
       if (kind !== "list" && !gate.consume(extra)) return reply(todoFailureResultText("root-only", TODO_ROOT_ONLY), true);
@@ -622,5 +659,5 @@ export function createTodoMcpServer(sdk: Pick<typeof Sdk, "createSdkMcpServer" |
       }
       const item = view.live.find(entry => entry.id === input.id);
       return item ? reply(JSON.stringify(itemView(view, item, true))) : reply(todoFailureResultText("not-found", OPERATION_ERRORS["not-found"]), true);
-    }))) });
+    })))] });
 }

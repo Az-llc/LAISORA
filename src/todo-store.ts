@@ -28,7 +28,7 @@ export class TodoStoreError extends Error {
 const delay = (ms: number) => new Promise<void>(resolve => setTimeout(resolve, ms));
 const errorCode = (error: unknown) => (error as NodeJS.ErrnoException | undefined)?.code ?? "";
 
-async function retryTransient<T>(action: () => Promise<T>): Promise<T> {
+export async function retryTransient<T>(action: () => Promise<T>): Promise<T> {
   const started = Date.now();
   for (let attempt = 0; ; attempt++) {
     try { return await action(); }
@@ -57,14 +57,24 @@ export class TodoStore {
   }
 
   async apply(operation: TodoOperation, author: TodoAuthor): Promise<TodoOperationResult> {
+    return this.write(current => applyTodoOperation(current, operation, { author, now: Date.now(), newId: taken => {
+      for (;;) { const id = randomBytes(4).toString("hex"); if (!taken.has(id)) return id; }
+    } }));
+  }
+
+  async replace(imported: TodoDocument): Promise<TodoDocument> {
+    const result = await this.write(current => ({ ok: true, document: { ...imported, revision: current.revision + 1, writes: current.writes ?? [] }, itemId: "", changed: true }));
+    if (!result.ok) throw new TodoStoreError("conflict");
+    return result.document;
+  }
+
+  private async write(next: (current: TodoDocument) => TodoOperationResult): Promise<TodoOperationResult> {
     try { await mkdir(this.directory, { recursive: true }); }
     catch (error) { throw new TodoStoreError("io", error); }
     const writeId = randomBytes(6).toString("hex");
     for (let attempt = 0; attempt < TODO_WRITE_ATTEMPTS; attempt++) {
       const current = await this.read();
-      const result = applyTodoOperation(current, operation, { author, now: Date.now(), newId: taken => {
-        for (;;) { const id = randomBytes(4).toString("hex"); if (!taken.has(id)) return id; }
-      } });
+      const result = next(current);
       if (!result.ok || result.document === current) return result;
       const document: TodoDocument = { ...result.document, writes: [...(current.writes ?? []), writeId].slice(-TODO_WRITE_WINDOW) };
       if (await this.publish(document)) {

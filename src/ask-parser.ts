@@ -97,11 +97,10 @@ function scalar(raw: string, multiline = false): string | null {
   const value = raw.trim();
   if (!value || /[\u0000-\u001f]/.test(value)) return null;
   if (value.startsWith('"')) {
-    try {
-      const parsed: unknown = JSON.parse(value);
-      const forbidden = multiline ? /[\u0000-\u0009\u000b-\u001f]/ : /[\u0000-\u001f]/;
-      return typeof parsed === "string" && parsed.trim() && !forbidden.test(parsed) ? parsed : null;
-    } catch { return null; }
+    let parsed: unknown;
+    try { parsed = JSON.parse(value); } catch { return value; }
+    const forbidden = multiline ? /[\u0000-\u0009\u000b-\u001f]/ : /[\u0000-\u001f]/;
+    return typeof parsed === "string" && parsed.trim() && !forbidden.test(parsed) ? parsed : null;
   }
   if (/^[|>&*!]/.test(value)) return null;
   return value;
@@ -184,6 +183,39 @@ export function parsePlanBlock(source: string): PlanBlock | null {
   return parseBlock(source, "plan") as PlanBlock | null;
 }
 
+export const ASK_BLOCK_LINE = /^( *)(- )?([a-z]+):(?: (.*))?$/;
+const PLAN_KEYS = ["goal"] as const;
+const ASK_LIST_KEYS = ["options", "steps"] as const;
+const ASK_ROOT_KEYS = ["kind", "title", "why", "details", "default", ...ASK_LIST_KEYS] as const;
+const OPTION_KEYS = ["label", "effect", "pros", "cons", "recommended"] as const;
+const STEP_KEYS = ["do", "look"] as const;
+const KEY_TYPO_MIN_LENGTH = 3;
+const ASK_KEYS: readonly string[] = [...ASK_ROOT_KEYS, ...OPTION_KEYS, ...STEP_KEYS];
+
+export function isPartialAskLine(line: string): boolean {
+  const match = /^ *(?:-(?: ([a-z]*))?|([a-z]+))$/.exec(line) ?? /^ {0,3}[`~]{1,2}$/.exec(line);
+  if (!match) return false;
+  const word = match[1] ?? match[2];
+  return word === undefined || ASK_KEYS.some((key) => key.startsWith(word));
+}
+
+function oneEditApart(a: string, b: string): boolean {
+  if (Math.abs(a.length - b.length) > 1 || a === b) return false;
+  let i = 0;
+  while (i < a.length && i < b.length && a[i] === b[i]) i++;
+  if (a.length === b.length) return a.slice(i + 1) === b.slice(i + 1) || (a[i] === b[i + 1] && a[i + 1] === b[i] && a.slice(i + 2) === b.slice(i + 2));
+  return a.length > b.length ? a.slice(i + 1) === b.slice(i) : a.slice(i) === b.slice(i + 1);
+}
+
+export function blockKey<K extends string>(written: string, allowed: readonly K[], present: readonly string[]): K | undefined {
+  const open = allowed.filter((key) => !present.includes(key));
+  const exact = allowed.find((key) => key === written);
+  if (exact !== undefined) return open.includes(exact) ? exact : undefined;
+  if (written.length < KEY_TYPO_MIN_LENGTH) return undefined;
+  const near = open.filter((key) => oneEditApart(written, key));
+  return near.length === 1 ? near[0] : undefined;
+}
+
 function parseBlock(source: string, type: "ask" | "plan"): AskBlock | PlanBlock | null {
   const root: Record<string, string> = Object.create(null);
   const entries: Record<string, string>[] = [];
@@ -192,17 +224,21 @@ function parseBlock(source: string, type: "ask" | "plan"): AskBlock | PlanBlock 
   let entry: Record<string, string> | undefined;
   for (const line of source.replace(/\r\n/g, "\n").split("\n")) {
     if (!line.trim()) continue;
-    const match = /^( *)(- )?([a-z]+):(?: (.*))?$/.exec(line);
+    const match = ASK_BLOCK_LINE.exec(line);
     if (!match) return null;
-    const [, indent, dash, key, raw = ""] = match;
+    const [, indent, dash, written, raw = ""] = match;
     if (indent.length === 0 && !dash) {
       inList = false;
-      if (type === "ask" && (key === "options" || key === "steps")) {
+      const allowed = type === "plan" ? PLAN_KEYS : ASK_ROOT_KEYS;
+      const same = blockKey(written, allowed, []);
+      if (same !== undefined && Object.hasOwn(root, same) && root[same] === scalar(raw, same === "details")) continue;
+      const key = blockKey(written, allowed, [...Object.keys(root), ...(list ? ASK_LIST_KEYS : [])]);
+      if (key === "options" || key === "steps") {
         if (list || raw.trim()) return null;
         list = key;
         inList = true;
       } else {
-        if (!(type === "plan" ? ["goal"] : ["kind", "title", "why", "details", "default"]).includes(key) || Object.hasOwn(root, key)) return null;
+        if (key === undefined) return null;
         const value = scalar(raw, key === "details");
         if (value === null) return null;
         root[key] = value;
@@ -214,10 +250,15 @@ function parseBlock(source: string, type: "ask" | "plan"): AskBlock | PlanBlock 
       entry = Object.create(null) as Record<string, string>;
       entries.push(entry);
     } else if (indent.length !== 4 || dash || !entry) return null;
-    if (!entry || Object.hasOwn(entry, key)) return null;
-    if (!(list === "options" ? ["label", "effect", "pros", "cons", "recommended"] : ["do", "look"]).includes(key)) return null;
+    if (!entry) return null;
+    const allowed = list === "options" ? OPTION_KEYS : STEP_KEYS;
+    const same = blockKey(written, allowed, []);
+    if (same !== undefined && Object.hasOwn(entry, same) && entry[same] === scalar(raw)) continue;
+    const key = blockKey(written, allowed, Object.keys(entry));
+    if (key === undefined) return null;
     const value = scalar(raw);
-    if (value === null || (key === "recommended" && raw !== "true")) return null;
+    if (value === null) return null;
+    if (key === "recommended" && value !== "true") continue;
     entry[key] = value;
   }
   if (type === "plan") return root.goal ? { goal: root.goal } : null;

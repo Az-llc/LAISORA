@@ -16,6 +16,23 @@ export function claudeProjectsDir(): string {
   return join(claudeConfigDir(), "projects");
 }
 
+export const PROJECT_DIR_ENCODE_MAX = 200;
+
+function projectDirNameHash(cwd: string): string {
+  let hash = 0;
+  for (let index = 0; index < cwd.length; index++) hash = (hash << 5) - hash + cwd.charCodeAt(index) | 0;
+  return Math.abs(hash).toString(36);
+}
+
+export function normalizeDriveLetter(cwd: string): string {
+  return /^[a-z]:/.test(cwd) ? cwd[0].toUpperCase() + cwd.slice(1) : cwd;
+}
+
+export function claudeProjectDirName(cwd: string): string {
+  const encoded = cwd.replace(/[^a-zA-Z0-9]/g, "-");
+  return encoded.length <= PROJECT_DIR_ENCODE_MAX ? encoded : `${encoded.slice(0, PROJECT_DIR_ENCODE_MAX)}-${projectDirNameHash(cwd)}`;
+}
+
 export function claudeSettingsFiles(projectDir?: string, configDir: string = claudeConfigDir()): string[] {
   const directory = projectDir === undefined ? configDir : join(projectDir, ".claude");
   return [join(directory, "settings.json"), ...(projectDir === undefined ? [] : [join(directory, "settings.local.json")])];

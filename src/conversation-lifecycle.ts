@@ -1,13 +1,14 @@
 import { EXTERNAL_TIMEOUT_SETTING_KEY } from "./orchestration-executors";
 import { applyFallbackModel, fallbackCoalesces, fallbackOriginalModel, fallbackTurnKey, fallbackUnresolved, reportedPermissionMode, resolveFallbackByChoice, type EventProvenance, type FallbackRevertOutcome, type NormalizedEventBody, type PermissionModeId, type PermissionModeRequest } from "./protocol";
 import { randomUUID } from "node:crypto";
-import { getLaisoraConfiguration } from "./claude-settings";
+import { getLaisoraConfiguration, writesLostNoticeOn } from "./claude-settings";
 import { placementSettingsOf } from "./placement-line";
 import { cachedExternalModels, noteRunningExecutorVersion } from "./gateway-host-actions";
 import { noteCliUpdateOpportunity } from "./claude-cli-update";
 import { transcriptRetentionSettings } from "./transcript-retention";
 import { chromeIntegrationEnabled } from "./chrome-integration";
 import { mcpElicitationEnabled } from "./elicitation";
+import { recordWritesLost } from "./session-writes-lost";
 
 import {
   PERMISSION_MODE_KEY,
@@ -29,14 +30,17 @@ import { OrchestrationViewPublisher, orchestrationViewForConversation, orchestra
 import { orchestrationRunsDirectoryOf } from "./orchestration-external";
 import { orchestrationPluginDirectoryOf } from "./orchestration-plugin";
 import { hostTodoStore, noteTodoConversationEvent, postTodoSnapshot, settleTodoReplyStart, todoFeatureEnabled, todoLinkedItemAtStart } from "./todo-surface";
+import { migrationTools } from "./migration-host";
 import { postAttachments } from "./composer-io";
 import { pendingAttachments } from "./pending-attachments";
 import { flushChosenTitle } from "./session-list-wiring";
-import { noteAutoHandoffEvent, noteAutoHandoffUserSend } from "./handoff-wiring";
+import { cliActivityOf, noteAutoHandoffEvent, noteAutoHandoffUserSend } from "./handoff-wiring";
 import * as l10n from "@vscode/l10n";
 import { isUnusedSession, type Session } from "./session";
 import { applyLiveDiscoveredModels, modelsMessage } from "./gateway-models";
 import { resolveModelDisplayName } from "./model-display-name";
+import { claudeAiSignInExpired, isAccountErrorReason } from "./account-error";
+import { cliReplaceable } from "./handoff-auto";
 import { clearProcessEphemeral } from "./guardrail";
 import { extensionContext, output, sinceActivation, store } from "./host-context";
 import { INJECTED_TAG_RE as HUMAN_INPUT_INJECTED_TAG_RE, isNonHumanCommandInput } from "./human-input-vocabulary";
@@ -659,8 +663,17 @@ export async function handleConversationMessage(
   }
 }
 
+function restartsAfterSignIn(s: Session): boolean {
+  const conv = s.conversation;
+  return conv !== null && conv === s.restartAfterSignIn && !conv.isClosed && cliReplaceable(cliActivityOf(s));
+}
+
+function processReplaced(s: Session): boolean {
+  return s.conversation !== null && (s.conversation.isClosed || restartsAfterSignIn(s));
+}
+
 function crashResumeSessionIdOf(s: Session): string | undefined {
-  return s.conversation?.isClosed && !isUnusedSession(s) ? s.auth?.sessionId ?? undefined : undefined;
+  return processReplaced(s) && !isUnusedSession(s) ? s.auth?.sessionId ?? undefined : undefined;
 }
 
 const pendingCliStarts = new WeakMap<Session, { started: Promise<void>; resolve: () => void }>();
@@ -721,7 +734,9 @@ async function ensureConversationInner(s: Session, requestedAt: number): Promise
   const innerT0 = Date.now();
   const logicalGenerationAtStart = s.logicalGeneration;
   const crashResumeSessionId = crashResumeSessionIdOf(s);
-  if (s.conversation?.isClosed) {
+  if (s.conversation !== null && processReplaced(s)) {
+    if (!s.conversation.isClosed) s.detachedConversationIds.add(s.conversation.conversationId);
+    s.restartAfterSignIn = undefined;
     s.guardrailRunner.settleConversationLost();
     void s.conversation.dispose();
     s.conversation = null;
@@ -780,6 +795,7 @@ async function ensureConversationInner(s: Session, requestedAt: number): Promise
     askQualityCheck: cfg.get<boolean>("claude.askQualityCheck") === true,
     todoStore: todoEnabled ? hostTodoStore() : undefined,
     todoLinkedItem,
+    migrationTools,
     planLaunchVerdict: description => numberedLaunchVerdict(s.evidenceIndex.timeBuckets, description),
     planResumeVerdict: (to, namedToolUseId, toolUseId, summary) => resumeVerdict(s.evidenceIndex.timeBuckets, to, namedToolUseId, toolUseId,
       id => isRunningLane(s.workModel, id), summary),
@@ -800,6 +816,10 @@ async function ensureConversationInner(s: Session, requestedAt: number): Promise
     },
     onCliVersion: (version) => noteRunningExecutorVersion("claude", version),
     onBridgeState: (connection) => noteBridgeState(s, conv, connection),
+    onSessionWritesLost: (loss) => {
+      const failed = (error: unknown): void => output.appendLine(`[${s.title}] could not save the lost-writes mark: ${String(error)}`);
+      void Promise.resolve().then(() => recordWritesLost(extensionContext?.globalState, loss, Date.now())).then(undefined, failed);
+    },
     interruptForceKillTimeoutMs: cfg.get<number>("interruptForceKillTimeoutMs")!,
     onEvent: (raw, conversationId, meta) => {
       const own = conversationId === s.expectedConversationId && !s.closed;
@@ -807,6 +827,7 @@ async function ensureConversationInner(s: Session, requestedAt: number): Promise
         if (own) applyReportedPermissionMode(store, s, raw.mode);
         return;
       }
+      if (raw.kind === "session_writes_lost" && !writesLostNoticeOn()) return;
       const ev = own ? noteFallbackRevert(s, conv, raw) : raw;
       if (
         ev.kind === "auth_status" &&
@@ -826,6 +847,7 @@ async function ensureConversationInner(s: Session, requestedAt: number): Promise
       if (own) settleFallbackRevert(store, s, conv, ev);
       if (own && todoEnabled) noteTodoConversationEvent(s, ev);
       if (own && TURN_END_KINDS.has(ev.kind)) settleTodoReplyStart(s, ev.kind === "turn_completed");
+      if (own && ev.kind === "turn_failed" && ev.errorKind === "account" && isAccountErrorReason(ev.reason) && claudeAiSignInExpired(ev.reason, s.auth)) s.restartAfterSignIn = conv;
       if (TURN_END_KINDS.has(ev.kind)) noteCliUpdateOpportunity();
       if (own && TURN_END_KINDS.has(ev.kind) && s.unpersistedChosenTitle !== null) void flushChosenTitle(s);
       if (ev.kind === "auth_status" && conversationId === s.expectedConversationId && ev.auth?.billingRealm === "api") {

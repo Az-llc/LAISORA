@@ -615,3 +615,12 @@ textarea.settings-input { height: auto; }
   border-color: var(--vscode-contrastActiveBorder, var(--vscode-button-background));
 }
 .settings-segment.settings-primary { background: var(--vscode-button-background); }
+.settings-migration-number { font-variant-numeric: tabular-nums; }
+.settings-migration-progress { margin-top: var(--settings-gap-1); }
+.settings-migration-contents { margin-left: var(--settings-gap-4); padding-left: var(--settings-gap-3); border-left: var(--settings-rule); }
+.settings-migration-contents-title { margin: var(--settings-gap-2) 0 0; font-size: var(--l-note); font-weight: 600; color: var(--vscode-descriptionForeground); }
+.settings-progress-track { position: relative; height: 4px; overflow: hidden; background: var(--vscode-input-background, transparent); border: 1px solid var(--vscode-contrastBorder, var(--vscode-widget-border, transparent)); border-radius: 2px; }
+.settings-progress-bar { width: 0; height: 100%; background: var(--laisora-accent); }
+.settings-progress-track.indeterminate .settings-progress-bar { position: absolute; width: 30%; animation: settings-progress-sweep 1.4s ease-in-out infinite; }
+@keyframes settings-progress-sweep { from { left: -30%; } to { left: 100%; } }
+@media (prefers-reduced-motion: reduce) { .settings-progress-track.indeterminate .settings-progress-bar { animation: none; left: 0; width: 100%; opacity: 0.5; } }

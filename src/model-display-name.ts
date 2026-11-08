@@ -1,4 +1,5 @@
 import * as l10n from "@vscode/l10n";
+import { accountErrorText, isAccountErrorReason } from "./account-error";
 import type { ExternalDetection, ExternalModelsState } from "./orchestration-executors";
 import type { ModelInfo } from "./protocol";
 
@@ -6,16 +7,9 @@ export function modelListStatusText(list: ExternalModelsState, detection: Extern
   const reason = detection.state === "notInstalled" ? "not-installed"
     : list.state === "failed" ? list.reason : list.state === "ok" && list.refresh === "failed" ? list.refreshReason ?? "model-list-failed" : undefined;
   if (!reason) return "";
-  let text: string;
-  switch (reason) {
-    case "authentication-required": text = l10n.t("Sign-in is required. Log in using the CLI, then recheck."); break;
-    case "organization-not-allowed": text = l10n.t("This organization is not allowed. Check your CLI account, then recheck."); break;
-    case "account-on-hold": text = l10n.t("This account is on hold. Check your account, then recheck."); break;
-    case "verification-required": text = l10n.t("Account verification is required. Verify your account, then recheck."); break;
-    case "billing-error": text = l10n.t("There is an account billing problem. Check your subscription or billing settings, then recheck."); break;
-    case "not-installed": text = l10n.t("The CLI could not be found. Install it or check its path, then recheck."); break;
-    default: text = l10n.t("Could not fetch the latest model list");
-  }
+  const text = isAccountErrorReason(reason) ? accountErrorText(reason, "recheck", undefined)
+    : reason === "not-installed" ? l10n.t("The CLI could not be found. Install it or check its path, then recheck.")
+    : l10n.t("Could not fetch the latest model list");
   if (list.state !== "ok" || !list.fetchedAt) return text;
   const remembered = l10n.t("Could not fetch the latest list (showing the list from {0})", new Date(list.fetchedAt).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", hour12: false }));
   return text === l10n.t("Could not fetch the latest model list") ? remembered : `${text} ${remembered}`;

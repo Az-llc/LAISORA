@@ -37,7 +37,8 @@ import type {
 } from "./protocol";
 import { clipSummary, summarizeToolInput, type ApiKeyPolicy, type BridgeConnection } from "./protocol";
 import { bridgeStateOf, enableRemoteControl, type RemoteControlSession } from "./remote-control";
-import { resolveClaudeCodeExecutable } from "./claudeCliResolver";
+import { checkClaudeCodeVersion, resolveClaudeCodeExecutable } from "./claudeCliResolver";
+import { compareSemVer, parseSemVer } from "./semver";
 import {
   buildClaudeEnv,
   claudeConfigDir,
@@ -62,7 +63,7 @@ import { isShellTool } from "./shell-tools";
 import { compileVocabulary, PLACEMENT_EFFORT_WORDS, placementPath, protectedDestination, isControlFile, delegateControlRefusal, judgeFileWrite, judgeMemoryWrite, memoryGuardReason, type MemoryDecision, judgeShellWrite, PLACEMENT_GUARD_REFUSAL, PLACEMENT_UNREADABLE_REFUSAL } from "./placement-guard";
 import { RootGate } from "./root-gate";
 import { laisoraInputLine, markLaisoraInput, type LaisoraInput } from "./laisora-input";
-import { createTodoMcpServer, TODO_ROOT_SCOPE, TODO_SERVER_NAME, TODO_TOOL_NAMES, todoLinkedInstruction, todoWorkspaceRoots, type TodoLinkedItem } from "./todo-mcp";
+import { createTodoMcpServer, TODO_ROOT_SCOPE, TODO_SERVER_NAME, TODO_TOOL_NAMES, todoLinkedInstruction, todoWorkspaceRoots, type TodoLinkedItem, type TodoMigrationTools } from "./todo-mcp";
 import type { TodoStore } from "./todo-store";
 import { claudeModelIdLabel, EXTERNAL_TIMEOUT_DEFAULT_MINUTES, externalUnknownTargetReason, isExternalRunTool } from "./orchestration-executors";
 import { delegateForegroundInput, isDelegationLaunchTool, isDelegationTool } from "./claude-tool-names";
@@ -72,6 +73,7 @@ import { AgentAttribution } from "./orchestration-attribution";
 import type { NormalizedOutMeta } from "./claude-normalizer";
 import { askQualityDenial, rejectedAskTitles } from "./markdown-ast";
 import { elicitationAnswer, elicitationSpecOf, type ElicitationSpec } from "./elicitation";
+import type { SessionWritesLost } from "./session-writes-lost";
 
 type UserContentBlock =
   | { type: "text"; text: string }
@@ -94,6 +96,19 @@ type InterruptReceipt = { still_queued?: string[]; cancelled?: string[] };
 const CAP_INTERRUPT_CANCEL_QUEUED = "interrupt_cancel_queued_v1";
 const CAP_ASK_USER_QUESTION_UNANSWERED = "ask_user_question_unanswered_v1";
 const TODO_RECENT_FILES = 20;
+export const HOOK_ON_FAILURE_MIN_CLI = "2.1.317";
+const cliVersions = new Map<string, Promise<string | undefined>>();
+
+export function honorsHookOnFailure(version: string | undefined): boolean {
+  const running = parseSemVer(version), minimum = parseSemVer(HOOK_ON_FAILURE_MIN_CLI);
+  return !!running && !!minimum && compareSemVer(running, minimum) >= 0;
+}
+
+function cliVersionOf(executablePath: string): Promise<string | undefined> {
+  let version = cliVersions.get(executablePath);
+  if (!version) cliVersions.set(executablePath, version = checkClaudeCodeVersion(executablePath));
+  return version;
+}
 export const REPLAY_USER_MESSAGES_ARG = "replay-user-messages";
 export const CHROME_ARG = "chrome";
 
@@ -129,7 +144,7 @@ export const PLAN_INSTRUCTION = [
   "Put an action that waits for the user's approval (such as merging or publishing) in its own step, separate from work you can finish yourself, and do not mark it in_progress until the user answers.",
   `While TaskCreate steps exist, start the description of every Agent call and external run with the number of the step it serves exactly as the PLAN panel shows it (the task id, zero-padded to at least two digits) followed by a space, as in "03 Remove model research". A delegation without a valid step number, or for a step that is not in progress, is rejected before it runs: before the delegation, ${PLAN_IN_PROGRESS_FIRST}.`,
   `When you resume a finished agent with SendMessage, ${PLAN_RESUME_NUMBER}. That step must be a step of the current PLAN in progress, as for a delegation. ${PLAN_RESUMED_AGENT_PLACE}: resuming without a number an agent placed on a completed step is rejected before it runs unless you first ${PLAN_IN_PROGRESS_FIRST}.`,
-  "When you need the user's decision or a real-machine check, do not bury it in prose. Write a ```laisora-ask block (format below) at the point you ask.",
+  "When you need the user's decision or a real-machine check, do not bury it in prose. Write a ```laisora-ask block (format below) at the point you ask; the fence name is laisora-ask for both kinds.",
   "Before asking, check earlier decisions (ledger, contracts, earlier answers here) instead of re-asking, and investigate first if the current state is unknown.",
   "In every decision (laisora-ask or AskUserQuestion): why = what you observed (facts, numbers, sources) + the exact question + why the user, not you, must decide; never restate the title. effect = the concrete change to the user's screen, operation or work; never restate the label. pros/cons = compared with the other options, including effects on other features and operations. Give technical reasons, not history; explain terms the user may not share. For LAISORA's own behaviour, state the current behaviour and its technical reason from contracts or facts, or 理由の記録なし.",
   "Keep why short. Put material the user may need but not always (current behaviour and its technical reason, numbers, sources, terms explained) in the optional details key after why, so the user rarely has to ask back; the card shows it folded. details is a JSON double-quoted string; write \\n for a line break.",
@@ -201,7 +216,7 @@ interface QueryHandle extends AsyncIterable<any> {
   getSettings?(): Promise<unknown>;
   renameSession?(title: string, sessionId?: string): Promise<void>;
   supportedModels(): Promise<Array<{ model?: string; id?: string; value?: string; resolvedModel?: string; displayName?: string; description?: string; supportsEffort?: boolean; supportedEffortLevels?: string[] }>>;
-  initializationResult(): Promise<{ claude_code_version?: string; remote_control_auto_enable?: boolean } | undefined>;
+  initializationResult(): Promise<{ claude_code_version?: string; remote_control_auto_enable?: boolean; account?: { apiProvider?: unknown; tokenSource?: unknown } } | undefined>;
   usage_EXPERIMENTAL_MAY_CHANGE_DO_NOT_RELY_ON_THIS_API_YET?(opts?: { skipBehaviors?: boolean }): Promise<unknown>;
   getContextUsage(): Promise<{
     percentage: number;
@@ -231,6 +246,7 @@ export interface ClaudeHostOptions {
   askQualityCheck?: boolean;
   todoStore?: TodoStore;
   todoLinkedItem?: TodoLinkedItem;
+  migrationTools?: TodoMigrationTools;
   planLaunchVerdict?: (description: string | undefined) => NumberedLaunchVerdict;
   planResumeVerdict?: (to: string, namedToolUseId: string | undefined, toolUseId: string, summary: string | undefined) => ResumeVerdict;
   planCompletionVerdict?: (toolName: string, input: Record<string, unknown> | undefined, toolUseId: string, admittedLaunches: ReadonlySet<string>) => CompletionVerdict;
@@ -247,6 +263,7 @@ export interface ClaudeHostOptions {
   onOrchestrationChanged?: () => void;
   onCliVersion?: (version: string) => void;
   onBridgeState?: (connection: BridgeConnection) => void;
+  onSessionWritesLost?: (loss: SessionWritesLost) => void;
   interruptForceKillTimeoutMs: number;
   testInterruptHang?: boolean;
   progressTracking?: ProgressTrackingMode;
@@ -513,6 +530,7 @@ export class ClaudeConversation {
   private abortController = new AbortController();
   private pendingApprovals = new Map<string, PendingApproval>();
   private questionRequests = new Set<string>();
+  private delegateApprovals = new Set<string>();
   private elicitations = new Map<string, ElicitationSpec>();
   private runLoopDone: Promise<void> | null = null;
   private inputGen: AsyncGenerator<SDKUserMessage> | null = null;
@@ -568,14 +586,12 @@ export class ClaudeConversation {
           clearTimeout(this.interruptTimer);
           this.interruptTimer = null;
         }
-        for (const requestId of this.pendingApprovals.keys()) {
-          if (!this.elicitations.has(requestId)) this.resolveApproval(requestId, "deny", undefined, APPROVAL_RESOLVED_BY.turnEnd);
-        }
         this.turnsEnded += 1;
         void this.requestContextUsage();
       },
       isClosed: () => this.closed,
       onDelegateUsageLimitStop: (agentId) => this.usageLimitResume.delegateStopped(agentId),
+      onSessionWritesLost: (loss) => this.opts.onSessionWritesLost?.(loss),
     });
   }
 
@@ -593,6 +609,10 @@ export class ClaudeConversation {
 
   get recordSessionId(): string | undefined {
     return this.authSessionId ?? this.opts.resumeSessionId;
+  }
+
+  launchRuntime(): ReturnType<typeof resolveHandoffRuntime> {
+    return resolveHandoffRuntime(this.opts.claudeCodeExecutablePath, this.opts.apiKeyPolicy);
   }
 
   get hasTodoTools(): boolean {
@@ -619,6 +639,7 @@ export class ClaudeConversation {
     const sdkLoaded = Date.now();
     const resolvedExecutable = await resolveClaudeCodeExecutable(this.opts.claudeCodeExecutablePath);
     const resolved = Date.now();
+    const cliVersion = cliVersionOf(resolvedExecutable.path);
     this.opts.log(`Claude Code executable resolved from ${resolvedExecutable.source}: ${resolvedExecutable.path}` + (resolvedExecutable.shimPath ? ` (npm shim: ${resolvedExecutable.shimPath})` : ""));
     this.normalizer.setUsageLimitPrefixes([...sdk.USAGE_LIMIT_ERROR_PREFIXES]);
 
@@ -686,8 +707,9 @@ ${ctxJson}`
       const rootCall = ctx.toolUseID;
       rootGate?.hold(rootCall);
       if (questions) self.questionRequests.add(requestId);
+      if (ctx.agentID) self.delegateApprovals.add(requestId);
       const decision = await self.awaitDecision({ requestId, toolName, toolUseId: ctx.toolUseID, rawInputJson }, ctx.signal,
-        () => rootGate?.revoke(rootCall), () => self.questionRequests.delete(requestId));
+        () => rootGate?.revoke(rootCall), () => { self.questionRequests.delete(requestId); self.delegateApprovals.delete(requestId); });
       if (decision === undefined) return null;
       const { permission, unanswered } = approvalPermission(input, questions,
         { behavior: decision.behavior, answers: decision.answers, resolvedBy: decision.resolvedBy }, self.answersUnanswered);
@@ -861,7 +883,7 @@ ${ctxJson}`
     if (this.opts.todoStore) {
       const gate = this.todoGate = new RootGate(undefined, this.opts.log, TODO_ROOT_SCOPE);
       options.mcpServers = { ...(options.mcpServers ?? {}), [TODO_SERVER_NAME]: createTodoMcpServer(sdk, this.opts.todoStore, gate, this.opts.log, () => this.recordSessionId,
-        () => ({ cwd: this.opts.cwd, files: this.todoFiles, roots: todoWorkspaceRoots(), home: homedir() })) };
+        () => ({ cwd: this.opts.cwd, files: this.todoFiles, roots: todoWorkspaceRoots(), home: homedir() }), this.opts.migrationTools) };
       options.allowedTools = [...(options.allowedTools ?? []), ...TODO_TOOL_NAMES];
       addRootGate(gate);
       const noteFile: ClaudeCodeSdk.HookCallback = async input => {
@@ -1007,7 +1029,8 @@ ${ctxJson}`
     options.hooks = { ...(options.hooks ?? {}), PreToolUse: [...(options.hooks?.PreToolUse ?? []), { hooks: [delegateForeground] }] };
     const preToolUse = options.hooks?.PreToolUse ?? [];
     if (preToolUse.length) {
-      options.hooks = { ...(options.hooks ?? {}), PreToolUse: [{ hooks: [async (input, id, context) => {
+      const onFailure = honorsHookOnFailure(await cliVersion) ? { onFailure: "block" as const } : {};
+      options.hooks = { ...(options.hooks ?? {}), PreToolUse: [{ ...onFailure, hooks: [async (input, id, context) => {
         type PreToolUseSpecific = Extract<NonNullable<ClaudeCodeSdk.SyncHookJSONOutput["hookSpecificOutput"]>, { hookEventName: "PreToolUse" }>;
         let rest: ClaudeCodeSdk.SyncHookJSONOutput = {};
         let specific: PreToolUseSpecific | undefined;
@@ -1049,10 +1072,14 @@ ${ctxJson}`
       Promise.resolve(this.q.initializationResult()).then(
         (init) => {
           const cliVersion = init?.claude_code_version;
+          this.normalizer.noteAccount(init?.account);
           this.opts.log(`CLI init response: ${Date.now() - queried}ms after query(); Claude Code CLI version: ${cliVersion ?? "unavailable"}; SDK expected: ${sdkClaudeCodeVersion() ?? "unknown"}`);
-          if (cliVersion) this.opts.onCliVersion?.(cliVersion);
+          if (cliVersion) {
+            cliVersions.set(resolvedExecutable.path, Promise.resolve(cliVersion));
+            this.opts.onCliVersion?.(cliVersion);
+          }
         },
-        () => undefined
+        () => { cliVersions.delete(resolvedExecutable.path); }
       );
     }
 
@@ -1262,7 +1289,7 @@ ${ctxJson}`
     extra?: {
       usage?: UsageSnapshot;
       reason?: string;
-      errorKind?: "usage_limit";
+      errorKind?: Extract<NormalizedEventBody, { kind: "turn_failed" }>["errorKind"];
       resetsAt?: number | null;
       detail?: string;
     }
@@ -1566,7 +1593,7 @@ ${ctxJson}`
   }
 
   answerPendingQuestionsInChat(text: string): void {
-    const pending = [...this.pendingApprovals.values()].map((p) => ({ requestId: p.requestId, question: this.questionRequests.has(p.requestId) }));
+    const pending = [...this.pendingApprovals.values()].map((p) => ({ requestId: p.requestId, question: this.questionRequests.has(p.requestId), delegate: this.delegateApprovals.has(p.requestId) }));
     for (const requestId of questionsRepliedInChat(text, this.answersUnanswered, pending)) {
       this.resolveApproval(requestId, "deny", undefined, APPROVAL_RESOLVED_BY.chat);
     }

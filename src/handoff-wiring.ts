@@ -68,6 +68,7 @@ import {
   resolveHandoffAutoSettings,
   sizeAutoStart,
   type AutoHandoffGateInput,
+  type CliActivity,
   type AutoHandoffMemory,
 } from "./handoff-auto";
 import {
@@ -272,6 +273,7 @@ async function runHandoff(st: SessionStore, sender: vscode.Webview | null, targe
       sessionId: outcome.forkSessionId,
       filePath: outcome.forkFilePath,
       activate: shouldActivateForkTab(sender === null ? undefined : st.activeTabIdOf(sender), target.tabId),
+      activateIn: sender,
       inherit: profile,
       knownCwd: cwd,
       startMeasurement,
@@ -607,7 +609,7 @@ function autoHandoffPermittedFor(s: Session, tab: AutoHandoffTab): boolean {
   return autoHandoffPermitted(tab.memory, sessionRecordId(s), handedOffSources());
 }
 
-function autoHandoffGateOf(s: Session): AutoHandoffGateInput {
+export function cliActivityOf(s: Session): CliActivity {
   const conv = s.conversation;
   return {
     idle: conv !== null && !conv.isClosed && conv.state === "idle" && s.starting === null && !s.closed && !s.clearing
@@ -615,7 +617,15 @@ function autoHandoffGateOf(s: Session): AutoHandoffGateInput {
     runningAgents: runningDelegationIds(s.backgroundActivity).length,
     runningBackgroundTasks: liveBackgroundTasks(s.backgroundActivity).length,
     runningExternalRuns: conv?.runningExternalRunCount ?? 0,
-    queuedMessages: (conv?.queuedInputCount ?? 0) + s.unsentSends.size,
+    queuedMessages: conv?.queuedInputCount ?? 0,
+  };
+}
+
+function autoHandoffGateOf(s: Session): AutoHandoffGateInput {
+  const activity = cliActivityOf(s);
+  return {
+    ...activity,
+    queuedMessages: activity.queuedMessages + s.unsentSends.size,
     composerHasText: composerHasText(s.tabId),
     handoffRunning: handoffRuns.has(s.tabId),
   };

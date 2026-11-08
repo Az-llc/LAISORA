@@ -1,6 +1,7 @@
 import * as vscode from "vscode";
 import * as l10n from "@vscode/l10n";
 import { fork, type ForkOptions } from "node:child_process";
+import { withExtensionNodeRuntime } from "./extension-runtime";
 import { randomBytes } from "node:crypto";
 import { copyFile, mkdir, readdir, rename, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
@@ -12,10 +13,7 @@ import {
   IMPROVEMENT_BRIEF_FILE, IMPROVEMENT_DIR, IMPROVEMENT_INDEX_FILE, IMPROVEMENT_PATTERNS_FILE, IMPROVEMENT_PARTIAL_SUFFIX, IMPROVEMENT_SCAN_TIMEOUT_MS, IMPROVEMENT_TOOL_FILE,
   improvementFirstMessage, improvementRecordCommand, improvementRunName, improvementRunsToDelete, languageName, renderImprovementBrief,
 } from "./improvement-brief";
-import type { Session } from "./session";
-import { normalizeTitleValue } from "./session-display-title";
-import { displayTitleFromSummary } from "./session-list";
-import { openNewConversationTab, type SessionStore } from "./store-surfaces";
+import { openTitledConversationTab, type SessionStore } from "./store-surfaces";
 
 const BUNDLED_TOOL = ["dist", IMPROVEMENT_TOOL_FILE] as const;
 const TAB_CLOSED_POLL_MS = 1000;
@@ -27,7 +25,7 @@ class ScanCancelled extends Error {}
 
 function scanEnv(): NodeJS.ProcessEnv {
   const keep = ["SystemRoot", "SYSTEMROOT", "USERPROFILE", "HOME", "TEMP", "TMP", "LOCALAPPDATA", "APPDATA", "HOMEDRIVE", "HOMEPATH"];
-  const env: NodeJS.ProcessEnv = { ELECTRON_RUN_AS_NODE: "1" };
+  const env: NodeJS.ProcessEnv = withExtensionNodeRuntime({});
   for (const k of keep) if (process.env[k] !== undefined) env[k] = process.env[k];
   return env;
 }
@@ -78,25 +76,15 @@ async function pruneRuns(root: string, st: SessionStore): Promise<void> {
   }
 }
 
-function openAnalysisTab(st: SessionStore): Session | undefined {
-  const title = l10n.t("LLM improvement analysis");
-  return openNewConversationTab(st, (s) => {
-    s.title = displayTitleFromSummary(title, s.tabId);
-    s.autoTitled = true;
-    const chosen = normalizeTitleValue(title);
-    s.unpersistedChosenTitle = chosen === null ? null : { title: chosen, failedAttempts: 0 };
-  });
-}
-
-export async function startImprovementAnalysis(st: SessionStore): Promise<void> {
+export async function startImprovementAnalysis(st: SessionStore, sender?: vscode.Webview): Promise<void> {
   const context = extensionContext;
   if (!context) return;
   if (runningTab !== undefined) {
-    st.post({ type: "activateTab", tabId: runningTab });
+    st.activateExisting(sender, runningTab);
     void vscode.window.showInformationMessage(l10n.t("LAISORA: An LLM improvement analysis is already scanning. Wait for it to finish."));
     return;
   }
-  const session = openAnalysisTab(st);
+  const session = openTitledConversationTab(st, l10n.t("LLM improvement analysis"), sender);
   if (!session) return;
   runningTab = session.tabId;
   session.awaitingLaisoraInput = true;

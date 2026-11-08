@@ -1,5 +1,5 @@
 import { AskAnswerTitles, askAnswerBody, askAnswerChoices, askAnswerParts, askOptionLetter, otherReplyAsksBack } from "./ask-parser";
-import { ASK_FENCE_INFO, askBlocksIn } from "./markdown-ast";
+import { askBlocksIn, mayHoldAskBlock } from "./markdown-ast";
 import { parseFileLinkTarget } from "./file-link-target";
 
 export const TODO_STATES = ["todo", "doing", "done"] as const;
@@ -355,7 +355,8 @@ export type TodoGroupOperation =
   | { kind: "groupDelete"; name: string }
   | { kind: "groupFolderRemove"; name: string; path: string }
   | { kind: "groupFolderAdd"; name: string; path: string }
-  | { kind: "groupAliasRemove"; name: string; words: string };
+  | { kind: "groupAliasRemove"; name: string; words: string }
+  | { kind: "setGroupBindings"; group: string; folders: readonly TodoGroupFolder[]; aliases: readonly TodoGroupAlias[] };
 
 export type TodoTidyOperation =
   | { kind: "tidy"; steps: readonly TodoTidyStep[] };
@@ -401,7 +402,6 @@ type TodoDecisionOperation = Extract<TodoOperation, { kind: "recordDecisions" | 
 type TodoStepOperation =
   | Exclude<TodoOperation, { kind: "revert" } | { kind: "acknowledge" } | { kind: "seedWelcome" } | TodoDecisionOperation | TodoTidyOperation>
   | { kind: "tidyStep"; step: TodoTidyStep }
-  | { kind: "setGroupBindings"; group: string; folders: readonly TodoGroupFolder[]; aliases: readonly TodoGroupAlias[] }
   | { kind: "setExactState"; id: string; state: TodoState; completion?: TodoCompletion; startedAt?: number | null }
   | { kind: "restoreWorkMemo"; id: string; section: WorkMemoSection; version: number | null }
   | { kind: "putDoc"; id: string; doc: TodoDoc }
@@ -923,6 +923,11 @@ function subtreeHeight(items: readonly TodoItem[], id: string): number {
 
 const tooDeep: TodoOperationFailure = { ok: false, error: "too-deep" };
 
+export function todoBindableFolderPath(raw: string): string | undefined {
+  const path = raw.trim();
+  return path && path.length <= TODO_DOC_TARGET_MAX ? path : undefined;
+}
+
 export function todoFolderKey(path: string): string {
   const slashed = path.trim().replace(/\\/g, "/").replace(/\/+$/, "");
   return /^[a-z]:(\/|$)/i.test(slashed) || slashed.startsWith("//") ? slashed.toLowerCase() : slashed;
@@ -1192,8 +1197,8 @@ function step(items: TodoItem[], operation: TodoStepOperation, author: TodoAutho
       return setGroups(withNewGroup(meta.groups, name, log));
     }
     case "groupFolderAdd": {
-      const path = operation.path.trim();
-      if (!path || path.length > TODO_DOC_TARGET_MAX) return { ok: false, error: "invalid-name" };
+      const path = todoBindableFolderPath(operation.path);
+      if (path === undefined) return { ok: false, error: "invalid-name" };
       if (!meta.groups.some(entry => entry.name === operation.name)) return { ok: false, error: "not-found" };
       const groups = withFolder(meta.groups, operation.name, { path });
       groups.forEach((entry, index) => { if (entry !== meta.groups[index]) log("", "groupBindings", bindingsOf(meta.groups[index]), bindingsOf(entry)); });
@@ -2938,9 +2943,9 @@ export interface TodoRecordMessage {
 
 export function todoAskSourceMessages(messages: readonly TodoRecordMessage[]): Array<TodoRecordMessage & { role: "user" | "assistant" }> {
   const spoken = messages.filter((m): m is TodoRecordMessage & { role: "user" | "assistant" } => m.role === "user" || m.role === "assistant");
-  const first = spoken.findIndex(m => m.role === "assistant" && m.text.includes(ASK_FENCE_INFO));
+  const first = spoken.findIndex(m => m.role === "assistant" && mayHoldAskBlock(m.text));
   if (first < 0) return [];
-  return spoken.slice(first).filter(m => m.role === "user" || m.text.includes(ASK_FENCE_INFO))
+  return spoken.slice(first).filter(m => m.role === "user" || mayHoldAskBlock(m.text))
     .slice(-TODO_ASK_SOURCE_MESSAGES_MAX).map(m => ({ uuid: m.uuid, role: m.role, text: m.text, timestamp: m.timestamp }));
 }
 

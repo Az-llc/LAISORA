@@ -1,8 +1,13 @@
-const FENCE_RE = /^ {0,3}(`{3,}|~{3,})(.*)$/;
+const FENCE_RE = /^( {0,3})(`{3,}|~{3,})(.*)$/;
 
 export function isClosingFence(line: string, opening: string): boolean {
   const match = line.match(FENCE_RE);
-  return !!match && match[1][0] === opening[0] && match[1].length >= opening.length && match[2].trim() === "";
+  return !!match && match[2][0] === opening[0] && match[2].length >= opening.length && match[3].trim() === "";
+}
+
+export function fenceOpening(line: string): { indent: string; marker: string; info: string } | null {
+  const match = line.match(FENCE_RE);
+  return match && !(match[2][0] === "`" && match[3].includes("`")) ? { indent: match[1], marker: match[2], info: match[3] } : null;
 }
 
 export function recordSeparator(text: string): string {
@@ -62,15 +67,11 @@ export function findCommitBoundary(buf: string, committedLen: number): number {
   const lines = buf.slice(committedLen).split("\n");
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i];
-    const m = line.match(FENCE_RE);
-    if (m) {
-      const run = m[1];
-      const rest = m[2];
-      if (fence === null) {
-        if (!(run[0] === "`" && rest.includes("`"))) fence = { char: run[0], len: run.length };
-      } else if (isClosingFence(line, fence.char.repeat(fence.len))) {
-        fence = null;
-      }
+    if (fence === null) {
+      const opening = fenceOpening(line);
+      if (opening) fence = { char: opening.marker[0], len: opening.marker.length };
+    } else if (isClosingFence(line, fence.char.repeat(fence.len))) {
+      fence = null;
     }
     pos += line.length + 1;
     if (fence === null && line.trim() === "" && pos > committedLen) boundary = pos;

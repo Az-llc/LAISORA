@@ -1,3 +1,4 @@
+import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
@@ -144,6 +145,7 @@ export interface ScanResult {
   hookGroups: HookGroup[];
   hookSourcesRead: string[];
   settingsFilesRead: string[];
+  inventory: Inventory;
 }
 
 export interface ScanOptions {
@@ -1170,28 +1172,243 @@ export function listTranscriptFiles(projectsDir: string): FileEntry[] {
   return out;
 }
 
-function settingsHookScripts(file: string, projectDir: string | undefined, home: string): string[] {
-  let json: unknown;
-  try { json = JSON.parse(fs.readFileSync(file, "utf8")); } catch { return []; }
-  const commands: string[] = [];
-  const walk = (v: unknown): void => {
-    if (Array.isArray(v)) v.forEach(walk);
-    else if (v && typeof v === "object") for (const [k, x] of Object.entries(v)) { if (k === "command" && typeof x === "string") commands.push(x); else walk(x); }
-  };
-  walk((json as { hooks?: unknown } | undefined)?.hooks);
-  return commands.flatMap((command) => commandScripts(command, projectDir, home));
+function readJsonFile(file: string): unknown {
+  try { return JSON.parse(fs.readFileSync(file, "utf8")); } catch { return undefined; }
 }
 
-export function commandScripts(command: string, projectDir: string | undefined, home: string): string[] {
-  const expanded = command
-    .replace(/\$\{?CLAUDE_PROJECT_DIR\}?|%CLAUDE_PROJECT_DIR%/g, projectDir ?? "")
-    .replace(/\$\{?HOME\}?|%USERPROFILE%|\$env:USERPROFILE|(?<![\w.])~(?=[\\/])/g, home);
+function settingsHookScripts(json: unknown, projectDir: string | undefined, home: string): string[] {
   const scripts: string[] = [];
-  for (const m of expanded.matchAll(/"([^"]+)"|'([^']+)'|(\S+)/g)) {
-    const token = (m[1] ?? m[2] ?? m[3] ?? "").replace(/^["']|["']$/g, "");
-    if (HOOK_SCRIPT_RE.test(token) && path.isAbsolute(token)) scripts.push(path.normalize(token));
-  }
+  const walk = (v: unknown): void => {
+    if (Array.isArray(v)) v.forEach(walk);
+    else if (v && typeof v === "object") for (const [k, x] of Object.entries(v)) {
+      if (k === "command" && typeof x === "string") scripts.push(...commandScripts(x, projectDir, home));
+      else if (k === "args" && Array.isArray(x)) scripts.push(...argScripts(x, projectDir, home));
+      else walk(x);
+    }
+  };
+  walk((json as { hooks?: unknown } | undefined)?.hooks);
   return scripts;
+}
+
+const expandHookVars = (s: string, projectDir: string | undefined, home: string): string => s
+  .replace(/\$\{?CLAUDE_PROJECT_DIR\}?|%CLAUDE_PROJECT_DIR%/g, projectDir ?? "")
+  .replace(/\$\{?HOME\}?|%USERPROFILE%|\$env:USERPROFILE|(?<![\w.])~(?=[\\/])/g, home);
+const SHELL_WORD_RE = /(?:"[^"]*"|'[^']*'|[^\s"'])+/g;
+const GIT_BASH_DRIVE_RE = /^\/([A-Za-z])(?=\/|$)/;
+const ROOT_RELATIVE_RE = /^[\\/](?![\\/])/;
+
+export function scriptPathOf(word: string, platform: NodeJS.Platform = process.platform): string | undefined {
+  const lib = platform === "win32" ? path.win32 : path.posix;
+  const p = platform === "win32" ? word.replace(GIT_BASH_DRIVE_RE, "$1:") : word;
+  return HOOK_SCRIPT_RE.test(p) && lib.isAbsolute(p) ? lib.normalize(p) : undefined;
+}
+
+export const checkableScriptPath = (p: string, platform: NodeJS.Platform = process.platform): boolean => platform !== "win32" || !ROOT_RELATIVE_RE.test(p);
+
+export function commandScripts(command: string, projectDir: string | undefined, home: string, platform: NodeJS.Platform = process.platform): string[] {
+  return (expandHookVars(command, projectDir, home).match(SHELL_WORD_RE) ?? []).map((w) => scriptPathOf(w.replace(/["']/g, ""), platform)).filter((p): p is string => p !== undefined);
+}
+
+export function argScripts(args: readonly unknown[], projectDir: string | undefined, home: string, platform: NodeJS.Platform = process.platform): string[] {
+  return args.filter((a): a is string => typeof a === "string").map((a) => scriptPathOf(expandHookVars(a, projectDir, home), platform)).filter((p): p is string => p !== undefined);
+}
+
+export const TOOL_MATCHER_EVENTS: readonly string[] = ["PreToolUse", "PostToolUse", "PostToolUseFailure", "PermissionRequest", "PermissionDenied"];
+const TOOL_NAME_TOKEN_RE = /^[A-Za-z][A-Za-z0-9_-]*$/;
+const PROJECT_DIR_RE = /CLAUDE_PROJECT_DIR/;
+
+export interface HookScriptState { readonly path: string; readonly exists: boolean }
+
+export interface HookRegistration {
+  id: string;
+  readonly settingsFile: string;
+  readonly event: string;
+  readonly matcher: string;
+  readonly type: string;
+  readonly content: string;
+  readonly identity: string;
+  readonly condition?: string;
+  readonly shell?: string;
+  readonly command: string;
+  readonly args: readonly string[];
+  readonly scripts: readonly HookScriptState[];
+  readonly uncheckedScripts: readonly string[];
+  readonly projectDependent: boolean;
+  count: number;
+}
+
+export interface MatcherLead { id: string; readonly token: string; readonly registrations: readonly HookRegistration[] }
+
+export interface VersionSpan { readonly version: string; records: number; first: string | null; last: string | null }
+
+export type InstructionFileKind = "hook script" | "rule" | "CLAUDE.md";
+
+export interface FileAge { id: string; readonly path: string; readonly kind: InstructionFileKind; readonly added: string | null; readonly source: "git" | "mtime" | "unknown"; readonly registered?: boolean }
+
+export interface Inventory { readonly hooks: HookRegistration[]; readonly matcherLeads: MatcherLead[]; readonly toolNamesSeen: number; readonly versions: VersionSpan[]; readonly files: FileAge[] }
+
+const NON_IDENTIFYING_HOOK_FIELDS = new Set(["timeout", "statusMessage"]);
+
+export function canonicalJson(v: unknown): string {
+  if (Array.isArray(v)) return `[${v.map(canonicalJson).join(",")}]`;
+  if (v && typeof v === "object") return `{${Object.keys(v).sort().map((k) => `${JSON.stringify(k)}:${canonicalJson((v as Record<string, unknown>)[k])}`).join(",")}}`;
+  return JSON.stringify(v) ?? "null";
+}
+
+export function hookIdentity(h: Record<string, unknown>): string {
+  return canonicalJson(Object.fromEntries(Object.entries(h).filter(([k]) => !NON_IDENTIFYING_HOOK_FIELDS.has(k))));
+}
+
+export function hookContent(h: Record<string, unknown>): string {
+  const type = typeof h.type === "string" ? h.type : "command";
+  const text = (k: string): string | undefined => (typeof h[k] === "string" ? (h[k] as string) : undefined);
+  if (type === "command") return `${text("command") ?? ""}${Array.isArray(h.args) ? ` ${JSON.stringify(h.args)}` : ""}`;
+  if (type === "http" && text("url")) return text("url")!;
+  if ((type === "prompt" || type === "agent") && text("prompt")) return text("prompt")!;
+  return canonicalJson(Object.fromEntries(Object.entries(h).filter(([k]) => k !== "type" && !NON_IDENTIFYING_HOOK_FIELDS.has(k))));
+}
+
+export function registrationScripts(h: Pick<HookRegistration, "type" | "command" | "args">, projectDir: string | undefined, home: string, platform: NodeJS.Platform = process.platform): string[] {
+  return h.type === "command" ? [...commandScripts(h.command, projectDir, home, platform), ...argScripts(h.args, projectDir, home, platform)] : [];
+}
+
+export const registrationKey = (h: Pick<HookRegistration, "settingsFile" | "event" | "matcher" | "identity">): string => `hook:${pathKey(h.settingsFile)}|${h.event}|${h.matcher}|${h.identity}`;
+
+export function hookRegistrations(json: unknown, settingsFile: string, projectDir: string | undefined, home: string, exists: (p: string) => boolean = fs.existsSync, platform: NodeJS.Platform = process.platform): HookRegistration[] {
+  const hooks = (json as { hooks?: unknown } | undefined)?.hooks;
+  if (!hooks || typeof hooks !== "object" || Array.isArray(hooks)) return [];
+  const out = new Map<string, HookRegistration>();
+  for (const [event, groups] of Object.entries(hooks)) {
+    if (!Array.isArray(groups)) continue;
+    for (const g of groups) {
+      const matcher = typeof g?.matcher === "string" ? g.matcher : "";
+      for (const h of Array.isArray(g?.hooks) ? g.hooks : []) {
+        if (!h || typeof h !== "object" || Array.isArray(h)) continue;
+        const type = typeof h.type === "string" ? h.type : "command";
+        const command = type === "command" && typeof h.command === "string" ? h.command : "";
+        const args: string[] = type === "command" && Array.isArray(h.args) ? h.args.filter((a: unknown): a is string => typeof a === "string") : [];
+        const base = {
+          settingsFile, event, matcher, type, content: hookContent(h), identity: hookIdentity(h),
+          ...(typeof h.if === "string" ? { condition: h.if } : {}), ...(typeof h.shell === "string" ? { shell: h.shell } : {}),
+        };
+        const key = registrationKey(base);
+        const dup = out.get(key);
+        if (dup) { dup.count++; continue; }
+        const projectDependent = type === "command" && projectDir === undefined && PROJECT_DIR_RE.test([command, ...args].join(" "));
+        const paths = projectDependent ? [] : registrationScripts({ type, command, args }, projectDir, home, platform);
+        const scripts = paths.filter((p) => checkableScriptPath(p, platform)).map((p) => ({ path: p, exists: exists(p) }));
+        const uncheckedScripts = paths.filter((p) => !checkableScriptPath(p, platform));
+        out.set(key, { id: "", ...base, command, args, scripts, uncheckedScripts, projectDependent, count: 1 });
+      }
+    }
+  }
+  return [...out.values()];
+}
+
+const EXACT_LIST_MATCHER_RE = /^[A-Za-z0-9_\-\s,|]*$/;
+
+export function matcherToolTokens(event: string, matcher: string): string[] {
+  if (!TOOL_MATCHER_EVENTS.includes(event)) return [];
+  const parts = matcher.split(EXACT_LIST_MATCHER_RE.test(matcher) ? /[|,\s]+/ : "|");
+  return [...new Set(parts.map((t) => t.trim()).filter((t) => TOOL_NAME_TOKEN_RE.test(t)))];
+}
+
+export function matcherLeads(registrations: readonly HookRegistration[], seenToolNames: ReadonlySet<string>): MatcherLead[] {
+  const byToken = new Map<string, HookRegistration[]>();
+  for (const r of registrations) for (const t of matcherToolTokens(r.event, r.matcher)) if (!seenToolNames.has(t)) byToken.set(t, [...(byToken.get(t) ?? []), r]);
+  return [...byToken].sort(([a], [b]) => a.localeCompare(b)).map(([token, regs]) => ({ id: "", token, registrations: regs }));
+}
+
+export function noteVersion(spans: Map<string, VersionSpan>, version: unknown, at: string | null): void {
+  if (typeof version !== "string" || !version.trim()) return;
+  const day = at?.slice(0, 10) ?? null;
+  let s = spans.get(version);
+  if (!s) spans.set(version, (s = { version, records: 0, first: null, last: null }));
+  s.records++;
+  if (day && (!s.first || day < s.first)) s.first = day;
+  if (day && (!s.last || day > s.last)) s.last = day;
+}
+
+export function versionSpans(spans: ReadonlyMap<string, VersionSpan>): VersionSpan[] {
+  return [...spans.values()].sort((a, b) => Number(a.first === null) - Number(b.first === null) || (a.first ?? "").localeCompare(b.first ?? "") || a.version.localeCompare(b.version, "en", { numeric: true }));
+}
+
+export function firstTouchDates(gitLog: string): Map<string, string> {
+  const out = new Map<string, string>();
+  for (const chunk of gitLog.split("\0")) {
+    const lines = chunk.split(/\r?\n/);
+    const date = lines[0].trim();
+    if (!date) continue;
+    for (const name of lines.slice(1)) if (name.trim()) out.set(name.trim(), date);
+  }
+  return out;
+}
+
+export function gitTopOf(file: string, exists: (p: string) => boolean = fs.existsSync): string | undefined {
+  for (let dir = path.dirname(path.resolve(file)); ; dir = path.dirname(dir)) {
+    if (exists(path.join(dir, ".git"))) return dir;
+    if (path.dirname(dir) === dir) return undefined;
+  }
+}
+
+const GIT_PATHS_PER_CALL = 100;
+const GIT_LOG_TIMEOUT_MS = 30_000;
+const GIT_LOG_MAX_BUFFER = 64 * 1024 * 1024;
+const RULE_DIR_DEPTH = 4;
+
+function gitFirstTouch(top: string, files: readonly string[]): Map<string, string> {
+  const out = new Map<string, string>();
+  const rel = files.map((f) => path.relative(top, f).replace(/\\/g, "/"));
+  for (let i = 0; i < rel.length; i += GIT_PATHS_PER_CALL) {
+    const r = spawnSync("git", ["-C", top, "--literal-pathspecs", "-c", "core.quotepath=false", "log", "--no-renames", "--format=%x00%aI", "--name-only", "--", ...rel.slice(i, i + GIT_PATHS_PER_CALL)], { encoding: "utf8", timeout: GIT_LOG_TIMEOUT_MS, maxBuffer: GIT_LOG_MAX_BUFFER, windowsHide: true });
+    if (r.status !== 0 || typeof r.stdout !== "string") continue;
+    for (const [name, date] of firstTouchDates(r.stdout)) out.set(pathKey(path.join(top, name)), date);
+  }
+  return out;
+}
+
+function markdownFilesUnder(dir: string, depth = RULE_DIR_DEPTH): string[] {
+  let ents: fs.Dirent[];
+  try { ents = fs.readdirSync(dir, { withFileTypes: true }); } catch { return []; }
+  return ents.flatMap((e) => (e.isDirectory() && depth > 0 ? markdownFilesUnder(path.join(dir, e.name), depth - 1) : e.isFile() && /\.md$/i.test(e.name) ? [path.join(dir, e.name)] : []));
+}
+
+export function instructionFiles(configDir: string, cwds: Iterable<string>, exists: (p: string) => boolean = fs.existsSync): { path: string; kind: InstructionFileKind }[] {
+  const dirs = new Map<string, string>();
+  for (const cwd of cwds) for (let d = path.resolve(cwd); ; d = path.dirname(d)) {
+    if (dirs.has(pathKey(d))) break;
+    dirs.set(pathKey(d), d);
+    if (path.dirname(d) === d) break;
+  }
+  const out = new Map<string, { path: string; kind: InstructionFileKind }>();
+  const add = (p: string, kind: InstructionFileKind): void => { if (!out.has(pathKey(p))) out.set(pathKey(p), { path: p, kind }); };
+  const claudeMd = (p: string): void => { if (exists(p)) add(p, "CLAUDE.md"); };
+  claudeMd(path.join(configDir, "CLAUDE.md"));
+  for (const p of markdownFilesUnder(path.join(configDir, "rules"))) add(p, "rule");
+  for (const d of dirs.values()) {
+    for (const name of ["CLAUDE.md", "CLAUDE.local.md", path.join(".claude", "CLAUDE.md")]) claudeMd(path.join(d, name));
+    for (const p of markdownFilesUnder(path.join(d, ".claude", "rules"))) add(p, "rule");
+  }
+  return [...out.values()];
+}
+
+function fileMtime(p: string): string | null {
+  try { return fs.statSync(p).mtime.toISOString(); } catch { return null; }
+}
+
+export function fileAges(files: readonly { path: string; kind: InstructionFileKind; registered?: boolean }[]): FileAge[] {
+  const byTop = new Map<string, string[]>();
+  for (const f of files) {
+    const top = gitTopOf(f.path);
+    if (top) byTop.set(top, [...(byTop.get(top) ?? []), f.path]);
+  }
+  const dates = new Map<string, string>();
+  for (const [top, list] of byTop) for (const [k, d] of gitFirstTouch(top, list)) dates.set(k, d);
+  return files.map((f) => {
+    const git = dates.get(pathKey(f.path));
+    const mtime = git ? null : fileMtime(f.path);
+    return { id: "", path: f.path, kind: f.kind, added: git ?? mtime, source: git ? "git" : mtime ? "mtime" : "unknown", ...(f.registered !== undefined ? { registered: f.registered } : {}) };
+  });
 }
 
 const CONSTANT_DECL_RE = /(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*(`(?:\\.|[^`\\])*`|"(?:\\.|[^"\\\n])*"|'(?:\\.|[^'\\\n])*')/g;
@@ -1216,17 +1433,21 @@ export function expandConstants(text: string, constants: ReadonlyMap<string, str
   return constants.size ? text.replace(CONSTANT_REF_RE, (all, ref: string) => constants.get(ref) ?? all) : text;
 }
 
-export function discoverHookSources(configDir: string, cwds: Iterable<string>, laisoraSources: readonly string[] = []): { sources: HookSource[]; settingsFiles: string[] } {
+export function discoverHookSources(configDir: string, cwds: Iterable<string>, laisoraSources: readonly string[] = []): { sources: HookSource[]; settingsFiles: string[]; registrations: HookRegistration[] } {
   const home = os.homedir();
   const scriptPaths = new Set<string>();
   const settingsFiles: string[] = [];
+  const registrations: HookRegistration[] = [];
+  const registered = new Set<string>();
   const seen = new Set<string>();
   const projectDirs = [undefined, ...[...cwds].filter((d) => { const k = pathKey(d); if (seen.has(k)) return false; seen.add(k); return true; })];
   for (const projectDir of projectDirs) {
     for (const file of claudeSettingsFiles(projectDir, configDir)) {
       if (!fs.existsSync(file)) continue;
       settingsFiles.push(file);
-      for (const s of settingsHookScripts(file, projectDir, home)) scriptPaths.add(s);
+      const json = readJsonFile(file);
+      for (const s of settingsHookScripts(json, projectDir, home)) scriptPaths.add(s);
+      if (!registered.has(pathKey(file))) { registered.add(pathKey(file)); registrations.push(...hookRegistrations(json, file, projectDir, home)); }
     }
     const hooksDir = projectDir === undefined ? path.join(configDir, "hooks") : path.join(projectDir, ".claude", "hooks");
     try {
@@ -1248,7 +1469,22 @@ export function discoverHookSources(configDir: string, cwds: Iterable<string>, l
     const text = read(p, HOOK_SOURCE_MAX_BYTES);
     if (text !== undefined) sources.push({ path: p, laisora: false, bundle: false, text });
   }
-  return { sources, settingsFiles };
+  return { sources, settingsFiles, registrations };
+}
+
+export function hookScriptFiles(registrations: readonly HookRegistration[], sources: readonly HookSource[], projectDirs: Iterable<string>, home: string = os.homedir()): { path: string; kind: InstructionFileKind; registered: boolean }[] {
+  const named = new Map<string, string>();
+  for (const r of registrations) for (const s of r.scripts) if (s.exists && !named.has(pathKey(s.path))) named.set(pathKey(s.path), s.path);
+  const referenced = new Set(registrations.flatMap((r) => r.scripts.map((s) => pathKey(s.path))));
+  const dirs = [...projectDirs];
+  for (const r of registrations.filter((x) => x.projectDependent)) for (const d of dirs) for (const p of registrationScripts(r, d, home)) referenced.add(pathKey(p));
+  const out = [...named.values()].map((p) => ({ path: p, kind: "hook script" as const, registered: true }));
+  for (const s of sources) {
+    if (s.laisora || named.has(pathKey(s.path))) continue;
+    named.set(pathKey(s.path), s.path);
+    out.push({ path: s.path, kind: "hook script", registered: referenced.has(pathKey(s.path)) });
+  }
+  return out;
 }
 
 const pathKey = (p: string): string => (process.platform === "win32" ? path.normalize(p).toLowerCase() : path.normalize(p));
@@ -1495,6 +1731,8 @@ export async function scanTranscripts(opts: ScanOptions): Promise<ScanResult> {
   const seenNotifications = new Set<string>();
   const seenHookEvents = new Set<string>();
   const countedResults = new Set<string>();
+  const toolNames = new Set<string>();
+  const versions = new Map<string, VersionSpan>();
   const addCandidate = (sig: MaskedSignal, loc: ScanLocation, session: string): ScanPattern | undefined => {
     const key = `${sig.marker} | ${sig.owner} | ${reasonSignature(sig.reason) ?? sig.reason.slice(0, SIGNATURE_CHARS)}`;
     const once = `${key} | ${loc.path} | ${loc.line}`;
@@ -1516,6 +1754,7 @@ export async function scanTranscripts(opts: ScanOptions): Promise<ScanResult> {
     const failures: { pattern: ScanPattern; idx: number }[] = [];
     const trackUse = (b: any, at: string | null): ToolUse => {
       const u: ToolUse = { name: String(b.name), input: b.input, inp: JSON.stringify(b.input ?? {}).slice(0, 4000), idx: useOrder.length, at };
+      toolNames.add(u.name);
       uses.set(b.id, u);
       useOrder.push(u);
       return u;
@@ -1541,6 +1780,7 @@ export async function scanTranscripts(opts: ScanOptions): Promise<ScanResult> {
         const day = at?.slice(0, 10) ?? null;
         if (day && (!stats.firstDate || day < stats.firstDate)) stats.firstDate = day;
         if (day && (!stats.lastDate || day > stats.lastDate)) stats.lastDate = day;
+        noteVersion(versions, rec.version, at);
         if (rec.type === "assistant" && Array.isArray(content)) {
           for (const b of content) {
             if (b?.type !== "tool_use") continue;
@@ -1654,7 +1894,14 @@ export async function scanTranscripts(opts: ScanOptions): Promise<ScanResult> {
     mismatches: mismatches.slice(0, 50),
   };
 
-  const { sources, settingsFiles } = discoverHookSources(opts.configDir, cwds, opts.laisoraSources);
+  const { sources, settingsFiles, registrations } = discoverHookSources(opts.configDir, cwds, opts.laisoraSources);
+  const inventory: Inventory = {
+    hooks: registrations,
+    matcherLeads: matcherLeads(registrations, toolNames),
+    toolNamesSeen: toolNames.size,
+    versions: versionSpans(versions),
+    files: fileAges([...hookScriptFiles(registrations, sources, cwds), ...instructionFiles(opts.configDir, cwds)]),
+  };
   const byPriority = (a: ScanPattern, b: ScanPattern) => b.sessions.size - a.sessions.size || b.count - a.count;
   const pats = [...patterns.values()].sort(byPriority);
   const groups = new Map<string, { owner: string; sources: Set<string>; patterns: ScanPattern[] }>();
@@ -1678,9 +1925,9 @@ export async function scanTranscripts(opts: ScanOptions): Promise<ScanResult> {
   const failureClasses = buildFailureClasses(pats, cands);
   const owners = maskedOwners(cands, pats);
   const causes = buildCauses(pats, cands);
-  const collisions = assignIds(hookGroups, pats, cands, owners, slowCalls, failureClasses, causes);
+  const collisions = assignIds(hookGroups, pats, cands, owners, slowCalls, failureClasses, causes, inventory);
   stats.runtimeSec = +((now() - t0) / 1000).toFixed(1);
-  return { stats, selfCheck, previous, idCollisions: collisions, patterns: pats, candidates: cands, maskedOwners: owners, causes, slowCalls, waitCalls: { count: waitCalls.count, conversations: waitCalls.sessions.size }, unansweredQuestions, failureClasses, hookGroups, hookSourcesRead: sources.map((s) => s.path), settingsFilesRead: settingsFiles };
+  return { stats, selfCheck, previous, idCollisions: collisions, patterns: pats, candidates: cands, maskedOwners: owners, causes, slowCalls, waitCalls: { count: waitCalls.count, conversations: waitCalls.sessions.size }, unansweredQuestions, failureClasses, hookGroups, hookSourcesRead: sources.map((s) => s.path), settingsFilesRead: settingsFiles, inventory };
 }
 
 const total = (ps: readonly ScanPattern[]): number => ps.reduce((n, p) => n + p.count, 0);
@@ -1792,7 +2039,7 @@ export function idCollisions(assigned: readonly { readonly id: string; readonly 
   return [...keysOf].filter(([, keys]) => keys.size > 1).map(([id, keys]) => ({ id, keys: [...keys] }));
 }
 
-function assignIds(hookGroups: readonly HookGroup[], pats: readonly ScanPattern[], cands: readonly ScanPattern[], owners: readonly MaskedOwner[], slowCalls: readonly ScanPattern[], classes: readonly FailureClass[], causes: readonly Cause[]): IdCollision[] {
+function assignIds(hookGroups: readonly HookGroup[], pats: readonly ScanPattern[], cands: readonly ScanPattern[], owners: readonly MaskedOwner[], slowCalls: readonly ScanPattern[], classes: readonly FailureClass[], causes: readonly Cause[], inventory: Inventory): IdCollision[] {
   const assigned: { id: string; key: string }[] = [];
   const give = (prefix: string, key: string): string => { const id = stableId(prefix, key); assigned.push({ id, key }); return id; };
   for (const p of [...pats, ...cands, ...slowCalls]) { const pre = KIND_PREFIX[p.kind]; if (pre) p.id = give(pre, p.key); }
@@ -1800,6 +2047,9 @@ function assignIds(hookGroups: readonly HookGroup[], pats: readonly ScanPattern[
   for (const o of owners) o.id = give("U", o.owner);
   for (const c of classes) c.id = give("K", `${c.head} | ${c.errorClass} | ${c.split ?? ""}`);
   for (const c of causes) c.id = give("X", c.family);
+  for (const h of inventory.hooks) h.id = give("I", registrationKey(h));
+  for (const l of inventory.matcherLeads) l.id = give("T", `tool:${l.token}`);
+  for (const f of inventory.files) f.id = give("F", `file:${pathKey(f.path)}`);
   return idCollisions(assigned);
 }
 
@@ -2091,7 +2341,7 @@ const PREV_REASON_CHARS = 120;
 const INDEX_BUILTIN = 16;
 const BOLD_ID_RE = new RegExp(`\\*\\*(${STABLE_ID_RE.source})\\*\\*`, "g");
 
-function previousText(v: ImprovementVerdict, locations: readonly ScanLocation[] | undefined, records: string): string {
+function previousText(v: ImprovementVerdict, locations: readonly ScanLocation[] | undefined, records: string, inInventory = false): string {
   const head = `${v.verdict}${v.group ? ` ${v.group}` : ""}${v.status ? ` (${v.status})` : ""} "${md(markCut(v.reason, PREV_REASON_CHARS))}"`;
   let fix = "";
   if (v.fixCommit || v.fixDate) {
@@ -2099,8 +2349,45 @@ function previousText(v: ImprovementVerdict, locations: readonly ScanLocation[] 
     fix = ` · fix ${md(v.fixCommit ?? "?")} at ${md(v.fixDate ?? "?")}${c ? `: ${c.before} before, ${c.after} after in ${c.afterConversations} conv${c.undated ? `, ${c.undated} undated` : ""}` : ""}`;
   }
   const last = locations ? locations.reduce<string | null>((m, l) => (l.at && (!m || l.at > m) ? l.at : m), null) : null;
-  const seen = !locations ? ` · not in this scan (records ${records})` : ` · ${locations.length} in this scan, last seen ${last?.slice(0, 10) ?? "?"}`;
+  const seen = inInventory ? " · still in this scan's inventory" : !locations ? ` · not in this scan (records ${records})` : ` · ${locations.length} in this scan, last seen ${last?.slice(0, 10) ?? "?"}`;
   return `${head}${fix}${seen}`;
+}
+
+const INVENTORY_COMMAND_CHARS = 200;
+
+export const hasMissingScript = (h: HookRegistration): boolean => h.scripts.some((s) => !s.exists);
+
+function inventoryIdsOf(inv: Inventory): string[] {
+  return [...inv.hooks, ...inv.matcherLeads, ...inv.files].map((x) => x.id).filter(Boolean);
+}
+
+const addedText = (f: FileAge | undefined): string => (!f || !f.added ? "added ?" : `added ${f.added.slice(0, 10)} (${f.source})`);
+
+export function hookScriptState(h: HookRegistration, ageOf: (p: string) => FileAge | undefined = () => undefined): string {
+  if (h.type !== "command") return `${md(h.type)} hook, no script`;
+  if (h.projectDependent) return "script path depends on the project folder (CLAUDE_PROJECT_DIR in a user settings file): not checked";
+  const unchecked = h.uncheckedScripts.map((p) => `script \`${md(p)}\` is a root-relative path of a POSIX shell here: not checked`);
+  if (!h.scripts.length && !unchecked.length) return "no absolute script path in the command or args: not checked";
+  return [...h.scripts.map((s) => (s.exists ? `script \`${md(s.path)}\` exists, ${addedText(ageOf(s.path))}` : `script \`${md(s.path)}\` MISSING`)), ...unchecked].join("; ");
+}
+
+const hookConditions = (h: HookRegistration): string => [h.condition !== undefined ? `if \`${md(h.condition)}\`` : "", h.shell !== undefined ? `shell ${md(h.shell)}` : ""].filter(Boolean).map((s) => ` ${s}`).join("");
+
+function inventoryLines(inv: Inventory): string[] {
+  const ages = new Map(inv.files.map((f) => [pathKey(f.path), f]));
+  const ageOf = (p: string): FileAge | undefined => ages.get(pathKey(p));
+  const out = ["## Inventory for removal and correction candidates (mechanical facts; a lead is not a finding)", ""];
+  out.push(`- Claude Code versions in the records (version first..last, records): ${inv.versions.map((v) => `${md(v.version)} ${v.first ?? "?"}..${v.last ?? "?"} (${v.records})`).join("; ") || "none"}`);
+  out.push(`- Distinct tool names seen as a tool_use name in the scanned records: ${inv.toolNamesSeen}`, "");
+  out.push("### Hook registrations in the settings files read (event [matcher] type with its if condition and shell when set, settings file, command or other content, script state; ×n = the same registration n times in that file)", "");
+  out.push(...(inv.hooks.length ? inv.hooks.map((h) => `- **${h.id}** ${md(h.event)} [${md(h.matcher || "*")}] ${md(h.type)}${hookConditions(h)}${h.count > 1 ? ` ×${h.count}` : ""} in \`${md(h.settingsFile)}\`: \`${md(markCut(h.content, INVENTORY_COMMAND_CHARS))}\` — ${hookScriptState(h, ageOf)}`) : ["- none"]), "");
+  out.push(`### Matcher tool names never seen as a tool_use name in the scanned records (${TOOL_MATCHER_EVENTS.join(", ")}; a lead to confirm with the current tool list, not evidence)`, "");
+  out.push(...(inv.matcherLeads.length ? inv.matcherLeads.map((l) => `- **${l.id}** \`${md(l.token)}\` in the matcher of ${l.registrations.map((h) => h.id).join(", ")}`) : ["- none"]), "");
+  out.push("### When each hook script, rule and CLAUDE.md file was added (author date of the first git commit touching it at this path, else the file's modification time labelled mtime; files found from the conversation working folders and their parent folders)", "");
+  const byDir = new Map<string, FileAge[]>();
+  for (const f of inv.files) byDir.set(path.dirname(f.path), [...(byDir.get(path.dirname(f.path)) ?? []), f]);
+  out.push(...(byDir.size ? [...byDir].sort(([a], [b]) => a.localeCompare(b)).map(([dir, files]) => `- \`${md(dir)}\`: ${files.map((f) => `**${f.id}** ${md(path.basename(f.path))}${f.kind === "CLAUDE.md" ? "" : ` ${f.kind}`}${f.registered === false ? " (named by no registration's command)" : ""} ${addedText(f)}`).join("; ")}`) : ["- none"]), "");
+  return out;
 }
 
 export interface IndexContext { readonly generatedAt: string; readonly projectsDir: string }
@@ -2113,9 +2400,10 @@ export function renderIndex(r: ScanResult, ctx: IndexContext): string {
   const locationsOf = itemLocations(r);
   const records = `${s.firstDate ?? "?"}..${s.lastDate ?? "?"}`;
   const listedIds = new Set<string>();
+  const inventoryIds = new Set(inventoryIdsOf(r.inventory));
   const prevOf = (id: string): string => {
     const v = prevById.get(id);
-    return v ? previousText(v, locationsOf.get(id)?.(), records) : "";
+    return v ? previousText(v, locationsOf.get(id)?.(), records, inventoryIds.has(id)) : "";
   };
   const prevNote = (id: string): string => {
     listedIds.add(id);
@@ -2221,11 +2509,14 @@ export function renderIndex(r: ScanResult, ctx: IndexContext): string {
   if (slowListed.length > INDEX_SLOW + slowTail.length) out.push(`- ${slowListed.length - INDEX_SLOW - slowTail.length} more slow command heads in fewer conversations in patterns.json`);
   out.push("");
 
+  out.push(...inventoryLines(r.inventory));
+  const deadHooks = r.inventory.hooks.filter(hasMissingScript);
+
   const need = {
     H: r.hookGroups.reduce((n, g) => n + g.patterns.length, 0), C: byKind("classifier_denial").length, P: byKind("permission_prompt").length, Y: byKind("safety_check").length, M: byKind("mcp_tool_error").length,
     X: listedCauses.length + causeTail.length, "E/O not covered": [...byKind("nonzero_exit"), ...byKind("other")].filter((p) => !fullyCovered([p])).length,
     U: listedOwners.filter((o) => !fullyCovered(o.patterns)).length, "MCP/external": mcpOwners.filter((o) => !fullyCovered(o.patterns)).length, S: Math.min(slowListed.length, INDEX_SLOW) + slowTail.length,
-    B: builtinListed.length,
+    B: builtinListed.length, "I missing script": deadHooks.length, T: r.inventory.matcherLeads.length,
   };
 
   const notListed = (k: PatternKind) => r.patterns.filter((p) => p.kind === k);
@@ -2249,9 +2540,9 @@ export function renderIndex(r: ScanResult, ctx: IndexContext): string {
     });
   }
   const notShown = previousNotShown(prev, listedIds);
-  out[previousAt] = previousSection(prev, notShown, prevOf, (id) => locationsOf.has(id)).join("\n");
+  out[previousAt] = previousSection(prev, notShown, prevOf, (id) => locationsOf.has(id) || inventoryIds.has(id)).join("\n");
   const allNeed = { ...need, "previous not shown": notShown.open.length };
-  out[accountingAt] = `Accounting: ${Object.values(allNeed).reduce((n, v) => n + v, 0)} entries are needed (${Object.entries(allNeed).map(([k, v]) => `${k} ${v}`).join(", ")}), each backed by at least one opened record; ids in the cause and slow tails may be grouped when they share a checked reason.`;
+  out[accountingAt] = `Accounting: ${Object.values(allNeed).reduce((n, v) => n + v, 0)} entries are needed (${Object.entries(allNeed).map(([k, v]) => `${k} ${v}`).join(", ")}), each backed by at least one opened record (for "I missing script" and T: the file check, the current tool list with the documented aliases, or a probe instead); ids in the cause and slow tails may be grouped when they share a checked reason.`;
   return out.join("\n") + "\n";
 }
 
@@ -2296,5 +2587,10 @@ export function patternsJson(r: ScanResult, ctx: IndexContext): string {
     maskedOwners: r.maskedOwners.map((o) => ({ id: o.id, owner: o.owner, conversations: [...o.sessions], count: o.count, patterns: o.patterns.map((p) => p.id) })),
     failureClasses: r.failureClasses.map((c) => ({ id: c.id, tier: c.tier, head: c.head, errorClass: c.errorClass, split: c.split, count: c.count, conversations: [...c.sessions], patterns: c.patterns.map((p) => ({ owner: p.owner, detail: p.detail, locations: p.locations.map((l) => l.ref) })) })),
     settingsFilesRead: r.settingsFilesRead, hookSourcesRead: r.hookSourcesRead,
+    inventory: {
+      hooks: r.inventory.hooks,
+      matcherLeads: r.inventory.matcherLeads.map((l) => ({ id: l.id, token: l.token, registrations: l.registrations.map((h) => h.id) })),
+      toolNamesSeen: r.inventory.toolNamesSeen, versions: r.inventory.versions, files: r.inventory.files,
+    },
   }, null, 1) + "\n";
 }

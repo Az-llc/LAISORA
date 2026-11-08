@@ -14,6 +14,12 @@ export function configurationBound(key: ConfigurationKey, bound: "minimum" | "ma
 
 const CONFIGURATION_KEYS = Object.keys(properties).map((key) => key.slice("laisora.".length)) as ConfigurationKey[];
 
+export function isPortableSetting(property: { readonly scope?: string }): boolean {
+  return property.scope !== "machine" && property.scope !== "machine-overridable";
+}
+
+export const PORTABLE_CONFIGURATION_KEYS: readonly string[] = CONFIGURATION_KEYS.filter((key) => isPortableSetting(properties[`laisora.${key}`] as { scope?: string }));
+
 export type ConfigurationInspect = (key: string) => { defaultValue?: unknown } | undefined;
 
 export function configurationRegistered(inspect: ConfigurationInspect, key: string): boolean {

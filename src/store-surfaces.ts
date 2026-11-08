@@ -18,6 +18,8 @@ import { PROTOCOL_VERSION, type HostToWebview, type TabSnapshot, type WebviewToH
 import { historyScopeKey, historyTranscriptScopeKey, Session } from "./session";
 import { noteHandoffForkTab, persistOpenTabs } from "./session-list-wiring";
 import { sessionRecordId } from "./session-record";
+import { normalizeTitleValue } from "./session-display-title";
+import { displayTitleFromSummary } from "./session-list";
 import { postSettingsState } from "./settings-panel";
 import { TAB_LIMIT_DEFAULT, resolveTabLimit, scopeMaxForTabs } from "./tab-limits";
 import { noteTodoSessionEnded, offerTodoReopen, postTodoSnapshot, setTodoDrawerFocus } from "./todo-surface";
@@ -37,6 +39,7 @@ interface WebviewSurface {
   restoreInitAt?: number;
   restoredInitPosted?: boolean;
   activeTabId?: string;
+  hostActiveTabId?: string;
   fillQueue?: string[];
   fillTimer?: ReturnType<typeof setTimeout>;
 }
@@ -83,10 +86,7 @@ export class SessionStore {
   }
 
   attach(webview: vscode.Webview): void {
-    if (this.activeWebview && this.activeWebview !== webview) {
-      this.previousWebview = this.activeWebview;
-    }
-    this.activeWebview = webview;
+    if (this.activeWebview === null || !this.surfaces.has(this.activeWebview)) this.activeWebview = webview;
     if (this.surfaces.has(webview)) return;
     const surface: WebviewSurface = {
       sub: webview.onDidReceiveMessage((raw: unknown) => {
@@ -139,13 +139,15 @@ export class SessionStore {
     surface.initInFlight = true;
     this.cancelRestoreFill(webview);
     try {
-      const plan = surface.restoredInitPosted === true ? this.restoreInitPlan(surface) : undefined;
+      const hostChosen = this.hostChosenTab(surface);
+      const plan = surface.restoredInitPosted === true || hostChosen !== undefined ? this.restoreInitPlan(surface) : undefined;
       const delivered = await this.postTo(webview, {
         type: "init",
         protocolVersion: PROTOCOL_VERSION,
         hostWindows: process.platform === "win32",
         systemAppExtensions: configuredSystemAppExtensions(),
         tabs: plan?.tabs ?? this.snapshotAll(),
+        ...(hostChosen !== undefined ? { activeTabId: hostChosen } : {}),
       });
       if (delivered) surface.readyInitAt = Date.now();
       output.appendLine(
@@ -182,6 +184,7 @@ export class SessionStore {
     if (armSuppression && surface) surface.restoreInitAt = postedAt;
     if (surface) surface.restoredInitPosted = true;
     const plan = this.restoreInitPlan(surface);
+    const hostChosen = this.hostChosenTab(surface);
     this.cancelRestoreFill(webview);
     void this.postTo(webview, {
       type: "init",
@@ -189,6 +192,7 @@ export class SessionStore {
       hostWindows: process.platform === "win32",
       systemAppExtensions: configuredSystemAppExtensions(),
       tabs: plan.tabs,
+      ...(hostChosen !== undefined ? { activeTabId: hostChosen } : {}),
     }).then((delivered) => {
       if (!delivered && surface && surface.restoreInitAt === postedAt) surface.restoreInitAt = undefined;
       output.appendLine(
@@ -228,14 +232,71 @@ export class SessionStore {
     all: readonly Session[]
   ): string | undefined {
     if (all.length === 1) return all[0].tabId;
+    const hostChosen = this.hostChosenTab(surface);
+    if (hostChosen !== undefined) return hostChosen;
     const activeTabId = surface?.activeTabId;
     if (activeTabId === undefined || !this.sessions.has(activeTabId)) return undefined;
     return activeTabId;
   }
 
-  noteActiveTab(webview: vscode.Webview, tabId: string): void {
+  noteActiveTab(webview: vscode.Webview, tabId: string, user = false): void {
     const surface = this.surfaces.get(webview);
-    if (surface) surface.activeTabId = tabId;
+    if (!surface) return;
+    surface.activeTabId = tabId;
+    if (user || surface.hostActiveTabId === tabId) surface.hostActiveTabId = undefined;
+  }
+
+  noteInteraction(webview: vscode.Webview): void {
+    if (!this.surfaces.has(webview) || this.activeWebview === webview) return;
+    this.previousWebview = this.activeWebview;
+    this.activeWebview = webview;
+  }
+
+  settingsOpener: vscode.Webview | null = null;
+  private settingsOpenRequest: vscode.Webview | null = null;
+
+  requestSettingsFrom(webview: vscode.Webview): void {
+    this.settingsOpenRequest = webview;
+  }
+
+  noteSettingsOpened(): void {
+    const from = this.settingsOpenRequest;
+    this.settingsOpenRequest = null;
+    this.settingsOpener = from && this.surfaces.has(from) ? from : null;
+  }
+
+  settingsStartTarget(): vscode.Webview | null {
+    return this.activationTarget(this.settingsOpener);
+  }
+
+  activationTarget(requested?: vscode.Webview | null): vscode.Webview | null {
+    return requested && this.surfaces.has(requested) ? requested : this.activeWebview;
+  }
+
+  postActivating(requested: vscode.Webview | null | undefined, tabId: string, message: (activate: boolean) => HostToWebview): void {
+    const target = this.activationTarget(requested);
+    if (!target) { this.post(message(false)); return; }
+    this.deliverActivation(target, tabId, message(true));
+    this.post(message(false), target);
+  }
+
+  activateExisting(requested: vscode.Webview | null | undefined, tabId: string): void {
+    const target = this.activationTarget(requested);
+    if (!target) return;
+    this.deliverActivation(target, tabId, { type: "activateTab", tabId });
+  }
+
+  private deliverActivation(target: vscode.Webview, tabId: string, message: HostToWebview): void {
+    const surface = this.surfaces.get(target);
+    if (!surface) return;
+    const record = () => { if (this.surfaces.get(target) === surface) surface.hostActiveTabId = tabId; };
+    if (!surface.visible || surface.readyInitAt === undefined && surface.restoredInitPosted !== true) record();
+    void this.postTo(target, message).then((delivered) => { if (!delivered) record(); });
+  }
+
+  private hostChosenTab(surface: WebviewSurface | undefined): string | undefined {
+    const tabId = surface?.hostActiveTabId;
+    return tabId !== undefined && this.sessions.has(tabId) ? tabId : undefined;
   }
 
   activeTabIdOf(webview: vscode.Webview): string | undefined {
@@ -276,6 +337,7 @@ export class SessionStore {
     noteComposerDrafts(webview, null);
     setTodoDrawerFocus(webview, false);
     if (this.previousWebview === webview) this.previousWebview = null;
+    if (this.settingsOpener === webview) this.settingsOpener = null;
     if (this.activeWebview !== webview) return;
     const fallback = this.previousWebview && this.surfaces.has(this.previousWebview)
       ? this.previousWebview : this.surfaces.keys().next().value ?? null;
@@ -315,7 +377,7 @@ export function currentScopeMax(): number {
   return scopeMaxForTabs(tabLimit(), store?.sessions.size ?? 0);
 }
 
-export function openNewConversationTab(st: SessionStore, initialize?: (session: Session) => void): Session | undefined {
+export function openNewConversationTab(st: SessionStore, initialize?: (session: Session) => void, activateIn?: vscode.Webview | null): Session | undefined {
   if (st.sessions.size >= tabLimit()) {
     warnTabLimit();
     return undefined;
@@ -323,9 +385,19 @@ export function openNewConversationTab(st: SessionStore, initialize?: (session: 
   const session = st.createSession();
   if (initialize) initialize(session);
   else session.welcome = openWelcome();
-  st.post({ type: "tabCreated", tab: session.snapshot(), activate: true });
+  const tab = session.snapshot();
+  st.postActivating(activateIn, session.tabId, activate => ({ type: "tabCreated", tab, activate }));
   warmup(session);
   return session;
+}
+
+export function openTitledConversationTab(st: SessionStore, title: string, activateIn?: vscode.Webview | null): Session | undefined {
+  return openNewConversationTab(st, (s) => {
+    s.title = displayTitleFromSummary(title, s.tabId);
+    s.autoTitled = true;
+    const chosen = normalizeTitleValue(title);
+    s.unpersistedChosenTitle = chosen === null ? null : { title: chosen, failedAttempts: 0 };
+  }, activateIn);
 }
 
 export function reorderSessionTabs(st: SessionStore, order: readonly string[], sender?: vscode.Webview): void {
@@ -372,10 +444,10 @@ export async function handleSurfaceMessage(
       output.appendLine(`[webview] ${msg.kind}: ${msg.message}`);
       break;
     case "activeTab":
-      st.noteActiveTab(sender, msg.tabId);
+      st.noteActiveTab(sender, msg.tabId, msg.user === true);
       break;
     case "newTab": {
-      openNewConversationTab(st);
+      openNewConversationTab(st, undefined, sender);
       break;
     }
     case "closeTab": {
@@ -398,7 +470,10 @@ export async function handleSurfaceMessage(
       void persistOpenTabs();
       const replacement = st.sessions.size === 0 ? st.createSession() : null;
       if (replacement) replacement.welcome = openWelcome();
-      if (replacement) st.post({ type: "tabCreated", tab: replacement.snapshot(), activate: true, replacement: true });
+      if (replacement) {
+        const tab = replacement.snapshot();
+        st.postActivating(sender, replacement.tabId, activate => ({ type: "tabCreated", tab, activate, replacement: true }));
+      }
       st.post({ type: "tabClosed", tabId: msg.tabId });
       postSettingsState();
       void target!

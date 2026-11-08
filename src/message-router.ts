@@ -38,6 +38,7 @@ export async function handleWebviewMessage(
     output.appendLine(`[drop] message for unknown tab: ${msg.type} ${msg.tabId}`);
     return;
   }
+  if (msg.type === "activeTab" && msg.user === true || msg.type === "send" || msg.type === "newTab" || msg.type === "composerFocus" && msg.focused) st.noteInteraction(sender);
   try {
     switch (msg.type) {
       case "ready":
@@ -124,7 +125,7 @@ export async function handleWebviewMessage(
         noteComposerDrafts(sender, msg.tabIds);
         break;
       case "runHostAction":
-        await runHostActionMessage(msg);
+        await runHostActionMessage(msg, sender);
         break;
       case "welcomeAction":
         await welcomeActionMessage(msg);
@@ -135,7 +136,7 @@ export async function handleWebviewMessage(
         break;
       case "resumeSession":
       case "resumeHydrationRetry":
-        await handleResumeMessage(st, msg, target);
+        await handleResumeMessage(st, msg, target, sender);
         break;
       case "todoEdit":
       case "todoDetailRequest":
@@ -158,10 +159,10 @@ export async function handleWebviewMessage(
         await openTodoConversation(st, msg, sender);
         break;
       case "todoFromReply":
-        await todoFromReply(st, msg, target!);
+        await todoFromReply(st, msg, target!, sender);
         break;
       case "startImprovementAnalysis":
-        await startImprovementAnalysis(st);
+        await startImprovementAnalysis(st, sender);
         break;
       default: {
         const unrouted: never = msg;

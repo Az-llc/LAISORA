@@ -1,10 +1,10 @@
 import { spawn } from "node:child_process";
-import { constants, existsSync } from "node:fs";
+import { constants, existsSync, statSync } from "node:fs";
 import { access, readFile, realpath } from "node:fs/promises";
 import { homedir } from "node:os";
 import { delimiter, dirname, extname, isAbsolute, join, posix, resolve, win32 } from "node:path";
 import * as l10n from "@vscode/l10n";
-import { envValueOf } from "./claude-env";
+import { envNameKey, envValueOf } from "./claude-env";
 
 export interface ResolvedClaudeCodeExecutable {
   path: string;
@@ -146,9 +146,46 @@ export function resolveClaudeCodeExecutable(configuredPath?: string): Promise<Re
   return resolveForProcess(configuredPath);
 }
 
+const SDK_SCRIPT_EXTENSIONS = [".js", ".mjs", ".tsx", ".ts", ".jsx"];
+const SDK_SCRIPT_RUNTIME = "node";
+const SDK_DROPPED_ENV = "NODE_OPTIONS";
+const WINDOWS_SPAWN_EXTENSIONS = [".com", ".exe"];
+
+function isRegularFile(candidate: string): boolean {
+  try {
+    return statSync(candidate).isFile();
+  } catch {
+    return false;
+  }
+}
+
+export function executableOnPath(name: string, env: Readonly<Record<string, string | undefined>>, platform: NodeJS.Platform = process.platform): string | undefined {
+  const paths = platform === "win32" ? win32 : posix;
+  const directories = (envValueOf(env, "PATH", platform) ?? "").split(platform === "win32" ? ";" : ":")
+    .map((dir) => dir.trim().replace(/^"(.*)"$/, "$1"))
+    .filter((dir) => dir && paths.isAbsolute(dir));
+  const extensions = platform === "win32" ? WINDOWS_SPAWN_EXTENSIONS : [""];
+  for (const directory of directories) {
+    for (const extension of extensions) {
+      const candidate = paths.join(directory, name + extension);
+      if (isRegularFile(candidate)) return candidate;
+    }
+  }
+  return undefined;
+}
+
+export function sdkCliLaunch(executablePath: string, args: readonly string[], env: Readonly<Record<string, string | undefined>>,
+  platform: NodeJS.Platform = process.platform): { command: string; args: string[]; env: Record<string, string> } | undefined {
+  const childEnv: Record<string, string> = {};
+  for (const [key, value] of Object.entries(env)) if (typeof value === "string" && envNameKey(key, platform) !== SDK_DROPPED_ENV) childEnv[key] = value;
+  if (!SDK_SCRIPT_EXTENSIONS.some((extension) => executablePath.endsWith(extension))) return { command: executablePath, args: [...args], env: childEnv };
+  const runtime = executableOnPath(SDK_SCRIPT_RUNTIME, childEnv, platform);
+  return runtime === undefined ? undefined : { command: runtime, args: [executablePath, ...args], env: childEnv };
+}
+
 export function checkClaudeCodeVersion(executablePath: string, timeoutMs = VERSION_TIMEOUT_MS): Promise<string | undefined> {
   return new Promise((resolveVersion) => {
-    const isJavaScript = extname(executablePath).toLowerCase() === ".js";
+    const invocation = sdkCliLaunch(executablePath, ["--version"], process.env);
     let stdout = "";
     let stderr = "";
     let settled = false;
@@ -158,9 +195,14 @@ export function checkClaudeCodeVersion(executablePath: string, timeoutMs = VERSI
       resolveVersion(/\b\d+\.\d+(?:\.\d+)?\b/.exec(`${stdout}\n${stderr}`)?.[0]);
     };
 
+    if (invocation === undefined) {
+      finish();
+      return;
+    }
     let child;
     try {
-      child = spawn(isJavaScript ? process.execPath : executablePath, isJavaScript ? [executablePath, "--version"] : ["--version"], {
+      child = spawn(invocation.command, invocation.args, {
+        env: invocation.env,
         windowsHide: true,
         stdio: ["ignore", "pipe", "pipe"],
       });

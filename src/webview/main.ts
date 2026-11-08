@@ -381,7 +381,7 @@ export function noteSurfaceChange(): void {
   surfaceGeneration += 1;
 }
 
-export function setActiveTab(tabId: string): void {
+export function setActiveTab(tabId: string, user = true): void {
   if (!tabs.has(tabId)) return;
   todoTab.setShown(false);
   closeSuggest();
@@ -405,7 +405,7 @@ export function setActiveTab(tabId: string): void {
   try {
     renderAttachments();
     persistState();
-    vscode.postMessage({ type: "activeTab", tabId });
+    vscode.postMessage({ type: "activeTab", tabId, ...(user ? { user: true as const } : {}) });
     for (const [id, t] of tabs) {
       t.tabBtn.classList.toggle("active", id === tabId);
       t.tabBtn.setAttribute("aria-selected", id === tabId ? "true" : "false");
@@ -2210,7 +2210,7 @@ function rebuildTabInPlace(snap: TabSnapshot, preserveScroll: boolean): void {
   for (const [tabId, tab] of entries) tabs.set(tabId, tab);
   tabbarEl.insertBefore(t.tabBtn, btnNext);
   logsEl.insertBefore(t.logEl, logNext);
-  if (activeTabId === snap.tabId) setActiveTab(snap.tabId);
+  if (activeTabId === snap.tabId) setActiveTab(snap.tabId, false);
   else if (!preserveScroll) persistState();
 }
 
@@ -2237,7 +2237,7 @@ function activateFirstUsableTab(preferred: string): void {
   for (const tabId of candidates) {
     if (!tabs.has(tabId)) continue;
     try {
-      setActiveTab(tabId);
+      setActiveTab(tabId, false);
       return;
     } catch (error) {
       reportWebviewDiagnostic("error", `setActiveTab failed: ${String(error)}`);
@@ -2298,8 +2298,13 @@ function initMessageBus(): void {
           }
         }
         const first = tabs.keys().next().value ?? null;
+        const hostChosen = msg.activeTabId !== undefined && tabs.has(msg.activeTabId) ? msg.activeTabId : null;
         const todoWasShown = todoTab.shown;
-        const preferred = activeTabId ?? todoReturnTabId;
+        if (hostChosen !== null) {
+          todoTab.dropRestore();
+          todoShowPending = false;
+        }
+        const preferred = hostChosen ?? activeTabId ?? todoReturnTabId;
         const chosen = preferred && tabs.has(preferred) ? preferred : first;
         if (chosen) {
           inputEl.value = drafts.get(chosen) ?? "";
@@ -2309,7 +2314,7 @@ function initMessageBus(): void {
         activeTabAfterInit = activeTabId;
         reportedComposerDrafts = null;
         reportComposerDrafts();
-        if (todoWasShown || todoShowPending) {
+        if ((todoWasShown || todoShowPending) && hostChosen === null) {
           todoShowPending = false;
           showTodoTab();
         }
@@ -2498,14 +2503,14 @@ function initMessageBus(): void {
       case "tabCreated": {
         if (tabs.has(msg.tab.tabId)) {
           rebuildTabInPlace(msg.tab, false);
-          if (msg.activate && activeTabId === activeTabAfterInit) setActiveTab(msg.tab.tabId);
+          if (msg.activate && activeTabId === activeTabAfterInit) setActiveTab(msg.tab.tabId, false);
         } else if (msg.replacement && todoTab.shown) {
           addTab(msg.tab);
           todoReturnTabId = msg.tab.tabId;
           persistState();
         } else {
           addTab(msg.tab);
-          if (msg.activate) setActiveTab(msg.tab.tabId);
+          if (msg.activate) setActiveTab(msg.tab.tabId, false);
         }
         break;
       }
@@ -2514,7 +2519,7 @@ function initMessageBus(): void {
         break;
       }
       case "activateTab": {
-        if (tabs.has(msg.tabId)) setActiveTab(msg.tabId);
+        if (tabs.has(msg.tabId)) setActiveTab(msg.tabId, false);
         break;
       }
       case "pasteText": {
@@ -2681,7 +2686,7 @@ function initMessageBus(): void {
           if (restoreShown && !todoTab.shown) showTodoTab();
         } else if (wasShown) {
           const back = todoReturnTabId && tabs.has(todoReturnTabId) ? todoReturnTabId : tabs.keys().next().value;
-          if (back) setActiveTab(back);
+          if (back) setActiveTab(back, false);
           else persistState();
         }
         break;
@@ -2733,7 +2738,7 @@ function initMessageBus(): void {
           todoTab.syncAskTabs();
           persistState();
           const next = [...tabs.keys()][0] ?? null;
-          if (!activeTabId && next && !todoTab.shown) setActiveTab(next);
+          if (!activeTabId && next && !todoTab.shown) setActiveTab(next, false);
           else if (!activeTabId) refreshChrome();
         }
         break;

@@ -127,7 +127,7 @@ Open the other views when you want to look more closely:
 
 - **SUMMARY**, for "how did this conversation go overall?": the key figures from GRAPH and ANALYSIS, PLAN and YOU side by side, and earlier requests with their steps, time, and tokens. The summary button at the top asks a model for a short summary of the conversation.
 - **GRAPH**, for "who was working when, and where was the waiting?": a timeline of the main Claude, its subagents, and background tasks. Each step of the plan is a row you can unfold to see the main Claude and the subagents that worked on it. A map of the whole conversation lets you narrow the time range shown, and waiting for subagents is shown separately from tool calls. Open a subagent to read the full instruction it was given, which helps when a subagent did something you did not expect.
-- **ANALYSIS**, for "where did the time and tokens go, and what should I change?": see [below](#see-where-time-and-tokens-went-then-get-improvements-to-make-next).
+- **ANALYSIS**, for "where did the time and tokens go?". Proposals for what to change come not from ANALYSIS but from **Start LLM improvement analysis** in a conversation's ☰ menu. Both are described [below](#see-where-time-and-tokens-went-then-get-improvements-to-make-next).
 
 These figures are computed locally from the work log, without calling a model. When the record is incomplete, the views say so instead of showing partial numbers as complete.
 
@@ -161,7 +161,7 @@ When the claude.ai usage limit stops a conversation, LAISORA can resume it autom
 
 **First, the numbers.** ANALYSIS shows time by model and in tool calls, time and tokens by role (worker, reviewer, and so on), with each run's executor (the agent or CLI that ran it), model, and effort, failures by kind, and each plan step's figures. Its script analysis runs fixed rules locally: it classifies failures and flags operations that match a rule table of conventions, even when they succeeded. GRAPH shows the same work over time, by subagent.
 
-**Then, what to change.** **Start LLM improvement analysis** in a conversation's ☰ menu opens a new conversation, counts the failures that recur across all your local Claude Code conversations, and then has Claude analyse them there and propose changes to your workflow, instructions, and settings. It runs only when you start it, and the conversation uses your plan or API key like any other. Proposals are model interpretations, so look at the records behind them. Hide the menu item with `laisora.improvementAnalysis.showMenuItem`.
+**Then, what to change.** Separately from ANALYSIS, **Start LLM improvement analysis** in a conversation's ☰ menu opens a new conversation, counts the failures that recur across all your local Claude Code conversations, and then has Claude analyse them there and propose changes to your workflow, instructions, and settings. It runs only when you start it, and the conversation uses your plan or API key like any other. Proposals are model interpretations, so look at the records behind them. Hide the menu item with `laisora.improvementAnalysis.showMenuItem`.
 
 ### Delegate work to subagents and other CLIs (agent orchestration)
 

@@ -5,6 +5,7 @@ import { randomUUID } from "node:crypto";
 import { basename, dirname, win32 } from "node:path";
 
 import { createBackgroundActivityState } from "./background-activity";
+import { claudeProjectDirName, PROJECT_DIR_ENCODE_MAX } from "./claude-env";
 import { ClaudeConversation } from "./claudeHost";
 import { registerConversationHistory, releaseConversationHistory } from "./conversation-history";
 import { cliStartOf, refreshFallbackAppliedModel, warmup } from "./conversation-lifecycle";
@@ -39,7 +40,8 @@ import {
 import { createGuardrailState } from "./guardrail";
 import { initialSessionFacts } from "./session-facts";
 import { isInSessionStore, lookupSessionFile } from "./session-files";
-import { recordCwds, splitCompleteLines } from "./session-display-title";
+import { recordCwds } from "./session-display-title";
+import { lastRelocatedCwd, readCwdWindowLines } from "./transcript-cwd";
 import { displayTitleFromSummary } from "./session-list";
 import { isHandoffForkHidden, type HandoffForkState } from "./handoff-runner";
 import {
@@ -75,6 +77,8 @@ import {
   type UsageScanOwner,
 } from "./session-transcript";
 import { childSpansOf } from "./transcript-time-buckets";
+import { restoredWritesLostIn, type WritesLostLookup, type WritesLostShown } from "./session-writes-lost";
+import { writesLostNoticeOn } from "./claude-settings";
 import {
   Session,
   historyScopeKey,
@@ -133,35 +137,8 @@ export function markRestoredSubagentGaps(workModel: WorkModelState,
 const HYDRATION_SWITCHOVER_MAX = 64;
 const HYDRATION_DRAIN_BATCH = 512;
 
-const RESUME_CWD_SCAN_BYTES = 64 * 1024;
-
-function lastRelocatedCwd(
-  lines: readonly { text: string }[]
-): { cwd: string | undefined; malformedLines: number } {
-  let cwd: string | undefined;
-  let malformedLines = 0;
-  for (const line of lines) {
-    if (!line.text.includes('"relocated"')) continue;
-    let record: unknown;
-    try {
-      record = JSON.parse(line.text);
-    } catch {
-      malformedLines += 1;
-      continue;
-    }
-    if (typeof record !== "object" || record === null) continue;
-    const fields = record as { type?: unknown; relocatedCwd?: unknown };
-    if (fields.type !== "relocated") continue;
-    if (typeof fields.relocatedCwd === "string" && fields.relocatedCwd.length > 0) {
-      cwd = fields.relocatedCwd;
-    }
-  }
-  return { cwd, malformedLines };
-}
-
-const PROJECT_DIR_ENCODE_MAX = 200;
 function encodedProjectDirName(cwd: string): string | undefined {
-  const encoded = cwd.replace(/[^a-zA-Z0-9]/g, "-");
+  const encoded = claudeProjectDirName(cwd);
   return encoded.length > PROJECT_DIR_ENCODE_MAX ? undefined : encoded;
 }
 
@@ -185,39 +162,22 @@ type RecordedCwdSource = "record-matched" | "ancestor-matched" | "unconfirmed";
 async function readRecordedSessionCwd(
   filePath: string
 ): Promise<{ cwd: string | undefined; source: RecordedCwdSource; malformedRelocationLines: number }> {
-  const { open } = await import("node:fs/promises");
-  const handle = await open(filePath, "r");
-  try {
-    const size = (await handle.stat()).size;
-    const headLength = Math.min(size, RESUME_CWD_SCAN_BYTES);
-    const head = new Uint8Array(headLength);
-    if (headLength > 0) await handle.read(head, 0, headLength, 0);
-    const tailStart = Math.max(headLength, size - RESUME_CWD_SCAN_BYTES);
-    const tailLength = size - tailStart;
-    const tail = new Uint8Array(tailLength);
-    if (tailLength > 0) await handle.read(tail, 0, tailLength, tailStart);
-    const lines = [
-      ...splitCompleteLines(head, 0).lines,
-      ...splitCompleteLines(tail, tailStart).lines,
-    ];
-    const relocation = lastRelocatedCwd(lines);
-    const cwds = recordCwds(lines);
-    const firstCwd = cwds[0];
-    const dirName = basename(dirname(filePath));
-    const matching = [...new Set([relocation.cwd, ...cwds])].filter(
-      (candidate): candidate is string =>
-        candidate !== undefined && encodedProjectDirName(candidate) === dirName
-    );
-    const ancestor =
-      matching.length === 0 && relocation.cwd === undefined ? ancestorMatchingStore(dirName, firstCwd) : undefined;
-    return {
-      cwd: ancestor ?? (matching.length === 1 ? matching[0] : relocation.cwd ?? firstCwd),
-      source: ancestor !== undefined ? "ancestor-matched" : matching.length === 1 ? "record-matched" : "unconfirmed",
-      malformedRelocationLines: relocation.malformedLines,
-    };
-  } finally {
-    await handle.close();
-  }
+  const lines = await readCwdWindowLines(filePath);
+  const relocation = lastRelocatedCwd(lines);
+  const cwds = recordCwds(lines);
+  const firstCwd = cwds[0];
+  const dirName = basename(dirname(filePath));
+  const matching = [...new Set([relocation.cwd, ...cwds])].filter(
+    (candidate): candidate is string =>
+      candidate !== undefined && encodedProjectDirName(candidate) === dirName
+  );
+  const ancestor =
+    matching.length === 0 && relocation.cwd === undefined ? ancestorMatchingStore(dirName, firstCwd) : undefined;
+  return {
+    cwd: ancestor ?? (matching.length === 1 ? matching[0] : relocation.cwd ?? firstCwd),
+    source: ancestor !== undefined ? "ancestor-matched" : matching.length === 1 ? "record-matched" : "unconfirmed",
+    malformedRelocationLines: relocation.malformedLines,
+  };
 }
 
 export type HydrationVerdict = "accepted" | "dropped-timestamp" | "dropped-stale";
@@ -281,7 +241,7 @@ export async function openSessionById(
     (s) => !s.closed && (s.resumeSessionId === sessionId || s.auth?.sessionId === sessionId)
   );
   if (existing) {
-    await st.postTo(sender, { type: "activateTab", tabId: existing.tabId });
+    st.activateExisting(sender, existing.tabId);
     return "activated";
   }
   const lookup = lookupSessionFile(sessionId);
@@ -291,7 +251,7 @@ export async function openSessionById(
     return "scan_failed";
   }
   if (!lookup.path) return "not_opened";
-  const opened = await openResumedSession(st, { sessionId, filePath: lookup.path, activate: true });
+  const opened = await openResumedSession(st, { sessionId, filePath: lookup.path, activate: true, activateIn: sender });
   return opened.tabPosted ? "opened" : "not_opened";
 }
 
@@ -302,6 +262,7 @@ export async function openResumedSession(
     filePath: string;
     intoTabId?: string;
     activate: boolean;
+    activateIn?: vscode.Webview | null;
     inherit?: { model: string | null | undefined; effort: Session["effortOverride"] };
     knownCwd?: string;
     startMeasurement?: StartMeasurement;
@@ -438,11 +399,10 @@ export async function openResumedSession(
     };
     s.hydration = hydration;
     s.hydrationCoverageUnconfirmed = false;
-    st.post(
-      canReuse
-        ? { type: "tabCleared", tab: s.resumePreviewSnapshot(hydration) }
-        : { type: "tabCreated", tab: s.resumePreviewSnapshot(hydration), activate: req.activate }
-    );
+    const preview = s.resumePreviewSnapshot(hydration);
+    if (canReuse) st.post({ type: "tabCleared", tab: preview });
+    else if (req.activate) st.postActivating(req.activateIn, s.tabId, activate => ({ type: "tabCreated", tab: preview, activate }));
+    else st.post({ type: "tabCreated", tab: preview, activate: false });
     tabPosted = !canReuse;
     noteHandoffForkTab({ kind: "opened", sessionId: req.sessionId });
     trackResumeTitle(st, s, hydration, titleRequest);
@@ -532,7 +492,8 @@ export async function openResumedSession(
 export async function handleResumeMessage(
   st: SessionStore,
   msg: Extract<WebviewToHost, { type: "resumeSession" | "resumeHydrationRetry" }>,
-  target: Session | undefined
+  target: Session | undefined,
+  sender?: vscode.Webview
 ): Promise<void> {
   switch (msg.type) {
     case "resumeSession": {
@@ -541,6 +502,7 @@ export async function handleResumeMessage(
         filePath: msg.filePath,
         ...(msg.intoTabId !== undefined ? { intoTabId: msg.intoTabId } : {}),
         activate: true,
+        activateIn: sender ?? null,
       });
       break;
     }
@@ -846,7 +808,8 @@ export async function foldRestoredRecords(
   transcript: Pick<SessionTranscript, "messages" | "readError" | "malformedLineCount">,
   history: Pick<SessionHistoryRead, "events" | "readError" | "subagentsReadError" | "malformedLineCount">,
   visit: (step: FoldEventResult) => "continue" | "stop",
-  invalidated: () => boolean
+  invalidated: () => boolean,
+  writesLost: WritesLostShown | undefined
 ): Promise<"complete" | "stopped" | "invalidated"> {
   const launchers = unknownLaunchers(draft.restoredAgents ?? [], currentGenerationRecords(history.events));
   draft.workModel = seedUnknownLauncherOwners(draft.workModel, launchers);
@@ -890,7 +853,12 @@ export async function foldRestoredRecords(
       if (invalidated()) return "invalidated";
     }
   }
+  if (writesLost !== undefined && foldBody({ kind: "session_writes_lost", ...writesLost }) === "stop") return "stopped";
   return "complete";
+}
+
+function restoredWritesLostOf(lookups: readonly WritesLostLookup[]): WritesLostShown | undefined {
+  return writesLostNoticeOn() ? restoredWritesLostIn(extensionContext?.globalState, lookups) : undefined;
 }
 
 function replayJournalInto(
@@ -1147,6 +1115,12 @@ async function runResumeHydrationStages(
     }
   }
 
+  const forkEnvelope = conversation.handoffEnvelope?.snapshot.forkSessionId === h.sessionId ? conversation.handoffEnvelope : undefined;
+  const forkCapturedAt = forkEnvelope === undefined ? Number.NaN : Date.parse(forkEnvelope.snapshot.capturedAt);
+  const writesLost = restoredWritesLostOf([
+    { sessionId: h.sessionId },
+    ...(forkEnvelope !== undefined && Number.isFinite(forkCapturedAt) ? [{ sessionId: forkEnvelope.snapshot.sourceSessionId, markedBy: forkCapturedAt }] : []),
+  ]);
   const draft = createHydrationDraft(s);
   draft.childSpans = childSpansOf(restored.agents, restored.readAt);
   draft.restoredAgents = restored.agents;
@@ -1165,7 +1139,8 @@ async function runResumeHydrationStages(
       applyDraftEffects(step.effects, sink);
       return "continue";
     },
-    invalidated
+    invalidated,
+    writesLost
   );
   stage("fold");
   if (folded === "invalidated") return abort("履歴集計中にセッションが変化しました");
@@ -1180,21 +1155,21 @@ async function runResumeHydrationStages(
     .map((m) => m.uuid)
     .filter((u): u is string => typeof u === "string" && u.length > 0);
 
-  if (conversation.handoffEnvelope?.snapshot.forkSessionId === h.sessionId) {
-    const sourceId = conversation.handoffEnvelope.snapshot.sourceSessionId;
+  if (forkEnvelope !== undefined) {
+    const sourceId = forkEnvelope.snapshot.sourceSessionId;
     const sourceTitle = await sessionDisplayTitleOf(sourceId);
     if (invalidated()) return abort("引き継ぎ元の題名の読み取り中にセッションが変化しました");
     const restoredContextUsage = restoredHandoffContextUsage(extensionContext?.globalState.get(handoffContextUsageKey(h.sessionId)));
     const unreadableLineCount = restoredHandoffUnreadableLineCount(extensionContext?.globalState.get(handoffUnreadableLinesKey(h.sessionId)));
-    const decisions = conversation.handoffEnvelope.decisions;
+    const decisions = forkEnvelope.decisions;
     s.handoffSource = {
       sessionId: sourceId,
       ...(sourceTitle !== undefined ? { title: sourceTitle } : {}),
-      ...(conversation.handoffEnvelope.snapshot.compact !== undefined
-        ? { compact: conversation.handoffEnvelope.snapshot.compact }
+      ...(forkEnvelope.snapshot.compact !== undefined
+        ? { compact: forkEnvelope.snapshot.compact }
         : {}),
       ...(restoredContextUsage !== undefined ? { contextUsage: restoredContextUsage } : {}),
-      utteranceCount: conversation.handoffEnvelope.userUtterances.length,
+      utteranceCount: forkEnvelope.userUtterances.length,
       ...(unreadableLineCount !== undefined ? { unreadableLineCount } : {}),
       ...(decisions !== undefined
         ? { decisionCount: handoffDecisionLineCount(decisions), decisions: handoffDecisionCounts(decisions) }
@@ -1225,6 +1200,7 @@ async function runResumeHydrationStages(
   refreshFallbackAppliedModel(st, s);
   s.restoredAgents = restored.agents;
   s.childSpans = draft.childSpans;
+  s.restoredWritesLost = { sessionId: h.sessionId, notice: writesLost };
   s.hydrationCoverageUnconfirmed = false;
   s.conversationAnchorUuids = anchors;
   h.journal.length = 0;

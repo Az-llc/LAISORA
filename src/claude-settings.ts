@@ -5,11 +5,12 @@ import { readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:
 import { join } from "node:path";
 import { homedir } from "node:os";
 
-import { claudeConfigDir } from "./claude-env";
+import { claudeConfigDir, normalizeDriveLetter } from "./claude-env";
 import { normalizeDisplayName } from "./display-name";
 import { EVENT_LIMIT_DEFAULT, resolveEventLimit } from "./event-limits";
 import { extensionContext, output } from "./host-context";
 import { isPermissionModeId, PermissionModeId } from "./protocol";
+import { writesLostNoticeEnabled } from "./session-writes-lost";
 import type { ModelInfo } from "./protocol";
 import type { Session } from "./extension";
 import type * as ClaudeCodeSdk from "@anthropic-ai/claude-agent-sdk" with { "resolution-mode": "import" };
@@ -263,9 +264,7 @@ export function configuredClaudeExecutablePath(cfg: vscode.WorkspaceConfiguratio
   return cfg.get<string>("claude.executablePath")!.trim() || undefined;
 }
 
-export function normalizeDriveLetter(cwd: string): string {
-  return /^[a-z]:/.test(cwd) ? cwd[0].toUpperCase() + cwd.slice(1) : cwd;
-}
+export { normalizeDriveLetter } from "./claude-env";
 
 export function resolveSessionCwd(s: Session): string | undefined {
   const cfg = getLaisoraConfiguration();
@@ -299,6 +298,10 @@ export function sessionBackgroundCwd(s: Session): string {
 
 export function getLaisoraConfiguration(): vscode.WorkspaceConfiguration {
   return vscode.workspace.getConfiguration("laisora");
+}
+
+export function writesLostNoticeOn(): boolean {
+  return writesLostNoticeEnabled((key) => getLaisoraConfiguration().get<unknown>(key));
 }
 
 export function configuredEventLimit(): number {

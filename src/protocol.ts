@@ -5,6 +5,8 @@ import { isEventLimit } from "./event-limits";
 import { isTranscriptRetentionDays, isTranscriptRetentionFallback, type TranscriptRetentionFallback } from "./transcript-retention";
 import { configurationBound } from "./configuration-defaults";
 import { normalizeSystemAppExtension } from "./file-link-open-mode";
+import { isMigrationCategory, MIGRATION_OPERATIONS, MIGRATION_PROGRESS_PHASES, type MigrationCategory, type MigrationProgress } from "./migration-categories";
+import type { MigrationScan } from "./migration";
 import type { MainTokenTotal } from "./plan-usage";
 import type { FailureSummaryView } from "./exec-log-marks";
 import type { HandoffCompactStats } from "./handoff-envelope";
@@ -14,6 +16,8 @@ import { EXECUTORS, externalRunStatus, isExecutorId, isExternalRunOutcome, type 
 import { isDelegationTool } from "./claude-tool-names";
 import { isAskUnansweredKind, type AskUnansweredKind } from "./ask-unanswered";
 import { ELICITATION_CONTENT_LIMITS, elicitationTextLength, type ElicitationAction, type ElicitationSpec, type ElicitationValue } from "./elicitation";
+import { isWritesLostErrorCode, isWritesLostKind, type WritesLostShown } from "./session-writes-lost";
+import { isAccountErrorReason, type AccountErrorReason } from "./account-error";
 import { isExternalTimeout, isExternalDetection, isExternalModels, type ExternalModels, type ExternalDetection } from "./orchestration-roster";
 import { isOrchestrationSettingRoster, type OrchestrationSettingRow, type RecommendedRosterChange } from "./orchestration-roster";
 import { isOrchestrationView, type OrchestrationView } from "./orchestration-view";
@@ -295,10 +299,11 @@ export type NormalizedEventBody =
         kind: "turn_failed";
         turnId: string;
         reason: string;
-        errorKind?: "usage_limit";
+        errorKind?: "usage_limit" | "account";
         resetsAt?: number | null;
         detail?: string;
       }
+    | { kind: "account_error"; turnId: string | null; reason: AccountErrorReason; detail?: string; priorGeneration?: true }
     | {
         kind: "api_retry";
         turnId: string | null;
@@ -362,6 +367,7 @@ export type NormalizedEventBody =
     | { kind: "subagent_info"; turnId: string | null; toolUseId: string; model?: string; agentId?: string }
     | { kind: "model_observed"; turnId: string | null; model: string; priorGeneration?: true }
     | { kind: "compact_boundary"; trigger: "auto" | "manual"; preTokens?: number; priorGeneration?: true }
+    | ({ kind: "session_writes_lost" } & WritesLostShown)
     | {
         kind: "tool_call_finished";
         priorGeneration?: true;
@@ -518,6 +524,8 @@ export interface AuthStatus {
   credentialSource: "oauth-subscription" | "api-key" | "cloud" | "helper" | "unknown";
   billingRealm: "subscription" | "api" | "cloud" | "unknown";
   apiKeySource?: string;
+  apiProvider?: string;
+  tokenSource?: string;
   model?: string;
   effort?: "low" | "medium" | "high" | "xhigh" | "max" | null;
   sessionId?: string;
@@ -697,7 +705,7 @@ export function summarizeToolInput(toolName: string, input: unknown): string | n
   }
 }
 
-export const HOST_ACTIONS = ["openSettings", "addClaudeModel"] as const;
+export const HOST_ACTIONS = ["openSettings", "addClaudeModel", "signInAgain"] as const;
 export type HostAction = (typeof HOST_ACTIONS)[number];
 
 export const SETTINGS_REVEAL_TARGETS = ["handoffAuto", "orchestration", "appearance", "todo"] as const;
@@ -803,7 +811,7 @@ export function normalizeComposerSendKey(v: unknown): ComposerSendKey {
   return v === "shiftEnter" ? "shiftEnter" : "enter";
 }
 
-export const FILE_LINK_BOOLEAN_SETTINGS = ["fileLinkInstruction", "planInstruction", "chromeIntegration", "mcpElicitation", "revealInExplorer", "allowOutsideWorkspace", "confirmOutsideWorkspace", "openOutsideReadOnly"] as const;
+export const FILE_LINK_BOOLEAN_SETTINGS = ["fileLinkInstruction", "planInstruction", "chromeIntegration", "mcpElicitation", "writesLostNotice", "revealInExplorer", "allowOutsideWorkspace", "confirmOutsideWorkspace", "openOutsideReadOnly"] as const;
 export const FILE_LINK_SETTINGS = [...FILE_LINK_BOOLEAN_SETTINGS, "openWithSystemApp"] as const;
 export type FileLinkBooleanSetting = (typeof FILE_LINK_BOOLEAN_SETTINGS)[number];
 export type FileLinkSetting = (typeof FILE_LINK_SETTINGS)[number];
@@ -901,7 +909,42 @@ export type SettingsPageToHost =
   | { type: "setFileLinkSetting"; requestId: number; setting: FileLinkBooleanSetting; enabled: boolean }
   | { type: "setFileLinkSetting"; requestId: number; setting: "openWithSystemApp"; value: string[] }
   | { type: "openVsCodeSettings" }
-  | { type: "settingWriteFailureAction"; action: SettingWriteFailureAction };
+  | { type: "settingWriteFailureAction"; action: SettingWriteFailureAction }
+  | { type: "migrationScan" }
+  | { type: "migrationExport"; categories: MigrationCategory[] }
+  | { type: "migrationImport" };
+
+export type MigrationNotice = { ok: boolean; text: string };
+
+function isMigrationNotice(v: unknown): v is MigrationNotice {
+  return typeof v === "object" && v !== null && hasOnlyKeys(v as Record<string, unknown>, ["ok", "text"])
+    && typeof (v as MigrationNotice).ok === "boolean" && typeof (v as MigrationNotice).text === "string";
+}
+
+function isMigrationScan(v: unknown): v is MigrationScan {
+  if (typeof v !== "object" || v === null) return false;
+  const m = v as Record<string, unknown>;
+  const count = (n: unknown) => Number.isSafeInteger(n) && (n as number) >= 0;
+  const todo = m.todo as Record<string, unknown> | undefined;
+  const env = m.claudeEnv as Record<string, unknown> | undefined;
+  const conversations = m.conversations as Record<string, unknown> | undefined;
+  const memory = m.memory as Record<string, unknown> | undefined;
+  return hasOnlyKeys(m, ["todo", "laisoraSettings", "claudeEnv", "conversations", "memory"]) && count(m.laisoraSettings)
+    && typeof conversations === "object" && conversations !== null && hasOnlyKeys(conversations, ["sessions", "bytes"]) && count(conversations.sessions) && count(conversations.bytes)
+    && typeof memory === "object" && memory !== null && hasOnlyKeys(memory, ["files", "bytes"]) && count(memory.files) && count(memory.bytes)
+    && (todo === undefined || typeof todo === "object" && todo !== null && hasOnlyKeys(todo, ["items", "bytes"]) && count(todo.items) && count(todo.bytes))
+    && typeof env === "object" && env !== null && hasOnlyKeys(env, ["files", "bytes", "mcpServers", "mcpKeyServers", "settingsKeyFiles"]) && count(env.files) && count(env.bytes) && count(env.mcpServers)
+    && isStringList(env.mcpKeyServers) && isStringList(env.settingsKeyFiles);
+}
+
+function isMigrationProgress(v: unknown): v is MigrationProgress {
+  if (typeof v !== "object" || v === null) return false;
+  const m = v as Record<string, unknown>;
+  const count = (n: unknown) => Number.isSafeInteger(n) && (n as number) >= 0;
+  return hasOnlyKeys(m, ["operation", "phase", "startedAt", "done", "total"]) && (MIGRATION_OPERATIONS as readonly unknown[]).includes(m.operation)
+    && (MIGRATION_PROGRESS_PHASES as readonly unknown[]).includes(m.phase) && count(m.startedAt)
+    && (m.done === undefined || count(m.done)) && (m.total === undefined || count(m.total));
+}
 
 export const SETTING_WRITE_FAILURE_KINDS = ["unregistered", "other"] as const;
 export type SettingWriteFailure = { kind: typeof SETTING_WRITE_FAILURE_KINDS[number]; reason: string };
@@ -926,6 +969,8 @@ export type HostToSettingsPage =
   | { type: "conductorPreview"; requestId: number; text: string; tokens: number }
   | { type: "recommendedRoster"; revision: string; changes: RecommendedRosterChange[] }
   | { type: "revealSetting"; target: SettingsRevealTarget }
+  | { type: "migrationState"; scan?: MigrationScan; busy: boolean; notice?: MigrationNotice }
+  | { type: "migrationProgress"; progress: MigrationProgress }
   | ({ type: "settingsState"; appearance?: AccentSettings; displayName?: string; eventLimit?: number; transcriptRetentionDays?: number; transcriptRetentionFallback: TranscriptRetentionFallback; composerSendKey: ComposerSendKey; apiKeyPolicy: ApiKeyPolicy; restoreTabsOnStartup: boolean; cliAutoUpdate: Record<ExecutorId, boolean>; initialModel?: string; autoContinueAtUsageLimit: boolean; guardEnabled: boolean; memoryBlockProjectType: boolean; todoEnabled: boolean; editSummaryEnabled: boolean; remoteControlCard: boolean; improvementMenu: boolean; welcome?: WelcomeSettings; handoffAuto?: HandoffAutoSettings; reloadNeeded: boolean; replyTo?: number; writeFailure?: SettingWriteFailure }
     & SettingsProfileProjection & Record<FileLinkBooleanSetting, boolean> & { openWithSystemApp: string[] } & { orchestrationEnabled: boolean; orchestrationAgents: OrchestrationSettingRow[]; orchestrationDefaults: OrchestrationSettingRow[]; conductorPolicy: string; conductorPolicyDefault: string; externalTimeoutMinutes: number; externalDetection: Record<ExecutorId, ExternalDetection>; externalModels: ExternalModels });
 
@@ -941,6 +986,10 @@ export function isSettingsPageToHost(v: unknown): v is SettingsPageToHost {
   if (t === "applyRecommendedRoster") return hasOnlyKeys(m, ["type", "requestId", "revision"]) && isSettingsRequestId(m.requestId) && isRosterRevision(m.revision);
   if (t === "settingWriteFailureAction") {
     return hasOnlyKeys(m, ["type", "action"]) && (SETTING_WRITE_FAILURE_ACTIONS as readonly string[]).includes(m.action as string);
+  }
+  if (t === "migrationScan" || t === "migrationImport") return hasOnlyKeys(m, ["type"]);
+  if (t === "migrationExport") {
+    return hasOnlyKeys(m, ["type", "categories"]) && Array.isArray(m.categories) && m.categories.every(isMigrationCategory);
   }
   if (t === "previewConductorInstruction") return hasOnlyKeys(m, ["type", "requestId", "policy"]) && isSettingsRequestId(m.requestId) && typeof m.policy === "string";
   if (t === "setAccentSetting") {
@@ -1038,6 +1087,11 @@ export function isHostToSettingsPage(v: unknown): v is HostToSettingsPage {
     && typeof m.text === "string" && typeof m.tokens === "number" && Number.isFinite(m.tokens);
   if (t === "recommendedRoster") return hasOnlyKeys(m, ["type", "revision", "changes"]) && isRosterRevision(m.revision) && Array.isArray(m.changes) && m.changes.every(isRecommendedRosterChange);
   if (t === "revealSetting") return hasOnlyKeys(m, ["type", "target"]) && isSettingsRevealTarget(m.target);
+  if (t === "migrationState") {
+    return hasOnlyKeys(m, ["type", "scan", "busy", "notice"]) && typeof m.busy === "boolean"
+      && (m.scan === undefined || isMigrationScan(m.scan)) && (m.notice === undefined || isMigrationNotice(m.notice));
+  }
+  if (t === "migrationProgress") return hasOnlyKeys(m, ["type", "progress"]) && isMigrationProgress(m.progress);
   if (t === "settingsState") {
     return isSettingsProfiles(m) && (m.appearance === undefined || isAccentSettings(m.appearance))
       && (m.displayName === undefined || isDisplayName(m.displayName))
@@ -1111,7 +1165,7 @@ export type WebviewToHost =
   | { type: "runHostAction"; action: "openSettings"; target?: SettingsRevealTarget }
   | { type: "welcomeAction"; action: "dismissNews"; version: string }
   | { type: "welcomeAction"; action: "hideTips" }
-  | { type: "runHostAction"; action: "addClaudeModel"; tabId: string }
+  | { type: "runHostAction"; action: "addClaudeModel" | "signInAgain"; tabId: string }
   | { type: "requestAccountUsage"; tabId: string; requestId: string }
   | { type: "requestAccountUsage"; requestId: string }
   | { type: "accountUsagePanelClosed" }
@@ -1169,7 +1223,7 @@ export type WebviewToHost =
     }
   | { type: "resumeSession"; sessionId: string; filePath: string; intoTabId?: string }
   | { type: "resumeHydrationRetry"; tabId: string }
-  | { type: "activeTab"; tabId: string }
+  | { type: "activeTab"; tabId: string; user?: true }
   | { type: "todoEdit"; requestId: string; edit: TodoEdit }
   | { type: "todoDetailRequest"; id: string }
   | { type: "todoLogRequest"; view: TodoLogView }
@@ -3228,7 +3282,7 @@ export interface ResumeHydrationSendDisposition {
 
 export type HostToWebview =
   | { type: "orchestrationView"; tabId: string; state: OrchestrationView }
-  | { type: "init"; protocolVersion: number; tabs: TabSnapshot[]; hostWindows?: boolean; systemAppExtensions?: string[] }
+  | { type: "init"; protocolVersion: number; tabs: TabSnapshot[]; hostWindows?: boolean; systemAppExtensions?: string[]; activeTabId?: string }
   | { type: "events"; tabId: string; events: NormalizedEvent[] }
   | {
       type: "resumeHydrationState";
@@ -3705,7 +3759,7 @@ export function isWebviewToHost(v: unknown): v is WebviewToHost {
     const m = v as Record<string, unknown>;
     const action = m.action;
     if (!(HOST_ACTIONS as readonly string[]).includes(action as string)) return false;
-    if (action === "addClaudeModel") return typeof tabId === "string" && tabId.length > 0
+    if (action === "addClaudeModel" || action === "signInAgain") return typeof tabId === "string" && tabId.length > 0
       && Object.keys(m).every((key) => key === "type" || key === "action" || key === "tabId");
     return (m.target === undefined || isSettingsRevealTarget(m.target)) && hasOnlyKeys(m, ["type", "action", "target"]);
   }
@@ -3873,7 +3927,7 @@ export function isWebviewToHost(v: unknown): v is WebviewToHost {
       typeof message.tabId === "string"
     );
   }
-  if (t === "activeTab") return typeof tabId === "string";
+  if (t === "activeTab") return typeof tabId === "string" && ((v as { user?: unknown }).user === undefined || (v as { user?: unknown }).user === true);
   if (t === "setEffort") {
     const effort = (v as { effort?: unknown }).effort;
     return (
@@ -4265,6 +4319,13 @@ function isPlausibleNormalizedEvent(x: unknown): x is NormalizedEvent {
       return false;
     }
     if (e.priorGeneration !== undefined && e.priorGeneration !== true) return false;
+  }
+  if (e.kind === "session_writes_lost") {
+    if (!isWritesLostErrorCode(e.errorCode) || !Array.isArray(e.lost) || e.lost.length === 0 || !e.lost.every(isWritesLostKind)) return false;
+  }
+  if (e.kind === "account_error") {
+    if (!isAccountErrorReason(e.reason) || (e.turnId !== null && typeof e.turnId !== "string") || (e.detail !== undefined && typeof e.detail !== "string") ||
+      (e.priorGeneration !== undefined && e.priorGeneration !== true)) return false;
   }
   if (e.kind === "tool_call_finished" && e.priorGeneration !== undefined && e.priorGeneration !== true) return false;
   return true;
@@ -4795,7 +4856,8 @@ export function isHostToWebview(v: unknown): v is HostToWebview {
       (extensions === undefined || (Array.isArray(extensions) &&
         extensions.every((item) => typeof item === "string" && normalizeSystemAppExtension(item) === item))) &&
       Array.isArray(tabs) &&
-      (tabs as unknown[]).every(isTabSnapshotShape)
+      (tabs as unknown[]).every(isTabSnapshotShape) &&
+      ((v as { activeTabId?: unknown }).activeTabId === undefined || typeof (v as { activeTabId?: unknown }).activeTabId === "string")
     );
   }
   if (t === "events") {

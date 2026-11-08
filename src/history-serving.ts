@@ -568,7 +568,8 @@ export async function handleHistoryMessage(
               scopeEvents.push(folded);
               return folded.seq === anchor.seq ? "stop" : "continue";
             },
-            () => !requestStillValid()
+            () => !requestStillValid(),
+            session.restoredWritesLost?.sessionId === ref.sessionId ? session.restoredWritesLost.notice : undefined
           );
           if (outcome === "invalidated") {
             await postWorklogTranscriptError(st, sender, session, msg.requestId, generation, "stale-request");

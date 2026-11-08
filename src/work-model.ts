@@ -5,7 +5,7 @@ import { isRequestMessage, mainCallTimeKind, MAX_TIME_TOOL_INTERVALS, toolTimeSp
 import { isFailedToolResult, isRejectedBeforeRun, taskNotificationOutcome, taskNotificationTerminal } from "./tool-result-signals";
 import { declaredBackgroundLaunch, DELEGATION_TOOL_NAMES, isCountedExternalRunCall, isMainExternalRun, TASK_TOOL_NAMES } from "./claude-tool-names";
 import { isPureCommandWrapper } from "./human-input-vocabulary";
-import { parseMarkdown } from "./markdown-ast";
+import { PLAN_FENCE_INFO, parseMarkdown } from "./markdown-ast";
 import { appendRecordPart, findCommitBoundary, joinRecordTexts, type RecordTextPart } from "./commit-boundary";
 import { redactAbsolutePaths, redactOptional } from "./path-redaction";
 import { planStepKey, planWorkTaskKey, TASK_KEY_PREFIX, TASK_PENDING_KEY_PREFIX, TODO_KEY_PREFIX } from "./plan-steps";
@@ -2421,7 +2421,7 @@ export function foldPlanDeclarationText(previous: PlanTextState | undefined, tur
   const text = joinRecordTexts(parts.map(part => part.text));
   let declaredThrough = prior?.declaredThrough ?? -1;
   const declarations: { goal: string; at: number }[] = [];
-  if (text.includes("laisora-plan")) {
+  if (text.includes(PLAN_FENCE_INFO)) {
     for (const node of parseMarkdown(text)) {
       if (node.type !== "plan" || node.offset <= declaredThrough) continue;
       declarations.push({ goal: node.goal, at });

@@ -20,6 +20,8 @@ import { redactAbsolutePaths, redactOptional } from "./path-redaction";
 import { countFileEdit, singleToolUseResult } from "./edit-summary";
 import { AUTO_MODE_UNEVALUATED } from "./tool-result-signals";
 import { isDelegationTool } from "./claude-tool-names";
+import { sessionWritesLostOf, shownWritesLost, type SessionWritesLost } from "./session-writes-lost";
+import { accountErrorOfRecord, type AccountErrorReason } from "./account-error";
 
 export function localizeLocalCommandReply(record: Record<string, unknown>, text: string): string {
   const message = record.message as Record<string, unknown> | undefined;
@@ -66,6 +68,7 @@ export interface ClaudeLiveNormalizerOptions {
   isClosed?: () => boolean;
   usageLimitPrefixes?: string[];
   onDelegateUsageLimitStop?: (agentId: string) => void;
+  onSessionWritesLost?: (loss: SessionWritesLost) => void;
   knownBackgroundTask?: (taskId: string) => "agent" | "tool" | "unconfirmed" | undefined;
   onRawToolUse?: (toolUseId: string, tool: string, input: Record<string, unknown>) => void;
   onRawToolResult?: (result: RawToolResult) => void;
@@ -315,6 +318,22 @@ export function isRefusalErrorProse(record: Record<string, unknown>, message: un
   return parseRefusalStop(message) !== null && isApiErrorFrame(record);
 }
 
+export function isReplacedErrorProse(record: Record<string, unknown>, message: unknown): boolean {
+  return isRefusalErrorProse(record, message) || accountErrorOfRecord(record) !== undefined;
+}
+
+export function accountErrorEvent(record: Record<string, unknown>, turnId: string | null): Extract<NormalizedEventBody, { kind: "account_error" }> | undefined {
+  const reason = accountErrorOfRecord(record);
+  if (reason === undefined) return undefined;
+  const content = (record.message as { content?: unknown } | undefined)?.content;
+  const detail = (Array.isArray(content) ? content as Record<string, unknown>[] : [])
+    .filter((block) => block?.type === "text" && typeof block.text === "string")
+    .map((block) => block.text as string)
+    .join("")
+    .trim();
+  return { kind: "account_error", turnId, reason, ...(detail ? { detail: redactAbsolutePaths(detail) } : {}) };
+}
+
 function parseTimestamp(msg: unknown): number | undefined {
   if (typeof msg === "object" && msg !== null && "timestamp" in msg) {
     const raw = (msg as { timestamp?: unknown }).timestamp;
@@ -338,6 +357,8 @@ export class ClaudeLiveNormalizer {
   private lastCompletedTurnId: string | null = null;
   private lastCompletedAssistantTextEvidence: AssistantTextEvidenceState | null = null;
   private lastAssistantError: string | null = null;
+  private lastAccountError: AccountErrorReason | null = null;
+  private account: Pick<AuthStatus, "apiProvider" | "tokenSource"> = {};
   private refusalWithoutFallback: RefusalStop | null = null;
   private refusalNoticeEmitted = false;
   private unlabeledAssistantTextTurnId: string | null = null;
@@ -379,6 +400,13 @@ export class ClaudeLiveNormalizer {
     this.turnState = state;
   }
 
+  noteAccount(account: { apiProvider?: unknown; tokenSource?: unknown } | undefined): void {
+    this.account = {
+      ...(typeof account?.apiProvider === "string" ? { apiProvider: account.apiProvider } : {}),
+      ...(typeof account?.tokenSource === "string" ? { tokenSource: account.tokenSource } : {}),
+    };
+  }
+
   noteOwnInput(uuid: string): void {
     this.ownInputs.add(uuid);
     if (this.ownInputs.size > OWN_INPUT_MEMORY_MAX) this.ownInputs.delete(this.ownInputs.values().next().value!);
@@ -400,6 +428,7 @@ export class ClaudeLiveNormalizer {
     this.lastCompletedTurnId = null;
     this.lastCompletedAssistantTextEvidence = null;
     this.lastAssistantError = null;
+    this.lastAccountError = null;
     this.refusalWithoutFallback = null;
     this.refusalNoticeEmitted = false;
     this.unlabeledAssistantTextTurnId = null;
@@ -419,7 +448,7 @@ export class ClaudeLiveNormalizer {
     extra?: {
       usage?: UsageSnapshot;
       reason?: string;
-      errorKind?: "usage_limit";
+      errorKind?: Extract<NormalizedEventBody, { kind: "turn_failed" }>["errorKind"];
       resetsAt?: number | null;
       detail?: string;
     },
@@ -434,6 +463,7 @@ export class ClaudeLiveNormalizer {
     this.rootAssistantMessageId = null;
     this.activeRootAssistantTextEvidence = null;
     this.lastAssistantError = null;
+    this.lastAccountError = null;
     this.refusalWithoutFallback = null;
     this.refusalNoticeEmitted = false;
     this.unlabeledAssistantTextTurnId = null;
@@ -518,6 +548,7 @@ export class ClaudeLiveNormalizer {
             verifiedAt: Date.now(),
             status: "verified",
             runtime,
+            ...this.account,
           };
           this.emit({ kind: "auth_status", auth }, defaultMeta);
           this.emitReportedPermissionMode(record, defaultMeta);
@@ -650,6 +681,16 @@ export class ClaudeLiveNormalizer {
             },
             defaultMeta
           );
+        } else if (record.subtype === "session_writes_lost") {
+          const loss = sessionWritesLostOf(record);
+          if (loss) {
+            this.emit({ kind: "session_writes_lost", ...shownWritesLost(loss) }, defaultMeta);
+            try {
+              this.opts.onSessionWritesLost?.(loss);
+            } catch (error) {
+              this.opts.log(`[session_writes_lost] could not record the mark: ${String(error)}`);
+            }
+          }
         } else {
           const notice = parseRefusalNotice(record);
           if (notice) this.handleRefusalNotice(notice, record, defaultMeta);
@@ -752,6 +793,11 @@ export class ClaudeLiveNormalizer {
         if (record.parent_tool_use_id == null && typeof record.error === "string" && record.error) {
           this.lastAssistantError = record.error;
         }
+        const accountError = accountErrorEvent(record, this.currentTurnId ?? this.lastCompletedTurnId);
+        if (accountError !== undefined) {
+          this.lastAccountError = accountError.reason;
+          this.emit(accountError, defaultMeta);
+        }
         const parentToolUseId =
           typeof record.parent_tool_use_id === "string" ? record.parent_tool_use_id : null;
         const msgObj = record.message as Record<string, unknown> | undefined;
@@ -799,8 +845,7 @@ export class ClaudeLiveNormalizer {
           // CLI records contain one completed block. Defensive combined records use
           // HEAD's text aggregation in content order, before the unchanged tool loop.
           const uuid = parseWireUuid(record);
-          if ((uuid === null || !this.emittedNarrationUuids.has(uuid)) &&
-              !(parseRefusalStop(msgObj) !== null && isApiErrorFrame(record))) {
+          if ((uuid === null || !this.emittedNarrationUuids.has(uuid)) && !isReplacedErrorProse(record, msgObj)) {
             const turnId = this.currentTurnId ?? this.lastCompletedTurnId ?? this.startTurn(undefined, defaultMeta);
             const unlabeledText = this.unlabeledAssistantTextTurnId;
             if (uuid !== null) this.emittedNarrationUuids.add(uuid);
@@ -836,7 +881,7 @@ export class ClaudeLiveNormalizer {
             }
           }
           let foreignFinalWithoutText = false;
-          if (finalText.length > 0 && !refusalIsErrorProse) {
+          if (finalText.length > 0 && !refusalIsErrorProse && accountError === undefined) {
             const messageId = typeof msgObj?.id === "string" && msgObj.id.length > 0 ? msgObj.id : null;
             const isActiveMessage =
               messageId === null ||
@@ -1153,6 +1198,8 @@ export class ClaudeLiveNormalizer {
               },
               defaultMeta
             );
+          } else if (this.lastAccountError !== null) {
+            this.endTurn("turn_failed", { reason: this.lastAccountError, errorKind: "account" }, defaultMeta);
           } else {
             const subtype =
               typeof record.subtype === "string" && record.subtype && record.subtype !== "success"

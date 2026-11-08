@@ -1,5 +1,25 @@
 # Changelog
 
+## 1.16.0
+
+- **Migration.** A new "Migration" tab in the settings puts your ToDo, portable LAISORA settings,
+  your Claude environment and the conversations you choose into one ZIP, and imports it on a new
+  PC, remapping your home folder and keeping backups of what it replaces. Login credentials are not
+  included.
+- When a full disk keeps part of a conversation from being saved, the conversation shows a notice,
+  and again when you resume it. A switch on the settings page turns it off.
+- LLM improvement analysis also suggests removing or correcting hooks and instructions that are no
+  longer needed, are replaced by a built-in Claude Code feature, or contradict its changelog or docs.
+- Decision and check cards also read blocks with small mistakes (a misnamed fence, a missing
+  closing fence, an unclosed quote, a one-letter key typo) instead of showing them as raw text.
+- The end of a turn no longer denies approvals that are still waiting, and a subagent's question
+  stays open when you send a message in the main chat.
+- An expired claude.ai sign-in shows a plain explanation with a sign-in button instead of the raw
+  error.
+- A new or opened conversation becomes active in exactly one LAISORA view.
+- A failing combined guard hook blocks the tool call instead of letting it through.
+- Updated the Claude Agent SDK to 0.3.319 (Claude Code 2.1.319).
+
 ## 1.15.3
 
 - When an MCP server asks for your input or asks you to open a page, the conversation shows a card

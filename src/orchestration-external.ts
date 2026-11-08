@@ -1,5 +1,6 @@
 import { pathIsInside, lexicalPathIsInsideForEarlyRejectOnly, realPathOrNearestSync } from "./path-containment";
 import { execFile, spawn, type ChildProcess, type SpawnOptions } from "node:child_process";
+import { extensionNodeLaunch } from "./extension-runtime";
 import { accessSync, constants, existsSync, readFileSync } from "node:fs";
 import { appendFile, mkdir, open, readFile, readdir, lstat, readlink, rm, stat, realpath, utimes, writeFile } from "node:fs/promises";
 import { EXTERNAL_RUN_MARKER_HEARTBEAT_MS, externalRunMarkerFresh } from "./cli-update-policy";
@@ -255,7 +256,7 @@ export function externalLaunch(executable: string, args: string[], env: NodeJS.P
   if (!script) throw new Error("R-ORC-12: unsupported executable shim");
   const entry = resolve(dirname(executable), script.replace(/\\/g, "/"));
   accessSync(entry, constants.F_OK);
-  return { executable: process.execPath, args: [entry, ...args], env: { ...env, ELECTRON_RUN_AS_NODE: "1" } };
+  return extensionNodeLaunch(entry, args, env);
 }
 
 export function windowsCommandLineUnits(executable: string, args: readonly string[]): number {

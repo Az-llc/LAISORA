@@ -835,7 +835,7 @@ async function openTodoConversationNow(st: SessionStore, msg: Extract<WebviewToH
     return;
   }
   if (target.kind === "tab") {
-    await st.postTo(sender, { type: "activateTab", tabId: target.tabId });
+    st.activateExisting(sender, target.tabId);
     return;
   }
   if (target.kind === "session") {
@@ -854,7 +854,7 @@ async function openTodoConversationNow(st: SessionStore, msg: Extract<WebviewToH
       s.autoTitled = true;
       const chosen = normalizeTitleValue(item.title);
       s.unpersistedChosenTitle = chosen === null ? null : { title: chosen, failedAttempts: 0 };
-    });
+    }, sender);
     if (!session) return false;
     postTodoSnapshot();
     const parent = liveItem(read.document, item.parentId);
@@ -866,7 +866,7 @@ async function openTodoConversationNow(st: SessionStore, msg: Extract<WebviewToH
   if (started === "elsewhere") showOpenElsewhere();
 }
 
-const replyStarts = new WeakMap<Session, { sinceRevision: number; st: SessionStore }>();
+const replyStarts = new WeakMap<Session, { sinceRevision: number; st: SessionStore; from?: vscode.Webview }>();
 const replyRequests = new WeakSet<Session>();
 
 const replySessionId = (s: Session): string | undefined => s.conversation?.recordSessionId ?? sessionRecordId(s);
@@ -890,7 +890,7 @@ async function replyTextOf(sessionId: string, replyId: string): Promise<string |
   return todoReplyText(read.messages, replyId);
 }
 
-export async function todoFromReply(st: SessionStore, msg: Extract<WebviewToHost, { type: "todoFromReply" }>, s: Session): Promise<void> {
+export async function todoFromReply(st: SessionStore, msg: Extract<WebviewToHost, { type: "todoFromReply" }>, s: Session, sender?: vscode.Webview): Promise<void> {
   const refuse = (why: string, notice?: string) => {
     output.appendLine(`[todo] todoFromReply refused: ${why}`);
     if (notice !== undefined) st.post({ type: "tabNotice", tabId: s.tabId, text: notice });
@@ -914,7 +914,7 @@ export async function todoFromReply(st: SessionStore, msg: Extract<WebviewToHost
     if (!again.ok) return refuse(again.message);
     const linked = liveItem(read.document, linkedTodoItemIdOf(s));
     const instruction = todoFromReplyInstruction({ excerpt: todoReplyExcerpt(text), ...(linked ? { linked: { id: linked.id, title: linked.title } } : {}), start: msg.start });
-    if (msg.start) replyStarts.set(s, { sinceRevision: read.document.revision, st });
+    if (msg.start) replyStarts.set(s, { sinceRevision: read.document.revision, st, ...(sender ? { from: sender } : {}) });
     else replyStarts.delete(s);
     let started = false;
     try {
@@ -944,7 +944,7 @@ export function settleTodoReplyStart(s: Session, completed: boolean): void {
       output.appendLine(`[todo] todoFromReply: Claude added ${added.length} top-level items in that turn, so none is opened`);
       return;
     }
-    const webview = pending.st.activeWebview;
+    const webview = pending.st.activationTarget(pending.from);
     if (!webview) {
       output.appendLine("[todo] todoFromReply: no LAISORA view is open, so the item is not opened");
       return;

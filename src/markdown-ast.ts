@@ -1,6 +1,8 @@
 import MarkdownIt, { type Token } from "markdown-it";
-import { askQualityIssues, parseAskBlock, parsePlanBlock, type AskBlock, type AskQualityIssue } from "./ask-parser";
+import { ASK_BLOCK_LINE, askQualityIssues, isPartialAskLine, parseAskBlock, parsePlanBlock, type AskBlock, type AskQualityIssue } from "./ask-parser";
+import { fenceOpening, isClosingFence } from "./commit-boundary";
 import { DEFAULT_SYSTEM_APP_EXTENSIONS } from "./file-link-open-mode";
+import { IMPROVEMENT_VERDICTS_FENCE } from "./improvement-brief";
 import { parseFileLinkTarget, type FileLinkPlatform, type FileLinkTarget } from "./file-link-target";
 
 export type TableAlign = "left" | "center" | "right" | undefined;
@@ -258,8 +260,8 @@ interface TableBuilder {
   currentCell: MdTableCellNode | null;
 }
 
-export const ASK_FENCE_INFO = "laisora-ask";
-export const ASK_REJECTED_FENCE_INFO = "laisora-ask rejected";
+const ASK_FENCE_INFO = "laisora-ask";
+export const ASK_REJECTED_FENCE_INFO = `${ASK_FENCE_INFO} rejected`;
 export const TODO_SPLIT_FENCE_INFO = "laisora-todo-split";
 const TODO_SPLIT_REASON_MAX = 500;
 
@@ -275,13 +277,58 @@ function parseTodoSplit(content: string): { item: string; reason: string } | nul
   }
 }
 
+export const PLAN_FENCE_INFO = "laisora-plan";
+const LAISORA_FENCE_PREFIX = "laisora-";
+const NON_ASK_LAISORA_FENCES: readonly string[] = [PLAN_FENCE_INFO, TODO_SPLIT_FENCE_INFO, IMPROVEMENT_VERDICTS_FENCE];
+const FENCE_INFO_ANYWHERE = /(?:`{3,}|~{3,})([^\n`]*)/g;
+const ASK_FENCE_INFO_AT_END = new RegExp(`${LAISORA_FENCE_PREFIX}\\S*(?: rejected)?\\s*$`);
+
 function isAskFenceInfo(info: string): boolean {
   const trimmed = info.trim();
-  return trimmed === ASK_FENCE_INFO || trimmed === ASK_REJECTED_FENCE_INFO;
+  return trimmed === ASK_REJECTED_FENCE_INFO || (trimmed.startsWith(LAISORA_FENCE_PREFIX) && !/\s/.test(trimmed) && !NON_ASK_LAISORA_FENCES.includes(trimmed));
 }
 
-function askFences(src: string): { ask: AskBlock; startLine: number; endLine: number }[] {
-  return md.parse(src, {}).flatMap((token) => {
+export function mayHoldAskBlock(text: string): boolean {
+  return [...text.matchAll(FENCE_INFO_ANYWHERE)].some((match) => isAskFenceInfo(match[1]));
+}
+
+const withoutCr = (line: string): string => line.endsWith("\r") ? line.slice(0, -1) : line;
+
+function fenceLeftOpen(lines: readonly string[], from: number, marker: string): boolean {
+  for (let k = from; k < lines.length; k++) {
+    if (isClosingFence(withoutCr(lines[k]), marker)) return false;
+    if (fenceOpening(withoutCr(lines[k]))?.info.trim()) return true;
+  }
+  return !(from === lines.length - 1 && isPartialAskLine(withoutCr(lines[from])));
+}
+
+export function closeAskFences(src: string): string {
+  const lines = src.split("\n");
+  const out: string[] = [];
+  let i = 0;
+  while (i < lines.length) {
+    const opening = fenceOpening(withoutCr(lines[i]));
+    if (!opening) { out.push(lines[i++]); continue; }
+    let end = i + 1;
+    if (isAskFenceInfo(opening.info)) {
+      while (end < lines.length && !isClosingFence(withoutCr(lines[end]), opening.marker) && (!lines[end].trim() || ASK_BLOCK_LINE.test(withoutCr(lines[end])))) end++;
+      let last = end;
+      while (last > i + 1 && !lines[last - 1].trim()) last--;
+      if (end < lines.length && !isClosingFence(withoutCr(lines[end]), opening.marker) && fenceLeftOpen(lines, end, opening.marker) && parseAskBlock(lines.slice(i + 1, last).map(withoutCr).join("\n"))) {
+        out.push(...lines.slice(i, last), opening.indent + opening.marker, ...lines.slice(last, end));
+        i = end;
+        continue;
+      }
+    }
+    while (end < lines.length && !isClosingFence(withoutCr(lines[end]), opening.marker)) end++;
+    out.push(...lines.slice(i, Math.min(end + 1, lines.length)));
+    i = end + 1;
+  }
+  return out.join("\n");
+}
+
+function askFences(source: string): { ask: AskBlock; startLine: number; endLine: number }[] {
+  return md.parse(closeAskFences(source), {}).flatMap((token) => {
     if (token.type !== "fence" || !isAskFenceInfo(token.info) || !token.map) return [];
     const ask = parseAskBlock(token.content);
     return ask ? [{ ask, startLine: token.map[0], endLine: token.map[1] }] : [];
@@ -325,7 +372,8 @@ export function isRejectedAsk(ask: AskBlock, titles: readonly string[]): boolean
 export interface AskRejection { readonly upTo: number; readonly titles: readonly string[] }
 
 export function resolveRejectedAsks(texts: readonly string[], rejections: readonly AskRejection[]): (string | null)[] {
-  const fences = texts.map((text) => askFences(text));
+  const repaired = texts.map(closeAskFences);
+  const fences = repaired.map((text) => askFences(text));
   const rejected = new Set<string>();
   let from = 0;
   for (const rejection of [...rejections].sort((a, b) => a.upTo - b.upTo)) {
@@ -336,21 +384,22 @@ export function resolveRejectedAsks(texts: readonly string[], rejections: readon
   }
   const laterDecide = (k: number, index: number): boolean =>
     fences[k].some((fence, i) => i > index && fence.ask.kind === "decide") || fences.slice(k + 1).some((list) => list.some((fence) => fence.ask.kind === "decide"));
-  return texts.map((text, k) => {
+  return repaired.map((text, k) => {
     const marks = fences[k].flatMap((fence, index) => rejected.has(`${k}:${index}`) ? [{ fence, hide: laterDecide(k, index) }] : []);
-    if (marks.length === 0) return text;
+    if (marks.length === 0) return texts[k];
     const lines = text.split("\n");
     const dropped = new Set<number>();
     for (const { fence, hide } of marks) {
       if (hide) for (let line = fence.startLine; line < fence.endLine; line++) dropped.add(line);
-      else lines[fence.startLine] = lines[fence.startLine].replace(new RegExp(`${ASK_FENCE_INFO}(?: rejected)?\\s*$`), ASK_REJECTED_FENCE_INFO);
+      else lines[fence.startLine] = lines[fence.startLine].replace(ASK_FENCE_INFO_AT_END, ASK_REJECTED_FENCE_INFO);
     }
     const kept = lines.filter((_, line) => !dropped.has(line)).join("\n");
     return kept.trim() ? kept : null;
   });
 }
 
-export function parseMarkdown(src: string): MdNode[] {
+export function parseMarkdown(source: string): MdNode[] {
+  const src = closeAskFences(source);
   const tokens = md.parse(src, {});
   const rootNodes: MdNode[] = [];
   const stack: { node: MdNode & { children?: MdNode[] }; tableBuilder?: TableBuilder }[] = [];
@@ -520,7 +569,7 @@ export function parseMarkdown(src: string): MdNode[] {
         const lines = src.split("\n");
         const offset = blockOffset(lines, token);
         const closed = fenceClosed(token);
-        const plan = token.info.trim() === "laisora-plan" && closed ? parsePlanBlock(token.content) : null;
+        const plan = token.info.trim() === PLAN_FENCE_INFO && closed ? parsePlanBlock(token.content) : null;
         if (plan) {
           currentContainer().push({ type: "plan", goal: plan.goal, offset });
           continue;

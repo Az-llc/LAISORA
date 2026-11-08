@@ -6,9 +6,10 @@ export type LaisoraInput =
   | { readonly kind: "resume" }
   | { readonly kind: "todo"; readonly title: string }
   | { readonly kind: "todoFromReply"; readonly start: boolean }
-  | { readonly kind: "improvement" };
+  | { readonly kind: "improvement" }
+  | { readonly kind: "migrationImport" };
 
-const LAISORA_INPUT_HEAD = /^\[LAISORA:(resume|todo|todoFromReply|improvement)\](?: ([^\n]*))?\n/;
+const LAISORA_INPUT_HEAD = /^\[LAISORA:(resume|todo|todoFromReply|improvement|migrationImport)\](?: ([^\n]*))?\n/;
 const TODO_FROM_REPLY_START = "start";
 
 function laisoraInputLabel(input: LaisoraInput): string {
@@ -28,6 +29,7 @@ export function parseLaisoraInput(recorded: string): { input: LaisoraInput; text
   const input: LaisoraInput = head[1] === "todo" ? { kind: "todo", title: head[2] ?? "" }
     : head[1] === "todoFromReply" ? { kind: "todoFromReply", start: head[2] === TODO_FROM_REPLY_START }
     : head[1] === "improvement" ? { kind: "improvement" }
+    : head[1] === "migrationImport" ? { kind: "migrationImport" }
     : { kind: "resume" };
   return { input, text: trimmed.slice(head[0].length) };
 }
@@ -44,5 +46,6 @@ export function laisoraInputLine(input: LaisoraInput): string | undefined {
       : l10n.t("LAISORA: Add to ToDo (the topic of this reply)");
   }
   if (input.kind === "improvement") return l10n.t("LAISORA sent Claude the brief for the LLM improvement analysis.");
+  if (input.kind === "migrationImport") return l10n.t("LAISORA asked Claude to import a migration ZIP.");
   return undefined;
 }

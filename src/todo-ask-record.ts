@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 import { open, stat } from "node:fs/promises";
 import type { ConversationMessage } from "./conversation-history";
-import { ASK_FENCE_INFO } from "./markdown-ast";
+import { mayHoldAskBlock } from "./markdown-ast";
 import { createConversationMessageParser, extractCliInsertedUserText, extractHumanUserPrompt } from "./session-transcript";
 import { todoAskDecisionTracker, todoAskSourceMessages, todoDecisionKey, type TodoAskDecisionTracker, type TodoDecision, type TodoDecisionAsk, type TodoRecordMessage } from "./todo-model";
 
@@ -78,7 +78,7 @@ export class RecordTailReader<R> {
   }
 }
 
-const keepForAsks = (message: ConversationMessage): boolean => message.role === "user" || (message.role === "assistant" && message.text.includes(ASK_FENCE_INFO));
+const keepForAsks = (message: ConversationMessage): boolean => message.role === "user" || (message.role === "assistant" && mayHoldAskBlock(message.text));
 
 export interface TodoAskRecordRead {
   readonly endedAt: number;

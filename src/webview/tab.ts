@@ -57,6 +57,8 @@ import { createYouItems, encodeAskDismissal, encodeAskResolution, youAnchor, typ
 import { findCommitBoundary, joinRecordTexts, prependRecordParts, recordSeparator, withoutRetracted, type RecordTextPart } from "../commit-boundary";
 import { breaksParagraph, cardHome, compareTurnOrder, editSummaryPlace, labelPendingParts, legacyAskKeys, locateInParts, mergedParagraph, paragraphKey, paragraphText, prependTurnLayout, turnLabelModel, type ModelMark, type TurnItem, type TurnOrder, type TurnParagraph } from "./turn-layout";
 import { isConvMessageEvent, isConvRenderableEvent, permissionDeniedTarget } from "../conv-renderable";
+import { writesLostNotices, type WritesLostNotice } from "../session-writes-lost";
+import { accountErrorText, claudeAiSignInExpired, type AccountAuthSource } from "../account-error";
 import { isFailedToolResult, taskNotificationOutcome } from "../tool-result-signals";
 import { MARKS } from "./marks";
 import {
@@ -618,6 +620,36 @@ function compactBoundaryText(ev: { trigger: "auto" | "manual"; preTokens?: numbe
   const trigger = ev.trigger === "auto" ? l10n.t("auto") : l10n.t("manual");
   const from = typeof ev.preTokens === "number" ? l10n.t(", from {0} tokens", ev.preTokens.toLocaleString(uiLocale())) : "";
   return l10n.t("── Context compacted ({0}{1}) ──", trigger, from);
+}
+function writesLostText(notice: WritesLostNotice): string {
+  if (notice.subject === "transcript") {
+    if (notice.cause === "diskFull") return l10n.t("The disk was full, so part of this conversation's record was not saved. When you resume this conversation, earlier parts may be missing.");
+    if (notice.cause === "quota") return l10n.t("The disk quota was used up, so part of this conversation's record was not saved. When you resume this conversation, earlier parts may be missing.");
+    return l10n.t("Part of this conversation's record could not be saved ({0}). When you resume this conversation, earlier parts may be missing.", notice.errorCode || l10n.t("unknown error"));
+  }
+  if (notice.cause === "diskFull") return l10n.t("The disk was full, so Claude Code settings changes from this run (~/.claude.json) were not saved.");
+  if (notice.cause === "quota") return l10n.t("The disk quota was used up, so Claude Code settings changes from this run (~/.claude.json) were not saved.");
+  if (notice.cause === "unspecified") return l10n.t("Claude Code settings changes from this run (~/.claude.json) were not saved either.");
+  return l10n.t("Claude Code settings changes from this run (~/.claude.json) could not be saved ({0}).", notice.errorCode || l10n.t("unknown error"));
+}
+function fillAccountErrorBlock(block: HTMLElement, ev: Extract<NormalizedEvent, { kind: "account_error" }>, tabId: string, auth: AccountAuthSource): void {
+  block.textContent = "";
+  block.dataset.accountError = ev.reason;
+  const lines = [accountErrorText(ev.reason, "resend", auth), ...(ev.detail ? [ev.detail] : [])];
+  for (const line of lines) {
+    const row = document.createElement("div");
+    row.textContent = line;
+    block.append(row);
+  }
+  if (!claudeAiSignInExpired(ev.reason, auth)) return;
+  const row = document.createElement("div");
+  const signIn = document.createElement("button");
+  signIn.type = "button";
+  signIn.className = "primary";
+  signIn.textContent = l10n.t("Sign in again");
+  signIn.addEventListener("click", () => vscode.postMessage({ type: "runHostAction", action: "signInAgain", tabId }));
+  row.append(signIn);
+  block.append(row);
 }
 const APPROVAL_REF_SUFFIX = l10n.t(" (respond in the Conversation tab)");
 
@@ -1816,6 +1848,7 @@ export class Tab {
   }
 
   auth: AuthStatus | null = null;
+  private readonly accountErrorBlocks = new Map<HTMLElement, Extract<NormalizedEvent, { kind: "account_error" }>>();
   resumeSessionId: string | undefined;
   configModel: string | undefined;
   configEffort: string | undefined;
@@ -4495,6 +4528,15 @@ export class Tab {
       case "compact_boundary":
         if (isConvRenderableEvent(ev)) this.onCompactBoundary(ev);
         break;
+      case "session_writes_lost":
+        for (const notice of writesLostNotices(ev)) this.addBlock("system", writesLostText(notice));
+        break;
+      case "account_error":
+        if (isConvRenderableEvent(ev)) {
+          this.placeAccountError(this.addBlock("error", ""), ev);
+          this.flagConvAttention();
+        }
+        break;
       case "permission_denied":
         this.onPermissionDenied(ev);
         break;
@@ -4546,8 +4588,17 @@ export class Tab {
     this.updateStrip();
   }
 
+  private placeAccountError(block: HTMLElement, ev: Extract<NormalizedEvent, { kind: "account_error" }>): void {
+    this.accountErrorBlocks.set(block, ev);
+    fillAccountErrorBlock(block, ev, this.tabId, this.auth);
+  }
+
   private onAuthStatus(ev: Extract<NormalizedEvent, { kind: "auth_status" }>): void {
     this.auth = ev.auth;
+    for (const [block, error] of this.accountErrorBlocks) {
+      if (block.isConnected) fillAccountErrorBlock(block, error, this.tabId, this.auth);
+      else this.accountErrorBlocks.delete(block);
+    }
     if (activeTabId === this.tabId) refreshChrome();
   }
 
@@ -4922,7 +4973,7 @@ export class Tab {
           : null;
       const head = ev.detail ? l10n.t("Limit reached: {0}", ev.detail) : l10n.t("Usage limit reached");
       this.addBlock("error", when ? l10n.t("{0} (resets at {1})", head, when) : head);
-    } else {
+    } else if (ev.errorKind !== "account") {
       this.addBlock("error", l10n.t("Turn failed: {0}", ev.reason));
     }
     this.setTurnState("idle");
@@ -6199,6 +6250,24 @@ export class Tab {
         this.convMessageUuids.add(ev.uuid);
       }
       frag.append(div);
+      return "created";
+    }
+    if (ev.kind === "account_error") {
+      const div = document.createElement("div");
+      div.className = "block error";
+      div.dataset.convPast = "1";
+      this.placeAccountError(div, ev);
+      frag.append(div);
+      return "created";
+    }
+    if (ev.kind === "session_writes_lost") {
+      for (const notice of writesLostNotices(ev)) {
+        const div = document.createElement("div");
+        div.className = "block system";
+        div.dataset.convPast = "1";
+        div.textContent = writesLostText(notice);
+        frag.append(div);
+      }
       return "created";
     }
     if (ev.kind === "model_refusal_fallback" || ev.kind === "model_fallback_revert") {

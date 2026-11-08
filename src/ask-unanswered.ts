@@ -13,7 +13,6 @@ export function isAskUnansweredKind(value: unknown): value is AskUnansweredKind 
 export const APPROVAL_RESOLVED_BY = {
   user: "user",
   chat: "chat",
-  turnEnd: "turn-end",
   interrupt: "interrupt",
   dispose: "dispose",
   withdrawn: "withdrawn",
@@ -51,10 +50,10 @@ export function askUnansweredOf(toolUseResult: unknown): AskUnansweredKind | und
 export function questionsRepliedInChat(
   text: string,
   unansweredCapable: boolean,
-  pending: readonly { requestId: string; question: boolean }[]
+  pending: readonly { requestId: string; question: boolean; delegate?: boolean }[]
 ): string[] {
   if (!unansweredCapable || isCommandInput(text)) return [];
-  return pending.filter((p) => p.question).map((p) => p.requestId);
+  return pending.filter((p) => p.question && !p.delegate).map((p) => p.requestId);
 }
 
 export interface ApprovalOutcome {

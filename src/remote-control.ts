@@ -1,6 +1,7 @@
 import * as l10n from "@vscode/l10n";
 import { BRIDGE_CONNECTIONS, isRemoteControlSessionUrl, type BridgeConnection } from "./protocol";
 import type { ClaudeConversation } from "./claudeHost";
+import { withLatestWritten } from "./capped-record";
 
 export const REMOTE_CONTROL_CARD_SETTING = "remoteControl.showCard";
 export const REMOTE_CONTROL_SESSIONS_KEY = "remoteControl.sessions";
@@ -118,7 +119,5 @@ export function remoteControlRecordOf(raw: unknown, sessionId: string): RemoteCo
 }
 
 export function withRemoteControlRecord(raw: unknown, sessionId: string, record: RemoteControlRecord): Record<string, RemoteControlRecord> {
-  const { [sessionId]: _replaced, ...rest } = recordsOf(raw);
-  const entries = [...Object.entries(rest), [sessionId, record] as const];
-  return Object.fromEntries(entries.slice(-REMOTE_CONTROL_SESSIONS_MAX));
+  return withLatestWritten(recordsOf(raw), [[sessionId, record]], REMOTE_CONTROL_SESSIONS_MAX).entries;
 }

@@ -128,19 +128,26 @@ export function decisionPendingSinceUserSend(events: readonly NormalizedEvent[])
   return askBlocksIn(texts.reverse().join("")).some((ask) => ask.kind === "decide");
 }
 
-export interface AutoHandoffGateInput {
+export interface CliActivity {
   idle: boolean;
   runningAgents: number;
   runningBackgroundTasks: number;
   runningExternalRuns: number;
   queuedMessages: number;
+}
+
+export interface AutoHandoffGateInput extends CliActivity {
   composerHasText: boolean;
   handoffRunning: boolean;
 }
 
+export function cliReplaceable(activity: CliActivity): boolean {
+  return activity.idle && activity.runningAgents === 0 && activity.runningBackgroundTasks === 0 && activity.runningExternalRuns === 0
+    && activity.queuedMessages === 0;
+}
+
 export function autoHandoffGateOpen(gate: AutoHandoffGateInput): boolean {
-  return gate.idle && gate.runningAgents === 0 && gate.runningBackgroundTasks === 0 && gate.runningExternalRuns === 0
-    && gate.queuedMessages === 0 && !gate.composerHasText && !gate.handoffRunning;
+  return cliReplaceable(gate) && !gate.composerHasText && !gate.handoffRunning;
 }
 
 export type HeldCandidateStep = { action: "fire" } | { action: "hold"; heldByBackground: boolean } | { action: "drop" };

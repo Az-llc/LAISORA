@@ -76,6 +76,7 @@ import {
   type WorkModelState,
 } from "./work-model";
 import type { HostArtifactAccess } from "./artifact-access";
+import type { WritesLostShown } from "./session-writes-lost";
 
 const RESUME_DISPLAY_BYPASS_KINDS: ReadonlySet<string> = new Set([
   "approval_request",
@@ -127,6 +128,7 @@ export class Session {
   seq = 0;
   generation = 1;
   conversation: ClaudeConversation | null = null;
+  restartAfterSignIn: ClaudeConversation | undefined;
   cliStartedAt?: number;
   startMeasurement: StartMeasurement | null = null;
   readonly unsentSends = new Set<() => void>();
@@ -170,6 +172,7 @@ export class Session {
   todoItemId: string | undefined;
   todoTurnStartedAt: number | undefined;
   handoffSource?: HandoffSourceSnapshot;
+  restoredWritesLost?: { sessionId: string; notice: WritesLostShown | undefined };
   resuming = false;
   hydration: ResumeHydration | null = null;
   hydrationCoverageUnconfirmed = false;
@@ -243,6 +246,7 @@ export class Session {
       this.auth = auth;
     }
     this.handoffSource = undefined;
+    this.restoredWritesLost = undefined;
     this.resumeFilePath = undefined;
     this.remoteControl = initialTabRemoteControl(this.remoteControl.choice);
     releaseHistoryWindow(historyScopeKey(this));

@@ -18,6 +18,11 @@ export interface WelcomeUiNames { menuGlyph: string; handoffItem: string; appear
 
 export function welcomeNews(): Readonly<Record<string, readonly WelcomeNewsItem[]>> {
   return {
+    "1.16.0": [
+      { kind: "new", text: l10n.t("The \"Migration\" tab in the settings puts ToDo, LAISORA settings, your Claude environment and the conversations you choose into one ZIP, and brings them into a new PC.") },
+      { kind: "new", text: l10n.t("When a full disk keeps part of a conversation from being saved, the conversation shows a notice, also when you resume it. You can turn it off in the settings.") },
+      { kind: "new", text: l10n.t("LLM improvement analysis also suggests removing or correcting instructions and hooks that are no longer needed or that contradict Claude Code.") },
+    ],
     "1.15.3": [],
     "1.15.2": [],
     "1.15.1": [],

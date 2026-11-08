@@ -212,7 +212,10 @@ function activateReady(context: vscode.ExtensionContext): void {
   if (editDiffs) context.subscriptions.push(editDiffs);
   context.subscriptions.push(
     vscode.commands.registerCommand("laisora.open", () => openPanel(context)),
-    vscode.commands.registerCommand("laisora.openSettings", (target?: unknown) => openSettingsPanel(context, undefined, isSettingsRevealTarget(target) ? target : undefined)),
+    vscode.commands.registerCommand("laisora.openSettings", (target?: unknown) => {
+      store?.noteSettingsOpened();
+      openSettingsPanel(context, undefined, isSettingsRevealTarget(target) ? target : undefined);
+    }),
     vscode.commands.registerCommand("laisora.pasteText", () => pasteClipboardTextIntoComposer(store)),
     vscode.commands.registerCommand("laisora.todoToggleDrawer", () => toggleTodoDrawer())
   );
@@ -319,6 +322,7 @@ function activateReady(context: vscode.ExtensionContext): void {
 export type { SessionStore } from "./store-surfaces";
 
 export { sessionsForTest } from "./store-surfaces";
+export { startMigrationImport } from "./migration-host";
 export { appendSessionRecordOnFreshLine as appendSessionRecordForTest } from "./session-files";
 
 function guardMessage(): string | null {

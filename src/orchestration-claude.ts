@@ -1,6 +1,7 @@
 import { ClaudeConversation, type ClaudeHostOptions } from "./claudeHost";
 import { checkClaudeCodeVersion, resolveClaudeCodeExecutable } from "./claudeCliResolver";
 import { runFailureReason } from "./orchestration-external";
+import { accountErrorReason } from "./account-error";
 import { resolveModelDisplayName } from "./model-display-name";
 import { claudeModelIdLabel, isOrchestrationEffort, type ExternalModel, type ExternalModelsState, type ExternalDetection } from "./orchestration-executors";
 
@@ -55,12 +56,8 @@ export async function listClaudeModels(cwd: string, log: (message: string) => vo
   try {
     conv = create({ ...options, cwd, model: "opus[1m]", settingSources: [], permissionMode: "default", interruptForceKillTimeoutMs: 5000,
       onApprovalRequest: async () => ({ behavior: "deny" }), onEvent: event => {
-        if (event.kind !== "api_retry") return;
-        const reason = event.errorType === "authentication_failed" ? "authentication-required"
-          : event.errorType === "oauth_org_not_allowed" ? "organization-not-allowed"
-          : event.errorType === "account_on_hold" ? "account-on-hold"
-          : event.errorType === "verification_required" ? "verification-required"
-          : event.errorType === "billing_error" ? "billing-error" : undefined;
+        const reason = event.kind === "api_retry" ? accountErrorReason(event.errorType)
+          : event.kind === "account_error" ? event.reason : undefined;
         if (reason && !failureReason) {
           failureReason = reason;
           log(`R-ORC-39: Claude ${reason}`);

@@ -141,7 +141,7 @@ export class TodoTab {
   private group: string | null;
   private due: TodoDueFilter;
   private readonly collapsed: Set<string>;
-  private readonly restoreShown: boolean;
+  private restoreShown: boolean;
   private restoredOnce = false;
   private midnightTimer: ReturnType<typeof setTimeout> | undefined;
   private revision = -1;
@@ -534,6 +534,10 @@ export class TodoTab {
   viewState(): TodoViewState {
     return { shown: this.shownNow, group: this.group, due: this.due, collapsed: [...this.collapsed], foldDone: this.foldDone,
       foldedGroups: [...this.foldedGroups], askOnly: this.askOnly, fresh: [...this.fresh], splitDeclined: [...this.splitDeclinedNow], historySeenAt: this.historySeenAt };
+  }
+
+  dropRestore(): void {
+    this.restoreShown = false;
   }
 
   apply(message: TodoSnapshotMessage): { restoreShown: boolean } {

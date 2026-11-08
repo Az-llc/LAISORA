@@ -10,6 +10,7 @@ import { readSessionHistory } from "./session-transcript";
 import { currentGenerationEvents } from "./time-buckets";
 import { bookkeepingIntent } from "./work-model";
 import { hasSessionRecord } from "./session-record";
+import { withOldestEvicted } from "./capped-record";
 import type { Session } from "./extension";
 import type { SessionStore } from "./store-surfaces";
 
@@ -268,14 +269,14 @@ export class SessionSummaryWiring {
       output.appendLine(`[${this.host.title}] 要約を保存できませんでした（保存先を解決できません）`);
       return false;
     }
-    const store = { ...(gs.get<Record<string, { text: string; model: string; generatedAt: number }>>(SESSION_SUMMARY_STORE_KEY) ?? {}) };
-    store[key] = { ...summary, generatedAt: Date.now() };
-    const keys = Object.keys(store);
-    if (keys.length > SESSION_SUMMARY_STORE_MAX) {
-      keys.sort((a, b) => (store[a].generatedAt ?? 0) - (store[b].generatedAt ?? 0));
-      const evicted = keys.slice(0, keys.length - SESSION_SUMMARY_STORE_MAX);
-      for (const old of evicted) delete store[old];
-      output.appendLine(`[${this.host.title}] 要約の保存件数が上限 ${SESSION_SUMMARY_STORE_MAX} を超えたため、最古の ${evicted.length} 件を削除しました（新しい方を保持）`);
+    const { entries: store, evicted } = withOldestEvicted(
+      gs.get<Record<string, { text: string; model: string; generatedAt: number }>>(SESSION_SUMMARY_STORE_KEY) ?? {},
+      [[key, { ...summary, generatedAt: Date.now() }]],
+      SESSION_SUMMARY_STORE_MAX,
+      (entry) => entry.generatedAt ?? 0
+    );
+    if (evicted > 0) {
+      output.appendLine(`[${this.host.title}] 要約の保存件数が上限 ${SESSION_SUMMARY_STORE_MAX} を超えたため、最古の ${evicted} 件を削除しました（新しい方を保持）`);
     }
     try {
       await gs.update(SESSION_SUMMARY_STORE_KEY, store);

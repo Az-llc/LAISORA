@@ -39,8 +39,9 @@ import { isInSessionStore, sessionTranscriptRef } from "./session-files";
 import { readSessionHistory } from "./session-transcript";
 import type { SessionStore } from "./store-surfaces";
 import { appendRecordPart, joinRecordTexts, withoutRetracted, type RecordTextPart } from "./commit-boundary";
+import { accountErrorText, type AccountAuthSource } from "./account-error";
 
-function createExportSink(lines: string[], userHeading: string): {
+function createExportSink(lines: string[], userHeading: string, auth: AccountAuthSource): {
   push: (ev: NormalizedEventBody) => void;
   finish: () => void;
 } {
@@ -106,11 +107,20 @@ function createExportSink(lines: string[], userHeading: string): {
       case "error":
         out.push(`> ⚠ ${ev.message}`, "");
         break;
+      case "account_error":
+        if (ev.priorGeneration === true) break;
+        flush();
+        out.push(`> ⚠ ${accountErrorText(ev.reason, "resend", auth)}`, "");
+        break;
       default:
         break;
     }
   };
   return { push, finish };
+}
+
+function accountErrorNoticeKey(ev: Extract<NormalizedEventBody, { kind: "account_error" }>): string {
+  return `account_error:${ev.reason}:${ev.detail ?? ""}`;
 }
 
 function heldEventsForExport(events: readonly NormalizedEvent[]): NormalizedEvent[] {
@@ -152,13 +162,13 @@ async function buildExportMarkdown(s: Session): Promise<string> {
   if (degraded !== undefined || history === undefined) {
     output.appendLine(`[${s.title}] export: falling back to held events (${degraded ?? "empty-record"})`);
     lines.push(l10n.t("- Note: the record could not be read, so only the part held in memory was exported."), "");
-    const sink = createExportSink(lines, userHeading);
+    const sink = createExportSink(lines, userHeading, s.auth);
     for (const ev of heldEventsForExport(s.events)) sink.push(ev);
     sink.finish();
     return lines.join("\n");
   }
   lines.push("");
-  const sink = createExportSink(lines, userHeading);
+  const sink = createExportSink(lines, userHeading, s.auth);
   const from = history.generationStartAt;
   const recordToolUseIds = new Set<string>();
   const recordNotices = new Set<string>();
@@ -171,6 +181,7 @@ async function buildExportMarkdown(s: Session): Promise<string> {
       if (ev === null) return "continue";
       if (from !== undefined && ev.timestamp < from) return "continue";
       if (ev.kind === "error") recordNotices.add(ev.message);
+      if (ev.kind === "account_error") recordNotices.add(accountErrorNoticeKey(ev));
       if (ev.kind === "tool_call_started") recordToolUseIds.add(ev.toolUseId);
       sink.push(ev);
       return "continue";
@@ -181,6 +192,7 @@ async function buildExportMarkdown(s: Session): Promise<string> {
   const pushLive = (ev: NormalizedEvent): void => {
     if (ev.kind === "user_message" && ev.uuid !== undefined && history.sentUserUuids.has(ev.uuid)) return;
     if (ev.kind === "error" && recordNotices.has(ev.message)) return;
+    if (ev.kind === "account_error" && recordNotices.has(accountErrorNoticeKey(ev))) return;
     if (ev.kind === "tool_call_started" && recordToolUseIds.has(ev.toolUseId)) return;
     sink.push(ev);
   };

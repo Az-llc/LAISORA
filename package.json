@@ -2,7 +2,7 @@
   "name": "laisora",
   "displayName": "LAISORA",
   "description": "%extension.description%",
-  "version": "1.15.3",
+  "version": "1.16.0",
   "publisher": "az-llc",
   "categories": [
     "AI",
@@ -371,6 +371,12 @@
           "description": "%config.laisora.claude.mcpElicitation.description%",
           "scope": "application"
         },
+        "laisora.claude.writesLostNotice": {
+          "type": "boolean",
+          "default": true,
+          "description": "%config.laisora.claude.writesLostNotice.description%",
+          "scope": "application"
+        },
         "laisora.orchestration.enabled": {
           "type": "boolean",
           "default": false,
@@ -584,7 +590,7 @@
     "typecheck": "tsc --noEmit"
   },
   "devDependencies": {
-    "@anthropic-ai/claude-agent-sdk": "0.3.318",
+    "@anthropic-ai/claude-agent-sdk": "0.3.319",
     "@types/node": "^24.0.0",
     "@types/vscode": "^1.90.0",
     "@vscode/l10n": "0.0.18",

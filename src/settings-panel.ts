@@ -3,7 +3,8 @@ import * as l10n from "@vscode/l10n";
 import { randomBytes } from "node:crypto";
 import { updateClaudeCodeSettings } from "./claude-settings";
 import { output } from "./host-context";
-import { isSettingsPageToHost, type SettingsRevealTarget, type SettingWriteFailure } from "./protocol";
+import { isSettingsPageToHost, type MigrationNotice, type SettingsRevealTarget, type SettingWriteFailure } from "./protocol";
+import { exportMigrationFromPage, migrationBusy, onMigrationBusyChange, onMigrationProgress, scanMigrationForPage, startMigrationImport } from "./migration-host";
 import {
   settingsStateMessage,
   projectConductorPreview,
@@ -60,7 +61,11 @@ export function openSettingsPanel(context: vscode.ExtensionContext, detect?: Par
     lang: String(vscode.env.language ?? "").toLowerCase().startsWith("ja") ? "ja" : "en",
   });
   panel.onDidChangeViewState(() => { if (panel.visible) postSettingsState(); });
+  const busyWatch = onMigrationBusyChange(() => void panel.webview.postMessage({ type: "migrationState", busy: migrationBusy() }));
+  const progressWatch = onMigrationProgress(progress => void panel.webview.postMessage({ type: "migrationProgress", progress }));
   panel.onDidDispose(() => {
+    busyWatch.dispose();
+    progressWatch.dispose();
     if (settingsPanel === panel) settingsPanel = null;
   });
   context.subscriptions.push(panel);
@@ -77,7 +82,22 @@ export async function handleSettingsPageMessage(webview: vscode.Webview, raw: un
     return;
   }
   let writeFailure: SettingWriteFailure | undefined;
+  const migrationReply = async (notice?: MigrationNotice) => {
+    const scan = await scanMigrationForPage().catch((error: unknown) => { output.appendLine(`[migration] scan failed: ${String(error)}`); return undefined; });
+    void webview.postMessage({ type: "migrationState", busy: migrationBusy(), ...(scan ? { scan } : {}), ...(notice ? { notice } : {}) });
+  };
   switch (raw.type) {
+    case "migrationScan":
+      await migrationReply();
+      return;
+    case "migrationExport":
+      await migrationReply(await exportMigrationFromPage(raw.categories));
+      return;
+    case "migrationImport": {
+      const notice = await startMigrationImport();
+      void webview.postMessage({ type: "migrationState", busy: migrationBusy(), ...(notice ? { notice } : {}) });
+      return;
+    }
     case "previewConductorInstruction":
       void webview.postMessage({ type: "conductorPreview", requestId: raw.requestId, ...projectConductorPreview(raw.policy) });
       return;

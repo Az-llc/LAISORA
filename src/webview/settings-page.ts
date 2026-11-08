@@ -12,6 +12,7 @@ import { resolveOrchestrationCacheTtl, emptyOrchestrationRole, externalExecutorN
 import { type OrchestrationSettingRow, type RecommendedRosterChange } from "../orchestration-roster";
 import * as l10n from "@vscode/l10n";
 import { uiLocale } from "./l10n";
+import { formatBytes as formatByteCount, formatElapsed, MIGRATION_CATEGORIES, MIGRATION_OPERATIONS, migrationCategoryTitle, migrationProgressView, type MigrationCategory, type MigrationOperation, type MigrationProgress, type MigrationProgressView } from "../migration-categories";
 import { CACHE_EXPIRY_LEAD_MS, CACHE_EXPIRY_MIN_TOTAL_TOKENS } from "../handoff-auto";
 import { CLAUDE_MODEL_PRICES, PROMPT_CACHE_PRICES_CHECKED_ON, PROMPT_CACHE_WRITE_MULTIPLIER, type TokenPrices } from "../claude-prices";
 import {
@@ -171,6 +172,7 @@ const settingsCategories = [
   { key: "files", title: l10n.t("File links") },
   { key: "roster", title: l10n.t("Agent roster") },
   { key: "cli", title: l10n.t("CLI") },
+  { key: "migration", title: l10n.t("Migration") },
 ].map((category, index) => {
   const button = element("button", "settings-tab");
   button.type = "button";
@@ -196,6 +198,7 @@ function activateSettingsCategory(key: string): void {
   }
   vscode.setState({ category: key });
   renderSettingsToc();
+  if (key === "migration") vscode.postMessage({ type: "migrationScan" });
 }
 function renderSettingsToc(): void {
   const panel = settingsCategories.find((category) => !category.panel.hidden)?.panel;
@@ -247,7 +250,7 @@ settingsBody.append(settingsContent, settingsToc);
 settingsMain.append(settingsPageHead, settingsBody);
 settingsShell.append(settingsNav, settingsMain);
 root.appendChild(settingsShell);
-const [generalCategory, fileCategory, rosterCategory, cliCategory] = settingsCategories.map((category) => category.panel);
+const [generalCategory, fileCategory, rosterCategory, cliCategory, migrationCategory] = settingsCategories.map((category) => category.panel);
 const accentCard = section(generalCategory, appearanceSectionTitle());
 const displayNameField = element("div", "settings-name-field");
 const displayNameInput = element("input", "settings-input settings-name-input");
@@ -592,6 +595,8 @@ const chromeIntegrationSwitch = switchButton("setting-chrome-integration");
 row(chatCard, l10n.t("Use Claude in Chrome"), l10n.t("Let Claude use the Claude in Chrome extension, which acts in your Chrome. Needs the extension installed and connected. Applies to conversations started or resumed afterwards; running conversations are not changed."), chromeIntegrationSwitch);
 const mcpElicitationSwitch = switchButton("setting-mcp-elicitation");
 row(chatCard, l10n.t("Show input requests from MCP servers"), l10n.t("When an MCP server asks you for input or to open a page, show a card in the conversation to answer it. Off declines these requests automatically. Applies to conversations started or resumed afterwards; running conversations are not changed."), mcpElicitationSwitch);
+const writesLostNoticeSwitch = switchButton("setting-writes-lost-notice");
+row(chatCard, l10n.t("Show when the conversation record could not be saved"), l10n.t("When the disk was full or its quota was used up and Claude Code could not save part of the conversation record or its settings, show a notice in the conversation. When part of the conversation record was lost, that notice shows again when you reopen the conversation."), writesLostNoticeSwitch);
 const editSummarySwitch = switchButton("setting-edit-summary-enabled");
 const editSummaryText = row(chatCard, l10n.t("Show edited files after each reply"), l10n.t("At the end of each reply, list the files Claude edited in that turn with the lines added and removed. Click a file to compare it before and after the turn."), editSummarySwitch);
 const remoteControlCardSwitch = switchButton("setting-remote-control-card");
@@ -657,6 +662,7 @@ const fileLinkSwitches: Record<FileLinkBooleanSetting, HTMLButtonElement> = {
   planInstruction: switchButton("setting-plan-instruction"),
   chromeIntegration: chromeIntegrationSwitch,
   mcpElicitation: mcpElicitationSwitch,
+  writesLostNotice: writesLostNoticeSwitch,
   revealInExplorer: switchButton("setting-file-link-reveal-in-explorer"),
   allowOutsideWorkspace: switchButton("setting-file-link-allow-outside"),
   confirmOutsideWorkspace: switchButton("setting-file-link-confirm-outside"),
@@ -1408,6 +1414,7 @@ const pendingFileLink: Record<FileLinkBooleanSetting, number | null> = {
   planInstruction: null,
   chromeIntegration: null,
   mcpElicitation: null,
+  writesLostNotice: null,
   revealInExplorer: null,
   allowOutsideWorkspace: null,
   confirmOutsideWorkspace: null,
@@ -1545,6 +1552,7 @@ function render(state: SettingsState): void {
   fileLinkSwitches.planInstruction.disabled = false;
   fileLinkSwitches.chromeIntegration.disabled = false;
   fileLinkSwitches.mcpElicitation.disabled = false;
+  fileLinkSwitches.writesLostNotice.disabled = false;
   fileLinkSwitches.revealInExplorer.disabled = false;
   fileLinkSwitches.allowOutsideWorkspace.disabled = false;
   for (const child of outsideChildren) {
@@ -1667,6 +1675,159 @@ for (const key of FILE_LINK_BOOLEAN_SETTINGS) {
 }
 moreLink.addEventListener("click", () => post({ type: "openVsCodeSettings" }));
 
+type MigrationState = Extract<HostToSettingsPage, { type: "migrationState" }>;
+type MigrationScanView = NonNullable<MigrationState["scan"]>;
+const formatBytes = (bytes: number): string => formatByteCount(bytes, uiLocale());
+const exportCard = section(migrationCategory, l10n.t("To a new PC"));
+const migrationExportButton = element("button", "settings-segment settings-primary", l10n.t("Export…"));
+migrationExportButton.id = "setting-migration-export";
+migrationExportButton.type = "button";
+migrationExportButton.disabled = true;
+const migrationExportText = row(exportCard, l10n.t("Migration ZIP"), l10n.t("Puts what is switched on below into one ZIP at the place you choose. Keep it somewhere safe and use it on the new PC. Login credentials are not included."), migrationExportButton);
+const migrationTotal = rowNote(migrationExportText, "settings-row-note settings-migration-number", "");
+migrationExportButton.setAttribute("aria-describedby", `${migrationExportButton.getAttribute("aria-describedby")} ${migrationTotal.id}`);
+const migrationContents = element("div", "settings-migration-contents");
+migrationContents.setAttribute("role", "group");
+const migrationContentsTitle = element("h3", "settings-migration-contents-title", l10n.t("What goes into the ZIP"));
+migrationContentsTitle.id = "settings-migration-contents-title";
+migrationContents.setAttribute("aria-labelledby", migrationContentsTitle.id);
+migrationContents.appendChild(migrationContentsTitle);
+exportCard.appendChild(migrationContents);
+const migrationSwitches = Object.fromEntries(MIGRATION_CATEGORIES.map(category => [category, switchButton(`setting-migration-${category}`)])) as Record<MigrationCategory, HTMLButtonElement>;
+const migrationTexts = Object.fromEntries(MIGRATION_CATEGORIES.map(category => [category, row(migrationContents, migrationCategoryTitle(category), "", migrationSwitches[category])])) as Record<MigrationCategory, HTMLElement>;
+const migrationKeyNote = rowNote(migrationTexts.claudeEnv, "settings-row-note", "");
+migrationKeyNote.hidden = true;
+const importCard = section(migrationCategory, l10n.t("From the old PC"));
+const migrationImportButton = element("button", "settings-segment settings-primary", l10n.t("Import…"));
+migrationImportButton.id = "setting-migration-import";
+migrationImportButton.type = "button";
+migrationImportButton.disabled = true;
+const migrationImportText = row(importCard, l10n.t("ZIP from the old PC"), l10n.t("A new conversation with Claude starts; give it the path of the ZIP file."), migrationImportButton);
+type MigrationProgressNote = { readonly box: HTMLElement; readonly track: HTMLElement; readonly bar: HTMLElement; readonly label: HTMLElement };
+function migrationProgressNote(text: HTMLElement): MigrationProgressNote {
+  const box = element("div", "settings-migration-progress");
+  const track = element("div", "settings-progress-track");
+  track.setAttribute("role", "progressbar");
+  track.setAttribute("aria-valuemin", "0");
+  track.setAttribute("aria-valuemax", "100");
+  const bar = element("div", "settings-progress-bar");
+  track.appendChild(bar);
+  const label = element("div", "settings-row-note settings-migration-number");
+  box.append(track, label);
+  box.hidden = true;
+  text.appendChild(box);
+  return { box, track, bar, label };
+}
+const migrationProgressNotes: Record<MigrationOperation, MigrationProgressNote> = { export: migrationProgressNote(migrationExportText), import: migrationProgressNote(migrationImportText) };
+const migrationNotices: Record<MigrationOperation, HTMLElement> = { export: rowNote(migrationExportText, "settings-row-note", ""), import: rowNote(migrationImportText, "settings-row-note", "") };
+for (const notice of Object.values(migrationNotices)) notice.setAttribute("role", "status");
+let migrationScan: MigrationScanView | undefined;
+let migrationBusyNow = false;
+let migrationImportPending = false;
+let migrationProgress: MigrationProgress | undefined;
+let migrationProgressTimer: ReturnType<typeof setInterval> | undefined;
+const migrationChosen = new Set<MigrationCategory>(MIGRATION_CATEGORIES);
+let migrationPendingNotice: HTMLElement | undefined;
+function migrationCategoryBytes(scan: MigrationScanView, category: MigrationCategory): number {
+  if (category === "todo") return scan.todo?.bytes ?? 0;
+  if (category === "claudeEnv") return scan.claudeEnv.bytes;
+  if (category === "conversations") return scan.conversations.bytes;
+  if (category === "memory") return scan.memory.bytes;
+  return 0;
+}
+function migrationProgressText(view: MigrationProgressView): string {
+  const elapsed = formatElapsed(view.elapsedMs);
+  switch (view.stage) {
+    case "preparing": return view.total !== undefined ? l10n.t("Preparing: {0} / {1} work folders · {2}", view.done ?? 0, view.total, elapsed) : l10n.t("Preparing · {0}", elapsed);
+    case "archiving": return view.percent !== undefined ? l10n.t("Compressing: {0}% ({1} / {2} items) · {3}", view.percent, view.done ?? 0, view.total ?? 0, elapsed) : l10n.t("Compressing · {0}", elapsed);
+    case "finishing": return l10n.t("Finishing the ZIP · {0}", elapsed);
+    case "extracting": return l10n.t("Opening the ZIP: {0} files · {1}", view.done ?? 0, elapsed);
+    case "placing": return l10n.t("Placing files · {0}", elapsed);
+  }
+}
+function renderMigrationProgress(): void {
+  const shown = migrationBusyNow ? migrationProgress : undefined;
+  for (const operation of MIGRATION_OPERATIONS) {
+    const note = migrationProgressNotes[operation];
+    const progress = shown?.operation === operation ? shown : undefined;
+    note.box.hidden = progress === undefined;
+    if (!progress) continue;
+    const view = migrationProgressView(progress, Date.now());
+    const text = migrationProgressText(view);
+    note.label.textContent = text;
+    note.track.setAttribute("aria-valuetext", text);
+    note.track.classList.toggle("indeterminate", view.percent === undefined);
+    if (view.percent === undefined) {
+      note.track.removeAttribute("aria-valuenow");
+      note.bar.style.removeProperty("width");
+    } else {
+      note.track.setAttribute("aria-valuenow", String(view.percent));
+      note.bar.style.width = `${view.percent}%`;
+    }
+  }
+  if (shown && migrationProgressTimer === undefined) migrationProgressTimer = setInterval(renderMigrationProgress, 1000);
+  if (!shown && migrationProgressTimer !== undefined) { clearInterval(migrationProgressTimer); migrationProgressTimer = undefined; }
+}
+function renderMigrationControls(): void {
+  const scan = migrationScan;
+  for (const category of MIGRATION_CATEGORIES) {
+    migrationSwitches[category].setAttribute("aria-checked", String(migrationChosen.has(category)));
+    migrationSwitches[category].disabled = migrationBusyNow || scan === undefined || category === "todo" && scan.todo === undefined;
+  }
+  const total = scan ? MIGRATION_CATEGORIES.filter(category => migrationChosen.has(category)).reduce((sum, category) => sum + migrationCategoryBytes(scan, category), 0) : 0;
+  migrationTotal.textContent = scan ? l10n.t("Total before compression: {0}", formatBytes(total)) : l10n.t("Loading…");
+  migrationExportButton.disabled = migrationBusyNow || scan === undefined || migrationChosen.size === 0;
+  migrationImportButton.disabled = migrationBusyNow || migrationImportPending;
+  renderMigrationProgress();
+}
+function renderMigration(state: MigrationState): void {
+  migrationBusyNow = state.busy;
+  if (state.notice && migrationPendingNotice === migrationNotices.import) migrationImportPending = false;
+  if (!state.busy) migrationProgress = undefined;
+  if (state.notice && migrationPendingNotice) {
+    migrationPendingNotice.textContent = `${state.notice.ok ? "" : "✗ "}${state.notice.text}`;
+    migrationPendingNotice = undefined;
+  }
+  if (state.scan) {
+    const scan = migrationScan = state.scan;
+    if (scan.todo === undefined) migrationChosen.delete("todo");
+    const describe = (category: MigrationCategory, text: string) => { migrationTexts[category].querySelector(".settings-row-description")!.textContent = text; };
+    describe("todo", scan.todo ? l10n.t("The latest ToDo ({0} items) and its images. {1}", scan.todo.items, formatBytes(scan.todo.bytes)) : l10n.t("ToDo is not available in this window."));
+    describe("laisoraSettings", l10n.t("{0} values you set in your user settings.", scan.laisoraSettings));
+    describe("claudeEnv", l10n.t("CLAUDE.md, rules, hooks, skills, agents, commands, output styles, plugins, settings and keybindings in ~/.claude ({0} files, {1}), and {2} MCP servers from ~/.claude.json. Login credentials and other values of ~/.claude.json are not included.", scan.claudeEnv.files, formatBytes(scan.claudeEnv.bytes), scan.claudeEnv.mcpServers));
+    describe("conversations", l10n.t("Conversation records of every work folder in ~/.claude/projects ({0} conversations, {1}).", scan.conversations.sessions, formatBytes(scan.conversations.bytes)));
+    describe("memory", l10n.t("Claude's memory of every work folder in ~/.claude/projects ({0} files, {1}).", scan.memory.files, formatBytes(scan.memory.bytes)));
+    migrationKeyNote.textContent = [
+      ...(scan.claudeEnv.mcpKeyServers.length ? [l10n.t("MCP servers {0} have env, headers, arguments or URLs that look like keys. Keys written there go into the ZIP.", scan.claudeEnv.mcpKeyServers.join(", "))] : []),
+      ...(scan.claudeEnv.settingsKeyFiles.length ? [l10n.t("{0} look like keys. Keys written there go into the ZIP.", scan.claudeEnv.settingsKeyFiles.join(", "))] : []),
+    ].join(" ");
+    migrationKeyNote.hidden = !migrationKeyNote.textContent;
+  }
+  renderMigrationControls();
+}
+for (const category of MIGRATION_CATEGORIES) {
+  migrationSwitches[category].addEventListener("click", () => {
+    if (migrationSwitches[category].disabled) return;
+    if (migrationChosen.has(category)) migrationChosen.delete(category); else migrationChosen.add(category);
+    renderMigrationControls();
+  });
+}
+migrationExportButton.addEventListener("click", () => {
+  if (migrationExportButton.disabled) return;
+  migrationNotices.export.textContent = "";
+  migrationPendingNotice = migrationNotices.export;
+  post({ type: "migrationExport", categories: MIGRATION_CATEGORIES.filter(category => migrationChosen.has(category)) });
+});
+migrationImportButton.addEventListener("click", () => {
+  if (migrationImportButton.disabled) return;
+  migrationNotices.import.textContent = "";
+  migrationPendingNotice = migrationNotices.import;
+  migrationImportPending = true;
+  renderMigrationControls();
+  post({ type: "migrationImport" });
+});
+renderMigrationControls();
+
 const REVEAL_TARGETS: Record<SettingsRevealTarget, { category: string; target: () => HTMLElement }> = {
   handoffAuto: { category: "general", target: () => handoffAutoTexts.enabled.closest<HTMLElement>(".settings-row") ?? handoffAutoTexts.enabled },
   orchestration: { category: "roster", target: () => orchestrationCard },
@@ -1693,6 +1854,11 @@ window.addEventListener("message", (event: MessageEvent<unknown>) => {
     instructionPreview.textContent = event.data.text;
     instructionTokens.textContent = l10n.t("≈ {0} tokens", event.data.tokens);
   } else if (event.data.type === "recommendedRoster") renderRecommendation(event.data.revision, event.data.changes);
+  else if (event.data.type === "migrationState") renderMigration(event.data);
+  else if (event.data.type === "migrationProgress") {
+    migrationProgress = event.data.progress;
+    renderMigrationProgress();
+  }
   else {
     render(event.data);
     if (pendingReveal !== undefined) revealSetting(pendingReveal);
