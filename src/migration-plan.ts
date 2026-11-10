@@ -257,6 +257,123 @@ export function importPlacement(existing: Uint8Array | undefined, incoming: Uint
   return Buffer.compare(Buffer.from(existing), Buffer.from(incoming)) === 0 ? "same" : "backup";
 }
 
+export const jsonChanged = (before: unknown, after: unknown) => JSON.stringify(before) !== JSON.stringify(after);
+
+export type ClaudeFilePlacement = ImportPlacement | "kept" | "backedUpOnly";
+
+export interface FolderPlacement { sessions: string[]; sessionsKept: number; files: number; filesKept: number; memoryPaths: string[]; memoryKept: number }
+export const emptyFolderPlacement = (): FolderPlacement => ({ sessions: [], sessionsKept: 0, files: 0, filesKept: 0, memoryPaths: [], memoryKept: 0 });
+
+export interface MigrationFolderFacts {
+  readonly dirName: string;
+  readonly placedIn: string;
+  readonly intoExisting: boolean;
+  readonly relocated: boolean;
+  readonly target?: ConversationTarget;
+  readonly placement: FolderPlacement;
+}
+
+export interface MigrationImportFacts {
+  readonly categories: readonly MigrationCategory[];
+  readonly claudeFiles: Array<{ readonly path: string; readonly placement: ClaudeFilePlacement; readonly rewritten: boolean }>;
+  mcp?: { readonly current: Record<string, unknown>; readonly incoming: Record<string, unknown>; readonly remapped: Record<string, unknown>; readonly skipped?: string };
+  settings?: { readonly incoming: Record<string, unknown>; readonly remapped: Record<string, unknown>; readonly failed: readonly string[] };
+  todo?: { items?: number; readonly incoming: TodoDocument; readonly remapped: TodoDocument; previousSavedTo?: string; imagesPlaced: number; imagesKept: number };
+  todoNotPlaced?: string;
+  readonly folders: MigrationFolderFacts[];
+}
+
+type Tally = { readonly placed?: number; readonly kept?: number };
+type Counts<K extends string> = Partial<Record<K, number>>;
+
+export interface MigrationImportReport {
+  readonly categories: readonly MigrationCategory[];
+  readonly claudeFiles?: Counts<"placed" | "replaced" | "kept" | "unchanged" | "pathsRewritten"> & { readonly backedUpNotPlaced?: readonly string[] };
+  readonly mcpServers?: Counts<"added" | "replaced" | "unchanged" | "pathsRewritten"> & { readonly notAdded?: readonly string[]; readonly notAddedReason?: string };
+  readonly laisoraSettings?: Counts<"written" | "pathsRewritten"> & { readonly failed?: readonly string[] };
+  readonly todo?: { readonly items?: number; readonly previousSavedTo?: string; readonly pathsRewritten?: true; readonly images?: Tally; readonly notPlaced?: string };
+  readonly workFolders?: Counts<"folders" | "foldersUnderOtherName" | "foldersIntoExisting" | "foldersRelocated"> & { readonly conversations?: Tally; readonly otherFiles?: Tally; readonly memory?: Tally };
+  readonly unresolved: ReadonlyArray<{ readonly cwd: string; readonly dirName: string }>;
+}
+
+const CLAUDE_FILE_OUTCOME = { write: "placed", backup: "replaced", same: "unchanged", kept: "kept", backedUpOnly: "backedUpNotPlaced" } as const satisfies Record<ClaudeFilePlacement, string>;
+
+function nonZero<K extends string>(counts: Record<K, number>): Counts<K> {
+  return Object.fromEntries(Object.entries<number>(counts).filter(([, count]) => count > 0)) as Counts<K>;
+}
+
+const named = <K extends string>(key: K, names: readonly string[]) => (names.length ? { [key]: [...names] } : {}) as Partial<Record<K, string[]>>;
+
+function tally(placed: number, kept: number): Tally | undefined {
+  return placed || kept ? { ...(placed ? { placed } : {}), ...(kept ? { kept } : {}) } : undefined;
+}
+
+const isNonEmpty = (value: object | undefined): value is object => value !== undefined && Object.keys(value).length > 0;
+const sum = (folders: readonly MigrationFolderFacts[], pick: (folder: MigrationFolderFacts) => number) => folders.reduce((total, folder) => total + pick(folder), 0);
+
+function workFoldersReport(folders: readonly MigrationFolderFacts[]): MigrationImportReport["workFolders"] {
+  if (!folders.length) return undefined;
+  const count = (test: (folder: MigrationFolderFacts) => boolean) => folders.filter(test).length;
+  const conversations = tally(sum(folders, folder => folder.placement.sessions.length), sum(folders, folder => folder.placement.sessionsKept));
+  const otherFiles = tally(sum(folders, folder => folder.placement.files), sum(folders, folder => folder.placement.filesKept));
+  const memory = tally(sum(folders, folder => folder.placement.memoryPaths.length), sum(folders, folder => folder.placement.memoryKept));
+  return {
+    ...nonZero({ folders: folders.length, foldersUnderOtherName: count(folder => folder.placedIn !== folder.dirName), foldersIntoExisting: count(folder => folder.intoExisting),
+      foldersRelocated: count(folder => folder.relocated && folder.placement.sessions.length > 0) }),
+    ...(conversations ? { conversations } : {}),
+    ...(otherFiles ? { otherFiles } : {}),
+    ...(memory ? { memory } : {}),
+  };
+}
+
+export function migrationImportReport(facts: MigrationImportFacts): MigrationImportReport {
+  const claudeCounts = { placed: 0, replaced: 0, kept: 0, unchanged: 0, pathsRewritten: 0 };
+  const backedUpNotPlaced: string[] = [];
+  for (const file of facts.claudeFiles) {
+    const outcome = CLAUDE_FILE_OUTCOME[file.placement];
+    if (outcome === "backedUpNotPlaced") { backedUpNotPlaced.push(file.path); continue; }
+    claudeCounts[outcome]++;
+    if (file.rewritten && (outcome === "placed" || outcome === "replaced")) claudeCounts.pathsRewritten++;
+  }
+  const claudeFiles = { ...nonZero(claudeCounts), ...named("backedUpNotPlaced", backedUpNotPlaced) };
+  let mcpServers: MigrationImportReport["mcpServers"];
+  if (facts.mcp?.skipped !== undefined) mcpServers = { ...named("notAdded", Object.keys(facts.mcp.incoming)), notAddedReason: facts.mcp.skipped };
+  else if (facts.mcp) {
+    const { current, incoming, remapped } = facts.mcp;
+    const counts = { added: 0, replaced: 0, unchanged: 0, pathsRewritten: 0 };
+    for (const [name, server] of Object.entries(remapped)) {
+      const outcome = !(name in current) ? "added" : jsonChanged(current[name], server) ? "replaced" : "unchanged";
+      counts[outcome]++;
+      if (outcome !== "unchanged" && jsonChanged(incoming[name], server)) counts.pathsRewritten++;
+    }
+    mcpServers = nonZero(counts);
+  }
+  let laisoraSettings: MigrationImportReport["laisoraSettings"];
+  if (facts.settings) {
+    const { incoming, remapped, failed } = facts.settings;
+    const written = Object.keys(remapped).filter(key => !failed.includes(key));
+    laisoraSettings = { ...nonZero({ written: written.length, pathsRewritten: written.filter(key => jsonChanged(incoming[key], remapped[key])).length }), ...named("failed", failed) };
+  }
+  let todo: MigrationImportReport["todo"];
+  if (facts.todo) {
+    const { items, incoming, remapped, previousSavedTo, imagesPlaced, imagesKept } = facts.todo;
+    const images = tally(imagesPlaced, imagesKept);
+    const replaced = items !== undefined;
+    todo = { ...(replaced ? { items } : { notPlaced: "The ToDo was not replaced; see error." }), ...(previousSavedTo !== undefined ? { previousSavedTo } : {}),
+      ...(replaced && jsonChanged(incoming, remapped) ? { pathsRewritten: true as const } : {}), ...(images ? { images } : {}) };
+  } else if (facts.todoNotPlaced !== undefined) todo = { notPlaced: facts.todoNotPlaced };
+  const workFolders = workFoldersReport(facts.folders);
+  return {
+    categories: facts.categories,
+    ...(isNonEmpty(claudeFiles) ? { claudeFiles } : {}),
+    ...(isNonEmpty(mcpServers) ? { mcpServers } : {}),
+    ...(isNonEmpty(laisoraSettings) ? { laisoraSettings } : {}),
+    ...(todo ? { todo } : {}),
+    ...(workFolders ? { workFolders } : {}),
+    unresolved: facts.folders.flatMap(folder => folder.target && !folder.target.found ? [{ cwd: folder.target.cwd, dirName: folder.target.dirName }] : []),
+  };
+}
+
 export function userMcpServers(globalConfigText: string | undefined): Record<string, unknown> {
   if (globalConfigText === undefined) return {};
   try {

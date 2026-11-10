@@ -34,11 +34,12 @@ export function connectionText(connection: BridgeConnection | undefined): string
   }
 }
 
-export type RemoteControlCardAction = "create" | "update" | "close" | "none";
+export type RemoteControlCardAction = "create" | "update" | "close" | "remove" | "none";
 
 export function remoteControlCardAction(cardOpen: boolean, view: RemoteControlView | undefined): RemoteControlCardAction {
   if (remoteControlOn(view)) return cardOpen ? "update" : "create";
-  return cardOpen ? "close" : "none";
+  if (!cardOpen) return "none";
+  return view?.auto === true ? "remove" : "close";
 }
 
 export interface RemoteControlCardState { stateText: string; sessionUrl?: string }
@@ -49,10 +50,12 @@ export function remoteControlCardState(view: RemoteControlView | undefined): Rem
     : { stateText: connectionText(view.connection), sessionUrl: view.sessionUrl };
 }
 
-export function remoteControlCardNotes(menuGlyph: string): string[] {
+export function remoteControlCardNotes(menuGlyph: string, auto: boolean): string[] {
   return [
     l10n.t("The session is reachable from claude.ai and the Claude app only while VS Code and LAISORA are running."),
     l10n.t("Closing this tab or VS Code takes it offline, and messages sent from there while it is offline are refused."),
-    l10n.t("After VS Code restarts, Remote Control does not reconnect by itself unless \"Claude: Remote Control At Startup\" (laisora.claude.remoteControlAtStartup) is on in VS Code Settings; turn it on again from the {0} menu to get the same claude.ai link.", menuGlyph),
+    auto
+      ? l10n.t("LAISORA turned Remote Control on for a mobile notification. It turns off when you send a message or answer in LAISORA; replies from claude.ai or the Claude app keep it on.")
+      : l10n.t("After VS Code restarts, Remote Control does not reconnect by itself unless \"Claude: Remote Control At Startup\" (laisora.claude.remoteControlAtStartup) is on in VS Code Settings; turn it on again from the {0} menu to get the same claude.ai link.", menuGlyph),
   ];
 }

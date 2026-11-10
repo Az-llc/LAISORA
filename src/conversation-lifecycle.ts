@@ -35,6 +35,7 @@ import { postAttachments } from "./composer-io";
 import { pendingAttachments } from "./pending-attachments";
 import { flushChosenTitle } from "./session-list-wiring";
 import { cliActivityOf, noteAutoHandoffEvent, noteAutoHandoffUserSend } from "./handoff-wiring";
+import { noteLaisoraWindowInput, noteWaitNotifyEvent, noteWaitNotifyHumanInput, waitNotifyLaunchOptions } from "./wait-notify-wiring";
 import * as l10n from "@vscode/l10n";
 import { isUnusedSession, type Session } from "./session";
 import { applyLiveDiscoveredModels, modelsMessage } from "./gateway-models";
@@ -52,6 +53,7 @@ import { completionVerdict, numberedLaunchVerdict, resumeVerdict } from "./time-
 import { isRunningLane, knownBackgroundTask } from "./work-model";
 import { parseLaisoraInput, type LaisoraInput } from "./laisora-input";
 import { flushRemoteControlRecord, noteBridgeState, noteRemoteControlClosed, setRemoteControl, startRemoteControlAtLaunch } from "./remote-control-wiring";
+import { signalWaitNotify } from "./wait-notify-signal";
 
 const orchestrationPublishers = new WeakMap<ClaudeConversation, OrchestrationViewPublisher>();
 
@@ -524,6 +526,7 @@ export async function sendLaisoraInput(s: Session, input: LaisoraInput, text: st
   if (s.closed || s.clearing || !s.conversation) return false;
   const sent = s.conversation.send(text, undefined, Date.now(), input);
   s.awaitingLaisoraInput = false;
+  if (sent) noteLaisoraWindowInput(s);
   return sent;
 }
 
@@ -617,8 +620,9 @@ export async function handleConversationMessage(
       target!.conversation!.answerPendingQuestionsInChat(msg.text);
       if (!isNonHumanCommandInput(msg.text)) {
         disposition("accepted-human");
+        const absorbedInto = target!.conversation!.runningTurnId;
         target!.pushEvent(
-          { kind: "user_message", turnId: null, text: msg.text, images: msg.images, sentAt, uuid: messageUuid, provenance: { path: "live" } },
+          { kind: "user_message", turnId: null, ...(absorbedInto === null ? {} : { absorbedInto }), text: msg.text, images: msg.images, sentAt, uuid: messageUuid, provenance: { path: "live" } },
           undefined,
           { timestamp: sentAt },
           clientToken
@@ -628,17 +632,20 @@ export async function handleConversationMessage(
       }
       target!.welcome = undefined;
       noteAutoHandoffUserSend(target!);
+      noteWaitNotifyHumanInput(target!);
       target!.conversation!.send(msg.text, msg.images, sentAt, false, messageUuid);
       break;
     }
     case "cancelAutoResume":
       target!.conversation?.cancelAutoResume();
+      signalWaitNotify(target!);
       break;
     case "interrupt": {
       const unsent = [...target!.unsentSends].reverse();
       target!.unsentSends.clear();
       for (const reject of unsent) reject();
       if (unsent.length > 0) target!.pushEvent({ kind: "error", message: interruptDiscardNotice(unsent.length), fatal: false });
+      noteLaisoraWindowInput(target!);
       await target!.conversation?.interrupt();
       break;
     }
@@ -785,6 +792,7 @@ async function ensureConversationInner(s: Session, requestedAt: number): Promise
     settingSources,
     transcriptRetention: transcriptRetentionSettings((key) => cfg.get<unknown>(key)),
     remoteControlAtStartup: cfg.get<boolean>("claude.remoteControlAtStartup")!,
+    waitNotify: waitNotifyLaunchOptions(s),
     chromeIntegration: chromeIntegrationEnabled((key) => cfg.get<unknown>(key)),
     mcpElicitation: mcpElicitationEnabled((key) => cfg.get<unknown>(key)),
     progressTracking: normalizeProgressTracking(cfg.get<string>("progressTracking")!),
@@ -844,6 +852,7 @@ async function ensureConversationInner(s: Session, requestedAt: number): Promise
       if (own && ev.kind === "conversation_closed") noteRemoteControlClosed(s, conv);
       if (own && ev.kind === "auth_status") flushRemoteControlRecord(s);
       if (own) noteAutoHandoffEvent(s, ev);
+      if (own) noteWaitNotifyEvent(s, ev);
       if (own) settleFallbackRevert(store, s, conv, ev);
       if (own && todoEnabled) noteTodoConversationEvent(s, ev);
       if (own && TURN_END_KINDS.has(ev.kind)) settleTodoReplyStart(s, ev.kind === "turn_completed");

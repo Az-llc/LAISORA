@@ -21,6 +21,8 @@
   "config.laisora.claude.askQualityCheck.description": "実行中のターンで Claude が書いた判断を検査します。理由が判断の必要を述べるだけのもの、質問名の繰り返し、選択肢の説明が選択肢名の繰り返しのものは表示せず、Claude に書き直させます。新しく始めた会話と、再開した会話から有効です。計画の指示の設定が必要です。",
   "config.laisora.todo.enabled.description": "ToDo を有効にします。Claude に項目を追加・入れ子にする・更新する道具を渡します。項目はこの PC に保存し、すべてのウィンドウで共有します。新しく始めた会話と、再開した会話から有効です。",
   "config.laisora.remoteControl.showCard.description": "会話にRemote Controlのカードを表示します。claude.aiのリンク、接続の状態、セッションにつながる条件を示します。タブのセッションが動いている間は会話に残り、Remote Controlがオフになったこともカードで示します。",
+  "config.laisora.remoteControl.waitNotify.enabled.description": "会話があなたを長く待っているとき、Claude アプリからスマホに通知します。Remote Control は通知が要るときだけオンになり、LAISORA で送信や回答をするとまたオフになります。自分でオンにした Remote Control はオンのままです。答えていない判断・実機確認のカードを残して手番を終えた会話は、下の分数が過ぎたら Remote Control をオンにし、Claude を起こして通知を 1 回送ります（Claude の短い手番を使います）。手番の途中の承認や質問にしばらく答えないままのときは Remote Control をオンにし、Claude Code が自分の時機で通知できるようにします。新しく始めた会話と、再開した会話から有効です。",
+  "config.laisora.remoteControl.waitNotify.minutes.description": "手番を終えた会話が、答えていない判断・実機確認のカードを残して待ってから、スマホに通知するまでの分数です。",
   "config.laisora.improvementAnalysis.showMenuItem.description": "各会話の ☰ に「LLM改善分析開始」を表示します。この PC のすべての Claude Code の会話から繰り返し起きた失敗を数え、Claude が分析する新しい会話を始めます。",
   "config.laisora.welcome.showNews.description": "新しい会話に、この版の LAISORA のお知らせ（新機能と追加された設定）を閉じるまで表示します。",
   "config.laisora.welcome.showTips.description": "新しい会話に、LAISORA の使い方のヒントを 1 つ表示します。新しい会話を開くたびに次のヒントを出します。",

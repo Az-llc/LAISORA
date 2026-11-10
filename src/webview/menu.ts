@@ -21,8 +21,10 @@ const INPUT_PLACEHOLDER_SHIFT_ENTER = l10n.t("Type a message (Shift+Enter to sen
 
 let sendKey: ComposerSendKey = "enter";
 let askQualityCheck = false;
+let waitNotify = false;
 let editSummary = false;
 const editSummaryListeners = new Set<() => void>();
+const waitNotifyListeners = new Set<() => void>();
 const REPLY_TODO_SHOWN_CLASS = "reply-todo-shown";
 
 export function setTodoAvailable(available: boolean): void {
@@ -32,6 +34,11 @@ export function setTodoAvailable(available: boolean): void {
 export function applyUserSettings(msg: Extract<HostToWebview, { type: "userSettings" }>): void {
   sendKey = msg.composerSendKey;
   askQualityCheck = msg.askQualityCheck === true;
+  const nextWaitNotify = msg.waitNotify === true;
+  if (nextWaitNotify !== waitNotify) {
+    waitNotify = nextWaitNotify;
+    for (const listener of waitNotifyListeners) listener();
+  }
   document.body.classList.toggle(REMOTE_CONTROL_CARD_HIDDEN_CLASS, msg.remoteControlCard === false);
   setImprovementMenuShown(msg.improvementMenu !== false);
   const nextEditSummary = msg.editSummaryEnabled === true;
@@ -45,8 +52,17 @@ export function onEditSummaryChange(listener: () => void): () => void {
   return () => editSummaryListeners.delete(listener);
 }
 
+export function onWaitNotifyChange(listener: () => void): () => void {
+  waitNotifyListeners.add(listener);
+  return () => waitNotifyListeners.delete(listener);
+}
+
 export function askQualityCheckEnabled(): boolean {
   return askQualityCheck;
+}
+
+export function waitNotifyEnabled(): boolean {
+  return waitNotify;
 }
 
 export function editSummaryEnabled(): boolean {

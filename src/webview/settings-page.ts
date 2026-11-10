@@ -22,8 +22,12 @@ import {
   HANDOFF_AUTO_TOKENS_MIN,
   isHandoffAutoSettingValue,
   isHostToSettingsPage,
+  isWaitNotifySettingValue,
+  WAIT_NOTIFY_MINUTES_MAX,
+  WAIT_NOTIFY_MINUTES_MIN,
   type HandoffAutoMode,
   type HandoffAutoSettingName,
+  type WaitNotifySettingName,
   type ApiKeyPolicy,
   type ComposerSendKey,
   type FileLinkBooleanSetting,
@@ -447,24 +451,35 @@ const handoffAutoTexts: Record<HandoffAutoSettingName, HTMLElement> = {
   cacheExpiryEnabled: row(handoffAutoCard, l10n.t("Hand off before the prompt cache expires"), l10n.t("When a waiting conversation's last reply was cached for 1 hour, work is unfinished (a PLAN step or an unanswered decision) and the context holds at least {0} tokens, hand it off {1} minutes before that cache expires unless you send a message first. The same background and message box conditions apply.", CACHE_EXPIRY_MIN_TOTAL_TOKENS.toLocaleString(uiLocale()), CACHE_EXPIRY_LEAD_MS / 60_000), handoffAutoControls.cacheExpiryEnabled),
 };
 handoffAutoControls.percent.parentElement?.appendChild(element("span", "settings-input-unit", "%"));
-const pendingHandoffAuto: Record<HandoffAutoSettingName, number | null> = { enabled: null, mode: null, percent: null, tokens: null, cacheExpiryEnabled: null };
-function requestHandoffAutoSetting(setting: HandoffAutoSettingName, value: boolean | number | string): void {
-  if (current?.handoffAuto === undefined || pendingHandoffAuto[setting] !== null) return;
-  if (!isHandoffAutoSettingValue(setting, value)) {
-    const control = handoffAutoControls[setting];
-    if (control instanceof HTMLInputElement) control.reportValidity();
-    return;
-  }
-  const requestId = nextRequestId();
-  pendingHandoffAuto[setting] = requestId;
-  handoffAutoControls[setting].disabled = true;
-  post({ type: "setHandoffAutoSetting", requestId, setting, value });
+function settingGroup<N extends string, V>(controls: Record<N, { disabled: boolean }>, isValue: (setting: N, value: V) => boolean,
+  loaded: () => boolean, send: (requestId: number, setting: N, value: V) => void) {
+  const pending = Object.fromEntries(Object.keys(controls).map((name) => [name, null])) as Record<N, number | null>;
+  return {
+    pending,
+    request(setting: N, value: V): void {
+      if (!loaded() || pending[setting] !== null) return;
+      if (!isValue(setting, value)) {
+        const control = controls[setting];
+        if (control instanceof HTMLInputElement) control.reportValidity();
+        return;
+      }
+      const requestId = nextRequestId();
+      pending[setting] = requestId;
+      controls[setting].disabled = true;
+      send(requestId, setting, value);
+    },
+    settle(replyTo: number | undefined): void {
+      for (const name of Object.keys(pending) as N[]) if (pending[name] === replyTo) pending[name] = null;
+    },
+  };
 }
+const handoffAutoGroup = settingGroup<HandoffAutoSettingName, boolean | number | string>(handoffAutoControls, isHandoffAutoSettingValue,
+  () => current?.handoffAuto !== undefined, (requestId, setting, value) => post({ type: "setHandoffAutoSetting", requestId, setting, value }));
+const pendingHandoffAuto = handoffAutoGroup.pending;
+const requestHandoffAutoSetting = handoffAutoGroup.request;
 function renderHandoffAuto(state: SettingsState): void {
   const settings = state.handoffAuto;
-  for (const name of Object.keys(pendingHandoffAuto) as HandoffAutoSettingName[]) {
-    if (pendingHandoffAuto[name] === state.replyTo) pendingHandoffAuto[name] = null;
-  }
+  handoffAutoGroup.settle(state.replyTo);
   if (settings === undefined) return;
   const { enabled, mode, percent, tokens, cacheExpiryEnabled } = handoffAutoControls;
   enabled.setAttribute("aria-checked", String(settings.enabled));
@@ -484,6 +499,34 @@ handoffAutoControls.cacheExpiryEnabled.addEventListener("click", () => requestHa
 handoffAutoControls.mode.addEventListener("change", () => requestHandoffAutoSetting("mode", handoffAutoControls.mode.value));
 handoffAutoControls.percent.addEventListener("change", () => requestHandoffAutoSetting("percent", handoffAutoControls.percent.valueAsNumber));
 handoffAutoControls.tokens.addEventListener("change", () => requestHandoffAutoSetting("tokens", handoffAutoControls.tokens.valueAsNumber));
+
+const waitNotifyCard = section(generalCategory, l10n.t("Mobile notifications"));
+const waitNotifyControls = {
+  enabled: switchButton("setting-wait-notify-enabled"),
+  minutes: numberInput("setting-wait-notify-minutes", WAIT_NOTIFY_MINUTES_MIN, WAIT_NOTIFY_MINUTES_MAX, "1"),
+} satisfies Record<WaitNotifySettingName, HTMLElement>;
+const waitNotifyTexts: Record<WaitNotifySettingName, HTMLElement> = {
+  enabled: row(waitNotifyCard, l10n.t("Notify my phone when a conversation has waited for me too long"), l10n.t("Remote Control turns on only when a notification is needed and turns off again when you send a message or answer in LAISORA; Remote Control you turned on yourself stays on. When a conversation has ended its turn with an unanswered decision or check card, LAISORA turns Remote Control on after the minutes below and wakes Claude to send one notification to the Claude app, which uses a short Claude turn. When an approval or a question during a turn stays unanswered for a short while, Remote Control turns on so that Claude Code can notify at its own timing. Applies from the next conversation you start or resume."), waitNotifyControls.enabled),
+  minutes: row(waitNotifyCard, l10n.t("Minutes before notifying"), WAIT_NOTIFY_MINUTES_MIN !== undefined && WAIT_NOTIFY_MINUTES_MAX !== undefined
+    ? l10n.t("Counted from the end of the turn, from {0} to {1} minutes.", WAIT_NOTIFY_MINUTES_MIN, WAIT_NOTIFY_MINUTES_MAX)
+    : l10n.t("Counted from the end of the turn."), waitNotifyControls.minutes),
+};
+const waitNotifyGroup = settingGroup<WaitNotifySettingName, boolean | number>(waitNotifyControls, isWaitNotifySettingValue,
+  () => current?.waitNotify !== undefined, (requestId, setting, value) => post({ type: "setWaitNotifySetting", requestId, setting, value }));
+const pendingWaitNotify = waitNotifyGroup.pending;
+const requestWaitNotifySetting = waitNotifyGroup.request;
+function renderWaitNotify(state: SettingsState): void {
+  waitNotifyGroup.settle(state.replyTo);
+  const settings = state.waitNotify;
+  if (settings === undefined) return;
+  const { enabled, minutes } = waitNotifyControls;
+  enabled.setAttribute("aria-checked", String(settings.enabled));
+  enabled.disabled = pendingWaitNotify.enabled !== null;
+  if (pendingWaitNotify.minutes === null && document.activeElement !== minutes) minutes.value = String(settings.minutes);
+  minutes.disabled = pendingWaitNotify.minutes !== null || !settings.enabled;
+}
+waitNotifyControls.enabled.addEventListener("click", () => requestWaitNotifySetting("enabled", current?.waitNotify?.enabled !== true));
+waitNotifyControls.minutes.addEventListener("change", () => requestWaitNotifySetting("minutes", waitNotifyControls.minutes.valueAsNumber));
 
 const sendKeySelect = select<ComposerSendKey>([
   ["enter", "Enter"],
@@ -1448,6 +1491,7 @@ function writeAnchor(message: SettingsPageToHost): HTMLElement | undefined {
     case "setImprovementMenu": return improvementMenuText;
     case "setWelcomeSetting": return welcomeTexts[message.setting];
     case "setHandoffAutoSetting": return handoffAutoTexts[message.setting];
+    case "setWaitNotifySetting": return waitNotifyTexts[message.setting];
     case "setApiKeyPolicy": return apiKeyText;
     case "setFileLinkSetting": return message.setting === "openWithSystemApp" ? extensionText : rowTextOf(fileLinkSwitches[message.setting]);
     case "setOrchestrationSetting":
@@ -1542,6 +1586,7 @@ function render(state: SettingsState): void {
   improvementMenuSwitch.disabled = pending.improvementMenu !== null;
   renderWelcomeSettings(state);
   renderHandoffAuto(state);
+  renderWaitNotify(state);
   if (pending.restore === state.replyTo) pending.restore = null;
   if (pending.apiKey === state.replyTo) pending.apiKey = null;
   for (const key of FILE_LINK_BOOLEAN_SETTINGS) {

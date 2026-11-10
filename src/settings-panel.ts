@@ -22,6 +22,7 @@ import {
   writeImprovementMenu,
   writeWelcomeSetting,
   writeHandoffAutoSetting,
+  writeWaitNotifySetting,
   writeCliAutoUpdate,
   writeComposerSendKey,
   writeFileLinkSetting,
@@ -174,6 +175,9 @@ export async function handleSettingsPageMessage(webview: vscode.Webview, raw: un
       break;
     case "setHandoffAutoSetting":
       writeFailure = await writeHandoffAutoSetting(raw.setting, raw.value);
+      break;
+    case "setWaitNotifySetting":
+      writeFailure = await writeWaitNotifySetting(raw.setting, raw.value);
       break;
     case "setOrchestrationSetting":
       writeFailure = await writeOrchestrationSetting(raw.setting, raw.value);

@@ -1,6 +1,7 @@
 import { getLaisoraConfiguration } from "./claude-settings";
 import * as vscode from "vscode";
 import * as l10n from "@vscode/l10n";
+import { formatHandoffTokens } from "./handoff-format";
 import { randomUUID } from "node:crypto";
 import { mkdir, readFile, unlink, writeFile } from "node:fs/promises";
 import { join } from "node:path";
@@ -9,11 +10,10 @@ import { configuredClaudeExecutablePath, inheritedProfile, launchFolderMissing, 
 import { claudeConfigDir } from "./claude-env";
 import { transcriptRetentionSettings } from "./transcript-retention";
 import { resolveHandoffRuntime, type ClaudeConversation } from "./claudeHost";
+import { signalWaitNotify } from "./wait-notify-signal";
 import { openResumedSession, openSessionById } from "./resume-hydration";
 import type { Session, StartMeasurement } from "./session";
 import {
-  handoffDecisionCounts,
-  handoffDecisionLineCount,
   handoffContextUsageKey,
   handoffUnreadableLinesKey,
   type HandoffContextMeasurement,
@@ -39,6 +39,7 @@ import {
   CACHE_EXPIRY_MIN_TOTAL_TOKENS,
   HANDED_OFF_SOURCES_KEY,
   autoHandoffPermitted,
+  autoHandoffGateOpen,
   handedOffSourcesOf,
   handoffOriginOf,
   postTurnMeasurement,
@@ -66,7 +67,7 @@ import {
   noteUserSend,
   planHasUnfinishedStep,
   resolveHandoffAutoSettings,
-  sizeAutoStart,
+  sizeAutoDecision,
   type AutoHandoffGateInput,
   type CliActivity,
   type AutoHandoffMemory,
@@ -284,7 +285,6 @@ async function runHandoff(st: SessionStore, sender: vscode.Webview | null, targe
       return false;
     }
     const forkSession = opened.session;
-    const decisions = outcome.detail?.decisions;
     forkSession.handoffSource = {
       contextUsage,
       sessionId: source.sessionId,
@@ -292,9 +292,6 @@ async function runHandoff(st: SessionStore, sender: vscode.Webview | null, targe
       ...(outcome.compact !== undefined ? { compact: outcome.compact } : {}),
       utteranceCount: outcome.utteranceCount,
       ...(outcome.unreadableLineCount > 0 ? { unreadableLineCount: outcome.unreadableLineCount } : {}),
-      ...(decisions !== undefined
-        ? { decisionCount: handoffDecisionLineCount(decisions), decisions: handoffDecisionCounts(decisions) }
-        : {}),
       detailRunId: restoredHandoffRunId(outcome.forkSessionId),
     };
     if (outcome.unreadableLineCount > 0) {
@@ -305,7 +302,6 @@ async function runHandoff(st: SessionStore, sender: vscode.Webview | null, targe
       runId,
       state: "done",
       contextUsage,
-      ...(decisions !== undefined ? { decisions: handoffDecisionCounts(decisions) } : {}),
       message:
         outcome.unreadableLineCount > 0
           ? l10n.t(
@@ -346,6 +342,7 @@ async function runHandoff(st: SessionStore, sender: vscode.Webview | null, targe
     return false;
   } finally {
     if (handoffRuns.get(target.tabId)?.runId === runId) handoffRuns.delete(target.tabId);
+    signalWaitNotify(target);
   }
 }
 
@@ -414,8 +411,7 @@ async function sendHandoffDetailPart(
   const parts = buildHandoffDetailParts(
     sourceRef.detail.summary,
     sourceRef.detail.utterances,
-    HANDOFF_DETAIL_MAX_BYTES - base,
-    sourceRef.detail.decisions
+    HANDOFF_DETAIL_MAX_BYTES - base
   );
   const chunk = parts[part];
   if (chunk === undefined) {
@@ -429,7 +425,6 @@ async function sendHandoffDetailPart(
     part,
     total: parts.length,
     ...(chunk.summary !== undefined ? { summary: chunk.summary } : {}),
-    ...(chunk.decisions !== undefined ? { decisions: chunk.decisions } : {}),
     utterances: chunk.utterances,
   });
 }
@@ -552,6 +547,7 @@ interface AutoHandoffTab {
   usage?: { totalTokens: number; autoCompactThreshold?: number };
   noticeTurn?: string;
   timer?: ReturnType<typeof setTimeout>;
+  originTooLargeToldGeneration?: number;
 }
 
 const NOTICE_TURN_PENDING = "";
@@ -621,14 +617,21 @@ export function cliActivityOf(s: Session): CliActivity {
   };
 }
 
-function autoHandoffGateOf(s: Session): AutoHandoffGateInput {
+function quietGateOf(s: Session): Omit<AutoHandoffGateInput, "composerHasText"> {
   const activity = cliActivityOf(s);
-  return {
-    ...activity,
-    queuedMessages: activity.queuedMessages + s.unsentSends.size,
-    composerHasText: composerHasText(s.tabId),
-    handoffRunning: handoffRuns.has(s.tabId),
-  };
+  return { ...activity, queuedMessages: activity.queuedMessages + s.unsentSends.size, handoffRunning: handoffRuns.has(s.tabId) };
+}
+
+function autoHandoffGateOf(s: Session): AutoHandoffGateInput {
+  return { ...quietGateOf(s), composerHasText: composerHasText(s.tabId) };
+}
+
+export function conversationQuiet(s: Session): boolean {
+  return autoHandoffGateOpen({ ...quietGateOf(s), composerHasText: false });
+}
+
+export function autoHandoffDue(s: Session): boolean {
+  return autoHandoffTabs.get(s)?.candidate !== undefined;
 }
 
 function unfinishedWorkOf(s: Session): boolean {
@@ -720,11 +723,18 @@ function evaluateAutoHandoff(s: Session, tab: AutoHandoffTab, usage: Extract<Nor
     return;
   }
   const settings = readAutoHandoffSettings();
-  const size = sizeAutoStart(settings, usage, handoffOriginOf(s.handoffSource));
-  if (size !== undefined) {
-    tab.candidate = size;
+  const size = sizeAutoDecision(settings, usage, handoffOriginOf(s.handoffSource));
+  if (size?.action === "start") {
+    tab.candidate = size.start;
     tryAutoHandoff(s);
     return;
+  }
+  if (size?.action === "origin_too_large" && tab.originTooLargeToldGeneration !== s.logicalGeneration) {
+    tab.originTooLargeToldGeneration = s.logicalGeneration;
+    output.appendLine(`[${s.title}] automatic handoff by size skipped: context after the previous handoff ${size.postTokens} > half the threshold ${size.threshold}`);
+    store?.post({ type: "tabNotice", tabId: s.tabId, text: l10n.t(
+      "Automatic handoff by context size will not start in this conversation: right after the previous handoff it already held {0} tokens, more than half the threshold ({1}). You can still hand off from the tab menu.",
+      formatHandoffTokens(size.postTokens), formatHandoffTokens(size.threshold)) });
   }
   armCacheExpiryTimer(s, tab, usage.totalTokens);
 }
@@ -817,5 +827,8 @@ export function noteAutoHandoffUserSend(s: Session): void {
 export function noteComposerDrafts(sender: vscode.Webview, tabIds: readonly string[] | null): void {
   if (tabIds === null) composerDraftTabs.delete(sender);
   else composerDraftTabs.set(sender, new Set(tabIds));
-  for (const s of store?.sessions.values() ?? []) tryAutoHandoff(s);
+  for (const s of store?.sessions.values() ?? []) {
+    tryAutoHandoff(s);
+    signalWaitNotify(s);
+  }
 }

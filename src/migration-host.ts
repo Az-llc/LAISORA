@@ -186,7 +186,7 @@ export async function exportMigrationFromPage(categories: readonly MigrationCate
 }
 
 export function migrationImportPrompt(): string {
-  return l10n.t("Please help me import a LAISORA migration ZIP that I exported on my old PC, step by step.\n1. Ask me only for the path of the ZIP file. Accept the path as I paste it, with or without quotes.\n2. Call the import_migration tool with that path. VS Code asks me to confirm. Then tell me in plain words what was placed and what was kept as it was.\n3. Read the LAISORA-MIGRATION.md whose path is in the tool result (guide).\n4. If the result lists work folders not found on this PC (unresolved), ask me once, listing all of them, where each project is now; I may answer that one is not needed. For each folder I give, call the rebind_migrated_folder tool with its dirName and cwd from the result as dirName and oldCwd and that folder as newCwd (VS Code asks me to confirm), then tell me what it moved and whether its check passed.\n5. Do not delete or overwrite anything without asking me first.");
+  return l10n.t("Please help me import a LAISORA migration ZIP that I exported on my old PC, step by step.\n1. Ask me only for the path of the ZIP file. Accept the path as I paste it, with or without quotes.\n2. Call the import_migration tool with that path. VS Code asks me to confirm. Then tell me briefly, per category, the counts in the result (placed, replaced with a backup, rewritten from the old PC's paths, unchanged, kept), and name only what failed or was not placed.\n3. Read the LAISORA-MIGRATION.md whose path is in the tool result (guide).\n4. If the result lists work folders not found on this PC (unresolved), ask me once, listing all of them, where each project is now; I may answer that one is not needed. For each folder I give, call the rebind_migrated_folder tool with its dirName and cwd from the result as dirName and oldCwd and that folder as newCwd (VS Code asks me to confirm), then tell me what it moved and whether its check passed.\n5. Do not delete or overwrite anything without asking me first.");
 }
 
 let importStarting = false;
@@ -278,8 +278,11 @@ export const migrationTools = {
       const result = await runImport(archive);
       if (result === "busy") return { text: "Another migration is running in LAISORA; try again when it finishes.", isError: true };
       if (result === "cancelled") return { text: "The user declined the import; nothing was placed.", isError: true };
-      return { isError: result.error !== undefined, text: JSON.stringify({ ...result, ...(result.error ? { error: migrationFailureText(result.error) } : {}),
-        ...(result.guide ? { next: `${MIGRATION_README} is at ${result.guide}. ${result.unresolved.length ? "unresolved lists the work folders not found on this PC; their records and memory are under ~/.claude/projects/<dirName>. Ask the user where each project is now, then call rebind_migrated_folder with its dirName and that folder." : "Every work folder was found on this PC."}` } : {}) }) };
+      const { error, unresolved, guide, backups, ...outcomes } = result;
+      return { isError: error !== undefined, text: JSON.stringify({ ...(error ? { error: migrationFailureText(error) } : {}), unresolved,
+        ...(guide ? { guide } : {}), ...(backups ? { backups } : {}),
+        ...(guide ? { next: `${MIGRATION_README} is at ${guide}. ${unresolved.length ? "unresolved lists the work folders not found on this PC; their records and memory are under ~/.claude/projects/<dirName>. Ask the user where each project is now, then call rebind_migrated_folder with its dirName and that folder." : "Every work folder was found on this PC."}` } : {}),
+        ...outcomes }) };
     } catch (error) {
       output.appendLine(`[migration] import tool failed: ${String(error)}`);
       return { text: migrationErrorText(error), isError: true };

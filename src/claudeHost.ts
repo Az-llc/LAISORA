@@ -63,6 +63,7 @@ import { isShellTool } from "./shell-tools";
 import { compileVocabulary, PLACEMENT_EFFORT_WORDS, placementPath, protectedDestination, isControlFile, delegateControlRefusal, judgeFileWrite, judgeMemoryWrite, memoryGuardReason, type MemoryDecision, judgeShellWrite, PLACEMENT_GUARD_REFUSAL, PLACEMENT_UNREADABLE_REFUSAL } from "./placement-guard";
 import { RootGate } from "./root-gate";
 import { laisoraInputLine, markLaisoraInput, type LaisoraInput } from "./laisora-input";
+import { wakeToolDecision, waitNotifyFlagSettings, type WaitNotifyStopHook, type WakeGate } from "./wait-notify";
 import { createTodoMcpServer, TODO_ROOT_SCOPE, TODO_SERVER_NAME, TODO_TOOL_NAMES, todoLinkedInstruction, todoWorkspaceRoots, type TodoLinkedItem, type TodoMigrationTools } from "./todo-mcp";
 import type { TodoStore } from "./todo-store";
 import { claudeModelIdLabel, EXTERNAL_TIMEOUT_DEFAULT_MINUTES, externalUnknownTargetReason, isExternalRunTool } from "./orchestration-executors";
@@ -72,6 +73,8 @@ import { planItemLabel, type PlanStepUpdate } from "./plan-steps";
 import { AgentAttribution } from "./orchestration-attribution";
 import type { NormalizedOutMeta } from "./claude-normalizer";
 import { askQualityDenial, rejectedAskTitles } from "./markdown-ast";
+import { plainAskFormat } from "./ask-plain-form";
+import { classifyPrompt, forgetOwnPrompt, noteOwnPrompt, type OwnPrompt } from "./prompt-origin";
 import { elicitationAnswer, elicitationSpecOf, type ElicitationSpec } from "./elicitation";
 import type { SessionWritesLost } from "./session-writes-lost";
 
@@ -157,6 +160,12 @@ export const PLAN_INSTRUCTION = [
   "</format>",
 ].join("\n");
 
+export const REMOTE_ORIGIN_ASK_INSTRUCTION = (): string => [
+  "This message was not sent from the LAISORA window, so the user may be reading this turn on claude.ai or the Claude mobile app, where laisora-ask blocks show as raw code.",
+  "In this turn, write each decision or real-machine check in the plain form below instead of a laisora-ask block. The content rules for decisions and checks in your instructions still apply.",
+  plainAskFormat(),
+].join("\n\n");
+
 export function interruptDiscardNotice(count: number): string {
   return l10n.t("Discarded {0} unprocessed messages due to the interrupt", count);
 }
@@ -237,6 +246,7 @@ export interface ClaudeHostOptions {
   settingSources: Array<"user" | "project" | "local">;
   transcriptRetention?: TranscriptRetentionSettings;
   remoteControlAtStartup?: boolean;
+  waitNotify?: { stopHook: WaitNotifyStopHook; wakeGate: (turnId: string | null) => WakeGate | undefined; onWakeAllowed: () => void };
   chromeIntegration?: boolean;
   mcpElicitation?: boolean;
   claudeCodeExecutablePath?: string;
@@ -504,6 +514,7 @@ export class ClaudeConversation {
   readonly conversationId = randomUUID();
   lastRecordReceivedAt: number | undefined;
   private turnAssistantText: string[] = [];
+  private ownPrompts: OwnPrompt[] = [];
   private normalizer: ClaudeLiveNormalizer;
   private readonly usageLimitResume: UsageLimitResume;
   private readonly unsubscribeAutoContinue: () => void;
@@ -749,7 +760,8 @@ ${ctxJson}`
       cwd: this.opts.cwd,
       permissionMode: this.opts.permissionMode,
       settingSources: this.opts.settingSources,
-      settings: { remoteControlAtStartup: this.opts.remoteControlAtStartup === true, ...SDK_AUTO_CONTINUE_SETTINGS, ultracode: false, ...this.opts.transcriptRetention },
+      settings: { remoteControlAtStartup: this.opts.remoteControlAtStartup === true, ...SDK_AUTO_CONTINUE_SETTINGS, ultracode: false, ...this.opts.transcriptRetention,
+        ...(this.opts.waitNotify ? waitNotifyFlagSettings(this.opts.waitNotify.stopHook) : {}) },
       extraArgs: conversationExtraArgs(this.opts.chromeIntegration === true),
       includePartialMessages: true,
       pathToClaudeCodeExecutable: resolvedExecutable.path,
@@ -982,6 +994,7 @@ ${ctxJson}`
       const askQualityGate: ClaudeCodeSdk.HookCallback = async input => {
         if (input.hook_event_name !== "Stop") return {};
         if (!input.stop_hook_active) rewrites = 0;
+        if (this.opts.waitNotify?.wakeGate(this.normalizer.currentTurnId) !== undefined) return {};
         try {
           const text = [...this.turnAssistantText, input.last_assistant_message ?? ""].join("\n\n");
           const reason = askQualityDenial(text);
@@ -997,6 +1010,15 @@ ${ctxJson}`
         }
       };
       options.hooks = { ...(options.hooks ?? {}), Stop: [...(options.hooks?.Stop ?? []), { hooks: [askQualityGate] }] };
+    }
+    if (planInstruction) {
+      const promptOrigin: ClaudeCodeSdk.HookCallback = async input => {
+        if (input.hook_event_name !== "UserPromptSubmit") return {};
+        const verdict = classifyPrompt(this.ownPrompts, input.prompt);
+        this.ownPrompts = verdict.pending;
+        return verdict.own ? {} : { hookSpecificOutput: { hookEventName: "UserPromptSubmit" as const, additionalContext: REMOTE_ORIGIN_ASK_INSTRUCTION() } };
+      };
+      options.hooks = { ...(options.hooks ?? {}), UserPromptSubmit: [...(options.hooks?.UserPromptSubmit ?? []), { hooks: [promptOrigin] }] };
     }
     if (this.orchestrationEnabled) {
       const observeDispatch: ClaudeCodeSdk.HookCallback = async input => {
@@ -1020,6 +1042,18 @@ ${ctxJson}`
       };
       options.hooks = { ...(options.hooks ?? {}), PreToolUse: [...(options.hooks?.PreToolUse ?? []), { hooks: [observeDispatch] },
         { matcher: `^${SUBAGENT_HANDBACK_TOOL}$`, hooks: [handbackGate] }] };
+    }
+    const waitNotify = this.opts.waitNotify;
+    if (waitNotify) {
+      const wakeGate: ClaudeCodeSdk.HookCallback = async input => {
+        if (input.hook_event_name !== "PreToolUse") return {};
+        const decision = wakeToolDecision(input.tool_name, input.tool_input as Record<string, unknown> | undefined, input.agent_id,
+          waitNotify.wakeGate(this.normalizer.currentTurnId));
+        if (decision.kind === "deny") return { hookSpecificOutput: { hookEventName: "PreToolUse", permissionDecision: "deny", permissionDecisionReason: decision.reason } };
+        if (decision.kind === "allow") waitNotify.onWakeAllowed();
+        return {};
+      };
+      options.hooks = { ...(options.hooks ?? {}), PreToolUse: [{ hooks: [wakeGate] }, ...(options.hooks?.PreToolUse ?? [])] };
     }
     const delegateForeground: ClaudeCodeSdk.HookCallback = async input => {
       if (input.hook_event_name !== "PreToolUse" || !isDelegationTool(input.tool_name)) return {};
@@ -1112,7 +1146,9 @@ ${ctxJson}`
       checkEnvelopeRedaction
     );
     if (!admission.ok) return admission;
-    this.queueUserInput([{ type: "text", text: envelopeText }], { uuid: randomUUID() });
+    const uuid = randomUUID();
+    this.normalizer.noteAutomaticInput(uuid);
+    this.queueUserInput([{ type: "text", text: envelopeText }], { uuid });
     return { ok: true };
   }
 
@@ -1123,7 +1159,9 @@ ${ctxJson}`
       checkEnvelopeRedaction
     );
     if (!admission.ok) return admission;
-    this.queueUserInput([{ type: "text", text: envelopeText }], { uuid: randomUUID() });
+    const uuid = randomUUID();
+    this.normalizer.noteAutomaticInput(uuid);
+    this.queueUserInput([{ type: "text", text: envelopeText }], { uuid });
     return { ok: true };
   }
 
@@ -1144,6 +1182,7 @@ ${ctxJson}`
   private queueUserInput(content: UserContentBlock[], extra: { isMeta?: true; uuid: `${string}-${string}-${string}-${string}-${string}` }): void {
     this.invalidateHandoffContextUsage();
     this.normalizer.noteOwnInput(extra.uuid);
+    this.ownPrompts = noteOwnPrompt(this.ownPrompts, extra.uuid, content.flatMap((block) => block.type === "text" ? [block.text] : []).join("\n\n"));
     this.inputQueue.push({
       type: "user",
       message: { role: "user", content },
@@ -1160,6 +1199,12 @@ ${ctxJson}`
   get pendingAutoResumeAt(): number | null { return this.usageLimitResume.pendingResumeAt; }
 
   get queuedInputCount(): number { return this.inputQueue.length; }
+
+  get launchedWithWaitNotify(): boolean { return this.opts.waitNotify !== undefined; }
+
+  get runningTurnId(): string | null { return this.normalizer.turnState === "idle" ? null : this.normalizer.currentTurnId; }
+
+  expectLaisoraWake(expected: boolean): void { this.normalizer.laisoraWakeExpected = expected; }
 
   get runningExternalRunCount(): number { return this.activeExternalRuns.size; }
 
@@ -1215,7 +1260,10 @@ ${ctxJson}`
     this.normalizer.turnState = "interrupting";
     const turnId = this.normalizer.currentTurnId;
     const drained = this.inputQueue.length;
-    for (const input of this.inputQueue) this.normalizer.forgetOwnInput(input.uuid);
+    for (const input of this.inputQueue) {
+      this.normalizer.forgetOwnInput(input.uuid);
+      this.ownPrompts = forgetOwnPrompt(this.ownPrompts, input.uuid);
+    }
     this.inputQueue = [];
     if (drained > 0) {
       this.emit({
@@ -1356,6 +1404,7 @@ ${ctxJson}`
       const text = msg.message.content.filter((block: any) => block?.type === "text" && typeof block.text === "string").map((block: any) => block.text).join("");
       if (text) this.turnAssistantText.push(text);
     }
+    if (msg?.type === "user" && msg.isReplay === true && msg.parent_tool_use_id == null && typeof msg.uuid === "string") this.ownPrompts = forgetOwnPrompt(this.ownPrompts, msg.uuid);
     if (msg?.type !== "tool_progress") this.lastRecordReceivedAt = Date.now();
     if (msg?.type === "stream_event" && msg.parent_tool_use_id == null && msg.event?.type === "message_start") this.lastRootMessageStartedAt = Date.now();
     const bridge = bridgeStateOf(msg);

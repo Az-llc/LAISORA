@@ -1,3 +1,5 @@
+import { closesPlainAsk, opensPlainAsk } from "./ask-plain-form";
+
 const FENCE_RE = /^( {0,3})(`{3,}|~{3,})(.*)$/;
 
 export function isClosingFence(line: string, opening: string): boolean {
@@ -60,9 +62,41 @@ export function prependRecordParts(older: readonly RecordTextPart[], newer: read
   return parts;
 }
 
+const ATX_HEADING = /^ {0,3}#{1,6}(?:[ \t]|$)/;
+const ORDERED_ITEM = /^ {0,3}\d{1,9}[.)](?:[ \t]|$)/;
+const BULLET_ITEM = /^ {0,3}[-+*](?:[ \t]|$)/;
+const NESTED_BULLET_ITEM = /^[ \t]*[-+*](?:[ \t]|$)/;
+const TABLE_DELIMITER_ROW = /^ {0,3}\|?[ \t]*:?-+:?[ \t]*(?:\|[ \t]*:?-+:?[ \t]*)*\|?[ \t]*$/;
+const THEMATIC_BREAK = /^ {0,3}(?:(?:-[ \t]*){3,}|(?:\*[ \t]*){3,}|(?:_[ \t]*){3,})$/;
+const CODE_INDENT = /^(?: {4}|\t)/;
+
+type PlainAskHold = "none" | "head" | "list";
+
+const tableCells = (row: string): number => row.trim().replace(/^\|/, "").replace(/\|$/, "").split("|").length;
+
+function startsTable(previous: string, line: string): boolean {
+  return line.includes("|") && previous.includes("|") && TABLE_DELIMITER_ROW.test(line) && tableCells(previous) === tableCells(line);
+}
+
+function stepPlainAskHold(hold: PlainAskHold, line: string, previous: string, fenceOpens: boolean): PlainAskHold {
+  if (opensPlainAsk(line)) return "head";
+  if (hold === "none" || line.trim() === "") return hold;
+  if (fenceOpens || closesPlainAsk(line) || ATX_HEADING.test(line)) return "none";
+  const afterBlank = previous.trim() === "";
+  if (hold === "head") {
+    if (afterBlank && CODE_INDENT.test(line)) return "none";
+    if (ORDERED_ITEM.test(line)) return "list";
+    return BULLET_ITEM.test(line) || THEMATIC_BREAK.test(line) || (!afterBlank && startsTable(previous, line)) ? "none" : hold;
+  }
+  if (ORDERED_ITEM.test(line)) return hold;
+  return afterBlank && !NESTED_BULLET_ITEM.test(line) ? "none" : hold;
+}
+
 export function findCommitBoundary(buf: string, committedLen: number): number {
   let boundary = -1;
   let fence: { char: string; len: number } | null = null;
+  let hold: PlainAskHold = "none";
+  let previous = "";
   let pos = committedLen;
   const lines = buf.slice(committedLen).split("\n");
   for (let i = 0; i < lines.length; i++) {
@@ -70,11 +104,13 @@ export function findCommitBoundary(buf: string, committedLen: number): number {
     if (fence === null) {
       const opening = fenceOpening(line);
       if (opening) fence = { char: opening.marker[0], len: opening.marker.length };
+      hold = stepPlainAskHold(hold, line, previous, opening !== null);
     } else if (isClosingFence(line, fence.char.repeat(fence.len))) {
       fence = null;
     }
+    previous = line;
     pos += line.length + 1;
-    if (fence === null && line.trim() === "" && pos > committedLen) boundary = pos;
+    if (fence === null && hold === "none" && line.trim() === "" && pos > committedLen) boundary = pos;
   }
   return boundary >= buf.length ? -1 : boundary;
 }

@@ -36,7 +36,7 @@ import {
 import { initHostL10n } from "./l10n";
 import { SessionStore, tabLimit } from "./store-surfaces";
 export { createStartMeasurement } from "./handoff-wiring";
-import { PROTOCOL_VERSION, isSettingsRevealTarget } from "./protocol";
+import { PROTOCOL_VERSION, WAIT_NOTIFY_SETTING_KEYS, isSettingsRevealTarget } from "./protocol";
 import { hostCpuMs, openResumedSession as resumePersistedTab, startLoopLagProbe } from "./resume-hydration";
 import { lookupSessionFile } from "./session-files";
 import { isHandoffForkHidden } from "./handoff-runner";
@@ -58,6 +58,7 @@ export { settingsStateMessage, setExternalDetectorForTest } from "./gateway-host
 import { openSettingsPanel, postSettingsState } from "./settings-panel";
 import { postOrchestrationView } from "./conversation-lifecycle";
 import { clearAutoHandoff } from "./handoff-wiring";
+import { clearWaitNotify, reevaluateWaitNotify } from "./wait-notify-wiring";
 import { registerReadOnlyFileProvider } from "./composer-io";
 import { pasteClipboardTextIntoComposer, setComposerFocus } from "./composer-paste";
 export { Session, historyScopeKey, historyTranscriptScopeKey, isUnusedSession } from "./session";
@@ -230,7 +231,9 @@ function activateReady(context: vscode.ExtensionContext): void {
         if (cacheTtlSetting) session.semantic.scheduleSemanticModelPost();
       }
     }
-    if (affectsProductConfiguration(e, "composer.sendKey") || affectsProductConfiguration(e, "appearance") || affectsProductConfiguration(e, "claude.askQualityCheck") || affectsProductConfiguration(e, EDIT_SUMMARY_SETTING) || affectsProductConfiguration(e, REMOTE_CONTROL_CARD_SETTING) || affectsProductConfiguration(e, IMPROVEMENT_MENU_SETTING) || welcomeSettingChanged((key) => affectsProductConfiguration(e, key))) store?.post(userSettingsMessage());
+    const waitNotifyChanged = Object.values(WAIT_NOTIFY_SETTING_KEYS).some((key) => affectsProductConfiguration(e, key));
+    if (waitNotifyChanged) reevaluateWaitNotify();
+    if (affectsProductConfiguration(e, "composer.sendKey") || affectsProductConfiguration(e, "appearance") || affectsProductConfiguration(e, "claude.askQualityCheck") || affectsProductConfiguration(e, EDIT_SUMMARY_SETTING) || affectsProductConfiguration(e, REMOTE_CONTROL_CARD_SETTING) || waitNotifyChanged || affectsProductConfiguration(e, IMPROVEMENT_MENU_SETTING) || welcomeSettingChanged((key) => affectsProductConfiguration(e, key))) store?.post(userSettingsMessage());
     if (
       affectsProductConfiguration(e, "appearance") ||
       affectsProductConfiguration(e, "composer.sendKey") ||
@@ -239,7 +242,7 @@ function activateReady(context: vscode.ExtensionContext): void {
       affectsProductConfiguration(e, "restoreTabsOnStartup") ||
       affectsProductConfiguration(e, TODO_ENABLED_SETTING) ||
       affectsProductConfiguration(e, EDIT_SUMMARY_SETTING) ||
-      affectsProductConfiguration(e, REMOTE_CONTROL_CARD_SETTING) || affectsProductConfiguration(e, IMPROVEMENT_MENU_SETTING) ||
+      affectsProductConfiguration(e, REMOTE_CONTROL_CARD_SETTING) || waitNotifyChanged || affectsProductConfiguration(e, IMPROVEMENT_MENU_SETTING) ||
       welcomeSettingChanged((key) => affectsProductConfiguration(e, key)) ||
       affectsProductConfiguration(e, GUARD_ENABLED_SETTING) ||
       affectsProductConfiguration(e, MEMORY_BLOCK_PROJECT_TYPE_SETTING) ||
@@ -503,6 +506,7 @@ async function settleForShutdown(): Promise<void> {
       s.guardrailRunner.clearGuardrailTickTimer();
       s.startMeasurement?.abandon();
       clearAutoHandoff(s);
+      clearWaitNotify(s);
     }
   }
   await Promise.all([

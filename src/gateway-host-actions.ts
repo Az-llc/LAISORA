@@ -14,9 +14,14 @@ import { DEFAULT_ORCHESTRATION_ROSTER, buildRecommendedClaudeRoster, isOrchestra
 import * as vscode from "vscode";
 import { openSignInTerminal } from "./claude-sign-in";
 import { resolveHandoffAutoSettings } from "./handoff-auto";
+import { resolveWaitNotifySettings } from "./wait-notify";
 import {
   HANDOFF_AUTO_SETTING_KEYS,
+  WAIT_NOTIFY_SETTING_KEYS,
   isHandoffAutoSettingValue,
+  isWaitNotifySettingValue,
+  type WaitNotifySettingName,
+  type WaitNotifySettings,
   normalizeApiKeyPolicy,
   normalizeComposerSendKey,
   type HandoffAutoSettingName,
@@ -64,6 +69,11 @@ export function improvementMenuEnabled(): boolean {
 
 export function remoteControlCardEnabled(): boolean {
   return getLaisoraConfiguration().get<boolean>(REMOTE_CONTROL_CARD_SETTING) !== false;
+}
+
+export function waitNotifySettings(): WaitNotifySettings {
+  const cfg = getLaisoraConfiguration();
+  return resolveWaitNotifySettings((key) => cfg.get<unknown>(key));
 }
 
 export const WELCOME_SETTING_KEYS: Record<WelcomeSetting, string> = { showNews: "welcome.showNews", showTips: "welcome.showTips" };
@@ -151,6 +161,7 @@ export function userSettingsMessage(): Extract<HostToWebview, { type: "userSetti
     askQualityCheck: getLaisoraConfiguration().get<boolean>("claude.askQualityCheck") === true,
     editSummaryEnabled: editSummarySettingEnabled(),
     remoteControlCard: remoteControlCardEnabled(),
+    waitNotify: waitNotifySettings().enabled,
     improvementMenu: improvementMenuEnabled(),
     welcome: welcomeState(),
   };
@@ -322,6 +333,7 @@ export function settingsStateMessage(): Extract<HostToSettingsPage, { type: "set
     improvementMenu: improvementMenuEnabled(),
     welcome: welcomeSettings(),
     handoffAuto: resolveHandoffAutoSettings((key) => cfg.get<unknown>(key)),
+    waitNotify: waitNotifySettings(),
     orchestrationAgents: readRoster(cfg.get<unknown>("orchestration.agents")),
     orchestrationDefaults: readRoster(cfg.inspect("orchestration.agents")?.defaultValue ?? DEFAULT_ORCHESTRATION_ROSTER),
     conductorPolicy: cfg.get<string>("orchestration.conductorPolicy")!,
@@ -447,6 +459,10 @@ export async function writeRemoteControlCard(enabled: boolean): Promise<SettingW
 
 export async function writeHandoffAutoSetting(setting: HandoffAutoSettingName, value: unknown): Promise<SettingWriteFailure | undefined> {
   return isHandoffAutoSettingValue(setting, value) ? updateUserSetting(HANDOFF_AUTO_SETTING_KEYS[setting], value) : undefined;
+}
+
+export async function writeWaitNotifySetting(setting: WaitNotifySettingName, value: unknown): Promise<SettingWriteFailure | undefined> {
+  return isWaitNotifySettingValue(setting, value) ? updateUserSetting(WAIT_NOTIFY_SETTING_KEYS[setting], value) : undefined;
 }
 
 let normalizedRosterLogged = false;

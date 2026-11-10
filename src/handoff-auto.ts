@@ -1,6 +1,6 @@
 import { CACHE_TTL_MS, cacheWriteTtl } from "./cache-ttl-cost";
 import type { CacheTtl } from "./claude-prices";
-import { configurationDefault } from "./configuration-defaults";
+import { resolveSettingGroup } from "./configuration-defaults";
 import { askBlocksIn } from "./markdown-ast";
 import { planCurrentSteps } from "./plan-steps";
 import type { HandoffNoticeFacts } from "./steering-envelope";
@@ -9,7 +9,6 @@ import {
   isHandoffAutoSettingValue,
   type AssistantUsage,
   type HandoffContextUsage,
-  type HandoffAutoSettingName,
   type HandoffAutoSettings,
   type HandoffAutoNotice,
   type HandoffAutoStart,
@@ -20,12 +19,7 @@ export const CACHE_EXPIRY_LEAD_MS = 5 * 60_000;
 export const CACHE_EXPIRY_MIN_TOTAL_TOKENS = 100_000;
 
 export function resolveHandoffAutoSettings(read: (key: string) => unknown): HandoffAutoSettings {
-  const pick = <K extends HandoffAutoSettingName>(name: K): HandoffAutoSettings[K] => {
-    const key = HANDOFF_AUTO_SETTING_KEYS[name];
-    const value = read(key);
-    return (isHandoffAutoSettingValue(name, value) ? value : configurationDefault<HandoffAutoSettings[K]>(key)) as HandoffAutoSettings[K];
-  };
-  return { enabled: pick("enabled"), mode: pick("mode"), percent: pick("percent"), tokens: pick("tokens"), cacheExpiryEnabled: pick("cacheExpiryEnabled") };
+  return resolveSettingGroup<HandoffAutoSettings>(HANDOFF_AUTO_SETTING_KEYS, isHandoffAutoSettingValue, read);
 }
 
 const measured = (value: number | undefined): value is number => typeof value === "number" && Number.isFinite(value) && value > 0;
@@ -37,12 +31,24 @@ export function autoHandoffThreshold(settings: Pick<HandoffAutoSettings, "mode" 
 
 export type HandoffOrigin = { postTokens: number | undefined } | undefined;
 
-export function sizeAutoStart(settings: HandoffAutoSettings, usage: { totalTokens?: number; autoCompactThreshold?: number }, origin: HandoffOrigin): Extract<HandoffAutoStart, { trigger: "size" }> | undefined {
+export type SizeAutoDecision =
+  | { action: "start"; start: Extract<HandoffAutoStart, { trigger: "size" }> }
+  | { action: "origin_too_large"; postTokens: number; threshold: number };
+
+export function sizeAutoDecision(settings: HandoffAutoSettings, usage: { totalTokens?: number; autoCompactThreshold?: number }, origin: HandoffOrigin): SizeAutoDecision | undefined {
   if (!settings.enabled || !measured(usage.totalTokens)) return undefined;
   const threshold = autoHandoffThreshold(settings, usage.autoCompactThreshold);
   if (threshold === undefined || usage.totalTokens < threshold) return undefined;
-  if (origin !== undefined && (origin.postTokens === undefined || origin.postTokens > threshold / 2)) return undefined;
-  return { trigger: "size", totalTokens: usage.totalTokens, threshold };
+  if (origin !== undefined) {
+    if (origin.postTokens === undefined) return undefined;
+    if (origin.postTokens > threshold / 2) return { action: "origin_too_large", postTokens: origin.postTokens, threshold };
+  }
+  return { action: "start", start: { trigger: "size", totalTokens: usage.totalTokens, threshold } };
+}
+
+export function sizeAutoStart(settings: HandoffAutoSettings, usage: { totalTokens?: number; autoCompactThreshold?: number }, origin: HandoffOrigin): Extract<HandoffAutoStart, { trigger: "size" }> | undefined {
+  const decision = sizeAutoDecision(settings, usage, origin);
+  return decision?.action === "start" ? decision.start : undefined;
 }
 
 export function handoffOriginOf(source: { contextUsage?: HandoffContextUsage } | undefined): HandoffOrigin {
@@ -111,15 +117,19 @@ export function decisionPendingSinceUserSend(events: readonly NormalizedEvent[])
   const resolved = new Set<string>();
   const texts: string[] = [];
   let turnId: string | undefined;
-  for (let i = events.length - 1; i >= 0; i--) {
-    const ev = events[i];
-    if (ev.kind === "user_message" || (ev.kind === "replayed_message" && ev.role === "user")) break;
+  const isUserSend = (ev: NormalizedEvent): boolean => ev.kind === "user_message" || (ev.kind === "replayed_message" && ev.role === "user");
+  let from = events.length;
+  while (from > 0 && !isUserSend(events[from - 1])) from--;
+  const since = events.slice(from);
+  const wakeTurns = new Set(since.flatMap((ev) => ev.kind === "turn_started" && ev.laisoraWake === true ? [ev.turnId] : []));
+  for (let i = since.length - 1; i >= 0; i--) {
+    const ev = since[i];
     if (ev.kind === "approval_resolved") resolved.add(ev.requestId);
     else if (ev.kind === "approval_request" && ev.questions !== undefined && !resolved.has(ev.requestId)) return true;
     else if (ev.kind === "replayed_message" && ev.role === "assistant") {
       texts.push("\n", ev.text, "\n");
       turnId = undefined;
-    } else if (ev.kind === "assistant_text_delta" && ev.priorGeneration !== true) {
+    } else if (ev.kind === "assistant_text_delta" && ev.priorGeneration !== true && !wakeTurns.has(ev.turnId)) {
       if (turnId !== undefined && turnId !== ev.turnId) texts.push("\n");
       texts.push(ev.text);
       turnId = ev.turnId;

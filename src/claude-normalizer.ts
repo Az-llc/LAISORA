@@ -17,6 +17,7 @@ import { assistantUsageFromRaw, isSyntheticModel, summarizeToolInput } from "./p
 import type { HostArtifactAccess } from "./artifact-access";
 import { extractResumeSignals, extractStage0ToolFields, isResumeSignalToolName } from "./tool-observation";
 import { redactAbsolutePaths, redactOptional } from "./path-redaction";
+import { toolInputPreview } from "./tool-input-preview";
 import { countFileEdit, singleToolUseResult } from "./edit-summary";
 import { AUTO_MODE_UNEVALUATED } from "./tool-result-signals";
 import { isDelegationTool } from "./claude-tool-names";
@@ -414,9 +415,18 @@ export class ClaudeLiveNormalizer {
 
   forgetOwnInput(uuid: string): void {
     this.ownInputs.delete(uuid);
+    this.automaticInputs.delete(uuid);
+  }
+
+  noteAutomaticInput(uuid: string): void {
+    this.automaticInputs.add(uuid);
+    if (this.automaticInputs.size > OWN_INPUT_MEMORY_MAX) this.automaticInputs.delete(this.automaticInputs.values().next().value!);
   }
 
   private latestRateLimitReset: number | null = null;
+  laisoraWakeExpected = false;
+  private nextTurnAutomatic = false;
+  private readonly automaticInputs = new Set<string>();
 
   startTurn(turnId?: string, meta?: NormalizedOutMeta, automatic = false): string {
     const id = turnId ?? randomUUID();
@@ -439,7 +449,11 @@ export class ClaudeLiveNormalizer {
       meta?.timestamp === undefined && this.lastObservedTimestamp !== undefined
         ? { ...meta, timestamp: this.lastObservedTimestamp }
         : meta;
-    this.emit({ kind: "turn_started", turnId: id, ...(automatic ? { cliInserted: true as const, laisoraInput: true as const } : {}) }, startMeta);
+    const wake = !automatic && !this.nextTurnAutomatic && this.laisoraWakeExpected;
+    this.nextTurnAutomatic = false;
+    if (wake) this.laisoraWakeExpected = false;
+    this.emit({ kind: "turn_started", turnId: id, ...(automatic || wake ? { cliInserted: true as const, laisoraInput: true as const } : {}),
+      ...(wake ? { laisoraWake: true as const } : {}) }, startMeta);
     return id;
   }
 
@@ -1018,10 +1032,7 @@ export class ClaudeLiveNormalizer {
                 parentToolUseId,
                 toolName: blockName,
                 ...(typeof msgObj?.id === "string" && msgObj.id.length > 0 ? { messageId: msgObj.id } : {}),
-                inputPreview:
-                  blockName === "TodoWrite"
-                    ? redactAbsolutePaths(JSON.stringify(block.input)).slice(0, 20_000)
-                    : redactAbsolutePaths(JSON.stringify(block.input)).slice(0, 500),
+                inputPreview: toolInputPreview(blockName, block.input),
                 inputSummary: redactOptional(summarizeToolInput(blockName, block.input) ?? undefined),
                 intentInput: captureToolIntentInput(blockName, block.input),
                 isBackground: isBackground || undefined,
@@ -1044,9 +1055,11 @@ export class ClaudeLiveNormalizer {
 
       case "user": {
         const echoed = record.isReplay === true && (record.parent_tool_use_id ?? null) === null ? parseWireUuid(record) : null;
+        if (echoed !== null && this.automaticInputs.delete(echoed) && this.turnState === "idle") this.nextTurnAutomatic = true;
         if (echoed !== null && this.ownInputs.delete(echoed)) break;
         const inbound = inboundHumanInput(record);
         if (inbound !== null) {
+          this.laisoraWakeExpected = false;
           const turnId = this.currentTurnId ?? this.startTurn(undefined, defaultMeta);
           this.emit({
             kind: "user_message", turnId, text: inbound.text, uuid: inbound.uuid,

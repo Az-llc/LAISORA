@@ -18,6 +18,11 @@ export interface WelcomeUiNames { menuGlyph: string; handoffItem: string; appear
 
 export function welcomeNews(): Readonly<Record<string, readonly WelcomeNewsItem[]>> {
   return {
+    "1.17.0": [
+      { kind: "new", text: l10n.t("LAISORA can notify your phone through the Claude app when a conversation has waited on you too long. It is turned off at first; turn it on in the settings.") },
+      { kind: "new", text: l10n.t("Decision and check cards are readable on claude.ai and the mobile app when you follow a conversation over Remote Control.") },
+      { kind: "new", text: l10n.t("A handoff carries your own messages from every earlier conversation in the chain word for word.") },
+    ],
     "1.16.0": [
       { kind: "new", text: l10n.t("The \"Migration\" tab in the settings puts ToDo, LAISORA settings, your Claude environment and the conversations you choose into one ZIP, and brings them into a new PC.") },
       { kind: "new", text: l10n.t("When a full disk keeps part of a conversation from being saved, the conversation shows a notice, also when you resume it. You can turn it off in the settings.") },
@@ -61,7 +66,7 @@ export function welcomeTips(ui: WelcomeUiNames): readonly WelcomeTip[] {
   const viewing = l10n.t("Seeing the work");
   const tidying = l10n.t("Tidying up");
   return [
-    { id: "handoff", kind: connecting, title: l10n.t("Hand off when a conversation gets long"), body: l10n.t("\"{1}\" in the tab menu ({0}) starts a new conversation that carries the summary and your messages as they are. The original conversation stays.", ui.menuGlyph, ui.handoffItem) },
+    { id: "handoff", kind: connecting, title: l10n.t("Hand off when a conversation gets long"), body: l10n.t("\"{1}\" in the tab menu ({0}) starts a new conversation that carries the summary and your messages, with very long ones shortened. The original conversation stays.", ui.menuGlyph, ui.handoffItem) },
     { id: "handoffAuto", kind: connecting, title: l10n.t("Make the handoff automatic"), body: l10n.t("When the context grows large, the conversation moves to a new one by itself once it is free. Another setting moves it before the cache expires."), setting: "handoffAuto" },
     { id: "remoteControl", kind: connecting, title: l10n.t("Continue from another device"), body: l10n.t("Turn Remote Control on with `/rc` to send to the same conversation from claude.ai or your phone.") },
     { id: "resumeClaudeCode", kind: connecting, title: l10n.t("Resume Claude Code conversations too"), body: l10n.t("History ({0}) also lists conversations started in Claude Code or Claude Desktop. Pick one to continue it in LAISORA.", ui.historyButton) },

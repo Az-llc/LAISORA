@@ -1,5 +1,6 @@
 import MarkdownIt, { type Token } from "markdown-it";
-import { ASK_BLOCK_LINE, askQualityIssues, isPartialAskLine, parseAskBlock, parsePlanBlock, type AskBlock, type AskQualityIssue } from "./ask-parser";
+import { ASK_BLOCK_LINE, askQualityIssues, isPartialAskLine, parseAskBlock, parsePlanBlock, type AskBlock, type AskOption, type AskQualityIssue, type AskStep } from "./ask-parser";
+import { afterAnyPlainAskMark, afterPlainAskMark, isPlainAskMarkOnly, opensPlainAsk, PLAIN_ASK_CONS_MARKS, PLAIN_ASK_HEADING, PLAIN_ASK_MARK, PLAIN_ASK_PROS_MARKS, withoutPlainAskMarkAtEnds } from "./ask-plain-form";
 import { fenceOpening, isClosingFence } from "./commit-boundary";
 import { DEFAULT_SYSTEM_APP_EXTENSIONS } from "./file-link-open-mode";
 import { IMPROVEMENT_VERDICTS_FENCE } from "./improvement-brief";
@@ -111,7 +112,7 @@ export interface MdHardbreakNode {
 
 export type MdNode =
   | { type: "plan"; goal: string; offset: number }
-  | { type: "ask"; ask: AskBlock; offset: number; rejected?: true }
+  | { type: "ask"; ask: AskBlock; offset: number; rejected?: true; plain?: true }
   | { type: "todoSplit"; item: string; reason: string; offset: number }
   | MdHeadingNode
   | MdParagraphNode
@@ -289,7 +290,162 @@ function isAskFenceInfo(info: string): boolean {
 }
 
 export function mayHoldAskBlock(text: string): boolean {
-  return [...text.matchAll(FENCE_INFO_ANYWHERE)].some((match) => isAskFenceInfo(match[1]));
+  return [...text.matchAll(FENCE_INFO_ANYWHERE)].some((match) => isAskFenceInfo(match[1])) || opensPlainAsk(text);
+}
+
+export interface PlainAsk { readonly ask: AskBlock; readonly rejected: boolean; readonly end: number; readonly startLine: number; readonly endLine: number }
+
+function optionHead(inline: Token): { label: string; recommended: boolean } | undefined {
+  const star = PLAIN_ASK_MARK.recommended;
+  const children = (inline.children ?? []).filter((child) => child.type !== "text" || child.content !== "");
+  const before = children[0]?.type === "text" && isPlainAskMarkOnly(children[0].content, star);
+  const open = before ? 1 : 0;
+  if (children[open]?.type !== "strong_open") return undefined;
+  let depth = 0;
+  let close = -1;
+  for (let k = open; k < children.length && close < 0; k++) {
+    if (children[k].type === "strong_open") depth++;
+    else if (children[k].type === "strong_close" && --depth === 0) close = k;
+  }
+  if (close < 0) return undefined;
+  const written = children.slice(open + 1, close).map((child) => child.type === "softbreak" || child.type === "hardbreak" ? " " : child.content).join("").trim();
+  const label = withoutPlainAskMarkAtEnds(written, star);
+  const rest = children.slice(close + 1);
+  const after = rest.length === 1 && rest[0].type === "text" && isPlainAskMarkOnly(rest[0].content, star);
+  if (label === "" || label.includes(star) || (rest.length > 0 && !after)) return undefined;
+  return { label, recommended: before || after || label !== written };
+}
+
+export function plainAskAt(tokens: readonly Token[], start: number): PlainAsk | null {
+  const head = tokens[start];
+  if (head?.type !== "heading_open" || head.markup !== PLAIN_ASK_HEADING || head.map === null || tokens[start + 2]?.type !== "heading_close") return null;
+  const level = head.level;
+  const heading = tokens[start + 1]?.content ?? "";
+  const decideTitle = afterPlainAskMark(heading, PLAIN_ASK_MARK.decide);
+  const rejectedTitle = afterPlainAskMark(heading, PLAIN_ASK_MARK.rejected);
+  const checkTitle = afterPlainAskMark(heading, PLAIN_ASK_MARK.check);
+  const title = decideTitle ?? rejectedTitle ?? checkTitle;
+  if (!title) return null;
+  const kind = checkTitle !== undefined ? "check" : "decide";
+  const paragraphAt = (i: number, at: number): string | undefined =>
+    tokens[i]?.type === "paragraph_open" && tokens[i].level === at && tokens[i + 1]?.type === "inline" && tokens[i + 2]?.type === "paragraph_close" ? tokens[i + 1].content : undefined;
+  let i = start + 3;
+  const why: string[] = [];
+  for (let text = paragraphAt(i, level); text !== undefined; text = paragraphAt(i, level)) {
+    why.push(text);
+    i += 3;
+  }
+  if (why.length === 0) return null;
+  let details: string | undefined;
+  if (tokens[i]?.type === "blockquote_open" && tokens[i].level === level) {
+    const parts: string[] = [];
+    i++;
+    for (let text = paragraphAt(i, level + 1); text !== undefined; text = paragraphAt(i, level + 1)) {
+      parts.push(text);
+      i += 3;
+    }
+    if (parts.length === 0 || tokens[i]?.type !== "blockquote_close") return null;
+    details = parts.join("\n\n");
+    i++;
+  }
+  const bulletsAt = (at: number, base: number): { bullets: string[]; next: number } | null => {
+    if (tokens[at]?.type !== "bullet_list_open" || tokens[at].level !== base) return null;
+    let k = at + 1;
+    const bullets: string[] = [];
+    while (tokens[k]?.type === "list_item_open") {
+      const text = paragraphAt(k + 1, base + 2);
+      if (text !== undefined && tokens[k + 4]?.type === "list_item_close") {
+        bullets.push(text);
+        k += 5;
+        continue;
+      }
+      const marked = tokens[k + 2];
+      const nested = tokens[k + 1]?.type === "bullet_list_open" && marked?.type === "list_item_open" ? paragraphAt(k + 3, base + 4) : undefined;
+      if (nested === undefined || tokens[k + 6]?.type !== "list_item_close" || tokens[k + 7]?.type !== "bullet_list_close" || tokens[k + 8]?.type !== "list_item_close"
+        || ![...PLAIN_ASK_PROS_MARKS, ...PLAIN_ASK_CONS_MARKS].includes(marked.markup)) return null;
+      bullets.push(`${marked.markup} ${nested}`);
+      k += 9;
+    }
+    return tokens[k]?.type === "bullet_list_close" ? { bullets, next: k + 1 } : null;
+  };
+  const items: { head: Token; bullets?: string[] }[] = [];
+  let listEndLine = -1;
+  while (tokens[i]?.type === "ordered_list_open" && tokens[i].level === level) {
+    listEndLine = tokens[i].map?.[1] ?? -1;
+    i++;
+    while (tokens[i]?.type === "list_item_open") {
+      const itemHead = tokens[i + 2];
+      if (paragraphAt(i + 1, level + 2) === undefined) return null;
+      i += 4;
+      let bullets: string[] | undefined;
+      if (tokens[i]?.type === "bullet_list_open") {
+        const nested = bulletsAt(i, level + 2);
+        if (nested === null) return null;
+        bullets = nested.bullets;
+        i = nested.next;
+      }
+      if (tokens[i]?.type !== "list_item_close") return null;
+      i++;
+      items.push({ head: itemHead, bullets });
+    }
+    if (tokens[i]?.type !== "ordered_list_close") return null;
+    i++;
+    if (tokens[i]?.type === "bullet_list_open" && tokens[i].level === level) {
+      const last = items.at(-1);
+      const sibling = bulletsAt(i, level);
+      if (last === undefined || last.bullets !== undefined || sibling === null) return null;
+      listEndLine = tokens[i].map?.[1] ?? -1;
+      last.bullets = sibling.bullets;
+      i = sibling.next;
+    }
+  }
+  if (items.length === 0 || items.some((item) => item.bullets === undefined) || listEndLine < 0) return null;
+  let fallback = afterPlainAskMark(paragraphAt(i, level) ?? "", PLAIN_ASK_MARK.default);
+  let end = i + 2;
+  let endLine = tokens[i]?.map?.[1] ?? -1;
+  if (fallback === undefined) {
+    const bullets = items.at(-1)!.bullets!;
+    const lines = bullets.at(-1)!.split("\n");
+    const at = lines.findIndex((line, k) => k > 0 && afterPlainAskMark(line, PLAIN_ASK_MARK.default) !== undefined);
+    if (at < 0) return null;
+    bullets[bullets.length - 1] = lines.slice(0, at).join("\n");
+    fallback = afterPlainAskMark(lines.slice(at).join("\n"), PLAIN_ASK_MARK.default);
+    end = i - 1;
+    endLine = listEndLine;
+  }
+  if (!fallback || endLine < 0) return null;
+  const base = { title, why: why.join("\n\n"), default: fallback, ...(details ? { details } : {}) };
+  const span = { rejected: rejectedTitle !== undefined, end, startLine: head.map[0], endLine };
+  if (kind === "check") {
+    const steps: AskStep[] = [];
+    for (const { head: itemHead, bullets = [] } of items) {
+      const look = bullets.length === 1 ? afterPlainAskMark(bullets[0], PLAIN_ASK_MARK.look) : undefined;
+      const action = itemHead.content.trim();
+      if (!look || !action) return null;
+      steps.push({ do: action, look });
+    }
+    return { ask: { ...base, kind: "check", steps }, ...span };
+  }
+  const options: AskOption[] = [];
+  for (const { head: itemHead, bullets = [] } of items) {
+    const optionLabel = optionHead(itemHead);
+    if (optionLabel === undefined || bullets.length !== 3) return null;
+    const { label, recommended } = optionLabel;
+    const parts = bullets.map((bullet) => {
+      const pros = afterAnyPlainAskMark(bullet, PLAIN_ASK_PROS_MARKS);
+      if (pros !== undefined) return { key: "pros", text: pros };
+      const cons = afterAnyPlainAskMark(bullet, PLAIN_ASK_CONS_MARKS);
+      return cons !== undefined ? { key: "cons", text: cons } : { key: "effect", text: bullet.trim() };
+    });
+    const field = (key: string): string | undefined => {
+      const found = parts.filter((part) => part.key === key);
+      return found.length === 1 && found[0].text ? found[0].text : undefined;
+    };
+    const effect = field("effect"), pros = field("pros"), cons = field("cons");
+    if (!effect || !pros || !cons) return null;
+    options.push({ label, effect, pros, cons, ...(recommended ? { recommended: true as const } : {}) });
+  }
+  return { ask: { ...base, kind: "decide", options }, ...span };
 }
 
 const withoutCr = (line: string): string => line.endsWith("\r") ? line.slice(0, -1) : line;
@@ -327,16 +483,42 @@ export function closeAskFences(src: string): string {
   return out.join("\n");
 }
 
-function askFences(source: string): { ask: AskBlock; startLine: number; endLine: number }[] {
-  return md.parse(closeAskFences(source), {}).flatMap((token) => {
-    if (token.type !== "fence" || !isAskFenceInfo(token.info) || !token.map) return [];
+interface AskSpan { readonly ask: AskBlock; readonly startLine: number; readonly endLine: number; readonly plain: boolean }
+
+function plainAsksIn(src: string, tokens: readonly Token[]): Map<number, PlainAsk> {
+  const found = new Map<number, PlainAsk>();
+  if (!opensPlainAsk(src)) return found;
+  for (let i = 0; i < tokens.length; i++) {
+    const plain = tokens[i].type === "heading_open" ? plainAskAt(tokens, i) : null;
+    if (plain === null) continue;
+    found.set(i, plain);
+    i = plain.end;
+  }
+  return found;
+}
+
+function askSpans(source: string): AskSpan[] {
+  const src = closeAskFences(source);
+  const tokens = md.parse(src, {});
+  const plains = plainAsksIn(src, tokens);
+  const spans: AskSpan[] = [];
+  for (let i = 0; i < tokens.length; i++) {
+    const token = tokens[i];
+    const plain = plains.get(i);
+    if (plain !== undefined) {
+      spans.push({ ask: plain.ask, startLine: plain.startLine, endLine: plain.endLine, plain: true });
+      i = plain.end;
+      continue;
+    }
+    if (token.type !== "fence" || !isAskFenceInfo(token.info) || !token.map) continue;
     const ask = parseAskBlock(token.content);
-    return ask ? [{ ask, startLine: token.map[0], endLine: token.map[1] }] : [];
-  });
+    if (ask) spans.push({ ask, startLine: token.map[0], endLine: token.map[1], plain: false });
+  }
+  return spans;
 }
 
 export function askBlocksIn(src: string): AskBlock[] {
-  return askFences(src).map((fence) => fence.ask);
+  return askSpans(src).map((span) => span.ask);
 }
 
 export const ASK_QUALITY_DENIAL_HEAD = "Rejected before display: these laisora-ask decisions were not shown to the user.";
@@ -354,7 +536,7 @@ export function askQualityDenial(text: string): string | undefined {
     const issues = askQualityIssues(ask);
     return issues.length ? [`${rejectedTitleKey(ask.title)}${issues.map(askQualityProblem).join(" ")}`] : [];
   });
-  return problems.length ? `${ASK_QUALITY_DENIAL_HEAD} ${problems.join(" ")} Rewrite each block in full, then continue.` : undefined;
+  return problems.length ? `${ASK_QUALITY_DENIAL_HEAD} ${problems.join(" ")} Rewrite each block in full, in the same form it was written in (a laisora-ask block or the plain Markdown form), then continue.` : undefined;
 }
 
 export function rejectedAskTitles(text: string): string[] {
@@ -373,7 +555,7 @@ export interface AskRejection { readonly upTo: number; readonly titles: readonly
 
 export function resolveRejectedAsks(texts: readonly string[], rejections: readonly AskRejection[]): (string | null)[] {
   const repaired = texts.map(closeAskFences);
-  const fences = repaired.map((text) => askFences(text));
+  const fences = repaired.map((text) => askSpans(text));
   const rejected = new Set<string>();
   let from = 0;
   for (const rejection of [...rejections].sort((a, b) => a.upTo - b.upTo)) {
@@ -391,6 +573,7 @@ export function resolveRejectedAsks(texts: readonly string[], rejections: readon
     const dropped = new Set<number>();
     for (const { fence, hide } of marks) {
       if (hide) for (let line = fence.startLine; line < fence.endLine; line++) dropped.add(line);
+      else if (fence.plain) lines[fence.startLine] = lines[fence.startLine].replace(PLAIN_ASK_MARK.decide, PLAIN_ASK_MARK.rejected);
       else lines[fence.startLine] = lines[fence.startLine].replace(ASK_FENCE_INFO_AT_END, ASK_REJECTED_FENCE_INFO);
     }
     const kept = lines.filter((_, line) => !dropped.has(line)).join("\n");
@@ -401,6 +584,7 @@ export function resolveRejectedAsks(texts: readonly string[], rejections: readon
 export function parseMarkdown(source: string): MdNode[] {
   const src = closeAskFences(source);
   const tokens = md.parse(src, {});
+  const plains = plainAsksIn(src, tokens);
   const rootNodes: MdNode[] = [];
   const stack: { node: MdNode & { children?: MdNode[] }; tableBuilder?: TableBuilder }[] = [];
 
@@ -419,6 +603,13 @@ export function parseMarkdown(source: string): MdNode[] {
 
   for (let i = 0; i < tokens.length; i++) {
     const token = tokens[i];
+
+    const plain = plains.get(i);
+    if (plain !== undefined) {
+      currentContainer().push({ type: "ask", ask: plain.ask, offset: blockOffset(src.split("\n"), token), plain: true, ...(plain.rejected ? { rejected: true as const } : {}) });
+      i = plain.end;
+      continue;
+    }
 
     if (token.type === "table_open") {
       const tableBuilder: TableBuilder = {

@@ -4,20 +4,27 @@ import { extensionContext, output, store } from "./host-context";
 import { sessionRecordId } from "./session-record";
 import type { ClaudeConversation } from "./claudeHost";
 import type { Session } from "./session";
+import { signalWaitNotify } from "./wait-notify-signal";
 import {
   INITIAL_REMOTE_CONTROL_LANE,
   REMOTE_CONTROL_POLICY_OFF,
   REMOTE_CONTROL_SESSIONS_KEY,
   REMOTE_CONTROL_TIMEOUT_MS,
+  autoEnableGivenUp,
+  policyOffNoticed,
   remoteControlAtLaunch,
+  remoteControlAutoStep,
   remoteControlRecordOf,
+  remoteControlStateOf,
   stepRemoteControlLane,
   withRemoteControlRecord,
+  type RemoteControlAutoCause,
   type RemoteControlCli,
   type RemoteControlLaneInput,
   type RemoteControlRecord,
   type RemoteControlRequest,
   type RemoteControlSession,
+  type RemoteControlState,
   type RemoteControlStep,
 } from "./remote-control";
 
@@ -56,6 +63,10 @@ function cliFor(s: Session, conv: ClaudeConversation): RemoteControlCli {
   return s.remoteControl.cli;
 }
 
+export function remoteControlStateOfTab(s: Session): RemoteControlState {
+  return remoteControlStateOf(s.remoteControl.choice, cliOf(s));
+}
+
 export function remoteControlView(s: Session): RemoteControlView {
   const conv = s.conversation;
   const available = conv !== null && !conv.isClosed;
@@ -65,11 +76,13 @@ export function remoteControlView(s: Session): RemoteControlView {
     pending: cli?.lane.busy === true,
     ...(cli?.sessionUrl === undefined ? {} : { sessionUrl: cli.sessionUrl }),
     ...(cli?.sessionUrl === undefined || cli.connection === undefined ? {} : { connection: cli.connection }),
+    ...(cli?.auto === true ? { auto: true as const } : {}),
   };
 }
 
 export function postRemoteControl(s: Session): void {
   if (!s.closed) store?.post({ type: "remoteControlState", tabId: s.tabId, state: remoteControlView(s) });
+  signalWaitNotify(s);
 }
 
 function errorText(error: unknown): string {
@@ -82,6 +95,10 @@ function reportFailure(s: Session, enabled: boolean, reason: string): void {
     message: enabled ? l10n.t("Remote Control could not be turned on: {0}", reason) : l10n.t("Remote Control could not be turned off: {0}", reason),
     fatal: false,
   });
+}
+
+function autoEnableFailureText(reason: string): string {
+  return l10n.t("Remote Control could not be turned on for mobile notifications ({0}). This conversation will not send mobile notifications until you turn Remote Control on yourself from the tab menu or with /remote-control.", reason);
 }
 
 function stuckText(): string {
@@ -114,11 +131,16 @@ function apply(s: Session, cli: RemoteControlCli, input: RemoteControlLaneInput,
       reportFailure(s, request!.enabled, l10n.t("Claude Code did not answer the Remote Control request in time. {0}", stuckText()));
       break;
     case "timedOutForced":
-      output.appendLine(`[${s.title}] Remote Control: Claude Code did not answer the off request LAISORA sent on its own in time`);
+      output.appendLine(`[${s.title}] Remote Control: Claude Code did not answer the ${request!.enabled ? "on" : "off"} request LAISORA sent on its own in time`);
       break;
     case "enableFailed":
-      s.remoteControl.choice = false;
-      reportFailure(s, true, reason!);
+      if (autoEnableGivenUp(request, step.verdict, s.remoteControl.choice)) {
+        cli.autoFailed = true;
+        s.pushEvent({ kind: "error", message: autoEnableFailureText(reason!), fatal: false });
+      } else if (!request!.forced) {
+        s.remoteControl.choice = false;
+        reportFailure(s, true, reason!);
+      }
       break;
     case "off":
       cli.sessionUrl = undefined;
@@ -163,7 +185,7 @@ async function drive(s: Session, cli: RemoteControlCli, first: RemoteControlRequ
   }
 }
 
-export async function setRemoteControl(s: Session, requested: boolean | undefined, origin: "user" | "launch"): Promise<void> {
+export async function setRemoteControl(s: Session, requested: boolean | undefined, origin: "user" | "launch" | "notify"): Promise<void> {
   const conv = s.conversation;
   if (conv === null || conv.isClosed || s.closed) {
     if (origin === "user") s.pushEvent({ kind: "error", message: l10n.t("Remote Control needs a running conversation. Send a message first, then try again."), fatal: false });
@@ -173,21 +195,51 @@ export async function setRemoteControl(s: Session, requested: boolean | undefine
   const on = cli.sessionUrl !== undefined;
   const enabled = requested ?? !on;
   const reattach = enabled ? knownBridgeSessionId(s) : undefined;
-  const step = apply(s, cli, { type: "request", request: { enabled, ...(reattach === undefined ? {} : { reattach }) }, on });
+  const step = apply(s, cli, { type: "request", request: { enabled, ...(reattach === undefined ? {} : { reattach }), ...(origin === "notify" ? { forced: true as const } : {}) }, on });
   if (step.verdict === "refused" || step.verdict === "refusedStuck") {
     const text = step.verdict === "refused" ? l10n.t("Remote Control is still switching. Try again when it has finished.") : stuckText();
     if (origin === "user") store?.post({ type: "tabNotice", tabId: s.tabId, text });
     return;
   }
-  if (origin === "user") s.remoteControl.choice = enabled;
+  if (origin === "user") {
+    s.remoteControl.choice = enabled;
+    cli.autoFailed = undefined;
+  }
+  if (origin === "user" || step.send !== undefined) cli.auto = origin === "notify" ? true : undefined;
   if (step.send !== undefined) await drive(s, cli, step.send);
 }
 
 export async function startRemoteControlAtLaunch(s: Session, conv: ClaudeConversation): Promise<void> {
+  const cli = cliFor(s, conv);
+  cli.launching = true;
   postRemoteControl(s);
-  const autoEnable = await conv.remoteControlAutoEnable();
+  let autoEnable = false;
+  try {
+    autoEnable = await conv.remoteControlAutoEnable();
+  } finally {
+    cli.launching = undefined;
+  }
   if (s.conversation !== conv || conv.isClosed) return;
   if (remoteControlAtLaunch(s.remoteControl.choice, autoEnable)) await setRemoteControl(s, true, "launch");
+  else postRemoteControl(s);
+}
+
+function forceOff(s: Session, cli: RemoteControlCli): RemoteControlStep {
+  return apply(s, cli, { type: "forcedOff", on: cli.sessionUrl !== undefined });
+}
+
+export function requestRemoteControlAuto(s: Session, cause: RemoteControlAutoCause): void {
+  const conv = s.conversation;
+  if (conv === null || conv.isClosed || s.closed) return;
+  const cli = cliFor(s, conv);
+  const step = remoteControlAutoStep(s.remoteControl.choice, cli, cause);
+  if (step === "none") return;
+  output.appendLine(`[${s.title}] Remote Control: turning it ${step} ${step === "on" ? "for a mobile notification" : "after input in LAISORA"}`);
+  if (step === "on") void setRemoteControl(s, true, "notify");
+  else {
+    const off = forceOff(s, cli);
+    if (off.send !== undefined) void drive(s, cli, off.send);
+  }
 }
 
 export function noteBridgeState(s: Session, conv: ClaudeConversation, connection: BridgeConnection): void {
@@ -198,10 +250,12 @@ export function noteBridgeState(s: Session, conv: ClaudeConversation, connection
     postRemoteControl(s);
     return;
   }
-  const step = apply(s, cli, { type: "policyOff", on: cli.sessionUrl !== undefined });
-  if (step.verdict !== "sent" && step.verdict !== "offQueued") return;
+  const on = cli.sessionUrl !== undefined;
+  const busy = cli.lane.busy;
+  const choice = s.remoteControl.choice;
   s.remoteControl.choice = false;
-  s.pushEvent({ kind: "error", message: l10n.t("Remote Control was turned off: your organization's policy does not allow it."), fatal: false });
+  const step = forceOff(s, cli);
+  if (policyOffNoticed(on, busy, choice, step.verdict)) s.pushEvent({ kind: "error", message: l10n.t("Remote Control was turned off: your organization's policy does not allow it."), fatal: false });
   if (step.send !== undefined) void drive(s, cli, step.send);
 }
 

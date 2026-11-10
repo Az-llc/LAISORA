@@ -6,6 +6,7 @@ import { handleAnalysisMessage } from "./analysis-messages";
 import { handleConversationMessage } from "./conversation-lifecycle";
 import { openEditDiff } from "./edit-diff-host";
 import { handleHandoffMessage, noteComposerDrafts } from "./handoff-wiring";
+import { noteYouWaiting } from "./wait-notify-wiring";
 import { handleResumeMessage } from "./resume-hydration";
 import { handleSurfaceMessage, reorderSessionTabs } from "./store-surfaces";
 import { runHostActionMessage, userSettingsMessage, welcomeActionMessage } from "./gateway-host-actions";
@@ -123,6 +124,9 @@ export async function handleWebviewMessage(
         break;
       case "composerDrafts":
         noteComposerDrafts(sender, msg.tabIds);
+        break;
+      case "youWaiting":
+        noteYouWaiting(target!, msg);
         break;
       case "runHostAction":
         await runHostActionMessage(msg, sender);

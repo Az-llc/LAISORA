@@ -23,7 +23,8 @@ import {
   refusalFallbackEvent,
   parseRefusalStop,
 } from "./claude-normalizer";
-import { HANDOFF_TAG, parseHandoffEnvelope, type HandoffEnvelopeV2 } from "./handoff-envelope";
+import { HANDOFF_TAG, parseHandoffEnvelope, type HandoffEnvelopeV2, type HandoffParseResult } from "./handoff-envelope";
+import { capVerbatimText } from "./verbatim-cap";
 import { isLaisoraInputText, laisoraInputLine, parseLaisoraInput } from "./laisora-input";
 import { ASK_QUALITY_DENIAL_HEAD, feedbackRejectedTitles, resolveRejectedAsks, type AskRejection } from "./markdown-ast";
 import {
@@ -42,6 +43,8 @@ export { extractCliInsertedUserText, extractHumanUserText, extractImageRefs, ext
 import { isCliRejectionText, isLaisoraDenialText } from "./tool-result-signals";
 import { TASK_NOTIFICATION_ORIGIN_KIND } from "./task-notification-origin";
 import { handoffNoticeCardText, handoffNoticeOf } from "./steering-envelope";
+import { PUSH_NOTIFICATION_TOOL, isWaitNotifyRewake, waitNotifyLine, wakeLineAfterCall, type WakeLine } from "./wait-notify";
+import { toolInputPreview } from "./tool-input-preview";
 
 export interface HistoryEvent {
   body: NormalizedEventBody & { provenance: EventProvenance };
@@ -70,6 +73,11 @@ const RESUME_TAIL_MAX_BYTES = 1024 * 1024;
 const RESUME_TAIL_MAX_RECORDS = 1500;
 const RESUME_CAPTURE_CHUNK_BYTES = 64 * 1024;
 const AGENT_WAKE_ORIGIN_KINDS: ReadonlySet<string> = new Set([TASK_NOTIFICATION_ORIGIN_KIND, "peer"]);
+
+export function isLaisoraWakeRecord(obj: Record<string, unknown>): boolean {
+  return obj.type === "user" && asRecord(obj.origin)?.kind === TASK_NOTIFICATION_ORIGIN_KIND
+    && isWaitNotifyRewake(joinTextBlocks(asRecord(obj.message)?.content));
+}
 const EARLIER_GENERATION_TURN_ID = "replay-earlier-generation";
 const TOOL_RESULT_TYPE = "tool_result";
 const APPROVAL_RESOLVED_TYPE = "approval_resolved";
@@ -1382,6 +1390,7 @@ async function readHistory(
         const humanText = prompt?.text ?? null;
         const cliInsertedText = obj.type === "user" && humanText === null ? extractCliInsertedUserText(obj) : null;
         const agentWake = obj.type === "user" && AGENT_WAKE_ORIGIN_KINDS.has(String(asRecord(obj.origin)?.kind));
+        const laisoraWake = humanText === null && isLaisoraWakeRecord(obj);
         const handoffNotice = obj.type === "user" && humanText === null ? handoffNoticeOf(joinedText) : undefined;
         if (openNoticeCard !== undefined && obj.type === "user" && isInterruptMarker(content)) {
           (openNoticeCard.body as Extract<NormalizedEventBody, { kind: "local_command_output" }>).handoffNoticeStopped = true;
@@ -1406,7 +1415,7 @@ async function readHistory(
           const texts = historyTurnTexts(rawEvents, currentTurnId).map((item) => (item.body as { text: string }).text);
           askRejections.push({ turnId: currentTurnId, upTo: texts.length, titles: feedbackRejectedTitles(texts.join("\n\n"), askFeedback) });
         }
-        const turnInsertedText = askFeedback === null ? cliInsertedText ?? (handoffNotice !== undefined ? joinedText : null) : null;
+        const turnInsertedText = askFeedback === null ? cliInsertedText ?? (handoffNotice !== undefined || laisoraWake ? joinedText : null) : null;
         const absorbedMidTurn = extractQueuedPromptRecord(obj) !== null && prompt !== null && currentTurnId !== null;
         if (absorbedMidTurn && prompt !== null) {
           rawEvents.push({
@@ -1449,7 +1458,8 @@ async function readHistory(
               kind: "turn_started",
               turnId: currentTurnId,
               ...(turnInsertedText !== null ? { cliInserted: true as const } : {}),
-              ...(turnInsertedText !== null && (handoffNotice !== undefined || isLaisoraInputText(turnInsertedText)) ? { laisoraInput: true as const } : {}),
+              ...(turnInsertedText !== null && (handoffNotice !== undefined || laisoraWake || isLaisoraInputText(turnInsertedText)) ? { laisoraInput: true as const } : {}),
+              ...(laisoraWake ? { laisoraWake: true as const } : {}),
               provenance: { path: "history" },
             },
             timestamp: recordTime,
@@ -2316,6 +2326,34 @@ function createConversationRecordParser(sessionId?: string, keep?: (message: Con
   let lastTimestamp = 0;
   let askTurnFrom = 0;
   const askRejections: AskRejection[] = [];
+  let wake: { uuid: string; timestamp: number; calls: Map<string, string>; line?: WakeLine } | undefined;
+  const wakeMessage = (open: NonNullable<typeof wake>): ConversationMessage =>
+    ({ uuid: open.uuid, role: "system", text: waitNotifyLine(open.line?.message, open.line?.sent === true), timestamp: open.timestamp });
+  const flushWake = (): void => {
+    if (wake !== undefined && wake.uuid.length > 0) messages.push(wakeMessage(wake));
+    wake = undefined;
+  };
+  const wakeStep = (obj: Record<string, unknown>): "hide" | "pass" | "end" => {
+    if (wake === undefined) return "pass";
+    if (extractQueuedPromptRecord(obj) !== null) return "end";
+    const content = asRecord(obj.message)?.content;
+    if (obj.type === "assistant") {
+      for (const block of Array.isArray(content) ? content : []) {
+        const b = asRecord(block);
+        if (b?.type === "tool_use" && b.name === PUSH_NOTIFICATION_TOOL && typeof b.id === "string") wake.calls.set(b.id, toolInputPreview(PUSH_NOTIFICATION_TOOL, b.input));
+      }
+      return "hide";
+    }
+    if (obj.type !== "user") return "pass";
+    if (obj.isMeta === true) return "hide";
+    if (!Array.isArray(content) || !content.some((block) => asRecord(block)?.type === TOOL_RESULT_TYPE)) return "end";
+    for (const block of content) {
+      const b = asRecord(block);
+      const input = b?.type === TOOL_RESULT_TYPE && typeof b.tool_use_id === "string" ? wake.calls.get(b.tool_use_id) : undefined;
+      if (input !== undefined) wake.line = wakeLineAfterCall(wake.line, input, joinTextBlocks(b!.content), b!.is_error === true);
+    }
+    return "hide";
+  };
   const compactBeforeTurn = (): void => {
     if (keep === undefined) return;
     messages = messages.slice(cutFrom).filter(keep);
@@ -2362,6 +2400,14 @@ function createConversationRecordParser(sessionId?: string, keep?: (message: Con
           messages.push({ uuid, role: "system", text: localOutput, timestamp: lastTimestamp });
           continue;
         }
+        if (isLaisoraWakeRecord(obj)) {
+          flushWake();
+          wake = { uuid: typeof obj.uuid === "string" ? obj.uuid : "", timestamp: lastTimestamp, calls: new Map() };
+          continue;
+        }
+        const step = wakeStep(obj);
+        if (step === "hide") continue;
+        if (step === "end") flushWake();
         const approvalMessages = extractRestoredApprovalMessages(obj, approvalResults, lastTimestamp);
         const prompt = extractHumanUserPrompt(obj, queuedSources, seenQueuedPrompts);
         const uuid = prompt?.uuid ?? (typeof obj.uuid === "string" ? obj.uuid : "");
@@ -2442,6 +2488,7 @@ function createConversationRecordParser(sessionId?: string, keep?: (message: Con
     },
     result() {
       const settled = messages.slice();
+      if (wake !== undefined && wake.uuid.length > 0) settled.push(wakeMessage(wake));
       resolveMessageAskRejections(settled, askTurnFrom, askRejections);
       return {
         messages: settled.slice(cutFrom),
@@ -3123,22 +3170,64 @@ function verbatimTextOf(record: Record<string, unknown>): string {
     .join("");
 }
 
-function verbatimGenerationStart(records: readonly Record<string, unknown>[]): number {
+type RecordedHandoffEnvelope = { index: number; parsed: Extract<HandoffParseResult, { ok: true }> };
+
+function* handoffEnvelopesNewestFirst(records: readonly Record<string, unknown>[]): Generator<RecordedHandoffEnvelope> {
   for (let i = records.length - 1; i >= 0; i--) {
     const record = records[i];
     if (record.type !== "user") continue;
     const parsed = parseHandoffEnvelope(verbatimTextOf(record));
-    if (parsed.ok && parsed.version === "2") return i + 1;
+    if (parsed.ok && parsed.version === "2") yield { index: i, parsed };
   }
-  return 0;
+}
+
+export interface CarriedEnvelope {
+  index: number;
+  singleGeneration: boolean;
+  utterances: readonly VerbatimUtterance[];
+}
+
+function carriesEveryEarlierGeneration(envelope: CarriedEnvelope): boolean {
+  return !envelope.singleGeneration && envelope.utterances.length > 0;
+}
+
+export function verbatimCarried<E extends CarriedEnvelope>(newestFirst: Iterable<E>): {
+  start: number; carried: VerbatimUtterance[]; used: E[];
+} {
+  const used: E[] = [];
+  for (const envelope of newestFirst) {
+    used.push(envelope);
+    if (carriesEveryEarlierGeneration(envelope)) break;
+  }
+  if (used.length === 0) return { start: 0, carried: [], used };
+  return { start: used[0].index + 1, carried: used.slice().reverse().flatMap((envelope) => envelope.utterances), used };
+}
+
+type RecordedCarriedEnvelope = CarriedEnvelope & { parsed: RecordedHandoffEnvelope["parsed"] };
+
+function* carriedEnvelopesNewestFirst(records: readonly Record<string, unknown>[]): Generator<RecordedCarriedEnvelope> {
+  for (const { index, parsed } of handoffEnvelopesNewestFirst(records)) {
+    yield { index, singleGeneration: parsed.singleGeneration === true, utterances: parsed.envelope.userUtterances, parsed };
+  }
+}
+
+export interface VerbatimExtraction {
+  utterances: VerbatimUtterance[];
+  carriedCount: number;
+  carriedFrom: readonly RecordedHandoffEnvelope["parsed"][];
 }
 
 export function extractVerbatimUserUtterances(
   records: readonly Record<string, unknown>[]
 ): VerbatimUtterance[] {
-  const utterances: VerbatimUtterance[] = [];
+  return extractVerbatim(records).utterances;
+}
+
+export function extractVerbatim(records: readonly Record<string, unknown>[]): VerbatimExtraction {
+  const { start: generationStart, carried, used } = verbatimCarried(carriedEnvelopesNewestFirst(records));
+  const utterances: VerbatimUtterance[] = carried.map((utterance, index) =>
+    ({ ...utterance, n: index + 1, ...(utterance.kind === "typed" ? { text: capVerbatimText(utterance.text) } : {}) }));
   let lastAt = "";
-  const generationStart = verbatimGenerationStart(records);
   const queuedSources = queuedPromptSources(records.map((record) => JSON.stringify(record)));
   const seenQueuedPrompts = new Set<string>();
   for (let index = 0; index < records.length; index++) {
@@ -3169,16 +3258,16 @@ export function extractVerbatimUserUtterances(
         at: lastAt,
         kind: "answer",
         questions: entries.map(([question]) => question),
-        text: entries.map(([, answer]) => answer as string).join("\n"),
+        text: entries.map(([, answer]) => capVerbatimText(answer as string)).join("\n"),
       });
       continue;
     }
 
     const prompt = extractHumanUserPrompt(record, queuedSources, seenQueuedPrompts);
     if (prompt !== null) {
-      utterances.push({ n: utterances.length + 1, at: lastAt, kind: "typed", text: prompt.text,
+      utterances.push({ n: utterances.length + 1, at: lastAt, kind: "typed", text: capVerbatimText(prompt.text),
         ...(prompt.imageRefs ? { imageRefs: prompt.imageRefs } : {}) });
     }
   }
-  return utterances;
+  return { utterances, carriedCount: carried.length, carriedFrom: used.map((envelope) => envelope.parsed) };
 }

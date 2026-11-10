@@ -12,6 +12,15 @@ export function configurationBound(key: ConfigurationKey, bound: "minimum" | "ma
   return typeof value === "number" && Number.isFinite(value) ? value : undefined;
 }
 
+export function resolveSettingGroup<T extends object>(keys: { readonly [K in keyof T]: ConfigurationKey }, isValue: (setting: unknown, value: unknown) => boolean, read: (key: string) => unknown): T {
+  const out: Record<string, unknown> = {};
+  for (const [name, key] of Object.entries(keys) as [string, ConfigurationKey][]) {
+    const value = read(key);
+    out[name] = isValue(name, value) ? value : configurationDefault(key);
+  }
+  return out as T;
+}
+
 const CONFIGURATION_KEYS = Object.keys(properties).map((key) => key.slice("laisora.".length)) as ConfigurationKey[];
 
 export function isPortableSetting(property: { readonly scope?: string }): boolean {

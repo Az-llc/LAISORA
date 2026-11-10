@@ -8,6 +8,7 @@ import { postAttachments } from "./composer-io";
 import { releaseConversationHistory } from "./conversation-history";
 import { postOrchestrationView, warmup } from "./conversation-lifecycle";
 import { clearAutoHandoff, handoffDetailSources, noteComposerDrafts } from "./handoff-wiring";
+import { clearWaitNotify } from "./wait-notify-wiring";
 import { orchestrationRunsDirectoryOf } from "./orchestration-external";
 import { releaseHistoryWindow } from "./history-window";
 import { extensionContext, output, sinceActivation, store } from "./host-context";
@@ -459,6 +460,7 @@ export async function handleSurfaceMessage(
       pendingAttachments.release(msg.tabId);
       handoffDetailSources.delete(target!.tabId);
       clearAutoHandoff(target!);
+      clearWaitNotify(target!);
       target!.semantic.clearSemanticModelPostTimer();
       target!.guardrailRunner.clearGuardrailRefreshTimer();
       releaseHistoryWindow(historyScopeKey(target!));

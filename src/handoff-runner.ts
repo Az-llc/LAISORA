@@ -10,20 +10,16 @@ import type {
 } from "@anthropic-ai/claude-agent-sdk" with { "resolution-mode": "import" };
 import {
   acceptCompactSummary,
-  compactInstructionFor,
-  DECISIONS_PREAMBLE,
+  COMPACT_INSTRUCTION,
   ENVELOPE_PREAMBLE,
-  extractDecisionLines,
-  type ExtractedDecisionLine,
 } from "./handoff-accept";
 import {
   buildHandoffEnvelopeV2,
   handoffContextUsageKey,
+  handoffUtteranceAt,
   parseCompactMetadata,
   parseHandoffEnvelope,
   type HandoffCompactStats,
-  type HandoffDecisionEntry,
-  type HandoffDecisions,
   type HandoffEnvelopeV2,
   type HandoffUtterance,
   type HandoffWorkMemo,
@@ -33,7 +29,7 @@ import {
   createParseYielder,
   createRecordUuidFilter,
   extractHumanUserPrompt,
-  extractVerbatimUserUtterances,
+  extractVerbatim,
   isHandoffGenerationBoundary,
 } from "./session-transcript";
 import { claudeProjectsDir } from "./claude-env";
@@ -430,7 +426,6 @@ export function forkHasUserTurns(records: readonly Record<string, unknown>[]): b
 export interface HandoffDetail {
   summary?: string;
   utterances: HandoffUtterance[];
-  decisions?: HandoffDecisions;
 }
 
 export function extractHandoffDetail(
@@ -455,111 +450,12 @@ export function extractHandoffDetail(
   return {
     ...(summary !== undefined ? { summary } : {}),
     utterances: envelope.userUtterances,
-    ...(envelope.decisions !== undefined ? { decisions: envelope.decisions } : {}),
   };
-}
-
-export const DECISIONS_WARN_ENTRIES = 120;
-export const DECISIONS_WARN_BYTES = 24_000;
-
-function decisionKey(tag: string, body: string): string {
-  return `${tag}\0${body.replace(/\s+/g, " ").trim().replace(/\s*src=(?:user|assistant)$/i, "")}`;
-}
-
-function decisionIdNumber(id: string): number {
-  const m = /^D(\d+)$/.exec(id);
-  return m === null ? 0 : Number(m[1]);
-}
-
-export function mergeHandoffDecisions(
-  previous: HandoffDecisions | undefined,
-  lines: readonly ExtractedDecisionLine[],
-  source: "hook" | "previous_only"
-): HandoffDecisions {
-  const carriedEntries = (previous?.entries ?? []).map((entry) => ({ ...entry }));
-  const seen = [...carriedEntries, ...(previous?.removedLastGen ?? [])];
-  const generation = seen.reduce((max, entry) => Math.max(max, entry.g), 0) + 1;
-  let nextId = Math.max(
-    previous?.nextId ?? 0,
-    seen.reduce((max, entry) => Math.max(max, decisionIdNumber(entry.id)), 0) + 1
-  );
-  const carriedCount = carriedEntries.length;
-  const entries = carriedEntries;
-  const removedLastGen: HandoffDecisionEntry[] = [];
-  let extracted = 0;
-  let unknownIdRefs = 0;
-
-  const ordered = [...lines].sort((a, b) => Number(b.t === "DONE") - Number(a.t === "DONE"));
-  const removedIds = new Set<string>();
-
-  for (const line of ordered) {
-    if (line.t === "DONE") {
-      const at = line.id === undefined ? -1 : entries.findIndex((entry) => entry.id === line.id);
-      if (at < 0) {
-        unknownIdRefs++;
-        continue;
-      }
-      const gone = entries.splice(at, 1)[0];
-      removedIds.add(gone.id);
-      removedLastGen.push(gone);
-      continue;
-    }
-    if (line.t === "DROPPED" && line.id !== undefined) {
-      const target = entries.find((entry) => entry.id === line.id);
-      if (target === undefined) {
-        if (!removedIds.has(line.id)) unknownIdRefs++;
-        continue;
-      }
-      target.t = "DROPPED";
-      target.s = line.s;
-      target.g = generation;
-      continue;
-    }
-    const key = decisionKey(line.t, line.s);
-    if (entries.some((entry) => decisionKey(entry.t, entry.s) === key)) continue;
-    entries.push({ id: `D${nextId++}`, t: line.t, g: generation, s: line.s });
-    extracted++;
-  }
-
-  const bytes = jsonBytes({ preamble: DECISIONS_PREAMBLE, entries });
-  const warn =
-    entries.length >= DECISIONS_WARN_ENTRIES || bytes >= DECISIONS_WARN_BYTES
-      ? { entries: entries.length, bytes }
-      : undefined;
-
-  return {
-    preamble: DECISIONS_PREAMBLE,
-    entries,
-    ...(removedLastGen.length > 0 ? { removedLastGen } : {}),
-    nextId,
-    carried: carriedCount,
-    extracted,
-    removed: removedLastGen.length,
-    unknownIdRefs,
-    source,
-    ...(warn !== undefined ? { warn } : {}),
-  };
-}
-
-function previousDecisionsOf(
-  records: readonly Record<string, unknown>[],
-  log: (line: string) => void
-): HandoffDecisions | undefined {
-  for (let i = records.length - 1; i >= 0; i--) {
-    if (records[i].type !== "user") continue;
-    const parsed = parseHandoffEnvelope(textFromRecord(records[i]));
-    if (!parsed.ok || parsed.version !== "2") continue;
-    if (parsed.decisionsDropped) log("handoff previous decisions dropped: envelope decisions failed validation");
-    if (parsed.workMemoDropped) log("handoff previous work memo dropped: envelope workMemo failed validation");
-    return parsed.envelope.decisions;
-  }
-  return undefined;
 }
 
 export const HANDOFF_DETAIL_MAX_BYTES = 200_000;
 
 const SUMMARY_KEY_BYTES = 11;
-const DECISIONS_KEY_BYTES = 13;
 
 function jsonBytes(value: unknown): number {
   return Buffer.byteLength(JSON.stringify(value), "utf8");
@@ -568,26 +464,21 @@ function jsonBytes(value: unknown): number {
 export interface HandoffDetailPart {
   summary?: string;
   utterances: HandoffUtterance[];
-  decisions?: HandoffDecisions;
 }
 
 export function buildHandoffDetailParts(
   summary: string | undefined,
   utterances: readonly HandoffUtterance[],
-  budgetBytes: number,
-  decisions?: HandoffDecisions
+  budgetBytes: number
 ): HandoffDetailPart[] {
   const parts: HandoffDetailPart[] = [
-    { ...(summary !== undefined ? { summary } : {}), utterances: [], ...(decisions !== undefined ? { decisions } : {}) },
+    { ...(summary !== undefined ? { summary } : {}), utterances: [] },
   ];
-  let used =
-    (summary === undefined ? 0 : jsonBytes(summary) + SUMMARY_KEY_BYTES) +
-    (decisions === undefined ? 0 : jsonBytes(decisions) + DECISIONS_KEY_BYTES);
+  let used = summary === undefined ? 0 : jsonBytes(summary) + SUMMARY_KEY_BYTES;
   for (const utterance of utterances) {
     const current = parts[parts.length - 1];
     const cost = jsonBytes(utterance) + (current.utterances.length === 0 ? 0 : 1);
-    const canSplit =
-      current.utterances.length > 0 || current.summary !== undefined || current.decisions !== undefined;
+    const canSplit = current.utterances.length > 0 || current.summary !== undefined;
     if (canSplit && used + cost > budgetBytes) {
       parts.push({ utterances: [utterance] });
       used = jsonBytes(utterance);
@@ -663,9 +554,8 @@ export class HandoffRunner {
   private async compactRound(
     runId: string,
     forkSessionId: string,
-    registryEntry: PersistedHandoff,
-    workMemo: HandoffWorkMemo | undefined
-  ): Promise<{ hookBody?: string; streamCompact?: HandoffCompactStats }> {
+    registryEntry: PersistedHandoff
+  ): Promise<{ streamCompact?: HandoffCompactStats }> {
     if (this.terminal !== undefined) return {};
     const queue = new InputQueue();
     const abortController = new AbortController();
@@ -673,12 +563,11 @@ export class HandoffRunner {
     this.abortController = abortController;
     queue.push({
       type: "user",
-      message: { role: "user", content: `/compact ${compactInstructionFor(workMemo)}` },
+      message: { role: "user", content: `/compact ${COMPACT_INSTRUCTION.text}` },
       parent_tool_use_id: null,
       session_id: forkSessionId,
     });
     let hookCount = 0;
-    let hookBody: string | undefined;
     let streamCompact: HandoffCompactStats | undefined;
     let completedBy: "hook" | "status" | "boundary" | undefined;
     let resultSuccess = false;
@@ -732,7 +621,6 @@ export class HandoffRunner {
         if (this.commitTerminal(accepted.reason)) abortRun();
         return {};
       }
-      hookBody = accepted.body;
       complete("hook");
       return {};
     };
@@ -826,7 +714,7 @@ export class HandoffRunner {
         resultSuccess ? "success" : "none", waitDetail()));
     }
     if (this.terminal === undefined && !resultSuccess) this.commitTerminal("compact_failed", "result=none");
-    return { hookBody, streamCompact };
+    return { streamCompact };
   }
 
   private async appendEnvelopeOnly(
@@ -979,20 +867,22 @@ export class HandoffRunner {
           try {
           const read = await this.deps.readRecords(forkFilePath);
           unreadableLineCount = read.unreadableLineCount;
-          const utterances = extractVerbatimUserUtterances(read.records);
+          const { utterances, carriedCount, carriedFrom } = extractVerbatim(read.records);
           utteranceCount = utterances.length;
-          const previousDecisions = previousDecisionsOf(read.records, this.deps.log);
+          if (carriedFrom[0]?.workMemoDropped) this.deps.log("handoff previous work memo dropped: envelope workMemo failed validation");
+          if (carriedFrom.some((envelope) => envelope.imageRefsDropped)) this.deps.log("handoff previous image refs dropped: some carried image references failed validation");
+          if (carriedFrom.length > 0) {
+            this.deps.log(`handoff carried utterances: ${carriedCount} of ${utterances.length}`);
+          }
 
           if (this.terminal !== undefined) return this.failureOutcome(input.runId, forkSessionId);
           let currentRecords = read.records;
           let retainedResponseCount: number | undefined;
-          let decisionLines: ExtractedDecisionLine[] = [];
-          let hasAcceptedHook = false;
 
           if (this.terminal === undefined) {
             this.transition("compacting");
             const priorBoundary = lastCompactBoundaryIndex(currentRecords);
-            const roundResult = await this.compactRound(input.runId, forkSessionId, registryEntry, input.workMemo);
+            const roundResult = await this.compactRound(input.runId, forkSessionId, registryEntry);
             if (this.terminal === undefined) {
               const roundRead = await this.deps.readRecords(forkFilePath);
               unreadableLineCount = Math.max(unreadableLineCount, roundRead.unreadableLineCount);
@@ -1013,12 +903,6 @@ export class HandoffRunner {
                       .catch((e) => this.deps.log(`handoff compact raw save failed: ${errorDetail(e)}`));
                     this.commitTerminal(accepted.reason);
                   } else {
-                    if (roundResult.hookBody !== undefined) {
-                      decisionLines = extractDecisionLines(roundResult.hookBody);
-                      hasAcceptedHook = true;
-                    } else {
-                      this.deps.log("handoff compact: no PostCompact summary; keeping persisted summary");
-                    }
                     const boundaryMetadata = asRecord(currentRecords[boundaryIndex].compactMetadata);
                     const fromJsonl = parseCompactMetadata({ preTokens: boundaryMetadata?.preTokens, postTokens: boundaryMetadata?.postTokens });
                     compact = roundResult.streamCompact ?? fromJsonl;
@@ -1034,16 +918,6 @@ export class HandoffRunner {
           if (this.terminal === undefined) {
             if (retainedResponseCount !== undefined) compact = { ...compact, retainedResponseCount };
             this.transition("appending");
-            const uniqueDecisionLines = decisionLines.filter((line, index, lines) =>
-              lines.findIndex((candidate) => candidate.t === line.t && candidate.id === line.id && candidate.s === line.s) === index
-            );
-            const decisions = mergeHandoffDecisions(
-              previousDecisions,
-              uniqueDecisionLines,
-              hasAcceptedHook ? "hook" : "previous_only"
-            );
-            const carryDecisions = decisions.entries.length > 0 || (decisions.removedLastGen?.length ?? 0) > 0
-              ? decisions : undefined;
             const envelope: HandoffEnvelopeV2 = {
               schema: "hb2",
               preamble: ENVELOPE_PREAMBLE,
@@ -1053,8 +927,7 @@ export class HandoffRunner {
                 capturedAt: new Date(this.deps.now()).toISOString(),
                 ...(compact !== undefined ? { compact } : {}),
               },
-              userUtterances: utterances,
-              ...(carryDecisions !== undefined ? { decisions: carryDecisions } : {}),
+              userUtterances: utterances.map((utterance) => ({ ...utterance, at: handoffUtteranceAt(utterance.at) })),
               ...(input.workMemo !== undefined ? { workMemo: input.workMemo } : {}),
             };
             if (this.terminal === undefined) await this.appendEnvelopeOnly(forkSessionId, envelope, registryEntry);

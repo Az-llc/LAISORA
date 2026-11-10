@@ -19,8 +19,6 @@ import {
   type FoldEventResult,
 } from "./event-fold";
 import {
-  handoffDecisionCounts,
-  handoffDecisionLineCount,
   handoffContextUsageKey,
   handoffUnreadableLinesKey,
   restoredHandoffUnreadableLineCount,
@@ -1161,7 +1159,6 @@ async function runResumeHydrationStages(
     if (invalidated()) return abort("引き継ぎ元の題名の読み取り中にセッションが変化しました");
     const restoredContextUsage = restoredHandoffContextUsage(extensionContext?.globalState.get(handoffContextUsageKey(h.sessionId)));
     const unreadableLineCount = restoredHandoffUnreadableLineCount(extensionContext?.globalState.get(handoffUnreadableLinesKey(h.sessionId)));
-    const decisions = forkEnvelope.decisions;
     s.handoffSource = {
       sessionId: sourceId,
       ...(sourceTitle !== undefined ? { title: sourceTitle } : {}),
@@ -1171,9 +1168,6 @@ async function runResumeHydrationStages(
       ...(restoredContextUsage !== undefined ? { contextUsage: restoredContextUsage } : {}),
       utteranceCount: forkEnvelope.userUtterances.length,
       ...(unreadableLineCount !== undefined ? { unreadableLineCount } : {}),
-      ...(decisions !== undefined
-        ? { decisionCount: handoffDecisionLineCount(decisions), decisions: handoffDecisionCounts(decisions) }
-        : {}),
       detailRunId: restoredHandoffRunId(h.sessionId),
     };
   }

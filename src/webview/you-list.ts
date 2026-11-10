@@ -27,7 +27,7 @@ export class YouList {
   readonly element = node("section", "you-section");
   private readonly unsubscribe: () => void;
 
-  constructor(reader: YouItemsReader, navigate: (item: YouItem) => void, onCount?: (count: number, total: number) => void,
+  constructor(reader: YouItemsReader, navigate: (item: YouItem) => void, onOpen?: (open: readonly YouItem[], total: number) => void,
     dismiss?: (item: YouItem) => void) {
     this.element.lang = document.documentElement.lang;
     bindUserLabel(this.element, "aria");
@@ -40,7 +40,7 @@ export class YouList {
       const open = items.filter(isWaitingYouItem);
       const resolved = items.filter(item => !isWaitingYouItem(item) && item.resolution !== "dismissed");
       const folded = this.element.dataset.resolvedOpen !== "true";
-      onCount?.(open.length, items.length);
+      onOpen?.(open, items.length);
       const head = node("header", "plan-section-head");
       const label = node("div", "plan-top");
       label.append(bindUserLabel(node("span", "you-label")));

@@ -17,7 +17,7 @@ In short:
 - **Requests for you in one place:** approvals, decisions, and checks collected in YOU, beside the conversation.
 - **Where the time and tokens went, and what to change next:** time and tokens by model, by role and by subagent, plus failures, counted from the work log. When you want more, an LLM improvement analysis looks for failures that keep recurring across your conversations and proposes concrete fixes.
 - **Tabs:** several conversations side by side.
-- **Handoff:** continue a long conversation in a fresh one without losing your messages or decisions.
+- **Handoff:** continue a long conversation in a fresh one without losing your own messages.
 - **Agent orchestration (off by default):** let Claude hand parts of the work to other agents with roles you set.
 - **Where it runs:** a local, trusted VS Code window; tested on Windows. Remote and container setups are not supported (details under [Requirements](#requirements)).
 - **Price:** LAISORA is free and open source (MIT). It runs your own Claude Code: with a subscription, use counts against your plan's limits; with an API key, it is billed to that key. Codex and Antigravity runs, if you add them, use those CLIs' own accounts.
@@ -189,9 +189,9 @@ The protection is on by default. Turn it off on the settings page or with `laiso
 
 ### Hand off a long conversation to a new one
 
-**Why:** when Claude Code compacts a long conversation on its own, it summarizes everything, including your requests and the decisions you made, at a moment you did not pick. Details you cared about can be summarized away. A handoff starts when you choose, or at a threshold you set; it carries your own messages word for word, and copies the recorded decisions into the next conversation as they are, instead of summarizing them again.
+**Why:** when Claude Code compacts a long conversation on its own, it summarizes everything, including your requests and the decisions you made, at a moment you did not pick. Details you cared about can be summarized away. A handoff starts when you choose, or at a threshold you set; it carries your own messages word for word into the next conversation instead of summarizing them.
 
-Hand off an idle conversation: LAISORA creates a new conversation that starts from a summary and your messages since the previous handoff, while the original is kept unchanged. The continuation starts with its summary card. A recorded decision stays through later handoffs until you tell Claude it is settled. If the conversation is linked to a ToDo item that has a work memo, that memo is the main content of the handoff, and ▶ Continue then opens the new conversation.
+Hand off an idle conversation: LAISORA creates a new conversation that starts from a summary and all your messages, including those carried by earlier handoffs, while the original is kept unchanged. A very long message keeps its beginning and end, with a note that the full text is in the previous conversation. The continuation starts with its summary card. If the conversation is linked to a ToDo item that has a work memo, that memo is the main content of the handoff, and ▶ Continue then opens the new conversation.
 
 The summary itself can still omit or misread details, so check important requirements when you continue. To hand off automatically when the context reaches a threshold, turn on `laisora.handoff.auto.enabled` (off by default).
 

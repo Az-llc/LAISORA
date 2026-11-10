@@ -22,7 +22,7 @@ export type RemoteControlLane =
 export type RemoteControlLaneInput =
   | { readonly type: "request"; readonly request: RemoteControlRequest; readonly on: boolean }
   | { readonly type: "timeout"; readonly seq: number }
-  | { readonly type: "policyOff"; readonly on: boolean }
+  | { readonly type: "forcedOff"; readonly on: boolean }
   | { readonly type: "settled"; readonly seq: number; readonly ok: boolean }
   | { readonly type: "exit" };
 
@@ -35,13 +35,53 @@ export interface RemoteControlStep { lane: RemoteControlLane; verdict: RemoteCon
 
 export const INITIAL_REMOTE_CONTROL_LANE: RemoteControlLane = { seq: 0, busy: false };
 
-export interface RemoteControlCli { conversation: ClaudeConversation; lane: RemoteControlLane; sessionUrl?: string; connection?: BridgeConnection }
+export interface RemoteControlCli {
+  conversation: ClaudeConversation;
+  lane: RemoteControlLane;
+  sessionUrl?: string;
+  connection?: BridgeConnection;
+  auto?: true;
+  autoFailed?: true;
+  launching?: true;
+}
 
 export interface TabRemoteControl {
   choice?: boolean;
   bridgeSessionId?: string;
   unsaved?: RemoteControlRecord;
   cli?: RemoteControlCli;
+}
+
+export type RemoteControlCliFacts = Pick<RemoteControlCli, "lane" | "sessionUrl" | "connection" | "auto" | "autoFailed" | "launching">;
+
+export type RemoteControlState = "refused" | "off" | "switching" | "connecting" | "connected";
+
+export function remoteControlRefused(choice: boolean | undefined, cli: RemoteControlCliFacts | undefined): boolean {
+  return choice === false || cli?.autoFailed === true;
+}
+
+export function remoteControlStateOf(choice: boolean | undefined, cli: RemoteControlCliFacts | undefined): RemoteControlState {
+  if (remoteControlRefused(choice, cli)) return "refused";
+  if (cli === undefined) return "off";
+  if (cli.launching === true || cli.lane.busy) return "switching";
+  if (cli.sessionUrl === undefined) return "off";
+  return cli.connection === "connected" ? "connected" : "connecting";
+}
+
+export function autoEnableGivenUp(request: RemoteControlRequest | undefined, verdict: RemoteControlVerdict, choice: boolean | undefined): boolean {
+  return verdict === "enableFailed" && request?.enabled === true && request.forced === true && choice !== false;
+}
+
+export function policyOffNoticed(on: boolean, busy: boolean, choice: boolean | undefined, verdict: RemoteControlVerdict): boolean {
+  return (on || busy) && (choice !== false || verdict === "sent" || verdict === "offQueued");
+}
+
+export type RemoteControlAutoCause = "needed" | "laisoraInput";
+
+export function remoteControlAutoStep(choice: boolean | undefined, cli: RemoteControlCliFacts | undefined, cause: RemoteControlAutoCause): "on" | "off" | "none" {
+  if (cli === undefined) return "none";
+  if (cause === "laisoraInput") return cli.auto === true && (cli.sessionUrl !== undefined || cli.lane.busy) ? "off" : "none";
+  return choice === undefined && remoteControlStateOf(choice, cli) === "off" ? "on" : "none";
 }
 
 export function initialTabRemoteControl(choice?: boolean): TabRemoteControl {
@@ -58,7 +98,7 @@ export function stepRemoteControlLane(lane: RemoteControlLane, input: RemoteCont
     case "request":
       if (lane.busy) return { lane, verdict: lane.timedOut ? "refusedStuck" : "refused" };
       return input.on === input.request.enabled ? { lane, verdict: "unchanged" } : sending(lane, "sent", input.request);
-    case "policyOff":
+    case "forcedOff":
       if (lane.busy) {
         return lane.request.enabled && !lane.offAfter && !lane.timedOut ? { lane: { ...lane, offAfter: true }, verdict: "offQueued" } : { lane, verdict: "ignored" };
       }
@@ -74,8 +114,8 @@ export function stepRemoteControlLane(lane: RemoteControlLane, input: RemoteCont
       if (!request.enabled) return { lane: idle, verdict: input.ok ? "off" : lane.timedOut && !request.forced ? "silentFailure" : "disableFailed" };
       const discarded = lane.timedOut || lane.offAfter;
       if (input.ok) return discarded ? sending(lane, "adoptThenOff", { enabled: false, forced: true }) : { lane: idle, verdict: "adopt" };
-      if (discarded) return { lane: idle, verdict: "silentFailure" };
-      return request.reattach !== undefined ? sending(lane, "retry", { enabled: true }) : { lane: idle, verdict: "enableFailed" };
+      if (discarded) return { lane: idle, verdict: request.forced && !lane.offAfter ? "enableFailed" : "silentFailure" };
+      return request.reattach !== undefined ? sending(lane, "retry", { enabled: true, ...(request.forced ? { forced: true as const } : {}) }) : { lane: idle, verdict: "enableFailed" };
     }
   }
 }

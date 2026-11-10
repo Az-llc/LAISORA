@@ -4,10 +4,10 @@ import { appendFile, copyFile, lstat, mkdir, mkdtemp, open, readdir, readFile, r
 import { tmpdir } from "node:os";
 import { basename, dirname, join } from "node:path";
 import {
-  archiveCommands, archiveExcludeList, claudeEnvEntries, claudeEnvPathsRemapped, claudeSettingsKeyFields, conversationFileKept, conversationTarget, exportedProjectFolder, folderHoldingAllSessions, sessionsAlreadyPresent, extractCommand, folderCwd, importPlacement,
-  isSessionFileName, mcpServersWithKeys, mergedGlobalConfig, migrationReadme, parseMigrationManifest, projectFileCategory, projectsArchive, normalizedWorkFolder, projectsTotals, sameFolderName, relocatedGroupBindings, relocatedRecord, remapJsonPaths, remapTodoDocument, userMcpServers,
+  archiveCommands, archiveExcludeList, claudeEnvEntries, claudeEnvPathsRemapped, claudeSettingsKeyFields, conversationFileKept, conversationTarget, emptyFolderPlacement, exportedProjectFolder, folderHoldingAllSessions, sessionsAlreadyPresent, extractCommand, folderCwd, importPlacement,
+  isSessionFileName, jsonChanged, mcpServersWithKeys, mergedGlobalConfig, migrationImportReport, migrationReadme, parseMigrationManifest, projectFileCategory, projectsArchive, normalizedWorkFolder, projectsTotals, sameFolderName, relocatedGroupBindings, relocatedRecord, remapJsonPaths, remapTodoDocument, userMcpServers,
   MEMORY_DIR, MIGRATION_DIR, MIGRATION_FORMAT, MIGRATION_MANIFEST, MIGRATION_MCP_SERVERS, MIGRATION_README, MIGRATION_SETTINGS, MIGRATION_TODO, MIGRATION_TODO_FILES, PROJECTS_DIR,
-  type ArchiverCommand, type MigrationCounts, type MigrationManifest, type MigrationManifestFolder, type ProjectFileCategory, type ProjectFolderInventory, type ProjectsTotals,
+  type ArchiverCommand, type FolderPlacement, type ImportPlacement, type MigrationCounts, type MigrationImportFacts, type MigrationImportReport, type MigrationManifest, type MigrationManifestFolder, type ProjectFileCategory, type ProjectFolderInventory, type ProjectsTotals,
 } from "./migration-plan";
 import { claudeProjectDirName } from "./claude-env";
 import { isProjectDirName, type MigrationCategory, type MigrationProgress } from "./migration-categories";
@@ -322,22 +322,19 @@ async function appendRelocated(file: string, cwd: string): Promise<void> {
   await retryTransient(() => appendFile(file, `${endsWithNewline ? "" : "\n"}${relocatedRecord(basename(file, ".jsonl"), cwd)}`));
 }
 
-type Placement = { placed: number; kept: number; files: number; filesKept: number; memory: number; memoryKept: number; sessions: string[]; memoryPaths: string[] };
-const emptyPlacement = (): Placement => ({ placed: 0, kept: 0, files: 0, filesKept: 0, memory: 0, memoryKept: 0, sessions: [], memoryPaths: [] });
-
-async function placeFile(source: string, destination: string, backup: (existing: string) => Promise<void>, data?: Buffer): Promise<"placed" | "same"> {
+async function placeFile(source: string, destination: string, backup: (existing: string) => Promise<void>, data?: Buffer): Promise<ImportPlacement> {
   const incoming = data ?? await readFile(source);
   const existing = await readFile(destination).catch(() => undefined);
   const placement = importPlacement(existing, incoming);
-  if (placement === "same") return "same";
+  if (placement === "same") return placement;
   if (placement === "backup") await backup(destination);
   if (data) { await mkdir(dirname(destination), { recursive: true }); await retryTransient(() => writeFile(destination, data)); }
   else await moveInto(source, destination);
-  return "placed";
+  return placement;
 }
 
-async function moveConversationFolder(source: string, destination: string, cwd: string | undefined, counted: Placement,
-  presentSessionFiles: readonly string[], categories: readonly ProjectFileCategory[]): Promise<Placement> {
+async function moveConversationFolder(source: string, destination: string, cwd: string | undefined, counted: FolderPlacement,
+  presentSessionFiles: readonly string[], categories: readonly ProjectFileCategory[]): Promise<FolderPlacement> {
   const incoming = categories.includes("conversations") ? await sessionFiles(source) : [];
   const keptSessions = sessionsAlreadyPresent(incoming, presentSessionFiles);
   for await (const segments of walkFiles(source)) {
@@ -346,39 +343,22 @@ async function moveConversationFolder(source: string, destination: string, cwd: 
     const from = join(source, ...segments), target = join(destination, ...segments);
     const session = isSessionFile(segments);
     if (conversationFileKept(segments, keptSessions, existsSync(target))) {
-      if (session) counted.kept++; else if (category === "memory") counted.memoryKept++; else counted.filesKept++;
+      if (session) counted.sessionsKept++; else if (category === "memory") counted.memoryKept++; else counted.filesKept++;
       continue;
     }
     if (session && cwd !== undefined) await appendRelocated(from, cwd);
     await moveInto(from, target);
-    if (category === "memory") { counted.memory++; counted.memoryPaths.push(segments.join("/")); continue; }
+    if (category === "memory") { counted.memoryPaths.push(segments.join("/")); continue; }
     if (!session) { counted.files++; continue; }
-    counted.placed++;
     counted.sessions.push(segments[0]);
   }
   return counted;
 }
 
-export interface MigrationImportResult {
-  readonly categories: readonly MigrationCategory[];
-  todoItems?: number;
-  todoBackup?: string;
-  laisoraSettings?: number;
-  settingFailures: readonly string[];
-  claudeEnvFiles: number;
-  backedUp: number;
-  backups?: string;
-  mcpServers: number;
-  mcpSkipped?: string;
-  conversations: number;
-  conversationsKept: number;
-  conversationFiles: number;
-  conversationFilesKept: number;
-  memoryFiles: number;
-  memoryFilesKept: number;
-  guide?: string;
-  readonly unresolved: Array<{ readonly cwd: string; readonly dirName: string }>;
-  error?: { readonly code?: MigrationErrorCode; readonly fsCode?: string; readonly detail: string };
+export interface MigrationImportResult extends MigrationImportReport {
+  readonly backups?: string;
+  readonly guide?: string;
+  readonly error?: { readonly code?: MigrationErrorCode; readonly fsCode?: string; readonly detail: string };
 }
 
 export function migrationFailureOf(error: unknown): NonNullable<MigrationImportResult["error"]> {
@@ -390,11 +370,11 @@ export function migrationFailureOf(error: unknown): NonNullable<MigrationImportR
 export async function importMigration(place: MigrationPlace, archive: string, manifest: MigrationManifest,
   writeSettings: (values: Record<string, unknown>) => Promise<readonly string[]>, report: MigrationProgressReport = () => undefined, now: Date = new Date()): Promise<MigrationImportResult> {
   const backupDir = join(place.configDir, "backups", `laisora-import-${now.toISOString().replace(/[:.]/g, "-")}`);
-  const result: MigrationImportResult = { categories: manifest.categories, settingFailures: [], claudeEnvFiles: 0, backedUp: 0, mcpServers: 0, conversations: 0, conversationsKept: 0, conversationFiles: 0, conversationFilesKept: 0, memoryFiles: 0, memoryFilesKept: 0, unresolved: [] };
+  const facts: MigrationImportFacts = { categories: manifest.categories, claudeFiles: [], folders: [] };
+  let backups: string | undefined, guide: string | undefined, failure: MigrationImportResult["error"];
   const backup = async (existing: string, relative: string) => {
     await moveInto(existing, join(backupDir, relative));
-    result.backedUp++;
-    result.backups = backupDir;
+    backups = backupDir;
   };
   const remap = <T>(value: T): T => remapJsonPaths(value, manifest.home, place.home) as T;
   let temp: string | undefined;
@@ -412,7 +392,7 @@ export async function importMigration(place: MigrationPlace, archive: string, ma
     if (existsSync(join(extracted, MIGRATION_README))) {
       await mkdir(backupDir, { recursive: true });
       await copyFile(join(extracted, MIGRATION_README), join(backupDir, MIGRATION_README));
-      result.guide = join(backupDir, MIGRATION_README);
+      guide = join(backupDir, MIGRATION_README);
     }
     const has = (category: MigrationCategory) => manifest.categories.includes(category);
     if (has("claudeEnv")) {
@@ -423,7 +403,9 @@ export async function importMigration(place: MigrationPlace, archive: string, ma
           const segments = [entry, ...inner];
           const source = join(extracted, ...segments), destination = join(place.configDir, ...segments);
           if ((await lstat(source)).isSymbolicLink()) {
-            if (!existsSync(destination)) { await moveInto(source, destination); result.claudeEnvFiles++; }
+            const kept = existsSync(destination);
+            if (!kept) await moveInto(source, destination);
+            facts.claudeFiles.push({ path: segments.join("/"), placement: kept ? "kept" : "write", rewritten: false });
             continue;
           }
           let data: Buffer | undefined;
@@ -431,23 +413,30 @@ export async function importMigration(place: MigrationPlace, archive: string, ma
             try {
               const parsed: unknown = JSON.parse(await readFile(source, "utf8"));
               const remapped = remap(parsed);
-              if (JSON.stringify(remapped) !== JSON.stringify(parsed)) data = Buffer.from(`${JSON.stringify(remapped, null, 2)}\n`);
+              if (jsonChanged(parsed, remapped)) data = Buffer.from(`${JSON.stringify(remapped, null, 2)}\n`);
             } catch {}
           }
-          if (await placeFile(source, destination, existing => backup(existing, segments.join("/")), data) === "placed") result.claudeEnvFiles++;
+          let movedToBackup = false;
+          const placement = await placeFile(source, destination, async existing => { await backup(existing, segments.join("/")); movedToBackup = true; }, data)
+            .catch((error: unknown) => {
+              if (movedToBackup) facts.claudeFiles.push({ path: segments.join("/"), placement: "backedUpOnly", rewritten: false });
+              throw error;
+            });
+          facts.claudeFiles.push({ path: segments.join("/"), placement, rewritten: data !== undefined });
         }
       }
-      const servers = remap(userMcpServers(await readText(join(extracted, MIGRATION_MCP_SERVERS))));
+      const incoming = userMcpServers(await readText(join(extracted, MIGRATION_MCP_SERVERS)));
+      const servers = remap(incoming);
       if (Object.keys(servers).length > 0) {
         const current = await readText(place.globalConfigFile);
         const merged = mergedGlobalConfig(current, servers);
-        if (merged === undefined) result.mcpSkipped = `${place.globalConfigFile} could not be read as JSON`;
+        const mcp = { current: userMcpServers(current), incoming, remapped: servers };
+        if (merged === undefined) facts.mcp = { ...mcp, skipped: `${place.globalConfigFile} could not be read as JSON` };
         else {
           if (merged !== current && current !== undefined) {
             await mkdir(backupDir, { recursive: true });
             await retryTransient(() => writeFile(join(backupDir, basename(place.globalConfigFile)), current));
-            result.backedUp++;
-            result.backups = backupDir;
+            backups = backupDir;
           }
           if (merged !== current) {
             const written = `${place.globalConfigFile}.laisora-${process.pid}.tmp`;
@@ -455,33 +444,40 @@ export async function importMigration(place: MigrationPlace, archive: string, ma
             try { await retryTransient(() => rename(written, place.globalConfigFile)); }
             catch (error) { await rm(written, { force: true }).catch(() => undefined); throw error; }
           }
-          result.mcpServers = Object.keys(servers).length;
+          facts.mcp = mcp;
         }
       }
     }
     if (has("laisoraSettings")) {
       const text = await readText(join(extracted, MIGRATION_SETTINGS));
-      const values = remap(text === undefined ? {} : JSON.parse(text) as Record<string, unknown>);
-      result.laisoraSettings = Object.keys(values).length;
-      result.settingFailures = await writeSettings(values);
+      const incoming = text === undefined ? {} : JSON.parse(text) as Record<string, unknown>;
+      const values = remap(incoming);
+      facts.settings = { incoming, remapped: values, failed: await writeSettings(values) };
     }
-    if (has("todo") && place.todoStore) {
-      const text = await readText(join(extracted, MIGRATION_TODO));
-      if (text !== undefined) {
-        const document = remapTodoDocument(parseTodoDocument(text), manifest.home, place.home);
+    if (has("todo")) {
+      const text = place.todoStore ? await readText(join(extracted, MIGRATION_TODO)) : undefined;
+      if (!place.todoStore) facts.todoNotPlaced = "ToDo is not available in this window.";
+      else if (text === undefined) facts.todoNotPlaced = "The ZIP has no ToDo file.";
+      else {
+        const incoming = parseTodoDocument(text);
+        const document = remapTodoDocument(incoming, manifest.home, place.home);
+        const todo: NonNullable<MigrationImportFacts["todo"]> = facts.todo = { incoming, remapped: document, imagesPlaced: 0, imagesKept: 0 };
         for await (const [name] of walkFiles(join(extracted, MIGRATION_TODO_FILES))) {
           const destination = join(place.todoStore.filesDirectory, name);
-          if (!existsSync(destination)) await moveInto(join(extracted, MIGRATION_TODO_FILES, name), destination);
+          if (existsSync(destination)) { todo.imagesKept++; continue; }
+          await moveInto(join(extracted, MIGRATION_TODO_FILES, name), destination);
+          todo.imagesPlaced++;
         }
         const previous = await place.todoStore.read();
         if (previous.revision > 0) {
           await mkdir(backupDir, { recursive: true });
-          result.todoBackup = join(backupDir, "laisora-todo.json");
-          await retryTransient(() => writeFile(result.todoBackup!, todoDocumentJson(previous)));
-          result.backups = backupDir;
+          const saved = join(backupDir, "laisora-todo.json");
+          await retryTransient(() => writeFile(saved, todoDocumentJson(previous)));
+          todo.previousSavedTo = saved;
+          backups = backupDir;
         }
         const written = await place.todoStore.replace(document);
-        result.todoItems = written.items.filter(item => item.deletedAt === undefined).length;
+        todo.items = written.items.filter(item => item.deletedAt === undefined).length;
       }
     }
     const projectCategories = manifest.categories.filter((category): category is ProjectFileCategory => category === "conversations" || category === "memory");
@@ -495,27 +491,20 @@ export async function importMigration(place: MigrationPlace, archive: string, ma
         if (!existsSync(source)) continue;
         const holder = has("conversations") ? folderHoldingAllSessions(await sessionFiles(source), presentByFolder) : undefined;
         const target = holder === undefined && folder.cwd !== undefined ? conversationTarget({ dirName: folder.dirName, cwd: folder.cwd }, manifest.home, place.home, existsSync) : undefined;
-        const counted = emptyPlacement();
-        try {
-          await moveConversationFolder(source, join(projects, holder ?? target?.dirName ?? folder.dirName), target && target.cwd !== folder.cwd ? target.cwd : undefined, counted, presentSessionFiles, projectCategories);
-        } finally {
-          result.conversations += counted.placed;
-          result.conversationsKept += counted.kept;
-          result.conversationFiles += counted.files;
-          result.conversationFilesKept += counted.filesKept;
-          result.memoryFiles += counted.memory;
-          result.memoryFilesKept += counted.memoryKept;
-        }
-        if (target && !target.found) result.unresolved.push({ cwd: target.cwd, dirName: target.dirName });
+        const placedIn = holder ?? target?.dirName ?? folder.dirName;
+        const relocatedTo = target && target.cwd !== folder.cwd ? target.cwd : undefined;
+        const placement = emptyFolderPlacement();
+        facts.folders.push({ dirName: folder.dirName, placedIn, intoExisting: holder !== undefined, relocated: relocatedTo !== undefined, ...(target ? { target } : {}), placement });
+        await moveConversationFolder(source, join(projects, placedIn), relocatedTo, placement, presentSessionFiles, projectCategories);
       }
     }
   } catch (error) {
-    result.error = migrationFailureOf(error);
-    if (error instanceof MigrationError && (error.code === "archiverMissing" || error.code === "notMigration") && result.backedUp === 0 && result.conversations === 0) throw error;
+    failure = migrationFailureOf(error);
+    if (error instanceof MigrationError && (error.code === "archiverMissing" || error.code === "notMigration") && backups === undefined && !facts.folders.some(folder => folder.placement.sessions.length > 0)) throw error;
   } finally {
     if (temp) await rm(temp, { recursive: true, force: true }).catch(() => undefined);
   }
-  return result;
+  return { ...migrationImportReport(facts), ...(backups !== undefined ? { backups } : {}), ...(guide !== undefined ? { guide } : {}), ...(failure ? { error: failure } : {}) };
 }
 
 async function removeEmptyTree(root: string): Promise<void> {
@@ -566,13 +555,12 @@ export async function rebindMigratedFolder(place: MigrationPlace, dirName: strin
   const source = join(projects, dirName);
   const oldCwd = givenOldCwd !== undefined ? normalizedWorkFolder(givenOldCwd, place.platform) : await folderCwdOf(source, dirName);
   const target = claudeProjectDirName(newCwd);
-  const counted = emptyPlacement();
+  const counted = emptyFolderPlacement();
   let failure: string | undefined;
   try {
     if (target === dirName) {
       for (const name of await sessionFiles(source)) {
         await appendRelocated(join(source, name), newCwd);
-        counted.placed++;
         counted.sessions.push(name);
       }
     } else {
@@ -610,7 +598,7 @@ export async function rebindMigratedFolder(place: MigrationPlace, dirName: strin
     else unverified.push(relative);
   }
   return { complete: failure === undefined && unverified.length === 0 && todoFailures.length === 0 && todoNotChecked === undefined,
-    from: dirName, to: target, newCwd, ...(oldCwd !== undefined ? { oldCwd } : {}), conversations: counted.placed, conversationsKept: counted.kept, otherFiles: counted.files, otherFilesKept: counted.filesKept,
-    memoryFiles: counted.memory, memoryFilesKept: counted.memoryKept, todoGroups, todoFailures, ...(todoNotChecked ? { todoNotChecked } : {}), verified, memoryVerified, unverified,
+    from: dirName, to: target, newCwd, ...(oldCwd !== undefined ? { oldCwd } : {}), conversations: counted.sessions.length, conversationsKept: counted.sessionsKept, otherFiles: counted.files, otherFilesKept: counted.filesKept,
+    memoryFiles: counted.memoryPaths.length, memoryFilesKept: counted.memoryKept, todoGroups, todoFailures, ...(todoNotChecked ? { todoNotChecked } : {}), verified, memoryVerified, unverified,
     ...(failure !== undefined ? { error: `${failure}. What was moved so far is counted above; calling the tool again with the same arguments finishes the move.` } : {}) };
 }

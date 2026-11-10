@@ -47,7 +47,6 @@ import type { AgentSpanView, TimeBucket, TimeBucketView } from "./time-buckets";
 import { currentRunStart, launchlessRunSpan, memberRunTimes, runElapsedMs, type ChildTranscriptSpan, type Span } from "./spans";
 import type { AnalysisFactsView, SummaryAnalysisView } from "./analysis-facts-view";
 import type { ExecutionAttemptNode, SemanticModel, SemanticNode } from "./semantic-model";
-import type { HandoffDecisionEntry, HandoffDecisions } from "./handoff-envelope";
 
 export const PROTOCOL_VERSION = 5;
 
@@ -290,7 +289,7 @@ export type NormalizedEventBody =
   (
     | { kind: "conversation_opened"; cwd: string; model?: string }
     | { kind: "conversation_closed"; reason: string; stopped?: true }
-    | { kind: "turn_started"; turnId: string; cliInserted?: true; laisoraInput?: true }
+    | { kind: "turn_started"; turnId: string; cliInserted?: true; laisoraInput?: true; laisoraWake?: true }
     | { kind: "auto_resume"; state: "pending"; at: number }
     | { kind: "auto_resume"; state: "cancelled" | "fired" | "exhausted" }
     | { kind: "turn_completed"; turnId: string; usage?: UsageSnapshot }
@@ -323,6 +322,7 @@ export type NormalizedEventBody =
     | {
         kind: "user_message";
         turnId: string | null;
+        absorbedInto?: string;
         text: string;
         // The message uuid: sent with the message to the CLI, which keeps it as the transcript record uuid.
         uuid?: string;
@@ -609,6 +609,7 @@ export interface RemoteControlView {
   pending: boolean;
   sessionUrl?: string;
   connection?: BridgeConnection;
+  auto?: true;
 }
 
 export function isRemoteControlSessionUrl(value: unknown): value is string {
@@ -621,7 +622,8 @@ export function isRemoteControlView(value: unknown): value is RemoteControlView 
   return typeof v.available === "boolean" && typeof v.pending === "boolean"
     && (v.sessionUrl === undefined || isRemoteControlSessionUrl(v.sessionUrl))
     && (v.connection === undefined || (BRIDGE_CONNECTIONS as readonly unknown[]).includes(v.connection))
-    && hasOnlyKeys(v, ["available", "pending", "sessionUrl", "connection"]);
+    && (v.auto === undefined || v.auto === true)
+    && hasOnlyKeys(v, ["available", "pending", "sessionUrl", "connection", "auto"]);
 }
 
 export interface SlashCommandInfo {
@@ -848,20 +850,61 @@ export function isHandoffAutoSettingValue(setting: unknown, value: unknown): boo
     case "mode":
       return (HANDOFF_AUTO_MODES as readonly unknown[]).includes(value);
     case "percent":
-      return typeof value === "number" && Number.isSafeInteger(value) && value > 0
-        && (HANDOFF_AUTO_PERCENT_MIN === undefined || value >= HANDOFF_AUTO_PERCENT_MIN) && (HANDOFF_AUTO_PERCENT_MAX === undefined || value <= HANDOFF_AUTO_PERCENT_MAX);
+      return isBoundedInteger(value, HANDOFF_AUTO_PERCENT_MIN, HANDOFF_AUTO_PERCENT_MAX);
     case "tokens":
-      return typeof value === "number" && Number.isSafeInteger(value) && value > 0 && (HANDOFF_AUTO_TOKENS_MIN === undefined || value >= HANDOFF_AUTO_TOKENS_MIN);
+      return isBoundedInteger(value, HANDOFF_AUTO_TOKENS_MIN, undefined);
     default:
       return false;
   }
 }
 
-function isHandoffAutoSettings(value: unknown): value is HandoffAutoSettings {
+function isSettingsGroup<T>(value: unknown, keys: Record<string, string>, isValue: (setting: unknown, value: unknown) => boolean): value is T {
   if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
-  const names = Object.keys(HANDOFF_AUTO_SETTING_KEYS);
+  const names = Object.keys(keys);
   return hasOnlyKeys(value as Record<string, unknown>, names)
-    && names.every((name) => isHandoffAutoSettingValue(name, (value as Record<string, unknown>)[name]));
+    && names.every((name) => isValue(name, (value as Record<string, unknown>)[name]));
+}
+
+function isBoundedInteger(value: unknown, min: number | undefined, max: number | undefined): boolean {
+  return typeof value === "number" && Number.isSafeInteger(value) && value > 0 && (min === undefined || value >= min) && (max === undefined || value <= max);
+}
+
+export const WAIT_NOTIFY_MINUTES_MIN = configurationBound("remoteControl.waitNotify.minutes", "minimum");
+export const WAIT_NOTIFY_MINUTES_MAX = configurationBound("remoteControl.waitNotify.minutes", "maximum");
+
+export const WAIT_NOTIFY_SETTING_KEYS = {
+  enabled: "remoteControl.waitNotify.enabled",
+  minutes: "remoteControl.waitNotify.minutes",
+} as const;
+
+export interface WaitNotifySettings {
+  enabled: boolean;
+  minutes: number;
+}
+
+export type WaitNotifySettingName = keyof WaitNotifySettings;
+
+export function isWaitNotifySettingValue(setting: unknown, value: unknown): boolean {
+  switch (setting) {
+    case "enabled":
+      return typeof value === "boolean";
+    case "minutes":
+      return isBoundedInteger(value, WAIT_NOTIFY_MINUTES_MIN, WAIT_NOTIFY_MINUTES_MAX);
+    default:
+      return false;
+  }
+}
+
+export const WAIT_REPORT_ITEMS_MAX = 50;
+export const WAIT_REPORT_TITLE_MAX = 500;
+
+export interface WaitReportItem { title: string; createdAt: number }
+
+function isWaitReportItem(value: unknown): value is WaitReportItem {
+  if (typeof value !== "object" || value === null) return false;
+  const m = value as Record<string, unknown>;
+  return hasOnlyKeys(m, ["title", "createdAt"]) && typeof m.title === "string" && m.title.length <= WAIT_REPORT_TITLE_MAX
+    && typeof m.createdAt === "number" && Number.isFinite(m.createdAt) && m.createdAt >= 0;
 }
 
 export type HandoffAutoStart =
@@ -905,6 +948,7 @@ export type SettingsPageToHost =
   | { type: "setImprovementMenu"; requestId: number; enabled: boolean }
   | { type: "setWelcomeSetting"; requestId: number; setting: WelcomeSetting; enabled: boolean }
   | { type: "setHandoffAutoSetting"; requestId: number; setting: HandoffAutoSettingName; value: boolean | number | string }
+  | { type: "setWaitNotifySetting"; requestId: number; setting: WaitNotifySettingName; value: boolean | number }
   | { type: "setOrchestrationSetting"; requestId: number; setting: "enabled" | "agents" | "conductorPolicy" | "externalTimeoutMinutes"; value: unknown }
   | { type: "setFileLinkSetting"; requestId: number; setting: FileLinkBooleanSetting; enabled: boolean }
   | { type: "setFileLinkSetting"; requestId: number; setting: "openWithSystemApp"; value: string[] }
@@ -971,7 +1015,7 @@ export type HostToSettingsPage =
   | { type: "revealSetting"; target: SettingsRevealTarget }
   | { type: "migrationState"; scan?: MigrationScan; busy: boolean; notice?: MigrationNotice }
   | { type: "migrationProgress"; progress: MigrationProgress }
-  | ({ type: "settingsState"; appearance?: AccentSettings; displayName?: string; eventLimit?: number; transcriptRetentionDays?: number; transcriptRetentionFallback: TranscriptRetentionFallback; composerSendKey: ComposerSendKey; apiKeyPolicy: ApiKeyPolicy; restoreTabsOnStartup: boolean; cliAutoUpdate: Record<ExecutorId, boolean>; initialModel?: string; autoContinueAtUsageLimit: boolean; guardEnabled: boolean; memoryBlockProjectType: boolean; todoEnabled: boolean; editSummaryEnabled: boolean; remoteControlCard: boolean; improvementMenu: boolean; welcome?: WelcomeSettings; handoffAuto?: HandoffAutoSettings; reloadNeeded: boolean; replyTo?: number; writeFailure?: SettingWriteFailure }
+  | ({ type: "settingsState"; appearance?: AccentSettings; displayName?: string; eventLimit?: number; transcriptRetentionDays?: number; transcriptRetentionFallback: TranscriptRetentionFallback; composerSendKey: ComposerSendKey; apiKeyPolicy: ApiKeyPolicy; restoreTabsOnStartup: boolean; cliAutoUpdate: Record<ExecutorId, boolean>; initialModel?: string; autoContinueAtUsageLimit: boolean; guardEnabled: boolean; memoryBlockProjectType: boolean; todoEnabled: boolean; editSummaryEnabled: boolean; remoteControlCard: boolean; improvementMenu: boolean; welcome?: WelcomeSettings; handoffAuto?: HandoffAutoSettings; waitNotify?: WaitNotifySettings; reloadNeeded: boolean; replyTo?: number; writeFailure?: SettingWriteFailure }
     & SettingsProfileProjection & Record<FileLinkBooleanSetting, boolean> & { openWithSystemApp: string[] } & { orchestrationEnabled: boolean; orchestrationAgents: OrchestrationSettingRow[]; orchestrationDefaults: OrchestrationSettingRow[]; conductorPolicy: string; conductorPolicyDefault: string; externalTimeoutMinutes: number; externalDetection: Record<ExecutorId, ExternalDetection>; externalModels: ExternalModels });
 
 function isSettingsRequestId(v: unknown): v is number {
@@ -1026,6 +1070,9 @@ export function isSettingsPageToHost(v: unknown): v is SettingsPageToHost {
   }
   if (t === "setHandoffAutoSetting") {
     return isSettingsRequestId(m.requestId) && isHandoffAutoSettingValue(m.setting, m.value) && hasOnlyKeys(m, ["type", "requestId", "setting", "value"]);
+  }
+  if (t === "setWaitNotifySetting") {
+    return isSettingsRequestId(m.requestId) && isWaitNotifySettingValue(m.setting, m.value) && hasOnlyKeys(m, ["type", "requestId", "setting", "value"]);
   }
   if (t === "setCliAutoUpdate") {
     return isSettingsRequestId(m.requestId) && isExecutorId(m.executor) && typeof m.enabled === "boolean" && hasOnlyKeys(m, ["type", "requestId", "executor", "enabled"]);
@@ -1105,7 +1152,8 @@ export function isHostToSettingsPage(v: unknown): v is HostToSettingsPage {
       && typeof m.autoContinueAtUsageLimit === "boolean" && typeof m.guardEnabled === "boolean" && typeof m.memoryBlockProjectType === "boolean" && typeof m.todoEnabled === "boolean"
       && typeof m.editSummaryEnabled === "boolean" && typeof m.remoteControlCard === "boolean" && typeof m.improvementMenu === "boolean" && typeof m.reloadNeeded === "boolean"
       && (m.welcome === undefined || isWelcomeSettings(m.welcome))
-      && (m.handoffAuto === undefined || isHandoffAutoSettings(m.handoffAuto))
+      && (m.handoffAuto === undefined || isSettingsGroup<HandoffAutoSettings>(m.handoffAuto, HANDOFF_AUTO_SETTING_KEYS, isHandoffAutoSettingValue))
+      && (m.waitNotify === undefined || isSettingsGroup<WaitNotifySettings>(m.waitNotify, WAIT_NOTIFY_SETTING_KEYS, isWaitNotifySettingValue))
       && typeof m.orchestrationEnabled === "boolean" && typeof m.conductorPolicy === "string"
       && typeof m.conductorPolicyDefault === "string"
       && isOrchestrationSettingRoster(m.orchestrationAgents) && isOrchestrationSettingRoster(m.orchestrationDefaults)
@@ -1114,7 +1162,7 @@ export function isHostToSettingsPage(v: unknown): v is HostToSettingsPage {
       && Array.isArray(m.openWithSystemApp) && m.openWithSystemApp.every((item) => typeof item === "string")
       && (m.replyTo === undefined || isSettingsRequestId(m.replyTo))
       && (m.writeFailure === undefined || m.replyTo !== undefined && isSettingWriteFailure(m.writeFailure))
-      && hasOnlyKeys(m, ["type", "initialModel", "appearance", "displayName", "eventLimit", "transcriptRetentionDays", "transcriptRetentionFallback", "composerSendKey", "apiKeyPolicy", "restoreTabsOnStartup", "cliAutoUpdate", "autoContinueAtUsageLimit", "guardEnabled", "memoryBlockProjectType", "todoEnabled", "editSummaryEnabled", "remoteControlCard", "improvementMenu", "welcome", "handoffAuto", "reloadNeeded", ...FILE_LINK_SETTINGS, "orchestrationEnabled", "orchestrationAgents", "orchestrationDefaults", "conductorPolicy", "conductorPolicyDefault", "externalTimeoutMinutes", "externalDetection", "externalModels", "replyTo", "writeFailure", "conductorPreview", "recommendedRosterSame"]);
+      && hasOnlyKeys(m, ["type", "initialModel", "appearance", "displayName", "eventLimit", "transcriptRetentionDays", "transcriptRetentionFallback", "composerSendKey", "apiKeyPolicy", "restoreTabsOnStartup", "cliAutoUpdate", "autoContinueAtUsageLimit", "guardEnabled", "memoryBlockProjectType", "todoEnabled", "editSummaryEnabled", "remoteControlCard", "improvementMenu", "welcome", "handoffAuto", "waitNotify", "reloadNeeded", ...FILE_LINK_SETTINGS, "orchestrationEnabled", "orchestrationAgents", "orchestrationDefaults", "conductorPolicy", "conductorPolicyDefault", "externalTimeoutMinutes", "externalDetection", "externalModels", "replyTo", "writeFailure", "conductorPreview", "recommendedRosterSame"]);
   }
   t satisfies never;
   return false;
@@ -1142,6 +1190,7 @@ export type WebviewToHost =
   | { type: "newTab" }
   | { type: "composerFocus"; focused: boolean }
   | { type: "composerDrafts"; tabIds: string[] }
+  | { type: "youWaiting"; tabId: string; generation: number; seq: number; items: WaitReportItem[] }
   | { type: "closeTab"; tabId: string }
   | { type: "clearTab"; tabId: string }
   | { type: "setMode"; tabId: string; mode: PermissionModeId }
@@ -3223,17 +3272,6 @@ export type ResumeHydrationPhase = "loading" | "complete" | "failed";
 
 export const RESUME_PREVIEW_MESSAGE_MAX = 80;
 
-export const DECISIONS_REWRITE_RATIO = 0.8;
-
-export interface HandoffDecisionCounts {
-  total: number;
-  carried: number;
-  extracted: number;
-  removed: number;
-  unknownIdRefs: number;
-  warn?: { entries: number; bytes: number };
-}
-
 export interface HandoffSourceSnapshot {
   sessionId: string;
   title?: string;
@@ -3242,8 +3280,6 @@ export interface HandoffSourceSnapshot {
   utteranceCount?: number;
   unreadableLineCount?: number;
   detailRunId?: string;
-  decisionCount?: number;
-  decisions?: HandoffDecisionCounts;
 }
 
 export function restoredHandoffRunId(forkSessionId: string): string {
@@ -3336,7 +3372,6 @@ export type HostToWebview =
       contextUsage?: HandoffContextUsage;
       utteranceCount?: number;
       unreadableLineCount?: number;
-      decisions?: HandoffDecisionCounts;
       auto?: HandoffAutoStart | HandoffAutoNotice;
     }
   | {
@@ -3347,7 +3382,6 @@ export type HostToWebview =
       total: number;
       summary?: string;
       utterances: { n: number; at: string; kind: "typed" | "answer"; text: string; questions?: string[]; imageRefs?: ImageRefInfo[] }[];
-      decisions?: HandoffDecisions;
     }
   | { type: "modeChanged"; tabId: string; mode: PermissionModeId }
   | { type: "commands"; tabId: string; commands: SlashCommandInfo[] }
@@ -3371,7 +3405,7 @@ export type HostToWebview =
   | { type: "editorContext"; path: string; startLine: number; endLine: number }
   | { type: "workModel"; tabId: string; model: WorkModelPayload }
   | { type: "semanticModel"; tabId: string; model: SemanticModelPayload }
-  | { type: "userSettings"; appearance?: AccentSettings; displayName?: string; composerSendKey: ComposerSendKey; askQualityCheck?: boolean; editSummaryEnabled: boolean; remoteControlCard?: boolean; improvementMenu?: boolean; welcome?: WelcomeState }
+  | { type: "userSettings"; appearance?: AccentSettings; displayName?: string; composerSendKey: ComposerSendKey; askQualityCheck?: boolean; editSummaryEnabled: boolean; remoteControlCard?: boolean; waitNotify?: boolean; improvementMenu?: boolean; welcome?: WelcomeState }
   | { type: "remoteControlState"; tabId: string; state: RemoteControlView }
   | { type: "tabNotice"; tabId: string; text: string }
   | { type: "elicitationOpenFailed"; tabId: string; requestId: string }
@@ -3688,6 +3722,12 @@ export function isWebviewToHost(v: unknown): v is WebviewToHost {
   if (t === "composerDrafts") {
     const m = v as Record<string, unknown>;
     return hasOnlyKeys(m, ["type", "tabIds"]) && isTabOrder(m.tabIds);
+  }
+  if (t === "youWaiting") {
+    const m = v as Record<string, unknown>;
+    const count = (n: unknown): boolean => Number.isSafeInteger(n) && (n as number) >= 0;
+    return hasOnlyKeys(m, ["type", "tabId", "generation", "seq", "items"]) && typeof tabId === "string" && count(m.generation) && count(m.seq)
+      && Array.isArray(m.items) && m.items.length <= WAIT_REPORT_ITEMS_MAX && m.items.every(isWaitReportItem);
   }
   if (t === "setMode") {
     return typeof tabId === "string" && isPermissionModeId((v as { mode?: unknown }).mode);
@@ -4707,57 +4747,6 @@ function isTabSnapshotShape(x: unknown): x is TabSnapshot {
   );
 }
 
-function isNonNegativeInt(v: unknown): boolean {
-  return typeof v === "number" && Number.isInteger(v) && v >= 0;
-}
-
-function isDecisionWarn(v: unknown): boolean {
-  if (v === undefined) return true;
-  if (typeof v !== "object" || v === null) return false;
-  const w = v as Record<string, unknown>;
-  return isNonNegativeInt(w.entries) && isNonNegativeInt(w.bytes);
-}
-
-function isHandoffDecisionCounts(v: unknown): boolean {
-  if (v === undefined) return true;
-  if (typeof v !== "object" || v === null) return false;
-  const d = v as Record<string, unknown>;
-  return (
-    isNonNegativeInt(d.total) &&
-    isNonNegativeInt(d.carried) &&
-    isNonNegativeInt(d.extracted) &&
-    isNonNegativeInt(d.removed) &&
-    isNonNegativeInt(d.unknownIdRefs) &&
-    isDecisionWarn(d.warn)
-  );
-}
-
-const DECISION_TAG_VALUES: readonly string[] = ["GOAL", "KILLED", "DECIDED", "DROPPED"];
-
-function isDecisionEntryList(v: unknown): v is HandoffDecisionEntry[] {
-  return (
-    Array.isArray(v) &&
-    v.every(isHandoffDecisionEntry)
-  );
-}
-
-function isHandoffDecisions(v: unknown): v is HandoffDecisions | undefined {
-  if (v === undefined) return true;
-  if (typeof v !== "object" || v === null) return false;
-  const d = v as Record<string, unknown>;
-  return (
-    typeof d.preamble === "string" &&
-    isDecisionEntryList(d.entries) &&
-    (d.removedLastGen === undefined || isDecisionEntryList(d.removedLastGen)) &&
-    isNonNegativeInt(d.carried) &&
-    isNonNegativeInt(d.extracted) &&
-    isNonNegativeInt(d.removed) &&
-    isNonNegativeInt(d.unknownIdRefs) &&
-    (d.source === "hook" || d.source === "previous_only") &&
-    isDecisionWarn(d.warn)
-  );
-}
-
 export interface HandoffContextMeasurement {
   totalTokens: number;
   measuredAt: string;
@@ -4815,10 +4804,7 @@ function isHandoffSource(v: unknown): boolean {
     (h.detailRunId === undefined || typeof h.detailRunId === "string") &&
     (h.utteranceCount === undefined ||
       (typeof h.utteranceCount === "number" && Number.isSafeInteger(h.utteranceCount) && h.utteranceCount >= 0)) &&
-    (h.decisionCount === undefined ||
-      (typeof h.decisionCount === "number" && Number.isSafeInteger(h.decisionCount) && h.decisionCount >= 0)) &&
     isUnreadableLineCount(h.unreadableLineCount) &&
-    isHandoffDecisionCounts(h.decisions) &&
     (h.contextUsage === undefined || isHandoffContextUsage(h.contextUsage)) &&
     isHandoffCompactStats(h.compact);
 }
@@ -4912,7 +4898,6 @@ export function isHostToWebview(v: unknown): v is HostToWebview {
       (m.contextUsage === undefined || isHandoffContextUsage(m.contextUsage)) &&
       (m.utteranceCount === undefined || typeof m.utteranceCount === "number") &&
       isUnreadableLineCount(m.unreadableLineCount) &&
-      isHandoffDecisionCounts(m.decisions) &&
       (m.auto === undefined || isHandoffAutoStart(m.auto))
     );
   }
@@ -4930,8 +4915,7 @@ export function isHostToWebview(v: unknown): v is HostToWebview {
       m.total >= 0 &&
       (m.summary === undefined || typeof m.summary === "string") &&
       Array.isArray(utterances) &&
-      utterances.every(isHandoffUtterance) &&
-      isHandoffDecisions(m.decisions)
+      utterances.every(isHandoffUtterance)
     );
   }
   if (t === "modeChanged") {
@@ -5084,6 +5068,7 @@ export function isHostToWebview(v: unknown): v is HostToWebview {
       && [undefined, true, false].includes((v as { askQualityCheck?: unknown }).askQualityCheck as boolean | undefined)
       && typeof (v as { editSummaryEnabled?: unknown }).editSummaryEnabled === "boolean"
       && [undefined, true, false].includes((v as { remoteControlCard?: unknown }).remoteControlCard as boolean | undefined)
+      && [undefined, true, false].includes((v as { waitNotify?: unknown }).waitNotify as boolean | undefined)
       && [undefined, true, false].includes((v as { improvementMenu?: unknown }).improvementMenu as boolean | undefined)
       && ((v as { welcome?: unknown }).welcome === undefined || isWelcomeState((v as { welcome?: unknown }).welcome));
   }
@@ -5382,19 +5367,6 @@ function isWorkAgentStateView(item: unknown): boolean {
     (agent.tokens === undefined || isNumber(agent.tokens)) &&
     isOptionalString(agent.modelMeasured) &&
     isNumber(agent.revision)
-  );
-}
-
-function isHandoffDecisionEntry(item: unknown): boolean {
-  if (typeof item !== "object" || item === null) return false;
-  const e = item as Record<string, unknown>;
-  return (
-    typeof e.id === "string" &&
-    e.id.length > 0 &&
-    typeof e.t === "string" &&
-    DECISION_TAG_VALUES.includes(e.t) &&
-    isNonNegativeInt(e.g) &&
-    typeof e.s === "string"
   );
 }
 

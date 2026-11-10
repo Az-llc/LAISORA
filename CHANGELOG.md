@@ -1,5 +1,23 @@
 # Changelog
 
+## 1.17.0
+
+- **Phone notifications.** A new setting notifies your phone through the Claude app when a
+  conversation has waited on you too long: an approval, a question, or a finished turn with an
+  unanswered decision or check card. Remote Control turns on only when a notification is needed
+  and turns off again when you send a message or answer in LAISORA; Remote Control you turned on
+  yourself stays on. Off by default.
+- Decision and check cards are readable on claude.ai and the mobile app when you follow a
+  conversation over Remote Control.
+- A handoff carries your own messages from every earlier conversation in the chain word for word
+  (very long ones shortened to their head and tail), and no longer keeps a decision ledger. When a
+  conversation is too large for an automatic handoff, LAISORA tells you instead of skipping it
+  silently.
+- Importing a migration ZIP reports what happened to each part: placed, replaced, kept, rewritten
+  or not placed.
+- The cache cost estimate knows the price of Fable 5.2.
+- Updated the Claude Agent SDK to 0.3.322 (Claude Code 2.1.322).
+
 ## 1.16.0
 
 - **Migration.** A new "Migration" tab in the settings puts your ToDo, portable LAISORA settings,

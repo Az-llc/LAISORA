@@ -180,7 +180,7 @@ export function renderMarkdownInto(container: HTMLElement, src: string, tabId?: 
       }
       case "ask": {
         target.appendChild(renderAsk(node.ask, node.offset, askContext, node.rejected === true, renderAskInline));
-        fencedIndex++;
+        if (node.plain !== true) fencedIndex++;
         break;
       }
       case "todoSplit": {

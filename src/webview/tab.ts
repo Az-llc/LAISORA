@@ -36,9 +36,10 @@ import type {
   WorkTaskItemView,
   WorkTaskTotalsView,
 } from "../protocol";
-import { DECISIONS_REWRITE_RATIO } from "../protocol";
-import type { HandoffContextMeasurement, HandoffDecisionCounts, HandoffSourceSnapshot } from "../protocol";
-import type { HandoffCompactStats, HandoffContextUsage, HandoffDecisionEntry } from "../handoff-envelope";
+import { isIsoTimestamp, WAIT_REPORT_ITEMS_MAX, WAIT_REPORT_TITLE_MAX } from "../protocol";
+import { splitVerbatimCuts } from "../verbatim-cap";
+import type { HandoffContextMeasurement, HandoffSourceSnapshot } from "../protocol";
+import type { HandoffCompactStats, HandoffContextUsage } from "../handoff-envelope";
 import * as l10n from "@vscode/l10n";
 import { inputEl, logsEl, tabbarEl, usagePanelEl, sessionActionsEl, vscode } from "./dom";
 import { closeGlyphButton } from "./close-button";
@@ -51,7 +52,8 @@ import { createCopyButton, externalLinkElement, renderMarkdownInto } from "./mar
 import { codeActionIcon, forgetCodeBlockStates } from "./markdown-codeblock";
 import { askHeading, askOptionContent, rejectRenderedAsks, settleUncheckedAsks, updateAskCounters } from "./ask-view";
 import { askOtherChoice } from "../ask-parser";
-import { askQualityCheckEnabled, editSummaryEnabled, onEditSummaryChange } from "./menu";
+import { askQualityCheckEnabled, editSummaryEnabled, onEditSummaryChange, onWaitNotifyChange, waitNotifyEnabled } from "./menu";
+import { PUSH_NOTIFICATION_TOOL, foldWakeVisibility, waitNotifyLine, wakeLineAfterCall, wakeTurnHidden, type WakeLine, type WakeVisibility } from "../wait-notify";
 import { aggregateTurnEdits, buildEditSummaryCard, type TurnFileEdit } from "./edit-summary-card";
 import { createYouItems, encodeAskDismissal, encodeAskResolution, youAnchor, type AskIdentity, type AskResolutionRecord, type YouItemsReader } from "./you-items";
 import { findCommitBoundary, joinRecordTexts, prependRecordParts, recordSeparator, withoutRetracted, type RecordTextPart } from "../commit-boundary";
@@ -115,7 +117,7 @@ function writeModelText(span: HTMLElement, text: string): boolean {
   return true;
 }
 
-type HandoffDetailKind = "messages" | "decisions" | "summary";
+type HandoffDetailKind = "messages" | "summary";
 type PastTurns = {
   readonly frag: DocumentFragment;
   readonly items: Map<string, TurnItem[]>;
@@ -133,8 +135,6 @@ interface HandoffCardInput {
   utteranceCount?: number;
   unreadableLineCount?: number;
   runId?: string;
-  decisions?: HandoffDecisionCounts;
-  decisionCount?: number;
 }
 
 interface HandoffRowParts {
@@ -152,6 +152,10 @@ function handoffNode(tag: string, className: string, ...children: Array<Node | s
     el.appendChild(typeof child === "string" ? document.createTextNode(child) : child);
   }
   return el;
+}
+
+function remoteControlNoteNodes(auto: boolean): HTMLElement[] {
+  return remoteControlCardNotes(ACTIONS_MENU_GLYPH, auto).map((note) => handoffNode("p", "handoff-lede", note));
 }
 
 function handoffWarn(text: string): HTMLElement {
@@ -210,60 +214,16 @@ function setHandoffDetailFailed(body: HTMLElement, retry: () => void): void {
     retryBtn));
 }
 
-function renderDecisionCounts(card: HTMLElement, counts: HandoffDecisionCounts): void {
-  const row = card.querySelector<HTMLElement>(".handoff-row-decisions");
-  if (row === null) return;
-  const sub = row.querySelector<HTMLElement>(".handoff-row-sub");
-  if (sub !== null) {
-    sub.textContent = counts.removed > 0
-      ? l10n.t("{0} new · {1} from earlier generations · {2} removed this time", counts.extracted, counts.carried, counts.removed)
-      : l10n.t("{0} new · {1} from earlier generations", counts.extracted, counts.carried);
-  }
-  const num = row.querySelector<HTMLElement>(".handoff-row-num");
-  if (num !== null) renderHandoffCount(num, counts.total);
-  const slot = row.querySelector<HTMLElement>(".handoff-decisions-lines");
-  if (slot === null) return;
-  slot.textContent = "";
-  for (const text of decisionWarnings(counts)) slot.appendChild(handoffWarn(text));
-}
-
-function decisionWarnings(counts: HandoffDecisionCounts): string[] {
-  const out: string[] = [];
-  if (counts.unknownIdRefs > 0) {
-    out.push(l10n.t("⚠ {0} lines named an id that does not exist and were ignored", counts.unknownIdRefs));
-  }
-  if (counts.carried > 0 && counts.extracted >= counts.carried * DECISIONS_REWRITE_RATIO) {
-    out.push(l10n.t("⚠ Lines that were already carried forward may have been rewritten ({0} new against {1} carried over)", counts.extracted, counts.carried));
-  }
-  if (counts.warn !== undefined) {
-    out.push(l10n.t("⚠ {0} decision lines / {1} KB are attached. Consider tidying them up.", counts.warn.entries, Math.round(counts.warn.bytes / 1024)));
-  }
-  return out;
-}
-
-function buildHandoffDecisionRows(entries: HandoffDecisionEntry[], removed: HandoffDecisionEntry[]): HTMLElement[] {
-  const row = (entry: HandoffDecisionEntry, done: boolean): HTMLElement => handoffNode("div", done ? "handoff-dec removed" : "handoff-dec",
-    handoffNode("span", "handoff-dec-id", entry.id),
-    handoffNode("span", "handoff-dec-tag", done ? "DONE" : entry.t),
-    handoffNode("span", "handoff-dec-text", entry.s),
-    handoffNode("span", "handoff-dec-g", `g${entry.g}`));
-  const out = [handoffNode("div", "handoff-decs", ...entries.map((entry) => row(entry, false)))];
-  if (removed.length > 0) {
-    out.push(handoffNode("div", "handoff-dec-group", l10n.t("Removed this time")),
-      handoffNode("div", "handoff-decs", ...removed.map((entry) => row(entry, true))));
-  }
-  return out;
-}
-
 function buildHandoffUtterance(u: HandoffDetailMessage["utterances"][number]): HTMLElement {
   const body = handoffNode("div", "handoff-utt-body");
   for (const question of u.questions ?? []) body.appendChild(handoffNode("p", "handoff-utt-q", question));
-  body.appendChild(handoffNode("pre", "handoff-utt-text", u.text));
-  const at = Date.parse(u.at);
+  body.appendChild(handoffNode("pre", "handoff-utt-text", ...splitVerbatimCuts(u.text).map((part) => typeof part === "string"
+    ? part
+    : handoffNode("span", "handoff-utt-cut", l10n.t("[{0} characters left out here; the full text is in the previous conversation]", part.omitted)))));
   return handoffNode("div", "handoff-utt",
     handoffNode("span", "handoff-utt-no", String(u.n).padStart(2, "0")),
     body,
-    handoffNode("span", "handoff-utt-at", Number.isFinite(at) ? clock(at) : u.at));
+    handoffNode("span", "handoff-utt-at", isIsoTimestamp(u.at) ? clock(Date.parse(u.at)) : u.at));
 }
 
 export interface LightboxSource {
@@ -799,6 +759,7 @@ export function isScrollCarry(v: unknown): v is ScrollCarry {
 
 const ORPHAN_FINISH_MAX = 512;
 const FINISHED_CALL_MAX = 4096;
+export const WAKE_TURN_CLASS = "laisora-wake-turn";
 
 export type LoadProgressState =
   | { phase: "preparing" }
@@ -969,6 +930,8 @@ export class Tab {
 
   private readonly endedAskTurns = new Set<string>();
   private readonly rejectedAskKeys = new Set<string>();
+  private readonly wakeFrames = new WeakSet<HTMLElement>();
+  private readonly wakeAbsorbs = new Map<string, TurnOrder>();
 
   private onAskRejected(ev: Extract<NormalizedEvent, { kind: "ask_rejected" }>): void {
     this.flushDelta();
@@ -1000,7 +963,11 @@ export class Tab {
     return legacyAskKeys(replyId, paragraph?.live === true ? position : inParagraph, index, start + inParagraph).map((key) => youAnchor(this.tabId, key));
   }
 
-  private renderReplyMarkdown(container: HTMLElement, text: string, replyId = this.currentAssistantBlock?.dataset.askSource ?? this.currentSegTurnId ?? this.currentTurnId ?? "", offset = 0, at?: number, order?: number, generation?: number): void {
+  private renderReplyMarkdown(container: HTMLElement, text: string, replyId = this.currentAssistantBlock?.dataset.askSource ?? this.currentSegTurnId ?? this.currentTurnId ?? "", offset = 0, at?: number, order?: number, generation?: number, placedIn: HTMLElement = container): void {
+    if (this.inWakeText(placedIn, order === undefined || generation === undefined ? undefined : [generation, order])) {
+      renderMarkdownInto(container, text, this.tabId);
+      return;
+    }
     const event = this.askReplyEvents.get(replyId) ?? this.askReplyEvents.get(this.currentSegTurnId ?? "");
     const ids = new Set<string>();
     const hadAsks = container.querySelector(".laisora-ask") !== null;
@@ -1174,13 +1141,26 @@ export class Tab {
     this.titleDateEl.textContent = `${date.getFullYear()}.${String(date.getMonth() + 1).padStart(2, "0")}.${String(date.getDate()).padStart(2, "0")} · ${clock(firstAt)}`;
   }
 
-  private remoteControlCard: { root: HTMLElement; state: HTMLElement; link: HTMLElement } | null = null;
+  private remoteControlCard: { root: HTMLElement; state: HTMLElement; link: HTMLElement; notes: HTMLElement[]; auto: boolean } | null = null;
   setRemoteControl(view: RemoteControlView | undefined): void {
     this.sessionHeader.setRemoteControl(view);
     const open = this.remoteControlCard !== null && this.convEl.contains(this.remoteControlCard.root) ? this.remoteControlCard : null;
     const action = remoteControlCardAction(open !== null, view);
     if (action === "none") return;
-    const card = action === "create" ? this.renderRemoteControlCard() : open!;
+    if (action === "remove") {
+      open!.root.remove();
+      this.remoteControlCard = null;
+      return;
+    }
+    const auto = view?.auto === true;
+    const card = action === "create" ? this.renderRemoteControlCard(auto) : open!;
+    if (action === "update" && card.auto !== auto) {
+      const notes = remoteControlNoteNodes(auto);
+      card.notes[0].before(...notes);
+      for (const note of card.notes) note.remove();
+      card.notes = notes;
+      card.auto = auto;
+    }
     const { stateText, sessionUrl } = remoteControlCardState(view);
     if (action === "create") {
       setTimeout(() => { if (card.state.textContent === "") card.state.textContent = stateText; }, 0);
@@ -1206,19 +1186,20 @@ export class Tab {
     if (action === "create") this.scrollToBottom("conv");
   }
 
-  private renderRemoteControlCard(): { root: HTMLElement; state: HTMLElement; link: HTMLElement } {
+  private renderRemoteControlCard(auto: boolean): { root: HTMLElement; state: HTMLElement; link: HTMLElement; notes: HTMLElement[]; auto: boolean } {
     const root = this.addBlock("rc-card", "");
     root.setAttribute("role", "group");
     root.setAttribute("aria-label", remoteControlLabel());
     const state = handoffNode("h3", "handoff-title");
     state.setAttribute("aria-live", "polite");
     const link = handoffNode("span", "");
+    const notes = remoteControlNoteNodes(auto);
     root.append(
       handoffNode("div", "handoff-label", handoffNode("b", "", remoteControlLabel().toUpperCase())),
       handoffNode("div", "handoff-head", state, link),
-      ...remoteControlCardNotes(ACTIONS_MENU_GLYPH).map((note) => handoffNode("p", "handoff-lede", note)),
+      ...notes,
     );
-    return { root, state, link };
+    return { root, state, link, notes, auto };
   }
 
   setSessionMenuActive(active: boolean): void {
@@ -1426,7 +1407,14 @@ export class Tab {
     }
   }
 
+  private noteWakeTurn(ev: Extract<NormalizedEvent, { kind: "turn_started" }>): void {
+    this.observeWakeVisibility(ev);
+    if (ev.laisoraWake !== true || isHistoryEvent(ev) || this.wakeTurns.has(ev.turnId)) return;
+    this.wakeTurns.set(ev.turnId, { calls: new Map(), shown: false });
+  }
+
   private noteTurnStart(ev: Extract<NormalizedEvent, { kind: "turn_started" }>): void {
+    this.noteWakeTurn(ev);
     const order: TurnOrder = [ev.generation, ev.seq];
     const known = this.turnStarts.get(ev.turnId);
     if (known === undefined || compareTurnOrder(order, known) < 0) this.turnStarts.set(ev.turnId, order);
@@ -1455,6 +1443,10 @@ export class Tab {
   private createAssistantTurnBlock(turnId: string | null): HTMLElement {
     const turn = document.createElement("div");
     turn.className = "block assistant-turn";
+    if (this.hiddenWakeTurn(turnId)) {
+      turn.classList.add(WAKE_TURN_CLASS);
+      this.wakeFrames.add(turn);
+    }
     if (turnId !== null) {
       turn.dataset.turnId = turnId;
       this.turnFrames.set(turnId, turn);
@@ -1675,21 +1667,6 @@ export class Tab {
       }
       if (messagesBody !== null) fillHandoffDetail(messagesBody, handoffNode("div", "handoff-utts"));
     }
-    if (msg.decisions !== undefined) {
-      const decisions = msg.decisions;
-      this.ensureHandoffDecisionsRow(card, msg.runId);
-      renderDecisionCounts(card, {
-        total: decisions.entries.length,
-        carried: decisions.carried,
-        extracted: decisions.extracted,
-        removed: decisions.removed,
-        unknownIdRefs: decisions.unknownIdRefs,
-        ...(decisions.warn !== undefined ? { warn: decisions.warn } : {}),
-      });
-      const removed = decisions.removedLastGen ?? [];
-      const decisionsBody = detailBodyOf(card, "decisions");
-      if (decisionsBody !== null) fillHandoffDetail(decisionsBody, ...buildHandoffDecisionRows(decisions.entries, removed));
-    }
     const list = messagesBody?.querySelector<HTMLElement>(".handoff-utts");
     for (const u of msg.utterances) list?.appendChild(buildHandoffUtterance(u));
     this.handoffExpectedPart.set(msg.runId, msg.part + 1);
@@ -1725,16 +1702,6 @@ export class Tab {
     return parts;
   }
 
-  private ensureHandoffDecisionsRow(card: HTMLElement, runId: string): void {
-    if (card.querySelector(".handoff-row-decisions") !== null) return;
-    const parts = this.buildHandoffDetailRow(card, runId, "DECISIONS", l10n.t("Decision lines"), "decisions");
-    parts.warns.className = "handoff-row-warns handoff-decisions-lines";
-    const summary = card.querySelector<HTMLElement>(".handoff-row-summary");
-    const rows = card.querySelector<HTMLElement>(".handoff-rows");
-    if (summary !== null && summary.parentNode !== null) summary.parentNode.insertBefore(parts.row, summary);
-    else rows?.appendChild(parts.row);
-  }
-
   private noteHandoffEnded(runId: string): void {
     if (this.handoffEndedRunIds.size < HANDOFF_RUN_MEMORY) this.handoffEndedRunIds.add(runId);
   }
@@ -1767,8 +1734,6 @@ export class Tab {
       contextUsage: source.contextUsage,
       utteranceCount: source.utteranceCount,
       ...(source.unreadableLineCount !== undefined ? { unreadableLineCount: source.unreadableLineCount } : {}),
-      ...(source.decisions !== undefined ? { decisions: source.decisions } : {}),
-      ...(source.decisionCount !== undefined ? { decisionCount: source.decisionCount } : {}),
       ...(source.detailRunId !== undefined ? { runId: source.detailRunId } : {}),
     });
     this.restoredHandoffCard = card;
@@ -1819,7 +1784,7 @@ export class Tab {
     rows.appendChild(context.row);
 
     const runId = msg.runId;
-    const messages = this.buildHandoffDetailRow(card, runId, "MESSAGES", l10n.t("Your messages (verbatim)"), "messages");
+    const messages = this.buildHandoffDetailRow(card, runId, "MESSAGES", l10n.t("Your messages (very long ones shortened)"), "messages");
     renderHandoffCount(messages.num, msg.utteranceCount ?? 0);
     if (msg.unreadableLineCount !== undefined) {
       messages.warns.appendChild(handoffWarn(l10n.t(
@@ -1828,14 +1793,6 @@ export class Tab {
       )));
     }
     rows.appendChild(messages.row);
-
-    const lines = msg.decisions !== undefined ? msg.decisions.total + msg.decisions.removed : msg.decisionCount ?? 0;
-    if (lines > 0 || (msg.decisions !== undefined && decisionWarnings(msg.decisions).length > 0)) {
-      const decisionsRow = this.buildHandoffDetailRow(card, runId, "DECISIONS", l10n.t("Decision lines"), "decisions");
-      decisionsRow.warns.className = "handoff-row-warns handoff-decisions-lines";
-      rows.appendChild(decisionsRow.row);
-      if (msg.decisions !== undefined) renderDecisionCounts(card, msg.decisions);
-    }
 
     if (runId !== undefined) {
       const summary = this.buildHandoffDetailRow(card, runId, "SUMMARY", l10n.t("Handoff summary"), "summary");
@@ -2000,6 +1957,10 @@ export class Tab {
   private readonly todoCallsFailed = new Set<string>();
   private readonly cardAnchors = new Map<string, Comment>();
   private readonly unsubscribeEditSummary = onEditSummaryChange(() => this.refreshEditSummaries());
+  private readonly unsubscribeWaitNotify = onWaitNotifyChange(() => {
+    this.reportedYouWaiting = "";
+    this.reportYouWaiting(this.openYou);
+  });
   private welcome: WelcomeView | null = null;
   private lastPastModel: string | null = null;
   private todoCardEl: HTMLDetailsElement | null = null;
@@ -2062,6 +2023,11 @@ export class Tab {
   private logUnknownLauncherKey = "";
   private readonly unplacedOwnedRows = new Map<string, HTMLElement[]>();
   private openYouCount = 0;
+  private liveEventOrder = { generation: 0, seq: 0 };
+  private openYou: readonly YouItem[] = [];
+  private readonly wakeTurns = new Map<string, { calls: Map<string, string>; line?: WakeLine; shown: boolean }>();
+  private wakeVisibility: WakeVisibility = new Map();
+  private reportedYouWaiting = "";
   private stripWrapEl!: HTMLElement;
   private stripEl!: HTMLElement;
   private stripSpinnerEl!: HTMLElement;
@@ -2112,9 +2078,10 @@ export class Tab {
     chat.append(this.convEl);
     content.append(chat, this.workEl);
     this.planPanel = new PlanPanel(chat, this.headEl, this.tabId);
-    this.chatYou = new YouList(this.youItems, item => this.navigateToYou(item), count => {
-      this.planPanel.setWaiting(count);
-      this.openYouCount = count;
+    this.chatYou = new YouList(this.youItems, item => this.navigateToYou(item), open => {
+      this.planPanel.setWaiting(open.length);
+      this.openYouCount = open.length;
+      this.reportYouWaiting(open);
       if (this.tabBtn !== undefined) this.updateStrip();
     }, item => this.dismissYou(item));
     this.summaryYou = new YouList(this.youItems, item => this.navigateToYou(item), undefined, item => this.dismissYou(item));
@@ -2179,6 +2146,7 @@ export class Tab {
     this.unsubscribeUserLabel();
     this.unsubscribeTodoClosed();
     this.unsubscribeEditSummary();
+    this.unsubscribeWaitNotify();
     this.clearHandoffStatus();
     this.chatYou.destroy();
     this.summaryYou.destroy();
@@ -3760,7 +3728,7 @@ export class Tab {
     this.assistantBuffer = text;
     this.committedLen = boundary > 0 ? boundary : 0;
     const block = document.createElement("div");
-    this.renderReplyMarkdown(block, text.slice(0, this.committedLen), key, para.base, para.at, para.order?.[1], para.order?.[0]);
+    this.renderReplyMarkdown(block, text.slice(0, this.committedLen), key, para.base, para.at, para.order?.[1], para.order?.[0], seg);
     this.segCommittedEl.replaceChildren(block);
     this.renderReplyMarkdown(this.segTailEl, text.slice(this.committedLen), key, this.committedLen + para.base);
   }
@@ -3792,7 +3760,7 @@ export class Tab {
       const chunk = this.assistantBuffer.slice(this.committedLen, boundary);
       if (chunk.trim()) {
         const block = document.createElement("div");
-        this.renderReplyMarkdown(block, chunk, undefined, this.committedLen + this.segBase(this.currentAssistantBlock));
+        this.renderReplyMarkdown(block, chunk, undefined, this.committedLen + this.segBase(this.currentAssistantBlock), undefined, undefined, undefined, this.currentAssistantBlock);
         this.segCommittedEl.appendChild(block);
       }
       this.committedLen = boundary;
@@ -3922,7 +3890,7 @@ export class Tab {
           const rest = this.assistantBuffer.slice(this.committedLen);
           if (rest.trim()) {
             const block = document.createElement("div");
-            this.renderReplyMarkdown(block, rest, undefined, this.committedLen + this.segBase(seg));
+            this.renderReplyMarkdown(block, rest, undefined, this.committedLen + this.segBase(seg), undefined, undefined, undefined, seg);
             this.segCommittedEl.appendChild(block);
           }
           this.segTailEl.remove();
@@ -4432,11 +4400,28 @@ export class Tab {
     return foot;
   }
 
+  private reportYouWaiting(open: readonly YouItem[]): void {
+    this.openYou = open;
+    if (!waitNotifyEnabled()) return;
+    const items = open.filter((item) => item.anchor.approvalRef === undefined).slice(0, WAIT_REPORT_ITEMS_MAX)
+      .map((item) => ({ title: item.title.slice(0, WAIT_REPORT_TITLE_MAX), createdAt: item.createdAt }));
+    const message = { type: "youWaiting" as const, tabId: this.tabId, ...this.liveEventOrder, items };
+    const key = JSON.stringify(message);
+    if (key === this.reportedYouWaiting) return;
+    this.reportedYouWaiting = key;
+    vscode.postMessage(message);
+  }
+
   handleEvent(ev: NormalizedEvent): void {
     if (isConvMessageEvent(ev)) this.endWelcome();
     this.eventOrder = [ev.generation, ev.seq];
+    if (ev.generation > this.liveEventOrder.generation || ev.generation === this.liveEventOrder.generation && ev.seq > this.liveEventOrder.seq) {
+      this.liveEventOrder = { generation: ev.generation, seq: ev.seq };
+    }
     this.observeLogEvent(ev);
     this.observeYouEvent(ev);
+    const wakeText = this.wakeLineOf(ev);
+    if (wakeText !== undefined) this.addBlock("system", wakeText);
     this.notePriorGenerationText(ev);
     const fallback = foldModelFallback(this.modelFallback, ev, this.models);
     if (fallback !== this.modelFallback) {
@@ -4692,7 +4677,50 @@ export class Tab {
     this.setTurnState("running");
   }
 
+  private hiddenWakeTurn(turnId: string | null): boolean {
+    return wakeTurnHidden(this.wakeVisibility, turnId);
+  }
+
+  private observeWakeVisibility(ev: NormalizedEvent): void {
+    const { state, revealed } = foldWakeVisibility(this.wakeVisibility, ev);
+    this.wakeVisibility = state;
+    if (revealed === undefined) return;
+    this.wakeAbsorbs.set(revealed, [ev.generation, ev.seq]);
+    this.frameOf(revealed)?.classList.remove(WAKE_TURN_CLASS);
+  }
+
+  private inWakeText(placedIn: HTMLElement, order: TurnOrder | undefined): boolean {
+    const frame = placedIn.closest<HTMLElement>(".block.assistant-turn");
+    if (frame === null || !this.wakeFrames.has(frame)) return false;
+    const absorbed = frame.dataset.turnId === undefined ? undefined : this.wakeAbsorbs.get(frame.dataset.turnId);
+    return absorbed === undefined || order === undefined || compareTurnOrder(order, absorbed) < 0;
+  }
+
+  private wakeLineOf(ev: NormalizedEvent): string | undefined {
+    this.observeWakeVisibility(ev);
+    if (isHistoryEvent(ev)) return undefined;
+    if (ev.kind === "tool_call_started") {
+      if (ev.toolName === PUSH_NOTIFICATION_TOOL && !isChildCall(ev.parentToolUseId)) this.wakeTurns.get(ev.turnId)?.calls.set(ev.toolUseId, ev.inputPreview);
+      return undefined;
+    }
+    if (ev.kind === "tool_call_finished") {
+      const wake = this.wakeTurns.get(ev.turnId);
+      const input = wake?.calls.get(ev.toolUseId);
+      if (wake === undefined || input === undefined || wake.shown) return undefined;
+      wake.line = wakeLineAfterCall(wake.line, input, ev.resultPreview, ev.isError);
+      if (!wake.line.sent) return undefined;
+      wake.shown = true;
+      return waitNotifyLine(wake.line.message, true);
+    }
+    if (ev.kind !== "turn_completed" && ev.kind !== "turn_failed" && ev.kind !== "turn_interrupted") return undefined;
+    const wake = ev.turnId === null ? undefined : this.wakeTurns.get(ev.turnId);
+    if (wake === undefined || wake.shown) return undefined;
+    wake.shown = true;
+    return waitNotifyLine(wake.line?.message, false);
+  }
+
   private onTurnStarted(ev: Extract<NormalizedEvent, { kind: "turn_started" }>): void {
+    this.noteWakeTurn(ev);
     if (isHistoryEvent(ev)) this.historyTurnIds.add(ev.turnId);
     this.dropLiveEditTurnEnds();
     this.clearCancelledHandoffNotice();
@@ -4721,7 +4749,7 @@ export class Tab {
   }
 
   private appendLiveReplyFooter(ev: Extract<NormalizedEvent, { kind: "turn_completed" }>): void {
-    if (this.turnCopyText(ev.turnId).trim().length === 0) return;
+    if (this.hiddenWakeTurn(ev.turnId) || this.turnCopyText(ev.turnId).trim().length === 0) return;
     const turnId = ev.turnId;
     const frame = this.frameOf(turnId);
     if (this.replyFooterAnchor === null && frame !== undefined && this.turnFooter(frame) !== null) return;
@@ -4803,7 +4831,7 @@ export class Tab {
   private settleTurnTail(turnId: string): void {
     if (this.pastTurns !== null) return;
     const frame = this.frameOf(turnId);
-    if (frame !== undefined && this.pastTextTurns.has(turnId) && turnId !== this.currentTurnId && !this.suspendedReplies.has(turnId) &&
+    if (frame !== undefined && !this.hiddenWakeTurn(turnId) && this.pastTextTurns.has(turnId) && turnId !== this.currentTurnId && !this.suspendedReplies.has(turnId) &&
       this.turnFooter(frame) === null && frame.querySelector(":scope > .assistant-seg") !== null && !this.turnMayBeRunning(turnId, frame)) {
       const footer = this.buildReplyFooter(this.pastTurnCompletedAt.get(turnId), () => this.turnCopyText(turnId), () => this.turnReplyId(turnId));
       this.pastConvFooters.set(turnId, footer);
@@ -6227,6 +6255,14 @@ export class Tab {
     if (ev.kind === "assistant_message_uuid") {
       this.pastTurnItem(turns, ev.turnId, { kind: "uuid", order: [ev.generation, ev.seq], uuid: ev.uuid });
       if (isHistoryEvent(ev) && !turns.recordIds.has(ev.turnId)) turns.recordIds.set(ev.turnId, ev.uuid);
+    }
+    const wakeText = this.wakeLineOf(ev);
+    if (wakeText !== undefined) {
+      const div = document.createElement("div");
+      div.className = "block system";
+      div.dataset.convPast = "1";
+      div.textContent = wakeText;
+      frag.append(div);
     }
     if (!isConvRenderableEvent(ev)) return "skipped";
     if (ev.kind === "permission_denied") {
