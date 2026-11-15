@@ -171,7 +171,7 @@ function extractUserRecordText(obj: Record<string, unknown>): string | null {
     if (isNonHumanCommandName(command)) return null;
     return args;
   }
-  if (text.startsWith("Caveat:") || text.startsWith("Base directory for this skill:")) return null;
+  if (obj.isMeta === true && (text.startsWith("Caveat:") || text.startsWith("Base directory for this skill:"))) return null;
   if (isCliSyntheticUserContent(asRecord(obj.message)?.content)) return null;
   return text;
 }

@@ -10,8 +10,9 @@ import {
   usagePanelEl,
   vscode,
 } from "./dom";
-import { EFFORT_ORDER, MODE_LABELS, MODE_ORDER, activeTab, activeTabId, closeUsagePanel } from "./main";
-import { type ComposerSendKey, type HostToWebview, type ModelInfo } from "../protocol";
+import { MODE_LABELS, activeTab, activeTabId, closeUsagePanel } from "./main";
+import { PERMISSION_MODES, type ComposerSendKey, type HostToWebview, type ModelInfo } from "../protocol";
+import { CLAUDE_EFFORTS } from "../orchestration-executors";
 import { setImprovementMenuShown, setSessionMenuExtras, type SessionMenuExtra } from "./session-header";
 import type { Tab } from "./tab";
 import { REMOTE_CONTROL_CARD_HIDDEN_CLASS } from "./remote-control-view";
@@ -71,6 +72,10 @@ export function editSummaryEnabled(): boolean {
 
 export function composerSendKey(): ComposerSendKey {
   return sendKey;
+}
+
+export function isComposerSendKey(e: KeyboardEvent): boolean {
+  return e.key === "Enter" && e.shiftKey === (sendKey === "shiftEnter");
 }
 
 export function composerPlaceholder(): string {
@@ -329,7 +334,7 @@ function openModeMenu(): void {
   closeUsagePanel();
   const t = activeTab();
   modeMenuEl.textContent = "";
-  for (const mode of MODE_ORDER) {
+  for (const mode of PERMISSION_MODES) {
     const item = document.createElement("div");
     item.className = "mode-menu-item";
     if (mode === "bypassPermissions") item.classList.add("mode-danger");
@@ -364,8 +369,8 @@ export function closeAuthPicker(): void {
 function buildEffortDots(level: number): HTMLElement {
   const wrap = document.createElement("span");
   wrap.className = "effort-dots";
-  for (let i = 1; i <= EFFORT_ORDER.length; i++) {
-    const value = EFFORT_ORDER[i - 1];
+  for (let i = 1; i <= CLAUDE_EFFORTS.length; i++) {
+    const value = CLAUDE_EFFORTS[i - 1];
     const dot = document.createElement("span");
     dot.className = i === level ? "effort-dot on" : "effort-dot";
     dot.dataset.effortLevel = value;
@@ -388,7 +393,7 @@ function renderEffortRow(row: HTMLElement, level: string | null, source?: "confi
     : source === "configured" ? l10n.t("{0} (configured)", level)
       : source === "default" ? l10n.t("{0} (default)", level) : level;
   name.textContent = l10n.t("Effort ({0})", shown);
-  const idx = level ? EFFORT_ORDER.indexOf(level as (typeof EFFORT_ORDER)[number]) + 1 : 0;
+  const idx = level ? CLAUDE_EFFORTS.indexOf(level as (typeof CLAUDE_EFFORTS)[number]) + 1 : 0;
   row.append(name, buildEffortDots(idx));
 }
 
@@ -406,7 +411,7 @@ function setEffortLevel(level: string): void {
 function stepEffort(dir: 1 | -1): void {
   const t = activeTab();
   if (!t || !activeTabId) return;
-  const scale: string[] = [...EFFORT_ORDER];
+  const scale: string[] = [...CLAUDE_EFFORTS];
   const cur = currentEffort(t);
   const i = cur ? scale.indexOf(cur) : -1;
   const next = i < 0 ? (dir > 0 ? scale[0] : scale[scale.length - 1]) : scale[(i + dir + scale.length) % scale.length];
@@ -570,7 +575,7 @@ export function initMenu(): void {
       e.preventDefault();
       const t = activeTab();
       if (!t || !activeTabId) return;
-      const next = MODE_ORDER[(MODE_ORDER.indexOf(t.permissionMode) + 1) % MODE_ORDER.length];
+      const next = PERMISSION_MODES[(PERMISSION_MODES.indexOf(t.permissionMode) + 1) % PERMISSION_MODES.length];
       vscode.postMessage({ type: "setMode", tabId: activeTabId, mode: next });
     }
   });

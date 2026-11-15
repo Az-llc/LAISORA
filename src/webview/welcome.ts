@@ -6,6 +6,7 @@ import { appearanceSectionTitle } from "./accent-settings";
 import { isConvMessageEvent } from "../conv-renderable";
 import { GREETING_SLOTS, welcomeGreetings, welcomeNews, welcomeTips, type GreetingSlot, type GreetingSpecialDay, type WelcomeGreetings, type WelcomeNewsItem, type WelcomeTip } from "../welcome-content";
 import type { NormalizedEvent, SettingsRevealTarget, WebviewToHost, WelcomeState, WelcomeTab } from "../protocol";
+import { element } from "./element";
 
 declare const __LAISORA_WELCOME_MARK__: string;
 
@@ -102,13 +103,6 @@ export function applyWelcomeState(next: WelcomeState | undefined): void {
 export interface WelcomeHost {
   post(message: WebviewToHost): void;
   port: HTMLElement;
-}
-
-function element<K extends keyof HTMLElementTagNameMap>(tag: K, className: string, text?: string): HTMLElementTagNameMap[K] {
-  const el = document.createElement(tag);
-  el.className = className;
-  if (text !== undefined) el.textContent = text;
-  return el;
 }
 
 function historyIcon(): HTMLElement {

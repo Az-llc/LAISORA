@@ -6,7 +6,6 @@ import {
   todoButton,
   todoCloseButton,
   todoDateInput,
-  todoEl as el,
   todoGroupSelect,
   todoNewTitlePlaceholder,
   todoOverlayTop,
@@ -20,6 +19,7 @@ import {
 } from "./todo-edit";
 import { todoInsertPosition, type TodoInsertSlot } from "./todo-rows";
 import { MARKS } from "./marks";
+import { element as el } from "./element";
 
 export interface TodoSheetDraft {
   title: string;

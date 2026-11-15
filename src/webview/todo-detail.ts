@@ -31,8 +31,8 @@ import {
   todoChangeRow, todoRevertUnit,
   todoClearNotice,
   todoCloseButton,
+  TodoTypingGuard,
   todoFillNotice,
-  todoEl,
   todoDateInput,
   todoDateEl,
   todoGroupSelect,
@@ -54,10 +54,15 @@ import {
   todoMenuToggle,
   todoTitleEdit,
   todoControlPressed,
+  todoStatePressLabel,
+  todoTitleLabel,
+  todoGenerationField,
 } from "./todo-edit";
 import { todoMoveSteps } from "./todo-organize";
 import { localDateKey, todoRootGroup } from "./todo-rows";
 import { MARKS } from "./marks";
+import { element as todoEl } from "./element";
+import { todoGroupLabel } from "../todo-labels";
 
 export interface TodoGroupPlaces {
   readonly folders: readonly string[];
@@ -116,7 +121,7 @@ export class TodoDetail {
   private maximized = false;
   private editingTitle = false;
   private memoDraft: string | null = null;
-  private deferred = false;
+  private readonly typing: TodoTypingGuard;
   private returnFocus: HTMLElement | null = null;
   private dragging: TodoDetailSection | null = null;
   private readonly noticeEl: HTMLElement;
@@ -160,9 +165,7 @@ export class TodoDetail {
       this.dialog.classList.remove("drag-over");
       for (const file of Array.from(e.dataTransfer.files)) if (isImageType(file.type)) this.addImage(file);
     });
-    this.dialog.addEventListener("focusout", () => queueMicrotask(() => {
-      if (this.deferred && !isTextEntryTarget(document.activeElement)) this.render();
-    }));
+    this.typing = new TodoTypingGuard(this.dialog, () => this.render());
     this.root.append(this.dialog);
   }
 
@@ -228,7 +231,7 @@ export class TodoDetail {
   applyWork(message: TodoWorkMessage): void {
     if (message.id !== this.id || message.revision < this.revision) return;
     this.work = message.work;
-    if (this.item && !this.deferred && !(this.dialog.contains(document.activeElement) && isTextEntryTarget(document.activeElement))) this.render();
+    if (this.item) this.typing.update();
   }
 
   apply(message: TodoDetailMessage): void {
@@ -240,11 +243,7 @@ export class TodoDetail {
     this.loadFailed = false;
     clearTimeout(this.loadTimer);
     if (!this.dragging) this.order = [...message.sectionOrder];
-    if (this.dialog.contains(document.activeElement) && isTextEntryTarget(document.activeElement)) {
-      this.deferred = true;
-      return;
-    }
-    this.render();
+    this.typing.update();
   }
 
   private edit(edit: TodoEdit): void {
@@ -314,7 +313,7 @@ export class TodoDetail {
   }
 
   private render(): void {
-    this.deferred = false;
+    this.typing.rendered();
     this.dialog.classList.toggle("max", this.maximized);
     if (this.id === null) return;
     const item = this.item;
@@ -354,7 +353,7 @@ export class TodoDetail {
       dot.style.setProperty("--todo-gc", color);
       crumb.append(dot);
     }
-    crumb.append(todoEl("span", "", todoRootGroup(this.host.items(), item.id) ?? item.group ?? l10n.t("No group")));
+    crumb.append(todoEl("span", "", todoGroupLabel(todoRootGroup(this.host.items(), item.id) ?? item.group)));
     const parent = item.parentId !== null ? this.host.items().find(entry => entry.id === item.parentId) : undefined;
     if (parent) {
       crumb.append(todoEl("span", "", "·"), todoEl("span", "", l10n.t("Parent:")),
@@ -431,7 +430,7 @@ export class TodoDetail {
 
   private stateButton(id: string, state: TodoState): HTMLButtonElement {
     const button = todoButton("todo-state todo-state-btn", "", () => todoStateMenu(button, state, next => this.edit({ kind: "setState", id, state: next })));
-    button.title = l10n.t("State: {0} (press to change)", TODO_STATE_LABELS[state]());
+    button.title = todoStatePressLabel(state);
     button.setAttribute("aria-label", button.title);
     button.setAttribute("aria-haspopup", "menu");
     button.setAttribute("aria-expanded", "false");
@@ -463,7 +462,7 @@ export class TodoDetail {
     input.value = item.title;
     input.maxLength = TODO_TITLE_MAX;
     input.spellcheck = false;
-    input.setAttribute("aria-label", l10n.t("Title"));
+    input.setAttribute("aria-label", todoTitleLabel());
     let done = false;
     const finish = (save: boolean) => {
       if (done) return;
@@ -495,7 +494,7 @@ export class TodoDetail {
 
   private changeActions() {
     return {
-      revert: (changeIds: readonly string[]) => this.edit({ kind: "revertClaude", changeIds: [...changeIds] }),
+      revert: (changeIds: readonly string[], generation: string | undefined) => this.edit({ kind: "revertClaude", changeIds: [...changeIds], ...todoGenerationField(generation) }),
       acknowledge: (changeIds: readonly string[]) => this.edit({ kind: "acknowledge", changeIds: [...changeIds] }),
     };
   }
@@ -1021,7 +1020,7 @@ export class TodoDetail {
     if (item.parentId === null) {
       field(l10n.t("Group"), todoGroupSelect(item.group, this.host.groups(), group => this.edit({ kind: "update", id: item.id, group })));
     } else {
-      field(l10n.t("Group"), todoEl("span", "todo-ro", l10n.t("{0} (follows the parent)", todoRootGroup(this.host.items(), item.id) ?? l10n.t("No group"))));
+      field(l10n.t("Group"), todoEl("span", "todo-ro", l10n.t("{0} (follows the parent)", todoGroupLabel(todoRootGroup(this.host.items(), item.id)))));
     }
     field(l10n.t("Parent"), todoParentSelect(this.host.items(), id => this.host.numberOf(id), item.parentId, item.id,
       parentId => this.moveUnder(item.id, parentId)));

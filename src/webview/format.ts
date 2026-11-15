@@ -48,6 +48,10 @@ export function clock(ms: number): string {
   return `${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}`;
 }
 
+export function secondsClock(ms: number): string {
+  return `${clock(ms)}:${String(new Date(ms).getSeconds()).padStart(2, "0")}`;
+}
+
 export function dayClock(ms: number): string {
   const d = new Date(ms);
   return `${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")} ${clock(ms)}`;

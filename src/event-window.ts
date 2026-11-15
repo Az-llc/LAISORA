@@ -1,4 +1,5 @@
-import type { NormalizedEvent } from "./protocol";
+import { CONVERSATION_ANCHOR_UUIDS_MAX, type NormalizedEvent } from "./protocol";
+import { contentText } from "./human-input-vocabulary";
 
 export interface EventWindow {
   events: NormalizedEvent[];
@@ -31,6 +32,47 @@ export function historyAnchorIndex(events: readonly NormalizedEvent[]): number {
   const next = events[1];
   if (head === undefined || next === undefined || head.kind !== "turn_started") return 0;
   return followsDirectly(head, next) ? 0 : 1;
+}
+
+export interface ShownConversationRecord {
+  uuid: string;
+  restored: boolean;
+  reply?: { text: string; leadsSegment: boolean };
+}
+
+export type PastRecordAction =
+  | { kind: "add" }
+  | { kind: "skip" }
+  | { kind: "complete"; prefix: string }
+  | { kind: "fetch" };
+
+export function pastRecordAction(
+  shown: ShownConversationRecord | undefined,
+  item: { text: string; clipped?: true }
+): PastRecordAction {
+  if (shown === undefined) return { kind: "add" };
+  const reply = shown.reply;
+  if (reply === undefined || !reply.leadsSegment) return { kind: "skip" };
+  const served = contentText(reply.text);
+  if (item.clipped) return served.startsWith(item.text) ? { kind: "skip" } : { kind: "fetch" };
+  if (item.text.length <= served.length || !item.text.endsWith(served)) return { kind: "skip" };
+  const prefix = item.text.slice(0, item.text.length - served.length);
+  const leading = reply.text.slice(0, reply.text.length - reply.text.trimStart().length);
+  return { kind: "complete", prefix: prefix.endsWith(leading) ? prefix.slice(0, prefix.length - leading.length) : prefix };
+}
+
+export function transcriptAnchorUuids(
+  shownOldestFirst: Iterable<ShownConversationRecord>,
+  hostDroppedEventCount: number
+): string[] {
+  const anchors: string[] = [];
+  let reachable = hostDroppedEventCount > 0;
+  for (const record of shownOldestFirst) {
+    reachable ||= record.restored;
+    if (anchors.length < CONVERSATION_ANCHOR_UUIDS_MAX && !anchors.includes(record.uuid)) anchors.push(record.uuid);
+    if (reachable && anchors.length >= CONVERSATION_ANCHOR_UUIDS_MAX) break;
+  }
+  return reachable ? anchors : [];
 }
 
 function findLastTurnStart(events: NormalizedEvent[], before: number): NormalizedEvent | undefined {

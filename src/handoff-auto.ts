@@ -1,5 +1,6 @@
 import { CACHE_TTL_MS, cacheWriteTtl } from "./cache-ttl-cost";
 import type { CacheTtl } from "./claude-prices";
+import { appendRecordPart, joinRecordTexts, withoutRetracted, type RecordTextPart } from "./commit-boundary";
 import { resolveSettingGroup } from "./configuration-defaults";
 import { askBlocksIn } from "./markdown-ast";
 import { planCurrentSteps } from "./plan-steps";
@@ -113,11 +114,64 @@ export function planHasUnfinishedStep(blocks: Parameters<typeof planCurrentSteps
   return planCurrentSteps(blocks).some((step) => step.status === "pending" || step.status === "in_progress");
 }
 
+export interface ContinueAfterHandoffInput {
+  trigger: HandoffAutoStart["trigger"];
+  planUnfinished: boolean;
+  decisionPending: boolean;
+}
+
+export function continueAfterHandoff(input: ContinueAfterHandoffInput): boolean {
+  return input.trigger === "size" && input.planUnfinished && !input.decisionPending;
+}
+
+export type HandoffContinueBlock = "not_started" | "setting_off" | "generation_changed" | "handed_off" | "gate_closed" | "turn_ran";
+
+export function handoffContinueBlock(input: {
+  firstStartSucceeded: boolean;
+  settingOn: boolean;
+  sameGeneration: boolean;
+  handedOff: boolean;
+  gate: AutoHandoffGateInput;
+  turnsEnded: number;
+}): HandoffContinueBlock | undefined {
+  if (!input.firstStartSucceeded) return "not_started";
+  if (!input.settingOn) return "setting_off";
+  if (!input.sameGeneration) return "generation_changed";
+  if (input.handedOff) return "handed_off";
+  if (!autoHandoffGateOpen(input.gate)) return "gate_closed";
+  if (input.turnsEnded !== 0) return "turn_ran";
+  return undefined;
+}
+
+export function continueMissedLineShown(input: {
+  settingOn: boolean;
+  sent: boolean;
+  sameGeneration: boolean;
+  closed: boolean;
+}): boolean {
+  return input.settingOn && !input.sent && input.sameGeneration && !input.closed;
+}
+
+export type SourceTabCloseBlock = "setting_off" | "closed" | "draft" | "busy" | "background";
+
+export function sourceTabCloseBlock(input: {
+  settingOn: boolean;
+  closed: boolean;
+  gate: Pick<AutoHandoffGateInput, "composerHasText">;
+  busy: boolean;
+  background: BackgroundWork;
+}): SourceTabCloseBlock | undefined {
+  if (!input.settingOn) return "setting_off";
+  if (input.closed) return "closed";
+  if (input.gate.composerHasText) return "draft";
+  if (input.busy) return "busy";
+  if (backgroundWorkRunning(input.background)) return "background";
+  return undefined;
+}
+
 export function decisionPendingSinceUserSend(events: readonly NormalizedEvent[]): boolean {
   const resolved = new Set<string>();
-  const texts: string[] = [];
-  let turnId: string | undefined;
-  const isUserSend = (ev: NormalizedEvent): boolean => ev.kind === "user_message" || (ev.kind === "replayed_message" && ev.role === "user");
+  const isUserSend = (ev: NormalizedEvent): boolean => (ev.kind === "user_message" && ev.cancelled !== true) || (ev.kind === "replayed_message" && ev.role === "user");
   let from = events.length;
   while (from > 0 && !isUserSend(events[from - 1])) from--;
   const since = events.slice(from);
@@ -126,16 +180,33 @@ export function decisionPendingSinceUserSend(events: readonly NormalizedEvent[])
     const ev = since[i];
     if (ev.kind === "approval_resolved") resolved.add(ev.requestId);
     else if (ev.kind === "approval_request" && ev.questions !== undefined && !resolved.has(ev.requestId)) return true;
-    else if (ev.kind === "replayed_message" && ev.role === "assistant") {
-      texts.push("\n", ev.text, "\n");
-      turnId = undefined;
+  }
+  const turns: RecordTextPart[][] = [];
+  let parts: RecordTextPart[] = [];
+  let turnId: string | undefined;
+  const enterTurn = (next: string | undefined): void => {
+    if (next === turnId) return;
+    if (parts.length > 0) turns.push(parts);
+    parts = [];
+    turnId = next;
+  };
+  for (const ev of since) {
+    if (ev.kind === "replayed_message" && ev.role === "assistant") {
+      enterTurn(undefined);
+      appendRecordPart(parts, { text: ev.text, uuid: ev.uuid ?? null, complete: true });
+    } else if (ev.kind === "assistant_message_uuid" && !wakeTurns.has(ev.turnId)) {
+      enterTurn(ev.turnId);
+      appendRecordPart(parts, { text: "", uuid: ev.uuid });
     } else if (ev.kind === "assistant_text_delta" && ev.priorGeneration !== true && !wakeTurns.has(ev.turnId)) {
-      if (turnId !== undefined && turnId !== ev.turnId) texts.push("\n");
-      texts.push(ev.text);
-      turnId = ev.turnId;
+      enterTurn(ev.turnId);
+      appendRecordPart(parts, ev.recordUuid === undefined ? { text: ev.text, uuid: null } : { text: ev.text, uuid: ev.recordUuid, complete: true });
+    } else if (ev.kind === "assistant_retracted") {
+      parts = withoutRetracted(parts, ev.uuids);
+      for (let i = 0; i < turns.length; i++) turns[i] = withoutRetracted(turns[i], ev.uuids);
     }
   }
-  return askBlocksIn(texts.reverse().join("")).some((ask) => ask.kind === "decide");
+  if (parts.length > 0) turns.push(parts);
+  return askBlocksIn(joinRecordTexts(turns.flat().map((part) => part.text))).some((ask) => ask.kind === "decide");
 }
 
 export interface CliActivity {
@@ -151,9 +222,14 @@ export interface AutoHandoffGateInput extends CliActivity {
   handoffRunning: boolean;
 }
 
+export type BackgroundWork = Pick<CliActivity, "runningAgents" | "runningBackgroundTasks" | "runningExternalRuns">;
+
+export function backgroundWorkRunning(work: BackgroundWork): boolean {
+  return work.runningAgents !== 0 || work.runningBackgroundTasks !== 0 || work.runningExternalRuns !== 0;
+}
+
 export function cliReplaceable(activity: CliActivity): boolean {
-  return activity.idle && activity.runningAgents === 0 && activity.runningBackgroundTasks === 0 && activity.runningExternalRuns === 0
-    && activity.queuedMessages === 0;
+  return activity.idle && !backgroundWorkRunning(activity) && activity.queuedMessages === 0;
 }
 
 export function autoHandoffGateOpen(gate: AutoHandoffGateInput): boolean {

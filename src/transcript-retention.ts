@@ -1,7 +1,7 @@
 import { configurationBound } from "./configuration-defaults";
 
 export const TRANSCRIPT_RETENTION_DAYS_KEY = "claude.transcriptRetentionDays";
-export const TRANSCRIPT_RETENTION_DAYS_MIN = configurationBound(TRANSCRIPT_RETENTION_DAYS_KEY, "minimum")!;
+export const TRANSCRIPT_RETENTION_DAYS_MIN = configurationBound(TRANSCRIPT_RETENTION_DAYS_KEY, "minimum");
 export const CLAUDE_CODE_DEFAULT_CLEANUP_PERIOD_DAYS = 30;
 
 export type TranscriptRetentionSettings = { cleanupPeriodDays: number } | undefined;

@@ -3,7 +3,10 @@ import * as vscode from "vscode";
 import { INSPECTOR_RESPONSE_BYTES } from "./agent-inspector";
 import {
   ConversationHistoryError,
-  conversationCursorBeforeAnyUuid,
+  clipConversationMessage,
+  clipConversationText,
+  conversationCursorThroughAnyUuid,
+  conversationMessageByUuid,
   hasConversationHistory,
   nextConversationChunk,
   registerConversationHistory,
@@ -27,6 +30,7 @@ import {
   registerHistoryWindow,
 } from "./history-window";
 import { output } from "./host-context";
+import { CONVERSATION_TEXT_MAX } from "./protocol";
 import type {
   ConversationHistoryErrorReason,
   ConversationHistoryPagePayload,
@@ -51,67 +55,43 @@ const HISTORY_CHUNK_MIN_ITEMS_LADDER = [HISTORY_CHUNK_MIN_ITEMS, 50, 12, 3, 1];
 const HISTORY_CHUNK_RESPONSE_BYTES = INSPECTOR_RESPONSE_BYTES;
 const CONVERSATION_CHUNK_ITEMS_LADDER = [40, 16, 6, 2, 1];
 const CONVERSATION_CHUNK_RESPONSE_BYTES = INSPECTOR_RESPONSE_BYTES;
-const CONVERSATION_TEXT_MAX = 20000;
 
-const historyRequests = new WeakMap<vscode.Webview, Map<string, string>>();
-
-function setLatestHistoryRequest(sender: vscode.Webview, tabId: string, requestId: string): void {
-  let byTab = historyRequests.get(sender);
-  if (!byTab) {
-    byTab = new Map();
-    historyRequests.set(sender, byTab);
-  }
-  byTab.set(tabId, requestId);
+export interface LatestRequests {
+  set(sender: vscode.Webview, tabId: string, requestId: string): void;
+  isLatest(sender: vscode.Webview, tabId: string, requestId: string): boolean;
 }
 
-function isLatestHistoryRequest(sender: vscode.Webview, tabId: string, requestId: string): boolean {
-  return historyRequests.get(sender)?.get(tabId) === requestId;
+export function latestRequests(): LatestRequests {
+  const byWebview = new WeakMap<vscode.Webview, Map<string, string>>();
+  return {
+    set(sender, tabId, requestId) {
+      let byTab = byWebview.get(sender);
+      if (!byTab) {
+        byTab = new Map();
+        byWebview.set(sender, byTab);
+      }
+      byTab.set(tabId, requestId);
+    },
+    isLatest: (sender, tabId, requestId) => byWebview.get(sender)?.get(tabId) === requestId,
+  };
 }
 
-const worklogTranscriptRequests = new WeakMap<vscode.Webview, Map<string, string>>();
+const historyRequests = latestRequests();
+const worklogTranscriptRequests = latestRequests();
+const conversationRequests = latestRequests();
 
-function setLatestWorklogTranscriptRequest(sender: vscode.Webview, tabId: string, requestId: string): void {
-  let byTab = worklogTranscriptRequests.get(sender);
-  if (!byTab) {
-    byTab = new Map();
-    worklogTranscriptRequests.set(sender, byTab);
-  }
-  byTab.set(tabId, requestId);
-}
-
-function isLatestWorklogTranscriptRequest(
-  sender: vscode.Webview,
-  tabId: string,
-  requestId: string
-): boolean {
-  return worklogTranscriptRequests.get(sender)?.get(tabId) === requestId;
-}
-
-async function postWorklogTranscriptError(
+async function postChunkError(
   st: SessionStore,
   sender: vscode.Webview,
+  type: "historyChunkError" | "worklogTranscriptError",
   session: Session,
   requestId: string,
   generation: number,
   reason: HistoryChunkErrorReason
 ): Promise<void> {
-  await st.postTo(sender, {
-    type: "worklogTranscriptError",
-    tabId: session.tabId,
-    requestId,
-    generation,
-    reason,
-  });
+  await st.postTo(sender, { type, tabId: session.tabId, requestId, generation, reason });
 }
 
-function clampConversationText<T extends { text: string }>(m: T, maxItems: number): T {
-  const limit = maxItems <= 2 ? CONVERSATION_TEXT_MAX : Math.floor(CONVERSATION_TEXT_MAX / 4);
-  if (m.text.length <= limit) return m;
-  let cut = limit - 1;
-  const code = m.text.charCodeAt(cut - 1);
-  if (code >= 0xd800 && code <= 0xdbff) cut -= 1;
-  return { ...m, text: `${m.text.slice(0, cut)}…` };
-}
 
 function stripHistoryChunkImages(items: NormalizedEvent[]): NormalizedEvent[] {
   return items.map((item) => {
@@ -127,25 +107,6 @@ function stripHistoryChunkImages(items: NormalizedEvent[]): NormalizedEvent[] {
     }
     return item;
   });
-}
-
-const conversationRequests = new WeakMap<vscode.Webview, Map<string, string>>();
-
-function setLatestConversationRequest(sender: vscode.Webview, tabId: string, requestId: string): void {
-  let byTab = conversationRequests.get(sender);
-  if (!byTab) {
-    byTab = new Map();
-    conversationRequests.set(sender, byTab);
-  }
-  byTab.set(tabId, requestId);
-}
-
-function isLatestConversationRequest(
-  sender: vscode.Webview,
-  tabId: string,
-  requestId: string
-): boolean {
-  return conversationRequests.get(sender)?.get(tabId) === requestId;
 }
 
 function conversationHistoryGapFields(
@@ -181,26 +142,40 @@ async function postConversationHistoryError(
   });
 }
 
-async function postHistoryChunkError(
-  st: SessionStore,
-  sender: vscode.Webview,
+
+async function loadConversationScope(
   session: Session,
-  requestId: string,
-  generation: number,
-  reason: HistoryChunkErrorReason
-): Promise<void> {
-  await st.postTo(sender, {
-    type: "historyChunkError",
-    tabId: session.tabId,
-    requestId,
-    generation,
-    reason,
-  });
+  scopeKey: string,
+  stillValid: () => boolean
+): Promise<{ reason: ConversationHistoryErrorReason; detail?: string } | undefined> {
+  const lookup: SessionFileLookup =
+    session.resumeFilePath !== undefined
+      ? { path: session.resumeFilePath, reason: null }
+      : lookupSessionFile(sessionRecordId(session) ?? "");
+  const filePath = lookup.path;
+  if (filePath === null) {
+    return lookup.reason === "scan_failed"
+      ? { reason: "session-scan-failed", detail: lookup.detail }
+      : { reason: "session-unavailable" };
+  }
+  const read = await readConversationMessages(filePath, isInSessionStore, undefined, sessionRecordId(session));
+  if (!stillValid()) return { reason: "stale-request" };
+  if (read.readError) return { reason: "read-failed", detail: read.readError };
+  registerConversationHistory(scopeKey, read.messages, currentScopeMax());
+  session.conversationHistoryGaps = {
+    malformedLineCount: read.malformedLineCount,
+    droppedWithoutUuidCount: read.droppedWithoutUuidCount,
+  };
+  output.appendLine(
+    `[${session.title}] 会話履歴を登録: ${read.messages.length}件 ` +
+      `malformed=${read.malformedLineCount} uuid欠落=${read.droppedWithoutUuidCount}`
+  );
+  return undefined;
 }
 
 export async function handleHistoryMessage(
   st: SessionStore,
-  msg: Extract<WebviewToHost, { type: "historyChunkRequest" | "conversationHistoryRequest" | "worklogTranscriptRequest" }>,
+  msg: Extract<WebviewToHost, { type: "historyChunkRequest" | "conversationHistoryRequest" | "conversationMessageTextRequest" | "worklogTranscriptRequest" }>,
   sender: vscode.Webview,
   target: Session | undefined
 ): Promise<void> {
@@ -209,14 +184,14 @@ export async function handleHistoryMessage(
       const session = target!;
       const generation = session.generation;
       const scopeKey = historyScopeKey(session);
-      setLatestHistoryRequest(sender, session.tabId, msg.requestId);
+      historyRequests.set(sender, session.tabId, msg.requestId);
       const requestStillValid = (): boolean =>
         st.sessions.get(session.tabId) === session &&
         !session.closed &&
         session.generation === generation &&
-        isLatestHistoryRequest(sender, session.tabId, msg.requestId);
+        historyRequests.isLatest(sender, session.tabId, msg.requestId);
       if (!requestStillValid()) {
-        await postHistoryChunkError(st, sender, session, msg.requestId, generation, "stale-request");
+        await postChunkError(st, sender, "historyChunkError", session, msg.requestId, generation, "stale-request");
         break;
       }
       try {
@@ -307,7 +282,7 @@ export async function handleHistoryMessage(
         }
         if (chunkResponse === undefined) throw new Error("history chunk response not built");
         if (!requestStillValid()) {
-          await postHistoryChunkError(st, sender, session, msg.requestId, generation, "stale-request");
+          await postChunkError(st, sender, "historyChunkError", session, msg.requestId, generation, "stale-request");
           break;
         }
         await st.postTo(sender, chunkResponse);
@@ -318,7 +293,7 @@ export async function handleHistoryMessage(
           `[${session.title}] 履歴chunk失敗: ${reason}` +
             (error instanceof HistoryWindowError ? "" : ` ${String(error)}`)
         );
-        await postHistoryChunkError(st, sender, session, msg.requestId, generation, reason);
+        await postChunkError(st, sender, "historyChunkError", session, msg.requestId, generation, reason);
       }
       break;
     }
@@ -326,12 +301,12 @@ export async function handleHistoryMessage(
       const session = target!;
       const generation = session.generation;
       const scopeKey = historyScopeKey(session);
-      setLatestConversationRequest(sender, session.tabId, msg.requestId);
+      conversationRequests.set(sender, session.tabId, msg.requestId);
       const requestStillValid = (): boolean =>
         st.sessions.get(session.tabId) === session &&
         !session.closed &&
         session.generation === generation &&
-        isLatestConversationRequest(sender, session.tabId, msg.requestId);
+        conversationRequests.isLatest(sender, session.tabId, msg.requestId);
       if (!requestStillValid()) {
         await postConversationHistoryError(
           st, sender, session, msg.requestId, generation, "stale-request"
@@ -339,78 +314,23 @@ export async function handleHistoryMessage(
         break;
       }
       try {
-        if (session.conversationAnchorUuids.length === 0) {
-          await postConversationHistoryError(
-            st, sender, session, msg.requestId, generation, "session-unavailable"
-          );
-          break;
-        }
-        let cursor = msg.anchorUuid === undefined ? msg.cursor : undefined;
-        const anchors =
-          msg.anchorUuid === undefined
-            ? session.conversationAnchorUuids
-            : [msg.anchorUuid, ...session.conversationAnchorUuids];
+        let cursor = msg.anchorUuids === undefined ? msg.cursor : undefined;
+        const anchors = [...(msg.anchorUuids ?? []), ...session.conversationAnchorUuids];
         if (cursor === undefined || !hasConversationHistory(scopeKey)) {
-          const lookup: SessionFileLookup =
-            session.resumeFilePath !== undefined
-              ? { path: session.resumeFilePath, reason: null }
-              : lookupSessionFile(sessionRecordId(session) ?? "");
-          const filePath = lookup.path;
-          if (filePath === null) {
+          if (anchors.length === 0) {
             await postConversationHistoryError(
-              st, sender, session, msg.requestId, generation,
-              lookup.reason === "scan_failed" ? "session-scan-failed" : "session-unavailable",
-              lookup.reason === "scan_failed" ? lookup.detail : undefined
+              st, sender, session, msg.requestId, generation, "session-unavailable"
             );
             break;
           }
-          const read = await readConversationMessages(
-            filePath,
-            isInSessionStore,
-            undefined,
-            sessionRecordId(session)
-          );
-          if (!requestStillValid()) {
+          const loaded = await loadConversationScope(session, scopeKey, requestStillValid);
+          if (loaded !== undefined) {
             await postConversationHistoryError(
-              st, sender, session, msg.requestId, generation, "stale-request"
+              st, sender, session, msg.requestId, generation, loaded.reason, loaded.detail
             );
             break;
           }
-          if (read.readError) {
-            await postConversationHistoryError(
-              st, sender, session, msg.requestId, generation, "read-failed", read.readError
-            );
-            break;
-          }
-          registerConversationHistory(scopeKey, read.messages, currentScopeMax());
-          session.conversationHistoryGaps = {
-            malformedLineCount: read.malformedLineCount,
-            droppedWithoutUuidCount: read.droppedWithoutUuidCount,
-          };
-          output.appendLine(
-            `[${session.title}] 会話履歴を登録: ${read.messages.length}件 ` +
-              `malformed=${read.malformedLineCount} uuid欠落=${read.droppedWithoutUuidCount}`
-          );
-          cursor = conversationCursorBeforeAnyUuid(scopeKey, anchors);
-          if (cursor === undefined) {
-            await st.postTo(sender, {
-              type: "conversationHistoryResult" as const,
-              tabId: session.tabId,
-              requestId: msg.requestId,
-              generation,
-              page: {
-                items: [],
-                hasMore: false,
-                coverage: {
-                  returnedCount: 0,
-                  remainingOlderCount: 0,
-                  oldestReached: true,
-                  ...conversationHistoryGapFields(session),
-                },
-              },
-            });
-            break;
-          }
+          cursor = conversationCursorThroughAnyUuid(scopeKey, anchors);
         }
         let response:
           | {
@@ -428,7 +348,9 @@ export async function handleHistoryMessage(
           lastCount = raw.items.length;
           const page = {
             ...raw,
-            items: raw.items.map((m) => clampConversationText(m, maxItems)),
+            items: raw.items.map((m) =>
+              clipConversationMessage(m, maxItems <= 2 ? CONVERSATION_TEXT_MAX : Math.floor(CONVERSATION_TEXT_MAX / 4))
+            ),
             coverage: { ...raw.coverage, ...conversationHistoryGapFields(session) },
           };
           const candidate = {
@@ -469,18 +391,60 @@ export async function handleHistoryMessage(
       }
       break;
     }
+    case "conversationMessageTextRequest": {
+      const session = target!;
+      const generation = session.generation;
+      const scopeKey = historyScopeKey(session);
+      const stillValid = (): boolean =>
+        st.sessions.get(session.tabId) === session && !session.closed && session.generation === generation;
+      const fail = async (reason: ConversationHistoryErrorReason, detail?: string): Promise<void> => {
+        output.appendLine(
+          `[${session.title}] 発言の続きの取得失敗: ${reason} session=${sessionIdForOutput(session)} uuid=${msg.uuid}` +
+            (detail === undefined ? "" : ` — ${detail}`)
+        );
+        await st.postTo(sender, { type: "conversationMessageTextError", tabId: session.tabId, requestId: msg.requestId, reason });
+      };
+      try {
+        let found = hasConversationHistory(scopeKey) ? conversationMessageByUuid(scopeKey, msg.uuid) : undefined;
+        if (found === undefined) {
+          const loaded = await loadConversationScope(session, scopeKey, stillValid);
+          if (loaded !== undefined) {
+            await fail(loaded.reason, loaded.detail);
+            break;
+          }
+          found = conversationMessageByUuid(scopeKey, msg.uuid);
+        }
+        if (found === undefined) {
+          await fail("unknown-anchor");
+          break;
+        }
+        const piece = clipConversationText({ text: found.text.slice(msg.offset) }, CONVERSATION_TEXT_MAX);
+        await st.postTo(sender, {
+          type: "conversationMessageTextResult",
+          tabId: session.tabId,
+          requestId: msg.requestId,
+          uuid: msg.uuid,
+          offset: msg.offset,
+          text: piece.text,
+          ...(piece.clipped ? { clipped: true as const } : {}),
+        });
+      } catch (error) {
+        await fail(error instanceof ConversationHistoryError ? error.reason : "host-error", String(error));
+      }
+      break;
+    }
     case "worklogTranscriptRequest": {
       const session = target!;
       const generation = session.generation;
       const scopeKey = historyTranscriptScopeKey(session);
-      setLatestWorklogTranscriptRequest(sender, session.tabId, msg.requestId);
+      worklogTranscriptRequests.set(sender, session.tabId, msg.requestId);
       const requestStillValid = (): boolean =>
         st.sessions.get(session.tabId) === session &&
         !session.closed &&
         session.generation === generation &&
-        isLatestWorklogTranscriptRequest(sender, session.tabId, msg.requestId);
+        worklogTranscriptRequests.isLatest(sender, session.tabId, msg.requestId);
       if (!requestStillValid()) {
-        await postWorklogTranscriptError(st, sender, session, msg.requestId, generation, "stale-request");
+        await postChunkError(st, sender, "worklogTranscriptError", session, msg.requestId, generation, "stale-request");
         break;
       }
       try {
@@ -499,8 +463,8 @@ export async function handleHistoryMessage(
         if (needsTranscriptScope) {
           if (msg.anchor === undefined) throw new HistoryWindowError("invalid-cursor");
           if (session.workModel.coverage.source !== "provider-transcript") {
-            await postWorklogTranscriptError(
-              st, sender, session, msg.requestId, generation, "history-unavailable"
+            await postChunkError(
+              st, sender, "worklogTranscriptError", session, msg.requestId, generation, "history-unavailable"
             );
             break;
           }
@@ -510,14 +474,14 @@ export async function handleHistoryMessage(
               `[${session.title}] worklogTranscript: ${lookup.reason ?? "no_session_id"} session=${sessionIdForOutput(session)}` +
                 (lookup.reason === "scan_failed" ? ` — ${lookup.detail}` : "")
             );
-            await postWorklogTranscriptError(
-              st, sender, session, msg.requestId, generation, "history-unavailable"
+            await postChunkError(
+              st, sender, "worklogTranscriptError", session, msg.requestId, generation, "history-unavailable"
             );
             break;
           }
           if (!isInSessionStore(ref.file)) {
-            await postWorklogTranscriptError(
-              st, sender, session, msg.requestId, generation, "history-unavailable"
+            await postChunkError(
+              st, sender, "worklogTranscriptError", session, msg.requestId, generation, "history-unavailable"
             );
             break;
           }
@@ -535,8 +499,8 @@ export async function handleHistoryMessage(
           }
           const { transcript, history } = restored;
           if (!requestStillValid()) {
-            await postWorklogTranscriptError(
-              st, sender, session, msg.requestId, generation, "stale-request"
+            await postChunkError(
+              st, sender, "worklogTranscriptError", session, msg.requestId, generation, "stale-request"
             );
             break;
           }
@@ -549,8 +513,8 @@ export async function handleHistoryMessage(
           const historyReadError = history.readError;
           if (historyReadError !== undefined) {
             output.appendLine(`[${session.title}] 履歴transcript読み取り失敗: ${historyReadError}`);
-            await postWorklogTranscriptError(
-              st, sender, session, msg.requestId, generation, "host-error"
+            await postChunkError(
+              st, sender, "worklogTranscriptError", session, msg.requestId, generation, "host-error"
             );
             break;
           }
@@ -572,7 +536,7 @@ export async function handleHistoryMessage(
             session.restoredWritesLost?.sessionId === ref.sessionId ? session.restoredWritesLost.notice : undefined
           );
           if (outcome === "invalidated") {
-            await postWorklogTranscriptError(st, sender, session, msg.requestId, generation, "stale-request");
+            await postChunkError(st, sender, "worklogTranscriptError", session, msg.requestId, generation, "stale-request");
             break;
           }
           const anchorEvent: NormalizedEvent | undefined =
@@ -588,8 +552,8 @@ export async function handleHistoryMessage(
             output.appendLine(
               `[${session.title}] 履歴transcript: anchor ${anchor.generation}:${anchor.seq} が記録の fold と一致しない`
             );
-            await postWorklogTranscriptError(
-              st, sender, session, msg.requestId, generation, "history-unavailable"
+            await postChunkError(
+              st, sender, "worklogTranscriptError", session, msg.requestId, generation, "history-unavailable"
             );
             break;
           }
@@ -683,7 +647,7 @@ export async function handleHistoryMessage(
         }
         if (transcriptResponse === undefined) throw new Error("worklog transcript chunk response not built");
         if (!requestStillValid()) {
-          await postWorklogTranscriptError(st, sender, session, msg.requestId, generation, "stale-request");
+          await postChunkError(st, sender, "worklogTranscriptError", session, msg.requestId, generation, "stale-request");
           break;
         }
         await st.postTo(sender, transcriptResponse);
@@ -694,7 +658,7 @@ export async function handleHistoryMessage(
           `[${session.title}] 履歴transcript失敗: ${reason}` +
             (error instanceof HistoryWindowError ? "" : ` ${String(error)}`)
         );
-        await postWorklogTranscriptError(st, sender, session, msg.requestId, generation, reason);
+        await postChunkError(st, sender, "worklogTranscriptError", session, msg.requestId, generation, reason);
       }
       break;
     }

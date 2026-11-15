@@ -3,6 +3,9 @@ import { containsAbsolutePath, redactAbsolutePaths } from "./path-redaction";
 import * as l10n from "@vscode/l10n";
 import { isTodoId, todoToolName } from "./todo-model";
 import { formatHandoffTime, formatHandoffTokens } from "./handoff-format";
+import { closingSummaryAfterHandoffOn, HANDOFF_AUTO_SETTING_KEYS, type HandoffAutoSettings } from "./protocol";
+import { closingSummaryInstruction } from "./closing-summary";
+import type { LaisoraInput } from "./laisora-input";
 
 export const STEER_TAG = "laisora-steer";
 export const STEER_SCHEMA = "gs1";
@@ -164,6 +167,30 @@ export function handoffNoticeInstruction(notice: HandoffNoticeFacts): string {
   return `${HANDOFF_NOTICE_HEAD} ${handoffNoticeReason(notice)}, ${HANDOFF_NOTICE_PREPARE}${record}${HANDOFF_NOTICE_TAIL}`;
 }
 
+const HANDOFF_CONTINUE_HEAD = (): string =>
+  "Machine-generated message from LAISORA; the user did not type it. " +
+  `The user has the LAISORA setting laisora.${HANDOFF_AUTO_SETTING_KEYS.continueWork} on, so for the unfinished work in the handoff material above, ` +
+  "this message takes the place of the user's next message that the material tells you to wait for. The material stays reference material.\n";
+const HANDOFF_CONTINUE_SOURCE_LINKED = (itemId: string): string =>
+  `the work memo of TODO item ${itemId} (read it with the ${todoToolName("list")} tool)`;
+const HANDOFF_CONTINUE_SOURCE_UNLINKED = "the summary in the handoff material";
+const HANDOFF_CONTINUE_TAIL =
+  ", then continue the unfinished work.\n" +
+  "- Do not start steps that wait for the user's approval (merge, publish, release and the like), and do not decide open decisions for the user; stop before them and ask.\n" +
+  "- If the state of the work is unclear, do not start: ask the user and end your turn.";
+
+export function handoffContinueInstruction(todoItemId: string | undefined): string {
+  const source = todoItemId === undefined ? HANDOFF_CONTINUE_SOURCE_UNLINKED : HANDOFF_CONTINUE_SOURCE_LINKED(todoItemId);
+  return `${HANDOFF_CONTINUE_HEAD()}- First restore the PLAN steps with TaskCreate (or TodoWrite) from ${source}${HANDOFF_CONTINUE_TAIL}`;
+}
+
+export function handoffContinueMessage(todoItemId: string | undefined, settings: Pick<HandoffAutoSettings, "enabled" | "continueWork" | "closingSummary">): { input: LaisoraInput; text: string } {
+  const closingSummary = closingSummaryAfterHandoffOn(settings);
+  const instruction = handoffContinueInstruction(todoItemId);
+  return { input: { kind: "handoffContinue", closingSummary },
+    text: closingSummary ? `${instruction}\n\n${closingSummaryInstruction("continued", todoItemId !== undefined)}` : instruction };
+}
+
 export function buildHandoffNoticeEnvelope(notice: HandoffNoticeFacts, issuedAt: number): string {
   return buildSteeringEnvelope({
     schema: "gs1",
@@ -321,7 +348,8 @@ export type SteeringSendRejectReason =
   | "not_running"
   | "not_idle"
   | "invalid_envelope"
-  | "redaction";
+  | "redaction"
+  | "handoff";
 
 export type SteeringAdmission =
   | { ok: true }

@@ -5,7 +5,7 @@ import { randomBytes } from "node:crypto";
 import { link, mkdir, open, readFile, rename, rm, stat } from "node:fs/promises";
 import { join } from "node:path";
 import { buildClaudeEnv, claudeGlobalConfigFile, claudeSettingsFiles } from "./claude-env";
-import { configuredClaudeExecutablePath, getLaisoraConfiguration } from "./claude-settings";
+import { configuredApiKeyPolicy, configuredClaudeExecutablePath, getLaisoraConfiguration } from "./claude-settings";
 import {
   checkClaudeCodeVersion,
   decideClaudeCliUpdate,
@@ -31,9 +31,10 @@ import {
 } from "./cli-update-policy";
 import { knownExecutorVersion, noteExecutorVersion } from "./gateway-host-actions";
 import { output, store } from "./host-context";
+import { launchingOrTurnRunning } from "./session";
 import { EXECUTORS, type ExecutorId, type ExternalExecutorId } from "./orchestration-executors";
 import { detectExternalExecutor, externalRunActive, externalRunActiveAnywhere, holdExternalRunsDuring, markExternalExecutorUpdating, resolveExternalExecutable, setExternalRunMarkerDirectory } from "./orchestration-external";
-import { normalizeApiKeyPolicy, type ApiKeyPolicy } from "./protocol";
+import type { ApiKeyPolicy } from "./protocol";
 import { postSettingsState } from "./settings-panel";
 
 const LOCK_FILE = "cli-update.lock";
@@ -170,13 +171,9 @@ export function noteCliUpdateOpportunity(modelListReady = false): void {
   settleTimer = setTimeout(() => void attemptCliUpdates().catch((e) => output.appendLine(`[cli-update] ${String(e)}`)), SETTLE_DELAY_MS);
 }
 
-function turnRunning(): boolean {
-  return [...(store?.sessions.values() ?? [])].some((session) => session.starting !== null || (session.conversation !== null && session.conversation.state !== "idle"));
-}
-
 function planFor(context: vscode.ExtensionContext, ids: readonly ExecutorId[], externalRunActive: boolean, ignoreThrottle = false) {
   const cfg = getLaisoraConfiguration();
-  const moment: CliUpdateMoment = { chatReady, turnRunning: turnRunning(), externalRunActive };
+  const moment: CliUpdateMoment = { chatReady, turnRunning: [...(store?.sessions.values() ?? [])].some(launchingOrTurnRunning), externalRunActive };
   return planCliUpdates(moment, ids.map((id) => ({
     id,
     autoUpdate: cliAutoUpdateEnabled(cfg, id),
@@ -207,13 +204,14 @@ async function attemptCliUpdates(): Promise<void> {
 }
 
 function apiKeyPolicy(): ApiKeyPolicy {
-  return normalizeApiKeyPolicy(getLaisoraConfiguration().get<string>("claude.apiKeyPolicy")!);
+  return configuredApiKeyPolicy();
 }
 
 async function claudeUpdateTarget(): Promise<UpdateTarget | CliUpdateSkip> {
   const resolved = await resolveClaudeCodeExecutable(configuredClaudeExecutablePath(getLaisoraConfiguration()));
   const executable = await nativeClaudeUpdateTarget(resolved.path);
-  const childEnv = buildClaudeEnv(process.env, apiKeyPolicy()).env;
+  const policy = apiKeyPolicy();
+  const childEnv = buildClaudeEnv(process.env, "claudeCli", policy).env;
   const settings = await Promise.all([...claudeSettingsFiles(), managedSettingsFile()].map(readJson));
   const inputs = {
     platform: process.platform,
@@ -228,7 +226,7 @@ async function claudeUpdateTarget(): Promise<UpdateTarget | CliUpdateSkip> {
     executable,
     env: windowsStandardEnv(childEnv, process.platform),
     knownVersion: knownExecutorVersion("claude"),
-    readVersion: () => checkClaudeCodeVersion(executable),
+    readVersion: () => checkClaudeCodeVersion(executable, policy),
   };
 }
 
@@ -239,7 +237,7 @@ function externalUpdateTarget(id: ExternalExecutorId): UpdateTarget | CliUpdateS
   const policy = apiKeyPolicy();
   return {
     executable,
-    env: windowsStandardEnv(buildClaudeEnv(process.env, policy).env, process.platform),
+    env: windowsStandardEnv(buildClaudeEnv(process.env, "externalCli", policy).env, process.platform),
     knownVersion: knownExecutorVersion(id),
     readVersion: async () => {
       const detected = await detectExternalExecutor(id, policy, { resolve: () => executable });

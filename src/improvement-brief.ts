@@ -16,13 +16,14 @@ export interface ImprovementBriefValues {
   readonly indexPath: string;
   readonly patternsPath: string;
   readonly recordCommand: string;
-  readonly extensionRoot: string;
+  readonly extensionRoot?: string;
+  readonly scope?: string;
   readonly language: string;
 }
 
 const IMPROVEMENT_BRIEF = `# LLM improvement analysis: brief
 
-You analyse the user's own Claude Code setup for recurring friction across all of their local conversations, and propose fixes for the user to choose from. LAISORA (the VS Code extension running this conversation) wrote this brief. Re-read this file ({{BRIEF}}) whenever your context has been compacted.
+You analyse the user's own Claude Code setup for recurring friction across all of their local conversations, and propose fixes for the user to choose from. {{WRITER}} wrote this brief. Re-read this file ({{BRIEF}}) whenever your context has been compacted.
 
 Reply to the user in {{LANGUAGE}}. The user does not read code: explain each finding and each option by its behaviour and trade-offs, not by code.
 
@@ -162,9 +163,23 @@ Group the numbered findings by owner, in this order, most valuable first within 
 - Certainty: high / medium / low, and what is unverified
 Number only unresolved patterns and fixed-but-recurring ones. Every number is a full finding with all fields; a pattern merged into another finding gets no number of its own. Then the excluded list: every pattern you looked at and dropped, with its criterion and how you checked it (the record you opened, the commit with the counts before and after, or the rule or setting you read with its file and key). Accounting: the index header states how many entries are needed and how they split by section; plan your effort (and any fan-out to subagents) from that number. Each needed line gets one entry (a finding or an excluded entry with a checked reason) backed by at least one opened record: every H, C, P, Y, M, B and X line, each id in the Causes and slow-call tails, every listed E, O, U, S and MCP/external line that is not marked "covered by X…", every inventory registration with a MISSING script and every T lead (backed not by a record but by the file check, the current tool list with the documented aliases, or a probe), and every previous finding listed in the previous verdicts section. A line marked "partly in X…" needs an entry only for its part outside those causes. Tail ids may be grouped when they share a checked reason, naming the ids; otherwise no blanket exclusions: one line per id, or a group only when every member shares the same checked reason, naming the ids (not ranges or labels such as "one-offs"). Opening one location per distinct reason or command is needed only for lines that become findings or whose exclusion depends on the reason; a line whose reasons lead to different causes is split. There is no "not opened" category. Owners in the compact tail and patterns that are only in patterns.json need not be covered. Account for every count in the hooks and gates section: for each hook pattern, the findings and excluded entries together cover all of its stops; when a finding explains only part of a large pattern, say what the rest is (for example "<n> of <total> are <kind>, finding 2; the other <m> are <kind>, excluded as intended stops").
 
-End the reply with one fenced code block whose info string is {{FENCE}} (the line \`\`\`{{FENCE}}, then the JSON, then \`\`\`). LAISORA reads the last such block of this conversation in the next analysis; do not write it to a file. When a later reply in this conversation changes a verdict, end that reply with the whole block again. The JSON is {"entries": [...]}, one entry per id in your findings, your excluded list and your not-investigated list, and one per previous finding (also when its id is no longer in the index); an id grouped with others in the reply gets its own entry. Fields: "id" (as in the index); "verdict" (one of {{VERDICTKINDS}}); "group" (the owner groups above in the same order: one of {{VERDICTGROUPS}}; for an exclusion, the group it would belong to); "reason" (one line: the cause for a finding; the criterion and how you checked it for an exclusion; the reason for not investigated); "fixCommit" and "fixDate" (the fix time as ISO 8601 with a time and an offset or Z, as \`git log -1 --format=%aI\` prints it) when a fix exists; "status" (one of {{VERDICTSTATUSES}}; {{NEWSTATUS}} for an id without a previous finding). The next run shows these verdicts beside the same ids; an entry with another field value is not read.
+End the reply with one fenced code block whose info string is {{FENCE}} (the line \`\`\`{{FENCE}}, then the JSON, then \`\`\`). {{READER}} reads the last such block of this conversation in the next analysis; do not write it to a file. When a later reply in this conversation changes a verdict, end that reply with the whole block again. The JSON is {"entries": [...]}, one entry per id in your findings, your excluded list and your not-investigated list, and one per previous finding (also when its id is no longer in the index); an id grouped with others in the reply gets its own entry. Fields: "id" (as in the index); "verdict" (one of {{VERDICTKINDS}}); "group" (the owner groups above in the same order: one of {{VERDICTGROUPS}}; for an exclusion, the group it would belong to); "reason" (one line: the cause for a finding; the criterion and how you checked it for an exclusion; the reason for not investigated); "fixCommit" and "fixDate" (the fix time as ISO 8601 with a time and an offset or Z, as \`git log -1 --format=%aI\` prints it) when a fix exists; "status" (one of {{VERDICTSTATUSES}}; {{NEWSTATUS}} for an id without a previous finding). The next run shows these verdicts beside the same ids; an entry with another field value is not read.
 
 Then stop and wait for the user's choice (for example "fix 1 and 3", "dig into 2"). Do not edit anything before the user picks.
+`;
+
+const WRITER_LAISORA = "LAISORA (the VS Code extension running this conversation)";
+const WRITER_STANDALONE = "The scan tool (improvement.mjs, started by a skill outside LAISORA)";
+const READER_LAISORA = "LAISORA";
+const READER_STANDALONE = "The scan tool";
+const EXTENSION_ROOT_STANDALONE = "the LAISORA folder under the VS Code extensions folder (this run was started outside LAISORA, so there is one only if the user also installed LAISORA)";
+
+const scopeSection = (scope: string): string => `
+## Scope chosen by the user
+
+${scope}
+
+This section overrides the accounting above for everything outside the scope. List each index section outside it once, as not investigated (未調査) with the user's choice as the reason, without opening its records and without one line per id. A previous finding whose id is outside the scope gets the status "not checked in this run (out of scope)" and needs no counter-record. Do not write the verdicts block in this run: a block that covers only part of the index would replace the verdicts of the last full analysis, and the next scan keeps using that analysis when this conversation has no block. Say in the reply that this run's verdicts are not carried to the next run. Then stop and wait for the user's choice as above.
 `;
 
 const fill = (template: string, values: Record<string, string>): string => template.replace(/\{\{([A-Z]+)\}\}/g, (all, key: string) => values[key] ?? all);
@@ -238,8 +253,11 @@ export function parseVerdicts(text: string): ParsedVerdicts {
 }
 
 export function renderImprovementBrief(v: ImprovementBriefValues): string {
-  return fill(IMPROVEMENT_BRIEF, {
-    BRIEF: v.briefPath, INDEX: v.indexPath, PATTERNS: v.patternsPath, FENCE: IMPROVEMENT_VERDICTS_FENCE, RECORD: v.recordCommand, EXTENSION: v.extensionRoot, LANGUAGE: v.language,
+  const inLaisora = v.extensionRoot !== undefined;
+  return fill(IMPROVEMENT_BRIEF + (v.scope ? scopeSection(v.scope) : ""), {
+    READER: inLaisora ? READER_LAISORA : READER_STANDALONE,
+    BRIEF: v.briefPath, INDEX: v.indexPath, PATTERNS: v.patternsPath, FENCE: IMPROVEMENT_VERDICTS_FENCE, RECORD: v.recordCommand, LANGUAGE: v.language,
+    WRITER: inLaisora ? WRITER_LAISORA : WRITER_STANDALONE, EXTENSION: v.extensionRoot ?? EXTENSION_ROOT_STANDALONE,
     RETRY: String(IMPROVEMENT_RETRY_WINDOW), MINCONV: String(IMPROVEMENT_MIN_CONVERSATIONS), LOCATIONS: String(IMPROVEMENT_INDEX_LOCATIONS),
     VERDICTKINDS: quotedList(VERDICT_KINDS), VERDICTGROUPS: quotedList(VERDICT_GROUPS), VERDICTSTATUSES: quotedList(VERDICT_STATUSES), NEWSTATUS: `"${NEW_STATUS}"`,
   });
@@ -249,12 +267,27 @@ export function improvementFirstMessage(v: Pick<ImprovementBriefValues, "briefPa
   return `Read ${v.briefPath} and follow it, then read ${v.indexPath}.\nReply in ${v.language}.`;
 }
 
+const FIRST_MESSAGE_RE = /^Read (.+) and follow it, then read (.+)\.\r?\nReply in [^\n]+\./;
+
+function firstMessageLength(text: string): number | undefined {
+  const m = FIRST_MESSAGE_RE.exec(text);
+  return m && m[1].endsWith(IMPROVEMENT_BRIEF_FILE) && m[2].endsWith(IMPROVEMENT_INDEX_FILE) ? m[0].length : undefined;
+}
+
 export function isImprovementFirstMessage(text: string): boolean {
-  const m = /^Read (.+) and follow it, then read (.+)\.\r?\nReply in [^\n]+\.\s*$/.exec(text.trim());
-  return !!m && m[1].endsWith(IMPROVEMENT_BRIEF_FILE) && m[2].endsWith(IMPROVEMENT_INDEX_FILE);
+  const trimmed = text.trim();
+  return firstMessageLength(trimmed) === trimmed.length;
+}
+
+export function startsWithImprovementFirstMessage(text: string): boolean {
+  const trimmed = text.trimStart();
+  const length = firstMessageLength(trimmed);
+  return length !== undefined && (length === trimmed.length || /^\r?\n/.test(trimmed.slice(length)));
 }
 
 export const IMPROVEMENT_TOOL_FILE = "improvement.mjs";
+export const LAISORA_SOURCE_FILES: readonly (readonly string[])[] = [["dist", "extension.js"], ["l10n", "bundle.l10n.ja.json"]];
+export const LAISORA_EXTENSION_FOLDER_PREFIX = "az-llc.laisora-";
 
 const bashQuoted = (value: string): string => `'${value.replace(/(?<=[^\\/:])[\\/]+$/, "").replace(/'/g, "'\\''")}'`;
 

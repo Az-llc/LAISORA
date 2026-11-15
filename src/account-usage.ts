@@ -1,7 +1,6 @@
-import type { Options as ClaudeCodeOptions } from "@anthropic-ai/claude-agent-sdk" with { "resolution-mode": "import" };
 import type * as ClaudeCodeSdk from "@anthropic-ai/claude-agent-sdk" with { "resolution-mode": "import" };
 
-import { buildClaudeEnv } from "./claude-env";
+import { loadSdkQuery, toolFreeQueryOptions } from "./sdk-one-shot";
 import {
   ACCOUNT_USAGE_REUSE_MS,
   ACCOUNT_USAGE_ROWS_MAX,
@@ -89,10 +88,6 @@ export interface UsageCommandOptions {
   loadSdk?: () => Pick<typeof ClaudeCodeSdk, "query">;
 }
 
-function defaultLoadSdk(): Pick<typeof ClaudeCodeSdk, "query"> {
-  return require("@anthropic-ai/claude-agent-sdk") as typeof ClaudeCodeSdk;
-}
-
 export function usageErrorTag(error: unknown): string {
   if (!(error instanceof Error)) return typeof error;
   const code = (error as { code?: unknown }).code;
@@ -101,23 +96,13 @@ export function usageErrorTag(error: unknown): string {
 
 export async function rateLimitsViaUsageCommand(opts: UsageCommandOptions): Promise<unknown> {
   if (opts.signal?.aborted) throw new Error("usage command aborted");
-  const sdk = (opts.loadSdk ?? defaultLoadSdk)();
+  const sdk = (opts.loadSdk ?? loadSdkQuery)();
   const pathToClaudeCodeExecutable = await opts.resolveExecutablePath();
   if (opts.signal?.aborted) throw new Error("usage command aborted");
   const abortController = new AbortController();
   const onAbort = (): void => abortController.abort();
   opts.signal?.addEventListener("abort", onAbort, { once: true });
-  const options: ClaudeCodeOptions = {
-    tools: [],
-    allowedTools: [],
-    permissionMode: "default",
-    persistSession: false,
-    settingSources: [],
-    maxTurns: 1,
-    cwd: opts.cwd,
-    env: buildClaudeEnv(process.env, opts.apiKeyPolicy).env,
-    abortController,
-  };
+  const options = toolFreeQueryOptions(opts.cwd, opts.apiKeyPolicy, abortController, 1);
   if (pathToClaudeCodeExecutable !== undefined) options.pathToClaudeCodeExecutable = pathToClaudeCodeExecutable;
   const timer = setTimeout(() => abortController.abort(), opts.timeoutMs ?? ACCOUNT_USAGE_TIMEOUT_MS);
   const stream = sdk.query({ prompt: "/usage", options });

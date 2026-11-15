@@ -1,6 +1,7 @@
 import type { Options as ClaudeCodeOptions } from "@anthropic-ai/claude-agent-sdk" with { "resolution-mode": "import" };
 import type * as ClaudeCodeSdk from "@anthropic-ai/claude-agent-sdk" with { "resolution-mode": "import" };
-import { buildClaudeEnv, describeSdkErrorResult } from "./claude-env";
+import { describeSdkErrorResult } from "./claude-env";
+import { loadSdkQuery, toolFreeQueryOptions } from "./sdk-one-shot";
 import { RENAME_TITLE_MAX, type ApiKeyPolicy } from "./protocol";
 import { resolveClaudeCodeExecutable } from "./claudeCliResolver";
 import * as l10n from "@vscode/l10n";
@@ -60,10 +61,6 @@ export interface GenerateSessionSummaryOptions {
   loadSdk?: () => Pick<typeof ClaudeCodeSdk, "query">;
 }
 
-function defaultLoadSdk(): Pick<typeof ClaudeCodeSdk, "query"> {
-  return require("@anthropic-ai/claude-agent-sdk") as typeof ClaudeCodeSdk;
-}
-
 function isRecord(v: unknown): v is Record<string, unknown> {
   return typeof v === "object" && v !== null && !Array.isArray(v);
 }
@@ -72,7 +69,7 @@ export async function generateSessionSummaryViaSdk(
   opts: GenerateSessionSummaryOptions
 ): Promise<{ summary?: string; model?: string }> {
   if (opts.signal.aborted) return {};
-  const sdk = (opts.loadSdk ?? defaultLoadSdk)();
+  const sdk = (opts.loadSdk ?? loadSdkQuery)();
   const resolveExecutablePath =
     opts.resolveExecutablePath ??
     (async (): Promise<string | undefined> =>
@@ -86,13 +83,7 @@ export async function generateSessionSummaryViaSdk(
   let executedModels: string[] | undefined;
   try {
     const options: ClaudeCodeOptions = {
-      tools: [],
-      allowedTools: [],
-      maxTurns: 2,
-      permissionMode: "default",
-      persistSession: false,
-      cwd: opts.cwd,
-      env: buildClaudeEnv(process.env, opts.apiKeyPolicy).env,
+      ...toolFreeQueryOptions(opts.cwd, opts.apiKeyPolicy, abortController, 2),
       outputFormat: {
         type: "json_schema",
         schema: {
@@ -102,8 +93,6 @@ export async function generateSessionSummaryViaSdk(
           required: ["summary"],
         },
       },
-      abortController,
-      settingSources: [],
     };
     if (opts.modelId !== undefined && opts.modelId.length > 0) {
       options.model = opts.modelId;

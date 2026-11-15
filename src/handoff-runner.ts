@@ -15,7 +15,6 @@ import {
 } from "./handoff-accept";
 import {
   buildHandoffEnvelopeV2,
-  handoffContextUsageKey,
   handoffUtteranceAt,
   parseCompactMetadata,
   parseHandoffEnvelope,
@@ -31,8 +30,14 @@ import {
   extractHumanUserPrompt,
   extractVerbatim,
   isHandoffGenerationBoundary,
+  verbatimTextOf,
 } from "./session-transcript";
 import { claudeProjectsDir } from "./claude-env";
+import type { OrchestrationEffort } from "./orchestration-executors";
+import { asObject, foldLegacyEntries, isStateFileId, type HandoffContextStore, type HandoffRegistry, type HandoffRegistryName, type LegacyMemento } from "./state-files";
+import { errorCode } from "./transient-fs";
+
+export { handoffRegistryFiles } from "./state-files";
 
 export type ForkSessionFn = typeof sdkForkSession;
 export type QueryFn = typeof sdkQuery;
@@ -79,14 +84,14 @@ export interface HandoffRunnerDeps {
   claudeExecutablePath: string;
   env: NodeJS.ProcessEnv;
   model?: string;
-  effort?: "low" | "medium" | "high" | "xhigh" | "max";
+  effort?: OrchestrationEffort;
   settingSources?: Array<"user" | "project" | "local">;
   transcriptRetention?: TranscriptRetentionSettings;
   lookupSessionFileById: (id: string) => Promise<ForkFileLookup>;
   readRecords: (filePath: string) => Promise<HandoffRecordsRead>;
   fs: { unlink(p: string): Promise<void>; readFile(p: string): Promise<string> };
   writeDiagnostic?: (name: string, text: string) => Promise<string>;
-  persist: { get(k: string): unknown; update(k: string, v: unknown): Promise<void> };
+  registry: HandoffRegistry;
   now: () => number;
   sleep?: (ms: number) => Promise<void>;
   timeoutMs: number;
@@ -119,7 +124,8 @@ export type HandoffFailReason =
   | "cancelled"
   | "source_busy"
   | "already_running"
-  | "folder_missing";
+  | "folder_missing"
+  | "transcript_write_forbidden";
 
 export type HandoffOutcome =
   | {
@@ -162,7 +168,17 @@ export const COMPACT_HEARTBEAT_GRACE_MS = 120_000;
 
 export const HANDOFF_LEASE_MS = COMPACT_HEARTBEAT_GRACE_MS * 2;
 
+export const HANDOFF_LEASE_RENEW_INTERVAL_MS = (HANDOFF_LEASE_MS - COMPACT_HEARTBEAT_GRACE_MS) / 2;
+
+export function leaseRenewalDue(now: number, lastStoredRenewal: number): boolean {
+  return now - lastStoredRenewal >= HANDOFF_LEASE_RENEW_INTERVAL_MS;
+}
+
 const HANDOFF_TITLE_MARK = "⇢";
+
+export function handoffSourceBusy(source: { turnRunning: boolean; unsentSendCount: number }): boolean {
+  return source.turnRunning || source.unsentSendCount > 0;
+}
 
 export function handoffForkTitle(sourceTitle: string): string {
   let rest = sourceTitle.trimStart();
@@ -215,28 +231,11 @@ function errorDetail(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
 
-function asRecord(value: unknown): Record<string, unknown> | undefined {
-  return typeof value === "object" && value !== null && !Array.isArray(value)
-    ? (value as Record<string, unknown>)
-    : undefined;
-}
-
-function textFromRecord(record: Record<string, unknown>): string {
-  const content = asRecord(record.message)?.content;
-  if (typeof content === "string") return content;
-  if (!Array.isArray(content)) return "";
-  return content
-    .map((block) => {
-      const value = asRecord(block);
-      return value?.type === "text" && typeof value.text === "string" ? value.text : "";
-    })
-    .join("");
-}
 
 function persistedEntries(value: unknown): PersistedHandoff[] {
   if (!Array.isArray(value)) return [];
   return value.filter((entry): entry is PersistedHandoff => {
-    const record = asRecord(entry);
+    const record = asObject(entry);
     return (
       record !== undefined &&
       typeof record.runId === "string" &&
@@ -249,6 +248,7 @@ function persistedEntries(value: unknown): PersistedHandoff[] {
 }
 
 const localRunningForks = new Map<string, string>();
+const settledOwnForks = new Set<string>();
 
 export type HandoffForkState = "handing_off" | "stale" | "cleanup_failed";
 
@@ -257,10 +257,12 @@ export function handoffForkState(
   orphans: unknown,
   sessionId: string,
   now: number,
-  ownRunning: ReadonlyMap<string, string> = localRunningForks
+  ownRunning: ReadonlyMap<string, string> = localRunningForks,
+  ownOwner: string = OWNER_ID,
+  settledOwn: ReadonlySet<string> = settledOwnForks
 ): HandoffForkState | undefined {
   if ([...ownRunning.values()].includes(sessionId)) return "handing_off";
-  const flight = persistedEntries(inFlight).filter((entry) => entry.forkSessionId === sessionId);
+  const flight = persistedEntries(inFlight).filter((entry) => entry.forkSessionId === sessionId && !(entry.owner === ownOwner && settledOwn.has(sessionId)));
   if (flight.some((entry) => typeof entry.leaseUntil === "number" && entry.leaseUntil > now)) return "handing_off";
   if (persistedEntries(orphans).some((entry) => entry.forkSessionId === sessionId)) return "cleanup_failed";
   return flight.length > 0 ? "stale" : undefined;
@@ -270,22 +272,75 @@ export function isHandoffForkHidden(state: HandoffForkState | undefined): boolea
   return state === "handing_off" || state === "stale";
 }
 
-interface HandoffSweepResolution {
-  resolved: readonly PersistedHandoff[];
-  failed: readonly PersistedHandoff[];
+export interface HandoffSweepPlan {
+  active: PersistedHandoff[];
+  candidates: PersistedHandoff[];
 }
 
-function settleHandoffRegistries(
+export function handoffSweepPlan(inFlight: unknown, orphans: unknown, now: number): HandoffSweepPlan {
+  const flight = persistedEntries(inFlight);
+  const abandoned = persistedEntries(orphans);
+  const abandonedPaths = new Set(abandoned.map((entry) => entry.filePath));
+  const active = new Map<string, PersistedHandoff>();
+  for (const entry of flight) {
+    if (!abandonedPaths.has(entry.filePath) && entry.leaseUntil > now) active.set(entry.filePath, entry);
+  }
+  const candidates = [...new Map([...flight, ...abandoned].map((entry) => [entry.filePath, entry])).values()]
+    .filter((entry) => !active.has(entry.filePath));
+  return { active: [...active.values()], candidates };
+}
+
+export interface HandoffSweepSettlement {
+  moveToOrphans: PersistedHandoff[];
+  removeInFlight: PersistedHandoff[];
+  removeOrphans: PersistedHandoff[];
+}
+
+export function handoffSweepSettlement(
   inFlight: unknown,
   orphans: unknown,
-  resolution: HandoffSweepResolution
-): { inFlight: PersistedHandoff[]; orphans: PersistedHandoff[] } {
-  const sameRun = (a: PersistedHandoff, b: PersistedHandoff): boolean => a.filePath === b.filePath && a.runId === b.runId;
-  const settled = [...resolution.resolved, ...resolution.failed];
-  const nextInFlight = persistedEntries(inFlight).filter((entry) => !settled.some((done) => sameRun(entry, done)));
-  const keptOrphans = persistedEntries(orphans).filter((entry) => !resolution.resolved.some((done) => sameRun(entry, done)));
-  const moved = resolution.failed.filter((entry) => !keptOrphans.some((orphan) => orphan.filePath === entry.filePath));
-  return { inFlight: nextInFlight, orphans: [...keptOrphans, ...moved] };
+  resolvedPaths: ReadonlySet<string>,
+  failedPaths: ReadonlySet<string>
+): HandoffSweepSettlement {
+  const flight = persistedEntries(inFlight);
+  const abandoned = persistedEntries(orphans);
+  const moveToOrphans = [...new Map(
+    flight
+      .filter((entry) => failedPaths.has(entry.filePath) && !abandoned.some((orphan) => orphan.filePath === entry.filePath))
+      .map((entry) => [entry.filePath, entry])
+  ).values()];
+  return {
+    moveToOrphans,
+    removeInFlight: flight.filter((entry) => resolvedPaths.has(entry.filePath) || failedPaths.has(entry.filePath)),
+    removeOrphans: abandoned.filter((entry) => resolvedPaths.has(entry.filePath)),
+  };
+}
+
+export async function foldLegacyHandoffRegistries(
+  legacy: LegacyMemento,
+  registry: HandoffRegistry,
+  log: (line: string) => void
+): Promise<void> {
+  for (const [key, name] of [[IN_FLIGHT_KEY, "inFlight"], [ORPHANS_KEY, "orphans"]] as const) {
+    const stored = legacy.get(key);
+    if (stored === undefined) continue;
+    const listing = await registry.list(name);
+    if (listing.unreadable) {
+      log(`handoff registry ${key}: kept in globalState because the ${name} folder could not be read`);
+      continue;
+    }
+    const present = new Map(persistedEntries(listing.entries).map((entry) => [entry.runId, entry]));
+    const moving = persistedEntries(stored).filter((entry) => {
+      if (!isStateFileId(entry.runId)) {
+        log(`handoff registry ${key}: dropped an entry whose run id cannot name a file: ${entry.forkSessionId}`);
+        return false;
+      }
+      const current = present.get(entry.runId);
+      return current === undefined || entry.leaseUntil > current.leaseUntil;
+    });
+    await foldLegacyEntries(legacy, key, moving, (entry) => registry.put(name, entry), (entry, error) =>
+      log(`handoff registry ${key}: an entry could not be moved to its file: ${entry.forkSessionId}: ${errorDetail(error)}`));
+  }
 }
 
 export type HeldForkTabAction = "keep" | "reopen" | "drop";
@@ -380,8 +435,8 @@ function preservedResponseIds(
   boundaryIndex: number
 ): Set<string> | undefined {
   if (boundaryIndex < 0) return undefined;
-  const metadata = asRecord(records[boundaryIndex].compactMetadata);
-  const preserved = asRecord(metadata?.preservedMessages);
+  const metadata = asObject(records[boundaryIndex].compactMetadata);
+  const preserved = asObject(metadata?.preservedMessages);
   if (!Array.isArray(preserved?.uuids) || !preserved.uuids.every((id) => typeof id === "string")) return undefined;
   const byUuid = new Map(records.map((record) => [record.uuid, record]));
   const ids = new Set<string>();
@@ -389,7 +444,7 @@ function preservedResponseIds(
     const record = byUuid.get(uuid);
     if (record === undefined) return undefined;
     if (record?.type !== "assistant") continue;
-    const id = asRecord(record.message)?.id;
+    const id = asObject(record.message)?.id;
     if (typeof id !== "string" || id.length === 0) return undefined;
     ids.add(id);
   }
@@ -405,12 +460,12 @@ function forkIncompleteReason(
 
   const summaries = compactSummariesAfter(records, lastBoundary);
   if (summaries.length !== 1) return `summary=${summaries.length}`;
-  const accepted = acceptCompactSummary(textFromRecord(summaries[0]));
+  const accepted = acceptCompactSummary(verbatimTextOf(summaries[0]));
   if (!accepted.ok) return `summary_rejected=${accepted.reason ?? "unknown"}`;
 
   const envelopes = records
     .filter((record, index) => index > lastBoundary && record.type === "user")
-    .map((record) => parseHandoffEnvelope(textFromRecord(record)))
+    .map((record) => parseHandoffEnvelope(verbatimTextOf(record)))
     .filter((parsed) => parsed.ok && parsed.version === "2");
   if (envelopes.length !== 1) return `envelope=${envelopes.length}`;
   const only = envelopes[0];
@@ -420,7 +475,7 @@ function forkIncompleteReason(
 }
 
 export function forkHasUserTurns(records: readonly Record<string, unknown>[]): boolean {
-  return records.some((record) => asRecord(record.forkedFrom) === undefined && extractHumanUserPrompt(record) !== null);
+  return records.some((record) => asObject(record.forkedFrom) === undefined && extractHumanUserPrompt(record) !== null);
 }
 
 export interface HandoffDetail {
@@ -437,11 +492,11 @@ export function extractHandoffDetail(
   let envelope: HandoffEnvelopeV2 | undefined;
   for (const record of records) {
     if (record.type === "user" && record.isCompactSummary === true) {
-      pendingSummary = textFromRecord(record);
+      pendingSummary = verbatimTextOf(record);
       continue;
     }
     if (!isHandoffGenerationBoundary(record, forkSessionId)) continue;
-    const parsed = parseHandoffEnvelope(textFromRecord(record));
+    const parsed = parseHandoffEnvelope(verbatimTextOf(record));
     if (!parsed.ok || parsed.version !== "2") continue;
     envelope = parsed.envelope;
     summary = pendingSummary;
@@ -494,6 +549,17 @@ export function shouldActivateForkTab(activeTabId: string | undefined, sourceTab
   return activeTabId !== undefined && activeTabId === sourceTabId;
 }
 
+export function forkTabActivationTargets<W>(input: {
+  auto: boolean;
+  sender: W | null;
+  surfaces: ReadonlyArray<{ surface: W; activeTabId: string | undefined }>;
+  sourceTabId: string;
+}): W[] {
+  return input.surfaces
+    .filter((s) => (input.auto || s.surface === input.sender) && shouldActivateForkTab(s.activeTabId, input.sourceTabId))
+    .map((s) => s.surface);
+}
+
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
@@ -506,6 +572,9 @@ export class HandoffRunner {
   private terminalDetail: string | undefined;
   private abortController: AbortController | undefined;
   private inputQueue: InputQueue | undefined;
+  private leaseStampedAt = 0;
+  private renewal: Promise<void> | undefined;
+  private leaseLost = false;
 
   constructor(deps: HandoffRunnerDeps) {
     this.deps = deps;
@@ -534,7 +603,11 @@ export class HandoffRunner {
   }
 
   cancel(): boolean {
-    if (!this.started || !this.commitTerminal("cancelled")) return false;
+    return this.started && this.stop("cancelled");
+  }
+
+  private stop(reason: HandoffFailReason, detail?: string): boolean {
+    if (!this.commitTerminal(reason, detail)) return false;
     this.inputQueue?.close();
     this.abortController?.abort();
     this.closeQuery();
@@ -653,7 +726,7 @@ export class HandoffRunner {
       this.query = query as unknown as { close?: () => void };
       for await (const message of query as AsyncIterable<SDKMessage>) {
         armTimeout();
-        if (this.terminal === undefined) await this.renewLease(registryEntry);
+        this.renewLeaseIfDue(registryEntry);
         const record = message as unknown as Record<string, unknown>;
         const isStatus = record.type === "system" && record.subtype === "status";
         if (this.terminal !== undefined) {
@@ -686,7 +759,7 @@ export class HandoffRunner {
           continue;
         }
         if (record.type === "system" && record.subtype === "compact_boundary") {
-          const metadata = asRecord(record.compact_metadata);
+          const metadata = asObject(record.compact_metadata);
           streamCompact = parseCompactMetadata({ preTokens: metadata?.pre_tokens, postTokens: metadata?.post_tokens });
           complete("boundary");
         }
@@ -768,7 +841,7 @@ export class HandoffRunner {
       armTimeout();
       for await (const message of query as AsyncIterable<SDKMessage>) {
         armTimeout();
-        if (this.terminal === undefined) await this.renewLease(registryEntry);
+        this.renewLeaseIfDue(registryEntry);
         if (this.terminal !== undefined) continue;
         if (message.type !== "result") continue;
         if (message.subtype === "success") resultSuccess = true;
@@ -811,6 +884,15 @@ export class HandoffRunner {
     let compact: HandoffCompactStats | undefined;
     let commitRecords: Record<string, unknown>[] | undefined;
     let detail: HandoffDetail | undefined;
+    const entryFor = (forkId: string, filePath: string): PersistedHandoff => ({
+      runId: input.runId,
+      sourceSessionId: input.sourceSessionId,
+      forkSessionId: forkId,
+      filePath,
+      phase: "forking",
+      owner: OWNER_ID,
+      leaseUntil: this.deps.now() + HANDOFF_LEASE_MS,
+    });
 
     try {
       this.transition("forking");
@@ -850,17 +932,10 @@ export class HandoffRunner {
       }
 
       if (forkSessionId !== undefined && forkFilePath !== undefined) {
-        registryEntry = {
-          runId: input.runId,
-          sourceSessionId: input.sourceSessionId,
-          forkSessionId,
-          filePath: forkFilePath,
-          phase: "forking",
-          owner: OWNER_ID,
-          leaseUntil: this.deps.now() + HANDOFF_LEASE_MS,
-        };
+        registryEntry = entryFor(forkSessionId, forkFilePath);
         localRunningForks.set(forkFilePath, forkSessionId);
-        await this.addRegistryEntry(IN_FLIGHT_KEY, registryEntry);
+        await this.addRegistryEntry("inFlight", registryEntry);
+        this.leaseStampedAt = registryEntry.leaseUntil - HANDOFF_LEASE_MS;
 
         if (this.terminal === undefined) {
           this.transition("extracting");
@@ -895,7 +970,7 @@ export class HandoffRunner {
                 if (summaries.length !== 1) {
                   this.commitTerminal("commit_failed", `compact: summary=${summaries.length}`);
                 } else {
-                  const persistedSummary = textFromRecord(summaries[0]);
+                  const persistedSummary = verbatimTextOf(summaries[0]);
                   const accepted = acceptCompactSummary(persistedSummary);
                   if (!accepted.ok) {
                     void this.deps.writeDiagnostic?.(`${input.runId}-compact-rejected.txt`, persistedSummary)
@@ -903,7 +978,7 @@ export class HandoffRunner {
                       .catch((e) => this.deps.log(`handoff compact raw save failed: ${errorDetail(e)}`));
                     this.commitTerminal(accepted.reason);
                   } else {
-                    const boundaryMetadata = asRecord(currentRecords[boundaryIndex].compactMetadata);
+                    const boundaryMetadata = asObject(currentRecords[boundaryIndex].compactMetadata);
                     const fromJsonl = parseCompactMetadata({ preTokens: boundaryMetadata?.preTokens, postTokens: boundaryMetadata?.postTokens });
                     compact = roundResult.streamCompact ?? fromJsonl;
                     const responseIds = preservedResponseIds(currentRecords, boundaryIndex);
@@ -915,6 +990,7 @@ export class HandoffRunner {
             }
           }
 
+          if (this.terminal === undefined && input.sourceBusy()) this.commitTerminal("source_busy");
           if (this.terminal === undefined) {
             if (retainedResponseCount !== undefined) compact = { ...compact, retainedResponseCount };
             this.transition("appending");
@@ -966,12 +1042,25 @@ export class HandoffRunner {
       }
     } finally {
       if (this.terminal !== "done") this.abortController?.abort();
+      if (forkSessionId !== undefined && forkFilePath === undefined) {
+        const found = await this.findUnresolvedFork(forkSessionId);
+        if (found !== undefined) {
+          forkFilePath = found;
+          registryEntry = entryFor(forkSessionId, found);
+        }
+      }
       if (registryEntry !== undefined) {
         try {
-          if (this.terminal !== "done" && forkFilePath !== undefined) {
-            await this.deleteFailedFork(registryEntry);
+          await this.renewal;
+          const settled = !this.leaseLost && (this.terminal === "done" || forkFilePath === undefined || await this.deleteFailedFork(registryEntry));
+          if (settled) {
+            settledOwnForks.add(registryEntry.forkSessionId);
+            try {
+              await this.deps.registry.remove("inFlight", registryEntry.runId);
+            } catch (error) {
+              this.deps.log(`handoff in-flight entry could not be removed: ${registryEntry.forkSessionId}: ${errorDetail(error)}`);
+            }
           }
-          await this.removeRegistryEntry(IN_FLIGHT_KEY, registryEntry.filePath);
         } finally {
           localRunningForks.delete(registryEntry.filePath);
         }
@@ -1004,90 +1093,121 @@ export class HandoffRunner {
     };
   }
 
-  private async addRegistryEntry(key: string, entry: PersistedHandoff): Promise<void> {
-    const entries = persistedEntries(this.deps.persist.get(key));
-    entries.push(entry);
-    if (entries.length > MAX_PERSISTED_HANDOFFS) {
-      this.deps.log(`handoff registry ${key} holds ${entries.length} entries; keeping all of them`);
+  private async addRegistryEntry(name: HandoffRegistryName, entry: PersistedHandoff): Promise<void> {
+    await this.deps.registry.put(name, entry);
+    const count = await this.deps.registry.count(name).catch(() => undefined);
+    if (count !== undefined && count > MAX_PERSISTED_HANDOFFS) {
+      this.deps.log(`handoff registry ${name} holds ${count} entries; keeping all of them`);
     }
-    await this.deps.persist.update(key, entries);
   }
 
-  private async renewLease(entry: PersistedHandoff): Promise<void> {
-    const entries = persistedEntries(this.deps.persist.get(IN_FLIGHT_KEY));
-    const index = entries.findIndex((candidate) => candidate.filePath === entry.filePath);
-    const renewed = { ...(index < 0 ? entry : entries[index]), leaseUntil: this.deps.now() + HANDOFF_LEASE_MS };
-    if (index < 0) entries.push(renewed);
-    else entries[index] = renewed;
-    await this.deps.persist.update(IN_FLIGHT_KEY, entries);
+  private renewLeaseIfDue(entry: PersistedHandoff): void {
+    if (this.terminal !== undefined || this.renewal !== undefined) return;
+    const now = this.deps.now();
+    if (!leaseRenewalDue(now, this.leaseStampedAt)) return;
+    this.renewal = this.renewLease(entry, now).finally(() => {
+      this.renewal = undefined;
+    });
   }
 
-  private async removeRegistryEntry(key: string, filePath: string): Promise<void> {
-    const entries = persistedEntries(this.deps.persist.get(key)).filter((entry) => entry.filePath !== filePath);
-    await this.deps.persist.update(key, entries);
+  private async renewLease(entry: PersistedHandoff, now: number): Promise<void> {
+    try {
+      if (!(await this.deps.registry.has("inFlight", entry.runId))) {
+        this.leaseLost = true;
+        const stopped = this.stop("commit_failed", "the handoff registration was removed by another window");
+        this.deps.log(`handoff lease lost${stopped ? "" : " after the run ended"}: the in-flight entry was removed by another window, which settles the copy: ${entry.forkSessionId}`);
+        return;
+      }
+      const renewed: PersistedHandoff = { ...entry, leaseUntil: now + HANDOFF_LEASE_MS };
+      await this.deps.registry.put("inFlight", renewed);
+      this.leaseStampedAt = now;
+    } catch (error) {
+      this.deps.log(`handoff lease renewal failed: ${entry.forkSessionId}: ${errorDetail(error)}`);
+    }
   }
 
-  private async deleteFailedFork(entry: PersistedHandoff): Promise<void> {
+  private async findUnresolvedFork(forkSessionId: string): Promise<string | undefined> {
+    for (const delay of UNLINK_RETRY_DELAYS_MS) {
+      await (this.deps.sleep ?? sleep)(delay);
+      try {
+        const lookup = await this.deps.lookupSessionFileById(forkSessionId);
+        if (lookup.path != null) return lookup.path;
+      } catch (error) {
+        this.deps.log(`handoff fork path lookup retry failed: ${forkSessionId}: ${errorDetail(error)}`);
+      }
+    }
+    this.deps.log(`handoff fork left without a path: ${forkSessionId}`);
+    return undefined;
+  }
+
+  private async deleteFailedFork(entry: PersistedHandoff): Promise<boolean> {
     const projectsRoot = path.resolve(claudeProjectsDir());
     if (!isWithinProjects(entry.filePath, projectsRoot)) {
       this.deps.log(`handoff orphan outside projects root: ${entry.forkSessionId}`);
-      await this.addRegistryEntry(ORPHANS_KEY, entry);
-      return;
+      return await this.recordOrphan(entry);
     }
     for (const delay of UNLINK_RETRY_DELAYS_MS) {
       await (this.deps.sleep ?? sleep)(delay);
       try {
         await this.deps.fs.unlink(entry.filePath);
-        return;
+        return true;
       } catch (error) {
+        if (errorCode(error) === "ENOENT") return true;
         this.deps.log(`handoff unlink failed: ${entry.forkSessionId}: ${errorDetail(error)}`);
       }
     }
-    await this.addRegistryEntry(ORPHANS_KEY, entry);
+    return await this.recordOrphan(entry);
+  }
+
+  private async recordOrphan(entry: PersistedHandoff): Promise<boolean> {
+    try {
+      await this.addRegistryEntry("orphans", entry);
+      return true;
+    } catch (error) {
+      this.deps.log(`handoff orphan could not be recorded; the in-flight entry stays for the startup sweep: ${entry.forkSessionId}: ${errorDetail(error)}`);
+      return false;
+    }
   }
 
   static async sweepOrphans(
-    deps: Pick<HandoffRunnerDeps, "fs" | "persist" | "readRecords" | "log"> & { now?: () => number },
+    deps: Pick<HandoffRunnerDeps, "fs" | "registry" | "readRecords" | "log"> & {
+      contextUsage: Pick<HandoffContextStore, "remove">;
+      now?: () => number;
+    },
     projectsRoot: string
   ): Promise<{ deleted: string[]; kept: string[]; failed: string[]; active: string[] }> {
     const now = deps.now?.() ?? Date.now();
-    const inFlight = persistedEntries(deps.persist.get(IN_FLIGHT_KEY));
-    const orphans = persistedEntries(deps.persist.get(ORPHANS_KEY));
-    const abandoned = new Set(orphans.map((entry) => entry.filePath));
-
-    const active = new Map<string, PersistedHandoff>();
-    for (const entry of inFlight) {
-      if (abandoned.has(entry.filePath)) continue;
-      if (entry.leaseUntil > now) {
-        active.set(entry.filePath, entry);
-        deps.log(
-          `handoff sweep skipped live handoff: ${entry.forkSessionId} owner=${entry.owner} lease=${entry.leaseUntil - now}ms`
-        );
-      }
+    const [inFlightListing, orphansListing] = [await deps.registry.list("inFlight"), await deps.registry.list("orphans")];
+    const malformed = inFlightListing.malformed + orphansListing.malformed;
+    if (malformed > 0) deps.log(`handoff sweep ignored ${malformed} registry file(s) that are not valid entries`);
+    if (inFlightListing.unreadable || orphansListing.unreadable) {
+      deps.log("handoff sweep skipped: a registry folder or file could not be read");
+      return { deleted: [], kept: [], failed: [], active: [] };
+    }
+    const inFlight = inFlightListing.entries;
+    const orphans = orphansListing.entries;
+    const { active, candidates } = handoffSweepPlan(inFlight, orphans, now);
+    for (const entry of active) {
+      deps.log(`handoff sweep skipped live handoff: ${entry.forkSessionId} owner=${entry.owner} lease=${entry.leaseUntil - now}ms`);
     }
 
-    const entries = [...inFlight, ...orphans];
-    const unique = [...new Map(entries.map((entry) => [entry.filePath, entry])).values()].filter(
-      (entry) => !active.has(entry.filePath)
-    );
     const deleted: string[] = [];
     const kept: string[] = [];
     const failed: string[] = [];
     const removeContextSnapshot = async (entry: PersistedHandoff): Promise<void> => {
       if (entry.forkSessionId === "") return;
       try {
-        await deps.persist.update(handoffContextUsageKey(entry.forkSessionId), undefined);
+        await deps.contextUsage.remove(entry.forkSessionId);
       } catch (error) {
         deps.log(`handoff orphan context snapshot removal failed: ${entry.forkSessionId}: ${errorDetail(error)}`);
       }
     };
 
-    for (const entry of unique) {
+    for (const entry of candidates) {
       try {
         await deps.fs.readFile(entry.filePath);
       } catch (error) {
-        const code = asRecord(error)?.code;
-        if (code === "ENOENT") {
+        if (errorCode(error) === "ENOENT") {
           deleted.push(entry.filePath);
           await removeContextSnapshot(entry);
           continue;
@@ -1127,23 +1247,25 @@ export class HandoffRunner {
       }
     }
 
-    const resolvedPaths = new Set([...deleted, ...kept]);
-    const failedPaths = new Set(failed);
-    const resolution: HandoffSweepResolution = {
-      resolved: unique.filter((entry) => resolvedPaths.has(entry.filePath)),
-      failed: unique.filter((entry) => failedPaths.has(entry.filePath)),
-    };
-    if (resolution.resolved.length > 0 || resolution.failed.length > 0) {
-      // A fork in neither registry is listed and openable (handoffForkState), so ORPHANS is written first.
-      await deps.persist.update(
-        ORPHANS_KEY,
-        settleHandoffRegistries(deps.persist.get(IN_FLIGHT_KEY), deps.persist.get(ORPHANS_KEY), resolution).orphans
-      );
-      await deps.persist.update(
-        IN_FLIGHT_KEY,
-        settleHandoffRegistries(deps.persist.get(IN_FLIGHT_KEY), deps.persist.get(ORPHANS_KEY), resolution).inFlight
-      );
+    const settlement = handoffSweepSettlement(inFlight, orphans, new Set([...deleted, ...kept]), new Set(failed));
+    const unmoved = new Set<string>();
+    for (const entry of settlement.moveToOrphans) {
+      try {
+        await deps.registry.put("orphans", entry);
+      } catch (error) {
+        unmoved.add(entry.filePath);
+        deps.log(`handoff orphan could not be recorded; the in-flight entry stays: ${entry.forkSessionId}: ${errorDetail(error)}`);
+      }
     }
-    return { deleted, kept, failed, active: [...active.keys()] };
+    const removeEntry = async (name: HandoffRegistryName, entry: PersistedHandoff): Promise<void> => {
+      try {
+        await deps.registry.remove(name, entry.runId);
+      } catch (error) {
+        deps.log(`handoff ${name} entry could not be removed: ${entry.forkSessionId}: ${errorDetail(error)}`);
+      }
+    };
+    for (const entry of settlement.removeInFlight) if (!unmoved.has(entry.filePath)) await removeEntry("inFlight", entry);
+    for (const entry of settlement.removeOrphans) await removeEntry("orphans", entry);
+    return { deleted, kept, failed, active: active.map((entry) => entry.filePath) };
   }
 }

@@ -7,14 +7,18 @@ export type LaisoraInput =
   | { readonly kind: "todo"; readonly title: string }
   | { readonly kind: "todoFromReply"; readonly start: boolean }
   | { readonly kind: "improvement" }
-  | { readonly kind: "migrationImport" };
+  | { readonly kind: "migrationImport" }
+  | { readonly kind: "handoffContinue"; readonly closingSummary: boolean }
+  | { readonly kind: "waitNotifyCarry" };
 
-const LAISORA_INPUT_HEAD = /^\[LAISORA:(resume|todo|todoFromReply|improvement|migrationImport)\](?: ([^\n]*))?\n/;
+const LAISORA_INPUT_HEAD = /^\[LAISORA:(resume|todo|todoFromReply|improvement|migrationImport|handoffContinue|waitNotifyCarry)\](?: ([^\n]*))?\n/;
 const TODO_FROM_REPLY_START = "start";
+const HANDOFF_CONTINUE_SUMMARY = "summary";
 
 function laisoraInputLabel(input: LaisoraInput): string {
   if (input.kind === "todo") return ` ${input.title.replace(/\s+/g, " ").trim()}`;
   if (input.kind === "todoFromReply" && input.start) return ` ${TODO_FROM_REPLY_START}`;
+  if (input.kind === "handoffContinue" && input.closingSummary) return ` ${HANDOFF_CONTINUE_SUMMARY}`;
   return "";
 }
 
@@ -30,6 +34,8 @@ export function parseLaisoraInput(recorded: string): { input: LaisoraInput; text
     : head[1] === "todoFromReply" ? { kind: "todoFromReply", start: head[2] === TODO_FROM_REPLY_START }
     : head[1] === "improvement" ? { kind: "improvement" }
     : head[1] === "migrationImport" ? { kind: "migrationImport" }
+    : head[1] === "handoffContinue" ? { kind: "handoffContinue", closingSummary: head[2] === HANDOFF_CONTINUE_SUMMARY }
+    : head[1] === "waitNotifyCarry" ? { kind: "waitNotifyCarry" }
     : { kind: "resume" };
   return { input, text: trimmed.slice(head[0].length) };
 }
@@ -47,5 +53,7 @@ export function laisoraInputLine(input: LaisoraInput): string | undefined {
   }
   if (input.kind === "improvement") return l10n.t("LAISORA sent Claude the brief for the LLM improvement analysis.");
   if (input.kind === "migrationImport") return l10n.t("LAISORA asked Claude to import a migration ZIP.");
+  if (input.kind === "handoffContinue") return l10n.t("LAISORA asked Claude to continue the unfinished work after the automatic handoff.");
+  if (input.kind === "waitNotifyCarry") return l10n.t("LAISORA asked Claude for a short reply so that this conversation can send the mobile notification for what still waits for you.");
   return undefined;
 }

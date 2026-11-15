@@ -1,7 +1,7 @@
-import { configurationDefault } from "./configuration-defaults";
+import { configurationBound, configurationDefault } from "./configuration-defaults";
 
 export const TAB_LIMIT_DEFAULT = configurationDefault<number>("tabLimit");
-export const TAB_LIMIT_MIN = 1;
+export const TAB_LIMIT_MIN = configurationBound("tabLimit", "minimum");
 export const SCOPE_MAX_PER_TAB = 2;
 
 export function resolveTabLimit(value: unknown, fallback: number = TAB_LIMIT_DEFAULT): number {

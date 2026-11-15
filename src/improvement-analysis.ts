@@ -10,10 +10,12 @@ import { sendLaisoraInput } from "./conversation-lifecycle";
 import { extensionContext, output } from "./host-context";
 import type { ImprovementScanMessage, ImprovementScanSummary } from "./improvement-cli";
 import {
-  IMPROVEMENT_BRIEF_FILE, IMPROVEMENT_DIR, IMPROVEMENT_INDEX_FILE, IMPROVEMENT_PATTERNS_FILE, IMPROVEMENT_PARTIAL_SUFFIX, IMPROVEMENT_SCAN_TIMEOUT_MS, IMPROVEMENT_TOOL_FILE,
+  IMPROVEMENT_BRIEF_FILE, IMPROVEMENT_DIR, IMPROVEMENT_INDEX_FILE, IMPROVEMENT_PATTERNS_FILE, IMPROVEMENT_PARTIAL_SUFFIX, IMPROVEMENT_SCAN_TIMEOUT_MS, IMPROVEMENT_TOOL_FILE, LAISORA_SOURCE_FILES,
   improvementFirstMessage, improvementRecordCommand, improvementRunName, improvementRunsToDelete, languageName, renderImprovementBrief,
 } from "./improvement-brief";
 import { openTitledConversationTab, type SessionStore } from "./store-surfaces";
+import { transcriptWriteLockedForNewTab } from "./transcript-write-lock";
+import { transcriptWriteLockedText } from "./protocol";
 
 const BUNDLED_TOOL = ["dist", IMPROVEMENT_TOOL_FILE] as const;
 const TAB_CLOSED_POLL_MS = 1000;
@@ -32,8 +34,7 @@ function scanEnv(): NodeJS.ProcessEnv {
 
 function runScan(context: vscode.ExtensionContext, outDir: string, cancelled: () => boolean): Promise<{ summary: ImprovementScanSummary; mismatches: readonly unknown[] }> {
   const ext = context.extensionUri.fsPath;
-  const args = ["scan", "--out", outDir, "--config-dir", claudeConfigDir(),
-    "--laisora-source", join(ext, "dist", "extension.js"), "--laisora-source", join(ext, "l10n", "bundle.l10n.ja.json")];
+  const args = ["scan", "--out", outDir, "--config-dir", claudeConfigDir(), ...LAISORA_SOURCE_FILES.flatMap((parts) => ["--laisora-source", join(ext, ...parts)])];
   return new Promise((resolve, reject) => {
     const options: ForkOptions & { windowsHide: boolean } = { execPath: process.execPath, execArgv: [], env: scanEnv(), windowsHide: true, stdio: ["ignore", "ignore", "pipe", "ipc"] };
     const child = fork(join(ext, ...BUNDLED_TOOL), args, options);
@@ -76,17 +77,29 @@ async function pruneRuns(root: string, st: SessionStore): Promise<void> {
   }
 }
 
+let improvementStarting = false;
+
 export async function startImprovementAnalysis(st: SessionStore, sender?: vscode.Webview): Promise<void> {
   const context = extensionContext;
   if (!context) return;
-  if (runningTab !== undefined) {
-    st.activateExisting(sender, runningTab);
+  if (runningTab !== undefined || improvementStarting) {
+    if (runningTab !== undefined) st.activateExisting(sender, runningTab);
     void vscode.window.showInformationMessage(l10n.t("LAISORA: An LLM improvement analysis is already scanning. Wait for it to finish."));
     return;
   }
-  const session = openTitledConversationTab(st, l10n.t("LLM improvement analysis"), sender);
-  if (!session) return;
-  runningTab = session.tabId;
+  improvementStarting = true;
+  let session: ReturnType<typeof openTitledConversationTab>;
+  try {
+    if (await transcriptWriteLockedForNewTab()) {
+      void vscode.window.showWarningMessage(transcriptWriteLockedText());
+      return;
+    }
+    session = openTitledConversationTab(st, l10n.t("LLM improvement analysis"), sender);
+    if (!session) return;
+    runningTab = session.tabId;
+  } finally {
+    improvementStarting = false;
+  }
   session.awaitingLaisoraInput = true;
   const notice = (text: string): void => { if (!session.closed) st.post({ type: "tabNotice", tabId: session.tabId, text }); };
   notice(l10n.t("Scanning all local Claude Code conversations for recurring failures. Claude starts the analysis when the scan finishes."));

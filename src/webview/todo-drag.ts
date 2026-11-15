@@ -1,5 +1,6 @@
-import { todoControlPressed, todoEl as el, type TodoPressTarget } from "./todo-edit";
+import { todoControlPressed, type TodoPressTarget } from "./todo-edit";
 import { todoDropAt, type TodoDrop, type TodoDropRow } from "./todo-organize";
+import { element as el } from "./element";
 
 export interface TodoDragHost {
   list(): HTMLElement;

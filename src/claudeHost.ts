@@ -35,7 +35,7 @@ import type {
   NormalizedEventBody,
   UsageSnapshot,
 } from "./protocol";
-import { clipSummary, summarizeToolInput, type ApiKeyPolicy, type BridgeConnection } from "./protocol";
+import { clipSummary, summarizeToolInput, type ApiKeyPolicy, type BridgeConnection, type PermissionModeId } from "./protocol";
 import { bridgeStateOf, enableRemoteControl, type RemoteControlSession } from "./remote-control";
 import { checkClaudeCodeVersion, resolveClaudeCodeExecutable } from "./claudeCliResolver";
 import { compareSemVer, parseSemVer } from "./semver";
@@ -49,9 +49,10 @@ import { checkEnvelopeRedaction } from "./send-boundary";
 import { admitHandoffNoticeSend, admitReportSend, admitSteeringSend, handoffNoticeCardText, type HandoffNoticeFacts, type SteeringAdmission } from "./steering-envelope";
 
 export type SteeringSendResult = SteeringAdmission;
+export type HandoffNoticeSendResult = Exclude<SteeringSendResult, { ok: true }> | { ok: true; handedOff: Promise<boolean> };
 import type { ProgressTrackingMode } from "./progress-protocol";
 import { PROGRESS_WIRE_TOOL_NAME } from "./artifact-access";
-import { FILE_WRITING_TOOLS } from "./file-writing-tools";
+import { FILE_TARGET_TOOLS, isFileChangingTool, isFileWritingTool, NOTEBOOK_EDIT_TOOL } from "./file-writing-tools";
 import { z } from "zod";
 import { ClaudeLiveNormalizer, parseAliases, type RawToolResult } from "./claude-normalizer";
 import { conductorInstruction, handbackGateVerdict, HANDBACK_DELEGATE_NOTICE, SUBAGENT_HANDBACK_TOOL, orchestrationExternalTargets, orchestrationVariants, resolveOrchestrationRoster, type OrchestrationRow, type ExternalModels } from "./orchestration-roster";
@@ -59,14 +60,14 @@ import { attributeSubagent, injectionOf, MAX_AGENT_STARTS, readRosterEvidence, t
 import { placementOf, DELEGATE_PLACEMENT_NOTICE, type Placement } from "./placement-line";
 import { APPROVAL_RESOLVED_BY, approvalPermission, questionsRepliedInChat } from "./ask-unanswered";
 import { failClosedGuard } from "./guard-evaluation";
-import { isShellTool } from "./shell-tools";
-import { compileVocabulary, PLACEMENT_EFFORT_WORDS, placementPath, protectedDestination, isControlFile, delegateControlRefusal, judgeFileWrite, judgeMemoryWrite, memoryGuardReason, type MemoryDecision, judgeShellWrite, PLACEMENT_GUARD_REFUSAL, PLACEMENT_UNREADABLE_REFUSAL } from "./placement-guard";
+import { runsShellCommand } from "./shell-tools";
+import { compileVocabulary, PLACEMENT_EFFORT_WORDS, placementPath, protectedDestination, isControlFile, delegateControlRefusal, judgeFileWrite, judgeMemoryWrite, memoryGuardReason, type MemoryDecision, judgeShellWrite, PLACEMENT_GUARD_REFUSAL, PLACEMENT_UNREADABLE_REFUSAL, PLACEMENT_EDIT_NOT_APPLIED_REFUSAL, readGuardedFile } from "./placement-guard";
 import { RootGate } from "./root-gate";
 import { laisoraInputLine, markLaisoraInput, type LaisoraInput } from "./laisora-input";
 import { wakeToolDecision, waitNotifyFlagSettings, type WaitNotifyStopHook, type WakeGate } from "./wait-notify";
 import { createTodoMcpServer, TODO_ROOT_SCOPE, TODO_SERVER_NAME, TODO_TOOL_NAMES, todoLinkedInstruction, todoWorkspaceRoots, type TodoLinkedItem, type TodoMigrationTools } from "./todo-mcp";
 import type { TodoStore } from "./todo-store";
-import { claudeModelIdLabel, EXTERNAL_TIMEOUT_DEFAULT_MINUTES, externalUnknownTargetReason, isExternalRunTool } from "./orchestration-executors";
+import { claudeModelIdLabel, EXTERNAL_TIMEOUT_DEFAULT_MINUTES, externalUnknownTargetReason, isExternalRunTool, isOrchestrationEffort, type OrchestrationEffort } from "./orchestration-executors";
 import { delegateForegroundInput, isDelegationLaunchTool, isDelegationTool } from "./claude-tool-names";
 import type { CompletionVerdict, NumberedLaunchVerdict, ResumeVerdict } from "./time-buckets";
 import { planItemLabel, type PlanStepUpdate } from "./plan-steps";
@@ -74,6 +75,8 @@ import { AgentAttribution } from "./orchestration-attribution";
 import type { NormalizedOutMeta } from "./claude-normalizer";
 import { askQualityDenial, rejectedAskTitles } from "./markdown-ast";
 import { plainAskFormat } from "./ask-plain-form";
+import { SUMMARY_FENCE_INFO } from "./summary-block";
+import { CLEAR_WORK_INSTRUCTION, closingSummaryInstruction, NOT_A_WORK_INSTRUCTION, REMOTE_ORIGIN_SUMMARY_INSTRUCTION } from "./closing-summary";
 import { classifyPrompt, forgetOwnPrompt, noteOwnPrompt, type OwnPrompt } from "./prompt-origin";
 import { elicitationAnswer, elicitationSpecOf, type ElicitationSpec } from "./elicitation";
 import type { SessionWritesLost } from "./session-writes-lost";
@@ -107,10 +110,14 @@ export function honorsHookOnFailure(version: string | undefined): boolean {
   return !!running && !!minimum && compareSemVer(running, minimum) >= 0;
 }
 
-function cliVersionOf(executablePath: string): Promise<string | undefined> {
+function cliVersionOf(executablePath: string, apiKeyPolicy: ApiKeyPolicy | undefined): Promise<string | undefined> {
   let version = cliVersions.get(executablePath);
-  if (!version) cliVersions.set(executablePath, version = checkClaudeCodeVersion(executablePath));
+  if (!version) cliVersions.set(executablePath, version = checkClaudeCodeVersion(executablePath, apiKeyPolicy));
   return version;
+}
+export function conversationInlineSettings(opts: Pick<ClaudeHostOptions, "remoteControlAtStartup" | "transcriptRetention" | "waitNotify">) {
+  return { remoteControlAtStartup: opts.remoteControlAtStartup === true, ...opts.transcriptRetention,
+    ...(opts.waitNotify ? waitNotifyFlagSettings(opts.waitNotify.stopHook) : {}), ...SDK_AUTO_CONTINUE_SETTINGS, ultracode: false };
 }
 export const REPLAY_USER_MESSAGES_ARG = "replay-user-messages";
 export const CHROME_ARG = "chrome";
@@ -140,8 +147,8 @@ const PLAN_RESUMED_AGENT_PLACE = "Without a number, a resumed agent stays on the
 const PLAN_COMPLETION_WAIT = "wait for them to finish or stop them with TaskStop";
 
 export const PLAN_INSTRUCTION = [
-  "Only for a clear work instruction (the user asks you to change, build, investigate or produce something), write a laisora-plan block with the goal as you understand it before your first tool call, then the TaskCreate steps; do not restate the user's words.",
-  "For such work, use TaskCreate before starting: one task per step, subject as the step title, and activeForm set. Mark the first task in_progress before the first other tool call. A question, a conversation, a confirmation or feedback on earlier work is not a work instruction: answer it without a laisora-plan block or new tasks.",
+  `Only for ${CLEAR_WORK_INSTRUCTION}, write a laisora-plan block with the goal as you understand it before your first tool call, then the TaskCreate steps; do not restate the user's words.`,
+  `For such work, use TaskCreate before starting: one task per step, subject as the step title, and activeForm set. Mark the first task in_progress before the first other tool call. ${NOT_A_WORK_INSTRUCTION}: answer it without a laisora-plan block or new tasks.`,
   "Use TaskUpdate to mark each step in_progress when starting and completed when done. Add new steps at the end with TaskCreate.",
   `Do not mark a step completed while an agent or external run placed on it is still running: first ${PLAN_COMPLETION_WAIT}; otherwise the update is rejected before it runs.`,
   "Put an action that waits for the user's approval (such as merging or publishing) in its own step, separate from work you can finish yourself, and do not mark it in_progress until the user answers.",
@@ -149,6 +156,7 @@ export const PLAN_INSTRUCTION = [
   `When you resume a finished agent with SendMessage, ${PLAN_RESUME_NUMBER}. That step must be a step of the current PLAN in progress, as for a delegation. ${PLAN_RESUMED_AGENT_PLACE}: resuming without a number an agent placed on a completed step is rejected before it runs unless you first ${PLAN_IN_PROGRESS_FIRST}.`,
   "When you need the user's decision or a real-machine check, do not bury it in prose. Write a ```laisora-ask block (format below) at the point you ask; the fence name is laisora-ask for both kinds.",
   "Before asking, check earlier decisions (ledger, contracts, earlier answers here) instead of re-asking, and investigate first if the current state is unknown.",
+  "When the user's answer to a decision asks a question or requests an explanation instead of choosing, answer it and present the decision again in the same form.",
   "In every decision (laisora-ask or AskUserQuestion): why = what you observed (facts, numbers, sources) + the exact question + why the user, not you, must decide; never restate the title. effect = the concrete change to the user's screen, operation or work; never restate the label. pros/cons = compared with the other options, including effects on other features and operations. Give technical reasons, not history; explain terms the user may not share. For LAISORA's own behaviour, state the current behaviour and its technical reason from contracts or facts, or 理由の記録なし.",
   "Keep why short. Put material the user may need but not always (current behaviour and its technical reason, numbers, sources, terms explained) in the optional details key after why, so the user rarely has to ask back; the card shows it folded. details is a JSON double-quoted string; write \\n for a line break.",
   "Use AskUserQuestion only when you cannot continue without the answer; otherwise use a laisora-ask block and continue with the stated default.",
@@ -160,15 +168,19 @@ export const PLAN_INSTRUCTION = [
   "</format>",
 ].join("\n");
 
-export const REMOTE_ORIGIN_ASK_INSTRUCTION = (): string => [
-  "This message was not sent from the LAISORA window, so the user may be reading this turn on claude.ai or the Claude mobile app, where laisora-ask blocks show as raw code.",
+const remoteOriginNotice = (fences: readonly string[]): string =>
+  `This message was not sent from the LAISORA window, so the user may be reading this turn on claude.ai or the Claude mobile app, where ${fences.join(" and ")} blocks show as raw code.`;
+const REMOTE_ORIGIN_ASK_FORM = (): string => [
   "In this turn, write each decision or real-machine check in the plain form below instead of a laisora-ask block. The content rules for decisions and checks in your instructions still apply.",
   plainAskFormat(),
 ].join("\n\n");
 
-export function interruptDiscardNotice(count: number): string {
-  return l10n.t("Discarded {0} unprocessed messages due to the interrupt", count);
+export function remoteOriginInstruction(planInstruction: boolean, summary: boolean): string {
+  if (!planInstruction && !summary) return "";
+  const fences = [...planInstruction ? ["laisora-ask"] : [], ...summary ? [SUMMARY_FENCE_INFO] : []];
+  return [remoteOriginNotice(fences), ...planInstruction ? [REMOTE_ORIGIN_ASK_FORM()] : [], ...summary ? [REMOTE_ORIGIN_SUMMARY_INSTRUCTION()] : []].join("\n\n");
 }
+
 
 const planStepList = (numbers: readonly number[]): string => `current steps: ${numbers.map(planItemLabel).join(", ")}`;
 
@@ -212,8 +224,8 @@ export function planCompletionDenial(verdict: CompletionVerdict): string | undef
 export const ASK_QUALITY_REWRITE_LIMIT = 2;
 export const RENAME_SESSION_TIMEOUT_MS = 5000;
 
-export function conversationSystemPrompt(fileLinkInstruction: boolean, planInstruction = true, cwd = "", placementLine: string): NonNullable<ClaudeCodeOptions["systemPrompt"]> {
-  return { type: "custom", prompt: [fileLinkInstruction ? FILE_LINK_INSTRUCTION(cwd) : "", planInstruction ? PLAN_INSTRUCTION : "", placementLine].filter(Boolean).join("\n\n"), snapshot: false };
+export function conversationSystemPrompt(fileLinkInstruction: boolean, planInstruction = true, cwd = "", tail: string, closingSummary?: { linked: boolean }): { type: "custom"; prompt: string; snapshot: false } {
+  return { type: "custom", prompt: [fileLinkInstruction ? FILE_LINK_INSTRUCTION(cwd) : "", planInstruction ? PLAN_INSTRUCTION : "", closingSummary ? closingSummaryInstruction("single", closingSummary.linked) : "", tail].filter(Boolean).join("\n\n"), snapshot: false };
 }
 
 interface QueryHandle extends AsyncIterable<any> {
@@ -221,7 +233,7 @@ interface QueryHandle extends AsyncIterable<any> {
   setPermissionMode(mode: string): Promise<void>;
   supportedCommands(): Promise<Array<{ name: string; description?: string; aliases?: string[] }>>;
   setModel(model?: string): Promise<void>;
-  applyFlagSettings(settings: { effortLevel: "low" | "medium" | "high" | "xhigh" | "max" | null }): Promise<void>;
+  applyFlagSettings(settings: { effortLevel: OrchestrationEffort | null }): Promise<void>;
   getSettings?(): Promise<unknown>;
   renameSession?(title: string, sessionId?: string): Promise<void>;
   supportedModels(): Promise<Array<{ model?: string; id?: string; value?: string; resolvedModel?: string; displayName?: string; description?: string; supportsEffort?: boolean; supportedEffortLevels?: string[] }>>;
@@ -240,9 +252,9 @@ export interface ClaudeHostOptions {
   cwd: string;
   knownBackgroundTask?: (taskId: string) => "agent" | "tool" | "unconfirmed" | undefined;
   model?: string;
-  effort?: "low" | "medium" | "high" | "xhigh" | "max";
+  effort?: OrchestrationEffort;
   resumeSessionId?: string;
-  permissionMode: "default" | "acceptEdits" | "plan" | "bypassPermissions" | "auto" | "dontAsk";
+  permissionMode: PermissionModeId;
   settingSources: Array<"user" | "project" | "local">;
   transcriptRetention?: TranscriptRetentionSettings;
   remoteControlAtStartup?: boolean;
@@ -253,6 +265,8 @@ export interface ClaudeHostOptions {
   apiKeyPolicy?: ApiKeyPolicy;
   fileLinkInstruction?: boolean;
   planInstruction?: boolean;
+  closingSummary?: boolean;
+  continuedWorkSummary?: () => boolean;
   askQualityCheck?: boolean;
   todoStore?: TodoStore;
   todoLinkedItem?: TodoLinkedItem;
@@ -273,6 +287,8 @@ export interface ClaudeHostOptions {
   onOrchestrationChanged?: () => void;
   onCliVersion?: (version: string) => void;
   onBridgeState?: (connection: BridgeConnection) => void;
+  sendBlocked?: () => boolean;
+  orderInput?: (queue: () => boolean) => Promise<boolean>;
   onSessionWritesLost?: (loss: SessionWritesLost) => void;
   interruptForceKillTimeoutMs: number;
   testInterruptHang?: boolean;
@@ -402,7 +418,7 @@ export async function resolveHandoffRuntime(
     "forkSession" | "query"
   >;
   const executable = await resolveClaudeCodeExecutable(configuredExecutablePath);
-  const { env } = buildClaudeEnv(process.env, apiKeyPolicy);
+  const { env } = buildClaudeEnv(process.env, "claudeCli", apiKeyPolicy);
   return { sdk, claudeExecutablePath: executable.path, env };
 }
 
@@ -548,6 +564,7 @@ export class ClaudeConversation {
   private interruptTimer: ReturnType<typeof setTimeout> | null = null;
   private agentDefs: Map<string, AgentDefInfo> | null = null;
   private cliCapabilities: string[] | null = null;
+  private initToolNames: string[] | undefined;
   private startMarks: { begin: number; sdkLoaded: number; resolved: number; optionsBuilt: number; queried: number } | null = null;
   private firstMessageLogged = false;
 
@@ -560,7 +577,8 @@ export class ClaudeConversation {
       enabled: () => readClaudeCodeSettings(true).autoContinueAtUsageLimit !== false,
       connected: () => this.q !== null && !this.closed,
       live: () => this.q !== null && !this.closed && this.state === "idle" && this.inputQueue.length === 0,
-      send: (text) => this.send(text, undefined, undefined, { kind: "resume" }),
+      held: () => this.opts.sendBlocked?.() === true,
+      send: (compose) => this.sendAutomatic({ kind: "resume" }, compose),
       notify: (event) => this.emit(event),
     });
     this.unsubscribeAutoContinue = onAutoContinueSettingChange(() => {
@@ -650,11 +668,11 @@ export class ClaudeConversation {
     const sdkLoaded = Date.now();
     const resolvedExecutable = await resolveClaudeCodeExecutable(this.opts.claudeCodeExecutablePath);
     const resolved = Date.now();
-    const cliVersion = cliVersionOf(resolvedExecutable.path);
+    const cliVersion = cliVersionOf(resolvedExecutable.path, this.opts.apiKeyPolicy);
     this.opts.log(`Claude Code executable resolved from ${resolvedExecutable.source}: ${resolvedExecutable.path}` + (resolvedExecutable.shimPath ? ` (npm shim: ${resolvedExecutable.shimPath})` : ""));
     this.normalizer.setUsageLimitPrefixes([...sdk.USAGE_LIMIT_ERROR_PREFIXES]);
 
-    const { env, removed } = buildClaudeEnv(process.env, this.opts.apiKeyPolicy,
+    const { env, removed } = buildClaudeEnv(process.env, "claudeCli", this.opts.apiKeyPolicy,
       this.orchestrationEnabled && this.externalRows.length > 0);
     if (Object.entries(env).some(([key, value]) => envNameKey(key) === "ANTHROPIC_API_KEY" && typeof value === "string" && value.length > 0)) {
       this.opts.log("ANTHROPIC_API_KEY inherited by the child process (apiKeyPolicy=inherit)");
@@ -760,8 +778,7 @@ ${ctxJson}`
       cwd: this.opts.cwd,
       permissionMode: this.opts.permissionMode,
       settingSources: this.opts.settingSources,
-      settings: { remoteControlAtStartup: this.opts.remoteControlAtStartup === true, ...SDK_AUTO_CONTINUE_SETTINGS, ultracode: false, ...this.opts.transcriptRetention,
-        ...(this.opts.waitNotify ? waitNotifyFlagSettings(this.opts.waitNotify.stopHook) : {}) },
+      settings: conversationInlineSettings(this.opts),
       extraArgs: conversationExtraArgs(this.opts.chromeIntegration === true),
       includePartialMessages: true,
       pathToClaudeCodeExecutable: resolvedExecutable.path,
@@ -815,14 +832,16 @@ ${ctxJson}`
     if (this.opts.planInstruction !== false) {
       options.allowedTools = [...(options.allowedTools ?? []), "TaskCreate", "TaskGet", "TaskUpdate", "TaskList"];
     }
-    options.systemPrompt = conversationSystemPrompt(this.opts.fileLinkInstruction === true, this.opts.planInstruction !== false, this.opts.cwd, this.placement.line);
+    const linkedItem = this.opts.todoStore ? this.opts.todoLinkedItem : undefined;
+    const singleSummary = this.opts.closingSummary === true;
+    const systemPrompt = (tail: string) => conversationSystemPrompt(this.opts.fileLinkInstruction === true, this.opts.planInstruction !== false, this.opts.cwd, tail,
+      singleSummary ? { linked: linkedItem !== undefined } : undefined);
+    options.systemPrompt = systemPrompt(this.placement.line);
     this.rosterInjections.push(injectionOf(this.orchestrationEnabled ? orchestrationVariants(this.roster, this.opts.externalModels) : [], Date.now(), true));
     if (this.orchestrationEnabled) {
       options.plugins = [...(options.plugins ?? []), { type: "local",
         path: await prepareOrchestrationPlugin(this.opts.orchestrationPluginDirectory ?? join(tmpdir(), "laisora-agent-plugin"), this.roster, this.opts.externalModels) }];
-      const base = this.opts.fileLinkInstruction === true ? FILE_LINK_INSTRUCTION(this.opts.cwd) : "";
-      options.systemPrompt = { type: "custom", snapshot: false,
-        prompt: [base, this.opts.planInstruction !== false ? PLAN_INSTRUCTION : "", conductorInstruction(this.roster, this.conductorPolicy, this.externalRows, this.opts.externalModels, this.placement.line)].filter(Boolean).join("\n\n") };
+      options.systemPrompt = systemPrompt(conductorInstruction(this.roster, this.conductorPolicy, this.externalRows, this.opts.externalModels, this.placement.line));
     }
     if (this.orchestrationEnabled) {
       const observe: ClaudeCodeSdk.HookCallback = async (input) => {
@@ -904,17 +923,17 @@ ${ctxJson}`
         if (typeof path === "string" && isAbsolute(path)) this.todoFiles = [...this.todoFiles.filter(entry => entry !== path), path].slice(-TODO_RECENT_FILES);
         return {};
       };
-      options.hooks = { ...(options.hooks ?? {}), PreToolUse: [...(options.hooks?.PreToolUse ?? []), { matcher: "Read|Edit|Write|MultiEdit|NotebookEdit", hooks: [noteFile] }] };
-      if (this.opts.todoLinkedItem) {
+      options.hooks = { ...(options.hooks ?? {}), PreToolUse: [...(options.hooks?.PreToolUse ?? []), { matcher: FILE_TARGET_TOOLS.join("|"), hooks: [noteFile] }] };
+      if (linkedItem) {
         const prompt = options.systemPrompt as { type: "custom"; snapshot: false; prompt: string };
-        options.systemPrompt = { ...prompt, prompt: [prompt.prompt, todoLinkedInstruction(this.opts.todoLinkedItem)].filter(Boolean).join("\n\n") };
+        options.systemPrompt = { ...prompt, prompt: [prompt.prompt, todoLinkedInstruction(linkedItem)].filter(Boolean).join("\n\n") };
       }
     }
     if (this.placement.guardEnabled) {
       const guard: ClaudeCodeSdk.HookCallback = async input => {
         if (input.hook_event_name !== "PreToolUse") return {};
         const delegate = typeof input.agent_id === "string" && input.agent_id.length > 0;
-        if (!([...FILE_WRITING_TOOLS, ...(delegate ? ["NotebookEdit"] : [])] as string[]).includes(input.tool_name) && !isShellTool(input.tool_name)) return {};
+        if (!(delegate ? isFileChangingTool(input.tool_name) : isFileWritingTool(input.tool_name)) && !runsShellCommand(input.tool_name)) return {};
         return failClosedGuard(async () => {
           const value = input.tool_input as Record<string, unknown>;
           const guardRoster = resolveOrchestrationRoster(this.opts.orchestrationAgents).roster;
@@ -930,12 +949,12 @@ ${ctxJson}`
           let unreadable = false;
           let memoryDecision: MemoryDecision | undefined = delegate && decision.destination === "memory"
             ? { destination: "memory", blocked: true, reasons: ["delegate"], blockedLines: [] } : undefined;
-          const filePath = input.tool_name === "NotebookEdit" ? value.notebook_path : value.file_path;
-          if (([...FILE_WRITING_TOOLS, "NotebookEdit"] as string[]).includes(input.tool_name) && typeof filePath === "string") {
+          const filePath = input.tool_name === NOTEBOOK_EDIT_TOOL ? value.notebook_path : value.file_path;
+          if (isFileChangingTool(input.tool_name) && typeof filePath === "string") {
             const path = placementPath(filePath, cwd, false);
             let current: string | undefined;
             if (path) {
-              try { current = readFileSync(path, "utf8"); }
+              try { current = readGuardedFile(path); }
               catch (error) { unreadable = (error as NodeJS.ErrnoException).code !== "ENOENT"; }
             }
             const target = path ?? filePath;
@@ -945,11 +964,13 @@ ${ctxJson}`
             memoryDecision = judgeMemoryWrite(input.tool_name, { ...value, file_path: target }, current,
               delegate ? "delegate" : "conductor", this.placement.memoryTypes, claudeConfigDir());
           }
-          const unchecked = unreadable && decision.skipped === "edit-does-not-apply";
+          const unchecked = unreadable && input.tool_name !== "Write";
           const destination = memoryDecision?.blocked ? "memory" : decision.destination;
           if ((!memoryDecision?.blocked && !decision.blocked && !unchecked) || !destination) return {};
           return { hookSpecificOutput: { hookEventName: "PreToolUse", permissionDecision: "deny",
-            permissionDecisionReason: memoryDecision?.blocked ? memoryGuardReason(memoryDecision, this.placement) : delegate ? delegateControlRefusal(decision.refusal) : unchecked ? PLACEMENT_UNREADABLE_REFUSAL : PLACEMENT_GUARD_REFUSAL } };
+            permissionDecisionReason: delegate ? (memoryDecision?.blocked ? memoryGuardReason(memoryDecision, this.placement) : delegateControlRefusal(decision.refusal))
+              : unchecked ? PLACEMENT_UNREADABLE_REFUSAL : memoryDecision?.blocked ? memoryGuardReason(memoryDecision, this.placement)
+              : decision.reasons.includes("edit-not-applied") ? PLACEMENT_EDIT_NOT_APPLIED_REFUSAL : PLACEMENT_GUARD_REFUSAL } };
         }, this.opts.log);
       };
       options.hooks = { ...(options.hooks ?? {}), PreToolUse: [{ hooks: [guard] }, ...(options.hooks?.PreToolUse ?? [])] };
@@ -1011,12 +1032,15 @@ ${ctxJson}`
       };
       options.hooks = { ...(options.hooks ?? {}), Stop: [...(options.hooks?.Stop ?? []), { hooks: [askQualityGate] }] };
     }
-    if (planInstruction) {
+    const continuedWorkSummary = this.opts.continuedWorkSummary;
+    const remoteContext = () => remoteOriginInstruction(planInstruction, singleSummary || continuedWorkSummary?.() === true);
+    if (planInstruction || singleSummary || continuedWorkSummary !== undefined) {
       const promptOrigin: ClaudeCodeSdk.HookCallback = async input => {
         if (input.hook_event_name !== "UserPromptSubmit") return {};
         const verdict = classifyPrompt(this.ownPrompts, input.prompt);
         this.ownPrompts = verdict.pending;
-        return verdict.own ? {} : { hookSpecificOutput: { hookEventName: "UserPromptSubmit" as const, additionalContext: REMOTE_ORIGIN_ASK_INSTRUCTION() } };
+        const context = verdict.own ? "" : remoteContext();
+        return context ? { hookSpecificOutput: { hookEventName: "UserPromptSubmit" as const, additionalContext: context } } : {};
       };
       options.hooks = { ...(options.hooks ?? {}), UserPromptSubmit: [...(options.hooks?.UserPromptSubmit ?? []), { hooks: [promptOrigin] }] };
     }
@@ -1139,44 +1163,64 @@ ${ctxJson}`
     }
   }
 
+  private inSendOrder(run: () => boolean): Promise<boolean> {
+    const queue = (): boolean => !this.closed && run();
+    return this.opts.orderInput === undefined ? Promise.resolve(queue()) : this.opts.orderInput(queue);
+  }
+
   sendSteeringEnvelope(envelopeText: string): SteeringSendResult {
-    const admission = admitSteeringSend(
+    const admit = (): SteeringAdmission => admitSteeringSend(
       { closed: this.closed, turnState: this.normalizer.turnState },
       envelopeText,
       checkEnvelopeRedaction
     );
+    const admission = admit();
     if (!admission.ok) return admission;
-    const uuid = randomUUID();
-    this.normalizer.noteAutomaticInput(uuid);
-    this.queueUserInput([{ type: "text", text: envelopeText }], { uuid });
+    void this.inSendOrder(() => {
+      if (!admit().ok) return false;
+      const uuid = randomUUID();
+      this.normalizer.noteAutomaticInput(uuid);
+      this.queueUserInput([{ type: "text", text: envelopeText }], { uuid });
+      return true;
+    });
     return { ok: true };
   }
 
   sendReportEnvelope(envelopeText: string): SteeringSendResult {
-    const admission = admitReportSend(
+    const admit = (): SteeringAdmission => admitReportSend(
       { closed: this.closed, turnState: this.normalizer.turnState },
       envelopeText,
       checkEnvelopeRedaction
     );
+    const admission = admit();
     if (!admission.ok) return admission;
-    const uuid = randomUUID();
-    this.normalizer.noteAutomaticInput(uuid);
-    this.queueUserInput([{ type: "text", text: envelopeText }], { uuid });
+    void this.inSendOrder(() => {
+      if (!admit().ok) return false;
+      const uuid = randomUUID();
+      this.normalizer.noteAutomaticInput(uuid);
+      this.queueUserInput([{ type: "text", text: envelopeText }], { uuid });
+      return true;
+    });
     return { ok: true };
   }
 
-  sendHandoffNotice(envelopeText: string, notice: HandoffNoticeFacts): SteeringSendResult {
-    const admission = admitHandoffNoticeSend(
+  sendHandoffNotice(envelopeText: string, notice: HandoffNoticeFacts): HandoffNoticeSendResult {
+    const admit = (): SteeringAdmission => admitHandoffNoticeSend(
       { closed: this.closed, turnState: this.normalizer.turnState },
       envelopeText,
       checkEnvelopeRedaction
     );
+    const admission = admit();
     if (!admission.ok) return admission;
-    const uuid = randomUUID();
-    this.normalizer.startTurn(undefined, { timestamp: Date.now() }, true);
-    this.emit({ kind: "local_command_output", text: handoffNoticeCardText(notice), uuid, handoffNotice: notice });
-    this.queueUserInput([{ type: "text", text: envelopeText }], { uuid });
-    return { ok: true };
+    const handedOff = this.inSendOrder(() => {
+      if (!admit().ok) return false;
+      const uuid = randomUUID();
+      this.normalizer.startTurn(undefined, { timestamp: Date.now() }, true);
+      this.emit({ kind: "local_command_output", text: handoffNoticeCardText(notice), uuid, handoffNotice: notice });
+      this.queueUserInput([{ type: "text", text: envelopeText }], { uuid });
+      return true;
+    });
+    return { ok: true, handedOff };
   }
 
   private queueUserInput(content: UserContentBlock[], extra: { isMeta?: true; uuid: `${string}-${string}-${string}-${string}-${string}` }): void {
@@ -1202,6 +1246,8 @@ ${ctxJson}`
 
   get launchedWithWaitNotify(): boolean { return this.opts.waitNotify !== undefined; }
 
+  get initTools(): readonly string[] | undefined { return this.initToolNames; }
+
   get runningTurnId(): string | null { return this.normalizer.turnState === "idle" ? null : this.normalizer.currentTurnId; }
 
   expectLaisoraWake(expected: boolean): void { this.normalizer.laisoraWakeExpected = expected; }
@@ -1212,24 +1258,28 @@ ${ctxJson}`
     return [...this.pendingApprovals.values()].flatMap(p => p.toolUseId === undefined ? [] : [p.toolUseId]);
   }
 
+  sendAutomatic(input: LaisoraInput, compose: () => string | undefined): Promise<boolean> {
+    return this.inSendOrder(() => {
+      if (this.normalizer.turnState === "interrupting") return false;
+      const text = compose();
+      return text !== undefined && this.send(text, undefined, Date.now(), input);
+    });
+  }
+
+  admitSend(): boolean {
+    const refusal = this.closed
+      ? l10n.t("The conversation has ended. Resend your message (a new connection will be started)")
+      : this.normalizer.turnState === "interrupting"
+        ? l10n.t("Interrupt in progress. Stop first, then send again.")
+        : undefined;
+    if (refusal === undefined) return true;
+    this.emit({ kind: "error", message: refusal, fatal: false });
+    return false;
+  }
+
   send(text: string, images?: ImageAttachment[], sentAt = Date.now(), automatic: LaisoraInput | false = false, uuid?: `${string}-${string}-${string}-${string}-${string}`): boolean {
     if (!automatic) this.usageLimitResume.manualSend();
-    if (this.closed) {
-      this.emit({
-        kind: "error",
-        message: l10n.t("The conversation has ended. Resend your message (a new connection will be started)"),
-        fatal: false,
-      });
-      return false;
-    }
-    if (this.normalizer.turnState === "interrupting") {
-      this.emit({
-        kind: "error",
-        message: l10n.t("Interrupt in progress. Stop first, then send again."),
-        fatal: false,
-      });
-      return false;
-    }
+    if (!this.admitSend()) return false;
     const runningAlready = this.normalizer.turnState !== "idle";
     if (!runningAlready) {
       this.normalizer.startTurn(undefined, { timestamp: sentAt }, automatic !== false);
@@ -1259,19 +1309,9 @@ ${ctxJson}`
     this.attribution.interrupt();
     this.normalizer.turnState = "interrupting";
     const turnId = this.normalizer.currentTurnId;
-    const drained = this.inputQueue.length;
-    for (const input of this.inputQueue) {
-      this.normalizer.forgetOwnInput(input.uuid);
-      this.ownPrompts = forgetOwnPrompt(this.ownPrompts, input.uuid);
-    }
+    const drained = this.inputQueue.map((input) => input.uuid);
     this.inputQueue = [];
-    if (drained > 0) {
-      this.emit({
-        kind: "error",
-        message: interruptDiscardNotice(drained),
-        fatal: false,
-      });
-    }
+    this.retractCancelledInputs(drained);
     for (const requestId of this.pendingApprovals.keys()) this.resolveApproval(requestId, "deny", undefined, APPROVAL_RESOLVED_BY.interrupt);
     const timeoutMs = this.opts.interruptForceKillTimeoutMs;
     this.interruptTimer = setTimeout(() => {
@@ -1288,12 +1328,14 @@ ${ctxJson}`
     }
     try {
       const receipt = await this.q.interrupt({ cancelQueued: true });
+      this.retractCancelledInputs(receipt?.cancelled ?? []);
       const honorsCancelQueued = this.cliCapabilities?.includes(CAP_INTERRUPT_CANCEL_QUEUED) === true;
       const survivors = receipt?.still_queued?.length ?? 0;
       if (!this.closed && (!honorsCancelQueued || survivors > 0)) {
         this.opts.log(
           `interrupt: queued input may survive (${CAP_INTERRUPT_CANCEL_QUEUED}=${honorsCancelQueued}, still_queued=${survivors}) → abort (force-kill)`
         );
+        this.retractCancelledInputs(receipt?.still_queued ?? []);
         this.killForStop();
         if (this.normalizer.turnState === "interrupting" && this.normalizer.currentTurnId === turnId) {
           this.endTurn("turn_interrupted");
@@ -1310,8 +1352,17 @@ ${ctxJson}`
     }
   }
 
+  private retractCancelledInputs(uuids: readonly string[]): void {
+    if (uuids.length === 0) return;
+    for (const uuid of uuids) {
+      this.normalizer.forgetOwnInput(uuid);
+      this.ownPrompts = forgetOwnPrompt(this.ownPrompts, uuid);
+    }
+    this.emit({ kind: "user_message_cancelled", uuids: [...uuids] });
+  }
+
   async setPermissionMode(
-    mode: "default" | "acceptEdits" | "plan" | "bypassPermissions" | "auto" | "dontAsk"
+    mode: PermissionModeId
   ): Promise<void> {
     if (!this.q || this.closed) return;
     await this.q.setPermissionMode(mode);
@@ -1412,6 +1463,9 @@ ${ctxJson}`
     if (msg?.type === "system" && msg?.subtype === "init" && Array.isArray(msg.capabilities)) {
       this.cliCapabilities = msg.capabilities.filter((c: unknown): c is string => typeof c === "string");
     }
+    if (msg?.type === "system" && msg?.subtype === "init" && Array.isArray(msg.tools)) {
+      this.initToolNames = msg.tools.filter((t: unknown): t is string => typeof t === "string");
+    }
     this.normalizer.handleMessage(msg);
   }
 
@@ -1481,7 +1535,7 @@ ${ctxJson}`
     }
   }
 
-  async setEffort(effort: "low" | "medium" | "high" | "xhigh" | "max" | null): Promise<void> {
+  async setEffort(effort: OrchestrationEffort | null): Promise<void> {
     if (!this.q || this.closed) throw new Error("Claude conversation is not connected");
     this.invalidateHandoffContextUsage();
     await this.q.applyFlagSettings({ effortLevel: effort });
@@ -1509,7 +1563,7 @@ ${ctxJson}`
   }
 
   async appliedSettings(): Promise<
-    { model?: string; effort?: "low" | "medium" | "high" | "xhigh" | "max" | null } | undefined
+    { model?: string; effort?: OrchestrationEffort | null } | undefined
   > {
     if (!this.q || this.closed || typeof this.q.getSettings !== "function") return undefined;
     try {
@@ -1519,9 +1573,7 @@ ${ctxJson}`
       const { model, effort } = applied as { model?: unknown; effort?: unknown };
       return {
         ...(typeof model === "string" && model.trim().length > 0 ? { model: model.trim() } : {}),
-        ...(effort === null || effort === "low" || effort === "medium" || effort === "high" || effort === "xhigh" || effort === "max"
-          ? { effort }
-          : {}),
+        ...(effort === null || isOrchestrationEffort(effort) ? { effort } : {}),
       };
     } catch (error) {
       this.opts.log(`getSettings failed: ${String(error)}`);

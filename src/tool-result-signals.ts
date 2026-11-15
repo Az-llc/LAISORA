@@ -1,9 +1,10 @@
 import * as l10n from "@vscode/l10n";
 import { CLI_USER_INTERRUPTED_TEXTS } from "./human-input-vocabulary";
+import { isShellTool } from "./shell-tools";
+import { escapeRegExp } from "./regexp-escape";
 import { "Denied by the LAISORA user" as enLaisoraDenial } from "../l10n/bundle.l10n.json";
 import { "Denied by the LAISORA user" as jaLaisoraDenial } from "../l10n/bundle.l10n.ja.json";
 
-export const escapeRegExp = (text: string): string => text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 const TOOL_USE_REJECTED_HEAD = "The user doesn't want to proceed with this tool use";
 export const TOOL_USE_REJECTED_TEXT = `${TOOL_USE_REJECTED_HEAD}. The tool use was rejected (eg. if it was a file edit, the new_string was NOT written to the file). STOP what you are doing and wait for the user to tell you how to proceed.`;
 export const TOOL_USE_REJECTED_RESULT = "User rejected tool use";
@@ -12,7 +13,7 @@ export const TOOL_USE_ERROR_PREFIX = "Error: ";
 const OPTIONAL_ERROR_PREFIX = `(?:${escapeRegExp(TOOL_USE_ERROR_PREFIX)})?`;
 const CLI_REJECTION_RE = new RegExp(`^${OPTIONAL_ERROR_PREFIX}${escapeRegExp(TOOL_USE_REJECTED_RESULT)}\\b`);
 const USER_INTERRUPTED = CLI_USER_INTERRUPTED_TEXTS.map(escapeRegExp).join("|");
-const HOOK_DENIAL_EVENT = "PreToolUse";
+export const HOOK_DENIAL_EVENT = "PreToolUse";
 const HOOK_EVENTS = [HOOK_DENIAL_EVENT, "PostToolUse", "PermissionRequest", "UserPromptSubmit", "Stop", "SubagentStop"] as const;
 type HookEvent = typeof HOOK_EVENTS[number];
 const HOOK_DENIAL_SUFFIX = " hook error:";
@@ -73,11 +74,17 @@ export function isInterruptedWhileRunning(result: ToolResultSignal): boolean {
   return result.isError === true && HUMAN_REJECTED_TOOL_RESULT_RE.test(stripToolUseErrorTags(result.resultPreview).trimStart());
 }
 
+function isHumanRejectedText(text: string): boolean {
+  return isCliRejectionText(text) || isLaisoraDenialText(text) || isInterruptedWhileRunning({ isError: true, resultPreview: text });
+}
+
+export function isHumanRejectedToolResult(result: ToolResultSignal): boolean {
+  return result.isError === true && isHumanRejectedText(result.resultPreview);
+}
+
 export function isFailedToolResult(result: ToolResultSignal): boolean {
   return result.isError === true && !isInterruptedWhileRunning(result);
 }
-
-export const isShellTool = (tool: string): boolean => tool === "Bash" || tool === "PowerShell";
 
 export type ToolFailure =
   | { kind: "classifier_unavailable" }
@@ -110,7 +117,7 @@ export function classifyToolFailure(rawText: string, toolName: string | undefine
   if (pd?.reasonType === "safetyCheck" || text.includes(SAFETY_CHECK)) return { kind: "safety_check", message: text.replace(SAFETY_BOILERPLATE_RE, "") };
   const prompt = PERMISSION_PROMPT_RE.exec(text);
   if (prompt) return { kind: "permission_prompt", prompt: prompt[0] };
-  if (denial === "user-rejected" || isCliRejectionText(text) || isLaisoraDenialText(text) || isInterruptedWhileRunning({ isError: true, resultPreview: text })) {
+  if (denial === "user-rejected" || isHumanRejectedText(text)) {
     return { kind: "user_rejected" };
   }
   if (pd?.source === "hook" && pd?.decision !== "accept") return { kind: "hook_denial", event: undefined, body: text };

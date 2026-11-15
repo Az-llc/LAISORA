@@ -1,7 +1,8 @@
-import { createHash, randomUUID } from "node:crypto";
+import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
-import { mkdir, open, rename, unlink } from "node:fs/promises";
 import * as path from "node:path";
+import { writeFileAtomic } from "./atomic-file";
+import { isRunMetadata } from "./orchestration-executors";
 
 export const ROSTER_EVIDENCE_VERSION = 1;
 export const MAX_ROSTER_INJECTIONS = 64;
@@ -53,8 +54,7 @@ export function emptyRosterEvidence(): RosterEvidence {
   return { injections: [], starts: [] };
 }
 
-const METADATA_RE = /^[A-Za-z0-9][A-Za-z0-9._:\[\]-]*$/;
-const metadata = (v: unknown): v is string => typeof v === "string" && v.length <= 200 && METADATA_RE.test(v);
+const metadata = isRunMetadata;
 const time = (v: unknown): v is number => typeof v === "number" && Number.isFinite(v) && v >= 0;
 
 function decodeAgent(raw: unknown): InjectedAgentDefinition | undefined {
@@ -188,22 +188,6 @@ export function readRosterEvidence(directory: string, sessionId: string, log: (l
 }
 
 export async function writeRosterEvidence(directory: string, sessionId: string, evidence: RosterEvidence): Promise<void> {
-  await mkdir(directory, { recursive: true });
-  const target = rosterEvidenceFile(directory, sessionId);
-  const temporary = `${target}.${randomUUID()}.tmp`;
   const contents = JSON.stringify({ version: ROSTER_EVIDENCE_VERSION, injections: evidence.injections, starts: evidence.starts });
-  try {
-    const handle = await open(temporary, "wx");
-    try {
-      await handle.writeFile(contents, "utf8");
-      await handle.sync();
-    } finally {
-      await handle.close();
-    }
-    await rename(temporary, target);
-  } finally {
-    await unlink(temporary).catch((error: NodeJS.ErrnoException) => {
-      if (error.code !== "ENOENT") throw error;
-    });
-  }
+  await writeFileAtomic(rosterEvidenceFile(directory, sessionId), contents);
 }

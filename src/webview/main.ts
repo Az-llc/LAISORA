@@ -26,12 +26,16 @@ import type {
   UsageSnapshot,
   WorkModelPayload,
 } from "../protocol";
-import { ACCOUNT_USAGE_REPLY_WAIT_MS, fallbackUnresolved, IMAGE_MAX_COUNT, isCurrentAccountUsageRow, isHistoryEvent, PROTOCOL_VERSION, RENAME_TITLE_MAX, isHostToWebview, withLocalEventDrop } from "../protocol";
+import { ACCOUNT_USAGE_REPLY_WAIT_MS, clearDuringTurnText, fallbackUnresolved, handoffSendLockedText, renameUsageText, IMAGE_MAX_COUNT, isCurrentAccountUsageRow, isHistoryEvent, PROTOCOL_VERSION, RENAME_TITLE_MAX, isHostToWebview, transcriptWriteLockedText, withLocalEventDrop } from "../protocol";
+import { composerActionState, composerLockOf, type ComposerLockReason } from "./composer-action";
 import { hasSessionRecord } from "../session-record";
-import { followsDirectly, historyAnchorIndex, windowEvents } from "../event-window";
-import { findModelRow, resolveModelDisplayName } from "../model-display-name";
+import { followsDirectly, historyAnchorIndex, transcriptAnchorUuids, windowEvents } from "../event-window";
+import { findModelRow, modelsLoadingText, resolveModelDisplayName } from "../model-display-name";
+import { CLAUDE_EFFORTS, isOrchestrationEffort } from "../orchestration-executors";
 import {
   actionBtn,
+  composerLockableEls,
+  sendLockEl,
   attachBtn,
   attachmentsEl,
   authEl,
@@ -52,6 +56,7 @@ import {
   usagePanelEl,
   vscode,
   CONTEXT_CHIP_EMPTY,
+  type WebviewState,
 } from "./dom";
 import { applySessionChunk, applySessionHiddenChanged, applySessionListActionFailed, applySessionRenamed, historyTitleCell, initHistory, openHistPanel, refreshHistList, reloadHistList, setHistoryTodoOpened } from "./history";
 import {
@@ -59,19 +64,23 @@ import {
   closeAuthPicker,
   closeModeMenu,
   composerPlaceholder,
-  composerSendKey,
+  isComposerSendKey,
   initMenu,
   openAuthPicker,
   renderAuthPicker,
   setTodoAvailable,
   syncMenuCursor,
 } from "./menu";
-import { closeSuggest, handleFilesResponse, initSuggest, insertFilePaths } from "./suggest";
+import { closeSuggest, composerReferenceText, handleFilesResponse, initSuggest, insertFilePaths } from "./suggest";
+import { dropApprovalDrafts } from "./approval-drafts";
+import { composerDraftsAfterInit } from "./composer-drafts";
 import { REMOTE_CONTROL_COMMAND, parseRemoteControlCommand } from "./remote-control-view";
 import { setFileLinkHostPlatform, setFileLinkSystemAppExtensions } from "../markdown-ast";
 import { handleCopyFilePathResult } from "./markdown";
 import type { ScrollCarry, ViewMode } from "./tab";
+import { adoptAskMarks, onAskMarksFromElsewhere, receiveAskMarks } from "./ask-marks";
 import {
+  HISTORY_REQUEST_TIMEOUT_MS,
   Tab,
   closeLightbox,
   handleSessionImageError,
@@ -80,6 +89,7 @@ import {
   persistAskDismissals,
   savedMessageAskState,
   setOnAskDismissed,
+  setOnAskChecked,
   setOnConvViewShown,
   setOnTabActivity,
 } from "./tab";
@@ -106,21 +116,14 @@ export const MODE_LABELS: Record<PermissionModeId, string> = {
   dontAsk: "DontAsk",
   bypassPermissions: "Bypass",
 };
-export const MODE_ORDER: PermissionModeId[] = [
-  "default",
-  "auto",
-  "acceptEdits",
-  "plan",
-  "dontAsk",
-  "bypassPermissions",
-];
-export const EFFORT_ORDER = ["low", "medium", "high", "xhigh", "max"] as const;
 
 const tabs = new Map<string, Tab>();
 const overviews = new Map<string, WorkOverview>();
 setOnTabActivity((tabId, active) => overviews.get(tabId)?.setActive(active));
 setOnConvViewShown((tabId) => resumeConversationChase(tabId));
 setOnAskDismissed((tabId, identity) => todoTab.noteTabDismissal(tabId, identity));
+setOnAskChecked((tabId, key, steps) => todoTab.noteTabAskCheck(tabId, key, steps));
+onAskMarksFromElsewhere(() => todoTab.rereadAskMarks());
 const localEventDrops = new Map<string, number>();
 const hostDroppedAtInstall = new Map<string, number>();
 export let activeTabId: string | null = vscode.getState()?.activeTabId ?? null;
@@ -132,7 +135,10 @@ const unconfirmedSends = new Map<string, {
   text: string;
   finalText: string;
   context: EditorReference | null;
+  runningNote?: HTMLElement;
 }>();
+const sameEditorReference = (a: EditorReference | null, b: EditorReference | null): boolean =>
+  a !== null && b !== null && a.path === b.path && a.startLine === b.startLine && a.endLine === b.endLine;
 const forgottenTabIds = new Set<string>();
 const TODO_TAB_KEY = "todo";
 const TAB_DRAG_MIME = "application/x-laisora-tab";
@@ -230,7 +236,7 @@ setHistoryTodoOpened((itemId) => { pendingDrawerReveal = { itemId, until: Date.n
 todoTab.onChange(() => {
   for (const t of tabs.values()) t.refreshTodo();
   refreshTodoSplitCards();
-  refreshTodoToolCards(todoTab.storeRevision);
+  refreshTodoToolCards({ enabled: todoTab.enabled, revision: todoTab.storeRevision, readable: todoTab.storeReadable });
   refreshHistList();
   tryPendingDrawerReveal();
 });
@@ -271,10 +277,8 @@ function getOrCreateCoordinator(tabId: string, host: ResumeHostState = "loading"
   return coord;
 }
 
-type PersistedState = Parameters<typeof vscode.setState>[0] & { scrollAnchors?: Record<string, unknown> };
-
 function savedScrollAnchors(): Record<string, unknown> {
-  const saved = (vscode.getState() as PersistedState | undefined)?.scrollAnchors;
+  const saved = vscode.getState()?.scrollAnchors;
   return typeof saved === "object" && saved !== null ? saved : {};
 }
 
@@ -294,8 +298,10 @@ export function persistState(): void {
   const askChecks = { ...(vscode.getState()?.askChecks ?? {}) };
   const askDismissed = { ...(vscode.getState()?.askDismissed ?? {}) };
   const askResolved = { ...(vscode.getState()?.askResolved ?? {}) };
+  const approvalDrafts = { ...(vscode.getState()?.approvalDrafts ?? {}) };
   const out = Object.fromEntries(drafts);
   for (const id of forgottenTabIds) {
+    delete approvalDrafts[id];
     delete views[id];
     delete workViews[id];
     delete askChecks[id];
@@ -307,8 +313,9 @@ export function persistState(): void {
   for (const [id, t] of tabs) views[id] = t.viewMode;
   for (const [id, t] of tabs) workViews[id] = t.workViewMode;
   for (const [id, t] of tabs) scrollAnchors[id] = t.captureScrollCarry(false);
-  const { askDismissedMessages, askResolvedMessages, askCheckedMessages, codeWrap } = vscode.getState() ?? {};
-  const next: PersistedState = { activeTabId: activeTabId ?? todoReturnTabId, drafts: out, views, workViews, scrollAnchors, askChecks, askDismissed, askDismissedMessages, askResolved, askResolvedMessages, askCheckedMessages, codeWrap, todo: todoTab.viewState() };
+  const saved = vscode.getState();
+  const codeWrap = saved?.codeWrap;
+  const next: WebviewState = { ...saved, activeTabId: activeTabId ?? todoReturnTabId, drafts: out, views, workViews, scrollAnchors, askChecks, askDismissed, askResolved, approvalDrafts, codeWrap, todo: todoTab.viewState() };
   vscode.setState(next);
   reportComposerDrafts();
 }
@@ -415,6 +422,7 @@ export function setActiveTab(tabId: string, user = true): void {
     revealActiveTabButton();
     tabs.get(tabId)!.updateStrip();
     refreshComposer();
+    refreshEditorReference();
     resumeConversationChase(tabId);
     resumeWorklogBackfill(tabId);
     autosizeComposer();
@@ -444,6 +452,7 @@ function showTodoTab(): void {
     todoReturnTabId = activeTabId;
   }
   activeTabId = null;
+  vscode.postMessage({ type: "conversationHidden" });
   todoDrawer.setActiveTab(null);
   noteSurfaceChange();
   for (const t of tabs.values()) {
@@ -514,22 +523,46 @@ function clearComposerInput(): void {
   reportComposerDrafts();
 }
 
+const COMPOSER_LOCK_TEXT: Record<ComposerLockReason, () => string> = {
+  handoff: handoffSendLockedText,
+  transcriptWrite: transcriptWriteLockedText,
+};
+
+let renderedComposerLock: ComposerLockReason | null = null;
+
+function renderComposerLock(lock: ComposerLockReason | null): void {
+  const text = lock === null ? "" : COMPOSER_LOCK_TEXT[lock]();
+  if (sendLockEl.textContent !== text) sendLockEl.textContent = text;
+  if (lock !== null && renderedComposerLock === null) {
+    closeSuggest();
+    closeModeMenu();
+    closeAuthPicker();
+    closeUsagePanel();
+  }
+  renderedComposerLock = lock;
+  for (const part of composerLockableEls) {
+    part.inert = lock !== null;
+    part.classList.toggle("composer-locked", lock !== null);
+  }
+}
+
 export function refreshChrome(): void {
   const t = activeTab();
-  const state = t?.turnState ?? "idle";
-  if (state === "idle") {
+  const lock = t === null ? null : composerLockOf(t);
+  const action = composerActionState(t?.turnState ?? "idle", lock !== null);
+  if (action.action === "send") {
     actionBtn.textContent = "➤";
     actionBtn.className = "icon";
     actionBtn.title = l10n.t("Send (Enter)");
     actionBtn.setAttribute("aria-label", l10n.t("Send"));
-    actionBtn.disabled = false;
   } else {
     actionBtn.textContent = "◼";
     actionBtn.className = "icon stop";
     actionBtn.title = l10n.t("Stop");
     actionBtn.setAttribute("aria-label", l10n.t("Stop"));
-    actionBtn.disabled = state === "interrupting";
   }
+  actionBtn.disabled = action.disabled;
+  renderComposerLock(lock);
   convPrevBtn.disabled = t === null;
   convNextBtn.disabled = t === null;
   renderAuth(t);
@@ -785,13 +818,12 @@ function initUsagePanel(): void {
 }
 
 const REPLAY_MAX = 1500;
-const HISTORY_REQUEST_TIMEOUT_MS = 30_000;
 const CONV_FIRST_TRANSCRIPT_TIMEOUT_MS = 120_000;
 const CONV_FIRST_CHUNK_RETRY_MAX = 3;
 const CONV_FIRST_CHUNK_RETRY_DELAY_MS = 2_000;
 
 interface HistoryPager {
-  anchorUuid?: string;
+  anchorUuids?: string[];
   phase?: "events" | "transcript";
   eventAnchor?: { generation: number; seq: number };
   status: "idle" | "inflight" | "exhausted" | "error";
@@ -1048,21 +1080,25 @@ function installConvPager(
   dropConvPager(tabId);
   const coord = resumeCoordinators.get(tabId);
   const eventAnchor = hasDroppedConvEvent ? initialHistoryAnchor(windowed) : undefined;
-  const canTranscript = t.hasReplayedConversation();
-  if (eventAnchor === undefined && !canTranscript) {
+  const anchorUuids = convTranscriptAnchors(t, tabId);
+  if (eventAnchor === undefined && anchorUuids.length === 0) {
     if (coord) coord.convPager = "exhausted";
     return;
   }
   const pager: HistoryPager = {
     status: "idle",
     retried: false,
-    anchorUuid: t.oldestConversationUuid(),
+    anchorUuids,
     phase: eventAnchor !== undefined ? "events" : "transcript",
     eventAnchor,
   };
   convPagers.set(tabId, pager);
   if (coord) coord.convPager = "running";
   startConversationChase(tabId);
+}
+
+function convTranscriptAnchors(t: Tab, tabId: string): string[] {
+  return transcriptAnchorUuids(t.shownConversationRecords(), hostDroppedAtInstall.get(tabId) ?? 0);
 }
 
 function startConversationChase(tabId: string): void {
@@ -1122,8 +1158,8 @@ function requestConversationChunk(tabId: string): void {
   vscode.postMessage(
     pager.cursor !== undefined
       ? { type: "conversationHistoryRequest", tabId, requestId, cursor: pager.cursor }
-      : pager.anchorUuid !== undefined
-        ? { type: "conversationHistoryRequest", tabId, requestId, anchorUuid: pager.anchorUuid }
+      : pager.anchorUuids !== undefined && pager.anchorUuids.length > 0
+        ? { type: "conversationHistoryRequest", tabId, requestId, anchorUuids: pager.anchorUuids }
         : { type: "conversationHistoryRequest", tabId, requestId }
   );
 }
@@ -1206,8 +1242,8 @@ function onConvEventChunkResult(
   }
   pager.cursor = undefined;
   pager.eventAnchor = undefined;
-  pager.anchorUuid = t.oldestConversationUuid();
-  if (t.hasReplayedConversation() && pager.anchorUuid !== undefined) {
+  pager.anchorUuids = convTranscriptAnchors(t, tabId);
+  if (pager.anchorUuids.length > 0) {
     pager.phase = "transcript";
     pager.status = "idle";
     if (pager.autoSteps !== undefined) {
@@ -1294,7 +1330,7 @@ function onConversationHistoryResult(
   refreshFindAfterPrepend(tabId);
   t.realignScrollAnchor("conv");
   const oldest = page.items[0];
-  if (oldest !== undefined) pager.anchorUuid = oldest.uuid;
+  if (oldest !== undefined) pager.anchorUuids = [oldest.uuid];
   if (page.hasMore && page.nextCursor !== undefined) {
     const chase = convChaseContinues(tabId, pager, usedCursor, page, page.items.length);
     pager.cursor = page.nextCursor;
@@ -1322,11 +1358,12 @@ function onConvEventChunkError(tabId: string, reason: string): void {
     return;
   }
   stopConvChase(pager);
-  if (t !== undefined && t.hasReplayedConversation() && t.oldestConversationUuid() !== undefined) {
+  const anchorUuids = t === undefined ? [] : convTranscriptAnchors(t, tabId);
+  if (anchorUuids.length > 0) {
     pager.phase = "transcript";
     pager.cursor = undefined;
     pager.eventAnchor = undefined;
-    pager.anchorUuid = t.oldestConversationUuid();
+    pager.anchorUuids = anchorUuids;
     pager.phaseInitialRemaining = undefined;
     pager.retried = false;
     pager.status = "idle";
@@ -1380,10 +1417,15 @@ function onConversationHistoryError(tabId: string, requestId: string, reason: st
     return;
   }
   stopConvChase(pager);
-  if (reason === "session-unavailable" || reason === "unknown-anchor") {
+  if (reason === "session-unavailable") {
     pager.status = "exhausted";
     finishConvChaseProgress(tabId);
     return;
+  }
+  const t = tabs.get(tabId);
+  if (reason === "unknown-anchor" && t !== undefined) {
+    pager.cursor = undefined;
+    pager.anchorUuids = convTranscriptAnchors(t, tabId);
   }
   pager.status = "error";
   const attempts = pager.receivedTranscriptChunk !== true ? (pager.firstChunkRetries ?? 0) : 1;
@@ -2014,6 +2056,7 @@ function addTab(snap: TabSnapshot, scrollCarry?: ScrollCarry): Tab {
   if (snap.state.workModel === undefined) lastWorkModels.delete(snap.tabId);
   lastSemanticModels.delete(snap.tabId);
   const t = new Tab(snap.tabId, snap.title);
+  t.laisoraPurpose = snap.state.laisoraPurpose === true;
   t.tabBtn.draggable = true;
   t.observeSessionTime(snap.state.semanticModel?.timeBuckets?.firstAt, "session");
   t.observeSessionTime(snap.state.events[0]?.timestamp, "fallback");
@@ -2028,6 +2071,8 @@ function addTab(snap: TabSnapshot, scrollCarry?: ScrollCarry): Tab {
   t.appliedModel = snap.state.appliedModel;
   t.appliedEffort = snap.state.appliedEffort;
   t.recordedModel = snap.state.recordedModel;
+  t.cwd = snap.state.cwd;
+  if (snap.tabId === activeTabId) refreshEditorReference();
   t.permissionMode = snap.state.permissionMode;
   t.commands = snap.state.commands ?? [];
   t.models = snap.state.models ?? [];
@@ -2131,6 +2176,9 @@ function addTab(snap: TabSnapshot, scrollCarry?: ScrollCarry): Tab {
   if (hydration === undefined && welcomeApplies(snap.state.welcome, snap.state.events, snap.state.headOmitted?.hasConvEvent === true)) t.showWelcome(snap.state.welcome);
   t.replaceAutoResumeReservation(snap.state.autoResumeAt ?? null);
   t.setRemoteControl(snap.state.remoteControl);
+  t.handoffSendLocked = snap.state.handoffSendLocked === true;
+  t.transcriptWriteLocked = snap.state.transcriptWriteLocked === true;
+  t.syncAskChoiceLock();
   t.setTurnState(snap.state.turnState);
   const savedView = vscode.getState()?.views?.[snap.tabId];
   if (savedView === "work") t.setViewMode("work", false, false);
@@ -2271,8 +2319,9 @@ function initMessageBus(): void {
         initReceived = true;
         if (initRetryTimer) clearTimeout(initRetryTimer);
         const versionMismatch = msg.protocolVersion !== PROTOCOL_VERSION;
-        setFileLinkHostPlatform(msg.hostWindows ?? true);
+        setFileLinkHostPlatform(msg.hostWindows);
         setFileLinkSystemAppExtensions(msg.systemAppExtensions);
+        if (msg.askMarks !== undefined) adoptAskMarks(msg.askMarks);
         for (const snap of msg.tabs) {
           try {
             addTab(snap, scrollCarries.get(snap.tabId) ?? savedScrollCarry(snap.tabId));
@@ -2307,8 +2356,11 @@ function initMessageBus(): void {
         const preferred = hostChosen ?? activeTabId ?? todoReturnTabId;
         const chosen = preferred && tabs.has(preferred) ? preferred : first;
         if (chosen) {
-          inputEl.value = drafts.get(chosen) ?? "";
-          autosizeComposer();
+          const settled = composerDraftsAfterInit(Object.fromEntries(drafts), activeTabId, chosen, inputEl.value);
+          drafts.clear();
+          for (const [tabId, text] of Object.entries(settled.drafts)) drafts.set(tabId, text);
+          inputEl.value = settled.composer;
+          activeTabId = chosen;
           activateFirstUsableTab(chosen);
         }
         activeTabAfterInit = activeTabId;
@@ -2328,6 +2380,9 @@ function initMessageBus(): void {
         );
         break;
       }
+      case "askMarksChanged":
+        receiveAskMarks(msg.marks, msg.origin);
+        break;
       case "events": {
         const t = tabs.get(msg.tabId);
         if (msg.events.some((event) => event.kind === "conversation_opened")) applyOrchestrationView(msg.tabId, undefined);
@@ -2452,6 +2507,11 @@ function initMessageBus(): void {
         onConversationHistoryError(msg.tabId, msg.requestId, msg.reason);
         break;
       }
+      case "conversationMessageTextResult":
+      case "conversationMessageTextError": {
+        tabs.get(msg.tabId)?.onConversationMessageText(msg);
+        break;
+      }
       case "sessionImageResult": {
         handleSessionImageResult(msg.tabId, msg.requestId, msg.mediaType, msg.data);
         break;
@@ -2534,6 +2594,24 @@ function initMessageBus(): void {
       }
       case "handoffStatus": {
         tabs.get(msg.tabId)?.showHandoffStatus(msg);
+        break;
+      }
+      case "handoffSendLock": {
+        const t = tabs.get(msg.tabId);
+        if (t) {
+          t.handoffSendLocked = msg.locked;
+          t.syncAskChoiceLock();
+          if (activeTabId === msg.tabId) refreshChrome();
+        }
+        break;
+      }
+      case "transcriptWriteLock": {
+        const t = tabs.get(msg.tabId);
+        if (t) {
+          t.transcriptWriteLocked = msg.locked;
+          t.syncAskChoiceLock();
+          if (activeTabId === msg.tabId) refreshChrome();
+        }
         break;
       }
       case "handoffDetail": {
@@ -2624,7 +2702,7 @@ function initMessageBus(): void {
         break;
       }
       case "files": {
-        handleFilesResponse(msg.reqId, msg.paths);
+        handleFilesResponse(msg.reqId, msg.rows);
         break;
       }
       case "pickedFiles": {
@@ -2710,6 +2788,7 @@ function initMessageBus(): void {
         todoDrawer.toggle();
         break;
       case "tabCleared": {
+        if (msg.replaced) dropApprovalDrafts(msg.tab.tabId);
         rebuildTabInPlace(msg.tab, false);
         break;
       }
@@ -2840,8 +2919,8 @@ function initComposer(): void {
     }
   };
   inputEl.addEventListener("keydown", (e) => {
-    if (e.key !== "Enter" || isComposingKey(e)) return;
-    if (e.shiftKey === (composerSendKey() === "shiftEnter")) {
+    if (isComposingKey(e)) return;
+    if (isComposerSendKey(e)) {
       e.preventDefault();
       send();
     }
@@ -3109,9 +3188,13 @@ function initTabbarOverflow(): void {
 
 let editorContext: EditorReference | null = null;
 
+function ctxLocation(ctx: EditorReference): string {
+  const path = composerReferenceText(ctx.path);
+  return ctx.startLine === ctx.endLine ? `${path}:${ctx.startLine}` : `${path}:${ctx.startLine}-${ctx.endLine}`;
+}
+
 function ctxLabel(ctx: EditorReference): string {
-  const loc = ctx.startLine === ctx.endLine ? `${ctx.path}:${ctx.startLine}` : `${ctx.path}:${ctx.startLine}-${ctx.endLine}`;
-  return `📄 ${loc}`;
+  return `📄 ${ctxLocation(ctx)}`;
 }
 
 function renderCtxChip(): void {
@@ -3138,6 +3221,10 @@ function renderCtxChip(): void {
   });
 }
 
+export function refreshEditorReference(): void {
+  if (editorContext) renderCtxChip();
+}
+
 const UNSUPPORTED_TERMINAL_HINT = new Map<string, string>([
   ["/config", l10n.t("Edit ~/.claude/settings.json directly (model and effort can be changed from the chips).")],
 ]);
@@ -3162,7 +3249,7 @@ function send(): void {
   if (text === "/clear") {
     const ct = activeTab();
     if (ct && ct.turnState !== "idle") {
-      ct.addBlock("system warn", l10n.t("Cannot use /clear during a turn. Wait for completion or interrupt, then try again."));
+      ct.addBlock("system warn", clearDuringTurnText());
       return;
     }
     clearComposerInput();
@@ -3194,7 +3281,7 @@ function send(): void {
     persistState();
     const t = activeTab();
     if (t && t.models.length === 0) {
-      t.addBlock("system", l10n.t("Loading models. This may take a few seconds after starting a conversation."));
+      t.addBlock("system", modelsLoadingText());
     } else {
       queueMicrotask(() => openAuthPicker(inputEl));
     }
@@ -3221,10 +3308,10 @@ function send(): void {
       queueMicrotask(() => openAuthPicker(inputEl, "effort"));
     } else if (arg === "default") {
       if (activeTabId) vscode.postMessage({ type: "setEffort", tabId: activeTabId, effort: null });
-    } else if ((EFFORT_ORDER as readonly string[]).includes(arg)) {
+    } else if (isOrchestrationEffort(arg)) {
       if (activeTabId) vscode.postMessage({ type: "setEffort", tabId: activeTabId, effort: arg });
     } else {
-      t?.addBlock("system warn", l10n.t("Usage: /effort <{0}|default>", EFFORT_ORDER.join("|")));
+      t?.addBlock("system warn", l10n.t("Usage: /effort <{0}|default>", CLAUDE_EFFORTS.join("|")));
     }
     return;
   }
@@ -3242,7 +3329,7 @@ function send(): void {
     persistState();
     const title = (rename[1] ?? "").split("\n")[0].trim();
     if (!title) {
-      t.addBlock("system warn", l10n.t("Usage: /rename <new name>"));
+      t.addBlock("system warn", renameUsageText());
     } else if (title.length > RENAME_TITLE_MAX) {
       t.addBlock("system warn", l10n.t("The name is too long (maximum {0} characters).", RENAME_TITLE_MAX));
     } else if (activeTabId) {
@@ -3264,24 +3351,16 @@ function send(): void {
   persistState();
   const t = activeTab();
   t?.clearCancelledHandoffNotice();
+  let runningNote: HTMLElement | undefined;
   if (t && !running) {
     t.pendingSend = true;
     t.setTurnState("running");
   } else if (t && running) {
-    t.addBlock("system", l10n.t("Added to the running turn"));
+    runningNote = t.addBlock("system", l10n.t("Added to the running turn"));
   }
   const shown = attachmentsOf(activeTabId);
   const images = shown.length > 0 ? shown.map((im) => ({ mediaType: im.mediaType, data: im.data })) : undefined;
-  const finalText = editorContext
-    ? `${l10n.t(
-        "Reference: {0}",
-        `${editorContext.path}:${
-          editorContext.startLine === editorContext.endLine
-            ? editorContext.startLine
-            : `${editorContext.startLine}-${editorContext.endLine}`
-        }`
-      )}\n${text}`
-    : text;
+  const finalText = editorContext ? `${l10n.t("Reference: {0}", ctxLocation(editorContext))}\n${text}` : text;
   const context = editorContext;
   editorContext = null;
   renderCtxChip();
@@ -3289,12 +3368,13 @@ function send(): void {
   const clientToken = crypto.randomUUID();
   const bubble = t?.renderOptimisticUserBubble(finalText, clientToken, images);
   if (bubble && coord && coord.host === "loading") coord.convTouched = true;
-  unconfirmedSends.set(clientToken, { tabId: activeTabId, text, finalText, context });
+  unconfirmedSends.set(clientToken, { tabId: activeTabId, text, finalText, context, runningNote });
   vscode.postMessage({ type: "send", tabId: activeTabId, text: finalText, clientToken });
 }
 
 function settleSendDisposition(tabId: string, disp: SendDisposition): void {
   const t = tabs.get(tabId);
+  if (disp.disposition === "rejected") t?.settleRejectedSend();
   if (disp.disposition === "rejected" || disp.disposition === "accepted-nonhuman") {
     t?.removeOptimisticBubble(disp.clientToken);
   } else {
@@ -3303,12 +3383,15 @@ function settleSendDisposition(tabId: string, disp: SendDisposition): void {
   const sent = unconfirmedSends.get(disp.clientToken);
   unconfirmedSends.delete(disp.clientToken);
   if (disp.disposition !== "rejected" || sent === undefined || !tabs.has(sent.tabId)) return;
-  const chipRestored = sent.context !== null && editorContext === null && activeTabId === sent.tabId;
+  sent.runningNote?.remove();
+  const onSentTab = sent.context !== null && activeTabId === sent.tabId;
+  const chipRestored = onSentTab && editorContext === null;
   if (chipRestored) {
     editorContext = sent.context;
     renderCtxChip();
   }
-  const text = chipRestored ? sent.text : sent.finalText;
+  const chipCarriesReference = chipRestored || onSentTab && sameEditorReference(editorContext, sent.context);
+  const text = chipCarriesReference ? sent.text : sent.finalText;
   if (text === "") return;
   const current = activeTabId === sent.tabId ? inputEl.value : drafts.get(sent.tabId) ?? "";
   const restored = current.trim() === "" ? text : `${text}\n${current}`;

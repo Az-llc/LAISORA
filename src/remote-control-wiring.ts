@@ -234,7 +234,7 @@ export function requestRemoteControlAuto(s: Session, cause: RemoteControlAutoCau
   const cli = cliFor(s, conv);
   const step = remoteControlAutoStep(s.remoteControl.choice, cli, cause);
   if (step === "none") return;
-  output.appendLine(`[${s.title}] Remote Control: turning it ${step} ${step === "on" ? "for a mobile notification" : "after input in LAISORA"}`);
+  output.appendLine(`[${s.title}] Remote Control: turning it ${step} ${step === "on" ? "for a mobile notification" : cause === "handedOff" ? "after the handoff carried its wait" : "after input in LAISORA"}`);
   if (step === "on") void setRemoteControl(s, true, "notify");
   else {
     const off = forceOff(s, cli);

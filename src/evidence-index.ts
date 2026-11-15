@@ -6,7 +6,7 @@ import { progressSubjectKey } from "./progress-protocol";
 import type { HostArtifactAccess } from "./artifact-access";
 import { PROGRESS_WIRE_TOOL_NAME } from "./artifact-access";
 import type { TaskIntent, TaskStatus } from "./work-model";
-import { bookkeepingIntent, CLAUDE_VOCABULARY, taskCreateKeyFromResult } from "./work-model";
+import { bookkeepingIntent, CLAUDE_VOCABULARY, countsAsPlanIntent, taskCreateKeyFromResult } from "./work-model";
 import { isPureCommandWrapper } from "./human-input-vocabulary";
 import { redactAbsolutePaths } from "./path-redaction";
 import { isRejectedBeforeRun } from "./tool-result-signals";
@@ -129,6 +129,7 @@ export interface SemanticEvidenceIndex {
   humanMessageTimes: number[];
   firstHumanMessageLine?: string;
   firstHumanMessageText?: string;
+  firstHumanMessageUuid?: string;
   timeBuckets: TimeBucketState;
   execLogMarks: ExecLogMarkState;
   longGaps: LongGapRecord[];
@@ -348,7 +349,9 @@ function classifyGapEvent(
     case "turn_completed":
       return { canEnd: true, canStart: false, turnId: event.turnId ?? null };
     case "turn_started":
+      return { canEnd: false, canStart: true, turnId: event.turnId ?? null };
     case "user_message":
+      if (event.absorbedInto !== undefined) return null;
       return { canEnd: false, canStart: true, turnId: event.turnId ?? null };
     case "tool_call_finished":
       if (openSidechainToolUseIds.includes(event.toolUseId)) return null;
@@ -470,6 +473,11 @@ function foldGapScan(
   };
 }
 
+export function clearCancelledFirstHumanMessage(index: SemanticEvidenceIndex, uuid: string): SemanticEvidenceIndex {
+  if (index.firstHumanMessageUuid !== uuid) return index;
+  return { ...index, firstHumanMessageLine: undefined, firstHumanMessageText: undefined, firstHumanMessageUuid: undefined, hash: "" };
+}
+
 export function foldEvidence(
   index: SemanticEvidenceIndex,
   event: NormalizedEvent,
@@ -556,11 +564,13 @@ function foldEvidenceBody(
     }
     let firstHumanMessageLine = index.firstHumanMessageLine;
     let firstHumanMessageText = index.firstHumanMessageText;
+    let firstHumanMessageUuid = index.firstHumanMessageUuid;
     if (firstHumanMessageLine === undefined && typeof event.text === "string" && event.text.trim() !== "") {
       firstHumanMessageText = redactAbsolutePaths(event.text.trim()).slice(0, 2000);
       firstHumanMessageLine = event.text.trim().split(/\r?\n/, 1)[0].slice(0, 200);
+      firstHumanMessageUuid = event.uuid;
     }
-    return { ...index, humanMessageTimes, firstHumanMessageLine, firstHumanMessageText, hash: "" };
+    return { ...index, humanMessageTimes, firstHumanMessageLine, firstHumanMessageText, firstHumanMessageUuid, hash: "" };
   }
 
   if (event.kind !== "tool_call_started") {
@@ -576,7 +586,7 @@ function foldEvidenceBody(
   const { activeTaskKeyAtStart, activeAmbiguousAtStart } = activeTaskState(summaryMap);
 
   let pendingIntents = index.pendingIntents;
-  const intent = bookkeepingIntent(event);
+  const intent = countsAsPlanIntent(parentToolUseId) ? bookkeepingIntent(event) : undefined;
   if (intent) {
     pendingIntents = { ...pendingIntents, [toolUseId]: { intent } };
     const keys = Object.keys(pendingIntents);

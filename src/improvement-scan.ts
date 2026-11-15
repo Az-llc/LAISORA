@@ -7,10 +7,14 @@ import readline from "node:readline";
 import { claudeSettingsFiles } from "./claude-env";
 import {
   IMPROVEMENT_CANDIDATE_RETRY_WINDOW as CANDIDATE_RETRY_WINDOW, IMPROVEMENT_INDEX_LOCATIONS as INDEX_LOCATIONS, IMPROVEMENT_MIN_CONVERSATIONS, IMPROVEMENT_RETRY_WINDOW as RETRY_WINDOW, IMPROVEMENT_TOOL_FILE,
-  VERDICT_KINDS, isImprovementFirstMessage, lastVerdictsBlock, parseVerdicts, type ImprovementVerdict,
+  VERDICT_KINDS, isImprovementFirstMessage, lastVerdictsBlock, startsWithImprovementFirstMessage, parseVerdicts, type ImprovementVerdict,
 } from "./improvement-brief";
 import { parseLaisoraInput } from "./laisora-input";
-import { classifyToolFailure, isShellTool, stripToolUseErrorTags, type ToolFailureKind, type ToolFailureRecord } from "./tool-result-signals";
+import { HOOK_DENIAL_EVENT, classifyToolFailure, stripToolUseErrorTags, type ToolFailureKind, type ToolFailureRecord } from "./tool-result-signals";
+import { isShellTool, toolDialect } from "./shell-tools";
+import { escapeRegExp } from "./regexp-escape";
+import { FILE_TARGET_TOOL_SET, isFileChangingTool } from "./file-writing-tools";
+import { agentIdOfTranscriptName, forkCopiedLineCount, forkLaunchOf, readSubagentMetaSync, subagentMetaPathOf, SUBAGENTS_DIR_NAME, withoutForkLaunchAnswer, type ForkLaunch } from "./subagent-files";
 import { ASK_UNANSWERED_KINDS, askUnansweredQuestions, type AskUnansweredKind } from "./ask-unanswered";
 import { singleToolUseResult } from "./edit-summary";
 
@@ -70,6 +74,7 @@ export interface ScanPattern {
   site?: string;
   siteStrong?: boolean;
   script?: string;
+  candidates?: HookRegistration[];
   variants: Map<string, { count: number; first: string | null; last: string | null }>;
   durationsSec: number[];
   backgrounded: number;
@@ -219,7 +224,7 @@ export function splitCommand(cmd: string, tool = "Bash"): CommandSegment[] {
 }
 
 function splitUncached(cmd: string, tool: string): CommandSegment[] {
-  const pwsh = tool === "PowerShell";
+  const pwsh = toolDialect(tool) === "powershell";
   const flat = pwsh ? cmd.replace(/`\r?\n/g, " ") : cmd.replace(HEREDOC_RE, "<<$1$2");
   const escape = pwsh ? "`" : "\\";
   const out: CommandSegment[] = [];
@@ -305,12 +310,12 @@ function segmentWord(seg: string): string {
   return path.basename(rawWord(seg).replace(/^["']|["']$/g, "")).replace(/\.exe$/i, "");
 }
 
-const isEchoSegment = (seg: string, tool: string): boolean => ECHO_PROGRAMS.has(segmentWord(seg)) || (tool === "PowerShell" && /^["']/.test(segmentBody(seg)));
+const isEchoSegment = (seg: string, tool: string): boolean => ECHO_PROGRAMS.has(segmentWord(seg)) || (toolDialect(tool) === "powershell" && /^["']/.test(segmentBody(seg)));
 
 function isProgramSegment(seg: string, tool = "Bash"): boolean {
   const body = segmentBody(seg);
   if (!body || /^[A-Za-z_][A-Za-z0-9_]*=/.test(body)) return false;
-  if (tool === "PowerShell" && /^["']/.test(body)) return false;
+  if (toolDialect(tool) === "powershell" && /^["']/.test(body)) return false;
   const raw = rawWord(seg).replace(/^["']|["']$/g, "");
   if (!raw || /^[$(\d-]/.test(raw)) return false;
   return !NOT_A_PROGRAM_RE.test(segmentWord(seg));
@@ -361,7 +366,7 @@ function statusOwnerBefore(segs: readonly CommandSegment[], i: number, ref: stri
   }
   for (let k = end; k >= start; k--) {
     const w = segmentWord(segs[k].text);
-    if (k > start && (TRANSPARENT_FILTERS.has(w) || (tool === "PowerShell" && isCmdlet(w)))) continue;
+    if (k > start && (TRANSPARENT_FILTERS.has(w) || (toolDialect(tool) === "powershell" && isCmdlet(w)))) continue;
     return k;
   }
   return end;
@@ -371,7 +376,6 @@ export interface StatusEcho { readonly re: RegExp; readonly owners: readonly (nu
 
 const ECHO_TOKEN_RE = /\$\{[^}]*\}|\$\([^)]*\)|\$(?:env:)?[A-Za-z_]\w*(?:\[\d+\])?|\$\?|["']|\s+|[^$"'\s]+|\$/g;
 const LOOP_VAR_RE = /^(?:for\s+([A-Za-z_]\w*)\s+in\b|foreach\s*\(\s*\$([A-Za-z_]\w*)\s+in\b)/;
-const escapeRe = (s: string): string => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 
 export function statusEchoes(cmd: string, tool: string, segs: readonly CommandSegment[] = splitCommand(cmd, tool)): StatusEcho[] {
   const vars = new Map<string, number | undefined>();
@@ -400,7 +404,7 @@ export function statusEchoes(cmd: string, tool: string, segs: readonly CommandSe
       if (name !== undefined && vars.has(name)) { parts.push("(-?\\d+)"); owners.push(vars.get(name)); loopVars.push(undefined); continue; }
       if (name !== undefined && loopNames.has(name)) { parts.push("(.*?)"); owners.push(undefined); loopVars.push(name); continue; }
       if (tok.startsWith("$")) { parts.push(".*?"); continue; }
-      parts.push(escapeRe(tok));
+      parts.push(escapeRegExp(tok));
       literal = true;
     }
     if (!owners.some((o, g) => o !== undefined || loopVars[g] === undefined)) return;
@@ -549,7 +553,7 @@ export function attributeFailure(cmd: unknown, tool: string, text: string, fromO
   if (diag) return at(diag.segment);
   const transparent = (i: number): boolean => {
     const w = segmentWord(segs[i].text);
-    if (TRANSPARENT_FILTERS.has(w) || (tool === "PowerShell" && isCmdlet(w))) return true;
+    if (TRANSPARENT_FILTERS.has(w) || (toolDialect(tool) === "powershell" && isCmdlet(w))) return true;
     return fromOutput && OUTPUT_FILTERS.has(w) && segs[i].sep === "|";
   };
   const working = progs.filter((i) => !transparent(i));
@@ -915,7 +919,7 @@ function shellOrMcpSignals(t: string, tool: string, input: unknown): MaskedSigna
         const otherDiagnostic = (l: string): boolean => { const n = DIAGNOSTIC_LINE_RE.exec(l)?.[1]?.replace(SCRIPT_EXT_RE, ""); return n !== undefined && names.has(n) && names.get(n) !== f.segment; };
         const reason = printedReason(lines, echoLines, f.line, (l) => !otherDiagnostic(l));
         const script = scriptRef(resolved, f.segment);
-        const statusLine = Object.values(f.loopValues).filter(Boolean).reduce((l, v) => l.replace(new RegExp(`(?<![\\w.-])${escapeRe(v)}(?![\\w.-])`, "g"), "<item>"), lines[f.line].trim());
+        const statusLine = Object.values(f.loopValues).filter(Boolean).reduce((l, v) => l.replace(new RegExp(`(?<![\\w.-])${escapeRegExp(v)}(?![\\w.-])`, "g"), "<item>"), lines[f.line].trim());
         return { marker: "printed-status", owner: `cmd:${ownerKey}`, reason: norm(reason ?? statusLine).slice(0, MASKED_REASON_CHARS), ...(script ? { script } : {}) };
       });
     }
@@ -1045,12 +1049,10 @@ export function notificationSignal(n: TaskNotification, use: { name: string; inp
 const RECOVERY_WINDOW = 15;
 const isTaskSwitch = (u: ToolUse): boolean => u.name === "TaskCreate" || (u.name === "TaskUpdate" && (u.input as { status?: unknown } | undefined)?.status === "completed");
 const EXPLORE_TOOLS = new Set(["Read", "Grep", "Glob", "LS", "NotebookRead"]);
-const FILE_TOOLS = new Set(["Edit", "Write", "MultiEdit", "NotebookEdit", "Read"]);
-
 function useKeys(u: ToolUse): Set<string> {
   if (u.keys) return u.keys;
   const input = (u.input ?? {}) as { file_path?: unknown; notebook_path?: unknown };
-  u.keys = isShellTool(u.name) ? retryKeys(u.input, u.name) : FILE_TOOLS.has(u.name) ? new Set([`file:${String(input.file_path ?? input.notebook_path ?? "")}`]) : new Set([`tool:${u.name}`]);
+  u.keys = isShellTool(u.name) ? retryKeys(u.input, u.name) : FILE_TARGET_TOOL_SET.has(u.name) ? new Set([`file:${String(input.file_path ?? input.notebook_path ?? "")}`]) : new Set([`tool:${u.name}`]);
   return u.keys;
 }
 
@@ -1116,10 +1118,11 @@ export function isImprovementRecord(rec: Record<string, any>): boolean {
   if (rec.type !== "user") return false;
   const content = rec.message?.content;
   const texts = typeof content === "string" ? [content] : Array.isArray(content) ? content.filter((b: any) => b?.type === "text" && typeof b.text === "string").map((b: any) => b.text as string) : [];
-  return texts.some((t) => parseLaisoraInput(t)?.input.kind === "improvement" || isImprovementFirstMessage(t));
+  if (texts.some((t) => parseLaisoraInput(t)?.input.kind === "improvement" || isImprovementFirstMessage(t))) return true;
+  return Array.isArray(content) && content.some((b: any) => b?.type === "tool_result" && !b.is_error && startsWithImprovementFirstMessage(textOf(b.content)));
 }
 
-interface FileEntry { full: string; session: string; label: string; ref: string; isFork: boolean; depth: number; parentAgentId?: string }
+interface FileEntry { full: string; session: string; label: string; ref: string; isFork: boolean; forkLaunch?: ForkLaunch; parentAgentId?: string }
 
 async function* jsonLines(file: string, stats: ScanStats, limit = Infinity): AsyncGenerator<{ lineNo: number; rec: Record<string, any> | undefined }> {
   const rl = readline.createInterface({ input: fs.createReadStream(file, { encoding: "utf8" }), crlfDelay: Infinity });
@@ -1139,13 +1142,11 @@ async function* jsonLines(file: string, stats: ScanStats, limit = Infinity): Asy
   }
 }
 
-function forkMeta(full: string): { isFork: boolean; depth: number; parentAgentId?: string } {
-  try {
-    const m = JSON.parse(fs.readFileSync(full.replace(/\.jsonl$/, ".meta.json"), "utf8"));
-    return { isFork: m.isFork === true, depth: typeof m.spawnDepth === "number" ? m.spawnDepth : 1, ...(typeof m.parentAgentId === "string" ? { parentAgentId: m.parentAgentId } : {}) };
-  } catch {
-    return { isFork: false, depth: 0 };
-  }
+function forkMeta(full: string): { isFork: boolean; forkLaunch?: ForkLaunch; parentAgentId?: string } {
+  const m = readSubagentMetaSync(subagentMetaPathOf(full), (p) => fs.readFileSync(p, "utf8"));
+  if (m === null) return { isFork: false };
+  const forkLaunch = forkLaunchOf(m);
+  return { isFork: m.isFork === true, ...(forkLaunch === undefined ? {} : { forkLaunch }), ...(typeof m.parentAgentId === "string" ? { parentAgentId: m.parentAgentId } : {}) };
 }
 
 export function listTranscriptFiles(projectsDir: string): FileEntry[] {
@@ -1158,11 +1159,11 @@ export function listTranscriptFiles(projectsDir: string): FileEntry[] {
       const full = path.join(pdir, ent.name);
       if (ent.isFile() && ent.name.endsWith(".jsonl")) {
         const session = ent.name.replace(/\.jsonl$/, "");
-        out.push({ full, session, label: "parent", ref: `${session.slice(0, 8)}:parent`, isFork: false, depth: 0 });
+        out.push({ full, session, label: "parent", ref: `${session.slice(0, 8)}:parent`, isFork: false });
       } else if (ent.isDirectory()) {
-        const sub = path.join(full, "subagents");
+        const sub = path.join(full, SUBAGENTS_DIR_NAME);
         for (const f of dirents(sub)) {
-          if (!f.isFile() || !f.name.endsWith(".jsonl")) continue;
+          if (!f.isFile() || agentIdOfTranscriptName(f.name) === undefined) continue;
           const fileFull = path.join(sub, f.name);
           out.push({ full: fileFull, session: ent.name, label: f.name, ref: `${ent.name.slice(0, 8)}:${f.name.replace(/\.jsonl$/, "")}`, ...forkMeta(fileFull) });
         }
@@ -1312,6 +1313,20 @@ export function matcherToolTokens(event: string, matcher: string): string[] {
   const parts = matcher.split(EXACT_LIST_MATCHER_RE.test(matcher) ? /[|,\s]+/ : "|");
   return [...new Set(parts.map((t) => t.trim()).filter((t) => TOOL_NAME_TOKEN_RE.test(t)))];
 }
+
+export function matcherCoversTool(matcher: string, tool: string): boolean {
+  const m = matcher.trim();
+  if (!m || m === "*") return true;
+  if (EXACT_LIST_MATCHER_RE.test(m)) return m.split(/[|,\s]+/).includes(tool);
+  try { return new RegExp(m).test(tool); } catch { return false; }
+}
+
+export function hookCandidates(tools: readonly string[], registrations: readonly HookRegistration[]): HookRegistration[] {
+  return tools.length ? registrations.filter((r) => r.event === HOOK_DENIAL_EVENT && tools.every((t) => matcherCoversTool(r.matcher, t))) : [];
+}
+
+export const UNRESOLVED_OWNER = "unresolved";
+export const isUnresolvedOwner = (owner: string): boolean => owner === UNRESOLVED_OWNER || owner.startsWith(`${UNRESOLVED_OWNER} [`);
 
 export function matcherLeads(registrations: readonly HookRegistration[], seenToolNames: ReadonlySet<string>): MatcherLead[] {
   const byToken = new Map<string, HookRegistration[]>();
@@ -1633,9 +1648,9 @@ export function resolveHookOwner(refusal: string, sources: readonly HookSource[]
   if (tag) {
     const byName = sources.filter((s) => !s.laisora && path.basename(s.path).toLowerCase().includes(tag.toLowerCase()));
     if (byName.length) return { owner: byName[0].path, sources: byName.map((s) => s.path) };
-    return { owner: `unresolved [${tag}]`, sources: [] };
+    return { owner: `${UNRESOLVED_OWNER} [${tag}]`, sources: [] };
   }
-  return { owner: "unresolved", sources: [] };
+  return { owner: UNRESOLVED_OWNER, sources: [] };
 }
 
 type PatternBase = Classified | { kind: "candidate" | "slow"; owner: string; detail: string; sample: string; uncertain?: string; script?: string };
@@ -1681,7 +1696,7 @@ export async function scanTranscripts(opts: ScanOptions): Promise<ScanResult> {
   stats.excludedImprovementSessions = excluded.size;
   const previous = await earlierVerdicts(fileList.filter((f) => f.label === "parent" && excluded.has(f.session)));
   const excludedAgents = new Set<string>();
-  const agentId = (f: FileEntry): string => f.label.replace(/^agent-|\.jsonl$/g, "");
+  const agentId = (f: FileEntry): string => agentIdOfTranscriptName(f.label) ?? f.label;
   const subagents = fileList.filter((x) => x.label !== "parent" && !excluded.has(x.session));
   for (const f of subagents) {
     try {
@@ -1705,18 +1720,23 @@ export async function scanTranscripts(opts: ScanOptions): Promise<ScanResult> {
   const credited = new Set<string>();
   const cwds = new Set<string>();
   const checks = files.map((_, i) => ({ i, raw: 0, credited: 0, creditedFromForkCopy: 0, readable: true }));
-  const originOrder = files.map((_, i) => i).sort((a, b) => Number(files[a].isFork) - Number(files[b].isFork) || files[a].depth - files[b].depth);
+  const copiedLines = files.map((f) => {
+    if (f.forkLaunch === undefined) return 0;
+    try { return forkCopiedLineCount(fs.readFileSync(f.full, "utf8").split("\n"), f.forkLaunch).copied; } catch { return 0; }
+  });
+  const ownRecord = (i: number, lineNo: number, rec: Record<string, any> | undefined): Record<string, any> | undefined =>
+    rec === undefined || lineNo <= copiedLines[i] ? undefined : withoutForkLaunchAnswer(rec, files[i].forkLaunch);
   const scratch: ScanStats = { ...stats };
-  for (const i of originOrder) {
+  for (let i = 0; i < files.length; i++) {
     const f = files[i];
     try {
-      for await (const { rec } of jsonLines(f.full, scratch)) {
+      for await (const { lineNo, rec: line } of jsonLines(f.full, scratch)) {
+        const rec = ownRecord(i, lineNo, line);
         if (!rec || rec.forkedFrom) continue;
         if (typeof rec.cwd === "string" && cwds.size < 500) cwds.add(rec.cwd);
         const k = dedupKeyOf(rec);
-        const fresh = k !== undefined && !origin.has(k);
-        if (fresh) origin.set(k!, i);
-        if (!f.isFork || fresh) checks[i].raw += errorBlocks(rec);
+        if (k !== undefined && !origin.has(k)) origin.set(k, i);
+        checks[i].raw += errorBlocks(rec);
       }
     } catch {
       checks[i].readable = false;
@@ -1761,8 +1781,13 @@ export async function scanTranscripts(opts: ScanOptions): Promise<ScanResult> {
     };
     try {
       stats.bytes += fs.statSync(f.full).size;
-      for await (const { lineNo, rec } of jsonLines(f.full, stats)) {
+      for await (const { lineNo, rec: line } of jsonLines(f.full, stats)) {
         stats.lines++;
+        if (line && lineNo <= copiedLines[i]) {
+          if (dedupKeyOf(line) !== undefined) stats.duplicateRecords++;
+          continue;
+        }
+        const rec = ownRecord(i, lineNo, line);
         if (!rec) continue;
         const dedupKey = dedupKeyOf(rec);
         const content = rec.message?.content;
@@ -1911,6 +1936,7 @@ export async function scanTranscripts(opts: ScanOptions): Promise<ScanResult> {
       ? { owner: p.owner, sources: [p.owner], ...(fixedSite ? { site: fixedSite.site, siteStrong: fixedSite.strong } : {}) }
       : resolveHookOwner(p.sample, sources);
     p.owner = r.owner;
+    if (p.kind === "hook_denial" && isUnresolvedOwner(r.owner)) p.candidates = hookCandidates([...p.tools.keys()], registrations);
     if (r.site) { p.site = r.site; p.siteStrong = r.siteStrong === true; }
     let g = groups.get(r.owner);
     if (!g) groups.set(r.owner, (g = { owner: r.owner, sources: new Set(), patterns: [] }));
@@ -2125,7 +2151,7 @@ function pathKind(file: unknown): string {
 
 export function commandShape(tool: string, input: unknown): string {
   const inp = (input ?? {}) as { command?: unknown; file_path?: unknown; notebook_path?: unknown };
-  if (/^(?:Edit|Write|MultiEdit|NotebookEdit)$/.test(tool)) return `${tool} ${pathKind(inp.file_path ?? inp.notebook_path)}`;
+  if (isFileChangingTool(tool)) return `${tool} ${pathKind(inp.file_path ?? inp.notebook_path)}`;
   if (!isShellTool(tool) || typeof inp.command !== "string") return tool;
   const cmd = inp.command;
   const segs = splitCommand(cmd, tool);
@@ -2148,6 +2174,23 @@ function shapeLine(ps: readonly ScanPattern[]): string | undefined {
   if (all.size < 2) return undefined;
   const ranked = [...all].sort((a, b) => b[1].count - a[1].count);
   return `  - stopped operations (${all.size} shapes): ${ranked.slice(0, SHAPES_SHOWN).map(([k, v]) => `${md(k)} ×${v.count} at ${v.ref}`).join("; ")}${ranked.length > SHAPES_SHOWN ? `; ${ranked.length - SHAPES_SHOWN} more` : ""}`;
+}
+
+function candidateLines(ps: readonly ScanPattern[]): string[] {
+  const byRoute = new Map<string, { tools: string[]; candidates: readonly HookRegistration[]; ids: string[] }>();
+  for (const p of ps) {
+    if (!p.candidates) continue;
+    const tools = [...p.tools.keys()].sort();
+    const key = `${tools.join("|")}>${p.candidates.map((c) => c.id).join(",")}`;
+    const route = byRoute.get(key) ?? { tools, candidates: p.candidates, ids: [] };
+    route.ids.push(p.id);
+    byRoute.set(key, route);
+  }
+  return [...byRoute.values()].map((r) => {
+    const scripts = (c: HookRegistration): string => (c.scripts.length ? c.scripts.map((s) => `\`${md(s.path)}\``).join(", ") : `\`${md(c.command || c.content)}\``);
+    const named = r.candidates.length ? r.candidates.map((c) => `${c.id} ${scripts(c)}`).join("; ") : "no registration on that event covers these tools in the settings files read";
+    return `- stopped on ${HOOK_DENIAL_EVENT}:${r.tools.map(md).join(", ")} (${r.ids.join(", ")}) — candidates: ${named}`;
+  });
 }
 
 function gateLines(gate: HookGate): string[] {
@@ -2438,9 +2481,11 @@ export function renderIndex(r: ScanResult, ctx: IndexContext): string {
   r.hookGroups.forEach((g) => {
     const ps = g.patterns;
     const retried = ps.reduce((n, p) => n + p.retries, 0);
-    out.push(`### ${g.id} ${md(g.owner)} — ${total(ps)} stops in ${convs(ps)} conversations, retried ${retried}${prevNote(g.id)}`);
-    out.push(g.sources.length ? `source: ${g.sources.map(md).join(", ")}` : "source: not resolved (search the hook scripts and settings files listed at the end for the refusal text)");
+    const unresolved = isUnresolvedOwner(g.owner);
+    out.push(`### ${g.id} ${md(unresolved ? g.owner.replace(UNRESOLVED_OWNER, "refusal text not found in the hook scripts read") : g.owner)} — ${total(ps)} stops in ${convs(ps)} conversations, retried ${retried}${prevNote(g.id)}`);
+    out.push(g.sources.length ? `source: ${g.sources.map(md).join(", ")}` : "source: no hook script read contains the refusal text (the hook was reworded since, builds the text from variables, or is not among the files read, for example a plugin's hook). \"stopped on\" below names the event and the tools of the stops with the registrations on that event whose matcher covers those tools: candidates, not proof. Search those scripts and the settings files listed at the end for the refusal text.");
     for (const gate of g.gates) out.push(...gateLines(gate));
+    if (unresolved) out.push(...candidateLines(ps));
     out.push("");
   });
 

@@ -18,7 +18,6 @@ import {
   isNetworkOrDevicePath,
   isWindowsDevicePath,
   isWindowsDriveRelativePath,
-  isWindowsUncPath,
   parseFileLinkTarget,
   type FileLinkTarget,
 } from "./file-link-target";
@@ -28,6 +27,7 @@ import {
   IMAGE_MAX_BASE64_LEN,
   PICKED_FILE_MAX_COUNT,
   isHistoryEvent,
+  type FileSuggestRow,
   type ImageAttachment,
   type NormalizedEvent,
   type NormalizedEventBody,
@@ -40,8 +40,19 @@ import { readSessionHistory } from "./session-transcript";
 import type { SessionStore } from "./store-surfaces";
 import { appendRecordPart, joinRecordTexts, withoutRetracted, type RecordTextPart } from "./commit-boundary";
 import { accountErrorText, type AccountAuthSource } from "./account-error";
+import { fileRowMatchesQuery } from "./file-query";
+import { composerFileReference, insideCwdReference } from "./composer-file-reference";
+import { HOST_FILE_LINK_PLATFORM } from "./host-platform";
 
-function createExportSink(lines: string[], userHeading: string, auth: AccountAuthSource): {
+function fileLinkRefusedText(): string {
+  return l10n.t("LAISORA: This file link cannot be opened.");
+}
+
+function fileNotFoundText(): string {
+  return l10n.t("LAISORA: The file was not found.");
+}
+
+export function createExportSink(lines: string[], userHeading: string, auth: AccountAuthSource): {
   push: (ev: NormalizedEventBody) => void;
   finish: () => void;
 } {
@@ -71,6 +82,7 @@ function createExportSink(lines: string[], userHeading: string, auth: AccountAut
   const push = (ev: NormalizedEventBody): void => {
     switch (ev.kind) {
       case "user_message":
+        if (ev.cancelled === true) break;
         flush();
         out.push(userHeading, "", userBody(ev.text, (ev.images?.length ?? 0) + (ev.imageRefs?.length ?? 0)), "");
         break;
@@ -223,16 +235,20 @@ async function buildExportMarkdown(s: Session): Promise<string> {
   return lines.join("\n");
 }
 
-let fileCache: { at: number; paths: string[] } | null = null;
-async function findWorkspaceFiles(query: string): Promise<string[]> {
+let fileCache: { at: number; files: Array<{ path: string; workspaceRelative: string }> } | null = null;
+async function findWorkspaceFiles(query: string, cwd: string): Promise<FileSuggestRow[]> {
   if (!fileCache || Date.now() - fileCache.at > 30_000) {
     const uris = await vscode.workspace.findFiles("**/*", "**/{node_modules,dist,.git}/**", 3000);
-    fileCache = { at: Date.now(), paths: uris.map((u) => vscode.workspace.asRelativePath(u)) };
+    fileCache = { at: Date.now(), files: uris.map((u) => ({ path: u.fsPath, workspaceRelative: vscode.workspace.asRelativePath(u) })) };
   }
-  const q = query.toLowerCase();
-  return fileCache.paths
-    .filter((p) => p.toLowerCase().includes(q))
-    .sort((a, b) => a.length - b.length)
+  return fileCache.files
+    .map((file): FileSuggestRow => ({
+      text: composerFileReference(file.path, cwd, HOST_FILE_LINK_PLATFORM),
+      workspaceRelative: file.workspaceRelative,
+      insideCwd: insideCwdReference(file.path, cwd, HOST_FILE_LINK_PLATFORM) !== undefined,
+    }))
+    .filter((row) => fileRowMatchesQuery(row, query))
+    .sort((a, b) => Number(b.insideCwd) - Number(a.insideCwd) || a.workspaceRelative.length - b.workspaceRelative.length)
     .slice(0, 20);
 }
 
@@ -266,7 +282,7 @@ async function pickComposerFiles(
       } catch {}
     }
     if (paths.length >= PICKED_FILE_MAX_COUNT) continue;
-    paths.push(vscode.workspace.asRelativePath(uri));
+    paths.push(uri.fsPath);
   }
   return { paths, images };
 }
@@ -275,14 +291,11 @@ export function postAttachments(st: SessionStore, tabId: string): void {
   st.post({ type: "attachments", tabId, items: pendingAttachments.infos(tabId) });
 }
 
-function normalizeWindowsVolumeCase(value: string): string {
-  if (process.platform !== "win32") return value;
-  if (/^[A-Za-z]:/.test(value)) return value[0].toUpperCase() + value.slice(1);
-  if (isWindowsUncPath(value)) {
-    const root = win32.parse(value).root;
-    return root.toLowerCase() + value.slice(root.length);
-  }
-  return value;
+const PATHS_IGNORE_CASE = process.platform !== "linux";
+
+function pathCompareKey(value: string): string {
+  const normalized = value.normalize("NFC");
+  return PATHS_IGNORE_CASE ? normalized.toLowerCase() : normalized;
 }
 
 function hasSymlinkBelowRoot(root: string, target: string): boolean | null {
@@ -325,26 +338,22 @@ function linkChainReachesNetworkOrDevice(target: string, depth: number): boolean
 
 function isWindowsReservedOrStreamPath(value: string): boolean {
   return (
-    process.platform === "win32" &&
+    HOST_FILE_LINK_PLATFORM.windows &&
     (isWindowsDriveRelativePath(value) || hasWindowsReservedDeviceName(value) || hasNonDriveColon(value))
   );
 }
 
 export const READ_ONLY_FILE_SCHEME = "laisora-readonly";
 const readOnlyApprovals = new Map<string, string>();
-const approvalKey = (fsPath: string): string => {
-  const normalized = fsPath.normalize("NFC");
-  return process.platform === "linux" ? normalized : normalized.toLowerCase();
-};
 
 function approvedReadOnlyUri(realPath: string): vscode.Uri {
-  readOnlyApprovals.set(approvalKey(realPath), realPath);
+  readOnlyApprovals.set(pathCompareKey(realPath), realPath);
   return vscode.Uri.file(realPath).with({ scheme: READ_ONLY_FILE_SCHEME });
 }
 
 export function createReadOnlyFileProvider(): vscode.FileSystemProvider {
   const approved = (uri: vscode.Uri): string => {
-    const realPath = readOnlyApprovals.get(approvalKey(uri.fsPath));
+    const realPath = readOnlyApprovals.get(pathCompareKey(uri.fsPath));
     if (realPath === undefined) throw vscode.FileSystemError.FileNotFound(uri);
     return realPath;
   };
@@ -376,7 +385,7 @@ export function createReadOnlyFileProvider(): vscode.FileSystemProvider {
 
 export function registerReadOnlyFileProvider(): vscode.Disposable | undefined {
   return vscode.workspace.registerFileSystemProvider?.(READ_ONLY_FILE_SCHEME, createReadOnlyFileProvider(), {
-    isCaseSensitive: process.platform === "linux",
+    isCaseSensitive: !PATHS_IGNORE_CASE,
     isReadonly: true,
   });
 }
@@ -393,9 +402,9 @@ async function resolveConversationFileLink(
   cwd: string,
   rawTarget: string
 ): Promise<ResolvedFileLink | { refused: string }> {
-  const cannotOpen = { refused: l10n.t("LAISORA: This file link cannot be opened.") };
+  const cannotOpen = { refused: fileLinkRefusedText() };
   const outsideBoundary = { refused: l10n.t("LAISORA: The file is outside this workspace and conversation folder.") };
-  const parsed = parseFileLinkTarget(rawTarget, { windows: process.platform === "win32" });
+  const parsed = parseFileLinkTarget(rawTarget, HOST_FILE_LINK_PLATFORM);
   if (parsed === null) return cannotOpen;
 
   const relativePath =
@@ -428,7 +437,7 @@ async function resolveConversationFileLink(
   const preflightRoot = roots
     .flatMap((root) => [root.raw, root.real])
     .find((root) =>
-      lexicalPathIsInsideForEarlyRejectOnly(normalizeWindowsVolumeCase(root), normalizeWindowsVolumeCase(candidate))
+      lexicalPathIsInsideForEarlyRejectOnly(pathCompareKey(root), pathCompareKey(candidate))
     );
   if (preflightRoot === undefined) {
     const config = vscode.workspace.getConfiguration("laisora");
@@ -458,7 +467,7 @@ async function statResolvedFileLink(
   outside: ResolvedFileLink["outside"],
   inside: boolean
 ): Promise<ResolvedFileLink | { refused: string }> {
-  if (isWindowsReservedOrStreamPath(realCandidate)) return { refused: l10n.t("LAISORA: This file link cannot be opened.") };
+  if (isWindowsReservedOrStreamPath(realCandidate)) return { refused: fileLinkRefusedText() };
   let info;
   try {
     info = await stat(realCandidate);
@@ -466,11 +475,11 @@ async function statResolvedFileLink(
     const code = (error as NodeJS.ErrnoException).code;
     return {
       refused: code === "ENOENT" || code === "ENOTDIR"
-        ? l10n.t("LAISORA: The file was not found.")
-        : l10n.t("LAISORA: This file link cannot be opened."),
+        ? fileNotFoundText()
+        : fileLinkRefusedText(),
     };
   }
-  if (!info.isFile() && !info.isDirectory()) return { refused: l10n.t("LAISORA: The file was not found.") };
+  if (!info.isFile() && !info.isDirectory()) return { refused: fileNotFoundText() };
   return { realCandidate, parsed, info, outside, inside };
 }
 
@@ -512,7 +521,7 @@ async function openResolvedFile(
   );
   const mode = decideOpenMode(realCandidate, { isDirectory: info.isDirectory(), inside, systemAppExtensions: extensions });
   if (mode === "refuse") {
-    void vscode.window.showWarningMessage(l10n.t("LAISORA: The file was not found."));
+    void vscode.window.showWarningMessage(fileNotFoundText());
     return;
   }
 
@@ -523,7 +532,7 @@ async function openResolvedFile(
       else if (!await vscode.env.openExternal(uri)) throw new Error("openExternal returned false");
     } catch (error) {
       output.appendLine(`[file-link] R-CNV-20: ${String(error)}`);
-      void vscode.window.showWarningMessage(l10n.t("LAISORA: This file link cannot be opened."));
+      void vscode.window.showWarningMessage(fileLinkRefusedText());
     }
     return;
   }
@@ -558,7 +567,7 @@ async function openResolvedFile(
     }
   } catch (error) {
     output.appendLine(`[file-link] open failed: ${String(error)}`);
-    void vscode.window.showWarningMessage(l10n.t("LAISORA: This file link cannot be opened."));
+    void vscode.window.showWarningMessage(fileLinkRefusedText());
     return;
   }
   if (outside !== null) return;
@@ -596,8 +605,8 @@ export async function handleComposerMessage(
       break;
     }
     case "queryFiles": {
-      const paths = await findWorkspaceFiles(msg.query);
-      st.post({ type: "files", reqId: msg.reqId, paths });
+      const rows = await findWorkspaceFiles(msg.query, target!.cwd).catch(() => []);
+      void st.postTo(sender, { type: "files", reqId: msg.reqId, rows });
       break;
     }
     case "pickFiles": {

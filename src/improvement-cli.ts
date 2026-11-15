@@ -1,7 +1,8 @@
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import { claudeConfigDir } from "./claude-env";
-import { IMPROVEMENT_INDEX_FILE, IMPROVEMENT_PATTERNS_FILE } from "./improvement-brief";
+import { IMPROVEMENT_BRIEF_FILE, IMPROVEMENT_INDEX_FILE, IMPROVEMENT_PATTERNS_FILE, LAISORA_EXTENSION_FOLDER_PREFIX, LAISORA_SOURCE_FILES, improvementFirstMessage, improvementRecordCommand, renderImprovementBrief } from "./improvement-brief";
 import { patternsJson, renderIndex, scanTranscripts } from "./improvement-scan";
 import { RECORD_FIELD_MAX, extractRecords, parseRecordLocation, resolveRecordFiles } from "./improvement-record";
 
@@ -26,12 +27,33 @@ function option(args: string[], name: string): string[] {
 
 const configDirOf = (args: string[]): string => option(args, "--config-dir")[0] ?? claudeConfigDir();
 
+const EXTENSION_HOST_FOLDERS = [".vscode", ".vscode-insiders", ".vscode-server", ".cursor"];
+
+export function installedLaisoraSources(home: string, list: (dir: string) => { name: string; mtimeMs: number }[], exists: (p: string) => boolean): string[] {
+  const folders = EXTENSION_HOST_FOLDERS.flatMap((host) => {
+    const dir = path.join(home, host, "extensions");
+    return list(dir).filter((e) => e.name.startsWith(LAISORA_EXTENSION_FOLDER_PREFIX)).map((e) => ({ full: path.join(dir, e.name), mtimeMs: e.mtimeMs }));
+  });
+  const newest = folders.sort((a, b) => b.mtimeMs - a.mtimeMs)[0];
+  return newest ? LAISORA_SOURCE_FILES.map((parts) => path.join(newest.full, ...parts)).filter(exists) : [];
+}
+
+function listFolders(dir: string): { name: string; mtimeMs: number }[] {
+  try {
+    return fs.readdirSync(dir, { withFileTypes: true }).filter((e) => e.isDirectory()).map((e) => ({ name: e.name, mtimeMs: fs.statSync(path.join(dir, e.name)).mtimeMs }));
+  } catch {
+    return [];
+  }
+}
+
 async function scan(args: string[]): Promise<ImprovementScanMessage> {
   const configDir = configDirOf(args);
   const out = option(args, "--out")[0];
   if (!out) throw new Error("--out is required");
   const projectsDir = path.join(configDir, "projects");
-  const result = await scanTranscripts({ projectsDir, configDir, laisoraSources: option(args, "--laisora-source") });
+  const given = option(args, "--laisora-source");
+  const laisoraSources = given.length ? given : installedLaisoraSources(os.homedir(), listFolders, fs.existsSync);
+  const result = await scanTranscripts({ projectsDir, configDir, laisoraSources });
   const ctx = { generatedAt: new Date().toISOString(), projectsDir };
   const index = renderIndex(result, ctx);
   fs.mkdirSync(out, { recursive: true });
@@ -59,6 +81,19 @@ async function record(args: string[]): Promise<string> {
   return parts.join("\n\n");
 }
 
+function brief(args: string[]): string {
+  const out = option(args, "--out")[0];
+  if (!out) throw new Error("--out is required");
+  const dir = path.resolve(out);
+  const language = option(args, "--language")[0] ?? "English";
+  const paths = { briefPath: path.join(dir, IMPROVEMENT_BRIEF_FILE), indexPath: path.join(dir, IMPROVEMENT_INDEX_FILE), patternsPath: path.join(dir, IMPROVEMENT_PATTERNS_FILE) };
+  if (!fs.existsSync(paths.indexPath)) throw new Error(`${paths.indexPath} does not exist: run scan --out first`);
+  const recordCommand = improvementRecordCommand(process.execPath, path.resolve(process.argv[1]), configDirOf(args));
+  const scope = option(args, "--scope")[0]?.trim();
+  fs.writeFileSync(paths.briefPath, renderImprovementBrief({ ...paths, recordCommand, language, ...(scope ? { scope } : {}) }));
+  return improvementFirstMessage({ ...paths, language });
+}
+
 async function main(): Promise<void> {
   const [command, ...args] = process.argv.slice(2);
   if (command === "scan") {
@@ -75,7 +110,11 @@ async function main(): Promise<void> {
     try { process.stdout.write((await record(args)) + "\n"); } catch (e) { process.stderr.write(`${e instanceof Error ? e.message : String(e)}\n`); process.exitCode = 1; }
     return;
   }
-  process.stderr.write("usage: improvement.mjs scan --out <dir> [--config-dir <dir>] [--laisora-source <file>]... | record <location> [--around N] [--max CHARS]\n");
+  if (command === "brief") {
+    try { process.stdout.write(brief(args) + "\n"); } catch (e) { process.stderr.write(`${e instanceof Error ? e.message : String(e)}\n`); process.exitCode = 1; }
+    return;
+  }
+  process.stderr.write("usage: improvement.mjs scan --out <dir> [--config-dir <dir>] [--laisora-source <file>]... | brief --out <dir> [--language NAME] [--scope TEXT] [--config-dir <dir>] | record <location> [--around N] [--max CHARS]\n");
   process.exitCode = 2;
 }
 

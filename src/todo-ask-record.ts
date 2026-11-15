@@ -100,9 +100,9 @@ export class TodoAskRecordReader extends RecordTailReader<TodoAskRecordRead> {
   }
 }
 
-function decisionSink(sessionId: string, otherChoice: string, state: { tracker?: TodoAskDecisionTracker }, known?: readonly TodoDecisionAsk[]): RecordLineSink<readonly TodoDecision[]> {
+function decisionSink(sessionId: string, otherChoice: string, state: { tracker?: TodoAskDecisionTracker }, known?: readonly TodoDecisionAsk[], latest?: readonly TodoDecisionAsk[]): RecordLineSink<readonly TodoDecision[]> {
   const parser = createConversationMessageParser(sessionId, keepForAsks);
-  const tracker = state.tracker = todoAskDecisionTracker(sessionId, otherChoice, known);
+  const tracker = state.tracker = todoAskDecisionTracker(sessionId, otherChoice, known, latest);
   return {
     push: lines => parser.push(lines),
     result: () => {
@@ -122,11 +122,15 @@ export class TodoDecisionRecordReader extends RecordTailReader<readonly TodoDeci
   }
 
   resume(cursor: TodoDecisionCursor): void {
-    this.resumeAt(cursor.offset, decisionSink(this.sessionId, this.otherChoice, this.state, cursor.asks));
+    this.resumeAt(cursor.offset, decisionSink(this.sessionId, this.otherChoice, this.state, cursor.asks, cursor.latest));
   }
 
   asks(): TodoDecisionAsk[] {
     return this.state.tracker?.asks() ?? [];
+  }
+
+  latest(): TodoDecisionAsk[] {
+    return this.state.tracker?.latest() ?? [];
   }
 }
 
@@ -137,13 +141,17 @@ export interface TodoDecisionCursor {
   readonly headLength: number;
   readonly head: string;
   readonly asks: readonly TodoDecisionAsk[];
+  readonly latest?: readonly TodoDecisionAsk[];
 }
+
+const isTodoDecisionAsks = (value: unknown): boolean => Array.isArray(value)
+  && value.every(ask => Array.isArray(ask) && typeof ask[0] === "string" && Array.isArray(ask[1]) && ask[1].every(label => typeof label === "string"));
 
 export function isTodoDecisionCursor(value: unknown): value is TodoDecisionCursor {
   if (typeof value !== "object" || value === null) return false;
   const cursor = value as Record<string, unknown>;
-  return Number.isSafeInteger(cursor.offset) && Number.isSafeInteger(cursor.headLength) && typeof cursor.head === "string" && Array.isArray(cursor.asks)
-    && cursor.asks.every(ask => Array.isArray(ask) && typeof ask[0] === "string" && Array.isArray(ask[1]) && ask[1].every(label => typeof label === "string"));
+  return Number.isSafeInteger(cursor.offset) && Number.isSafeInteger(cursor.headLength) && typeof cursor.head === "string" && isTodoDecisionAsks(cursor.asks)
+    && (cursor.latest === undefined || isTodoDecisionAsks(cursor.latest));
 }
 
 async function recordHead(path: string, length: number): Promise<string> {
@@ -173,7 +181,7 @@ export async function readTodoDecisions(sessionId: string, otherChoice: string, 
   }
   const decisions = await reader.read(file.path, file.size);
   const headLength = Math.min(TODO_DECISION_HEAD_BYTES, reader.position);
-  return { reader, decisions, cursor: { offset: reader.position, headLength, head: await recordHead(file.path, headLength), asks: reader.asks() } };
+  return { reader, decisions, cursor: { offset: reader.position, headLength, head: await recordHead(file.path, headLength), asks: reader.asks(), latest: reader.latest() } };
 }
 
 export type TodoDecisionSaved = (TodoDecisionCursor & { readonly path: string }) | { readonly gone: true };

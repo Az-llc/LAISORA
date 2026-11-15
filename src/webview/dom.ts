@@ -1,20 +1,26 @@
 import * as l10n from "@vscode/l10n";
 import type { WebviewToHost } from "../protocol";
+import type { ApprovalDrafts } from "./approval-drafts";
 import { CLOSE_GLYPH } from "./close-button";
+
+export interface WebviewState {
+  activeTabId: string | null;
+  drafts?: Record<string, string>;
+  askChecks?: Record<string, Record<string, boolean[]>>;
+  askDismissed?: Record<string, string[]>;
+  askResolved?: Record<string, string[]>;
+  approvalDrafts?: ApprovalDrafts;
+  views?: Record<string, "conv" | "work">;
+  workViews?: Record<string, "summary" | "graph" | "analysis" | "log">;
+  scrollAnchors?: Record<string, unknown>;
+  codeWrap?: boolean;
+  todo?: unknown;
+}
 
 type VsCodeWebviewApi = {
   postMessage(msg: WebviewToHost): void;
-  getState():
-    | { activeTabId: string | null; drafts?: Record<string, string>; askChecks?: Record<string, Record<string, boolean[]>>; askDismissed?: Record<string, string[]>; askDismissedMessages?: string[]; askResolved?: Record<string, string[]>; askResolvedMessages?: string[]; askCheckedMessages?: Record<string, boolean[]>; views?: Record<string, "conv" | "work">; workViews?: Record<string, "summary" | "graph" | "analysis" | "log">; codeWrap?: boolean; todo?: unknown }
-    | undefined;
-  setState(s: {
-    activeTabId: string | null;
-    drafts?: Record<string, string>; askChecks?: Record<string, Record<string, boolean[]>>; askDismissed?: Record<string, string[]>; askDismissedMessages?: string[]; askResolved?: Record<string, string[]>; askResolvedMessages?: string[]; askCheckedMessages?: Record<string, boolean[]>;
-    views?: Record<string, "conv" | "work">;
-    workViews?: Record<string, "summary" | "graph" | "analysis" | "log">;
-    codeWrap?: boolean;
-    todo?: unknown;
-  }): void;
+  getState(): WebviewState | undefined;
+  setState(s: WebviewState): void;
 };
 
 declare function acquireVsCodeApi(): VsCodeWebviewApi;
@@ -69,6 +75,7 @@ app.innerHTML = `
   </div>
   <main id="logs" aria-live="polite"></main>
   <footer id="composer">
+    <div id="send-lock" class="send-lock" role="status"></div>
     <div id="composer-top">
       <div id="attachments"></div>
       <div id="ctxchip" class="ctx-chip hidden"></div>
@@ -101,6 +108,9 @@ export const tabbarEl = document.getElementById("tabbar")!;
 export const logsEl = document.getElementById("logs")!;
 export const inputEl = document.getElementById("input") as HTMLTextAreaElement;
 export const actionBtn = document.getElementById("action") as HTMLButtonElement;
+export const sendLockEl = document.getElementById("send-lock") as HTMLDivElement;
+export const composerLockableEls: readonly HTMLElement[] = ["composer-top", "input", "composer-actions-left", "convprev", "convnext", "modebtn", "suggest", "modemenu", "authpicker", "authsubmenu", "usagepanel"]
+  .map((id) => document.getElementById(id)!);
 export const authEl = document.getElementById("auth") as HTMLButtonElement;
 export const authPickerEl = document.getElementById("authpicker") as HTMLDivElement;
 export const authSubmenuEl = document.getElementById("authsubmenu") as HTMLDivElement;

@@ -1,12 +1,12 @@
 import type { AnalysisPlanView, AnalysisPlansView, AnalysisTimeView, TokenDisplay, RoleRunView, RoleSummaryView, RoleView } from "../role-summary";
 import type { RoleCacheTtlView } from "../cache-ttl-cost";
 import { deriveEarlierPlanViews, derivePlanView, planStepCounted } from "./plan-view";
-import { ANALYSIS_TIME_PART_KEYS, MAIN_PROCESSING_BUCKETS, timePartShown, viewTimePartValues, type ShownTimePartKey, viewTimeProvisional, planContextOf, timeWindowMeasured, planLive, planNow, planRowPeriods, planPeriodEnd, UNMEASURED_LABEL } from "../plan-steps";
+import { ANALYSIS_TIME_PART_KEYS, MAIN_PROCESSING_BUCKETS, timePartShown, viewTimePartValues, type ShownTimePartKey, viewTimeProvisional, planContextOf, timeWindowMeasured, planLive, planNow, planRowPeriods, planPeriodEnd, droppedWorkBlockCount, UNMEASURED_LABEL } from "../plan-steps";
 import { renderPlanSection, planTokens, planWork } from "./plan-panel";
 import { createLoader } from "./loader";
 import { EXECUTORS, externalRunStatus } from "../orchestration-executors";
 import { delegationCount } from "../claude-tool-names";
-import { externalRunEndStatus } from "../protocol";
+import { externalRunStatusWord, workEndStatusWord } from "../protocol";
 import type {
   HostToWebview,
   OrchestrationView,
@@ -15,7 +15,7 @@ import type {
   WorkModelPayload,
 } from "../protocol";
 import type { TimeBucketView } from "../time-buckets";
-import type { ExecLogFindingView, ExecLogMark, FailureKindView, FailureSummaryView } from "../exec-log-marks";
+import { phaseCallTotals, type ExecLogFindingView, type ExecLogMark, type FailureKindView, type FailureSummaryView } from "../exec-log-marks";
 import { renderAnalysisFactsView } from "./analysis-facts-view";
 import { vscode } from "./dom";
 import { APPROX_MARK, approx, approxDuration, approxTitle, durationParts, formatDuration, clock, dayClock } from "./format";
@@ -28,6 +28,7 @@ import { memberRunTimes, runElapsedMs } from "../spans";
 import { AgentInspector } from "./agent-inspector";
 import * as l10n from "@vscode/l10n";
 import { noRecordReason } from "../session-record";
+import { markJapanese } from "./element";
 
 
 export type WorkViewMode = "summary" | "graph" | "analysis" | "log";
@@ -96,13 +97,8 @@ const RUN_TIME_TONE: ChartTone = "sub";
 
 type FoldArea = "roles" | "plans";
 
-export function earlierStepCount(block: TimeBucketView["blocks"][number], model: WorkModelPayload | undefined, last: boolean): string {
-  if (block.kind === "plan") return String((block.steps ?? []).filter(planStepCounted).length);
-  const history = model?.planHistory?.filter(entry => entry.kind === "todos" && entry.at >= block.start && (entry.at < block.end || last && entry.at === block.end));
-  if (model === undefined || !history?.length) return "—";
-  const view = derivePlanView({ ...model, planHistory: history }, undefined, block.end,
-    { blockId: block.blockId, text: block.text, start: block.start, end: block.end, running: false });
-  return String(view.steps.filter(planStepCounted).length);
+export function earlierStepCount(block: TimeBucketView["blocks"][number]): string {
+  return block.kind === "plan" ? String((block.steps ?? []).filter(planStepCounted).length) : "—";
 }
 
 function planPeriodText(start: number | null, end: number | null, running: boolean, now: number): string {
@@ -1060,9 +1056,7 @@ export class WorkOverview {
     this.rosterRunsKey = JSON.stringify(this.payload?.externalRuns ?? []);
     const roleRuns = [...this.payload?.externalRuns ?? []].sort((a, b) => (b.run.startedAt ?? 0) - (a.run.startedAt ?? 0)).slice(0, 50);
     for (const { label, run } of roleRuns) {
-      const end = externalRunEndStatus(run);
-      const outcome = end === "running" ? l10n.t("Running") : end === "stale" ? l10n.t("Tracking stopped") : run.outcome === "ok" ? l10n.t("Succeeded") : run.outcome === "failed" ? l10n.t("Failed")
-        : run.outcome === "timeout" ? l10n.t("Timed out") : run.outcome === "stopped" ? l10n.t("Stopped") : l10n.t("Refused");
+      const outcome = externalRunStatusWord(run);
       const numbers = `${outcome} · ${this.hudDuration(run.durationMs).textContent} · ${planTokens(run.tokens)} · ${l10n.t("Cache read")} ${planTokens(run.cacheRead)}` + (run.cwd ? ` · ${run.cwd}` : "");
       const failed = run.outcome !== null && externalRunStatus(run.outcome) === "failed";
       const executor = run.executor in EXECUTORS ? EXECUTORS[run.executor as keyof typeof EXECUTORS].displayName : run.executor || unknown;
@@ -1115,7 +1109,7 @@ export class WorkOverview {
     const view = semantic?.timeBuckets;
     const tasks = payload?.tasks ?? [];
     const hasFlow = view !== undefined && view.blocks.length > 0;
-    if (!hasFlow && tasks.length === 0 && (payload === undefined || this.totalToolCount(payload) === 0)) {
+    if (!hasFlow && tasks.length === 0 && (payload === undefined || phaseCallTotals(payload.phases).toolCount === 0)) {
       this.bodyEl.appendChild(span("wo-empty", NO_WORK_SUMMARY_TEXT));
       if (!this.hasRecord()) {
         const line = div("wo-gist-line");
@@ -1143,18 +1137,6 @@ export class WorkOverview {
       if (row.detail !== undefined) el.title = row.detail;
       this.coverageEl.appendChild(el);
     }
-  }
-
-  private totalToolCount(payload: WorkModelPayload): number {
-    let n = 0;
-    for (const p of payload.phases) n += p.toolCount + p.childToolCount;
-    return n;
-  }
-
-  private totalFailCount(payload: WorkModelPayload): number {
-    let n = 0;
-    for (const p of payload.phases) n += p.failCount + p.childFailCount;
-    return n;
   }
 
   private nowMs(view: TimeBucketView | undefined): number | undefined {
@@ -1405,7 +1387,8 @@ export class WorkOverview {
     heading.className = "earlier-label";
     heading.textContent = l10n.t("EARLIER REQUESTS {0} work blocks", undetermined ? UNMEASURED_LABEL : blocks.length);
     earlier.append(heading);
-    if (this.payload?.planHistoryTruncated) earlier.append(span("plan-lede earlier-partial", l10n.t("Some earlier work block details are unavailable.")));
+    const dropped = droppedWorkBlockCount(view);
+    if (dropped > 0) earlier.append(span("plan-lede earlier-partial", l10n.t("{0} older work blocks are not listed because of the limit.", dropped)));
     if (!blocks.length) earlier.append(span("earlier-empty", undetermined ? loadingHistoryText() : l10n.t("No earlier work blocks available.")));
     const shown = this.flowExpanded ? blocks : blocks.slice(0, EARLIER_LIMIT);
     for (const block of shown) {
@@ -1417,7 +1400,7 @@ export class WorkOverview {
       row.title = block.text;
       const at = span("earlier-at", block.anchorAt > 0 ? `${monthDay(block.anchorAt)} ${clock(block.anchorAt)}` : "—");
       at.title = formatDateTime(block.anchorAt);
-      const count = earlierStepCount(block, this.payload, block === view?.blocks.at(-1));
+      const count = earlierStepCount(block);
       const totals = this.payload?.blockTotals?.find(value => value.blockId === block.blockId);
       const usage = totals?.total ?? null;
       const elapsed = span("earlier-elapsed", "");
@@ -1425,11 +1408,11 @@ export class WorkOverview {
       const stats = span("earlier-stats", "");
       stats.append(at, ` · ${l10n.t("{0} steps", count)} · `, measuredSumNote(l10n.t("{0} tokens", planTokens(usage?.tokens ?? null)), usage?.partial));
       const duration = span("earlier-duration", "");
-      if (block.running) duration.append(l10n.t("Running"), " ");
+      if (block.running) duration.append(workEndStatusWord("running"), " ");
       duration.appendChild(elapsed);
       stats.title = l10n.t("Cache read: {0} tokens", planTokens(usage?.cacheRead ?? null));
       const title = span("earlier-title", block.text.split(/\r?\n/, 1)[0]);
-      if (/[\u3040-\u30ff\u3400-\u9fff]/.test(title.textContent ?? "")) title.lang = "ja";
+      markJapanese(title, title.textContent ?? "");
       const number = span("earlier-number", block.requestNumber ?? "—");
       if (block.running) number.classList.add("current");
       row.append(number, title, duration, stats);
@@ -1507,7 +1490,8 @@ export class WorkOverview {
     line.append(span("l-label", l10n.t("LOG")), span("", l10n.t("Execution record")));
     if (this.payload?.coverage.summary === "complete") {
       const agents = this.payload.phases.reduce((total, phase) => total + delegationCount(phase), 0);
-      line.appendChild(span("wl-totals", l10n.t("Tools {0} calls · Failures {1} · Subagents {2}", this.totalToolCount(this.payload), this.totalFailCount(this.payload), agents)));
+      const totals = phaseCallTotals(this.payload.phases);
+      line.appendChild(span("wl-totals", l10n.t("Tools {0} calls · Failures {1} · Subagents {2}", totals.toolCount, totals.failCount, agents)));
     }
     this.logSumEl.appendChild(line);
     const semantic = this.activeSemantic();

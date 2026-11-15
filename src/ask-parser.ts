@@ -28,7 +28,6 @@ export function askOptionLetter(index: number): string {
 
 const ASK_ANSWER_ARROW = " → ";
 const ASK_ANSWER_COLON = ":";
-const ASK_ANSWER_NEXT_LINE = new RegExp(`\\r?\\n[^\\r\\n]*${ASK_ANSWER_ARROW}`);
 export const ASK_ANSWER_TITLE_JOINED = /[\p{L}\p{N}]/u;
 const ASK_ANSWER_COLONS = `${ASK_ANSWER_COLON}：`;
 const ASK_ANSWER_HEAD = new RegExp(`^([^\\r\\n${ASK_ANSWER_COLONS}]*)[${ASK_ANSWER_COLONS}][ \\t]?`);
@@ -41,6 +40,17 @@ function titleStartsAt(text: string, title: string, at: number): boolean {
 
 export function askAnswerPrefix(title: string): string {
   return `${title}${ASK_ANSWER_ARROW}`;
+}
+
+export function holdsAskAnswerLine(text: string): boolean {
+  return text.split(/\r?\n/).some((line) => {
+    const at = line.indexOf(ASK_ANSWER_ARROW);
+    return at > 0 && line.slice(0, at).trim() !== "" && askAnswerParts(line.slice(at + ASK_ANSWER_ARROW.length), NO_OTHER_TITLES) !== undefined;
+  });
+}
+
+export function askAnswerShapedLines(text: string): string[] {
+  return text.split(/\r?\n/).filter(line => line.includes(ASK_ANSWER_ARROW));
 }
 
 export function askAnswerLine(title: string, choice: string, answer: string): string {
@@ -60,37 +70,59 @@ export class AskAnswerTitles {
     if (found === undefined) this.longer.set(title, found = this.titles.filter(other => other.length > title.length && other.endsWith(title)));
     return found;
   }
+
+  nextAnswerLine(text: string): number {
+    const firstBreak = text.indexOf("\n");
+    if (firstBreak < 0) return -1;
+    let end = -1;
+    for (const title of this.titles) {
+      const prefix = askAnswerPrefix(title);
+      for (let at = text.indexOf(prefix, firstBreak); at >= 0; at = text.indexOf(prefix, at + 1)) {
+        if (!answerStartsAt(text, title, at, this)) continue;
+        const line = text.lastIndexOf("\n", at);
+        const cut = text[line - 1] === "\r" ? line - 1 : line;
+        if (end < 0 || cut < end) end = cut;
+        break;
+      }
+    }
+    return end;
+  }
 }
 
 const NO_OTHER_TITLES = new AskAnswerTitles([]);
 
+function answerStartsAt(text: string, title: string, at: number, titles: AskAnswerTitles): boolean {
+  return titleStartsAt(text, title, at) && !titles.longerThan(title).some(other => titleStartsAt(text, other, at - (other.length - title.length)));
+}
+
 export function askAnswerChoices(title: string, text: string, titles: AskAnswerTitles = NO_OTHER_TITLES): string[] {
   const prefix = askAnswerPrefix(title);
-  const longer = titles.longerThan(title);
   const choices: string[] = [];
   for (let at = text.indexOf(prefix); at >= 0; at = text.indexOf(prefix, at + 1)) {
-    if (!titleStartsAt(text, title, at) || longer.some(other => titleStartsAt(text, other, at - (other.length - title.length)))) continue;
-    choices.push(text.slice(at + prefix.length));
+    if (answerStartsAt(text, title, at, titles)) choices.push(text.slice(at + prefix.length));
   }
   return choices;
 }
 
-export function askAnswerBody(choice: string): string {
-  const next = choice.search(ASK_ANSWER_NEXT_LINE);
+export function askAnswerBody(choice: string, titles: AskAnswerTitles): string {
+  const next = titles.nextAnswerLine(choice);
   return next < 0 ? choice : choice.slice(0, next);
 }
 
-export function askAnswerParts(choice: string): { readonly choice: string; readonly answer: string } | undefined {
-  const body = askAnswerBody(choice);
+export function askAnswerParts(choice: string, titles: AskAnswerTitles): { readonly choice: string; readonly answer: string } | undefined {
+  const body = askAnswerBody(choice, titles);
   const head = ASK_ANSWER_HEAD.exec(body);
   return head ? { choice: head[1], answer: body.slice(head[0].length) } : undefined;
 }
 
-export const OTHER_REPLY_QUESTION_PATTERN = /[？?]$|分からない|わからない|詳しく|詳細|どういう|なぜ/u;
+const LEADING_DIGIT = /^\d/u;
 
-export function otherReplyAsksBack(choice: string, otherChoice: string): boolean {
-  const parts = askAnswerParts(choice);
-  return parts?.choice === otherChoice && OTHER_REPLY_QUESTION_PATTERN.test(parts.answer.trim());
+export function wholeReplyOption(text: string, labels: readonly string[], numbered: boolean): number | undefined {
+  const reply = normalizeAskText(text);
+  const keys = labels.map(normalizeAskText);
+  const numbers = numbered && !keys.some(key => LEADING_DIGIT.test(key));
+  const picked = keys.flatMap((key, index) => (key !== "" && reply === key) || (numbers && (reply === String(index + 1) || reply === `${index + 1}${key}`)) ? [index] : []);
+  return picked.length === 1 ? picked[0] : undefined;
 }
 
 function scalar(raw: string, multiline = false): string | null {
@@ -186,7 +218,8 @@ export function parsePlanBlock(source: string): PlanBlock | null {
 export const ASK_BLOCK_LINE = /^( *)(- )?([a-z]+):(?: (.*))?$/;
 const PLAN_KEYS = ["goal"] as const;
 const ASK_LIST_KEYS = ["options", "steps"] as const;
-const ASK_ROOT_KEYS = ["kind", "title", "why", "details", "default", ...ASK_LIST_KEYS] as const;
+const ASK_SCALAR_KEYS = ["kind", "title", "why", "details", "default"] as const;
+const ASK_ROOT_KEYS = [...ASK_SCALAR_KEYS, ...ASK_LIST_KEYS] as const;
 const OPTION_KEYS = ["label", "effect", "pros", "cons", "recommended"] as const;
 const STEP_KEYS = ["do", "look"] as const;
 const KEY_TYPO_MIN_LENGTH = 3;
@@ -216,52 +249,97 @@ export function blockKey<K extends string>(written: string, allowed: readonly K[
   return near.length === 1 ? near[0] : undefined;
 }
 
-function parseBlock(source: string, type: "ask" | "plan"): AskBlock | PlanBlock | null {
+export type BlockEntry = Record<string, string>;
+export type BlockListShape = readonly string[] | "scalar";
+
+export interface BlockSchema {
+  readonly root: readonly string[];
+  readonly lists: Readonly<Record<string, BlockListShape>>;
+  readonly oneList?: true;
+  readonly multiline?: string;
+  readonly skipEntry?: (key: string, value: string) => boolean;
+}
+
+export interface BlockFields {
+  readonly root: Readonly<Record<string, string>>;
+  readonly lists: ReadonlyMap<string, readonly (string | BlockEntry)[]>;
+}
+
+const SCALAR_LIST_ITEM = /^  - (.*)$/;
+const PLAN_SCHEMA: BlockSchema = { root: PLAN_KEYS, lists: {} };
+const ASK_SCHEMA: BlockSchema = {
+  root: ASK_SCALAR_KEYS,
+  lists: { options: OPTION_KEYS, steps: STEP_KEYS },
+  oneList: true,
+  multiline: "details",
+  skipEntry: (key, value) => key === "recommended" && value !== "true",
+};
+
+export function parseBlockFields(source: string, schema: BlockSchema): BlockFields | null {
+  const listKeys = Object.keys(schema.lists);
+  const allowed = [...schema.root, ...listKeys];
   const root: Record<string, string> = Object.create(null);
-  const entries: Record<string, string>[] = [];
-  let list: "options" | "steps" | undefined;
-  let inList = false;
-  let entry: Record<string, string> | undefined;
+  const lists = new Map<string, (string | BlockEntry)[]>();
+  let current: (string | BlockEntry)[] | undefined;
+  let shape: BlockListShape | undefined;
+  let entry: BlockEntry | undefined;
   for (const line of source.replace(/\r\n/g, "\n").split("\n")) {
     if (!line.trim()) continue;
+    const item = shape === "scalar" ? SCALAR_LIST_ITEM.exec(line) : null;
+    if (item && current) {
+      const value = scalar(item[1]);
+      if (value === null) return null;
+      current.push(value);
+      continue;
+    }
     const match = ASK_BLOCK_LINE.exec(line);
     if (!match) return null;
     const [, indent, dash, written, raw = ""] = match;
     if (indent.length === 0 && !dash) {
-      inList = false;
-      const allowed = type === "plan" ? PLAN_KEYS : ASK_ROOT_KEYS;
+      current = undefined;
+      shape = undefined;
+      entry = undefined;
       const same = blockKey(written, allowed, []);
-      if (same !== undefined && Object.hasOwn(root, same) && root[same] === scalar(raw, same === "details")) continue;
-      const key = blockKey(written, allowed, [...Object.keys(root), ...(list ? ASK_LIST_KEYS : [])]);
-      if (key === "options" || key === "steps") {
-        if (list || raw.trim()) return null;
-        list = key;
-        inList = true;
+      if (same !== undefined && Object.hasOwn(root, same) && root[same] === scalar(raw, same === schema.multiline)) continue;
+      const key = blockKey(written, allowed, [...Object.keys(root), ...(schema.oneList && lists.size > 0 ? listKeys : [...lists.keys()])]);
+      if (key === undefined) return null;
+      if (Object.hasOwn(schema.lists, key)) {
+        if (raw.trim()) return null;
+        current = [];
+        shape = schema.lists[key];
+        lists.set(key, current);
       } else {
-        if (key === undefined) return null;
-        const value = scalar(raw, key === "details");
+        const value = scalar(raw, key === schema.multiline);
         if (value === null) return null;
         root[key] = value;
       }
       continue;
     }
-    if (!inList || !list) return null;
+    if (!current || shape === undefined || shape === "scalar") return null;
     if (indent.length === 2 && dash) {
-      entry = Object.create(null) as Record<string, string>;
-      entries.push(entry);
+      entry = Object.create(null) as BlockEntry;
+      current.push(entry);
     } else if (indent.length !== 4 || dash || !entry) return null;
     if (!entry) return null;
-    const allowed = list === "options" ? OPTION_KEYS : STEP_KEYS;
-    const same = blockKey(written, allowed, []);
+    const same = blockKey(written, shape, []);
     if (same !== undefined && Object.hasOwn(entry, same) && entry[same] === scalar(raw)) continue;
-    const key = blockKey(written, allowed, Object.keys(entry));
+    const key = blockKey(written, shape, Object.keys(entry));
     if (key === undefined) return null;
     const value = scalar(raw);
     if (value === null) return null;
-    if (key === "recommended" && value !== "true") continue;
+    if (schema.skipEntry?.(key, value)) continue;
     entry[key] = value;
   }
+  return { root, lists };
+}
+
+function parseBlock(source: string, type: "ask" | "plan"): AskBlock | PlanBlock | null {
+  const fields = parseBlockFields(source, type === "plan" ? PLAN_SCHEMA : ASK_SCHEMA);
+  if (fields === null) return null;
+  const { root } = fields;
   if (type === "plan") return root.goal ? { goal: root.goal } : null;
+  const [list, items = []] = [...fields.lists][0] ?? [];
+  const entries = items.filter((e): e is BlockEntry => typeof e !== "string");
   if (!root.title || !root.why || !root.default || entries.length === 0) return null;
   const base = { title: root.title, why: root.why, default: root.default, ...(root.details ? { details: root.details } : {}) };
   if (root.kind === "decide" && list === "options" && entries.every((e) => e.label && e.effect && e.pros && e.cons)) {

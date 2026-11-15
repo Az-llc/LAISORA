@@ -1,7 +1,7 @@
 import * as l10n from "@vscode/l10n";
 import { ROW_H } from "./row-frame";
-import { foregroundExternalCalls, viewTimeProvisional, planConductorRunning, planMemberDelegationCount, planFrame, planLive, planMemberEnd, planMemberKey, planNow, planMainIntervals, planWaitSpans, timePartShown, type ShownTimePartKey, planRowIndexAt, planRowPeriod, planRowProvisional, UNMEASURED_LABEL, type PlanFrameMembers, type PlanRowPeriod, type PlanSpan } from "../plan-steps";
-import { agentElapsedMs, displayedAncestorUsageGap, subagentDetailUnreadCount, type SemanticModelPayload, type TimeBucketsCoverage, type WorkAgentNode, type WorkModelPayload } from "../protocol";
+import { foregroundExternalCalls, viewTimeProvisional, planConductorRunning, planMemberDelegationCount, planFrame, planLive, planMemberEnd, planMemberKey, planNow, planMainIntervals, planWaitSpans, timePartShown, type ShownTimePartKey, planRowIndexAt, planRowPeriod, planRowProvisional, droppedWorkBlockCount, planFoldedRowCount, planRowsBelow, unknownLauncherDetail, UNMEASURED_LABEL, type PlanFrameMembers, type PlanRowPeriod, type PlanSpan } from "../plan-steps";
+import { agentElapsedMs, displayedAncestorUsageGap, subagentDetailUnreadCount, workEndStatusWord, type SemanticModelPayload, type TimeBucketsCoverage, type WorkAgentNode, type WorkModelPayload } from "../protocol";
 import type { AgentSpanView, BackgroundTaskSpanView, ConductorModel, ExternalRunCallView, PlanBlockStepView, RequestBlockView, TimeBucket, TimeBucketInterval, TimeBucketView } from "../time-buckets";
 import type { AgentInspector, InspectorAxis, InspectorTarget } from "./agent-inspector";
 import { approx, approxDuration, formatDuration, clock, dayClock } from "./format";
@@ -379,7 +379,7 @@ function shownBucket(bucket: TimeBucket | null): bucket is ShownTimePartKey & Ti
 }
 
 function segTitle(word: string, start: number, end: number | null, extra?: string): string {
-  const timeRange = end === null ? `${clock(start)}– · ${l10n.t("Running")}` : `${clock(start)}–${clock(end)} · ${formatDuration(end - start)}`;
+  const timeRange = end === null ? `${clock(start)}– · ${workEndStatusWord("running")}` : `${clock(start)}–${clock(end)} · ${formatDuration(end - start)}`;
   return extra !== undefined ? `${word} ${timeRange} · ${extra}` : `${word} ${timeRange}`;
 }
 
@@ -872,8 +872,8 @@ export class WorkGraph {
     };
     const nested = members.nested ?? [];
     const below = (toolUseId: string): Pick<GraphRow, "nestedCount"> => {
-      const count = members.nestedRanges?.get(toolUseId)?.count;
-      return count === undefined ? {} : { nestedCount: count };
+      const count = planRowsBelow(members.nestedRanges, toolUseId);
+      return count === 0 ? {} : { nestedCount: count };
     };
     const pushBelow = (toolUseId: string, key: RowKey, offset = 0): void => {
       const range = members.nestedRanges?.get(toolUseId);
@@ -901,7 +901,7 @@ export class WorkGraph {
     if (unknown.length > 0) {
       const key = `unknown:${parentItem ?? "unplaced"}`;
       rows.push({ key, kind: "unknown", parentBlock, parentItem, depth: 0,
-        nestedCount: unknown.reduce((sum, agent) => sum + 1 + (members.nestedRanges?.get(agent.toolUseId)?.count ?? 0), 0),
+        nestedCount: planFoldedRowCount(members.nestedRanges, unknown.map(agent => agent.toolUseId)),
         extent: [Math.min(...unknown.map(agent => agent.start)), Math.max(...unknown.map(agent => agent.end))] });
       if (this.expandedItems.has(key)) {
         for (const agent of unknown) {
@@ -1004,9 +1004,9 @@ export class WorkGraph {
       this.noteEl.dataset.fidelity = "inherited";
       this.noteEl.textContent = l10n.t("LLM generation is not shown because this path does not record actual times. Tool execution is measured.");
     }
-    if (view.droppedIntervalCount > 0 || view.droppedBlockCount > 0) {
+    if (view.droppedIntervalCount > 0 || droppedWorkBlockCount(view) > 0) {
       this.noteEl.hidden = false;
-      this.noteEl.append(span("wg-note-line", l10n.t("Older records were dropped because of the limit ({0} intervals · {1} work blocks).", view.droppedIntervalCount, view.droppedBlockCount)));
+      this.noteEl.append(span("wg-note-line", l10n.t("Older records were dropped because of the limit ({0} intervals · {1} work blocks).", view.droppedIntervalCount, droppedWorkBlockCount(view))));
     }
   }
 
@@ -1283,7 +1283,7 @@ export class WorkGraph {
         const title = row.title ?? "";
         const number = row.number ?? "";
         const duration = this.itemDuration(row);
-        const facts = [span !== undefined ? clock(span.start) : item?.removed ? "" : item?.status === "completed" ? l10n.t("Completed") : l10n.t("Not started"),
+        const facts = [span !== undefined ? clock(span.start) : item?.removed ? "" : workEndStatusWord(item?.status === "completed" ? "completed" : "pending"),
           item?.removed ? l10n.t("Removed") : "",
           subagents > 0 ? l10n.t("{0} subagents", subagents) : ""].filter(Boolean).join(" · ");
         addLabels(title, facts, duration, title);
@@ -1317,7 +1317,7 @@ export class WorkGraph {
         g.setAttribute("aria-label", `${l10n.t("Conductor")}${outsideSuffix}`);
       } else if (row.kind === "unknown") {
         const unknownOpen = this.expandedItems.has(row.key);
-        addLabels(l10n.t("Unknown launcher"), [l10n.t("Subagent"), unknownOpen ? "" : `+${row.nestedCount ?? 0}`].filter(Boolean).join(" · "), "");
+        addLabels(l10n.t("Unknown launcher"), unknownLauncherDetail(row.nestedCount ?? 0, unknownOpen), "");
         addFoldMark(unknownOpen);
         g.setAttribute("aria-expanded", String(unknownOpen));
         g.setAttribute("aria-label", `${l10n.t("Unknown launcher")}${outsideSuffix}`);
@@ -1741,7 +1741,7 @@ export class WorkGraph {
       rangeText = l10n.t("Visible range {0} – {1} (whole)", dayClock(range.start), dayClock(range.end));
     } else {
       const b = range.band;
-      rangeText = `${l10n.t("Visible range {0} – {1}", dayClock(range.start), dayClock(range.end))}${b.running ? ` · ${l10n.t("Running")}` : ""} · ${l10n.t("{0} rows that fit on screen", b.j - b.i)}`;
+      rangeText = `${l10n.t("Visible range {0} – {1}", dayClock(range.start), dayClock(range.end))}${b.running ? ` · ${workEndStatusWord("running")}` : ""} · ${l10n.t("{0} rows that fit on screen", b.j - b.i)}`;
     }
     this.zoomRangeEl.textContent = rangeText;
     this.zoomAllEl.setAttribute("aria-pressed", this.zoom.kind === "all" ? "true" : "false");

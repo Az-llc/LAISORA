@@ -14,6 +14,7 @@ import {
   type ElicitationValue,
 } from "../elicitation";
 import { approvalField, approvalLead } from "./approval";
+import { element as el } from "./element";
 
 export type ElicitationDecision = { behavior: "allow"; content?: Record<string, ElicitationValue> } | { behavior: "deny" };
 
@@ -50,13 +51,6 @@ function issueText(field: ElicitationField, kind: ElicitationIssueKind): string 
         ? l10n.t("Choose {0} to {1}.", field.minItems, elicitationMaxItems(field))
         : l10n.t("Choose at most {0}.", elicitationMaxItems(field));
   }
-}
-
-function el<K extends keyof HTMLElementTagNameMap>(tag: K, className: string, text?: string): HTMLElementTagNameMap[K] {
-  const node = document.createElement(tag);
-  node.className = className;
-  if (text !== undefined) node.textContent = text;
-  return node;
 }
 
 const TEXT_INPUT_TYPES: Record<ElicitationStringFormat, string> = { email: "email", uri: "url", date: "date", "date-time": "datetime-local" };
@@ -172,7 +166,8 @@ export function buildElicitationCard(
   spec: ElicitationSpec,
   rawInputJson: string,
   idPrefix: string,
-  decide: (decision: ElicitationDecision) => void
+  decide: (decision: ElicitationDecision) => void,
+  saved?: { draft: Record<string, ElicitationValue | undefined> | undefined; save: (draft: Record<string, ElicitationValue | undefined>) => void }
 ): { body: HTMLElement[]; actions: HTMLElement } {
   const body: HTMLElement[] = [];
   if (spec.title !== undefined) body.push(el("div", "elicit-title", spec.title));
@@ -206,6 +201,9 @@ export function buildElicitationCard(
   } else {
     const fields = spec.fields;
     const draft = elicitationDraftOf(fields);
+    for (const field of fields) {
+      if (saved?.draft !== undefined && Object.hasOwn(saved.draft, field.name)) draft[field.name] = saved.draft[field.name];
+    }
     let attempted = false;
     const views: FieldView[] = [];
     const showIssues = (): boolean => {
@@ -220,7 +218,10 @@ export function buildElicitationCard(
     };
     const form = el("div", "elicit-form");
     fields.forEach((field, index) => {
-      const view = fieldView(field, `${idPrefix}-f${index}`, draft, () => { if (attempted) showIssues(); });
+      const view = fieldView(field, `${idPrefix}-f${index}`, draft, () => {
+        saved?.save({ ...draft });
+        if (attempted) showIssues();
+      });
       views.push(view);
       form.append(view.root);
     });

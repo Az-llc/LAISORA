@@ -1,31 +1,23 @@
 import * as l10n from "@vscode/l10n";
 import { CLOSE_GLYPH } from "./close-button";
-import { isWaitingYouItem, type YouItem, type YouItemsReader } from "./you-items";
+import { askStale, isWaitingYouItem, nextAskStaleAt, type YouItem, type YouItemsReader } from "./you-items";
 import { bindUserLabel } from "./user-label";
 import { foldGlyph } from "./marks";
+import { textElement as node } from "./element";
+
+export function askStaleLabel(): string {
+  return l10n.t("Probably not needed");
+}
 
 export function youKindLabel(item: Pick<YouItem, "kind">): string {
   return item.kind === "approve" ? l10n.t("Approval") : item.kind === "decide" ? l10n.t("Decision") : l10n.t("Machine check");
 }
 
-export function youWaitingKindLabel(item: Pick<YouItem, "kind" | "awaitingDetail">): string {
-  const kind = youKindLabel(item);
-  return item.awaitingDetail ? l10n.t("{0} · Awaiting explanation", kind) : kind;
-}
-
-function node<K extends keyof HTMLElementTagNameMap>(tag: K, className: string, text?: string): HTMLElementTagNameMap[K] {
-  const element = document.createElement(tag);
-  element.className = className;
-  if (text !== undefined) {
-    element.textContent = text;
-    if (/[\u3040-\u30ff\u3400-\u9fff]/.test(text)) element.lang = "ja";
-  }
-  return element;
-}
 
 export class YouList {
   readonly element = node("section", "you-section");
   private readonly unsubscribe: () => void;
+  private staleTimer: ReturnType<typeof setTimeout> | undefined;
 
   constructor(reader: YouItemsReader, navigate: (item: YouItem) => void, onOpen?: (open: readonly YouItem[], total: number) => void,
     dismiss?: (item: YouItem) => void) {
@@ -34,11 +26,18 @@ export class YouList {
     let signature = "";
     const render = (force = false): void => {
       const items = reader.get();
-      const next = JSON.stringify(items);
+      const now = Date.now();
+      const waiting = items.filter(isWaitingYouItem);
+      const stale = new Set(waiting.filter(item => askStale(item, items, now) !== null));
+      const next = JSON.stringify([items, [...stale].map(item => item.id)]);
       if (!force && signature === next) return;
       signature = next;
-      const open = items.filter(isWaitingYouItem);
-      const resolved = items.filter(item => !isWaitingYouItem(item) && item.resolution !== "dismissed");
+      clearTimeout(this.staleTimer);
+      const staleAt = nextAskStaleAt(items, now);
+      if (staleAt !== null) this.staleTimer = setTimeout(() => render(), Math.min(staleAt - now + 1000, 2 ** 31 - 1));
+      const open = waiting.filter(item => !stale.has(item));
+      const resolved = items.filter(item => !isWaitingYouItem(item) && item.resolution !== "dismissed"
+        && !(item.kind === "check" && item.resolution === "superseded"));
       const folded = this.element.dataset.resolvedOpen !== "true";
       onOpen?.(open, items.length);
       const head = node("header", "plan-section-head");
@@ -55,7 +54,11 @@ export class YouList {
         square.setAttribute("aria-hidden", "true");
         const body = node("div", "you-body");
         const kind = youKindLabel(item);
-        body.append(node("div", "you-kind", isWaitingYouItem(item) ? youWaitingKindLabel(item)
+        if (stale.has(item)) {
+          row.classList.add("you-stale");
+          body.append(node("span", "todo-ask-stale", askStaleLabel()));
+        }
+        body.append(node("div", "you-kind", isWaitingYouItem(item) ? kind
           : item.resolution === "historical" ? l10n.t("{0} · Recorded", kind) : l10n.t("{0} · Resolved", kind)));
         const title = node("div", "you-title");
         const link = node("button", "you-link", item.anchor.approvalRef ? l10n.t("↗ Card") : l10n.t("↗ Message"));
@@ -97,11 +100,15 @@ export class YouList {
         if (!folded) appendRows(resolved);
       }
       if (open.length) appendRows(open);
-      else list.append(node("p", "you-empty", l10n.t("Nothing is waiting on you")));
+      if (stale.size) appendRows([...stale]);
+      if (!waiting.length) list.append(node("p", "you-empty", l10n.t("Nothing is waiting on you")));
     };
     this.unsubscribe = reader.subscribe(() => render());
     render();
   }
 
-  destroy(): void { this.unsubscribe(); }
+  destroy(): void {
+    clearTimeout(this.staleTimer);
+    this.unsubscribe();
+  }
 }

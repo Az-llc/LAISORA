@@ -1,13 +1,15 @@
 import { captureToolIntentInput } from "./tool-intent";
+import { escapeRegExp } from "./regexp-escape";
 import type { RosterSource } from "./roster-evidence";
 import { apiRetryEvent, localCommandOutput, taskNotificationDisplayFields, taskNotificationPreview, toolResultPreview } from "./transcript-display";
 import type { HostArtifactAccess } from "./artifact-access";
 import type { AssistantUsage, AskUserQuestionSpec, EventProvenance, ImageRefInfo, NormalizedEventBody, RestoredAgent, RestoredApprovalCard, ResumePreviewMessage, TaskNotificationInfo } from "./protocol";
 import type { ConversationMessage } from "./conversation-history";
-import { assistantUsageFromRaw, isObservedTime, isSyntheticModel, RESUME_PREVIEW_MESSAGE_MAX, summarizeToolInput } from "./protocol";
+import { assistantUsageFromRaw, CONVERSATION_TEXT_MAX, isObservedTime, RESUME_PREVIEW_MESSAGE_MAX, summarizeToolInput } from "./protocol";
+import { surrogateSafeEnd } from "./text-clip";
 import type { WorkCoverage } from "./work-model";
 import { compactBoundaryTime } from "./time-buckets";
-import { extractResumeSignals, extractStage0ToolFields, isResumeSignalToolName, parseTaskNotification } from "./tool-observation";
+import { extractResumeSignals, extractStage0ToolFields, isResumeSignalToolName, parseTaskNotification, type Stage0ToolFields } from "./tool-observation";
 import { redactAbsolutePaths, redactOptional } from "./path-redaction";
 import { advanceRunRoot, countFileEdit, singleToolUseResult, type RunRootState } from "./edit-summary";
 import { askUnansweredOf, askUnansweredQuestions, isAskUnansweredKind, type AskUnansweredKind } from "./ask-unanswered";
@@ -18,14 +20,17 @@ import {
   extractAssistantTextBlocks,
   isApiErrorFrame,
   isReplacedErrorProse,
+  recordedModelOf,
   accountErrorEvent,
   parseRefusalNotice,
   refusalFallbackEvent,
   parseRefusalStop,
+  isRemoteHumanRecord,
 } from "./claude-normalizer";
 import { HANDOFF_TAG, parseHandoffEnvelope, type HandoffEnvelopeV2, type HandoffParseResult } from "./handoff-envelope";
 import { capVerbatimText } from "./verbatim-cap";
 import { isLaisoraInputText, laisoraInputLine, parseLaisoraInput } from "./laisora-input";
+import { continuedWorkSummaryIn } from "./closing-summary";
 import { ASK_QUALITY_DENIAL_HEAD, feedbackRejectedTitles, resolveRejectedAsks, type AskRejection } from "./markdown-ast";
 import {
   CLI_USER_INTERRUPTED_TEXTS,
@@ -42,9 +47,10 @@ import {
 export { extractCliInsertedUserText, extractHumanUserText, extractImageRefs, extractQueuedPromptRecord } from "./human-input-vocabulary";
 import { isCliRejectionText, isLaisoraDenialText } from "./tool-result-signals";
 import { TASK_NOTIFICATION_ORIGIN_KIND } from "./task-notification-origin";
-import { handoffNoticeCardText, handoffNoticeOf } from "./steering-envelope";
+import { handoffNoticeCardText, handoffNoticeOf, type HandoffNoticeFacts } from "./steering-envelope";
 import { PUSH_NOTIFICATION_TOOL, isWaitNotifyRewake, waitNotifyLine, wakeLineAfterCall, type WakeLine } from "./wait-notify";
 import { toolInputPreview } from "./tool-input-preview";
+import { agentIdOfMetaName, agentIdOfTranscriptName, forkCopiedCount, forkCopiedLineCount, forkLaunchOf, forkOwnStart, withoutForkLaunchAnswer, type ForkLaunch, isSubagentMetaName, readSubagentMeta, subagentDirOf, subagentLaunchToolUseId, subagentMetaName, subagentTranscriptName, SUBAGENTS_DIR_NAME } from "./subagent-files";
 
 export interface HistoryEvent {
   body: NormalizedEventBody & { provenance: EventProvenance };
@@ -262,8 +268,10 @@ function usageRecordOf(line: string): Record<string, unknown> | "malformed" | un
   const obj = recordOf(value);
   const message = asRecord(obj?.message);
   if (obj === null || obj.type !== "assistant" || typeof message?.id !== "string" || typeof message.usage !== "object" || message.usage === null) return undefined;
+  const toolUses = Array.isArray(message.content)
+    ? message.content.flatMap((block: unknown) => asRecord(block)?.type === "tool_use" ? [{ type: "tool_use", id: asRecord(block)!.id }] : []) : [];
   return { type: "assistant", ...(obj.uuid === undefined ? {} : { uuid: obj.uuid }), ...(obj.timestamp === undefined ? {} : { timestamp: obj.timestamp }),
-    message: { id: message.id, usage: message.usage } };
+    message: { id: message.id, usage: message.usage, ...(toolUses.length > 0 ? { content: toolUses } : {}) } };
 }
 
 export async function scanChildUsage(filePath: string, byteLength: number, previous: ChildUsageScan | undefined):
@@ -300,6 +308,7 @@ export interface DeferredChildUsage {
   childPath: string;
   byteLength: number;
   parentToolUseId: string;
+  fork?: ForkLaunch;
   through?: number;
   launchedAt?: number;
   gapThrough?: number;
@@ -372,12 +381,13 @@ export function foldDeferredChildCoverage(coverage: WorkCoverage,
 
 type ChildUsageItem = RawHistoryItem & { body: Extract<NormalizedEventBody, { kind: "assistant_usage" }> & { parentToolUseId: string } };
 
-function childUsageEvents(records: readonly Record<string, unknown>[], parentToolUseId: string, turnOf: (recordTime: number) => string,
-  sourcePriority: number): ChildUsageItem[] {
+function childUsageEvents(records: readonly Record<string, unknown>[], parentToolUseId: string, fork: ForkLaunch | undefined, turnOf: (recordTime: number) => string,
+  sourcePriority: number): { events: ChildUsageItem[]; launchMissing: boolean } {
   const events: ChildUsageItem[] = [];
   const accept = createRecordUuidFilter();
   let lastTimestamp = 0;
-  for (const obj of records) {
+  const copies = forkCopiedCount(records, fork, (record) => record);
+  for (const obj of records.slice(copies.copied)) {
     if (!accept(obj)) continue;
     const rawTs = typeof obj.timestamp === "string" ? Date.parse(obj.timestamp) : NaN;
     const recordTime = Number.isFinite(rawTs) ? rawTs : lastTimestamp;
@@ -385,7 +395,7 @@ function childUsageEvents(records: readonly Record<string, unknown>[], parentToo
     const event = childUsageEvent(obj, parentToolUseId, recordTime, () => turnOf(recordTime), sourcePriority, events.length);
     if (event) events.push(event as ChildUsageItem);
   }
-  return events;
+  return { events, launchMissing: copies.launchMissing };
 }
 
 export interface DeferredChildUsageRead extends LargeChildUsageOutcome {
@@ -399,9 +409,10 @@ export async function readDeferredChildUsage(items: readonly DeferredChildUsage[
     try {
       const { scan, records, malformedLineCount } = await scanChildUsage(item.childPath, item.byteLength, usageScansOf(owner, item.transcriptFile)?.get(item.childPath));
       storeUsageScans(owner, item.transcriptFile, new Map([[item.childPath, scan]]), true);
-      const events = childUsageEvents(records, item.parentToolUseId, () => "", 0)
+      const usage = childUsageEvents(records, item.parentToolUseId, item.fork, () => "", 0);
+      const events = usage.events
         .filter(({ timestamp }) => item.through === undefined || timestamp <= item.through).map(({ timestamp, body }) => ({ timestamp, body }));
-      reads.push({ item, events, usageRead: true, malformedLineCount });
+      reads.push({ item, events, usageRead: true, malformedLineCount: malformedLineCount + (usage.launchMissing ? 1 : 0) });
     } catch {
       reads.push({ item, events: [], usageRead: false, malformedLineCount: 0 });
     }
@@ -454,8 +465,7 @@ async function captureParentBoundary(
     if (!assistantFound && isHandoffGenerationBoundary(record, sessionId)) assistantFound = true;
     if (!assistantFound && record.type === "assistant" && record.isSidechain !== true) {
       assistantFound = true;
-      const model = asRecord(record.message)?.model;
-      recordedModel = typeof model === "string" && model.length > 0 && !isSyntheticModel(model) ? model : undefined;
+      recordedModel = recordedModelOf(asRecord(record.message));
     }
   };
   const scanFloor = Math.max(0, size - RESUME_TAIL_MAX_BYTES);
@@ -511,14 +521,13 @@ export async function captureResumeReadSet(parentPath: string): Promise<ResumeRe
     await handle.close();
   }
 
-  const baseDir = parentPath.replace(/\.jsonl$/i, "");
-  const subagentsDir = `${baseDir}/subagents`;
+  const subagentsDir = subagentDirOf(parentPath);
   const subagents: Array<{ path: string; size: number }> = [];
-  if (baseDir !== parentPath) {
+  if (subagentsDir !== undefined) {
     let names: string[] = [];
     try {
       names = (await readdir(subagentsDir))
-        .filter((name) => name.startsWith("agent-") && name.endsWith(".jsonl"))
+        .filter((name) => agentIdOfTranscriptName(name) !== undefined)
         .sort();
     } catch (error) {
       if ((error as { code?: unknown }).code !== "ENOENT") throw error;
@@ -926,10 +935,9 @@ export async function readResumePreviewTail(
     } else if (obj.type === "assistant") {
       if (!uuid) continue;
       const message = asRecord(obj.message);
-      const text = extractAssistantRecordText(message?.content, obj.narration_block_indexes);
-      if (text && !isReplacedErrorProse(obj, message)) {
-        const rawModel = message?.model;
-        const model = typeof rawModel === "string" && rawModel.length > 0 && !isSyntheticModel(rawModel) ? rawModel : undefined;
+      const text = shownAssistantText(obj, message).text;
+      if (text) {
+        const model = recordedModelOf(message);
         messages.push({ uuid, role: "assistant", text, ...(model ? { model } : {}) });
       }
     }
@@ -945,6 +953,59 @@ interface RawHistoryItem {
   hostArtifacts?: HostArtifactAccess[];
   sourcePriority: number;
   fileOrder: number;
+}
+
+function historyToolStartedItem(
+  toolUse: Record<string, any>, toolUseId: string, turnId: string, parentToolUseId: string | null, messageId: string | null,
+  stage0: Stage0ToolFields, timestamp: number, sourcePriority: number, fileOrder: number
+): RawHistoryItem {
+  return {
+    body: {
+      kind: "tool_call_started",
+      turnId,
+      toolUseId,
+      parentToolUseId,
+      toolName: toolUse.name,
+      ...(messageId === null ? {} : { messageId }),
+      inputPreview: toolInputPreview(toolUse.name, toolUse.input),
+      inputSummary: redactOptional(summarizeToolInput(toolUse.name, toolUse.input) ?? undefined),
+      intentInput: captureToolIntentInput(toolUse.name, toolUse.input),
+      isBackground: stage0.delegation?.isBackground,
+      subagentType: stage0.delegation?.subagentType,
+      subagentModel: stage0.delegation?.subagentModel,
+      delegation: stage0.delegation,
+      taskIntentStructured: stage0.taskIntentStructured,
+      artifacts: stage0.artifacts,
+      effectCoverage: stage0.effectCoverage,
+      progressEmission: stage0.progressEmission,
+      provenance: { path: "history" },
+    },
+    timestamp,
+    hostArtifacts: stage0.hostArtifacts.length > 0 ? stage0.hostArtifacts : undefined,
+    sourcePriority,
+    fileOrder,
+  };
+}
+
+function historyToolFinishedItem(
+  turnId: string, toolUseId: string, toolResult: Record<string, any>, resumeSignals: ReturnType<typeof toolResultSignals>,
+  fileEdit: ReturnType<typeof countFileEdit>, timestamp: number, sourcePriority: number, fileOrder: number
+): RawHistoryItem {
+  return {
+    body: {
+      kind: "tool_call_finished",
+      turnId,
+      toolUseId,
+      isError: toolResult.is_error === true,
+      resultPreview: toolResultPreview(toolResult.content),
+      ...(resumeSignals ?? {}),
+      ...(fileEdit ? { fileEdit } : {}),
+      provenance: { path: "history" },
+    },
+    timestamp,
+    sourcePriority,
+    fileOrder,
+  };
 }
 
 function recordCwd(record: Record<string, unknown>, fallback: string): string {
@@ -1208,11 +1269,55 @@ async function readHistory(
     }
     return texts;
   };
+  const pushNotifications = (content: unknown, record: Record<string, unknown>, turnOf: () => string, timestamp: number, sourcePriority: number, nextOrder: () => number): void => {
+    for (const text of collectNotificationTexts(content)) {
+      const fields = makeNotificationFields(text, record);
+      if (!fields) continue;
+      rawEvents.push({
+        body: { kind: "tool_call_finished", turnId: turnOf(), isError: false, ...fields, provenance: { path: "history" } },
+        timestamp,
+        sourcePriority,
+        fileOrder: nextOrder(),
+      });
+    }
+  };
+  const firstBlocks = (content: unknown, type: "tool_use" | "tool_result"): { id: string; block: Record<string, any> }[] => {
+    const out: { id: string; block: Record<string, any> }[] = [];
+    if (!Array.isArray(content)) return out;
+    const seen = type === "tool_use" ? seenToolUseIds : seenToolResultIds;
+    for (const raw of content) {
+      const block = asRecord(raw);
+      if (block?.type !== type) continue;
+      const id = type === "tool_result" ? block.tool_use_id : typeof block.name === "string" ? block.id : undefined;
+      if (typeof id !== "string" || id.length === 0 || seen.has(id)) continue;
+      seen.add(id);
+      out.push({ id, block });
+    }
+    return out;
+  };
+  const observeToolResult = (toolUseId: string, content: unknown, ownLaunch: boolean) => {
+    const resumeSignals = toolResultSignals(resumeSignalToolNames.get(toolUseId), content);
+    if (resumeSignals?.asyncLaunchedAgentId) observedAsyncAgentIds.add(resumeSignals.asyncLaunchedAgentId);
+    if (resumeSignals?.resumedAgentId) observedAsyncAgentIds.add(resumeSignals.resumedAgentId);
+    if (ownLaunch) noteOwnAgentLaunch(ownAgentLaunches, resumeSignals, toolUseId);
+    if (resumeSignals?.backgroundTaskId) observedBackgroundTaskIds.add(resumeSignals.backgroundTaskId);
+    return resumeSignals;
+  };
+  const observeToolUse = (toolUseId: string, name: string, at: number): void => {
+    if (isResumeSignalToolName(name)) resumeSignalToolNames.set(toolUseId, name);
+    launchedAt.set(toolUseId, at);
+  };
 
   let turnOrdinal = 0;
   let currentTurnId: string | null = null;
   let lastTurnActivityTimestamp = 0;
   let pendingSilentTurn = true;
+  let turnEndedByInterrupt = false;
+  const closeTurnBody = (turnId: string) => {
+    const body = { kind: "turn_completed" as const, turnId, ...(turnEndedByInterrupt ? { endedByInterrupt: true as const } : {}), provenance: { path: "history" as const } };
+    turnEndedByInterrupt = false;
+    return body;
+  };
   let openNoticeCard: RawHistoryItem | undefined;
   const openPendingSilentTurn = (at: number): void => {
     if (!pendingSilentTurn) return;
@@ -1283,23 +1388,15 @@ async function readHistory(
       if (value === undefined) continue;
       const pendingYield = maybeYieldParent();
       if (pendingYield) await pendingYield;
-      if (value === NOT_OBJECT_LINE) {
+      const obj = recordLineOutcome(value, opts?.resumeReadSet !== undefined && !parentRecords.endsAtBoundary && parentLineIndex === parentRecords.count - 1);
+      if (obj === "partial") {
+        boundaryPartialExcludedCount++;
+        continue;
+      }
+      if (obj === "malformed") {
         malformedLineCount++;
         continue;
       }
-      if (value === UNPARSEABLE_LINE) {
-        if (
-          opts?.resumeReadSet &&
-          !parentRecords.endsAtBoundary &&
-          parentLineIndex === parentRecords.count - 1
-        ) {
-          boundaryPartialExcludedCount++;
-          continue;
-        }
-        malformedLineCount++;
-        continue;
-      }
-      const obj = value;
 
       if (!acceptParentRecord(obj)) continue;
 
@@ -1362,6 +1459,8 @@ async function readHistory(
 
       const message = asRecord(obj.message);
       const content = message?.content;
+      if (obj.type === "assistant") turnEndedByInterrupt = false;
+      else if (obj.type === "user" && currentTurnId !== null && isInterruptMarker(content)) turnEndedByInterrupt = true;
       const assistantMessageId =
         obj.type === "assistant" && typeof message?.id === "string" && message.id.length > 0
           ? message.id
@@ -1391,14 +1490,14 @@ async function readHistory(
         const cliInsertedText = obj.type === "user" && humanText === null ? extractCliInsertedUserText(obj) : null;
         const agentWake = obj.type === "user" && AGENT_WAKE_ORIGIN_KINDS.has(String(asRecord(obj.origin)?.kind));
         const laisoraWake = humanText === null && isLaisoraWakeRecord(obj);
-        const handoffNotice = obj.type === "user" && humanText === null ? handoffNoticeOf(joinedText) : undefined;
+        const handoffNotice = humanText === null ? recordHandoffNotice(obj) : undefined;
         if (openNoticeCard !== undefined && obj.type === "user" && isInterruptMarker(content)) {
           (openNoticeCard.body as Extract<NormalizedEventBody, { kind: "local_command_output" }>).handoffNoticeStopped = true;
         }
         if (humanText === null && currentTurnId !== null && handoffNotice === undefined && (STEER_TAG_RE.test(joinedText) || agentWake)) {
           const completedTime = lastTurnActivityTimestamp || recordTime;
           rawEvents.push({
-            body: { kind: "turn_completed", turnId: currentTurnId, provenance: { path: "history" } },
+            body: closeTurnBody(currentTurnId),
             timestamp: completedTime,
             sourcePriority: 0,
             fileOrder: parentOrderCounter++,
@@ -1417,10 +1516,10 @@ async function readHistory(
         }
         const turnInsertedText = askFeedback === null ? cliInsertedText ?? (handoffNotice !== undefined || laisoraWake ? joinedText : null) : null;
         const absorbedMidTurn = extractQueuedPromptRecord(obj) !== null && prompt !== null && currentTurnId !== null;
-        if (absorbedMidTurn && prompt !== null) {
+        if (absorbedMidTurn && prompt !== null && currentTurnId !== null) {
           rawEvents.push({
-            body: { kind: "user_message", turnId: currentTurnId, text: prompt.text, ...(prompt.uuid ? { uuid: prompt.uuid } : {}),
-              ...(prompt.imageRefs ? { imageRefs: prompt.imageRefs } : {}), provenance: { path: "history" } },
+            body: { kind: "user_message", turnId: currentTurnId, absorbedInto: currentTurnId, text: prompt.text, ...(prompt.uuid ? { uuid: prompt.uuid } : {}),
+              ...(prompt.imageRefs ? { imageRefs: prompt.imageRefs } : {}), ...(prompt.remote ? { remote: true } : {}), provenance: { path: "history" } },
             timestamp: recordTime, sourcePriority: 0, fileOrder: parentOrderCounter++,
           });
           lastTurnActivityTimestamp = recordTime;
@@ -1430,11 +1529,7 @@ async function readHistory(
           if (currentTurnId !== null) {
             const completedTime = lastTurnActivityTimestamp || recordTime;
             rawEvents.push({
-              body: {
-                kind: "turn_completed",
-                turnId: currentTurnId,
-                provenance: { path: "history" },
-              },
+              body: closeTurnBody(currentTurnId),
               timestamp: completedTime,
               sourcePriority: 0,
               fileOrder: parentOrderCounter++,
@@ -1485,6 +1580,7 @@ async function readHistory(
                 text: prompt.text,
                 ...(prompt.uuid ? { uuid: prompt.uuid } : {}),
                 ...(imageRefs ? { imageRefs } : {}),
+                ...(prompt.remote ? { remote: true } : {}),
                 provenance: { path: "history" },
               },
               timestamp: recordTime,
@@ -1494,64 +1590,19 @@ async function readHistory(
           }
         }
 
-        if (Array.isArray(content)) {
-          for (const block of content) {
-            const toolResult = asRecord(block);
-            if (toolResult?.type !== "tool_result" || typeof toolResult.tool_use_id !== "string") continue;
-            const toolUseId = toolResult.tool_use_id;
-            if (toolUseId.length === 0 || seenToolResultIds.has(toolUseId)) continue;
-            seenToolResultIds.add(toolUseId);
-            openPendingSilentTurn(recordTime);
-
-            lastTurnActivityTimestamp = recordTime;
-            const resumeSignals = toolResultSignals(resumeSignalToolNames.get(toolUseId), toolResult.content);
-            if (resumeSignals?.asyncLaunchedAgentId) observedAsyncAgentIds.add(resumeSignals.asyncLaunchedAgentId);
-            if (resumeSignals?.resumedAgentId) observedAsyncAgentIds.add(resumeSignals.resumedAgentId);
-            if (copiedFrom === undefined) noteOwnAgentLaunch(ownAgentLaunches, resumeSignals, toolUseId);
-            if (resumeSignals?.backgroundTaskId) observedBackgroundTaskIds.add(resumeSignals.backgroundTaskId);
-            if (usageOnly) continue;
-            const preview = toolResultPreview(toolResult.content);
-            const isError = toolResult.is_error === true;
-            const turnId = currentTurnId ?? "replay-turn-1";
-            const editToolName = editToolNames.get(toolUseId);
-            const fileEdit = editToolName !== undefined && !isError
-              ? countFileEdit(editToolName, singleToolUseResult(content, obj.toolUseResult), runRoot.root ?? cwd)
-              : undefined;
-
-            rawEvents.push({
-              body: {
-                kind: "tool_call_finished",
-                turnId,
-                toolUseId,
-                isError,
-                resultPreview: preview,
-                ...(resumeSignals ?? {}),
-                ...(fileEdit ? { fileEdit } : {}),
-                provenance: { path: "history" },
-              },
-              timestamp: recordTime,
-              sourcePriority: 0,
-              fileOrder: parentOrderCounter++,
-            });
-          }
+        for (const { id: toolUseId, block: toolResult } of firstBlocks(content, "tool_result")) {
+          openPendingSilentTurn(recordTime);
+          lastTurnActivityTimestamp = recordTime;
+          const resumeSignals = observeToolResult(toolUseId, toolResult.content, copiedFrom === undefined);
+          if (usageOnly) continue;
+          const editToolName = editToolNames.get(toolUseId);
+          const fileEdit = editToolName !== undefined && toolResult.is_error !== true
+            ? countFileEdit(editToolName, singleToolUseResult(content, obj.toolUseResult), runRoot.root ?? cwd)
+            : undefined;
+          rawEvents.push(historyToolFinishedItem(currentTurnId ?? "replay-turn-1", toolUseId, toolResult, resumeSignals, fileEdit, recordTime, 0, parentOrderCounter++));
         }
 
-        for (const text of collectNotificationTexts(content)) {
-          const fields = makeNotificationFields(text, obj);
-          if (!fields) continue;
-          rawEvents.push({
-            body: {
-              kind: "tool_call_finished",
-              turnId: currentTurnId ?? "replay-turn-1",
-              isError: false,
-              ...fields,
-              provenance: { path: "history" },
-            },
-            timestamp: recordTime,
-            sourcePriority: 0,
-            fileOrder: parentOrderCounter++,
-          });
-        }
+        pushNotifications(content, obj, () => currentTurnId ?? "replay-turn-1", recordTime, 0, () => parentOrderCounter++);
       } else if (obj.type === "assistant") {
         openPendingSilentTurn(recordTime);
         const { text, narration } = assistantRecordText(content, obj.narration_block_indexes);
@@ -1573,8 +1624,8 @@ async function readHistory(
         } else if (pendingUsage && pendingUsage.messageId === messageId) {
           pendingUsage.timestamp = recordTime;
         }
-        const model = typeof message?.model === "string" ? message.model : null;
-        if (model !== null && !isSyntheticModel(model) && model !== lastRootModel) {
+        const model = recordedModelOf(message) ?? null;
+        if (model !== null && model !== lastRootModel) {
           lastRootModel = model;
           rawEvents.push({
             body: {
@@ -1642,56 +1693,15 @@ async function readHistory(
           }
         }
 
-        if (Array.isArray(content)) {
-          for (const block of content) {
-            const toolUse = asRecord(block);
-            if (toolUse?.type !== "tool_use" || typeof toolUse.name !== "string") continue;
-            const toolUseId = typeof toolUse.id === "string" ? toolUse.id : "";
-            if (toolUseId.length === 0 || seenToolUseIds.has(toolUseId)) continue;
-            seenToolUseIds.add(toolUseId);
-            if (isResumeSignalToolName(toolUse.name)) {
-              resumeSignalToolNames.set(toolUseId, toolUse.name);
-            }
-            if (isFileWritingTool(toolUse.name)) editToolNames.set(toolUseId, toolUse.name);
-            lastTurnActivityTimestamp = recordTime;
-            launchedAt.set(toolUseId, recordTime);
-            if (usageOnly && copiedFrom === undefined) continue;
-
-            const rawInput = asRecord(toolUse.input) ?? undefined;
-            const currentCwd = recordCwd(obj, cwd);
-            const stage0 = extractStage0ToolFields(toolUse.name, rawInput, toolUseId, currentCwd);
-            if (stage0.delegation !== undefined && copiedFrom !== undefined) usageOwnerSources.add(copiedFrom);
-            if (usageOnly) continue;
-            const inputSummary = redactOptional(summarizeToolInput(toolUse.name, toolUse.input) ?? undefined);
-            const inputPreview = redactAbsolutePaths(JSON.stringify(toolUse.input) ?? "").slice(0, 2000);
-
-            rawEvents.push({
-              body: {
-                kind: "tool_call_started",
-                turnId,
-                toolUseId,
-                parentToolUseId: null,
-                toolName: toolUse.name,
-                ...(messageId === null ? {} : { messageId }),
-                inputPreview,
-                inputSummary,
-                intentInput: captureToolIntentInput(toolUse.name, toolUse.input),
-                isBackground: stage0.delegation?.isBackground,
-                subagentType: stage0.delegation?.subagentType,
-                subagentModel: stage0.delegation?.subagentModel,
-                delegation: stage0.delegation,
-                taskIntentStructured: stage0.taskIntentStructured,
-                artifacts: stage0.artifacts,
-                effectCoverage: stage0.effectCoverage,
-                progressEmission: stage0.progressEmission,
-                provenance: { path: "history" },
-              },
-              timestamp: recordTime,
-              hostArtifacts: stage0.hostArtifacts.length > 0 ? stage0.hostArtifacts : undefined,
-              sourcePriority: 0,
-              fileOrder: parentOrderCounter++,
-            });
-          }
+        for (const { id: toolUseId, block: toolUse } of firstBlocks(content, "tool_use")) {
+          observeToolUse(toolUseId, toolUse.name, recordTime);
+          if (isFileWritingTool(toolUse.name)) editToolNames.set(toolUseId, toolUse.name);
+          lastTurnActivityTimestamp = recordTime;
+          if (usageOnly && copiedFrom === undefined) continue;
+          const stage0 = extractStage0ToolFields(toolUse.name, asRecord(toolUse.input) ?? undefined, toolUseId, recordCwd(obj, cwd));
+          if (stage0.delegation !== undefined && copiedFrom !== undefined) usageOwnerSources.add(copiedFrom);
+          if (usageOnly) continue;
+          rawEvents.push(historyToolStartedItem(toolUse, toolUseId, turnId, null, messageId, stage0, recordTime, 0, parentOrderCounter++));
         }
       } else if (isCompactBoundaryRecord(obj)) {
         const compactMeta = asRecord(obj.compactMetadata);
@@ -1776,11 +1786,7 @@ async function readHistory(
     if (currentTurnId !== null) {
       const finalTimestamp = lastTurnActivityTimestamp || lastParentTimestamp || 0;
       rawEvents.push({
-        body: {
-          kind: "turn_completed",
-          turnId: currentTurnId,
-          provenance: { path: "history" },
-        },
+        body: closeTurnBody(currentTurnId),
         timestamp: finalTimestamp,
         sourcePriority: 0,
         fileOrder: parentOrderCounter++,
@@ -1790,8 +1796,7 @@ async function readHistory(
       }
     }
 
-    const baseDir = parentFilePath.replace(/\.jsonl$/i, "");
-    const subagentsDir = opts?.subagentsDir ?? `${baseDir}/subagents`;
+    const subagentsDir = opts?.subagentsDir ?? subagentDirOf(parentFilePath) ?? `${parentFilePath}/${SUBAGENTS_DIR_NAME}`;
 
     if (allowed(subagentsDir)) {
       let entries: string[] = [];
@@ -1800,15 +1805,16 @@ async function readHistory(
       if (capturedSubagents) {
         for (const captured of capturedSubagents) {
           const name = captured.path.split(/[\\/]/).pop() ?? "";
-          if (!name.startsWith("agent-") || !name.endsWith(".jsonl")) continue;
+          const agentId = agentIdOfTranscriptName(name);
+          if (agentId === undefined) continue;
           capturedByName.set(name, captured);
-          entries.push(name, name.replace(/\.jsonl$/i, ".meta.json"));
+          entries.push(name, subagentMetaName(agentId));
         }
         const listing = await dirListing(subagentsDir).catch(() => undefined);
         if (listing === undefined) reusable = false;
         else {
           inputs.dirs.set(subagentsDir, listing);
-          const listed = (listing ?? []).filter((name) => name.startsWith("agent-") && name.endsWith(".jsonl"));
+          const listed = (listing ?? []).filter((name) => agentIdOfTranscriptName(name) !== undefined);
           if (listed.length !== capturedByName.size || listed.some((name) => !capturedByName.has(name))) reusable = false;
         }
       } else {
@@ -1826,34 +1832,32 @@ async function readHistory(
 
       if (entries.length > 0) {
         const metaMap = new Map<string, string>();
-        const metaFiles = entries.filter((name) => name.startsWith("agent-") && name.endsWith(".meta.json"));
-        for (const metaName of metaFiles) {
-          const agentId = metaName.slice("agent-".length, metaName.length - ".meta.json".length);
-          if (!agentId) continue;
+        const forkLaunches = new Map<string, ForkLaunch>();
+        for (const metaName of entries) {
+          const agentId = agentIdOfMetaName(metaName);
+          if (agentId === undefined) continue;
           await stamp(`${subagentsDir}/${metaName}`);
-          try {
-            const rawMeta = JSON.parse(await readFile(`${subagentsDir}/${metaName}`, "utf8"));
-            const metaObj = asRecord(rawMeta);
-            if (metaObj && typeof metaObj.toolUseId === "string") {
-              metaMap.set(agentId, metaObj.toolUseId);
-            }
-          } catch {
-          }
+          const meta = await readSubagentMeta(`${subagentsDir}/${metaName}`, (p) => readFile(p, "utf8"));
+          const toolUseId = subagentLaunchToolUseId(meta);
+          if (toolUseId !== undefined) metaMap.set(agentId, toolUseId);
+          const forkLaunch = forkLaunchOf(meta);
+          if (forkLaunch !== undefined) forkLaunches.set(agentId, forkLaunch);
         }
 
         const agentJsonlFiles = entries
-          .filter((name) => name.startsWith("agent-") && name.endsWith(".jsonl"))
+          .filter((name) => agentIdOfTranscriptName(name) !== undefined)
           .sort();
 
         let childFileIndex = 0;
         for (const jsonlName of agentJsonlFiles) {
           childFileIndex++;
-          const agentId = jsonlName.slice("agent-".length, jsonlName.length - ".jsonl".length);
+          const agentId = agentIdOfTranscriptName(jsonlName)!;
           listedSubagentAgentIds.add(agentId);
           const childFilePath = `${subagentsDir}/${jsonlName}`;
           const captured = capturedByName.get(jsonlName);
           const effectiveChildPath = captured?.path ?? childFilePath;
           const parentToolUseId = metaMap.get(agentId) ?? null;
+          const fork = parentToolUseId === null ? undefined : forkLaunches.get(agentId);
 
           const childStamp = await stamp(childFilePath);
           let fileSize: number;
@@ -1873,17 +1877,19 @@ async function readHistory(
             coverage.details = "prefix-truncated";
             const outcome: LargeChildUsageOutcome = { usageRead: false, malformedLineCount: 0 };
             if (parentToolUseId !== null && allowed(effectiveChildPath) && opts.largeChildUsage === "defer") {
-              deferredChildUsage.push({ transcriptFile: parentFilePath, childPath: effectiveChildPath, byteLength: fileSize, parentToolUseId });
+              deferredChildUsage.push({ transcriptFile: parentFilePath, childPath: effectiveChildPath, byteLength: fileSize, parentToolUseId, ...(fork === undefined ? {} : { fork }) });
               const held = previousUsageScans?.get(effectiveChildPath);
               if (held !== undefined) nextUsageScans.set(effectiveChildPath, held);
               usagePendingSubagents.add(agentId);
               continue;
             } else if (parentToolUseId !== null && allowed(effectiveChildPath) && opts.largeChildUsage === "read") {
               try {
-                const { scan, records, malformedLineCount: malformed } = await scanChildUsage(effectiveChildPath, fileSize, previousUsageScans?.get(effectiveChildPath));
+                const { scan, records, malformedLineCount: scanned } = await scanChildUsage(effectiveChildPath, fileSize, previousUsageScans?.get(effectiveChildPath));
                 nextUsageScans.set(effectiveChildPath, scan);
+                const usage = childUsageEvents(records, parentToolUseId, fork, recordTime => findTurnIdForTimestamp(parentTurns, recordTime), childFileIndex);
+                const malformed = scanned + (usage.launchMissing ? 1 : 0);
                 malformedLineCount += malformed;
-                rawEvents.push(...childUsageEvents(records, parentToolUseId, recordTime => findTurnIdForTimestamp(parentTurns, recordTime), childFileIndex));
+                rawEvents.push(...usage.events);
                 Object.assign(outcome, { usageRead: true, malformedLineCount: malformed });
               } catch {
                 reusable = false;
@@ -1916,8 +1922,13 @@ async function readHistory(
           const childLines = childText.split("\n");
           const childEndsAtBoundary = childText.endsWith("\n");
           const maybeYieldChild = createParseYielder();
+          const copies = forkCopiedLineCount(childLines, fork);
+          if (copies.launchMissing) {
+            malformedLineCount++;
+            subagentGaps.push({ toolUseId: parentToolUseId!, cause: "malformed" });
+          }
 
-          for (let childLineIndex = 0; childLineIndex < childLines.length; childLineIndex++) {
+          for (let childLineIndex = copies.copied; childLineIndex < childLines.length; childLineIndex++) {
             const value = lineValue(childLines[childLineIndex]);
             if (value === undefined) continue;
             const pendingYield = maybeYieldChild();
@@ -1937,7 +1948,7 @@ async function readHistory(
               if (parentToolUseId !== null && !trailingPartial) subagentGaps.push({ toolUseId: parentToolUseId, cause: "malformed" });
               continue;
             }
-            const obj = value;
+            const obj = withoutForkLaunchAnswer(value, fork);
 
             if (!acceptChildRecord(obj)) continue;
 
@@ -1956,121 +1967,24 @@ async function readHistory(
               childOrderCounter++;
             }
 
+            const nextChildOrder = (): number => childOrderCounter++;
             if (obj.type === "user") {
-              if (Array.isArray(content)) {
-                for (const block of content) {
-                  const toolResult = asRecord(block);
-                  if (toolResult?.type !== "tool_result" || typeof toolResult.tool_use_id !== "string") continue;
-                  const toolUseId = toolResult.tool_use_id;
-                  if (toolUseId.length === 0 || seenToolResultIds.has(toolUseId)) continue;
-                  seenToolResultIds.add(toolUseId);
-
-                  const resumeSignals = toolResultSignals(resumeSignalToolNames.get(toolUseId), toolResult.content);
-                  if (resumeSignals?.asyncLaunchedAgentId) observedAsyncAgentIds.add(resumeSignals.asyncLaunchedAgentId);
-                  if (resumeSignals?.resumedAgentId) observedAsyncAgentIds.add(resumeSignals.resumedAgentId);
-                  noteOwnAgentLaunch(ownAgentLaunches, resumeSignals, toolUseId);
-                  if (resumeSignals?.backgroundTaskId) observedBackgroundTaskIds.add(resumeSignals.backgroundTaskId);
-                  if (usageOnly) continue;
-                  const preview = toolResultPreview(toolResult.content);
-                  const isError = toolResult.is_error === true;
-
-                  rawEvents.push({
-                    body: {
-                      kind: "tool_call_finished",
-                      turnId: turnOf(),
-                      toolUseId,
-                      isError,
-                      resultPreview: preview,
-                      ...(resumeSignals ?? {}),
-                      provenance: { path: "history" },
-                    },
-                    timestamp: recordTime,
-                    sourcePriority: childFileIndex,
-                    fileOrder: childOrderCounter++,
-                  });
-                }
-              }
-              for (const text of collectNotificationTexts(content)) {
-                const fields = makeNotificationFields(text, obj);
-                if (!fields) continue;
-                rawEvents.push({
-                  body: {
-                    kind: "tool_call_finished",
-                    turnId: turnOf(),
-                    isError: false,
-                    ...fields,
-                    provenance: { path: "history" },
-                  },
-                  timestamp: recordTime,
-                  sourcePriority: childFileIndex,
-                  fileOrder: childOrderCounter++,
-                });
-              }
-            } else if (obj.type === "assistant" && Array.isArray(content)) {
-              for (const block of content) {
-                const toolUse = asRecord(block);
-                if (toolUse?.type !== "tool_use" || typeof toolUse.name !== "string") continue;
-                const toolUseId = typeof toolUse.id === "string" ? toolUse.id : "";
-                if (toolUseId.length === 0 || seenToolUseIds.has(toolUseId)) continue;
-                seenToolUseIds.add(toolUseId);
-                if (isResumeSignalToolName(toolUse.name)) {
-                  resumeSignalToolNames.set(toolUseId, toolUse.name);
-                }
-                launchedAt.set(toolUseId, recordTime);
+              for (const { id: toolUseId, block: toolResult } of firstBlocks(content, "tool_result")) {
+                const resumeSignals = observeToolResult(toolUseId, toolResult.content, true);
                 if (usageOnly) continue;
-
-                const rawInput = asRecord(toolUse.input) ?? undefined;
-                const currentCwd = recordCwd(obj, cwd);
-                const stage0 = extractStage0ToolFields(toolUse.name, rawInput, toolUseId, currentCwd);
-                const inputSummary = redactOptional(summarizeToolInput(toolUse.name, toolUse.input) ?? undefined);
-                const inputPreview = redactAbsolutePaths(JSON.stringify(toolUse.input) ?? "").slice(0, 2000);
-
-                rawEvents.push({
-                  body: {
-                    kind: "tool_call_started",
-                    turnId: turnOf(),
-                    toolUseId,
-                    parentToolUseId,
-                    toolName: toolUse.name,
-                    inputPreview,
-                    inputSummary,
-                    intentInput: captureToolIntentInput(toolUse.name, toolUse.input),
-                    isBackground: stage0.delegation?.isBackground,
-                    subagentType: stage0.delegation?.subagentType,
-                    subagentModel: stage0.delegation?.subagentModel,
-                    delegation: stage0.delegation,
-                    taskIntentStructured: stage0.taskIntentStructured,
-                    artifacts: stage0.artifacts,
-                    effectCoverage: stage0.effectCoverage,
-                    progressEmission: stage0.progressEmission,
-                    provenance: { path: "history" },
-                  },
-                  timestamp: recordTime,
-                  hostArtifacts: stage0.hostArtifacts.length > 0 ? stage0.hostArtifacts : undefined,
-                  sourcePriority: childFileIndex,
-                  fileOrder: childOrderCounter++,
-                });
+                rawEvents.push(historyToolFinishedItem(turnOf(), toolUseId, toolResult, resumeSignals, undefined, recordTime, childFileIndex, nextChildOrder()));
+              }
+              pushNotifications(content, obj, turnOf, recordTime, childFileIndex, nextChildOrder);
+            } else if (obj.type === "assistant") {
+              for (const { id: toolUseId, block: toolUse } of firstBlocks(content, "tool_use")) {
+                observeToolUse(toolUseId, toolUse.name, recordTime);
+                if (usageOnly) continue;
+                const stage0 = extractStage0ToolFields(toolUse.name, asRecord(toolUse.input) ?? undefined, toolUseId, recordCwd(obj, cwd));
+                rawEvents.push(historyToolStartedItem(toolUse, toolUseId, turnOf(), parentToolUseId, null, stage0, recordTime, childFileIndex, nextChildOrder()));
               }
             } else if (obj.type === "attachment") {
               const prompt = asRecord(obj.attachment)?.prompt;
-              if (typeof prompt === "string") {
-                for (const text of collectNotificationTexts(prompt)) {
-                  const fields = makeNotificationFields(text, obj);
-                  if (!fields) continue;
-                  rawEvents.push({
-                    body: {
-                      kind: "tool_call_finished",
-                      turnId: turnOf(),
-                      isError: false,
-                      ...fields,
-                      provenance: { path: "history" },
-                    },
-                    timestamp: recordTime,
-                    sourcePriority: childFileIndex,
-                    fileOrder: childOrderCounter++,
-                  });
-                }
-              }
+              if (typeof prompt === "string") pushNotifications(prompt, obj, turnOf, recordTime, childFileIndex, nextChildOrder);
             }
           }
         }
@@ -2299,6 +2213,7 @@ interface ConversationRecordParser {
     droppedWithoutUuidCount: number;
     boundaryPartialExcludedCount: number;
     handoffEnvelope?: HandoffEnvelopeV2;
+    continuedWorkSummary?: true;
     lastTimestamp: number;
   };
 }
@@ -2317,6 +2232,7 @@ function createConversationRecordParser(sessionId?: string, keep?: (message: Con
   let droppedWithoutUuidCount = 0;
   let boundaryPartialExcludedCount = 0;
   let handoffEnvelope: HandoffEnvelopeV2 | undefined;
+  let continuedWorkSummary = false;
   let cutFrom = 0;
   const acceptRecord = createRecordUuidFilter();
   const queuedSources = new Map<string, string | undefined>();
@@ -2370,19 +2286,15 @@ function createConversationRecordParser(sessionId?: string, keep?: (message: Con
         if (value === undefined) continue;
         const pendingYield = maybeYield();
         if (pendingYield) await pendingYield;
-        if (value === NOT_OBJECT_LINE) {
+        const obj = recordLineOutcome(value, options.lastLineMayBePartial === true && i === records.count - 1);
+        if (obj === "partial") {
+          boundaryPartialExcludedCount++;
+          continue;
+        }
+        if (obj === "malformed") {
           malformedLineCount++;
           continue;
         }
-        if (value === UNPARSEABLE_LINE) {
-          if (options.lastLineMayBePartial && i === records.count - 1) {
-            boundaryPartialExcludedCount++;
-            continue;
-          }
-          malformedLineCount++;
-          continue;
-        }
-        const obj = value;
         if (!acceptRecord(obj)) continue;
         if (obj.isSidechain === true) continue;
         if (isHandoffGenerationBoundary(obj, sessionId)) {
@@ -2391,6 +2303,7 @@ function createConversationRecordParser(sessionId?: string, keep?: (message: Con
           askRejections.length = 0;
           malformedLineCount = 0;
           droppedWithoutUuidCount = 0;
+          continuedWorkSummary = false;
         }
         lastTimestamp = recordTimestamp(obj.timestamp, lastTimestamp);
         const localOutput = localCommandOutput(obj);
@@ -2416,11 +2329,12 @@ function createConversationRecordParser(sessionId?: string, keep?: (message: Con
             const feedback = obj.type === "user" ? extractCliInsertedUserText(obj) : null;
             const sentByLaisora = feedback === null ? undefined : parseLaisoraInput(feedback);
             if (sentByLaisora !== undefined) {
+              if (continuedWorkSummaryIn(sentByLaisora.input)) continuedWorkSummary = true;
               const line = laisoraInputLine(sentByLaisora.input);
               if (line !== undefined && uuid.length > 0) messages.push({ uuid, role: "system", text: line, timestamp: lastTimestamp });
               continue;
             }
-            const handoffNotice = obj.type === "user" ? handoffNoticeOf(verbatimTextOf(obj)) : undefined;
+            const handoffNotice = recordHandoffNotice(obj);
             if (handoffNotice !== undefined) {
               if (uuid.length > 0) messages.push({ uuid, role: "system", text: handoffNoticeCardText(handoffNotice), timestamp: lastTimestamp });
               continue;
@@ -2450,7 +2364,7 @@ function createConversationRecordParser(sessionId?: string, keep?: (message: Con
             if (earlier < cutFrom) cutFrom--;
             if (earlier < askTurnFrom) askTurnFrom--;
           }
-          const { text: body, imageRefs } = prompt;
+          const { text: body, imageRefs, remote } = prompt;
           resolveMessageAskRejections(messages, askTurnFrom, askRejections.splice(0));
           compactBeforeTurn();
           askTurnFrom = messages.length;
@@ -2460,11 +2374,12 @@ function createConversationRecordParser(sessionId?: string, keep?: (message: Con
             text: body,
             timestamp: lastTimestamp,
             ...(imageRefs ? { imageRefs } : {}),
+            ...(remote ? { remote } : {}),
           });
         } else if (obj.type === "assistant") {
           const message = asRecord(obj.message);
-          const body = extractAssistantRecordText(message?.content, obj.narration_block_indexes);
-          if (!body || isReplacedErrorProse(obj, message)) {
+          const body = shownAssistantText(obj, message).text;
+          if (!body) {
             messages.push(...approvalMessages);
             continue;
           }
@@ -2473,8 +2388,7 @@ function createConversationRecordParser(sessionId?: string, keep?: (message: Con
             messages.push(...approvalMessages);
             continue;
           }
-          const rawModel = message?.model;
-          const model = typeof rawModel === "string" && rawModel.length > 0 && !isSyntheticModel(rawModel) ? rawModel : undefined;
+          const model = recordedModelOf(message);
           messages.push({
             uuid,
             role: "assistant",
@@ -2496,6 +2410,7 @@ function createConversationRecordParser(sessionId?: string, keep?: (message: Con
         droppedWithoutUuidCount,
         boundaryPartialExcludedCount,
         ...(handoffEnvelope ? { handoffEnvelope } : {}),
+        ...(continuedWorkSummary ? { continuedWorkSummary: true as const } : {}),
         lastTimestamp,
       };
     },
@@ -2515,6 +2430,7 @@ export async function readConversationMessages(
   boundaryPartialExcludedCount?: number;
   readError?: string;
   handoffEnvelope?: HandoffEnvelopeV2;
+  continuedWorkSummary?: true;
 }> {
   const failed = (readError: string) => ({
     messages: [], malformedLineCount: 0, droppedWithoutUuidCount: 0,
@@ -2574,24 +2490,19 @@ export async function readSessionTranscript(
         if (value === undefined) continue;
         const pendingYield = maybeYield();
         if (pendingYield) await pendingYield;
-        if (value === NOT_OBJECT_LINE) {
+        const obj = recordLineOutcome(value, resumeReadSet !== undefined && !records.endsAtBoundary && lineIndex === records.count - 1);
+        if (obj === "partial") {
+          boundaryPartialExcludedCount++;
+          continue;
+        }
+        if (obj === "malformed") {
           malformedLineCount++;
           continue;
         }
-        if (value === UNPARSEABLE_LINE) {
-          if (resumeReadSet && !records.endsAtBoundary && lineIndex === records.count - 1) {
-            boundaryPartialExcludedCount++;
-            continue;
-          }
-          malformedLineCount++;
-          continue;
-        }
-        const obj = value;
         if (typeof obj.version === "string" && obj.version.length > 0) {
           claudeCodeVersion = obj.version;
         }
         const message = asRecord(obj.message);
-        const content = message?.content;
         lastTimestamp = recordTimestamp(obj.timestamp, lastTimestamp);
         if (isHandoffGenerationBoundary(obj, sessionId)) {
           cutFrom = messages.length;
@@ -2607,27 +2518,23 @@ export async function readSessionTranscript(
         if (obj.type === "user" || obj.type === "attachment") {
           const prompt = extractHumanUserPrompt(obj, queuedSources, seenQueuedPrompts);
           if (prompt !== null) {
-            const { text, uuid, imageRefs } = prompt;
+            const { text, uuid, imageRefs, remote } = prompt;
             if (!title) title = text.split("\n")[0];
             messages.push({
               role: "user",
               text,
               uuid,
               ...(imageRefs ? { imageRefs } : {}),
+              ...(remote ? { remote } : {}),
               timestamp: lastTimestamp,
             });
           }
         } else if (obj.type === "assistant") {
-          if (obj.isSidechain !== true) {
-            const model = message?.model;
-            recordedModel = typeof model === "string" && model.length > 0 && !isSyntheticModel(model) ? model : undefined;
-          }
-          const recordText = assistantRecordText(content, obj.narration_block_indexes);
-          const text = obj.isSidechain === true || (recordText.narration && !acceptNarrationRecord(obj))
-            ? "" : recordText.text;
-          if (text && !isReplacedErrorProse(obj, message)) {
-            const rawModel = message?.model;
-            const model = typeof rawModel === "string" && rawModel.length > 0 && !isSyntheticModel(rawModel) ? rawModel : undefined;
+          if (obj.isSidechain !== true) recordedModel = recordedModelOf(message);
+          const shown = shownAssistantText(obj, message);
+          const text = obj.isSidechain === true || (shown.narration && !acceptNarrationRecord(obj)) ? "" : shown.text;
+          if (text) {
+            const model = recordedModelOf(message);
             messages.push({
               role: "assistant",
               text,
@@ -2734,9 +2641,8 @@ export async function readSubagentAgents(
     if (reusable && result.readError === undefined && result.transcriptReadFailureCount === 0) readInputsByResult.set(result, inputs);
     return result;
   };
-  const base = sessionFilePath.replace(/\.jsonl$/i, "");
-  const dir = `${base}/subagents`;
-  if (base === sessionFilePath || !isAllowedPath(dir)) {
+  const dir = subagentDirOf(sessionFilePath);
+  if (dir === undefined || !isAllowedPath(dir)) {
     result.readError = "outside-session-store";
     result.elapsedMs = Date.now() - startedAt;
     return result;
@@ -2747,37 +2653,36 @@ export async function readSubagentAgents(
   try {
     const listing = await readdir(dir);
     inputs.dirs.set(dir, [...listing].sort());
-    names = listing.filter((name) => name.endsWith(".meta.json"));
+    names = listing.filter(isSubagentMetaName);
   } catch (error) {
     if ((error as { code?: unknown }).code !== "ENOENT") result.readError = String(error);
     else inputs.dirs.set(dir, null);
     return finish();
   }
   names.sort();
+  const forkLaunches = new Map<string, ForkLaunch>();
   for (const name of names) {
     result.metaCount++;
-    const agentId = name.slice("agent-".length, name.length - ".meta.json".length);
-    if (!name.startsWith("agent-") || agentId.length === 0) {
+    const agentId = agentIdOfMetaName(name);
+    if (agentId === undefined) {
       result.malformedMetaCount++;
       result.unreadAgentIds.push(`meta:${name}`);
       continue;
     }
-    let meta: Record<string, any> | null;
     await stamp(`${dir}/${name}`);
-    try {
-      meta = asRecord(JSON.parse(await readFile(`${dir}/${name}`, "utf8")));
-    } catch {
-      meta = null;
-    }
-    if (!meta || typeof meta.toolUseId !== "string" || typeof meta.spawnDepth !== "number") {
+    const meta = await readSubagentMeta(`${dir}/${name}`, (p) => readFile(p, "utf8"));
+    const toolUseId = subagentLaunchToolUseId(meta);
+    if (!meta || toolUseId === undefined || typeof meta.spawnDepth !== "number") {
       result.malformedMetaCount++;
       result.unreadAgentIds.push(agentId);
       continue;
     }
+    const forkLaunch = forkLaunchOf(meta);
+    if (forkLaunch !== undefined) forkLaunches.set(agentId, forkLaunch);
     result.agents.push({
       agentId,
       parentAgentId: typeof meta.parentAgentId === "string" ? meta.parentAgentId : null,
-      toolUseId: meta.toolUseId,
+      toolUseId,
       spawnDepth: meta.spawnDepth,
       agentType: typeof meta.agentType === "string" ? meta.agentType : undefined,
       description: typeof meta.description === "string" ? meta.description : "",
@@ -2792,9 +2697,9 @@ export async function readSubagentAgents(
       continue;
     }
     let edges: TranscriptEdges;
-    await stamp(`${dir}/agent-${agent.agentId}.jsonl`);
+    await stamp(`${dir}/${subagentTranscriptName(agent.agentId)}`);
     try {
-      edges = await readTranscriptEdges(open, `${dir}/agent-${agent.agentId}.jsonl`);
+      edges = await readTranscriptEdges(open, `${dir}/${subagentTranscriptName(agent.agentId)}`, forkLaunches.get(agent.agentId));
     } catch {
       result.transcriptReadFailureCount++;
       result.unreadAgentIds.push(agent.agentId);
@@ -2815,25 +2720,25 @@ interface TranscriptEdges {
 
 async function readTranscriptEdges(
   open: typeof import("node:fs/promises").open,
-  filePath: string
+  filePath: string,
+  forkLaunch: ForkLaunch | undefined
 ): Promise<TranscriptEdges> {
   const handle = await open(filePath, "r");
   try {
     const size = (await handle.stat()).size;
-    if (size <= SUBAGENT_HEAD_SCAN_BYTES + SUBAGENT_TAIL_SCAN_BYTES) {
-      const buffer = Buffer.alloc(size);
-      const { bytesRead } = size > 0 ? await handle.read(buffer, 0, size, 0) : { bytesRead: 0 };
-      const lines = buffer.toString("utf8", 0, bytesRead).split("\n");
-      return { head: lines, tail: lines, bytesRead };
+    const { offset: start } = await forkOwnStart(handle, size, forkLaunch);
+    const own = size - start;
+    if (own <= SUBAGENT_HEAD_SCAN_BYTES + SUBAGENT_TAIL_SCAN_BYTES) {
+      const buffer = await readHandleRange(handle, start, own);
+      const lines = buffer.toString("utf8").split("\n");
+      return { head: lines, tail: lines, bytesRead: start + buffer.length };
     }
-    const headBuffer = Buffer.alloc(SUBAGENT_HEAD_SCAN_BYTES);
-    const head = await handle.read(headBuffer, 0, SUBAGENT_HEAD_SCAN_BYTES, 0);
-    const tailBuffer = Buffer.alloc(SUBAGENT_TAIL_SCAN_BYTES);
-    const tail = await handle.read(tailBuffer, 0, SUBAGENT_TAIL_SCAN_BYTES, size - SUBAGENT_TAIL_SCAN_BYTES);
-    const headLines = headBuffer.toString("utf8", 0, head.bytesRead).split("\n");
+    const head = await readHandleRange(handle, start, SUBAGENT_HEAD_SCAN_BYTES);
+    const tail = await readHandleRange(handle, size - SUBAGENT_TAIL_SCAN_BYTES, SUBAGENT_TAIL_SCAN_BYTES);
+    const headLines = head.toString("utf8").split("\n");
     headLines.pop();
-    const tailLines = tailBuffer.toString("utf8", 0, tail.bytesRead).split("\n").slice(1);
-    return { head: headLines, tail: tailLines, bytesRead: head.bytesRead + tail.bytesRead };
+    const tailLines = tail.toString("utf8").split("\n").slice(1);
+    return { head: headLines, tail: tailLines, bytesRead: start + head.length + tail.length };
   } finally {
     await handle.close();
   }
@@ -3033,7 +2938,7 @@ function recordedQuestionAnswers(text: string, questions: AskUserQuestionSpec): 
   const suffix = /\. You can now continue(?: with the user's answers in mind)?\.$/.exec(text);
   if (!text.startsWith(prefix) || !suffix) return undefined;
   const body = text.slice(prefix.length, suffix.index);
-  const names = questions.questions.map((q) => q.question.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"));
+  const names = questions.questions.map((q) => escapeRegExp(q.question));
   const entries = [...body.matchAll(new RegExp(`(?:^|, )"(${names.join("|")})"="`, "g"))];
   if (!entries.length || entries[0].index !== 0 || new Set(entries.map((e) => e[1])).size !== entries.length) return undefined;
   const answers: Record<string, string> = {};
@@ -3043,6 +2948,11 @@ function recordedQuestionAnswers(text: string, questions: AskUserQuestionSpec): 
     answers[entries[i][1]] = body.slice(entries[i].index! + entries[i][0].length, end - 1);
   }
   return answers;
+}
+
+export function clipRestoredApprovalInput(inputJson: string): Pick<RestoredApprovalCard, "inputJson" | "inputClipped"> {
+  if (inputJson.length <= CONVERSATION_TEXT_MAX) return { inputJson };
+  return { inputJson: inputJson.slice(0, surrogateSafeEnd(inputJson, CONVERSATION_TEXT_MAX)), inputClipped: true };
 }
 
 function extractRestoredApprovalMessages(
@@ -3074,7 +2984,7 @@ function extractRestoredApprovalMessages(
     if (!answers && !unanswered && questions && result?.text) answers = recordedQuestionAnswers(result.text, questions);
     const resolution = restoredApprovalResolution(result, answers, undefined);
     const restoredApproval = redactCardValue({
-      requestId: use.id, toolName: use.name, inputJson: JSON.stringify(redactCardValue(input ?? {})),
+      requestId: use.id, toolName: use.name, ...clipRestoredApprovalInput(JSON.stringify(redactCardValue(input ?? {}))),
       ...(questions ? { questions } : {}), ...(answers ? { answers } : {}), resolution, ...(unanswered ? { unanswered } : {}),
     }) as RestoredApprovalCard;
     if (result === undefined || (isCliRejectedResult(result) && !result.behavior)) {
@@ -3092,10 +3002,6 @@ function assistantRecordText(content: unknown, narrationBlockIndexes?: unknown):
   return { text: narration ? texts.join("") : extractText(content), narration };
 }
 
-function extractAssistantRecordText(content: unknown, narrationBlockIndexes?: unknown): string {
-  return assistantRecordText(content, narrationBlockIndexes).text;
-}
-
 function sentUserUuidOf(obj: Record<string, unknown>): string | undefined {
   const attachment = asRecord(obj.attachment);
   const queued = obj.type === "attachment" && attachment?.type === QUEUED_COMMAND_TYPE;
@@ -3107,7 +3013,7 @@ function sentUserUuidOf(obj: Record<string, unknown>): string | undefined {
 }
 
 export function extractHumanUserPrompt(obj: Record<string, unknown>, queuedSources?: ReadonlyMap<string, string | undefined>, seenQueuedPrompts?: Set<string>): {
-  text: string; uuid?: string; imageRefs?: ImageRefInfo[]; content: unknown;
+  text: string; uuid?: string; imageRefs?: ImageRefInfo[]; content: unknown; remote?: true;
 } | null {
   const queued = extractQueuedPromptRecord(obj);
   const record = queued ?? obj;
@@ -3125,7 +3031,7 @@ export function extractHumanUserPrompt(obj: Record<string, unknown>, queuedSourc
   const content = asRecord(record.message)?.content;
   const rawText = queued ? extractText(content, false) : "";
   return { text: queued && rawText.trim() === text ? rawText : text,
-    uuid, content, imageRefs: extractImageRefs(content, recordUuid) };
+    uuid, content, imageRefs: extractImageRefs(content, recordUuid), ...(isRemoteHumanRecord(record) || isRemoteHumanRecord(obj) ? { remote: true as const } : {}) };
 }
 
 function addQueuedPromptSource(sources: Map<string, string | undefined>, record: Record<string, any>): void {
@@ -3151,7 +3057,7 @@ export interface VerbatimUtterance {
   imageRefs?: ImageRefInfo[];
 }
 
-function verbatimTextOf(record: Record<string, unknown>): string {
+export function verbatimTextOf(record: Record<string, unknown>): string {
   const message = record.message;
   const content =
     typeof message === "object" && message !== null && !Array.isArray(message)
@@ -3168,6 +3074,21 @@ function verbatimTextOf(record: Record<string, unknown>): string {
       return value?.type === "text" && typeof value.text === "string" ? value.text : "";
     })
     .join("");
+}
+
+function recordHandoffNotice(record: Record<string, unknown>): HandoffNoticeFacts | undefined {
+  return record.type === "user" ? handoffNoticeOf(verbatimTextOf(record)) : undefined;
+}
+
+function shownAssistantText(record: Record<string, any>, message: Record<string, any> | null): { text: string; narration: boolean } {
+  const read = assistantRecordText(message?.content, record.narration_block_indexes);
+  return isReplacedErrorProse(record, message) ? { ...read, text: "" } : read;
+}
+
+function recordLineOutcome(value: LineValue, partialTail: boolean): Record<string, unknown> | "malformed" | "partial" {
+  if (value === NOT_OBJECT_LINE) return "malformed";
+  if (value === UNPARSEABLE_LINE) return partialTail ? "partial" : "malformed";
+  return value;
 }
 
 type RecordedHandoffEnvelope = { index: number; parsed: Extract<HandoffParseResult, { ok: true }> };

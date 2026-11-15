@@ -2,21 +2,22 @@ import { ClaudeConversation, type ClaudeHostOptions } from "./claudeHost";
 import { checkClaudeCodeVersion, resolveClaudeCodeExecutable } from "./claudeCliResolver";
 import { runFailureReason } from "./orchestration-external";
 import { accountErrorReason } from "./account-error";
-import { resolveModelDisplayName } from "./model-display-name";
+import type { ApiKeyPolicy } from "./protocol";
+import { EXTENDED_CONTEXT_SUFFIX, hasExtendedContext, resolveModelDisplayName, withoutExtendedContext } from "./model-display-name";
 import { claudeModelIdLabel, isOrchestrationEffort, type ExternalModel, type ExternalModelsState, type ExternalDetection } from "./orchestration-executors";
 
 const CLAUDE_ALIASES = ["haiku", "sonnet", "opus"] as const;
 
 export function claudeAliasModels(rows: readonly { id: string; label?: string; resolvedModel?: string; supportedEffortLevels?: readonly string[] }[]): ExternalModelsState {
-  const rank = (row: (typeof rows)[number]) => (row.resolvedModel ? 2 : 0) + (row.id === row.id.replace(/\[1m\]$/, "") ? 1 : 0);
+  const rank = (row: (typeof rows)[number]) => (row.resolvedModel ? 2 : 0) + (hasExtendedContext(row.id, false) ? 0 : 1);
   const uniqueRows = new Map<string, (typeof rows)[number]>();
   for (const row of rows) {
-    const id = row.id.replace(/\[1m\]$/, "");
+    const id = withoutExtendedContext(row.id, false);
     const previous = uniqueRows.get(id);
     if (!previous || rank(row) > rank(previous)) uniqueRows.set(id, row);
   }
   const listed = [...uniqueRows.entries()].map(([id, row]): ExternalModel => {
-    const resolvedModel = row.resolvedModel?.replace(/\[1m\]$/, "");
+    const resolvedModel = row.resolvedModel === undefined ? undefined : withoutExtendedContext(row.resolvedModel, false);
     const supportedEffortLevels = row.supportedEffortLevels === undefined ? {}
       : { supportedEffortLevels: [...new Set(row.supportedEffortLevels.filter(isOrchestrationEffort))] };
     if (!resolvedModel && CLAUDE_ALIASES.some((alias) => alias === id)) return { id, label: id, ...supportedEffortLevels };
@@ -54,7 +55,7 @@ export async function listClaudeModels(cwd: string, log: (message: string) => vo
   const terminalFailure = new Promise<ExternalModelsState>(resolve => { stopForFailure = resolve; });
   let conv: ReturnType<typeof create>;
   try {
-    conv = create({ ...options, cwd, model: "opus[1m]", settingSources: [], permissionMode: "default", interruptForceKillTimeoutMs: 5000,
+    conv = create({ ...options, cwd, model: `opus${EXTENDED_CONTEXT_SUFFIX}`, settingSources: [], permissionMode: "default", interruptForceKillTimeoutMs: 5000,
       onApprovalRequest: async () => ({ behavior: "deny" }), onEvent: event => {
         const reason = event.kind === "api_retry" ? accountErrorReason(event.errorType)
           : event.kind === "account_error" ? event.reason : undefined;
@@ -107,10 +108,10 @@ export async function listClaudeModels(cwd: string, log: (message: string) => vo
   } finally { clearTimeout(timer); }
 }
 
-export async function detectClaudeExecutor(configuredPath?: string): Promise<ExternalDetection> {
+export async function detectClaudeExecutor(configuredPath: string | undefined, apiKeyPolicy: ApiKeyPolicy): Promise<ExternalDetection> {
   try {
     const executable = await resolveClaudeCodeExecutable(configuredPath);
-    const version = await checkClaudeCodeVersion(executable.path);
+    const version = await checkClaudeCodeVersion(executable.path, apiKeyPolicy);
     return { state: "found", path: executable.path, version, ...(version ? {} : { versionNote: "version-unavailable" }) };
   } catch (error) {
     if ((error as { code?: unknown })?.code === "CLAUDE_CLI_NOT_FOUND") return { state: "notInstalled" };

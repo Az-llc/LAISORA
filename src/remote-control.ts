@@ -76,11 +76,11 @@ export function policyOffNoticed(on: boolean, busy: boolean, choice: boolean | u
   return (on || busy) && (choice !== false || verdict === "sent" || verdict === "offQueued");
 }
 
-export type RemoteControlAutoCause = "needed" | "laisoraInput";
+export type RemoteControlAutoCause = "needed" | "laisoraInput" | "handedOff";
 
 export function remoteControlAutoStep(choice: boolean | undefined, cli: RemoteControlCliFacts | undefined, cause: RemoteControlAutoCause): "on" | "off" | "none" {
   if (cli === undefined) return "none";
-  if (cause === "laisoraInput") return cli.auto === true && (cli.sessionUrl !== undefined || cli.lane.busy) ? "off" : "none";
+  if (cause !== "needed") return cli.auto === true && (cli.sessionUrl !== undefined || cli.lane.busy) ? "off" : "none";
   return choice === undefined && remoteControlStateOf(choice, cli) === "off" ? "on" : "none";
 }
 

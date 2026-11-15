@@ -1,4 +1,5 @@
 import * as vscode from "vscode";
+import * as l10n from "@vscode/l10n";
 
 import { handleComposerMessage } from "./composer-io";
 import { setComposerFocus } from "./composer-paste";
@@ -17,7 +18,8 @@ import { output } from "./host-context";
 import { handleInspectorMessage } from "./inspector-wiring";
 import { handleSessionFileMessage } from "./session-list-wiring";
 import { handleTodoMessage, openTodoConversation, setTodoDrawerFocus, todoFromReply } from "./todo-surface";
-import { isWebviewToHost, rejectedTodoEditId } from "./protocol";
+import { isWebviewToHost, rejectedSend, rejectedTodoEditId, SEND_TEXT_MAX_LEN } from "./protocol";
+import { editAskMarks } from "./ask-marks";
 import type { SessionStore } from "./store-surfaces";
 
 const openingElicitations = new Set<string>();
@@ -31,6 +33,17 @@ export async function handleWebviewMessage(
     output.appendLine(`[drop] invalid webview message: ${JSON.stringify(raw).slice(0, 200)}`);
     const requestId = rejectedTodoEditId(raw);
     if (requestId !== undefined) void st.postTo(sender, { type: "todoEditResult", requestId, ok: false, error: "rejected" });
+    const send = rejectedSend(raw);
+    if (send !== undefined) {
+      if (send.tooLong) {
+        st.sessions.get(send.tabId)?.pushEvent({
+          kind: "error",
+          message: l10n.t("The message is too long to send (limit {0} characters).", SEND_TEXT_MAX_LEN.toLocaleString(vscode.env.language)),
+          fatal: false,
+        });
+      }
+      void st.postTo(sender, { type: "resumeHydrationState", tabId: send.tabId, sendDisposition: { clientToken: send.clientToken, disposition: "rejected" } });
+    }
     return;
   }
   const msg = raw;
@@ -116,6 +129,7 @@ export async function handleWebviewMessage(
         break;
       case "historyChunkRequest":
       case "conversationHistoryRequest":
+      case "conversationMessageTextRequest":
       case "worklogTranscriptRequest":
         await handleHistoryMessage(st, msg, sender, target);
         break;
@@ -124,6 +138,9 @@ export async function handleWebviewMessage(
         break;
       case "composerDrafts":
         noteComposerDrafts(sender, msg.tabIds);
+        break;
+      case "askMarkEdit":
+        await editAskMarks(st, msg.edit, { client: msg.client, seq: msg.seq });
         break;
       case "youWaiting":
         noteYouWaiting(target!, msg);
@@ -150,11 +167,15 @@ export async function handleWebviewMessage(
       case "todoOpenDoc":
       case "todoAskSourceRequest":
       case "todoAskDismiss":
+      case "todoAskUntick":
       case "todoChangesRequest":
         await handleTodoMessage(msg, sender);
         break;
       case "todoDrawerFocus":
         setTodoDrawerFocus(sender, msg.focused);
+        break;
+      case "conversationHidden":
+        st.noteConversationHidden(sender);
         break;
       case "reorderTabs":
         reorderSessionTabs(st, msg.order, sender);

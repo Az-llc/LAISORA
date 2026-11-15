@@ -40,6 +40,14 @@ export function bindUserLabel<T extends HTMLElement>(el: T, target: "text" | "ar
   return el;
 }
 
+export function turnLabel(name: HTMLElement): HTMLElement {
+  name.classList.add("turn-label-name");
+  const label = document.createElement("div");
+  label.className = "turn-label";
+  label.appendChild(name);
+  return label;
+}
+
 function fill(el: HTMLElement): void {
   if (el.dataset.userLabel === "aria") {
     el.setAttribute("aria-label", userLabel());

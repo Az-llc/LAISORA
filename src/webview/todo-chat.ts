@@ -1,11 +1,13 @@
 import * as l10n from "@vscode/l10n";
-import { TODO_CHANGES_REQUEST_MAX, type TodoChangeView, type TodoListItem, type TodoStartView, type TodoTurnRevert } from "../protocol";
-import { parseTodoChangeId, TODO_CARD_TOOLS, TODO_TIDY_TOOL, todoCardTree, todoWriteResultRef, type TodoCardMark, type TodoCardRow, type TodoRevertBlock, type TodoStartKind, type TodoWriteResultRef } from "../todo-model";
+import { TODO_CHANGES_REQUEST_MAX, type HostToWebview, type TodoChangeView, type TodoListItem, type TodoStartView } from "../protocol";
+import { parseTodoChangeId, TODO_CARD_TOOLS, TODO_TIDY_TOOL, todoCardTree, todoGenerations, todoRefResolves, todoWriteResultRef, type TodoCardMark, type TodoGeneration, type TodoCardRow, type TodoRevertBlock, type TodoStartKind, type TodoWriteResultRef } from "../todo-model";
 import { formatDateTime } from "./l10n";
 import { summaryCardShell, summaryFold, summaryStat, type SummaryTone } from "./summary-card";
-import { describeTodoChange, TODO_MEMO_LABELS, TODO_REVERT_BLOCK_TEXT, todoButton, todoEl as el } from "./todo-edit";
+import { describeTodoChange, TODO_MEMO_LABELS, TODO_REVERT_BLOCK_TEXT, todoButton, todoGenerationField } from "./todo-edit";
 import { todoGroupCss, todoItemLabel, todoItemOf, todoLinkHub } from "./todo-links";
 import { todoItemPath } from "./todo-rows";
+import { element as el } from "./element";
+import { todoGroupLabel } from "../todo-labels";
 
 type CardCall =
   | { readonly state: "pending"; readonly tidy: boolean }
@@ -21,14 +23,17 @@ const unfolded = new WeakSet<HTMLElement>();
 const unresolvedRows = new WeakSet<HTMLElement>();
 const views = new Map<string, TodoChangeView>();
 const turnReverts = new Map<string, "ok" | TodoRevertBlock>();
-let viewsRevision = -1;
+const answeredRevisions = new Set<number>();
+let viewsGenerations: readonly TodoGeneration[] = todoGenerations({});
+let storeRevision = -1;
 let requestSeq = 0;
-let requested = new Set<string>();
-let requestedTurns = new Map<string, readonly number[]>();
-let sentTurns = new Set<string>();
-let answeredRevisions = new Set<number>();
-let inFlight = new Map<number, readonly (readonly number[])[]>();
 let flushQueued = false;
+type AskState = { readonly at: number; readonly answered: boolean };
+const asks = new Map<string, AskState>();
+const pendingAsks = new Map<string, number>();
+type ChangesAsked = { at: number; readonly keys: readonly string[]; readonly groups: readonly (readonly number[])[]; readonly received: Set<string> };
+const inFlight = new Map<number, ChangesAsked>();
+const toAsk = new Set<HTMLElement>();
 
 export function isTodoWriteTool(toolName: string): boolean {
   return todoLinkHub() !== null && TODO_CARD_TOOLS.includes(toolName);
@@ -84,6 +89,16 @@ function cardRevisions(card: HTMLElement): number[] {
   return [...new Set(cardRefs(card).flatMap(ref => "revision" in ref ? [ref.revision] : []))].sort((a, b) => a - b);
 }
 
+const refResolves = (ref: Extract<TodoWriteResultRef, { revision: number }>) => todoRefResolves(viewsGenerations, ref.generation, ref.revision);
+
+function cardTarget(card: HTMLElement): { revisions: number[]; generation?: string } | undefined {
+  const refs = cardRefs(card).flatMap(ref => "revision" in ref ? [ref] : []);
+  const generations = new Set(refs.map(ref => ref.generation));
+  if (refs.length === 0 || !refs.every(refResolves) || generations.size !== 1) return undefined;
+  const [generation] = generations;
+  return { revisions: cardRevisions(card), ...todoGenerationField(generation) };
+}
+
 const turnKey = (revisions: readonly number[]) => revisions.join(",");
 
 function revisionIds(revision: number): string[] {
@@ -97,6 +112,7 @@ function cardIds(card: HTMLElement): { ids: string[]; legacy: string[]; waiting:
   for (const ref of cardRefs(card)) {
     if ("ids" in ref) { ids.push(...ref.ids); legacy.push(...ref.ids); continue; }
     if (!answeredRevisions.has(ref.revision)) { waiting = true; continue; }
+    if (!refResolves(ref)) { lost++; continue; }
     const found = revisionIds(ref.revision);
     if (found.length === 0) lost++;
     ids.push(...found);
@@ -104,68 +120,168 @@ function cardIds(card: HTMLElement): { ids: string[]; legacy: string[]; waiting:
   return { ids, legacy, waiting, lost };
 }
 
-export function receiveTodoChanges(message: { readonly requestId: number; readonly revision: number; readonly changes: readonly TodoChangeView[]; readonly turns?: readonly TodoTurnRevert[]; readonly more?: true }): void {
+const idAsk = (id: string) => `id:${id}`;
+const turnAsk = (revisions: readonly number[]) => `turn:${turnKey(revisions)}`;
+
+function legacyIds(card: HTMLElement): string[] {
+  return [...new Set(cardRefs(card).flatMap(ref => "ids" in ref ? ref.ids : []))];
+}
+
+function cardAskKeys(card: HTMLElement): string[] {
+  const revisions = cardRevisions(card);
+  return [...legacyIds(card).map(idAsk), ...revisions.length ? [turnAsk(revisions)] : []];
+}
+
+function askDue(key: string): boolean {
+  const askedAt = pendingAsks.get(key);
+  if (askedAt !== undefined && askedAt >= storeRevision) return false;
+  const state = asks.get(key);
+  return state === undefined || state.at < storeRevision;
+}
+
+function askFresh(key: string): boolean {
+  const state = asks.get(key);
+  return state !== undefined && state.answered && state.at >= storeRevision;
+}
+
+function settleAsks(asked: ChangesAsked, at: number, answered: boolean): void {
+  for (const key of asked.keys) {
+    if (pendingAsks.get(key) === asked.at) pendingAsks.delete(key);
+    if (answered || (asks.get(key)?.at ?? -1) < at) asks.set(key, { at, answered });
+  }
+}
+
+function noteStoreRevision(revision: number): void {
+  if (revision <= storeRevision) return;
+  storeRevision = revision;
+  for (const card of [...cards]) if (!card.isConnected && card.dataset.seen === "1") cards.delete(card);
+  dropUnreferencedViews();
+  for (const card of cards) if (cardAskKeys(card).some(askDue)) renderCard(card);
+  queueRequest([...cards]);
+}
+
+function retryFailedAsks(): void {
+  let failed = false;
+  for (const [key, state] of [...asks]) if (!state.answered) { asks.delete(key); failed = true; }
+  if (failed) queueRequest([...cards]);
+}
+
+function resetAsks(): void {
+  asks.clear();
+  pendingAsks.clear();
+  inFlight.clear();
+  storeRevision = -1;
+}
+
+export function receiveTodoChanges(message: Extract<HostToWebview, { type: "todoChanges" }>): void {
   const asked = inFlight.get(message.requestId);
+  if (!asked) return;
+  if ("unreadable" in message) {
+    inFlight.delete(message.requestId);
+    settleAsks(asked, storeRevision, false);
+    return;
+  }
   if (!message.more) inFlight.delete(message.requestId);
-  if (message.revision < viewsRevision) {
-    if (asked && !message.more) {
-      for (const group of asked) sentTurns.delete(turnKey(group));
+  if (message.revision < asked.at) {
+    resetAsks();
+    if (message.more) inFlight.set(message.requestId, asked);
+  } else if (message.revision < storeRevision) {
+    if (!message.more) {
+      for (const key of asked.keys) if (pendingAsks.get(key) === asked.at) pendingAsks.delete(key);
       queueRequest([...cards]);
     }
     return;
   }
-  viewsRevision = message.revision;
-  for (const change of message.changes) views.set(change.id, change);
+  for (const key of asked.keys) if (pendingAsks.get(key) === asked.at) pendingAsks.set(key, message.revision);
+  asked.at = message.revision;
+  noteStoreRevision(message.revision);
+  viewsGenerations = todoGenerations({ generations: message.generations });
+  for (const change of message.changes) {
+    views.set(change.id, change);
+    asked.received.add(change.id);
+  }
   for (const turn of message.turns ?? []) turnReverts.set(turnKey(turn.revisions), turn.revert);
-  if (asked && !message.more) for (const group of asked) for (const revision of group) answeredRevisions.add(revision);
+  if (!message.more) {
+    const ids = new Set(asked.keys);
+    const revisions = new Set(asked.groups.flat());
+    for (const id of [...views.keys()]) if (!asked.received.has(id) && (ids.has(idAsk(id)) || revisions.has(parseTodoChangeId(id).revision))) views.delete(id);
+    for (const revision of revisions) answeredRevisions.add(revision);
+    settleAsks(asked, message.revision, true);
+    retryFailedAsks();
+  }
   for (const card of cards) renderCard(card);
 }
 
-export function refreshTodoToolCards(revision: number): void {
-  if (revision === viewsRevision) {
-    for (const card of cards) if (unresolvedRows.has(card)) renderCard(card);
+export function refreshTodoToolCards(store: { readonly enabled: boolean; readonly revision: number; readonly readable: boolean }): void {
+  if (!store.enabled) {
+    resetAsks();
     return;
   }
-  views.clear();
-  turnReverts.clear();
-  requested = new Set();
-  requestedTurns = new Map();
-  sentTurns = new Set();
-  answeredRevisions = new Set();
-  inFlight = new Map();
-  for (const card of [...cards]) if (!card.isConnected && card.dataset.seen === "1") cards.delete(card);
-  queueRequest([...cards]);
+  for (const card of cards) if (unresolvedRows.has(card)) renderCard(card);
+  if (store.readable) retryFailedAsks();
+  noteStoreRevision(store.revision);
+}
+
+function dropUnreferencedViews(): void {
+  const refs = [...cards].flatMap(cardRefs);
+  const ids = new Set(refs.flatMap(ref => "ids" in ref ? ref.ids : []));
+  const revisions = new Set(refs.flatMap(ref => "revision" in ref ? [ref.revision] : []));
+  const turns = new Set([...cards].map(card => turnKey(cardRevisions(card))));
+  const keys = new Set([...cards].flatMap(cardAskKeys));
+  for (const id of [...views.keys()]) if (!ids.has(id) && !revisions.has(parseTodoChangeId(id).revision)) views.delete(id);
+  for (const revision of [...answeredRevisions]) if (!revisions.has(revision)) answeredRevisions.delete(revision);
+  for (const key of [...turnReverts.keys()]) if (!turns.has(key)) turnReverts.delete(key);
+  for (const key of [...asks.keys()]) if (!keys.has(key)) asks.delete(key);
+  for (const key of [...pendingAsks.keys()]) if (!keys.has(key)) pendingAsks.delete(key);
+  for (const [requestId, asked] of [...inFlight]) if (!asked.keys.some(key => keys.has(key))) inFlight.delete(requestId);
 }
 
 function queueRequest(asking: readonly HTMLElement[]): void {
-  for (const card of asking) {
-    for (const ref of cardRefs(card)) if ("ids" in ref) for (const id of ref.ids) { if (!views.has(id)) requested.add(id); }
-    const revisions = cardRevisions(card);
-    if (revisions.length && !sentTurns.has(turnKey(revisions))) requestedTurns.set(turnKey(revisions), revisions);
-  }
-  if (flushQueued || (requested.size === 0 && requestedTurns.size === 0)) return;
+  for (const card of asking) toAsk.add(card);
+  if (flushQueued || toAsk.size === 0) return;
   flushQueued = true;
-  queueMicrotask(() => {
-    flushQueued = false;
-    const links = todoLinkHub();
-    if (!links) return;
-    const ids = [...requested].slice(0, TODO_CHANGES_REQUEST_MAX);
-    requested = new Set([...requested].slice(TODO_CHANGES_REQUEST_MAX));
-    const groups: number[][] = [];
-    let total = 0;
-    for (const [key, group] of requestedTurns) {
-      if (groups.length > 0 && total + group.length > TODO_CHANGES_REQUEST_MAX) break;
-      const taken = group.slice(-TODO_CHANGES_REQUEST_MAX);
-      groups.push(taken);
-      total += taken.length;
-      requestedTurns.delete(key);
-      sentTurns.add(key);
+  queueMicrotask(flushRequests);
+}
+
+function flushRequests(): void {
+  flushQueued = false;
+  const links = todoLinkHub();
+  if (!links) {
+    toAsk.clear();
+    return;
+  }
+  const ids: string[] = [];
+  const groups: number[][] = [];
+  const keys = new Set<string>();
+  let total = 0;
+  for (const card of [...toAsk]) {
+    let rest = false;
+    for (const id of legacyIds(card)) {
+      const key = idAsk(id);
+      if (keys.has(key) || !askDue(key)) continue;
+      if (ids.length >= TODO_CHANGES_REQUEST_MAX) { rest = true; break; }
+      ids.push(id);
+      keys.add(key);
     }
-    const requestId = ++requestSeq;
-    inFlight.set(requestId, groups);
-    links.post({ type: "todoChangesRequest", requestId, ids, ...(groups.length ? { revisions: groups } : {}) });
-    if (requested.size || requestedTurns.size) queueRequest([]);
-  });
+    const revisions = cardRevisions(card);
+    const key = turnAsk(revisions);
+    if (revisions.length && !keys.has(key) && askDue(key)) {
+      const taken = revisions.slice(-TODO_CHANGES_REQUEST_MAX);
+      if (groups.length > 0 && total + taken.length > TODO_CHANGES_REQUEST_MAX) rest = true;
+      else {
+        groups.push(taken);
+        total += taken.length;
+        keys.add(key);
+      }
+    }
+    if (!rest) toAsk.delete(card);
+  }
+  if (keys.size === 0) return;
+  for (const key of keys) pendingAsks.set(key, storeRevision);
+  const requestId = ++requestSeq;
+  inFlight.set(requestId, { at: storeRevision, keys: [...keys], groups, received: new Set() });
+  links.post({ type: "todoChangesRequest", requestId, ids, ...(groups.length ? { revisions: groups } : {}) });
+  if (toAsk.size) queueRequest([]);
 }
 
 const CARD_SIGN: Record<TodoCardMark, string> = { "-": "−", "+": "＋", "~": "～" };
@@ -208,10 +324,9 @@ function renderCard(card: HTMLElement): void {
   });
   summaryFold(card, overflow, rows.length, unfolded.has(card), expand => { if (expand) unfolded.add(card); else unfolded.delete(card); },
     hidden => l10n.t("⋯ {0} more · Show all", hidden));
-  if (calls.some(call => call.state === "pending")) card.append(el("p", "todo-tool-note", l10n.t("Writing to ToDo…")));
-  else if (waiting && rows.length === 0) card.append(el("p", "todo-tool-note", l10n.t("Loading…")));
+  if (waiting && rows.length === 0) card.append(el("p", "todo-tool-note", l10n.t("Loading…")));
   else if (missing > 0 && !waiting) card.append(el("p", "todo-tool-note", l10n.t("These changes are no longer kept in the ToDo history.")));
-  else if (rows.length === 0) card.append(el("p", "todo-tool-note", l10n.t("No change recorded.")));
+  else if (rows.length === 0 && !calls.some(call => call.state === "pending")) card.append(el("p", "todo-tool-note", l10n.t("No change recorded.")));
   card.append(cardStatus(card));
 }
 
@@ -220,14 +335,18 @@ function revertAllEl(card: HTMLElement, changes: readonly TodoChangeView[], lega
   const own = changes.filter(change => change.author === "claude");
   if (own.length === 0) return null;
   if (own.every(change => change.revert === "reverted")) return el("span", "todo-tool-state", l10n.t("Taken back"));
-  const revisions = cardRevisions(card);
-  const byRevision = legacy.length === 0 && revisions.length > 0;
-  const block = byRevision ? turnReverts.get(turnKey(revisions)) : own.find(change => change.revert !== "ok")?.revert ?? "ok";
-  if (block === "ok") {
-    return todoButton("todo-link todo-tool-revert", l10n.t("Take all back"),
-      () => links.edit(byRevision ? { kind: "revertClaude", revisions } : { kind: "revertClaude", changeIds: own.map(change => change.id).slice(0, TODO_CHANGES_REQUEST_MAX) }),
-      l10n.t("Take back everything this turn wrote to ToDo (your own undo is not used)"));
+  const target = legacy.length === 0 ? cardTarget(card) : undefined;
+  if (legacy.length > 0 ? cardRefs(card).some(ref => "revision" in ref) : target === undefined) return null;
+  const takeAllBack = () => todoButton("todo-link todo-tool-revert", l10n.t("Take all back"),
+    () => links.edit(target ? { kind: "revertClaude", ...target } : { kind: "revertClaude", changeIds: own.map(change => change.id).slice(0, TODO_CHANGES_REQUEST_MAX) }),
+    l10n.t("Take back everything this turn wrote to ToDo (your own undo is not used)"));
+  if (!cardAskKeys(card).every(askFresh)) {
+    const unanswered = takeAllBack();
+    unanswered.disabled = true;
+    return unanswered;
   }
+  const block = target ? turnReverts.get(turnKey(target.revisions)) : own.find(change => change.revert !== "ok")?.revert ?? "ok";
+  if (block === "ok") return takeAllBack();
   if (block === undefined || block === "not-target") return null;
   const state = el("span", "todo-tool-state", TODO_REVERT_BLOCK_TEXT[block]());
   if (block === "in-use") state.title = l10n.t("A group that still has items is not undone; move or delete its items first.");
@@ -253,7 +372,7 @@ function rowEl(row: TodoCardRow<TodoChangeView>): HTMLElement {
   line.classList.toggle("undone", reverted);
   line.append(el("span", "todo-card-num", row.number));
   const live = row.itemId !== undefined && row.mark !== "-" ? todoItemOf(row.itemId) : undefined;
-  const label = row.itemId === undefined ? row.group ?? l10n.t("No group") : row.title;
+  const label = row.itemId === undefined ? todoGroupLabel(row.group) : row.title;
   if (live) {
     const open = todoButton("todo-link todo-card-title edit-summary-name", label, () => links.reveal(live.id), l10n.t("Show this item in the conversation's ToDo drawer"));
     open.style.setProperty("--todo-gc", todoGroupCss(live));
@@ -273,15 +392,23 @@ const START_LABELS: Record<TodoStartKind, () => string> = {
   child: () => l10n.t("Split from ToDo as a child conversation"),
 };
 
-export function renderTodoHead(head: HTMLElement, tabId: string): void {
+export type TodoHeadKind = "linked" | "emptyHint" | "none";
+
+export function todoHeadKind(tab: { linked: boolean; laisoraPurpose: boolean }): TodoHeadKind {
+  if (tab.linked) return "linked";
+  return tab.laisoraPurpose ? "none" : "emptyHint";
+}
+
+export function renderTodoHead(head: HTMLElement, tabId: string, laisoraPurpose: boolean): void {
   const links = todoLinkHub();
   head.replaceChildren();
   if (!links) { head.hidden = true; return; }
   const entry = links.tabItem(tabId);
   const item = entry ? todoItemOf(entry.itemId) : undefined;
-  if (!entry || !item) {
-    head.hidden = false;
-    head.append(el("p", "todo-empty-hint", l10n.t("Paste an image or describe the work, and Claude puts it into ToDo directly. Take it all back from the ToDo card in the conversation, or one change at a time from History.")));
+  const kind = todoHeadKind({ linked: entry !== undefined && item !== undefined, laisoraPurpose });
+  if (kind !== "linked" || !entry || !item) {
+    head.hidden = kind !== "emptyHint";
+    if (kind === "emptyHint") head.append(el("p", "todo-empty-hint", l10n.t("Paste an image or describe the work, and Claude puts it into ToDo directly. Take it all back from the ToDo card in the conversation, or one change at a time from History.")));
     return;
   }
   head.hidden = entry.start === undefined && (entry.splits ?? []).length === 0;

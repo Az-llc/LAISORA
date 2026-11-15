@@ -13,7 +13,8 @@ import { exportMigration, importMigration, MigrationError, migrationFailureOf, p
 import { formatBytes, isMigrationCategory, MIGRATION_CATEGORIES, migrationCategoryTitle, type MigrationCategory, type MigrationOperation, type MigrationProgress } from "./migration-categories";
 import { folderHolds, MIGRATION_README, normalizedWorkFolder, type MigrationManifest } from "./migration-plan";
 import { PORTABLE_CONFIGURATION_KEYS } from "./configuration-defaults";
-import type { MigrationNotice } from "./protocol";
+import { transcriptWriteLockedText, type MigrationNotice } from "./protocol";
+import { transcriptWriteLockedForNewTab } from "./transcript-write-lock";
 import { openTitledConversationTab } from "./store-surfaces";
 import { hostTodoStore, todoFeatureEnabled } from "./todo-surface";
 
@@ -212,6 +213,7 @@ export async function startMigrationImport(): Promise<MigrationNotice | undefine
   if (importStarting) return { ok: false, text: BUSY_TEXT() };
   importStarting = true;
   try {
+    if (await transcriptWriteLockedForNewTab()) return { ok: false, text: transcriptWriteLockedText() };
     const target = await revealSettingsStartView();
     const session = store ? openTitledConversationTab(store, l10n.t("Migration import"), target) : undefined;
     if (!session) return { ok: false, text: l10n.t("The conversation could not be started.") };

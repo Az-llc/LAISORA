@@ -1,4 +1,5 @@
 import { spawn } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import { createReadStream, existsSync } from "node:fs";
 import { appendFile, copyFile, lstat, mkdir, mkdtemp, open, readdir, readFile, realpath, rename, rm, rmdir, stat, unlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -6,15 +7,17 @@ import { basename, dirname, join } from "node:path";
 import {
   archiveCommands, archiveExcludeList, claudeEnvEntries, claudeEnvPathsRemapped, claudeSettingsKeyFields, conversationFileKept, conversationTarget, emptyFolderPlacement, exportedProjectFolder, folderHoldingAllSessions, sessionsAlreadyPresent, extractCommand, folderCwd, importPlacement,
   isSessionFileName, jsonChanged, mcpServersWithKeys, mergedGlobalConfig, migrationImportReport, migrationReadme, parseMigrationManifest, projectFileCategory, projectsArchive, normalizedWorkFolder, projectsTotals, sameFolderName, relocatedGroupBindings, relocatedRecord, remapJsonPaths, remapTodoDocument, userMcpServers,
-  MEMORY_DIR, MIGRATION_DIR, MIGRATION_FORMAT, MIGRATION_MANIFEST, MIGRATION_MCP_SERVERS, MIGRATION_README, MIGRATION_SETTINGS, MIGRATION_TODO, MIGRATION_TODO_FILES, PROJECTS_DIR,
+  MEMORY_DIR, MIGRATION_DIR, MIGRATION_FORMAT, MIGRATION_MANIFEST, MIGRATION_MCP_SERVERS, MIGRATION_PREVIOUS_TODO, MIGRATION_PREVIOUS_TODO_FILES, MIGRATION_README, MIGRATION_SETTINGS, MIGRATION_TODO, MIGRATION_TODO_FILES, PROJECTS_DIR,
   type ArchiverCommand, type FolderPlacement, type ImportPlacement, type MigrationCounts, type MigrationImportFacts, type MigrationImportReport, type MigrationManifest, type MigrationManifestFolder, type ProjectFileCategory, type ProjectFolderInventory, type ProjectsTotals,
 } from "./migration-plan";
 import { claudeProjectDirName } from "./claude-env";
 import { isProjectDirName, type MigrationCategory, type MigrationProgress } from "./migration-categories";
+import { replaceFileThroughLinks } from "./replace-file-through-links";
 import { recordCwds } from "./session-display-title";
 import { lastRelocatedCwd, readCwdWindowLines } from "./transcript-cwd";
 import { liveImageNames, parseTodoDocument, todoDocumentJson, todoFolderKey, todoGroupsOf, todoImageRefs } from "./todo-model";
-import { retryTransient, type TodoStore } from "./todo-store";
+import { todoImportable, type TodoStore } from "./todo-store";
+import { errorCode, retryTransient } from "./transient-fs";
 
 export interface MigrationPlace {
   readonly configDir: string;
@@ -41,7 +44,6 @@ export interface MigrationScan extends ProjectsTotals {
   readonly claudeEnv: { readonly files: number; readonly bytes: number; readonly mcpServers: number; readonly mcpKeyServers: readonly string[]; readonly settingsKeyFiles: readonly string[] };
 }
 
-const errorCode = (error: unknown) => (error as NodeJS.ErrnoException | undefined)?.code ?? "";
 const errorText = (error: unknown) => error instanceof Error ? error.message : String(error);
 
 async function* walkFiles(root: string, segments: readonly string[] = [], follow = false): AsyncGenerator<readonly string[]> {
@@ -70,6 +72,47 @@ async function treeSize(root: string, names: readonly string[]): Promise<{ files
 }
 
 const readText = (path: string) => readFile(path, "utf8").catch(() => undefined);
+
+async function readIfPresent(path: string): Promise<string | undefined> {
+  try { return await retryTransient(() => readFile(path, "utf8")); }
+  catch (error) { if (errorCode(error) === "ENOENT") return undefined; throw error; }
+}
+
+const CLAUDE_CONFIG_LOCK_WAIT_MS = 15_000;
+const CLAUDE_CONFIG_LOCK_HOLD_MS = 5_000;
+
+async function withClaudeConfigLock<T>(file: string, action: (held: () => boolean) => Promise<T>): Promise<T | "locked"> {
+  const lock = `${file}.lock`;
+  await mkdir(dirname(file), { recursive: true });
+  const started = Date.now();
+  for (;;) {
+    try { await retryTransient(() => mkdir(lock)); break; }
+    catch (error) {
+      if (errorCode(error) !== "EEXIST") throw error;
+      if (Date.now() - started >= CLAUDE_CONFIG_LOCK_WAIT_MS) return "locked";
+      await new Promise(resolve => setTimeout(resolve, 50 + Math.random() * 100));
+    }
+  }
+  const acquired = Date.now();
+  const held = () => Date.now() - acquired < CLAUDE_CONFIG_LOCK_HOLD_MS;
+  try { return await action(held); }
+  finally { if (held()) await rmdir(lock).catch(() => undefined); }
+}
+
+async function moveInto(source: string, destination: string): Promise<void> {
+  await mkdir(dirname(destination), { recursive: true });
+  try { await retryTransient(() => rename(source, destination)); }
+  catch (error) {
+    if (errorCode(error) !== "EXDEV") throw error;
+    const partial = `${destination}.laisora-${process.pid}-${randomUUID()}.tmp`;
+    try {
+      await retryTransient(() => copyFile(source, partial));
+      await retryTransient(() => rename(partial, destination));
+    } catch (copyError) { await rm(partial, { force: true }).catch(() => undefined); throw copyError; }
+    await rm(source, { force: true });
+  }
+}
+
 const sessionFiles = async (folder: string) => (await readdir(folder).catch(() => [] as string[])).filter(isSessionFileName);
 
 async function folderCwdOf(folder: string, dirName: string): Promise<string | undefined> {
@@ -190,6 +233,18 @@ async function archiveEntryCount(root: string, name: string, keepClosed?: string
   return count;
 }
 
+const MIGRATION_PARTIAL_MARK = ".laisora-partial-";
+const MIGRATION_PARTIAL_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\.zip$/u;
+
+export function migrationPartialPath(output: string, id: string): string {
+  return join(dirname(output), `${basename(output)}${MIGRATION_PARTIAL_MARK}${id}.zip`);
+}
+
+export function isMigrationPartialOf(output: string, name: string): boolean {
+  const head = `${basename(output)}${MIGRATION_PARTIAL_MARK}`;
+  return name.startsWith(head) && MIGRATION_PARTIAL_ID.test(name.slice(head.length));
+}
+
 export interface MigrationExportRequest {
   readonly categories: readonly MigrationCategory[];
   readonly output: string;
@@ -262,7 +317,8 @@ export async function exportMigration(place: MigrationPlace, request: MigrationE
     if (excludeFile) await writeFile(excludeFile, excludeList);
     const listFile = archived.names.length ? join(staging, "projects.txt") : undefined;
     if (listFile) await writeFile(listFile, archived.names.map(name => `${name}\n`).join(""));
-    const commands = archiveCommands(place.platform, place.env, request.output, [{ dir: place.configDir, names: configNames }, { dir: staging, names: [MIGRATION_README, MIGRATION_DIR] }],
+    const partial = migrationPartialPath(request.output, randomUUID());
+    const commands = archiveCommands(place.platform, place.env, partial, [{ dir: place.configDir, names: configNames }, { dir: staging, names: [MIGRATION_README, MIGRATION_DIR] }],
       { ...(excludeFile ? { excludeFile } : {}), ...(listFile ? { listed: { dir: place.configDir, file: listFile } } : {}) });
     const measured = commands.every(command => command.reportsEntries);
     let total = 0, done = 0;
@@ -273,9 +329,14 @@ export async function exportMigration(place: MigrationPlace, request: MigrationE
       total += await archiveEntryCount(place.configDir, name, archived.memoryExcluded.includes(dirName) ? `${name}/${MEMORY_DIR}` : undefined);
     }
     report({ phase: "archiving", ...(measured ? { done, total } : {}) });
-    await unlink(request.output).catch(() => undefined);
-    try { for (const command of commands) await runArchiver(command, measured ? () => report({ phase: "archiving", done: Math.min(++done, Math.max(total - 1, 0)), total }) : undefined); }
-    catch (error) { await unlink(request.output).catch(() => undefined); throw error; }
+    for (const name of await readdir(dirname(request.output)).catch(() => [] as string[])) {
+      if (isMigrationPartialOf(request.output, name)) await unlink(join(dirname(request.output), name)).catch(() => undefined);
+    }
+    try {
+      for (const command of commands) await runArchiver(command, measured ? () => report({ phase: "archiving", done: Math.min(++done, Math.max(total - 1, 0)), total }) : undefined);
+      await retryTransient(() => rename(partial, request.output));
+    }
+    catch (error) { await unlink(partial).catch(() => undefined); throw error; }
     if (measured) report({ phase: "archiving", done: total, total });
     return { output: request.output, manifest, mcpKeyServers, settingsKeyFiles, projects };
   } finally {
@@ -293,16 +354,6 @@ export async function previewMigration(place: MigrationPlace, archive: string): 
     return manifest;
   } finally {
     await rm(temp, { recursive: true, force: true }).catch(() => undefined);
-  }
-}
-
-async function moveInto(source: string, destination: string): Promise<void> {
-  await mkdir(dirname(destination), { recursive: true });
-  try { await retryTransient(() => rename(source, destination)); }
-  catch (error) {
-    if (errorCode(error) !== "EXDEV") throw error;
-    await retryTransient(() => copyFile(source, destination));
-    await rm(source, { force: true });
   }
 }
 
@@ -428,24 +479,24 @@ export async function importMigration(place: MigrationPlace, archive: string, ma
       const incoming = userMcpServers(await readText(join(extracted, MIGRATION_MCP_SERVERS)));
       const servers = remap(incoming);
       if (Object.keys(servers).length > 0) {
-        const current = await readText(place.globalConfigFile);
-        const merged = mergedGlobalConfig(current, servers);
-        const mcp = { current: userMcpServers(current), incoming, remapped: servers };
-        if (merged === undefined) facts.mcp = { ...mcp, skipped: `${place.globalConfigFile} could not be read as JSON` };
-        else {
+        const outcome = await withClaudeConfigLock(place.globalConfigFile, async held => {
+          const current = await readIfPresent(place.globalConfigFile);
+          const merged = mergedGlobalConfig(current, servers);
+          const mcp = { current: userMcpServers(current), incoming, remapped: servers };
+          if (merged === undefined) { facts.mcp = { ...mcp, skipped: `${place.globalConfigFile} could not be read as JSON` }; return "done" as const; }
           if (merged !== current && current !== undefined) {
             await mkdir(backupDir, { recursive: true });
             await retryTransient(() => writeFile(join(backupDir, basename(place.globalConfigFile)), current));
             backups = backupDir;
           }
           if (merged !== current) {
-            const written = `${place.globalConfigFile}.laisora-${process.pid}.tmp`;
-            await retryTransient(() => writeFile(written, merged));
-            try { await retryTransient(() => rename(written, place.globalConfigFile)); }
-            catch (error) { await rm(written, { force: true }).catch(() => undefined); throw error; }
+            if (!held()) return "locked" as const;
+            await retryTransient(async () => replaceFileThroughLinks(place.globalConfigFile, merged));
           }
           facts.mcp = mcp;
-        }
+          return "done" as const;
+        });
+        if (outcome === "locked") facts.mcp = { current: {}, incoming, remapped: servers, skipped: `Claude Code held its lock on ${place.globalConfigFile}, so the MCP servers were not added; import again to add them` };
       }
     }
     if (has("laisoraSettings")) {
@@ -460,24 +511,37 @@ export async function importMigration(place: MigrationPlace, archive: string, ma
       else if (text === undefined) facts.todoNotPlaced = "The ZIP has no ToDo file.";
       else {
         const incoming = parseTodoDocument(text);
-        const document = remapTodoDocument(incoming, manifest.home, place.home);
-        const todo: NonNullable<MigrationImportFacts["todo"]> = facts.todo = { incoming, remapped: document, imagesPlaced: 0, imagesKept: 0 };
-        for await (const [name] of walkFiles(join(extracted, MIGRATION_TODO_FILES))) {
-          const destination = join(place.todoStore.filesDirectory, name);
-          if (existsSync(destination)) { todo.imagesKept++; continue; }
-          await moveInto(join(extracted, MIGRATION_TODO_FILES, name), destination);
-          todo.imagesPlaced++;
+        if (!todoImportable(incoming)) facts.todoNotPlaced = "The ZIP's ToDo has revision numbers this PC cannot continue from.";
+        else {
+          const store = place.todoStore;
+          const document = remapTodoDocument(incoming, manifest.home, place.home);
+          const todo: NonNullable<MigrationImportFacts["todo"]> = facts.todo = { incoming, remapped: document, imagesPlaced: 0, imagesKept: 0 };
+          const previous = await store.read();
+          if (previous.revision > 0) {
+            await mkdir(backupDir, { recursive: true });
+            const saved = join(backupDir, MIGRATION_PREVIOUS_TODO);
+            await retryTransient(() => writeFile(saved, todoDocumentJson(previous)));
+            for (const name of liveImageNames(todoImageRefs(previous), Date.now())) {
+              const data = await store.readImage(name);
+              if (data) { await mkdir(join(backupDir, MIGRATION_PREVIOUS_TODO_FILES), { recursive: true }); await retryTransient(() => writeFile(join(backupDir, MIGRATION_PREVIOUS_TODO_FILES, name), data)); }
+            }
+            todo.previousSavedTo = saved;
+            backups = backupDir;
+          }
+          const images: string[] = [];
+          for await (const [name] of walkFiles(join(extracted, MIGRATION_TODO_FILES))) images.push(name);
+          const release = await store.holdImages(images);
+          try {
+            for (const name of images) {
+              const destination = join(store.filesDirectory, name);
+              if (existsSync(destination)) { todo.imagesKept++; continue; }
+              await moveInto(join(extracted, MIGRATION_TODO_FILES, name), destination);
+              todo.imagesPlaced++;
+            }
+            const written = await store.replace(document);
+            todo.items = written.items.filter(item => item.deletedAt === undefined).length;
+          } finally { await release(); }
         }
-        const previous = await place.todoStore.read();
-        if (previous.revision > 0) {
-          await mkdir(backupDir, { recursive: true });
-          const saved = join(backupDir, "laisora-todo.json");
-          await retryTransient(() => writeFile(saved, todoDocumentJson(previous)));
-          todo.previousSavedTo = saved;
-          backups = backupDir;
-        }
-        const written = await place.todoStore.replace(document);
-        todo.items = written.items.filter(item => item.deletedAt === undefined).length;
       }
     }
     const projectCategories = manifest.categories.filter((category): category is ProjectFileCategory => category === "conversations" || category === "memory");

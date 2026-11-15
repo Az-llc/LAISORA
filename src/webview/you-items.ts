@@ -1,5 +1,8 @@
 import type { NormalizedEvent, RestoredApprovalCard } from "../protocol";
-import { AskAnswerTitles, askAnswerChoices, askTextFeatures, bigramSimilarity, normalizeAskText, otherReplyAsksBack, type AskBlock, type AskTextFeatures } from "../ask-parser";
+import { AskAnswerTitles, askAnswerChoices, askTextFeatures, bigramSimilarity, normalizeAskText, type AskBlock, type AskTextFeatures } from "../ask-parser";
+import { decodeAskResolution, type AskIdentity, type AskResolutionRecord, type AskStateKey } from "../ask-mark-edits";
+
+export { askStateLookup, encodeAskDismissal, encodeAskResolution, type AskIdentity, type AskResolutionRecord, type AskStateKey } from "../ask-mark-edits";
 
 export interface YouItem {
   readonly id: string;
@@ -10,13 +13,34 @@ export interface YouItem {
   readonly createdAt: number;
   readonly resolvedAt?: number;
   readonly resolution?: "replied" | "resolved" | "superseded" | "dismissed" | "historical";
-  readonly awaitingDetail?: true;
   readonly turn?: string;
   readonly anchor: { readonly id: string; readonly approvalRef?: string };
 }
 
 export function isWaitingYouItem(item: YouItem): boolean {
   return item.resolvedAt === undefined;
+}
+
+export const ASK_STALE_LATER_REPLIES = 2;
+export const ASK_STALE_MS = 7 * 24 * 60 * 60_000;
+export type AskStale = "age" | "moved-on";
+
+export const isDeclaredAsk = (item: YouItem): boolean => item.anchor.approvalRef === undefined && item.resolution !== "historical";
+
+export function askStale(item: YouItem, siblings: readonly YouItem[], now: number): AskStale | null {
+  if (!isDeclaredAsk(item) || item.createdAt <= 0) return null;
+  if (now - item.createdAt >= ASK_STALE_MS) return "age";
+  const later = new Set(siblings.filter(other => isDeclaredAsk(other) && other.createdAt > item.createdAt && other.turn !== item.turn).map(other => other.turn ?? other.id));
+  return later.size >= ASK_STALE_LATER_REPLIES ? "moved-on" : null;
+}
+
+export function nextAskStaleAt(items: readonly YouItem[], now: number): number | null {
+  let next: number | null = null;
+  for (const item of items) {
+    const at = item.createdAt + ASK_STALE_MS;
+    if (isWaitingYouItem(item) && isDeclaredAsk(item) && item.createdAt > 0 && at > now) next = Math.min(next ?? Infinity, at);
+  }
+  return next;
 }
 
 export interface YouItemsReader {
@@ -30,7 +54,6 @@ export interface AskPosition {
   createdAt: number;
   order?: number;
   generation?: number;
-  turn?: string;
 }
 
 export function youAnchor(tabId: string, id: string): string {
@@ -41,6 +64,11 @@ interface Ordered {
   at: number;
   order?: number;
   generation?: number;
+}
+
+interface Reply extends Ordered {
+  readonly text: string;
+  readonly remote: boolean;
 }
 
 function isAfter(earlier: Ordered, later: Ordered): boolean {
@@ -83,32 +111,6 @@ function replaceable(a: AskFeatures, b: AskFeatures): boolean {
 
 export type LocateAsk = (replyId: string, offset: number) => { readonly message: string; readonly start: number } | undefined;
 
-export interface AskIdentity { readonly message?: string; readonly content: string }
-
-export interface AskResolutionRecord {
-  readonly identity: AskIdentity;
-  readonly resolution: "replied" | "superseded";
-  readonly at: number;
-}
-
-export function encodeAskResolution(record: AskResolutionRecord): string {
-  return JSON.stringify({ ...JSON.parse(encodeAskDismissal(record.identity)), r: record.resolution, t: record.at });
-}
-
-function decodeAskResolution(entry: string): AskResolutionRecord | undefined {
-  try {
-    const value = JSON.parse(entry) as { m?: unknown; c?: unknown; r?: unknown; t?: unknown };
-    if (typeof value.c !== "string" || (value.r !== "replied" && value.r !== "superseded") || typeof value.t !== "number") return undefined;
-    return { identity: typeof value.m === "string" ? { message: value.m, content: value.c } : { content: value.c }, resolution: value.r, at: value.t };
-  } catch {
-    return undefined;
-  }
-}
-
-export function encodeAskDismissal(identity: AskIdentity): string {
-  return JSON.stringify(identity.message === undefined ? { c: identity.content } : { m: identity.message, c: identity.content });
-}
-
 function decodeAskDismissal(entry: string): { id?: string; message?: string; content?: string } {
   if (!entry.startsWith("{")) return { id: entry };
   try {
@@ -139,23 +141,22 @@ export interface SavedAskDismissals {
   readonly resolvedMessages?: Iterable<string>;
 }
 
-export function createYouItems(tabId: string, saved: SavedAskDismissals = {}, locate?: LocateAsk, otherChoice?: string) {
-  const isDetailRequest = (choice: string): boolean => otherChoice !== undefined && otherReplyAsksBack(choice, otherChoice);
+export function createYouItems(tabId: string, saved: SavedAskDismissals = {}, locate?: LocateAsk) {
   let titleIndex: AskAnswerTitles | undefined;
   const answerTitles = (): AskAnswerTitles => titleIndex ??= new AskAnswerTitles([...asks.values()].flatMap((ask) => ask.kind === "decide" ? [ask.title] : []));
-  const answers = (item: YouItem, text: string): boolean => item.kind !== "decide" || askAnswerChoices(item.title, text, answerTitles()).some((choice) => !isDetailRequest(choice));
-  const requestsDetail = (item: YouItem, text: string): boolean => item.kind === "decide" && askAnswerChoices(item.title, text, answerTitles()).some(isDetailRequest);
   const items = new Map<string, YouItem>();
   const asks = new Map<string, YouItem>();
   const positions = new Map<string, AskPosition>();
+  const registered = new Map<string, number>();
+  let registrations = 0;
   const messageKeys = new Map<string, string>();
-  const replies = new Map<string, Ordered & { text: string }>();
+  const replies = new Map<string, Reply>();
+  const replyIdsByUuid = new Map<string, string>();
   const completedChecks = new Map<string, number>();
   const contents = new Map<string, string>();
   const features = new Map<string, AskFeatures>();
   const replaceableWith = new Map<string, Set<string>>();
   const answeredAt = new Map<string, number>();
-  const detailAt = new Map<string, number>();
   const unticked = new Map<string, YouItem>();
   const anchors = new Map<string, string>();
   const resolutions = new Map<string, number>();
@@ -163,13 +164,18 @@ export function createYouItems(tabId: string, saved: SavedAskDismissals = {}, lo
     [...(saved.tab ?? [])].map((entry) => ({ ...decodeAskDismissal(entry), at: 0 }));
   const dismissedMessages = new Set(saved.messages ?? []);
   const savedResolutions = new Map<string, AskResolutionRecord[]>();
-  for (const entry of [...(saved.resolvedTab ?? []), ...(saved.resolvedMessages ?? [])]) {
+  const savedResolutionEntries = new Set<string>();
+  const addSavedResolution = (entry: string): boolean => {
+    if (savedResolutionEntries.has(entry)) return false;
+    savedResolutionEntries.add(entry);
     const record = decodeAskResolution(entry);
-    if (record === undefined) continue;
+    if (record === undefined) return false;
     const list = savedResolutions.get(record.identity.content) ?? [];
     list.push(record);
     savedResolutions.set(record.identity.content, list);
-  }
+    return true;
+  };
+  for (const entry of [...(saved.resolvedTab ?? []), ...(saved.resolvedMessages ?? [])]) addSavedResolution(entry);
   const identityOf = (id: string): AskIdentity => {
     const position = positions.get(id)!;
     let message = messageKeys.get(id);
@@ -203,24 +209,37 @@ export function createYouItems(tabId: string, saved: SavedAskDismissals = {}, lo
   const listeners = new Set<() => void>();
   const notify = (): void => { for (const listener of listeners) listener(); };
   const orderOf = (position: AskPosition): Ordered => ({ at: position.createdAt, order: position.order, generation: position.generation });
+  const presentedAfter = (earlierId: string, laterId: string): boolean => {
+    const earlier = positions.get(earlierId)!;
+    const later = positions.get(laterId)!;
+    if (earlier.replyId === later.replyId) return later.offset > earlier.offset;
+    if (isAfter(orderOf(earlier), orderOf(later))) return true;
+    if (isAfter(orderOf(later), orderOf(earlier))) return false;
+    return registered.get(laterId)! > registered.get(earlierId)!;
+  };
   const replyBetween = (earlier: Ordered, later: Ordered): boolean => {
     for (const reply of replies.values()) if (isAfter(earlier, reply) && isAfter(reply, later)) return true;
     return false;
   };
-  const replyTime = (id: string, matches: (item: YouItem, text: string) => boolean): number | undefined => {
+  const turnOf = (id: string): string => {
+    const position = orderOf(positions.get(id)!);
+    let last: [string, Reply] | undefined;
+    for (const entry of replies) if (isAfter(entry[1], position) && (last === undefined || isAfter(last[1], entry[1]))) last = entry;
+    return last?.[0] ?? "";
+  };
+  const answers = (item: YouItem, reply: Reply): boolean => item.kind === "decide" && askAnswerChoices(item.title, reply.text, answerTitles()).length > 0;
+  const track = (id: string): void => {
     const position = orderOf(positions.get(id)!);
     const item = asks.get(id)!;
+    const later = item.kind === "decide" ? [...replies.values()].filter((reply) => isAfter(position, reply)) : [];
+    let next: Reply | undefined;
+    for (const reply of later) if (next === undefined || isAfter(reply, next)) next = reply;
     let at: number | undefined;
-    for (const reply of replies.values()) {
-      if (isAfter(position, reply) && matches(item, reply.text) && (at === undefined || reply.at < at)) at = reply.at;
+    for (const reply of later) {
+      const closes = reply.remote ? !isAfter(next!, reply) : answers(item, reply);
+      if (closes && (at === undefined || reply.at < at)) at = reply.at;
     }
-    return at;
-  };
-  const track = (id: string): void => {
-    for (const [times, matches] of [[answeredAt, answers], [detailAt, requestsDetail]] as const) {
-      const at = replyTime(id, matches);
-      if (at === undefined) times.delete(id); else times.set(id, at);
-    }
+    if (at === undefined) answeredAt.delete(id); else answeredAt.set(id, at);
   };
   const unlink = (id: string): void => {
     for (const other of replaceableWith.get(id) ?? []) replaceableWith.get(other)?.delete(id);
@@ -233,7 +252,7 @@ export function createYouItems(tabId: string, saved: SavedAskDismissals = {}, lo
     const linked = new Set<string>();
     for (const [otherId, other] of features) {
       const otherPosition = positions.get(otherId)!;
-      if (otherId === id || other.kind !== own.kind || otherPosition.replyId === position.replyId) continue;
+      if (otherId === id || other.kind !== own.kind || (own.kind === "decide" && otherPosition.replyId === position.replyId)) continue;
       if (!replaceable(own, other)) continue;
       linked.add(otherId);
       replaceableWith.get(otherId)?.add(id);
@@ -250,12 +269,13 @@ export function createYouItems(tabId: string, saved: SavedAskDismissals = {}, lo
     if (answered !== undefined) consider(answered, "replied");
     for (const otherId of replaceableWith.get(id) ?? []) {
       const next = orderOf(positions.get(otherId)!);
-      if (isAfter(position, next) && replyBetween(position, next)) consider(next.at, "superseded");
+      if (item.kind === "check" ? presentedAfter(id, otherId) : isAfter(position, next) && replyBetween(position, next)) consider(next.at, "superseded");
     }
     const dismissal = dismissedAt(id);
     if (dismissal !== undefined) consider(dismissal, "dismissed");
     const identity = identityOf(id);
     for (const saved of savedResolutions.get(identity.content) ?? []) {
+      if (saved.resolution === "replied" && item.kind !== "decide") continue;
       if (saved.identity.message === undefined || identity.message === undefined || saved.identity.message === identity.message) {
         consider(saved.at, saved.resolution);
       }
@@ -268,29 +288,31 @@ export function createYouItems(tabId: string, saved: SavedAskDismissals = {}, lo
       const base = resolveUnticked(id, item);
       unticked.set(id, base);
       const completed = completedChecks.get(id);
-      const settled = completed !== undefined && (base.resolvedAt === undefined || completed <= base.resolvedAt)
+      let next: YouItem = completed !== undefined && (base.resolvedAt === undefined || completed <= base.resolvedAt)
         ? { ...item, resolvedAt: completed, resolution: "replied" as const } : base;
-      const next = settled.resolvedAt === undefined && detailAt.has(id) ? { ...settled, awaitingDetail: true as const } : settled;
+      const turn = turnOf(id);
+      if (next.turn !== turn) next = { ...next, turn };
       const shown = items.get(id);
-      if (shown === undefined || shown.title !== next.title || shown.kind !== next.kind || shown.createdAt !== next.createdAt
-        || shown.resolvedAt !== next.resolvedAt || shown.resolution !== next.resolution || shown.options !== next.options || shown.steps !== next.steps
-        || shown.awaitingDetail !== next.awaitingDetail) {
+      if (shown === undefined || shown.turn !== next.turn || shown.title !== next.title || shown.kind !== next.kind || shown.createdAt !== next.createdAt
+        || shown.resolvedAt !== next.resolvedAt || shown.resolution !== next.resolution || shown.options !== next.options || shown.steps !== next.steps) {
         items.set(id, next);
         changed = true;
       }
     }
     return changed;
   };
-  const reply = (id: string, at: number, order?: number, generation?: number, text = ""): void => {
+  const reply = (id: string, at: number, order?: number, generation?: number, text = "", remote = false): void => {
     const replaced = replies.has(id);
-    const entry = { at, order, generation, text };
+    const entry: Reply = { at, order, generation, text, remote };
     replies.set(id, entry);
+    const windowsMove = remote || [...replies.values()].some((other) => other.remote && isAfter(entry, other));
     for (const [askId, item] of asks) {
       if (replaced) track(askId);
       else if (isAfter(orderOf(positions.get(askId)!), entry)) {
-        for (const [times, matches] of [[answeredAt, answers], [detailAt, requestsDetail]] as const) {
-          const previous = times.get(askId);
-          if (matches(item, text) && (previous === undefined || at < previous)) times.set(askId, at);
+        if (windowsMove) track(askId);
+        else {
+          const previous = answeredAt.get(askId);
+          if (answers(item, entry) && (previous === undefined || at < previous)) answeredAt.set(askId, at);
         }
       }
     }
@@ -305,6 +327,7 @@ export function createYouItems(tabId: string, saved: SavedAskDismissals = {}, lo
   const drop = (id: string): void => {
     const dropped = positions.get(id);
     positions.delete(id);
+    registered.delete(id);
     if (dropped) reorderAfter(dropped);
     messageKeys.delete(id);
     unlink(id);
@@ -316,12 +339,18 @@ export function createYouItems(tabId: string, saved: SavedAskDismissals = {}, lo
     contents.delete(id);
     features.delete(id);
     answeredAt.delete(id);
-    detailAt.delete(id);
     unticked.delete(id);
   };
   const reader: YouItemsReader = {
     get: () => [...items.values()].sort((a, b) => a.createdAt - b.createdAt || a.id.localeCompare(b.id)),
     subscribe: (listener) => { listeners.add(listener); return () => { listeners.delete(listener); }; },
+  };
+  const adoptSaved = (next: Pick<SavedAskDismissals, "messages" | "resolvedMessages">): void => {
+    const before = dismissedMessages.size;
+    for (const message of next.messages ?? []) dismissedMessages.add(message);
+    let added = dismissedMessages.size !== before;
+    for (const entry of next.resolvedMessages ?? []) added = addSavedResolution(entry) || added;
+    if (added && refresh()) notify();
   };
   const restoreApproval = (card: RestoredApprovalCard, createdAt: number): void => {
     const id = `approval:${card.requestId}`;
@@ -340,12 +369,12 @@ export function createYouItems(tabId: string, saved: SavedAskDismissals = {}, lo
     reader,
     reply,
     restoreApproval,
-    tick(anchorId: string, ticked: (step: number) => boolean, at = Date.now()): void {
+    tick(anchorId: string, complete: boolean, at = Date.now()): void {
       const id = askIdOf(anchorId);
       if (id === undefined) return;
       const steps = asks.get(id)!.steps;
       if (steps === undefined || steps.length === 0) return;
-      if (!steps.every((_, step) => ticked(step))) completedChecks.delete(id);
+      if (!complete) completedChecks.delete(id);
       else if (!completedChecks.has(id)) completedChecks.set(id, at);
       if (refresh()) notify();
     },
@@ -390,10 +419,12 @@ export function createYouItems(tabId: string, saved: SavedAskDismissals = {}, lo
         const item = items.get(id);
         if (item) items.set(id, { ...item, resolvedAt: ev.timestamp, resolution: "resolved" });
         notify();
-      } else if (ev.kind === "user_message") {
-        reply(`event:${ev.generation}:${ev.seq}`, ev.sentAt ?? ev.timestamp, ev.seq, ev.generation, ev.text);
+      } else if (ev.kind === "user_message" && ev.cancelled !== true) {
+        const id = `event:${ev.generation}:${ev.seq}`;
+        if (ev.uuid !== undefined) replyIdsByUuid.set(ev.uuid, id);
+        reply(id, ev.sentAt ?? ev.timestamp, ev.seq, ev.generation, ev.text, ev.remote === true);
       } else if (ev.kind === "replayed_message" && ev.role === "user") {
-        reply(ev.uuid ?? `event:${ev.generation}:${ev.seq}`, ev.recordedAt ?? ev.sentAt ?? 0, ev.seq, ev.generation, ev.text);
+        reply(ev.uuid ?? `event:${ev.generation}:${ev.seq}`, ev.recordedAt ?? ev.sentAt ?? 0, ev.seq, ev.generation, ev.text, ev.remote === true);
       }
     },
     ask(ask: AskBlock, position: AskPosition): string {
@@ -401,7 +432,10 @@ export function createYouItems(tabId: string, saved: SavedAskDismissals = {}, lo
       const previous = positions.get(id);
       if (previous) position = previous;
       positions.set(id, position);
-      if (!previous) reorderAfter(position);
+      if (!previous) {
+        registered.set(id, registrations++);
+        reorderAfter(position);
+      }
       const content = contentKey(ask);
       const known = asks.get(id);
       if (known !== undefined && contents.get(id) === content) {
@@ -409,7 +443,7 @@ export function createYouItems(tabId: string, saved: SavedAskDismissals = {}, lo
         return known.anchor.id;
       }
       const item: YouItem = {
-        id, kind: ask.kind, title: ask.title, createdAt: position.createdAt, turn: position.turn ?? position.replyId,
+        id, kind: ask.kind, title: ask.title, createdAt: position.createdAt,
         anchor: { id: youAnchor(tabId, id) },
         ...(ask.kind === "decide" ? { options: ask.options.map((o) => ({ label: o.label, description: o.effect })) } : { steps: ask.steps }),
       };
@@ -431,10 +465,9 @@ export function createYouItems(tabId: string, saved: SavedAskDismissals = {}, lo
       return identity;
     },
     dismissMessages(messages: Iterable<string>): void {
-      const before = dismissedMessages.size;
-      for (const message of messages) dismissedMessages.add(message);
-      if (dismissedMessages.size !== before && refresh()) notify();
+      adoptSaved({ messages });
     },
+    adoptSaved,
     relabel(): AskIdentity[] {
       const upgraded: AskIdentity[] = [];
       for (const entry of dismissals) {
@@ -447,6 +480,18 @@ export function createYouItems(tabId: string, saved: SavedAskDismissals = {}, lo
       if (refresh()) notify();
       return upgraded;
     },
+    withdrawReplies(uuids: readonly string[]): void {
+      let changed = false;
+      for (const uuid of uuids) {
+        const id = replyIdsByUuid.get(uuid);
+        replyIdsByUuid.delete(uuid);
+        if (id !== undefined && replies.delete(id)) changed = true;
+      }
+      if (!changed) return;
+      for (const askId of asks.keys()) track(askId);
+      refresh();
+      notify();
+    },
     resolutionRecords(): AskResolutionRecord[] {
       const records: AskResolutionRecord[] = [];
       for (const [id, item] of unticked) {
@@ -458,6 +503,16 @@ export function createYouItems(tabId: string, saved: SavedAskDismissals = {}, lo
     messageOf(anchorId: string): string | undefined {
       const id = askIdOf(anchorId);
       return id === undefined ? undefined : identityOf(id).message;
+    },
+    stateKeyOf(anchorId: string): AskStateKey | undefined {
+      const id = askIdOf(anchorId);
+      const message = id === undefined ? undefined : identityOf(id).message;
+      if (message === undefined) return undefined;
+      const tagOf = (askId: string): string => `${asks.get(askId)!.kind}:${normalizeAskText(asks.get(askId)!.title)}`;
+      const tag = tagOf(id!);
+      const replyId = positions.get(id!)!.replyId;
+      const same = [...positions].filter(([other, position]) => position.replyId === replyId && tagOf(other) === tag).length;
+      return { message, tag, onlyInRecord: same === 1 };
     },
   };
 }

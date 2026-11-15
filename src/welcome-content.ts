@@ -18,6 +18,11 @@ export interface WelcomeUiNames { menuGlyph: string; handoffItem: string; appear
 
 export function welcomeNews(): Readonly<Record<string, readonly WelcomeNewsItem[]>> {
   return {
+    "1.18.0": [
+      { kind: "new", text: l10n.t("Claude can end finished or waiting work with a short summary card: the result, what was verified, and what waits for you. It is turned off at first; turn it on in the settings.") },
+      { kind: "new", text: l10n.t("After an automatic handoff, the new conversation continues an unfinished PLAN without waiting for your message. You can turn it off in the settings."), setting: "handoffAuto" },
+      { kind: "new", text: l10n.t("A setting closes the previous conversation's tab when a handoff completes.") },
+    ],
     "1.17.0": [
       { kind: "new", text: l10n.t("LAISORA can notify your phone through the Claude app when a conversation has waited on you too long. It is turned off at first; turn it on in the settings.") },
       { kind: "new", text: l10n.t("Decision and check cards are readable on claude.ai and the mobile app when you follow a conversation over Remote Control.") },

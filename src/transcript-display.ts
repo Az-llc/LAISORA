@@ -1,13 +1,13 @@
 import { redactAbsolutePaths } from "./path-redaction";
 import { subagentResultForDisplay } from "./subagent-result";
+import { surrogateSafeEnd } from "./text-clip";
 import type { NormalizedEventBody, TaskNotificationInfo } from "./protocol";
 
 export const RESULT_PREVIEW_MAX = 2000;
 
 export function boundedDisplayText(text: string): string {
   const display = redactAbsolutePaths(subagentResultForDisplay(text));
-  let end = Math.min(display.length, RESULT_PREVIEW_MAX);
-  if (end < display.length && /[\uD800-\uDBFF]/.test(display[end - 1])) end--;
+  const end = surrogateSafeEnd(display, RESULT_PREVIEW_MAX);
   return end === display.length ? display : `${display.slice(0, end)}\n[${display.length - end} characters omitted]`;
 }
 

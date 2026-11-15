@@ -4,7 +4,7 @@ import { CLOSE_GLYPH } from "./close-button";
 import type { TodoAskSourceMessageEnvelope, TodoBatchRevert, TodoChangeView, TodoDeletedView, TodoEdit, TodoListItem, TodoLogMessage, TodoLogView, TodoSessionLinkView, TodoSnapshotMessage, TodoTabItem, TodoTemplateView, WebviewToHost } from "../protocol";
 import { TODO_GROUP_COLOR_COUNT, TODO_PRIORITIES, TODO_STATES, TODO_TEMPLATE_NAME_MAX, TODO_TITLE_MAX, todoFinishedIds, todoNameKey, type TodoBatchStep, type TodoState } from "../todo-model";
 import type { TodoApp } from "./todo-app";
-import type { AskIdentity } from "./you-items";
+import type { AskIdentity, AskStateKey } from "./you-items";
 import { TodoAskBoard, type TodoAskActions, type TodoAskHost, type TodoAskRow } from "./todo-asks";
 import {
   formatTodoDay,
@@ -19,15 +19,16 @@ import {
   todoPlayText,
   todoClaudeChangesView,
   todoDeletedView,
-  todoEl as el,
   todoMenuToggle,
   todoNewTitlePlaceholder,
   todoNextExpiry,
   todoRecentSince,
   todoRevertUnit,
+  TodoTypingGuard,
   type TodoMenuEntry,
+  todoGenerationField,
 } from "./todo-edit";
-import { todoGroupColor as groupColor, TodoRowRenderer, type TodoRowGroups, type TodoRowInsert, type TodoRowOrganize } from "./todo-row-view";
+import { todoGroupColor as groupColor, TODO_ROW_FLASH_MS, todoFlashList, TodoRowRenderer, type TodoRowGroups, type TodoRowInsert, type TodoRowOrganize } from "./todo-row-view";
 import { startTodoDrag } from "./todo-drag";
 import { todoGroupSteps, todoIndentSlot, todoMoveSteps, todoSelectionRoots, todoStateSteps, todoStepSlot, type TodoDrop } from "./todo-organize";
 import {
@@ -55,6 +56,8 @@ import {
 import { parseTodoDate, todoDatePresets } from "./todo-quick";
 import { blankTodoSheetDraft, TodoAddSheet, type TodoSheetDraft } from "./todo-sheet";
 import { MARKS } from "./marks";
+import { element as el } from "./element";
+import { todoGroupLabel } from "../todo-labels";
 
 export interface TodoViewState {
   readonly shown?: boolean;
@@ -76,7 +79,6 @@ export interface TodoAttention {
 }
 
 const TODO_UNDO_NOTICE_MS = 8000;
-const TODO_FLASH_MS = 2400;
 const TODO_EXPIRY_SLACK_MS = 1000;
 
 const DUE_LABELS: Record<TodoDueFilter, () => string> = {
@@ -125,6 +127,7 @@ export class TodoTab {
   private readonly filterLabel: HTMLElement;
   private readonly menuEl: HTMLElement;
   private readonly listEl: HTMLElement;
+  private readonly typing: TodoTypingGuard;
   private itemsNow: readonly TodoListItem[] = [];
   private tabItemsNow: readonly TodoTabItem[] = [];
   private deletedTabsNow = new Set<string>();
@@ -316,7 +319,8 @@ export class TodoTab {
     const headWrap = el("div", "todo-headwrap");
     this.buildSearch();
     headWrap.append(head, this.menuEl, this.chipsEl, this.searchRowEl, this.historyTabsEl, this.selectionEl);
-    this.listEl = el("div", "todo-list");
+    this.listEl = todoFlashList(el("div", "todo-list"));
+    this.typing = new TodoTypingGuard(this.listEl, () => this.render());
     this.rows = new TodoRowRenderer({
       openDetail: id => { this.openDetail(id); },
       edit: edit => this.edit(edit),
@@ -430,12 +434,20 @@ export class TodoTab {
     if (this.enabledNow) this.askBoard.noteTabDismissal(tabId, identity);
   }
 
+  noteTabAskCheck(tabId: string, key: AskStateKey, steps: readonly boolean[]): void {
+    if (this.enabledNow) this.askBoard.noteTabCheck(tabId, key, steps);
+  }
+
   receiveAskSource(message: TodoAskSourceMessageEnvelope): void {
     if (this.enabledNow) this.askBoard.receive(message);
   }
 
   syncAskTabs(): void {
     if (this.enabledNow) this.askBoard.syncTabs();
+  }
+
+  rereadAskMarks(): void {
+    if (this.enabledNow) this.askBoard.rereadMarks();
   }
 
   private asksChanged(): void {
@@ -458,7 +470,7 @@ export class TodoTab {
     this.youCountEl.title = this.askOnly ? l10n.t("Show every item again") : l10n.t("Show only the items waiting for your decision");
     this.staleBtn.hidden = this.staleRows.length === 0;
     this.staleBtn.textContent = l10n.t("Mark the old questions done ({0})", this.staleRows.length);
-    this.render();
+    this.typing.update();
     for (const listener of this.listeners) listener();
   }
 
@@ -525,6 +537,10 @@ export class TodoTab {
 
   get storeRevision(): number {
     return this.revision;
+  }
+
+  get storeReadable(): boolean {
+    return !this.unreadable;
   }
 
   get shown(): boolean {
@@ -610,7 +626,7 @@ export class TodoTab {
       for (const key of this.foldedGroups) if (!sectionKeys.has(key)) { this.foldedGroups.delete(key); pruned = true; }
       if (added.length || pruned) this.hooks.changed();
       this.rows.prune(live);
-      this.askBoard.apply(message.tabItems, message.askSources, message.askDismissals, message.askClosedInTodo);
+      this.askBoard.apply(message.tabItems, message.askSources, message.askDismissals, message.askClosedInTodo, message.askTicked);
     }
     this.renderTab();
     this.asksChanged();
@@ -643,7 +659,7 @@ export class TodoTab {
     const now = Date.now();
     const next = todoNextExpiry([...this.claudeRecent, ...this.itemsNow.flatMap(item => (item.markInfo ?? []).map(info => info.at))], now);
     this.expiryTimer = next === undefined ? undefined : setTimeout(() => {
-      this.render();
+      this.typing.update();
       this.scheduleExpiry();
     }, next - now + TODO_EXPIRY_SLACK_MS);
   }
@@ -652,7 +668,7 @@ export class TodoTab {
     this.midnightTimer = setTimeout(() => {
       this.midnightTimer = undefined;
       if (!this.enabledNow) return;
-      this.render();
+      this.typing.update();
       this.scheduleMidnight();
     }, msUntilNextLocalDay(new Date()) + 1000);
   }
@@ -721,8 +737,8 @@ export class TodoTab {
       if ((change.field !== "position" && change.field !== "group") || seen.has(change.itemId) || !matches(change.itemTitle)) continue;
       if (!this.itemsNow.some(entry => entry.id === change.itemId)) continue;
       seen.add(change.itemId);
-      line(l10n.t("{0}: Claude moved it to {1} on {2}", change.itemTitle, change.after ?? l10n.t("No group"), formatTodoDay(localDateKey(new Date(change.at)))),
-        change.revert === "ok" ? todoButton("todo-link", l10n.t("Take back"), () => this.app.edits.send({ kind: "revertClaude", changeIds: todoRevertUnit(this.searchLogs.claude ?? [], change).map(entry => entry.id) })) : null);
+      line(l10n.t("{0}: Claude moved it to {1} on {2}", change.itemTitle, todoGroupLabel(change.after), formatTodoDay(localDateKey(new Date(change.at)))),
+        change.revert === "ok" ? todoButton("todo-link", l10n.t("Take back"), () => this.app.edits.send({ kind: "revertClaude", changeIds: todoRevertUnit(this.searchLogs.claude ?? [], change).map(entry => entry.id), ...todoGenerationField(change.generation) })) : null);
     }
     if (!this.searchLogs.claude || !this.searchLogs.deleted) box.append(el("p", "todo-note", l10n.t("Loading…")));
     return box.childElementCount ? box : null;
@@ -730,6 +746,7 @@ export class TodoTab {
 
   render(): void {
     if (this.dragging) return;
+    this.typing.rendered();
     const focusKey = this.pane.contains(document.activeElement) ? focusKeyOf(document.activeElement) : undefined;
     const view = this.listView();
     const full = deriveTodoList(this.itemsNow, { group: null, due: "all", collapsed: new Set(), today: localDateKey(new Date()), colors: this.colors });
@@ -744,8 +761,8 @@ export class TodoTab {
       if (this.log?.view === "claude") {
         this.listEl.append(todoClaudeChangesView(this.log.changes, this.log.batches, {
           open: id => this.openDetail(id),
-          revert: changeIds => this.app.edits.send({ kind: "revertClaude", changeIds: [...changeIds] }),
-          revertRevision: revision => this.app.edits.send({ kind: "revertClaude", revisions: [revision] }),
+          revert: (changeIds, generation) => this.app.edits.send({ kind: "revertClaude", changeIds: [...changeIds], ...todoGenerationField(generation) }),
+          revertRevision: (revision, generation) => this.app.edits.send({ kind: "revertClaude", revisions: [revision], ...todoGenerationField(generation) }),
         }));
       } else if (this.log?.view === "deleted") {
         this.listEl.append(todoDeletedView(this.log.items, id => this.app.edits.send({ kind: "restore", id })));
@@ -768,7 +785,7 @@ export class TodoTab {
     if (this.flash.size) {
       this.flash = new Set();
       clearTimeout(this.flashTimer);
-      this.flashTimer = setTimeout(() => { for (const node of Array.from(this.listEl.querySelectorAll(".todo-row.flash"))) node.classList.remove("flash"); }, TODO_FLASH_MS);
+      this.flashTimer = setTimeout(() => { for (const node of Array.from(this.listEl.querySelectorAll(".todo-row.flash"))) node.classList.remove("flash"); }, TODO_ROW_FLASH_MS);
     }
     const pending = this.pendingFocus;
     if (pending && this.colors.has(pending.group) && !view.sections.some(section => section.group === pending.group)) {
@@ -821,7 +838,7 @@ export class TodoTab {
     }
     const inbox = full.sections.find(section => section.group === null)?.open ?? 0;
     if (inbox > 0) {
-      const button = todoButton("todo-chip todo-chip-inbox", l10n.t("No group"), () => {
+      const button = todoButton("todo-chip todo-chip-inbox", todoGroupLabel(), () => {
         this.foldedGroups.delete(todoSectionKey(null));
         if (this.group !== null) this.setFilters(null, this.due);
         else this.render();
@@ -1030,7 +1047,7 @@ export class TodoTab {
     if (drop.slot.parentId !== null) return l10n.t("Into “{0}”", this.titleOf(drop.slot.parentId));
     const roots = todoSelectionRoots(this.itemsNow, ids, this.groupNames()).map(id => this.itemsNow.find(item => item.id === id)!);
     const same = roots.every(item => item.parentId === null && (item.group ?? null) === drop.slot.group);
-    return same ? l10n.t("Here") : l10n.t("To group “{0}”", drop.slot.group ?? l10n.t("No group"));
+    return same ? l10n.t("Here") : l10n.t("To group “{0}”", todoGroupLabel(drop.slot.group));
   }
 
   private renderSelection(): void {
@@ -1122,9 +1139,9 @@ export class TodoTab {
         } },
         { label: l10n.t("Remove the due date"), run: due(null) },
       ] },
-      { section: fields, label: l10n.t("Group"), ...(single ? { value: this.rootGroupOf(id) ?? l10n.t("No group") } : {}), children: [
+      { section: fields, label: l10n.t("Group"), ...(single ? { value: todoGroupLabel(this.rootGroupOf(id)) } : {}), children: [
         ...groups.map(group => ({ label: group, swatch: groupColor(this.colors.get(group) ?? null), run: () => this.sendSteps(todoGroupSteps(this.itemsNow, ids, group, this.groupNames())) })),
-        { label: l10n.t("No group"), run: () => this.sendSteps(todoGroupSteps(this.itemsNow, ids, null, this.groupNames())) },
+        { label: todoGroupLabel(), run: () => this.sendSteps(todoGroupSteps(this.itemsNow, ids, null, this.groupNames())) },
       ] },
       ...(single ? [{ section: actions, label: l10n.t("Edit the title"), keys: "F2", run: () => this.rows.editTitle(id) }] : []),
       { section: actions, label: l10n.t("Move up"), keys: "Alt+ArrowUp", run: () => this.organizeActions.step(ids, -1) },

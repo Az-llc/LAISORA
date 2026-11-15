@@ -25,7 +25,8 @@ interface ResumeRuntime {
   enabled(): boolean;
   connected(): boolean;
   live(): boolean;
-  send(text: string): void;
+  held?(): boolean;
+  send(compose: () => string | undefined): Promise<boolean>;
   notify(event: ResumeNotice): void;
 }
 
@@ -161,6 +162,7 @@ export class UsageLimitResume {
       if (this.pendingAt !== at) return;
       if (!this.runtime.connected()) { this.cancel(); return; }
       if (this.runtime.now() >= at && !this.runtime.enabled()) { this.cancel(); return; }
+      if (this.runtime.held?.() === true) { this.arm(LIVENESS_TICK_MS); return; }
       if (!this.runtime.live()) {
         this.dropMain();
         if (this.pendingAt !== at) return;
@@ -168,14 +170,19 @@ export class UsageLimitResume {
         return;
       }
       if (this.runtime.now() < at) { this.arm(); return; }
-      const text = usageLimitResumeText(this.pendingMain, [...this.stoppedDelegates]);
-      this.pendingAt = undefined;
-      this.pendingMain = false;
-      this.stoppedDelegates.clear();
-      this.attempts += 1;
-      this.automaticTurn = true;
-      this.runtime.notify({ kind: "auto_resume", state: "fired" });
-      this.runtime.send(text);
+      void this.runtime.send(() => {
+        if (this.pendingAt !== at) return undefined;
+        const text = usageLimitResumeText(this.pendingMain, [...this.stoppedDelegates]);
+        this.pendingAt = undefined;
+        this.pendingMain = false;
+        this.stoppedDelegates.clear();
+        this.attempts += 1;
+        this.automaticTurn = true;
+        this.runtime.notify({ kind: "auto_resume", state: "fired" });
+        return text;
+      }).then((handedOff) => {
+        if (!handedOff && this.pendingAt === at) this.cancel();
+      });
     }, delay ?? Math.max(0, Math.min(LIVENESS_TICK_MS, at - this.runtime.now())));
     this.timer = timer;
   }

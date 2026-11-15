@@ -1,16 +1,8 @@
 import { randomUUID } from "node:crypto";
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { WAIT_NOTIFY_ALIVE_PREFIX, WAIT_NOTIFY_HEARTBEAT_FRESH_MS, WAIT_NOTIFY_HOOK_TIMEOUT_SECONDS } from "./wait-notify";
-
-export function processAlive(pid: number): boolean {
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch (error) {
-    return (error as NodeJS.ErrnoException).code === "EPERM";
-  }
-}
+import { processAlive } from "./process-alive";
+import { WAIT_NOTIFY_ALIVE_PREFIX, WAIT_NOTIFY_EPOCH_FILE, WAIT_NOTIFY_HEARTBEAT_FRESH_MS, WAIT_NOTIFY_HOOK_TIMEOUT_SECONDS } from "./wait-notify";
 
 export function bellDirOwner(name: string): number | undefined {
   const match = /^(\d+)-/.exec(name);
@@ -41,7 +33,7 @@ export function sweepStaleBells(root: string, now: number, alive: (pid: number) 
     if (!entry.isDirectory()) continue;
     const dir = path.join(root, entry.name);
     const owner = bellDirOwner(entry.name);
-    if (dir === keep || owner === undefined || alive(owner)) continue;
+    if (dir === keep || owner === undefined || (alive(owner) && !bellDirRetired(dir))) continue;
     try {
       if (now - newestMtime(dir) < WAIT_NOTIFY_HOOK_TIMEOUT_SECONDS * 1000) continue;
       fs.rmSync(dir, { recursive: true, force: true });
@@ -51,6 +43,16 @@ export function sweepStaleBells(root: string, now: number, alive: (pid: number) 
     }
   }
   return removed;
+}
+
+function bellDirRetired(dir: string): boolean {
+  return !fs.existsSync(path.join(dir, WAIT_NOTIFY_EPOCH_FILE));
+}
+
+export function retireBellDir(dir: string, script: string): void {
+  for (const name of fs.readdirSync(dir)) {
+    if (name !== script) fs.rmSync(path.join(dir, name), { recursive: true, force: true });
+  }
 }
 
 export function createBellDir(root: string, ownerPid: number, now: number, alive: (pid: number) => boolean = processAlive): string {
@@ -68,8 +70,13 @@ export function writeBellFile(dir: string, name: string, text: string): void {
   fs.renameSync(temp, file);
 }
 
-export function removeBellFile(dir: string, name: string): void {
-  fs.rmSync(path.join(dir, name), { force: true });
+export function removeBellFile(dir: string, name: string): boolean {
+  try {
+    fs.rmSync(path.join(dir, name), { force: true });
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 export function bellFileExists(dir: string, name: string): boolean {
@@ -91,15 +98,4 @@ export function bellHookAlive(dir: string, now: number): boolean {
       return false;
     }
   });
-}
-
-export function writeBellScript(file: string, text: string): void {
-  let current: string | undefined;
-  try {
-    current = fs.readFileSync(file, "utf8");
-  } catch {
-    current = undefined;
-  }
-  if (current === text) return;
-  writeBellFile(path.dirname(file), path.basename(file), text);
 }

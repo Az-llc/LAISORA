@@ -14,7 +14,8 @@ import { DEFAULT_ORCHESTRATION_ROSTER, buildRecommendedClaudeRoster, isOrchestra
 import * as vscode from "vscode";
 import { openSignInTerminal } from "./claude-sign-in";
 import { resolveHandoffAutoSettings } from "./handoff-auto";
-import { resolveWaitNotifySettings } from "./wait-notify";
+import { resolveWaitNotifySettings, type WaitNotifyGate } from "./wait-notify";
+import { hostClaudeTelemetryDisabled, settingsEnvObject } from "./claude-env";
 import {
   HANDOFF_AUTO_SETTING_KEYS,
   WAIT_NOTIFY_SETTING_KEYS,
@@ -22,7 +23,6 @@ import {
   isWaitNotifySettingValue,
   type WaitNotifySettingName,
   type WaitNotifySettings,
-  normalizeApiKeyPolicy,
   normalizeComposerSendKey,
   type HandoffAutoSettingName,
   type ApiKeyPolicy,
@@ -40,15 +40,16 @@ import {
   type WebviewToHost,
 } from "./protocol";
 import * as l10n from "@vscode/l10n";
-import { configuredClaudeExecutablePath, configuredDisplayName, configuredEventLimit, existingFolderOrHome, getLaisoraConfiguration, readClaudeCodeSettings, writesLostNoticeOn } from "./claude-settings";
+import { configuredApiKeyPolicy, configuredSettingSources, configuredClaudeExecutablePath, configuredDisplayName, configuredEventLimit, existingFolderOrHome, getLaisoraConfiguration, invalidateClaudeCodeSettingsCache, readClaudeCodeSettings, writesLostNoticeOn } from "./claude-settings";
 import { isEventLimit } from "./event-limits";
 import { TRANSCRIPT_RETENTION_DAYS_KEY, configuredTranscriptRetentionDays, isTranscriptRetentionDays, transcriptRetentionFallback } from "./transcript-retention";
 import { CHROME_INTEGRATION_SETTING_KEY, chromeIntegrationEnabled } from "./chrome-integration";
 import { MCP_ELICITATION_SETTING_KEY, mcpElicitationEnabled } from "./elicitation";
 import { WRITES_LOST_NOTICE_SETTING_KEY } from "./session-writes-lost";
+import { CLOSING_SUMMARY_SETTING_KEY, closingSummaryEnabled } from "./closing-summary";
 import { isDisplayName } from "./display-name";
 import { extensionContext, output, store } from "./host-context";
-import { ADDITIONAL_MODELS_KEY, CLAUDE_VERSION_ID, additionalClaudeModelIds, recomputeModelRows, modelsMessage } from "./gateway-models";
+import { ADDITIONAL_MODELS_KEY, additionalClaudeModelIds, isClaudeVersionId, recomputeModelRows, modelsMessage } from "./gateway-models";
 import { restoreTabsOnStartupEnabled } from "./session-list-wiring";
 import { TODO_ENABLED_SETTING } from "./todo-store";
 import { todoFeatureEnabled } from "./todo-surface";
@@ -71,9 +72,20 @@ export function remoteControlCardEnabled(): boolean {
   return getLaisoraConfiguration().get<boolean>(REMOTE_CONTROL_CARD_SETTING) !== false;
 }
 
-export function waitNotifySettings(): WaitNotifySettings {
+export function waitNotifyGate(): WaitNotifyGate {
   const cfg = getLaisoraConfiguration();
-  return resolveWaitNotifySettings((key) => cfg.get<unknown>(key));
+  const userSettingsEnv = configuredSettingSources().includes("user") ? settingsEnvObject(readClaudeCodeSettings().env) : undefined;
+  return resolveWaitNotifySettings((key) => cfg.get<unknown>(key), hostClaudeTelemetryDisabled(userSettingsEnv));
+}
+
+export function waitNotifySettings(): WaitNotifySettings {
+  return waitNotifyGate().settings;
+}
+
+function waitNotifyState(): { waitNotify: WaitNotifySettings; waitNotifyTelemetryOff?: true } {
+  invalidateClaudeCodeSettingsCache();
+  const gate = waitNotifyGate();
+  return { waitNotify: gate.settings, ...(gate.telemetryOff ? { waitNotifyTelemetryOff: true } : {}) };
 }
 
 export const WELCOME_SETTING_KEYS: Record<WelcomeSetting, string> = { showNews: "welcome.showNews", showTips: "welcome.showTips" };
@@ -171,6 +183,7 @@ export const FILE_LINK_SETTING_KEYS: Record<FileLinkSetting, string> = {
   openWithSystemApp: "fileLinks.openWithSystemApp",
   fileLinkInstruction: "claude.fileLinkInstruction",
   planInstruction: "claude.planInstruction",
+  closingSummary: CLOSING_SUMMARY_SETTING_KEY,
   chromeIntegration: CHROME_INTEGRATION_SETTING_KEY,
   mcpElicitation: MCP_ELICITATION_SETTING_KEY,
   writesLostNotice: WRITES_LOST_NOTICE_SETTING_KEY,
@@ -244,7 +257,7 @@ export function refreshExternalDetection(detect = detectorOverride ?? detectExte
   if (onChange) detectionListeners.add(onChange);
   if (detectionPending) return detectionPending;
   loadRememberedModelLists();
-  const policy = normalizeApiKeyPolicy(getLaisoraConfiguration().get<string>("claude.apiKeyPolicy")!);
+  const policy = configuredApiKeyPolicy();
   externalDetection = executorMap(() => ({ state: "checking" }));
   externalModels = executorMap(id => {
     const remembered = rememberedModelLists[id];
@@ -256,7 +269,7 @@ export function refreshExternalDetection(detect = detectorOverride ?? detectExte
   detectionPending = Promise.all(executors.map(async (executor) => {
       const started = Date.now();
       let detected: ExternalDetection;
-      try { detected = await (executor === "claude" ? (claudeDetectorOverride ?? detectClaudeExecutor)(configuredPath) : detect(executor, policy)); }
+      try { detected = await (executor === "claude" ? (claudeDetectorOverride ?? detectClaudeExecutor)(configuredPath, policy) : detect(executor, policy)); }
       catch { detected = { state: "failed", path: "", reason: "spawn-error:UNKNOWN" }; }
       const reason = detected.state === "failed" ? detected.reason : detected.state === "found" ? detected.versionNote : undefined;
       if (reason) output.appendLine(`R-ORC-20: ${externalExecutorName(executor)} detection ${reason} elapsed=${Date.now() - started}ms`);
@@ -333,13 +346,13 @@ export function settingsStateMessage(): Extract<HostToSettingsPage, { type: "set
     improvementMenu: improvementMenuEnabled(),
     welcome: welcomeSettings(),
     handoffAuto: resolveHandoffAutoSettings((key) => cfg.get<unknown>(key)),
-    waitNotify: waitNotifySettings(),
+    ...waitNotifyState(),
     orchestrationAgents: readRoster(cfg.get<unknown>("orchestration.agents")),
     orchestrationDefaults: readRoster(cfg.inspect("orchestration.agents")?.defaultValue ?? DEFAULT_ORCHESTRATION_ROSTER),
     conductorPolicy: cfg.get<string>("orchestration.conductorPolicy")!,
     conductorPolicyDefault: configurationDefault<string>("orchestration.conductorPolicy"),
     composerSendKey: normalizeComposerSendKey(cfg.get<string>("composer.sendKey")!),
-    apiKeyPolicy: normalizeApiKeyPolicy(cfg.get<string>("claude.apiKeyPolicy")!),
+    apiKeyPolicy: configuredApiKeyPolicy(cfg),
     restoreTabsOnStartup: restoreTabsOnStartupEnabled(),
     cliAutoUpdate: executorMap((id) => cliAutoUpdateEnabled(cfg, id)),
     eventLimit: configuredEventLimit(),
@@ -349,6 +362,7 @@ export function settingsStateMessage(): Extract<HostToSettingsPage, { type: "set
     autoContinueAtUsageLimit: claudeCodeSettings.autoContinueAtUsageLimit !== false,
     fileLinkInstruction: cfg.get<boolean>(FILE_LINK_SETTING_KEYS.fileLinkInstruction)! !== false,
     planInstruction: cfg.get<boolean>(FILE_LINK_SETTING_KEYS.planInstruction)! !== false,
+    closingSummary: closingSummaryEnabled((key) => cfg.get<unknown>(key)),
     chromeIntegration: chromeIntegrationEnabled((key) => cfg.get<unknown>(key)),
     mcpElicitation: mcpElicitationEnabled((key) => cfg.get<unknown>(key)),
     writesLostNotice: writesLostNoticeOn(),
@@ -462,7 +476,7 @@ export async function writeHandoffAutoSetting(setting: HandoffAutoSettingName, v
 }
 
 export async function writeWaitNotifySetting(setting: WaitNotifySettingName, value: unknown): Promise<SettingWriteFailure | undefined> {
-  return isWaitNotifySettingValue(setting, value) ? updateUserSetting(WAIT_NOTIFY_SETTING_KEYS[setting], value) : undefined;
+  return isWaitNotifySettingValue(setting, value) && !waitNotifyGate().telemetryOff ? updateUserSetting(WAIT_NOTIFY_SETTING_KEYS[setting], value) : undefined;
 }
 
 let normalizedRosterLogged = false;
@@ -537,9 +551,9 @@ export async function runHostActionMessage(msg: Extract<WebviewToHost, { type: "
       title: l10n.t("Add a Claude model version"),
       prompt: l10n.t("Enter one model ID, for example claude-fable-5 or claude-sonnet-4-6. Availability depends on your Claude account."),
       placeHolder: "claude-sonnet-4-6",
-      validateInput: (value) => CLAUDE_VERSION_ID.test(value.trim()) ? undefined : l10n.t("Enter a versioned Claude model ID."),
+      validateInput: (value) => isClaudeVersionId(value.trim()) ? undefined : l10n.t("Enter a versioned Claude model ID."),
     }))?.trim();
-    if (!id || !CLAUDE_VERSION_ID.test(id) || store?.sessions.get(msg.tabId) !== target) return;
+    if (!id || !isClaudeVersionId(id) || store?.sessions.get(msg.tabId) !== target) return;
     await extensionContext?.globalState.update(ADDITIONAL_MODELS_KEY, [...new Set([...additionalClaudeModelIds(), id])]);
     for (const s of store.sessions.values()) {
       recomputeModelRows(s);

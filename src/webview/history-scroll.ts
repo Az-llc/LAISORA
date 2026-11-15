@@ -1,11 +1,10 @@
-export function prependPreservingView<T>(port: HTMLElement, content: HTMLElement, insert: () => T): T {
-  const anchor = content.lastElementChild;
+export function preservingViewAt<T>(port: HTMLElement, content: HTMLElement, anchor: Element | null, change: () => T): T {
   const previous = port.style.overflowAnchor;
   port.style.overflowAnchor = "none";
   try {
     const top = anchor?.getBoundingClientRect().top;
     const beforeScroll = port.scrollTop;
-    const result = insert();
+    const result = change();
     if (anchor?.isConnected && top !== undefined) {
       const delta = anchor.getBoundingClientRect().top - top;
       const quantum = 1;
@@ -19,4 +18,8 @@ export function prependPreservingView<T>(port: HTMLElement, content: HTMLElement
   } finally {
     port.style.overflowAnchor = previous;
   }
+}
+
+export function prependPreservingView<T>(port: HTMLElement, content: HTMLElement, insert: () => T): T {
+  return preservingViewAt(port, content, content.lastElementChild, insert);
 }

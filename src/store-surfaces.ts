@@ -1,4 +1,5 @@
 import { getLaisoraConfiguration } from "./claude-settings";
+import { HOST_FILE_LINK_PLATFORM } from "./host-platform";
 import { configuredSystemAppExtensions, openWelcome } from "./gateway-host-actions";
 import * as vscode from "vscode";
 import * as l10n from "@vscode/l10n";
@@ -6,8 +7,9 @@ import * as l10n from "@vscode/l10n";
 import { ClaudeConversation } from "./claudeHost";
 import { postAttachments } from "./composer-io";
 import { releaseConversationHistory } from "./conversation-history";
-import { postOrchestrationView, warmup } from "./conversation-lifecycle";
+import { postOrchestrationView, rejudgeTranscriptWriteLock, warmup } from "./conversation-lifecycle";
 import { clearAutoHandoff, handoffDetailSources, noteComposerDrafts } from "./handoff-wiring";
+import { handoffInProgress } from "./handoff-runs";
 import { clearWaitNotify } from "./wait-notify-wiring";
 import { orchestrationRunsDirectoryOf } from "./orchestration-external";
 import { releaseHistoryWindow } from "./history-window";
@@ -15,13 +17,14 @@ import { extensionContext, output, sinceActivation, store } from "./host-context
 import { handleWebviewMessage } from "./message-router";
 import { seedLastDiscoveredModels } from "./gateway-models";
 import { pendingAttachments } from "./pending-attachments";
-import { PROTOCOL_VERSION, type HostToWebview, type TabSnapshot, type WebviewToHost } from "./protocol";
-import { historyScopeKey, historyTranscriptScopeKey, Session } from "./session";
+import { clearDuringTurnText, PROTOCOL_VERSION, type HostToWebview, type TabSnapshot, type WebviewToHost } from "./protocol";
+import { historyScopeKey, historyTranscriptScopeKey, launchingOrTurnRunning, Session } from "./session";
 import { noteHandoffForkTab, persistOpenTabs } from "./session-list-wiring";
 import { sessionRecordId } from "./session-record";
 import { normalizeTitleValue } from "./session-display-title";
 import { displayTitleFromSummary } from "./session-list";
 import { postSettingsState } from "./settings-panel";
+import { savedAskMarks } from "./ask-marks";
 import { TAB_LIMIT_DEFAULT, resolveTabLimit, scopeMaxForTabs } from "./tab-limits";
 import { noteTodoSessionEnded, offerTodoReopen, postTodoSnapshot, setTodoDrawerFocus } from "./todo-surface";
 
@@ -30,6 +33,8 @@ export const RESTORE_TAIL_EVENT_MAX = 150;
 const WEBVIEW_BOOTSTRAP_TIMEOUT_MS = 5000;
 const INIT_COALESCE_WINDOW_MS = 300;
 const RESTORE_INIT_SUPPRESS_MS = 800;
+
+export type ActivationRequest = vscode.Webview | null | undefined | (() => readonly vscode.Webview[]);
 
 interface WebviewSurface {
   sub: vscode.Disposable;
@@ -40,6 +45,7 @@ interface WebviewSurface {
   restoreInitAt?: number;
   restoredInitPosted?: boolean;
   activeTabId?: string;
+  conversationHidden?: boolean;
   hostActiveTabId?: string;
   fillQueue?: string[];
   fillTimer?: ReturnType<typeof setTimeout>;
@@ -145,8 +151,9 @@ export class SessionStore {
       const delivered = await this.postTo(webview, {
         type: "init",
         protocolVersion: PROTOCOL_VERSION,
-        hostWindows: process.platform === "win32",
+        hostWindows: HOST_FILE_LINK_PLATFORM.windows,
         systemAppExtensions: configuredSystemAppExtensions(),
+        askMarks: savedAskMarks(),
         tabs: plan?.tabs ?? this.snapshotAll(),
         ...(hostChosen !== undefined ? { activeTabId: hostChosen } : {}),
       });
@@ -181,17 +188,18 @@ export class SessionStore {
 
   restoreVisible(webview: vscode.Webview, armSuppression = false): void {
     const surface = this.surfaces.get(webview);
-    const postedAt = Date.now();
-    if (armSuppression && surface) surface.restoreInitAt = postedAt;
     if (surface) surface.restoredInitPosted = true;
     const plan = this.restoreInitPlan(surface);
     const hostChosen = this.hostChosenTab(surface);
     this.cancelRestoreFill(webview);
+    const postedAt = Date.now();
+    if (armSuppression && surface) surface.restoreInitAt = postedAt;
     void this.postTo(webview, {
       type: "init",
       protocolVersion: PROTOCOL_VERSION,
-      hostWindows: process.platform === "win32",
+      hostWindows: HOST_FILE_LINK_PLATFORM.windows,
       systemAppExtensions: configuredSystemAppExtensions(),
+      askMarks: savedAskMarks(),
       tabs: plan.tabs,
       ...(hostChosen !== undefined ? { activeTabId: hostChosen } : {}),
     }).then((delivered) => {
@@ -244,6 +252,7 @@ export class SessionStore {
     const surface = this.surfaces.get(webview);
     if (!surface) return;
     surface.activeTabId = tabId;
+    surface.conversationHidden = undefined;
     if (user || surface.hostActiveTabId === tabId) surface.hostActiveTabId = undefined;
   }
 
@@ -274,11 +283,17 @@ export class SessionStore {
     return requested && this.surfaces.has(requested) ? requested : this.activeWebview;
   }
 
-  postActivating(requested: vscode.Webview | null | undefined, tabId: string, message: (activate: boolean) => HostToWebview): void {
-    const target = this.activationTarget(requested);
-    if (!target) { this.post(message(false)); return; }
-    this.deliverActivation(target, tabId, message(true));
-    this.post(message(false), target);
+  postActivating(requested: ActivationRequest, tabId: string, message: (activate: boolean) => HostToWebview): void {
+    const targets = typeof requested === "function"
+      ? requested().filter((webview) => this.surfaces.has(webview))
+      : [this.activationTarget(requested)].filter((webview): webview is vscode.Webview => webview !== null);
+    if (targets.length === 0) { this.post(message(false)); return; }
+    for (const target of targets) this.deliverActivation(target, tabId, message(true));
+    for (const webview of this.surfaces.keys()) if (!targets.includes(webview)) void this.postTo(webview, message(false));
+  }
+
+  attachedWebviews(): vscode.Webview[] {
+    return [...this.surfaces.keys()];
   }
 
   activateExisting(requested: vscode.Webview | null | undefined, tabId: string): void {
@@ -300,8 +315,14 @@ export class SessionStore {
     return tabId !== undefined && this.sessions.has(tabId) ? tabId : undefined;
   }
 
-  activeTabIdOf(webview: vscode.Webview): string | undefined {
-    return this.surfaces.get(webview)?.activeTabId;
+  noteConversationHidden(webview: vscode.Webview): void {
+    const surface = this.surfaces.get(webview);
+    if (surface) surface.conversationHidden = true;
+  }
+
+  shownTabIdOf(webview: vscode.Webview): string | undefined {
+    const surface = this.surfaces.get(webview);
+    return surface?.conversationHidden === true ? undefined : surface?.activeTabId;
   }
 
   private scheduleRestoreFill(webview: vscode.Webview, tabIds: string[]): void {
@@ -396,6 +417,7 @@ export function openTitledConversationTab(st: SessionStore, title: string, activ
   return openNewConversationTab(st, (s) => {
     s.title = displayTitleFromSummary(title, s.tabId);
     s.autoTitled = true;
+    s.laisoraPurpose = true;
     const chosen = normalizeTitleValue(title);
     s.unpersistedChosenTitle = chosen === null ? null : { title: chosen, failedAttempts: 0 };
   }, activateIn);
@@ -410,6 +432,57 @@ export function reorderSessionTabs(st: SessionStore, order: readonly string[], s
   for (const s of sessions) st.sessions.set(s.tabId, s);
   st.post({ type: "tabOrder", order: sessions.map(s => s.tabId) }, sender);
   void persistOpenTabs();
+}
+
+function runCloseSteps(closing: Session, steps: ReadonlyArray<() => void>): void {
+  for (const step of steps) {
+    try {
+      step();
+    } catch (error) {
+      output.appendLine(`[${closing.title}] タブ閉鎖: 後始末の失敗 ${String(error)}`);
+    }
+  }
+}
+
+export function closeConversationTab(st: SessionStore, closing: Session, sender: vscode.Webview | null, opts: { offerReopen: boolean } = { offerReopen: true }): void {
+  closing.closed = true;
+  runCloseSteps(closing, [
+    () => closing.startMeasurement?.abandon(),
+    () => { if (opts.offerReopen && sender !== null) offerTodoReopen(st, closing, sender); },
+    () => noteTodoSessionEnded(closing),
+    () => closing.cancelResumePreparation(),
+    () => pendingAttachments.release(closing.tabId),
+    () => handoffDetailSources.delete(closing.tabId),
+    () => clearAutoHandoff(closing),
+    () => clearWaitNotify(closing),
+    () => closing.semantic.clearSemanticModelPostTimer(),
+    () => closing.guardrailRunner.clearGuardrailRefreshTimer(),
+    () => releaseHistoryWindow(historyScopeKey(closing)),
+    () => releaseHistoryWindow(historyTranscriptScopeKey(closing)),
+    () => releaseConversationHistory(historyScopeKey(closing)),
+  ]);
+  st.sessions.delete(closing.tabId);
+  let replacement: Session | null = null;
+  try {
+    const closedSessionId = sessionRecordId(closing);
+    if (closedSessionId !== undefined) noteHandoffForkTab({ kind: "closed", sessionId: closedSessionId });
+    void persistOpenTabs();
+    const created = st.sessions.size === 0 ? st.createSession() : null;
+    replacement = created;
+    if (created) {
+      created.welcome = openWelcome();
+      const tab = created.snapshot();
+      st.postActivating(sender, created.tabId, activate => ({ type: "tabCreated", tab, activate, replacement: true }));
+    }
+    st.post({ type: "tabClosed", tabId: closing.tabId });
+    postSettingsState();
+  } finally {
+    void closing
+      .disposeConversation()
+      .then(() => output.appendLine(`[${closing.title}] タブ閉鎖: dispose 完了`))
+      .catch((e) => output.appendLine(`[${closing.title}] タブ閉鎖: dispose 失敗 ${String(e)}`));
+  }
+  if (replacement) warmup(replacement);
 }
 
 export function sessionsForTest(): Session[] {
@@ -446,51 +519,29 @@ export async function handleSurfaceMessage(
       break;
     case "activeTab":
       st.noteActiveTab(sender, msg.tabId, msg.user === true);
+      if (target) rejudgeTranscriptWriteLock(target);
       break;
     case "newTab": {
       openNewConversationTab(st, undefined, sender);
       break;
     }
-    case "closeTab": {
-      target!.closed = true;
-      target!.startMeasurement?.abandon();
-      offerTodoReopen(st, target!, sender);
-      noteTodoSessionEnded(target!);
-      target!.cancelResumePreparation();
-      pendingAttachments.release(msg.tabId);
-      handoffDetailSources.delete(target!.tabId);
-      clearAutoHandoff(target!);
-      clearWaitNotify(target!);
-      target!.semantic.clearSemanticModelPostTimer();
-      target!.guardrailRunner.clearGuardrailRefreshTimer();
-      releaseHistoryWindow(historyScopeKey(target!));
-      releaseHistoryWindow(historyTranscriptScopeKey(target!));
-      releaseConversationHistory(historyScopeKey(target!));
-      st.sessions.delete(msg.tabId);
-      const closedSessionId = sessionRecordId(target!);
-      if (closedSessionId !== undefined) noteHandoffForkTab({ kind: "closed", sessionId: closedSessionId });
-      void persistOpenTabs();
-      const replacement = st.sessions.size === 0 ? st.createSession() : null;
-      if (replacement) replacement.welcome = openWelcome();
-      if (replacement) {
-        const tab = replacement.snapshot();
-        st.postActivating(sender, replacement.tabId, activate => ({ type: "tabCreated", tab, activate, replacement: true }));
-      }
-      st.post({ type: "tabClosed", tabId: msg.tabId });
-      postSettingsState();
-      void target!
-        .disposeConversation()
-        .then(() => output.appendLine(`[${target!.title}] タブ閉鎖: dispose 完了`))
-        .catch((e) => output.appendLine(`[${target!.title}] タブ閉鎖: dispose 失敗 ${String(e)}`));
-      if (replacement) warmup(replacement);
+    case "closeTab":
+      closeConversationTab(st, target!, sender);
       break;
-    }
     case "clearTab": {
       const s = target!;
-      if (s.starting || (s.conversation && s.conversation.state !== "idle")) {
+      if (handoffInProgress(s.tabId)) {
+        s.pushEvent({ kind: "error", message: l10n.t("Cannot use /clear while this conversation is being handed off."), fatal: false });
+        break;
+      }
+      if (s.transcriptWriteLocked) {
+        output.appendLine(`[${s.title}] /clear refused: the conversation record is not written`);
+        break;
+      }
+      if (launchingOrTurnRunning(s)) {
         s.pushEvent({
           kind: "error",
-          message: l10n.t("Cannot use /clear during a turn. Wait for completion or interrupt, then try again."),
+          message: clearDuringTurnText(),
           fatal: false,
         });
         break;
@@ -508,7 +559,7 @@ export async function handleSurfaceMessage(
         s.resetLogicalSession();
         s.resumeSessionId = undefined;
         void persistOpenTabs();
-        st.post({ type: "tabCleared", tab: s.snapshot() });
+        st.post({ type: "tabCleared", tab: s.snapshot(), replaced: true });
         s.pushEvent({
           kind: "conversation_closed",
           reason: l10n.t("Context cleared by /clear (a new session will start)"),

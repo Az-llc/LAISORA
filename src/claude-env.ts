@@ -1,6 +1,7 @@
 import { homedir } from "node:os";
 import { join } from "node:path";
 import type { ApiKeyPolicy } from "./protocol";
+import { SKIP_PROMPT_HISTORY_ENV } from "./skip-prompt-history-env";
 
 export function claudeConfigDir(): string {
   const configured = process.env.CLAUDE_CONFIG_DIR;
@@ -41,6 +42,7 @@ export function claudeSettingsFiles(projectDir?: string, configDir: string = cla
 export interface SanitizedClaudeEnv {
   env: Record<string, string | undefined>;
   removed: string[];
+  nested: boolean;
 }
 
 export function envNameKey(key: string, platform: NodeJS.Platform = process.platform): string {
@@ -66,6 +68,35 @@ export function telemetryOptOutNeeded(env: Readonly<Record<string, unknown>>, te
   return !telemetryEnabled && envKeysOf(env, "DISABLE_TELEMETRY", platform).length === 0;
 }
 
+export function claudeTelemetryDisabled(
+  env: Readonly<Record<string, unknown>>,
+  telemetryEnabled: boolean,
+  settingsEnv: Readonly<Record<string, unknown>> | undefined,
+  platform: NodeJS.Platform = process.platform
+): boolean {
+  const value = configuredEnvValue(env, settingsEnv, "DISABLE_TELEMETRY", platform);
+  if (value === undefined) return telemetryOptOutNeeded(env, telemetryEnabled, platform);
+  return value !== null && String(value) !== "";
+}
+
+export function hostClaudeTelemetryDisabled(settingsEnv: Readonly<Record<string, unknown>> | undefined): boolean {
+  return claudeTelemetryDisabled(process.env, hostTelemetryEnabled(), settingsEnv);
+}
+
+export function settingsEnvObject(env: unknown): Record<string, unknown> {
+  return typeof env === "object" && env !== null && !Array.isArray(env) ? env as Record<string, unknown> : {};
+}
+
+function configuredEnvValue(
+  source: Readonly<Record<string, unknown>>,
+  settingsEnv: Readonly<Record<string, unknown>> | undefined,
+  name: string,
+  platform: NodeJS.Platform
+): unknown {
+  const configured = settingsEnv === undefined ? undefined : envValueOf(settingsEnv, name, platform);
+  return configured !== undefined ? configured : envValueOf(source, name, platform);
+}
+
 export const WINDOWS_DEFAULT_LOCALE = "C.UTF-8";
 
 export function withWindowsDefaultLocale(
@@ -77,38 +108,86 @@ export function withWindowsDefaultLocale(
   return { ...env, [envKeysOf(env, "LANG", platform)[0] ?? "LANG"]: WINDOWS_DEFAULT_LOCALE };
 }
 
+export type ChildEnvTarget = "claudeCli" | "externalCli";
+
+export interface ChildEnvMode {
+  target: ChildEnvTarget;
+  nested: boolean;
+  apiKeyPolicy: ApiKeyPolicy;
+}
+
+export const NESTED_SESSION_MARKERS: readonly string[] = ["CLAUDECODE", "CLAUDE_CODE_CHILD_SESSION", "CLAUDE_CODE_SSE_PORT"];
+
+const MCP_AUTO_BACKGROUND_ENV: Readonly<Record<string, string>> = {
+  CLAUDE_AUTO_BACKGROUND_TASKS: "true",
+  CLAUDE_CODE_MCP_AUTO_BACKGROUND_MS: "1000",
+};
+
+export const LAISORA_OWNED_ENV: ReadonlySet<string> = new Set(Object.keys(MCP_AUTO_BACKGROUND_ENV));
+
+export const CLAUDE_SESSION_ENV: ReadonlySet<string> = new Set([...NESTED_SESSION_MARKERS, "AI_AGENT", "CLAUDE_PID", "CLAUDE_EFFORT"]);
+
+export { SKIP_PROMPT_HISTORY_ENV };
+
+export const TRANSCRIPT_WRITE_ENV: ReadonlySet<string> = new Set([
+  "CLAUDE_CODE_PROJECT_DIR_NAME",
+  "CLAUDE_CODE_TRANSCRIPT_LOCAL_GC",
+]);
+
+const CLAUDE_CODE_ENV_PREFIX = "CLAUDE_CODE_";
+
+export function isNestedSessionEnv(env: Readonly<Record<string, string | undefined>>, platform: NodeJS.Platform = process.platform): boolean {
+  return NESTED_SESSION_MARKERS.some((name) => !!envValueOf(env, name, platform));
+}
+
+const CLI_TRUTHY_ENV_VALUES = ["1", "true", "yes", "on"];
+
+export function cliEnvTruthy(value: unknown): boolean {
+  if (typeof value === "boolean") return value;
+  return !!value && CLI_TRUTHY_ENV_VALUES.includes(String(value).toLowerCase().trim());
+}
+
+export function transcriptWriteForbidden(
+  source: Readonly<Record<string, string | undefined>>,
+  settingsEnv: Readonly<Record<string, unknown>> | undefined,
+  platform: NodeJS.Platform = process.platform
+): boolean {
+  return cliEnvTruthy(configuredEnvValue(source, settingsEnv, SKIP_PROMPT_HISTORY_ENV, platform));
+}
+
+export function passesUserClaudeCodeEnv(mode: ChildEnvMode): boolean {
+  return mode.target === "claudeCli" && !mode.nested && mode.apiKeyPolicy === "inherit";
+}
+
+export function childEnvRemoves(name: string, value: string | undefined, mode: ChildEnvMode): boolean {
+  if (name === "ANTHROPIC_API_KEY") return mode.apiKeyPolicy === "subscriptionOnly";
+  if (CLAUDE_SESSION_ENV.has(name) || LAISORA_OWNED_ENV.has(name) || TRANSCRIPT_WRITE_ENV.has(name)) return true;
+  if (name === "CLAUDE_CONFIG_DIR") return value === "";
+  return name.startsWith(CLAUDE_CODE_ENV_PREFIX) && !passesUserClaudeCodeEnv(mode);
+}
+
 export function buildClaudeEnv(
   source: Readonly<NodeJS.ProcessEnv>,
+  target: ChildEnvTarget,
   apiKeyPolicy: ApiKeyPolicy = "subscriptionOnly",
   mcpAutoBackground = false
 ): SanitizedClaudeEnv {
   const env = withWindowsDefaultLocale(source);
+  const mode: ChildEnvMode = { target, nested: isNestedSessionEnv(env), apiKeyPolicy };
   const removed: string[] = [];
   for (const key of Object.keys(env)) {
     const name = envNameKey(key);
-    if (name === "ANTHROPIC_API_KEY" && apiKeyPolicy === "inherit") continue;
-    if (
-      name === "ANTHROPIC_API_KEY" ||
-      name === "CLAUDECODE" ||
-      name === "AI_AGENT" ||
-      name === "CLAUDE_AUTO_BACKGROUND_TASKS" ||
-      name.startsWith("CLAUDE_CODE_") ||
-      name === "CLAUDE_PID" ||
-      name === "CLAUDE_EFFORT" ||
-      (name === "CLAUDE_CONFIG_DIR" && env[key] === "")
-    ) {
+    if (childEnvRemoves(name, env[key], mode)) {
       delete env[key];
       if (!removed.includes(name)) removed.push(name);
     }
   }
   if (telemetryOptOutNeeded(env, hostTelemetryEnabled())) env.DISABLE_TELEMETRY = "1";
-  if (mcpAutoBackground) {
-    env.CLAUDE_AUTO_BACKGROUND_TASKS = "true";
-    env.CLAUDE_CODE_MCP_AUTO_BACKGROUND_MS = "1000";
-  }
+  if (mcpAutoBackground) Object.assign(env, MCP_AUTO_BACKGROUND_ENV);
   return {
     env,
     removed,
+    nested: mode.nested,
   };
 }
 

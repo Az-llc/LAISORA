@@ -40,7 +40,7 @@ import { isInSessionStore, sessionTranscriptRef } from "./session-files";
 import type { Session } from "./extension";
 import type { SessionStore } from "./store-surfaces";
 import { currentWorkBlock, deriveTimeBuckets, keyedValues, liveAhead, overlayLiveTimeBucketState, projectWorkBlockTokens, webviewTimeBuckets, withCurrentBlockOpen, type ChildTranscriptSpan, type TimeBucketState, type TimeBucketView } from "./time-buckets";
-import { planContextOf, planRowPeriods } from "./plan-steps";
+import { planContextOf, planRowPeriods, unknownLauncherGroups } from "./plan-steps";
 import { readTranscriptTimeBucketsWithCoverage, transcriptTimeBucketsOf } from "./transcript-time-buckets";
 import { foldDeferredChildCoverage, openUsageScanOwner, readDeferredChildUsage, releaseUsageScanOwner, transcriptReadStillCurrent, type DeferredChildUsage, type DeferredChildUsageRead, type SessionHistoryRead, type SubagentRestore, type UsageScanOwner } from "./session-transcript";
 import { childSpansChangeRuns, liveWorkToolUseIds, requestActivity, type RequestActivity, type WorkCoverage, type WorkModelState } from "./work-model";
@@ -300,6 +300,7 @@ export class SessionSemantic {
       const externalRuns = roles.roles.flatMap(role => role.runs.filter(run => run.source === "external").map(run => ({ label: role.label, run })));
       if (externalRuns.length > 0) model.externalRuns = externalRuns;
     }
+    if (time && model.unknownLaunchers) model.unknownLaunchers = unknownLauncherGroups(time, model.unknownLaunchers);
     if (time && block && placementOf) {
       const periods = planRowPeriods(time);
       const context = planContextOf(block, time.lastAt ?? block.start, activity.running, periods);

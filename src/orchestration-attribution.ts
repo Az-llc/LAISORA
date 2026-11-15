@@ -5,6 +5,8 @@ import { CLAUDE_EFFORTS, claudeModelIdLabel } from "./orchestration-executors";
 import { HUMAN_REJECTED_TOOL_RESULT_RE } from "./tool-result-signals";
 import type { AgentRunRecord } from "./orchestration-external";
 import { isSyntheticModel } from "./protocol";
+import { recordedModelOf } from "./claude-normalizer";
+import { forkCopiedLineCount, forkLaunchOf, readSubagentMeta, subagentLaunchToolUseId, subagentMetaPathOf } from "./subagent-files";
 export const agentRecipient = (id: string): string => `agent:${id}`;
 
 interface Dispatch { run: string; dispatchId: string; parent: string; key?: string; effort?: string; model?: string; outcome?: "normal" | "stopped"; evidence?: string; background?: boolean; runtime: boolean; segment: number; terminalSegment?: number; taskId?: string }
@@ -93,16 +95,17 @@ export class AgentAttribution {
       let model: string | undefined;
       const transcript = typeof input.agent_transcript_path === "string" ? input.agent_transcript_path : undefined;
       if (transcript) {
+        const meta = await readSubagentMeta(subagentMetaPathOf(transcript), (p) => readFile(p, "utf8"));
+        if (meta === null) this.log("agent metadata unavailable");
+        parent = subagentLaunchToolUseId(meta);
+        stopped = meta?.stoppedByUser === true;
         try {
-          const meta = JSON.parse(await readFile(transcript.replace(/\.jsonl$/, ".meta.json"), "utf8"));
-          if (typeof meta.toolUseId === "string") parent = meta.toolUseId;
-          stopped = meta.stoppedByUser === true;
-        } catch { this.log("agent metadata unavailable"); }
-        try {
-          for (const line of (await readFile(transcript, "utf8")).split("\n")) {
+          const lines = (await readFile(transcript, "utf8")).split("\n");
+          for (const line of lines.slice(forkCopiedLineCount(lines, forkLaunchOf(meta)).copied)) {
             try {
               const value = JSON.parse(line);
-              if (value.type === "assistant" && typeof value.message?.model === "string" && !isSyntheticModel(value.message.model)) model = claudeModelIdLabel(value.message.model);
+              const recorded = value.type === "assistant" ? recordedModelOf(value.message) : undefined;
+              if (recorded !== undefined) model = claudeModelIdLabel(recorded);
             } catch {}
           }
         } catch { this.log("agent transcript unavailable"); }

@@ -87,6 +87,7 @@ export function runSearch(query: string, preserveIndex = false, anchor: "start" 
         parent.closest(".find-bar") ||
         parent.closest(`.${WELCOME_CLASS}`) ||
         parent.closest(".turn-label") ||
+        parent.closest(".conv-clipped-more, .conv-clipped-error") ||
         parent.closest(".code-copy-status") ||
         parent.closest(".assistant-seg.streaming .seg-tail") ||
         Boolean(parent.closest(".seg-tail")?.closest(".streaming"))

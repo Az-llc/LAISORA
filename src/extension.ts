@@ -3,6 +3,7 @@ import * as l10n from "@vscode/l10n";
 import * as vscode from "vscode";
 import { randomBytes } from "node:crypto";
 import { scheduleCliUpdates } from "./claude-cli-update";
+import { HOST_FILE_LINK_PLATFORM } from "./host-platform";
 import { setHostTelemetrySource } from "./claude-env";
 import { CLI_AUTO_UPDATE_SETTINGS } from "./cli-update-policy";
 export { handleAnalysisMessage } from "./analysis-messages";
@@ -34,6 +35,7 @@ import {
   store,
 } from "./host-context";
 import { initHostL10n } from "./l10n";
+import { registerHomePathRoot } from "./path-roots";
 import { SessionStore, tabLimit } from "./store-surfaces";
 export { createStartMeasurement } from "./handoff-wiring";
 import { PROTOCOL_VERSION, WAIT_NOTIFY_SETTING_KEYS, isSettingsRevealTarget } from "./protocol";
@@ -43,6 +45,7 @@ import { isHandoffForkHidden } from "./handoff-runner";
 import type { Session } from "./session";
 import {
   disposeAccountUsage,
+  handoffRegistries,
   persistOpenTabs,
   readPersistedOpenTabs,
   releaseAccountUsageWaiter,
@@ -60,6 +63,7 @@ import { postOrchestrationView } from "./conversation-lifecycle";
 import { clearAutoHandoff } from "./handoff-wiring";
 import { clearWaitNotify, reevaluateWaitNotify } from "./wait-notify-wiring";
 import { registerReadOnlyFileProvider } from "./composer-io";
+import { savedAskMarks } from "./ask-marks";
 import { pasteClipboardTextIntoComposer, setComposerFocus } from "./composer-paste";
 export { Session, historyScopeKey, historyTranscriptScopeKey, isUnusedSession } from "./session";
 export {
@@ -75,14 +79,21 @@ function affectsProductConfiguration(e: vscode.ConfigurationChangeEvent, key: st
   return e.affectsConfiguration(`laisora.${key}`);
 }
 
+const restoringStores = new WeakSet<SessionStore>();
+
 function ensureInitialTabs(st: SessionStore): void {
-  if (st.sessions.size > 0) return;
+  if (st.sessions.size > 0 || restoringStores.has(st)) return;
   const entries = restoreTabsOnStartupEnabled() ? readPersistedOpenTabs() : [];
   if (entries.length === 0) {
     st.createSession().welcome = openWelcome();
     return;
   }
-  void restorePersistedTabs(st, entries);
+  restoringStores.add(st);
+  void restorePersistedTabs(st, entries).finally(() => restoringStores.delete(st));
+}
+
+export function restoreTabLimitReached(openTabs: number, reservedTabs: number, limit: number): boolean {
+  return openTabs + reservedTabs >= limit;
 }
 
 async function restorePersistedTabs(st: SessionStore, entries: PersistedOpenTab[]): Promise<void> {
@@ -92,9 +103,11 @@ async function restorePersistedTabs(st: SessionStore, entries: PersistedOpenTab[
   const notices: string[] = [];
   const started: Array<{ label: string; sessionId: string; outcome: ReturnType<typeof resumePersistedTab> }> = [];
   let skippedByLimit = 0;
+  const forkStateOf = await handoffRegistries();
+  let reservedTabs = 0;
   for (const entry of entries) {
     const label = entry.title ?? entry.sessionId;
-    if (st.sessions.size >= tabLimit()) {
+    if (restoreTabLimitReached(st.sessions.size, reservedTabs, tabLimit())) {
       skippedByLimit++;
       continue;
     }
@@ -112,6 +125,7 @@ async function restorePersistedTabs(st: SessionStore, entries: PersistedOpenTab[
       }
       continue;
     }
+    if (forkStateOf(entry.sessionId) === undefined) reservedTabs++;
     started.push({
       label,
       sessionId: entry.sessionId,
@@ -195,12 +209,19 @@ export function activate(context: vscode.ExtensionContext): void {
   activateReady(context);
 }
 
+function waitNotifyAvailabilityChanged(): void {
+  reevaluateWaitNotify();
+  store?.post(userSettingsMessage());
+  postSettingsState();
+}
+
 function activateReady(context: vscode.ExtensionContext): void {
   initHostL10n();
   const activatedAt = Date.now();
   setActivationT0(activatedAt);
   setExtensionContext(context);
   setOutput(vscode.window.createOutputChannel("LAISORA"));
+  registerHomePathRoot();
   output.appendLine(`[startup] ${sinceActivation()} activate at ${localIsoTime(activatedAt)}`);
   sampleStartupLoopLag(activatedAt);
   void sweepHandoffForksAtStartup();
@@ -232,8 +253,8 @@ function activateReady(context: vscode.ExtensionContext): void {
       }
     }
     const waitNotifyChanged = Object.values(WAIT_NOTIFY_SETTING_KEYS).some((key) => affectsProductConfiguration(e, key));
-    if (waitNotifyChanged) reevaluateWaitNotify();
-    if (affectsProductConfiguration(e, "composer.sendKey") || affectsProductConfiguration(e, "appearance") || affectsProductConfiguration(e, "claude.askQualityCheck") || affectsProductConfiguration(e, EDIT_SUMMARY_SETTING) || affectsProductConfiguration(e, REMOTE_CONTROL_CARD_SETTING) || waitNotifyChanged || affectsProductConfiguration(e, IMPROVEMENT_MENU_SETTING) || welcomeSettingChanged((key) => affectsProductConfiguration(e, key))) store?.post(userSettingsMessage());
+    if (waitNotifyChanged) waitNotifyAvailabilityChanged();
+    if (affectsProductConfiguration(e, "composer.sendKey") || affectsProductConfiguration(e, "appearance") || affectsProductConfiguration(e, "claude.askQualityCheck") || affectsProductConfiguration(e, EDIT_SUMMARY_SETTING) || affectsProductConfiguration(e, REMOTE_CONTROL_CARD_SETTING) || affectsProductConfiguration(e, IMPROVEMENT_MENU_SETTING) || welcomeSettingChanged((key) => affectsProductConfiguration(e, key))) store?.post(userSettingsMessage());
     if (
       affectsProductConfiguration(e, "appearance") ||
       affectsProductConfiguration(e, "composer.sendKey") ||
@@ -242,7 +263,7 @@ function activateReady(context: vscode.ExtensionContext): void {
       affectsProductConfiguration(e, "restoreTabsOnStartup") ||
       affectsProductConfiguration(e, TODO_ENABLED_SETTING) ||
       affectsProductConfiguration(e, EDIT_SUMMARY_SETTING) ||
-      affectsProductConfiguration(e, REMOTE_CONTROL_CARD_SETTING) || waitNotifyChanged || affectsProductConfiguration(e, IMPROVEMENT_MENU_SETTING) ||
+      affectsProductConfiguration(e, REMOTE_CONTROL_CARD_SETTING) || affectsProductConfiguration(e, IMPROVEMENT_MENU_SETTING) ||
       welcomeSettingChanged((key) => affectsProductConfiguration(e, key)) ||
       affectsProductConfiguration(e, GUARD_ENABLED_SETTING) ||
       affectsProductConfiguration(e, MEMORY_BLOCK_PROJECT_TYPE_SETTING) ||
@@ -261,9 +282,11 @@ function activateReady(context: vscode.ExtensionContext): void {
     }
     if (!affectsProductConfiguration(e, "workLog.semanticView")) return;
     if (!store) return;
-    store.post({ type: "init", protocolVersion: PROTOCOL_VERSION, tabs: store.snapshotAll(), hostWindows: process.platform === "win32", systemAppExtensions: configuredSystemAppExtensions() });
+    store.post({ type: "init", protocolVersion: PROTOCOL_VERSION, tabs: store.snapshotAll(), hostWindows: HOST_FILE_LINK_PLATFORM.windows, systemAppExtensions: configuredSystemAppExtensions(), askMarks: savedAskMarks() });
   });
   if (displayConfigSub) context.subscriptions.push(displayConfigSub);
+  const telemetrySub = vscode.env.onDidChangeTelemetryEnabled?.(waitNotifyAvailabilityChanged);
+  if (telemetrySub) context.subscriptions.push(telemetrySub);
   let selTimer: ReturnType<typeof setTimeout> | undefined;
   context.subscriptions.push(
     vscode.window.onDidChangeTextEditorSelection((e) => {
@@ -274,7 +297,7 @@ function activateReady(context: vscode.ExtensionContext): void {
         if (!sel) return;
         store?.post({
           type: "editorContext",
-          path: vscode.workspace.asRelativePath(e.textEditor.document.uri),
+          path: e.textEditor.document.uri.fsPath,
           startLine: sel.start.line + 1,
           endLine: sel.end.line + 1,
         });

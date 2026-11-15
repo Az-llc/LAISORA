@@ -1,7 +1,7 @@
 import * as l10n from "@vscode/l10n";
 import { closeGlyphButton } from "./close-button";
-import { truncateToolIntent } from "./status-line";
-import type { OrchestrationView, PlanContextWork, WorkModelPayload } from "../protocol";
+import { truncateToolIntent, waitingDecisionText } from "./status-line";
+import { workEndStatusWord, type OrchestrationView, type PlanContextWork, type WorkModelPayload } from "../protocol";
 import { deriveEarlierPlanViews, derivePlanView, planAllStepsDone, planCurrentStep, planLaneRunning, planStepCount, planStepFolds, type PlanLane, type PlanStep, type PlanView } from "./plan-view";
 import { createLoader } from "./loader";
 import { approx, formatDuration } from "./format";
@@ -10,18 +10,10 @@ import { goalLabel } from "./ask-view";
 import { todoAgentLabel, todoAgentText } from "./todo-links";
 import { measuredSumNote } from "./term";
 import { MARKS, foldGlyph } from "./marks";
+import { textElement as node } from "./element";
 
 type PlanLaneLabel = (lane: PlanLane) => HTMLElement | null;
 
-function node<K extends keyof HTMLElementTagNameMap>(tag: K, className: string, text?: string): HTMLElementTagNameMap[K] {
-  const element = document.createElement(tag);
-  element.className = className;
-  if (text !== undefined) {
-    element.textContent = text;
-    if (/[\u3040-\u30ff\u3400-\u9fff]/.test(text)) element.lang = "ja";
-  }
-  return element;
-}
 export function planDuration(ms: number | null): string {
   return ms === null ? "—" : formatDuration(ms);
 }
@@ -37,12 +29,10 @@ function planClock(at: number): string {
 }
 function status(value: string): string {
   switch (value) {
-    case "in_progress": case "running": return l10n.t("In progress");
+    case "in_progress": case "running": return workEndStatusWord("running");
     case "completed": return "✓";
-    case "pending": return l10n.t("Pending");
-    case "failed": return `✗ ${l10n.t("Failed")}`;
-    case "stopped": return l10n.t("Stopped");
-    case "stale": return l10n.t("Tracking stopped");
+    case "failed": return `✗ ${workEndStatusWord("failed")}`;
+    case "pending": case "stopped": case "stale": return workEndStatusWord(value);
     default: return "—";
   }
 }
@@ -102,7 +92,7 @@ export class PlanPanel {
     };
     head.append(this.bar);
     content.append(this.aside, this.dialog);
-    this.resize = new ResizeObserver(() => { if (content.clientWidth >= 1100 || content.getClientRects().length === 0) this.close(); });
+    this.resize = new ResizeObserver(() => { if (getComputedStyle(this.bar).display === "none" || content.getClientRects().length === 0) this.close(); });
     this.resize.observe(content);
     this.theme = new MutationObserver(() => { this.signature = ""; this.render(); });
     this.theme.observe(document.body, { attributes: true, attributeFilter: ["class", "style"] });
@@ -110,7 +100,7 @@ export class PlanPanel {
   }
 
   setWaiting(count: number): void {
-    this.waiting.textContent = count ? l10n.t("Waiting for your decision: {0}", count) : "";
+    this.waiting.textContent = count ? waitingDecisionText(count) : "";
   }
 
   setStatus(text: string): void { this.nowStatus = text; this.render(); }

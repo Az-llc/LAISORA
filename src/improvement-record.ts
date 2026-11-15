@@ -2,6 +2,7 @@ import fs from "node:fs";
 import path from "node:path";
 import readline from "node:readline";
 import { IMPROVEMENT_LINE_MAX_CHARS, sanitizeText, textOf } from "./improvement-scan";
+import { isSubagentTranscriptPath, readSubagentMetaSync, SUBAGENTS_DIR_NAME, subagentMetaPathOf } from "./subagent-files";
 
 export const RECORD_FIELD_MAX = 2000;
 export const RECORD_OUTPUT_MAX = 30000;
@@ -31,7 +32,7 @@ export function resolveRecordFiles(projectsDir: string, loc: RecordLocation): st
       if (!name.toLowerCase().startsWith(loc.sessionPrefix!)) continue;
       if (loc.part === "parent" && name.endsWith(".jsonl")) hits.push(path.join(pdir, name));
       if (loc.part !== "parent" && !name.endsWith(".jsonl")) {
-        const f = path.join(pdir, name, "subagents", `${loc.part}.jsonl`);
+        const f = path.join(pdir, name, SUBAGENTS_DIR_NAME, `${loc.part}.jsonl`);
         if (fs.existsSync(f)) hits.push(f);
       }
     }
@@ -75,15 +76,10 @@ export function renderRecord(rec: Record<string, any>, lineNo: number, calls: Re
 }
 
 function actorOf(file: string): string {
-  const parts = file.split(/[\\/]/);
-  const i = parts.lastIndexOf("subagents");
-  if (i < 0) return "main conversation";
-  let meta = "";
-  try {
-    const m = JSON.parse(fs.readFileSync(file.replace(/\.jsonl$/, ".meta.json"), "utf8"));
-    meta = [m.agentType, m.description].filter((x) => typeof x === "string" && x).join(": ");
-  } catch { /* no meta */ }
-  return `subagent ${parts[parts.length - 1].replace(/\.jsonl$/, "")}${meta ? ` (${cap(meta, 200)})` : ""}`;
+  if (!isSubagentTranscriptPath(file)) return "main conversation";
+  const m = readSubagentMetaSync(subagentMetaPathOf(file), (p) => fs.readFileSync(p, "utf8"));
+  const meta = m === null ? "" : [m.agentType, m.description].filter((x) => typeof x === "string" && x).join(": ");
+  return `subagent ${(file.split(/[\\/]/).at(-1) ?? file).replace(/\.jsonl$/, "")}${meta ? ` (${cap(meta, 200)})` : ""}`;
 }
 
 export interface CollectedRecord { readonly line: number; readonly rec?: Record<string, any>; readonly state: "record" | "empty" | "oversized" | "unparsable" }

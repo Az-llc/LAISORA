@@ -2,20 +2,32 @@ import type { HostToWebview, ModelInfo } from "./protocol";
 import type { Session } from "./session";
 import { extensionContext, output } from "./host-context";
 import * as l10n from "@vscode/l10n";
+import { CLAUDE_MODEL_FAMILIES, claudeModelParts, isMajorMinorVersion } from "./model-display-name";
 
 export const ADDITIONAL_MODELS_KEY = "laisora.additionalClaudeModels.v1";
 export const LAST_DISCOVERED_MODELS_KEY = "laisora.lastDiscoveredClaudeModels.v1";
-export const CLAUDE_VERSION_ID = /^claude-(?:opus|sonnet|haiku|fable)-\d+(?:-\d+)*(?:\[1m\])?$/;
+export function isClaudeVersionId(id: string): boolean {
+  return claudeModelParts(id)?.exactCase === true;
+}
 
 export function additionalClaudeModelIds(): string[] {
   const value = extensionContext?.globalState?.get<unknown>(ADDITIONAL_MODELS_KEY);
-  return Array.isArray(value) ? value.filter((id): id is string => typeof id === "string" && CLAUDE_VERSION_ID.test(id)) : [];
+  return Array.isArray(value) ? value.filter((id): id is string => typeof id === "string" && isClaudeVersionId(id)) : [];
+}
+
+const LABEL_VERSION = new RegExp(`\\b(${CLAUDE_MODEL_FAMILIES.join("|")}) (\\d+(?:\\.\\d+)?)`, "i");
+
+function rankedVersion(id: string): { family: string; parts: number[] } | null {
+  const parts = claudeModelParts(id);
+  return parts && isMajorMinorVersion(parts)
+    ?{ family: parts.family, parts: parts.version.map(Number) } : null;
 }
 
 export function splitModelVersions(models: ModelInfo[]): { current: ModelInfo[]; older: ModelInfo[] } {
   const version = (m: ModelInfo) => {
-    const match = /^claude-(opus|sonnet|haiku|fable)-(\d+(?:-\d{1,2})?)(?:-\d{8})?(?:\[1m\])?$/i.exec(m.id)
-      ?? /\b(opus|sonnet|haiku|fable) (\d+(?:\.\d+)?)/i.exec(m.label);
+    const ranked = rankedVersion(m.id);
+    if (ranked) return ranked;
+    const match = LABEL_VERSION.exec(m.label);
     return match ? { family: match[1].toLowerCase(), parts: match[2].split(/[.-]/).map(Number) } : null;
   };
   const compare = (a: number[], b: number[]) => a[0] - b[0] || (a[1] ?? 0) - (b[1] ?? 0);

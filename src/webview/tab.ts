@@ -4,14 +4,14 @@ import { mergeAskChoice } from "./ask-choice";
 import { createSessionHeader } from "./session-header";
 import { remoteControlCardAction, remoteControlCardNotes, remoteControlCardState, remoteControlLabel } from "./remote-control-view";
 import { ACTIONS_MENU_GLYPH } from "./todo-edit";
-import { onTodoAsksClosedInTodo, todoAsksClosedInTodo } from "./todo-asks";
+import { askCheckReading, isAskTabLinked, onAskCheckSharing, onTodoAsksClosedInTodo, ownAskChecks, todoAsksClosedInTodo, type AskCheckReading, type SavedMessageAskState } from "./todo-asks";
 import { addTodoToolCall, isTodoWriteTool, renderTodoHead, setTodoToolCardResult, todoToolCard } from "./todo-chat";
 import { renderTodoCrumbs, todoAgentLabel, todoAgentText, todoLinkHub, todoTabMarks } from "./todo-links";
 import { PlanPanel } from "./plan-panel";
-import { agentElapsedMs, applyFallbackModel, fallbackNoticeOriginal, fallbackNoticeOutcome, flattenAgents, foldModelFallback, isHistoryEvent, resolveFallbackByChoice, workEndStatus } from "../protocol";
-import type { ModelFallbackState, WelcomeTab, WorkAgentNode, WorkEndStatus } from "../protocol";
+import { agentElapsedMs, applyFallbackModel, fallbackNoticeOriginal, fallbackNoticeOutcome, flattenAgents, foldModelFallback, isHistoryEvent, resolveFallbackByChoice, workEndStatus, workEndStatusWord } from "../protocol";
+import type { ModelFallbackState, WelcomeTab, WorkAgentNode } from "../protocol";
 import { YouList } from "./you-list";
-import { bindUserLabel, onUserLabelChange } from "./user-label";
+import { bindUserLabel, onUserLabelChange, turnLabel } from "./user-label";
 import type { YouItem } from "./you-items";
 import { resolveModelDisplayName } from "../model-display-name";
 import type {
@@ -36,32 +36,37 @@ import type {
   WorkTaskItemView,
   WorkTaskTotalsView,
 } from "../protocol";
-import { isIsoTimestamp, WAIT_REPORT_ITEMS_MAX, WAIT_REPORT_TITLE_MAX } from "../protocol";
+import { isIsoTimestamp, transcriptWriteLockedText, WAIT_REPORT_ITEMS_MAX, WAIT_REPORT_TITLE_MAX } from "../protocol";
+import { askMarks, editAskMarks, onAskMarksFromElsewhere } from "./ask-marks";
+import { askResolutionKey, mergeAskResolutions } from "../ask-mark-edits";
 import { splitVerbatimCuts } from "../verbatim-cap";
 import type { HandoffContextMeasurement, HandoffSourceSnapshot } from "../protocol";
 import type { HandoffCompactStats, HandoffContextUsage } from "../handoff-envelope";
+import { pastRecordAction, type ShownConversationRecord } from "../event-window";
 import * as l10n from "@vscode/l10n";
 import { inputEl, logsEl, tabbarEl, usagePanelEl, sessionActionsEl, vscode } from "./dom";
 import { closeGlyphButton } from "./close-button";
 import { approvalCardTone, approvalRefSuffix, approvalTitle, approvalVerdict, approvalVerdictLabel, approvalVerdictTone, buildApprovalBody, buildRestoredApprovalCard } from "./approval";
 import { buildElicitationCard, enableElicitationOpen } from "./elicitation-form";
+import { approvalDraftOf, dropApprovalDrafts, saveApprovalDraft, type AskQuestionDraft } from "./approval-drafts";
 import { clock, clockRange, formatDuration, monthDayClock, toolSummary } from "./format";
 import { uiLocale } from "./l10n";
 import { formatHandoffTime, formatHandoffTokens } from "../handoff-format";
 import { createCopyButton, externalLinkElement, renderMarkdownInto } from "./markdown";
 import { codeActionIcon, forgetCodeBlockStates } from "./markdown-codeblock";
-import { askHeading, askOptionContent, rejectRenderedAsks, settleUncheckedAsks, updateAskCounters } from "./ask-view";
-import { askOtherChoice } from "../ask-parser";
+import { askHeading, askOptionContent, lockAskChoice, markReplacedCheck, rejectRenderedAsks, settleUncheckedAsks, updateAskCounters } from "./ask-view";
+import { linkSummaryWaits } from "./summary-view";
+import { composerLockOf } from "./composer-action";
 import { askQualityCheckEnabled, editSummaryEnabled, onEditSummaryChange, onWaitNotifyChange, waitNotifyEnabled } from "./menu";
 import { PUSH_NOTIFICATION_TOOL, foldWakeVisibility, waitNotifyLine, wakeLineAfterCall, wakeTurnHidden, type WakeLine, type WakeVisibility } from "../wait-notify";
 import { aggregateTurnEdits, buildEditSummaryCard, type TurnFileEdit } from "./edit-summary-card";
-import { createYouItems, encodeAskDismissal, encodeAskResolution, youAnchor, type AskIdentity, type AskResolutionRecord, type YouItemsReader } from "./you-items";
+import { askStateLookup, createYouItems, encodeAskDismissal, encodeAskResolution, youAnchor, type AskIdentity, type AskResolutionRecord, type AskStateKey, type YouItemsReader } from "./you-items";
 import { findCommitBoundary, joinRecordTexts, prependRecordParts, recordSeparator, withoutRetracted, type RecordTextPart } from "../commit-boundary";
 import { breaksParagraph, cardHome, compareTurnOrder, editSummaryPlace, labelPendingParts, legacyAskKeys, locateInParts, mergedParagraph, paragraphKey, paragraphText, prependTurnLayout, turnLabelModel, type ModelMark, type TurnItem, type TurnOrder, type TurnParagraph } from "./turn-layout";
 import { isConvMessageEvent, isConvRenderableEvent, permissionDeniedTarget } from "../conv-renderable";
 import { writesLostNotices, type WritesLostNotice } from "../session-writes-lost";
 import { accountErrorText, claudeAiSignInExpired, type AccountAuthSource } from "../account-error";
-import { isFailedToolResult, taskNotificationOutcome } from "../tool-result-signals";
+import { isFailedToolResult, taskNotificationOutcome, taskNotificationTerminal } from "../tool-result-signals";
 import { MARKS } from "./marks";
 import {
   applyActivityEvent,
@@ -77,11 +82,13 @@ import {
 import type { HandoffFailReason } from "../handoff-runner";
 import type { WorkViewMode } from "./work-overview";
 import type { GraphScrollPort } from "./work-graph";
+import { unknownLauncherDetail } from "../plan-steps";
 import { refreshFind, refreshFindCount } from "./find-bar";
 import { deriveStatusLine, statusLineText, truncateToolIntent } from "./status-line";
 import { WelcomeView } from "./welcome";
 import { delegationCount, isTaskTool } from "../claude-tool-names";
 import type { ToolIntentInput } from "../tool-intent";
+import { preservingViewAt } from "./history-scroll";
 import {
   SCROLL_BOTTOM_GAP_PX,
   activeTabId,
@@ -89,6 +96,7 @@ import {
   noteSurfaceChange,
   persistState,
   refreshChrome,
+  refreshEditorReference,
   renderUsagePanel,
   setActiveTab,
   swapPreservingConvView,
@@ -306,14 +314,16 @@ export function attachLightboxHandlers(
   });
 }
 
-function createImageSlot(tabId: string, ref: SessionImageRef): HTMLSpanElement {
-  const slot = document.createElement("span");
-  slot.className = "user-image-slot";
-  slot.dataset.imageState = "pending";
-  slot.dataset.imageRef = JSON.stringify(ref);
-  slot.dataset.tabId = tabId;
-  slot.textContent = l10n.t("Loading image…");
-  return slot;
+function appendImageSlots(block: HTMLElement, tabId: string, refs: readonly ImageRefInfo[] | undefined): void {
+  for (const info of refs ?? []) {
+    const slot = document.createElement("span");
+    slot.className = "user-image-slot";
+    slot.dataset.imageState = "pending";
+    slot.dataset.imageRef = JSON.stringify(info.ref);
+    slot.dataset.tabId = tabId;
+    slot.textContent = l10n.t("Loading image…");
+    block.appendChild(slot);
+  }
 }
 
 interface InFlightImageJob {
@@ -417,6 +427,14 @@ export function clearPendingImageLoads(tab: Tab): void {
 
 const HANDOFF_FAILURE_VISIBLE_MS = 120_000;
 const HANDOFF_CANCEL_VISIBLE_MS = 5000;
+
+function askAnswerKey(question: string): string {
+  return question.slice(0, 2000);
+}
+
+function askAnswerValue(values: readonly string[]): string {
+  return values.join(", ").slice(0, 10_000);
+}
 const HANDOFF_RUN_MEMORY = 1_000;
 const HANDOFF_DETAIL_UNAVAILABLE = l10n.t("Could not read the details");
 
@@ -429,6 +447,7 @@ const HANDOFF_FAILURE_MESSAGES = {
   source_busy: l10n.t("Cannot hand off while a turn is running (wait for it to finish or interrupt it)"),
   already_running: l10n.t("A handoff is already running"),
   folder_missing: l10n.t("Cannot hand off because the working folder of this conversation was not found"),
+  transcript_write_forbidden: transcriptWriteLockedText(),
   tab_failed: l10n.t("The handoff was created. You can open it from history"),
   compact_failed: l10n.t("Could not summarize the conversation. Please try again"),
   hook_not_fired: l10n.t("The summary did not run. Please try again"),
@@ -456,6 +475,15 @@ const HANDOFF_PHASE_TEXTS: Record<string, string> = {
   appending: l10n.t("(writing the handoff content)"),
   finishing: l10n.t("(writing the handoff content)"),
 };
+
+function markUserMessageCancelled(block: HTMLElement): void {
+  if (block.classList.contains("cancelled")) return;
+  block.classList.add("cancelled");
+  const label = document.createElement("div");
+  label.className = "user-cancelled";
+  label.textContent = l10n.t("The send was cancelled.");
+  block.appendChild(label);
+}
 
 function handoffElapsedText(ms: number): string {
   const total = Math.max(0, Math.round(ms / 1000));
@@ -559,17 +587,35 @@ interface WorkRowData {
   childIds?: string[];
 }
 
-const AGENT_STATUS_WORD: Record<WorkEndStatus, string> = {
-  running: l10n.t("Running"),
-  completed: l10n.t("Completed"),
-  failed: l10n.t("Failed"),
-  stale: l10n.t("Tracking stopped"),
-  stopped: l10n.t("Stopped"),
-  unknown: l10n.t("Unknown"),
-};
+type PastMessageRef = { uuid: string; role: "user" | "assistant" | "system"; text: string; timestamp?: number; remote?: true };
+type ClippedPiece = { offset: number; text: string; clipped?: true };
+interface ClippedPastMessage {
+  div: HTMLElement;
+  m: PastMessageRef;
+  text: string;
+  more: boolean;
+  control: HTMLButtonElement;
+  error: HTMLElement | null;
+  loading: Promise<boolean> | null;
+}
+
+function messageLoadError(): HTMLSpanElement {
+  const error = document.createElement("span");
+  error.className = "conv-clipped-error";
+  error.setAttribute("role", "alert");
+  const mark = document.createElement("span");
+  mark.className = "l-failure";
+  mark.textContent = "✗ ";
+  error.append(mark, l10n.t("Could not load the rest of this message."));
+  return error;
+}
+
+function unconfirmedStaleText(): string {
+  return l10n.t("{0} (completion could not be confirmed)", workEndStatusWord("stale"));
+}
 
 function notifiedStaleText(status: string | undefined): string {
-  return taskNotificationOutcome(status) === "stopped" ? l10n.t("Stopped") : l10n.t("Tracking stopped (completion could not be confirmed)");
+  return taskNotificationOutcome(status) === "stopped" ? workEndStatusWord("stopped") : unconfirmedStaleText();
 }
 
 function permissionDeniedText(ev: { toolName: string; reason: string; classifierUnavailable?: boolean }): string {
@@ -760,6 +806,7 @@ export function isScrollCarry(v: unknown): v is ScrollCarry {
 const ORPHAN_FINISH_MAX = 512;
 const FINISHED_CALL_MAX = 4096;
 export const WAKE_TURN_CLASS = "laisora-wake-turn";
+export const HISTORY_REQUEST_TIMEOUT_MS = 30_000;
 
 export type LoadProgressState =
   | { phase: "preparing" }
@@ -806,7 +853,14 @@ export function setOnAskDismissed(fn: typeof onAskDismissed): void {
   onAskDismissed = fn;
 }
 
-const ASK_MESSAGE_STATE_MAX = 500;
+let onAskChecked: ((tabId: string, key: AskStateKey, steps: readonly boolean[]) => void) | undefined;
+export function setOnAskChecked(fn: typeof onAskChecked): void {
+  onAskChecked = fn;
+}
+
+function persistCheckedMessage(key: AskStateKey, steps: readonly boolean[], posted: boolean, ifAbsent = false): void {
+  editAskMarks({ kind: "check", key, steps: [...steps], posted, ...(ifAbsent ? { ifAbsent: true as const } : {}) });
+}
 const READING_ROW_PROBE_STEP_PX = 8;
 const READING_ROW_PROBE_SPAN_PX = 64;
 const READING_ROW_WIDTH_SLACK_PX = 0.5;
@@ -827,14 +881,13 @@ export function persistAskDismissals(tabId: string | null, identities: readonly 
     const superseded = new Set(identities.filter((i) => i.message !== undefined).map((i) => encodeAskDismissal({ content: i.content })));
     askDismissed[tabId] = [...new Set([...(askDismissed[tabId] ?? []).filter((e) => !superseded.has(e)), ...identities.map(encodeAskDismissal)])];
   }
+  if (askDismissed !== state.askDismissed) vscode.setState({ ...state, askDismissed });
   const messages = identities.flatMap((i) => (i.message === undefined ? [] : [i.message]));
-  const askDismissedMessages = [...new Set([...(state.askDismissedMessages ?? []), ...messages])].slice(-ASK_MESSAGE_STATE_MAX);
-  vscode.setState({ ...state, askDismissed, askDismissedMessages });
+  if (messages.length > 0) editAskMarks({ kind: "dismiss", messages });
 }
 
-export function savedMessageAskState(): { dismissed: readonly string[]; resolved: readonly string[]; checked: Readonly<Record<string, readonly boolean[]>> } {
-  const state = vscode.getState();
-  return { dismissed: state?.askDismissedMessages ?? [], resolved: state?.askResolvedMessages ?? [], checked: state?.askCheckedMessages ?? {} };
+export function savedMessageAskState(): SavedMessageAskState {
+  return askMarks();
 }
 
 type InsertedTurn = boolean | "laisora";
@@ -848,9 +901,9 @@ export class Tab {
     if (this.youStoreValue === undefined) {
       const state = vscode.getState();
       this.youStoreValue = createYouItems(this.tabId,
-        { tab: state?.askDismissed?.[this.tabId] ?? [], messages: state?.askDismissedMessages ?? [],
-          resolvedTab: state?.askResolved?.[this.tabId] ?? [], resolvedMessages: state?.askResolvedMessages ?? [] },
-        (replyId, offset) => this.locateAsk(replyId, offset), askOtherChoice());
+        { tab: state?.askDismissed?.[this.tabId] ?? [], messages: askMarks().dismissed,
+          resolvedTab: state?.askResolved?.[this.tabId] ?? [], resolvedMessages: askMarks().resolved },
+        (replyId, offset) => this.locateAsk(replyId, offset));
     }
     return this.youStoreValue;
   }
@@ -872,6 +925,51 @@ export class Tab {
   private persistAskDismissals(identities: readonly AskIdentity[]): void {
     persistAskDismissals(this.tabId, identities);
   }
+  private ticksWithoutRecord = false;
+  private carryTabChecksToMessages(): void {
+    const tabChecks = vscode.getState()?.askChecks?.[this.tabId];
+    let pending = false;
+    let carried = false;
+    for (const [id, values] of Object.entries(tabChecks ?? {})) {
+      const key = this.youStore.stateKeyOf(id);
+      if (key === undefined) { pending = true; continue; }
+      const saved = savedMessageAskState();
+      if (askStateLookup(key, saved.checked, saved.checkedTags) !== undefined) continue;
+      persistCheckedMessage(key, values, false, true);
+      carried = true;
+    }
+    this.ticksWithoutRecord = pending;
+    if (carried) this.syncCheckCards();
+  }
+  private tabTicks(id: string, legacy: () => string[] = () => []): readonly boolean[] | undefined {
+    const tabChecks = vscode.getState()?.askChecks?.[this.tabId];
+    return tabChecks?.[id] ?? (tabChecks === undefined ? undefined : legacy().map((anchor) => tabChecks[anchor]).find((value) => value !== undefined));
+  }
+  private checkReading(id: string, legacy: () => string[] = () => []): AskCheckReading {
+    const key = this.youStore.stateKeyOf(id);
+    const steps = this.youStore.reader.get().find((item) => item.anchor.id === id)?.steps?.length ?? 0;
+    const tabTicks = this.tabTicks(id, legacy);
+    const own = ownAskChecks(key, savedMessageAskState()) ?? (tabTicks === undefined ? undefined : { steps: tabTicks, posted: false });
+    const reading = askCheckReading(key, steps, own, isAskTabLinked(this.tabId));
+    if (!reading.post || key === undefined || own === undefined) return reading;
+    persistCheckedMessage(key, own.steps, true);
+    onAskChecked?.(this.tabId, key, own.steps);
+    return askCheckReading(key, steps, { steps: own.steps, posted: true }, isAskTabLinked(this.tabId));
+  }
+  private checkCards(): { item: YouItem; card: HTMLElement | null }[] {
+    return this.youStore.reader.get().filter((item) => item.kind === "check")
+      .map((item) => ({ item, card: this.convEl.querySelector<HTMLElement>(`#${CSS.escape(item.anchor.id)}`) }));
+  }
+  private syncCheckCards(): void {
+    for (const { item, card } of this.checkCards()) {
+      const reading = this.checkReading(item.anchor.id);
+      card?.querySelectorAll<HTMLInputElement>(".ask-checkbox").forEach((box, step) => { box.checked = reading.ticks[step] === true; });
+      this.youStore.tick(item.anchor.id, reading.resolved);
+    }
+  }
+  private markReplacedChecks(): void {
+    for (const { item, card } of this.checkCards()) if (card) markReplacedCheck(card, item.resolution === "superseded");
+  }
   private askResolutionBatchDepth = 0;
   private withAskResolutionBatch<T extends { failed: number }>(work: () => T): T {
     this.askResolutionBatchDepth++;
@@ -884,36 +982,20 @@ export class Tab {
       if (result !== undefined && result.failed === 0 && this.askResolutionBatchDepth === 0) this.persistAskResolutions();
     }
   }
-  private persistAskResolutions(): void {
+  private persistAskResolutions(withdrawn: readonly AskResolutionRecord[] = []): void {
     if (this.askResolutionBatchDepth > 0) return;
     const records = this.youStore.resolutionRecords?.() ?? [];
-    if (records.length === 0) return;
+    if (records.length === 0 && withdrawn.length === 0) return;
     const state = vscode.getState() ?? { activeTabId: null };
-    const decode = (entry: string): AskResolutionRecord | undefined => {
-      try {
-        const value = JSON.parse(entry) as { m?: unknown; c?: unknown; r?: unknown; t?: unknown };
-        if (typeof value.c !== "string" || (value.m !== undefined && typeof value.m !== "string") ||
-          (value.r !== "replied" && value.r !== "superseded") || typeof value.t !== "number") return undefined;
-        return { identity: { content: value.c, ...(typeof value.m === "string" ? { message: value.m } : {}) },
-          resolution: value.r, at: value.t };
-      } catch { return undefined; }
-    };
-    const merge = (old: readonly string[], updates: readonly AskResolutionRecord[]): string[] => {
-      const entries = new Map<string, string>();
-      for (const encoded of old) {
-        const record = decode(encoded);
-        if (record) entries.set(record.identity.message ?? `content:${record.identity.content}`, encoded);
-      }
-      for (const record of updates) {
-        if (record.identity.message) entries.delete(`content:${record.identity.content}`);
-        entries.set(record.identity.message ?? `content:${record.identity.content}`, encodeAskResolution(record));
-      }
-      return [...entries.values()].slice(-ASK_MESSAGE_STATE_MAX);
-    };
     const askResolved = { ...state.askResolved };
-    askResolved[this.tabId] = merge(askResolved[this.tabId] ?? [], records);
-    const askResolvedMessages = merge(state.askResolvedMessages ?? [], records.filter(record => record.identity.message !== undefined));
-    vscode.setState({ ...state, askResolved, askResolvedMessages });
+    askResolved[this.tabId] = mergeAskResolutions(askResolved[this.tabId] ?? [], records, withdrawn);
+    vscode.setState({ ...state, askResolved });
+    editAskMarks({ kind: "resolve", records: records.filter(record => record.identity.message !== undefined).map(encodeAskResolution), withdrawn: withdrawn.map(encodeAskResolution) });
+  }
+  private rereadAskMarks(): void {
+    const marks = askMarks();
+    this.youStore.adoptSaved({ messages: marks.dismissed, resolvedMessages: marks.resolved });
+    this.syncCheckCards();
   }
   get youItems(): YouItemsReader { return this.youStore.reader; }
   private askReplyEvents = new Map<string, NormalizedEvent>();
@@ -945,7 +1027,12 @@ export class Tab {
   private settleAskChecks(endedTurn?: string): void {
     if (endedTurn !== undefined) this.endedAskTurns.add(endedTurn);
     settleUncheckedAsks(this.convEl, (turn) => this.endedAskTurns.has(turn));
+    this.refreshAskViews();
+  }
+
+  private refreshAskViews(): void {
     updateAskCounters(this.convEl);
+    linkSummaryWaits(this.convEl, (target) => this.revealConvTarget(target));
   }
 
   private legacyAskAnchors(container: HTMLElement, replyId: string, anchorId: string): string[] {
@@ -971,15 +1058,8 @@ export class Tab {
     const event = this.askReplyEvents.get(replyId) ?? this.askReplyEvents.get(this.currentSegTurnId ?? "");
     const ids = new Set<string>();
     const hadAsks = container.querySelector(".laisora-ask") !== null;
-    const isChecked = (id: string, step: number): boolean => {
-      const state = vscode.getState();
-      const message = this.youStore.messageOf(id);
-      const byMessage = message === undefined ? undefined : state?.askCheckedMessages?.[message]?.[step];
-      const tabChecks = state?.askChecks?.[this.tabId];
-      const byTab = tabChecks?.[id]?.[step] ?? (tabChecks === undefined ? undefined
-        : this.legacyAskAnchors(container, replyId, id).map((legacy) => tabChecks[legacy]?.[step]).find((value) => value !== undefined));
-      return (byMessage ?? byTab) === true;
-    };
+    const legacy = (id: string) => () => this.legacyAskAnchors(container, replyId, id);
+    const isChecked = (id: string, step: number): boolean => this.checkReading(id, legacy(id)).ticks[step] === true;
     if (container.dataset.askQualityTurn === undefined && askQualityCheckEnabled() && this.replayDone && this.currentTurnId !== null) container.dataset.askQualityTurn = this.currentTurnId;
     renderMarkdownInto(container, text, this.tabId, {
       replyId, offset, qualityTurn: container.dataset.askQualityTurn,
@@ -988,10 +1068,12 @@ export class Tab {
       register: (ask, position) => {
         ids.add(`ask:${replyId}:${position}`);
         const id = this.youStore.ask(ask, { replyId, offset: position, createdAt: at ?? event?.timestamp ?? 0, order: order ?? event?.seq, generation: generation ?? event?.generation });
-        this.youStore.tick(id, (index) => isChecked(id, index));
+        this.youStore.tick(id, this.checkReading(id, legacy(id)).resolved);
         return id;
       },
+      choiceLocked: () => this.composerLocked,
       choose: (value, askKey, title) => {
+        if (this.composerLocked) return;
         setActiveTab(this.tabId);
         const merged = mergeAskChoice(inputEl.value, askKey, title, value, this.askChoiceLines.get(askKey));
         inputEl.value = merged.text;
@@ -1003,33 +1085,28 @@ export class Tab {
       },
       checked: isChecked,
       check: (id, step, checked) => {
+        const steps = this.checkReading(id, legacy(id)).ticks.map((value, index) => index === step ? checked : value);
         const state = vscode.getState() ?? { activeTabId: null };
-        const askChecks = { ...state.askChecks };
-        const tabChecks = { ...askChecks[this.tabId] };
-        const values = [...(tabChecks[id] ?? [])];
-        values[step] = checked;
-        tabChecks[id] = values;
-        askChecks[this.tabId] = tabChecks;
-        const message = this.youStore.messageOf(id);
-        let askCheckedMessages = state.askCheckedMessages;
-        if (message !== undefined) {
-          const { [message]: previous, ...rest } = askCheckedMessages ?? {};
-          const next = [...(previous ?? [])];
-          next[step] = checked;
-          askCheckedMessages = Object.fromEntries([...Object.entries(rest), [message, next]].slice(-ASK_MESSAGE_STATE_MAX));
-        }
-        vscode.setState({ ...state, askChecks, askCheckedMessages });
-        this.youStore.tick(id, (index) => isChecked(id, index));
+        vscode.setState({ ...state, askChecks: { ...state.askChecks, [this.tabId]: { ...state.askChecks?.[this.tabId], [id]: steps } } });
+        const key = this.youStore.stateKeyOf(id);
+        if (key !== undefined) {
+          persistCheckedMessage(key, steps, isAskTabLinked(this.tabId) && steps.length > 0 && steps.every(Boolean));
+          onAskChecked?.(this.tabId, key, steps);
+        } else this.ticksWithoutRecord = true;
+        this.youStore.tick(id, this.checkReading(id, legacy(id)).resolved);
       },
     });
     this.youStore.retain(replyId, offset, Math.max(offset + text.length, this.askRenderEnds.get(container) ?? 0), ids);
     this.askRenderEnds.set(container, offset + text.length);
-    if (ids.size > 0) this.syncTodoClosedAsks(container);
+    if (ids.size > 0) {
+      this.syncTodoClosedAsks(container);
+      this.markReplacedChecks();
+    }
     if (container.dataset.askQualityTurn !== undefined || this.rejectedAskKeys.size > 0) this.settleAskChecks();
     if (ids.size > 0) this.persistAskResolutions();
-    if ((hadAsks || ids.size > 0) && !this.askCountersScheduled) {
+    if ((hadAsks || ids.size > 0 || container.querySelector(".laisora-summary") !== null) && !this.askCountersScheduled) {
       this.askCountersScheduled = true;
-      queueMicrotask(() => { this.askCountersScheduled = false; updateAskCounters(this.convEl); });
+      queueMicrotask(() => { this.askCountersScheduled = false; this.refreshAskViews(); });
     }
   }
 
@@ -1093,6 +1170,7 @@ export class Tab {
   get workViewMode(): WorkViewMode { return this.workView; }
   private workViewReturnRow: HTMLElement | null = null;
   private lastHumanHeadline: string | null = null;
+  private lastHumanHeadlineUuid: string | undefined;
   private pendingHeadlineAnchor: HTMLElement | null = null;
   private pastPendingAnchor: HTMLElement | null = null;
   private pastPendingChunk = 0;
@@ -1280,7 +1358,7 @@ export class Tab {
     this.paintTodoMarks();
     renderTodoCrumbs(this.todoCrumbsEl, this.tabId);
     if (!this.todoHeadEl.isConnected) this.convEl.insertBefore(this.todoHeadEl, this.convEl.firstChild);
-    renderTodoHead(this.todoHeadEl, this.tabId);
+    renderTodoHead(this.todoHeadEl, this.tabId, this.laisoraPurpose);
     for (const [toolUseId, entry] of this.agentCards) {
       const data = this.rowData.get(toolUseId);
       if (data) this.paintAgentTodo(entry, this.agentTodoLabel(data));
@@ -1883,6 +1961,7 @@ export class Tab {
   }
 
   recordedModel: string | undefined;
+  cwd = "";
   permissionMode: PermissionModeId = "default";
   commands: SlashCommandInfo[] = [];
   models: ModelInfo[] = [];
@@ -1893,6 +1972,9 @@ export class Tab {
     if (this.tabId === activeTabId) refreshFind();
   });
   private readonly unsubscribeTodoClosed = onTodoAsksClosedInTodo(() => this.syncTodoClosedAsks());
+  private readonly unsubscribeSharedChecks = onAskCheckSharing(() => this.syncCheckCards());
+  private readonly unsubscribeAskMarks = onAskMarksFromElsewhere(() => this.rereadAskMarks());
+  private unsubscribeReplacedChecks: () => void = () => {};
   modelOverride: string | null | undefined = undefined;
   effortOverride: string | null | undefined = undefined;
   turnState: "idle" | "running" | "interrupting" = "idle";
@@ -1903,6 +1985,9 @@ export class Tab {
   private readonly adoptedTurnIds = new Set<string>();
   private replayDone = false;
   pendingSend = false;
+  handoffSendLocked = false;
+  transcriptWriteLocked = false;
+  laisoraPurpose = false;
   private currentAssistantBlock: HTMLElement | null = null;
   private assistantBuffer = "";
   private liveRecordOpen = false;
@@ -1929,6 +2014,9 @@ export class Tab {
   private convHistoryEl: HTMLElement | null = null;
   private convHistoryBodyEl: HTMLElement | null = null;
   private convMessageUuids = new Set<string>();
+  private readonly clippedTextRequests = new Map<string, (piece: ClippedPiece | undefined) => void>();
+  private readonly replyLoadErrors = new Map<string, HTMLElement>();
+  private clippedTextSerial = 0;
   private convPrependedTotal = 0;
   private renderedConvEventKeys = new Set<string>();
   private readonly pastParagraphs = new Map<string, PastParagraph>();
@@ -1982,6 +2070,7 @@ export class Tab {
   private taskItems: WorkTaskItemView[] = [];
   private pendingApprovalCount = 0;
   private approvalCards = new Map<string, HTMLElement>();
+  private restoredApprovalInputs = new Map<string, (resolved: Record<string, string> | undefined) => void>();
   private approvalRefs = new Map<string, HTMLElement>();
   private missingWorkInfoReported = false;
   private pastRender: PastRenderContext | null = null;
@@ -2085,6 +2174,7 @@ export class Tab {
       if (this.tabBtn !== undefined) this.updateStrip();
     }, item => this.dismissYou(item));
     this.summaryYou = new YouList(this.youItems, item => this.navigateToYou(item), undefined, item => this.dismissYou(item));
+    this.unsubscribeReplacedChecks = this.youItems.subscribe(() => this.markReplacedChecks());
     this.planPanel.you.append(this.chatYou.element);
     this.logEl.appendChild(content);
     logsEl.appendChild(this.logEl);
@@ -2145,6 +2235,9 @@ export class Tab {
     forgetCodeBlockStates(this.tabId);
     this.unsubscribeUserLabel();
     this.unsubscribeTodoClosed();
+    this.unsubscribeSharedChecks();
+    this.unsubscribeAskMarks();
+    this.unsubscribeReplacedChecks();
     this.unsubscribeEditSummary();
     this.unsubscribeWaitNotify();
     this.clearHandoffStatus();
@@ -2569,7 +2662,10 @@ export class Tab {
     this.planPanel.close(false);
     this.selectPane("chat");
     const target = this.convEl.querySelector<HTMLElement>(`#${CSS.escape(item.anchor.id)}`);
-    if (!target) return;
+    if (target) this.revealConvTarget(target);
+  }
+
+  private revealConvTarget(target: HTMLElement): void {
     let details = target.closest("details");
     while (details instanceof HTMLDetailsElement) {
       details.open = true;
@@ -2581,8 +2677,7 @@ export class Tab {
     target.tabIndex = -1;
     target.focus({ preventScroll: true });
     setTimeout(() => target.classList.remove("flash"), 1200);
-    this.atBottom.conv = false;
-    this.scrollPos.conv = logsEl.scrollTop;
+    this.leaveConvBottom();
   }
 
   hasConversationTurn(turnId: string): boolean {
@@ -2598,8 +2693,7 @@ export class Tab {
     target.scrollIntoView({ block: "start" });
     target.classList.add("flash");
     setTimeout(() => target.classList.remove("flash"), 1200);
-    this.atBottom.conv = false;
-    this.scrollPos.conv = logsEl.scrollTop;
+    this.leaveConvBottom();
   }
 
   switchWorkViewScroll(prev: WorkViewMode, next: WorkViewMode): () => void {
@@ -2701,8 +2795,7 @@ export class Tab {
     target.scrollIntoView({ block: "start" });
     target.classList.add("flash");
     setTimeout(() => target.classList.remove("flash"), 1200);
-    this.atBottom.conv = false;
-    this.scrollPos.conv = logsEl.scrollTop;
+    this.leaveConvBottom();
   }
 
   scrollToLatest(): void {
@@ -2841,14 +2934,10 @@ export class Tab {
   }
 
   private prependTurnLabel(block: HTMLElement, role: "user" | "assistant", model: string | null = null): void {
-    const label = document.createElement("div");
-    label.className = "turn-label";
     const name = document.createElement("span");
-    name.className = "turn-label-name";
     if (role === "user") bindUserLabel(name);
     else if (model) this.bindModelName(name, model);
-    label.appendChild(name);
-    block.prepend(label);
+    block.prepend(turnLabel(name));
   }
 
   addBlock(cls: string, text: string, markdown = false, target: ViewMode = "conv", model: string | null = null): HTMLElement {
@@ -3017,6 +3106,22 @@ export class Tab {
     else this.readingAnchor = undefined;
   }
 
+  private leaveConvBottom(): void {
+    this.atBottom.conv = false;
+    delete this.bottomTop.conv;
+    this.scrollPos.conv = logsEl.scrollTop;
+  }
+
+  private convViewAnchor(around?: Element): Element | null {
+    if (this.atBottom.conv) return this.convEl.lastElementChild;
+    if (around !== undefined) {
+      const line = this.readingLine();
+      const box = around.getBoundingClientRect();
+      if (box.top <= line && box.bottom > line) return around;
+    }
+    return this.readingBlock();
+  }
+
   private readingLine(): number {
     return Math.max(logsEl.getBoundingClientRect().top, this.headEl.getBoundingClientRect().bottom);
   }
@@ -3039,20 +3144,27 @@ export class Tab {
     return null;
   }
 
-  private measureReadingRow(): void {
-    if (activeTabId !== this.tabId || this.viewMode !== "conv" || this.atBottom.conv) return;
+  private readingBlock(): HTMLElement | null {
     const area = this.convEl.getBoundingClientRect();
-    if (area.width <= 0) return;
+    if (area.width <= 0) return null;
     const line = this.readingLine();
     const xs = [area.left + area.width / 2, area.right - Math.min(12, area.width / 2)];
     for (let y = line + 1; y < line + READING_ROW_PROBE_SPAN_PX; y += READING_ROW_PROBE_STEP_PX) {
       const row = this.blockAt(xs, y);
-      if (row === null) continue;
-      const rect = row.getBoundingClientRect();
-      this.readingAnchor = { row, point: line - rect.top, height: rect.height };
+      if (row !== null) return row;
+    }
+    return null;
+  }
+
+  private measureReadingRow(): void {
+    if (activeTabId !== this.tabId || this.viewMode !== "conv" || this.atBottom.conv || this.convEl.getBoundingClientRect().width <= 0) return;
+    const row = this.readingBlock();
+    if (row === null) {
+      this.readingAnchor = undefined;
       return;
     }
-    this.readingAnchor = undefined;
+    const rect = row.getBoundingClientRect();
+    this.readingAnchor = { row, point: this.readingLine() - rect.top, height: rect.height };
   }
 
   private measureAnchor(mode: ViewMode): RowAnchor | undefined {
@@ -3236,7 +3348,7 @@ export class Tab {
       if (data.status === "running") {
         data.status = "stale";
         data.statusGlyph = TOOL_STATUS_GLYPH.stale;
-        data.metaText = l10n.t("Tracking stopped (completion could not be confirmed)");
+        data.metaText = unconfirmedStaleText();
       }
       const row = this.toolCards.get(toolUseId);
       if (row) {
@@ -3257,7 +3369,7 @@ export class Tab {
             if (elapsed) rowSummary.insertBefore(metaEl, elapsed);
             else rowSummary.appendChild(metaEl);
           }
-          metaEl.textContent = l10n.t("Tracking stopped (completion could not be confirmed)");
+          metaEl.textContent = unconfirmedStaleText();
         }
       }
       const agent = this.agentCards.get(toolUseId);
@@ -3446,7 +3558,7 @@ export class Tab {
     if (state.status !== "running") entry.statusEl.textContent = state.status === "failed" ? "✗" : state.status === "completed" ? "✓" : TOOL_STATUS_GLYPH.stale;
     const elapsed = agentElapsedMs(state, Date.now());
     entry.metaEl.textContent = l10n.t("{0} calls · {1}", state.childCount, formatDuration(elapsed));
-    entry.metaEl.title = AGENT_STATUS_WORD[workEndStatus(state)];
+    entry.metaEl.title = workEndStatusWord(workEndStatus(state));
     if (state.modelMeasured) {
       setRowChip(data, "model", state.modelMeasured);
       fillChips(entry.chipsEl, data, this.models);
@@ -3634,6 +3746,7 @@ export class Tab {
     labelPendingParts(this.assistantRuns, ev.uuid);
     if (isHistoryEvent(ev)) this.noteRestoredRecord(this.frameOf(ev.turnId), ev.uuid);
     this.recordAskDismissals(this.youStore.relabel());
+    if (this.ticksWithoutRecord) this.carryTabChecksToMessages();
     this.syncTodoClosedAsks();
     this.syncTurnReplyTodo(ev.turnId);
     this.persistAskResolutions();
@@ -3819,7 +3932,7 @@ export class Tab {
       const rowSummary = document.createElement("summary");
       const icon = document.createElement("span");
       icon.className = "todocard-icon";
-      icon.setAttribute("aria-label", item.status === "completed" ? l10n.t("Completed") : item.status === "in_progress" ? l10n.t("Running") : l10n.t("Pending"));
+      icon.setAttribute("aria-label", workEndStatusWord(item.status === "completed" ? "completed" : item.status === "in_progress" ? "running" : "pending"));
       const label = document.createElement("span");
       label.className = "todocard-label";
       label.textContent = taskLabel(item);
@@ -4170,7 +4283,7 @@ export class Tab {
       const duration = anchor.querySelector<HTMLElement>(".wl-request-duration")!;
       const update = () => {
         setTextIfChanged(duration, startedAt <= 0 ? l10n.t("Time not observed")
-          : running ? `${l10n.t("Running")} ${clockRange(startedAt, null)}` : clockRange(startedAt, end !== undefined && end > 0 ? end : null));
+          : running ? `${workEndStatusWord("running")} ${clockRange(startedAt, null)}` : clockRange(startedAt, end !== undefined && end > 0 ? end : null));
         if (running || startedAt <= 0 || end === undefined || end <= 0) {
           duration.removeAttribute("title");
           duration.removeAttribute("aria-label");
@@ -4235,7 +4348,7 @@ export class Tab {
     if (b !== null && b.textContent === "") b.textContent = headline;
   }
 
-  private noteHumanHeadline(text: string, turnId: string | null): void {
+  private noteHumanHeadline(text: string, turnId: string | null, uuid?: string): void {
     const headline = Tab.headlineOf(text);
     if (headline.length === 0) return;
     const pending = this.pendingHeadlineAnchor;
@@ -4245,7 +4358,9 @@ export class Tab {
       this.pendingHeadlineAnchor = null;
       return;
     }
-    if (turnId === null) this.lastHumanHeadline = headline;
+    if (turnId !== null) return;
+    this.lastHumanHeadline = headline;
+    this.lastHumanHeadlineUuid = uuid;
   }
 
   private notePastHumanHeadline(text: string, turnId: string | null): boolean {
@@ -4278,7 +4393,7 @@ export class Tab {
     return time;
   }
 
-  private buildReplyFooter(at: number | undefined, source: () => string, replyId: () => string | undefined): HTMLElement {
+  private buildReplyFooter(at: number | undefined, source: () => string | Promise<string>, replyId: () => string | undefined): HTMLElement {
     const footer = document.createElement("div");
     footer.className = "reply-footer";
     const { button, status } = createCopyButton("msg-copy-button", l10n.t("Copy reply"), source);
@@ -4342,13 +4457,7 @@ export class Tab {
 
   private turnReplyId(turnId: string): string | undefined {
     if (this.priorGenerationTurns.has(turnId)) return undefined;
-    const segs = this.convEl.querySelectorAll<HTMLElement>(`.block.assistant-turn[data-turn-id="${CSS.escape(turnId)}"] > .assistant-seg`);
-    const parts = Array.from(segs, (seg) => this.segParts(seg)).flat();
-    for (let i = parts.length - 1; i >= 0; i--) {
-      const uuid = parts[i].uuid;
-      if (uuid !== null) return uuid;
-    }
-    return undefined;
+    return this.labelledRecords(`.block.assistant-turn[data-turn-id="${CSS.escape(turnId)}"] > .assistant-seg`, this.convEl).at(-1)?.uuid;
   }
 
   private static applyFooterTime(footer: HTMLElement, at: number | undefined): void {
@@ -4378,7 +4487,7 @@ export class Tab {
     this.latestReplyFooter = latest;
   }
 
-  private buildUserFoot(at: number | undefined, text: string): HTMLElement {
+  private buildUserFoot(at: number | undefined, text: string, source: () => string | Promise<string> = () => text): HTMLElement {
     const foot = document.createElement("div");
     foot.className = "msg-foot";
     const time = Tab.footerTime(at);
@@ -4387,15 +4496,15 @@ export class Tab {
       foot.appendChild(time);
     }
     if (text.length > 0) {
-      const { button, status } = createCopyButton("msg-copy-button", l10n.t("Copy message"), () => text);
+      const { button, status } = createCopyButton("msg-copy-button", l10n.t("Copy message"), source);
       foot.appendChild(button);
       foot.appendChild(status);
     }
     return foot;
   }
 
-  private appendUserFoot(block: HTMLElement, at: number | undefined, text: string): HTMLElement {
-    const foot = this.buildUserFoot(at, text);
+  private appendUserFoot(block: HTMLElement, at: number | undefined, text: string, source?: () => string | Promise<string>): HTMLElement {
+    const foot = this.buildUserFoot(at, text, source);
     block.after(foot);
     return foot;
   }
@@ -4403,7 +4512,7 @@ export class Tab {
   private reportYouWaiting(open: readonly YouItem[]): void {
     this.openYou = open;
     if (!waitNotifyEnabled()) return;
-    const items = open.filter((item) => item.anchor.approvalRef === undefined).slice(0, WAIT_REPORT_ITEMS_MAX)
+    const items = open.filter((item) => item.anchor.approvalRef === undefined).sort((a, b) => b.createdAt - a.createdAt).slice(0, WAIT_REPORT_ITEMS_MAX)
       .map((item) => ({ title: item.title.slice(0, WAIT_REPORT_TITLE_MAX), createdAt: item.createdAt }));
     const message = { type: "youWaiting" as const, tabId: this.tabId, ...this.liveEventOrder, items };
     const key = JSON.stringify(message);
@@ -4490,6 +4599,9 @@ export class Tab {
       case "user_message":
         this.onUserMessage(ev);
         break;
+      case "user_message_cancelled":
+        this.onUserMessageCancelled(ev);
+        break;
       case "replayed_message":
         this.onReplayedMessage(ev);
         break;
@@ -4551,12 +4663,17 @@ export class Tab {
     if (ev.kind !== "assistant_text_delta") this.scheduleLogRefresh();
   }
 
-  private onConversationOpened(_ev: Extract<NormalizedEvent, { kind: "conversation_opened" }>): void {
+  private onConversationOpened(ev: Extract<NormalizedEvent, { kind: "conversation_opened" }>): void {
+    if (this.replayDone) this.cwd = ev.cwd;
     this.contextUsage = null;
-    if (activeTabId === this.tabId) refreshChrome();
+    if (activeTabId === this.tabId) {
+      refreshChrome();
+      refreshEditorReference();
+    }
   }
 
   private onConversationClosed(ev: Extract<NormalizedEvent, { kind: "conversation_closed" }>): void {
+    dropApprovalDrafts(this.tabId, this.replayDone ? undefined : this.approvalCards.keys());
     for (const turnId of this.suspendedReplies.keys()) {
       this.withSuspendedReply(turnId, () => this.endAssistantTurn());
     }
@@ -5074,12 +5191,21 @@ export class Tab {
     const shown = isConvRenderableEvent(ev) && !(isHistoryEvent(ev) && this.liveRecordOpen);
     if (shown) this.endAssistantTurnBeforeConvBlock();
     this.applyWork(ev.work);
-    this.noteHumanHeadline(ev.text, ev.turnId);
+    if (ev.cancelled !== true) this.noteHumanHeadline(ev.text, ev.turnId, ev.uuid);
     if (!shown) return;
     if (!isHistoryEvent(ev)) this.replaceAcceptedOptimisticBubble();
     const block = this.addBlock("user", ev.text);
+    this.fillUserMessageBlock(block, ev);
+    if (ev.imageRefs && ev.imageRefs.length > 0) scheduleImageLoads(this);
+    this.observeSessionTime(ev.sentAt);
+    this.appendUserFoot(block, ev.sentAt ?? (ev.timestamp > 0 ? ev.timestamp : undefined), ev.text);
+    this.scrollToBottom("conv");
+  }
+
+  private fillUserMessageBlock(block: HTMLElement, ev: Extract<NormalizedEvent, { kind: "user_message" }>): void {
     if (ev.turnId !== null) block.dataset.turnId = ev.turnId;
     if (isHistoryEvent(ev)) this.noteRestoredRecord(block, ev.uuid);
+    else if (ev.uuid !== undefined) block.dataset.userUuid = ev.uuid;
     for (const im of ev.images ?? []) {
       const img = document.createElement("img");
       img.className = "user-image";
@@ -5088,15 +5214,22 @@ export class Tab {
       attachLightboxHandlers(img, this.tabId, { inline: im });
       block.appendChild(img);
     }
-    if (ev.imageRefs && ev.imageRefs.length > 0) {
-      for (const info of ev.imageRefs) {
-        block.appendChild(createImageSlot(this.tabId, info.ref));
-      }
-      scheduleImageLoads(this);
+    appendImageSlots(block, this.tabId, ev.imageRefs);
+    if (ev.cancelled === true) markUserMessageCancelled(block);
+  }
+
+  private onUserMessageCancelled(ev: Extract<NormalizedEvent, { kind: "user_message_cancelled" }>): void {
+    for (const uuid of ev.uuids) {
+      this.convEl.querySelectorAll<HTMLElement>(`.block.user[data-user-uuid="${CSS.escape(uuid)}"]`).forEach(markUserMessageCancelled);
     }
-    this.observeSessionTime(ev.sentAt);
-    this.appendUserFoot(block, ev.sentAt ?? (ev.timestamp > 0 ? ev.timestamp : undefined), ev.text);
-    this.scrollToBottom("conv");
+    if (this.lastHumanHeadlineUuid !== undefined && ev.uuids.includes(this.lastHumanHeadlineUuid)) {
+      this.lastHumanHeadline = null;
+      this.lastHumanHeadlineUuid = undefined;
+    }
+    const before = this.youStore.resolutionRecords?.() ?? [];
+    this.youStore.withdrawReplies(ev.uuids);
+    const after = new Set((this.youStore.resolutionRecords?.() ?? []).map(askResolutionKey));
+    this.persistAskResolutions(before.filter((record) => !after.has(askResolutionKey(record))));
   }
 
   private onLocalCommandOutput(ev: Extract<NormalizedEvent, { kind: "local_command_output" }>): void {
@@ -5152,9 +5285,7 @@ export class Tab {
       this.convMessageUuids.add(ev.uuid);
     }
     if (ev.role === "user" && ev.imageRefs && ev.imageRefs.length > 0) {
-      for (const info of ev.imageRefs) {
-        block.appendChild(createImageSlot(this.tabId, info.ref));
-      }
+      appendImageSlots(block, this.tabId, ev.imageRefs);
       scheduleImageLoads(this);
     }
     this.observeSessionTime(ev.recordedAt ?? ev.sentAt);
@@ -5233,9 +5364,13 @@ export class Tab {
     return (this.workModel?.unknownLaunchers ?? []).some(entry => entry.toolUseIds.includes(toolUseId));
   }
 
+  private unknownLauncherEntries(id: string): NonNullable<WorkModelPayload["unknownLaunchers"]> {
+    return (this.workModel?.unknownLaunchers ?? []).filter(entry => (this.logTurnAliases.get(entry.turnId) ?? entry.turnId) === id);
+  }
+
   private unknownLaunchersOf(id: string): WorkAgentNode[] {
     const model = this.workModel;
-    const toolUseIds = (model?.unknownLaunchers ?? []).filter(entry => (this.logTurnAliases.get(entry.turnId) ?? entry.turnId) === id).flatMap(entry => entry.toolUseIds);
+    const toolUseIds = this.unknownLauncherEntries(id).flatMap(entry => entry.toolUseIds);
     if (model === undefined || toolUseIds.length === 0) return [];
     const nodes = new Map(flattenAgents(model.phases, model.unlinkedAgents).map(agent => [agent.toolUseId, agent]));
     return toolUseIds.flatMap(toolUseId => nodes.get(toolUseId) ?? []);
@@ -5259,7 +5394,9 @@ export class Tab {
       request.unknownGroup = group;
     }
     const summary = group.querySelector("summary")!;
-    setTextIfChanged(summary, [l10n.t("Unknown launcher"), l10n.t("Subagent"), group.open ? "" : `+${agents.length}`].filter(Boolean).join(" · "));
+    const entries = this.unknownLauncherEntries(id);
+    const foldCount = entries.every(entry => entry.foldCount !== undefined) ? entries.reduce((sum, entry) => sum + entry.foldCount!, 0) : undefined;
+    setTextIfChanged(summary, [l10n.t("Unknown launcher"), unknownLauncherDetail(foldCount, group.open)].join(" · "));
     const list = group.querySelector<HTMLElement>(":scope > div")!;
     for (const agent of agents) {
       const card = this.unknownLauncherCard(agent, request);
@@ -5438,8 +5575,8 @@ export class Tab {
       const elapsedMs = startedAt !== undefined ? ev.timestamp - startedAt : 0;
 
       const notifStatus = ev.taskNotification.status;
-      const finalStatus: WorkRowData["status"] =
-        notifStatus === "completed" ? "done" : notifStatus === "failed" ? "failed" : "stale";
+      const terminal = taskNotificationTerminal(notifStatus);
+      const finalStatus: WorkRowData["status"] = terminal === "completed" ? "done" : terminal;
       const finalGlyph = TOOL_STATUS_GLYPH[finalStatus];
 
       const data = this.rowData.get(targetId);
@@ -5810,6 +5947,9 @@ export class Tab {
 
   private onApprovalResolved(ev: Extract<NormalizedEvent, { kind: "approval_resolved" }>): void {
     this.applyWork(ev.work);
+    saveApprovalDraft(this.tabId, ev.requestId, undefined);
+    this.restoredApprovalInputs.get(ev.requestId)?.(ev.answers);
+    this.restoredApprovalInputs.delete(ev.requestId);
     const el = this.approvalCards.get(ev.requestId);
     if (el) {
       el.querySelectorAll("button").forEach((b) => ((b as HTMLButtonElement).disabled = true));
@@ -5855,6 +5995,21 @@ export class Tab {
     if (!usagePanelEl.classList.contains("hidden")) renderUsagePanel();
   }
 
+  get composerLocked(): boolean {
+    return composerLockOf(this) !== null;
+  }
+
+  syncAskChoiceLock(): void {
+    const locked = this.composerLocked;
+    this.convEl.querySelectorAll<HTMLButtonElement>(".laisora-ask button.ask-option").forEach((button) => lockAskChoice(button, locked));
+  }
+
+  settleRejectedSend(): void {
+    if (!this.pendingSend) return;
+    this.pendingSend = false;
+    this.setTurnState("idle");
+  }
+
   private onError(ev: Extract<NormalizedEvent, { kind: "error" }>): void {
     this.addBlock("error", ev.message);
     this.flagConvAttention();
@@ -5873,6 +6028,7 @@ export class Tab {
     div.dataset.approval = requestId;
     div.id = youAnchor(this.tabId, `approval:${requestId}`);
     this.approvalCards.set(requestId, div);
+    const savedDraft = approvalDraftOf(this.tabId, requestId);
     const det = document.createElement("details");
     det.className = "approval-det";
     det.open = true;
@@ -5883,7 +6039,18 @@ export class Tab {
     if (ev.elicitation) {
       div.classList.add("elicitation-approval");
       const parts = buildElicitationCard(ev.elicitation, rawInputJson, `elicit-${this.tabId}-${requestId}`, (decision) =>
-        vscode.postMessage({ type: "approvalDecision", tabId: this.tabId, requestId, ...decision }));
+        vscode.postMessage({ type: "approvalDecision", tabId: this.tabId, requestId, ...decision }), {
+        draft: savedDraft !== undefined && "form" in savedDraft ? savedDraft.form : undefined,
+        save: (form) => saveApprovalDraft(this.tabId, requestId, { form }),
+      });
+      if (savedDraft !== undefined && "form" in savedDraft) {
+        this.restoredApprovalInputs.set(requestId, () => {
+          div.querySelectorAll<HTMLInputElement | HTMLSelectElement>(".elicit-form input, .elicit-form select").forEach((control) => {
+            if (control instanceof HTMLInputElement && control.type === "checkbox") control.checked = false;
+            else control.value = "";
+          });
+        });
+      }
       det.append(title, ...parts.body, parts.actions);
       div.append(det);
       this.placeApprovalCard(div, ev);
@@ -5909,6 +6076,10 @@ export class Tab {
       };
 
       div.classList.add("askq-approval");
+      const savedQuestions = savedDraft !== undefined && "questions" in savedDraft ? savedDraft.questions : undefined;
+      const questionDrafts: AskQuestionDraft[] = questions.questions.map((_q, index) => savedQuestions?.[index] ?? { selected: [], other: "" });
+      const restoredQuestions: Array<(resolved: Record<string, string> | undefined) => void> = [];
+      if (savedQuestions !== undefined) this.restoredApprovalInputs.set(requestId, (resolved) => { for (const settle of restoredQuestions) settle(resolved); });
       const cards = questions.questions.map((q, questionIndex) => {
         const card = document.createElement("div");
         card.className = "askq-item laisora-ask ask-decide";
@@ -5927,13 +6098,24 @@ export class Tab {
         otherInput.className = "askq-other";
         otherInput.placeholder = l10n.t("Other (free text)");
         otherInput.maxLength = 10_000;
+        const savedQuestion = savedQuestions?.[questionIndex];
+        for (const label of savedQuestion?.selected ?? []) {
+          if (q.options.some((opt) => opt.label === label)) selected.add(label);
+        }
+        otherInput.value = savedQuestion?.other ?? "";
 
-        const commit = () => {
+        const valsOf = () => {
           const other = otherInput.value.trim();
-          const vals = q.multiSelect ? [...selected, ...(other ? [other] : [])] : other ? [other] : [...selected];
+          return q.multiSelect ? [...selected, ...(other ? [other] : [])] : other ? [other] : [...selected];
+        };
+        const commit = (save = true) => {
+          const vals = valsOf();
           if (vals.length > 0) answers.set(q.question, vals);
           else answers.delete(q.question);
           updateAllowState();
+          if (!save) return;
+          questionDrafts[questionIndex] = { selected: [...selected], other: otherInput.value };
+          saveApprovalDraft(this.tabId, requestId, { questions: questionDrafts });
         };
 
         for (const [optionIndex, opt] of q.options.entries()) {
@@ -5942,6 +6124,7 @@ export class Tab {
           btn.className = "askq-option ask-option";
           btn.setAttribute("aria-pressed", "false");
           btn.append(...askOptionContent(optionIndex, opt.label, opt.description));
+          if (selected.has(opt.label)) setSelected(btn, true);
           btn.onclick = () => {
             if (q.multiSelect) {
               if (selected.has(opt.label)) selected.delete(opt.label);
@@ -5966,6 +6149,15 @@ export class Tab {
           }
           commit();
         };
+        if (savedQuestion !== undefined) {
+          commit(false);
+          restoredQuestions.push((resolved) => {
+            if (resolved?.[askAnswerKey(q.question)] === askAnswerValue(valsOf())) return;
+            selected.clear();
+            clearSelected();
+            otherInput.value = "";
+          });
+        }
         card.appendChild(otherInput);
         return card;
       });
@@ -5973,10 +6165,10 @@ export class Tab {
       allowBtn.onclick = () => {
         const out: Record<string, string> = {};
         for (const [question, vals] of answers) {
-          const key = question.slice(0, 2000);
+          const key = askAnswerKey(question);
           if (key.length === 0) continue;
           if (Object.keys(out).length >= 8) break;
-          out[key] = vals.join(", ").slice(0, 10_000);
+          out[key] = askAnswerValue(vals);
         }
         vscode.postMessage({
           type: "approvalDecision",
@@ -6071,13 +6263,39 @@ export class Tab {
     note.textContent = `⚠ ${text}`;
   }
 
-  hasReplayedConversation(): boolean {
-    return this.oldestConversationUuid() !== undefined;
+  *shownConversationRecords(): Generator<ShownConversationRecord> {
+    for (const el of Array.from(this.convEl.querySelectorAll<HTMLElement>("[data-msg-uuid], .block.user[data-user-uuid], .block.assistant-turn"))) {
+      const recorded = el.dataset.msgUuid;
+      const restored = recorded !== undefined;
+      if (restored) yield { uuid: recorded, restored };
+      if (el.classList.contains("assistant-turn")) {
+        for (const record of this.labelledRecords(":scope > .assistant-seg", el)) {
+          yield { uuid: record.uuid, restored, reply: { text: record.text, leadsSegment: record.leadsSegment } };
+        }
+      } else if (!restored && el.dataset.userUuid) {
+        yield { uuid: el.dataset.userUuid, restored };
+      }
+    }
   }
 
-  oldestConversationUuid(): string | undefined {
-    const el = this.convEl.querySelector<HTMLElement>("[data-msg-uuid]");
-    return el?.dataset.msgUuid;
+  private labelledRecords(segSelector: string, root: HTMLElement): { uuid: string; text: string; seg: HTMLElement; leadsSegment: boolean }[] {
+    const records: { uuid: string; text: string; seg: HTMLElement; leadsSegment: boolean }[] = [];
+    for (const seg of Array.from(root.querySelectorAll<HTMLElement>(segSelector))) {
+      this.segParts(seg).forEach((part, index) => {
+        if (part.uuid === null) return;
+        const last = records.at(-1);
+        if (last?.uuid === part.uuid) last.text += part.text;
+        else records.push({ uuid: part.uuid, text: part.text, seg, leadsSegment: index === 0 });
+      });
+    }
+    return records;
+  }
+
+  private completeShownReply(uuid: string, prefix: string): boolean {
+    const record = this.labelledRecords(".block.assistant-turn > .assistant-seg", this.convEl).find((r) => r.uuid === uuid);
+    if (record === undefined || !record.leadsSegment) return false;
+    this.mergeIntoHead(record.seg, [{ text: prefix, uuid: null }]);
+    return true;
   }
 
   prependPastConvEvents(events: readonly NormalizedEvent[]): ConvEventPrependResult {
@@ -6203,7 +6421,7 @@ export class Tab {
       this.pastTextTurns.add(turnId);
     }
     if (join.prefix !== undefined && head !== undefined) {
-      this.mergeIntoHead(head, join.prefix);
+      this.mergeIntoHead(head, join.prefix.parts, join.prefix);
       this.pastTextTurns.add(turnId);
     }
     const card = this.todoTurnCards.get(turnId);
@@ -6216,22 +6434,26 @@ export class Tab {
     if (this.frameEmpty(frame)) this.dropFrame(frame);
   }
 
-  private mergeIntoHead(seg: HTMLElement, prefix: TurnParagraph): void {
+  private mergeIntoHead(seg: HTMLElement, parts: RecordTextPart[], opened?: Pick<TurnParagraph, "at" | "opener">): void {
     const key = seg.dataset.askSource ?? "";
     const past = this.pastParagraphs.get(key);
     if (past !== undefined && !past.live) {
-      const merged = mergedParagraph(prefix.parts, past.parts);
+      const merged = mergedParagraph(parts, past.parts);
       past.parts = merged.parts;
       past.base -= merged.shift;
-      past.at = prefix.at;
-      past.order = prefix.opener;
+      if (opened !== undefined) {
+        past.at = opened.at;
+        past.order = opened.opener;
+      }
       this.renderReplyMarkdown(seg, paragraphText(past.parts), key, past.base, past.at, past.order?.[1], past.order?.[0]);
       return;
     }
     const live: PastParagraph = past ?? { parts: [], base: 0, live: true };
-    live.parts = prependRecordParts(prefix.parts, live.parts);
-    live.at = prefix.at;
-    live.order = prefix.opener;
+    live.parts = prependRecordParts(parts, live.parts);
+    if (opened !== undefined) {
+      live.at = opened.at;
+      live.order = opened.opener;
+    }
     this.pastParagraphs.set(key, live);
     this.renderLivePrefix(seg);
   }
@@ -6345,11 +6567,7 @@ export class Tab {
       else div.textContent = ev.text;
       if (ev.role !== "system") this.prependTurnLabel(div, ev.role, ev.model ?? null);
       this.observeSessionTime(ev.recordedAt ?? ev.sentAt);
-      if (ev.role === "user" && ev.imageRefs && ev.imageRefs.length > 0) {
-        for (const info of ev.imageRefs) {
-          div.appendChild(createImageSlot(this.tabId, info.ref));
-        }
-      }
+      if (ev.role === "user") appendImageSlots(div, this.tabId, ev.imageRefs);
       frag.appendChild(div);
       if (ev.role === "user") this.appendUserFoot(div, ev.recordedAt ?? ev.sentAt ?? undefined, ev.text);
       else if (ev.role === "assistant") frag.appendChild(this.buildReplyFooter(ev.recordedAt, () => ev.text, () => uuid || undefined));
@@ -6359,23 +6577,9 @@ export class Tab {
       const div = document.createElement("div");
       div.className = "block user";
       div.dataset.convPast = "1";
-      if (ev.turnId !== null) div.dataset.turnId = ev.turnId;
-      if (isHistoryEvent(ev)) this.noteRestoredRecord(div, ev.uuid);
       div.textContent = ev.text;
       this.prependTurnLabel(div, "user");
-      for (const im of ev.images ?? []) {
-        const img = document.createElement("img");
-        img.className = "user-image";
-        img.src = `data:${im.mediaType};base64,${im.data}`;
-        img.alt = l10n.t("Attached image");
-        attachLightboxHandlers(img, this.tabId, { inline: im });
-        div.appendChild(img);
-      }
-      if (ev.imageRefs !== undefined && ev.imageRefs.length > 0) {
-        for (const info of ev.imageRefs) {
-          div.appendChild(createImageSlot(this.tabId, info.ref));
-        }
-      }
+      this.fillUserMessageBlock(div, ev);
       frag.appendChild(div);
       this.observeSessionTime(ev.sentAt);
       this.appendUserFoot(div, ev.sentAt ?? (ev.timestamp > 0 ? ev.timestamp : undefined), ev.text);
@@ -6419,6 +6623,9 @@ export class Tab {
       model?: string;
       timestamp?: number;
       restoredApproval?: RestoredApprovalCard;
+      clipped?: true;
+      asksPastCut?: true;
+      remote?: true;
     }>
   ): ConvPrependResult {
     return this.withAskResolutionBatch(() => {
@@ -6429,8 +6636,16 @@ export class Tab {
     const failures: string[] = [];
     let pastModel: string | null = null;
     let dividersCreated = 0;
+    const shown = new Map<string, ShownConversationRecord>();
+    for (const record of this.shownConversationRecords()) {
+      if (!shown.has(record.uuid) || record.reply !== undefined) shown.set(record.uuid, record);
+    }
     for (const m of items) {
-      if (m.uuid.length === 0 || this.convMessageUuids.has(m.uuid)) {
+      const onScreen = shown.get(m.uuid) ?? (this.convMessageUuids.has(m.uuid) ? { uuid: m.uuid, restored: true } : undefined);
+      const action = m.uuid.length === 0 ? { kind: "skip" as const } : pastRecordAction(onScreen, m);
+      if (action.kind !== "add") {
+        if (action.kind === "complete") this.completeShownReply(m.uuid, action.prefix);
+        else if (action.kind === "fetch") void this.completeShownReplyFromRecord(m.uuid);
         duplicates++;
         continue;
       }
@@ -6458,25 +6673,20 @@ export class Tab {
         div.className = m.role === "system" ? "block system" : m.role === "user" ? "block user replayed" : "block assistant replayed";
         div.dataset.msgUuid = m.uuid;
         div.dataset.convPast = "1";
-        if (m.role === "assistant") {
-          this.recordReplyIds.add(m.uuid);
-          this.renderReplyMarkdown(div, m.text, m.uuid, 0, m.timestamp ?? 0);
-        }
-        else if (m.role === "user") {
-          div.textContent = m.text;
-          this.youStore.reply(m.uuid, m.timestamp ?? 0, undefined, undefined, m.text);
-          this.persistAskResolutions();
-        } else div.textContent = m.text;
+        if (m.role === "assistant") this.recordReplyIds.add(m.uuid);
+        this.drawPastMessageBody(div, m, m.text);
+        const clipped = m.clipped ? this.clippedMessage(div, m) : undefined;
         if (m.role !== "system") this.prependTurnLabel(div, m.role, m.model ?? null);
         this.observeSessionTime(m.timestamp);
-        if (m.role === "user" && m.imageRefs && m.imageRefs.length > 0) {
-          for (const info of m.imageRefs) {
-            div.appendChild(createImageSlot(this.tabId, info.ref));
-          }
-        }
+        if (m.role === "user") appendImageSlots(div, this.tabId, m.imageRefs);
         frag.appendChild(div);
-        if (m.role === "user") this.appendUserFoot(div, m.timestamp, m.text);
-        else if (m.role === "assistant") frag.appendChild(this.buildReplyFooter(m.timestamp, () => m.text, () => m.uuid || undefined));
+        const copySource = clipped === undefined ? () => m.text : () => this.loadClippedRest(clipped, true, true).then((loaded) => {
+          if (!loaded) throw new Error("the rest of the message did not load");
+          return clipped.text;
+        });
+        if (m.role === "user") this.appendUserFoot(div, m.timestamp, m.text, copySource);
+        else if (m.role === "assistant") frag.appendChild(this.buildReplyFooter(m.timestamp, copySource, () => m.uuid || undefined));
+        if (clipped !== undefined && m.asksPastCut) void this.loadClippedRest(clipped, true, true);
       } catch (error) {
         failed++;
         if (failures.length < 5) failures.push(String(error));
@@ -6501,6 +6711,156 @@ export class Tab {
       expectedConnected: this.convPrependedTotal,
     };
     });
+  }
+
+  private drawPastMessageBody(div: HTMLElement, m: PastMessageRef, text: string): void {
+    if (m.role === "assistant") {
+      this.renderReplyMarkdown(div, text, m.uuid, 0, m.timestamp ?? 0);
+      return;
+    }
+    div.textContent = text;
+    if (m.role === "user") {
+      this.youStore.reply(m.uuid, m.timestamp ?? 0, undefined, undefined, text, m.remote === true);
+      this.persistAskResolutions();
+    }
+  }
+
+  private clippedMessage(div: HTMLElement, m: PastMessageRef): ClippedPastMessage {
+    div.id = `conv-past-${this.tabId}-${++this.clippedTextSerial}`;
+    const control = document.createElement("button");
+    control.type = "button";
+    control.className = "conv-clipped-more";
+    control.textContent = l10n.t("Show more");
+    control.setAttribute("aria-expanded", "false");
+    control.setAttribute("aria-controls", div.id);
+    const state: ClippedPastMessage = { div, m, text: m.text, more: true, control, error: null, loading: null };
+    control.addEventListener("click", () => {
+      this.leaveConvBottom();
+      void this.loadClippedRest(state, false, false).then((ok) => {
+        if (!ok || state.more) this.returnClippedFocus(state, state.control);
+        else {
+          div.tabIndex = -1;
+          this.returnClippedFocus(state, div);
+        }
+      });
+    });
+    div.appendChild(control);
+    return state;
+  }
+
+  private returnClippedFocus(state: ClippedPastMessage, target: HTMLElement): void {
+    const active = document.activeElement;
+    if (active !== null && active !== document.body && active !== state.control) return;
+    if (target.isConnected) target.focus({ preventScroll: true });
+  }
+
+  private async loadClippedRest(state: ClippedPastMessage, all: boolean, keepView: boolean): Promise<boolean> {
+    while (state.more) {
+      state.loading ??= this.fetchClippedPiece(state, keepView);
+      const loading = state.loading;
+      const ok = await loading;
+      if (state.loading === loading) state.loading = null;
+      if (!ok) return false;
+      if (!all) break;
+    }
+    return true;
+  }
+
+  private async fetchClippedPiece(state: ClippedPastMessage, keepView: boolean): Promise<boolean> {
+    state.control.disabled = true;
+    state.div.setAttribute("aria-busy", "true");
+    state.error?.remove();
+    state.error = null;
+    const piece = await this.requestMessageText(state.m.uuid, state.text.length);
+    state.div.removeAttribute("aria-busy");
+    state.control.disabled = false;
+    if (!this.convEl.contains(state.div)) {
+      state.more = false;
+      return false;
+    }
+    if (piece === undefined) {
+      const error = messageLoadError();
+      state.control.after(error);
+      state.error = error;
+      return false;
+    }
+    state.text += piece.text;
+    state.more = piece.clipped === true;
+    const { div } = state;
+    const redraw = (): void => {
+      const label = div.querySelector(":scope > .turn-label");
+      const kept = state.m.role === "user" ? Array.from(div.children).filter((el) => el !== label && el !== state.control) : [];
+      this.drawPastMessageBody(div, state.m, state.text);
+      if (state.more) div.appendChild(state.control);
+      if (label !== null) div.prepend(label);
+      div.append(...kept);
+    };
+    if (keepView) {
+      preservingViewAt(logsEl, this.convEl, this.convViewAnchor(), redraw);
+      this.noteConvContentShift();
+    } else preservingViewAt(logsEl, this.convEl, this.convViewAnchor(div), redraw);
+    if (this.tabId === activeTabId) refreshFind();
+    return true;
+  }
+
+  private requestMessageText(uuid: string, offset: number): Promise<ClippedPiece | undefined> {
+    const requestId = `clipped-${++this.clippedTextSerial}`;
+    return new Promise<ClippedPiece | undefined>((resolve) => {
+      const timer = setTimeout(() => {
+        this.clippedTextRequests.delete(requestId);
+        resolve(undefined);
+      }, HISTORY_REQUEST_TIMEOUT_MS);
+      this.clippedTextRequests.set(requestId, (answer) => {
+        clearTimeout(timer);
+        this.clippedTextRequests.delete(requestId);
+        resolve(answer !== undefined && answer.offset === offset ? answer : undefined);
+      });
+      vscode.postMessage({ type: "conversationMessageTextRequest", tabId: this.tabId, requestId, uuid, offset });
+    });
+  }
+
+  private async completeShownReplyFromRecord(uuid: string): Promise<void> {
+    this.replyLoadErrors.get(uuid)?.remove();
+    this.replyLoadErrors.delete(uuid);
+    let text = "";
+    for (let more = true; more; ) {
+      const piece = await this.requestMessageText(uuid, text.length);
+      if (piece === undefined) {
+        this.showReplyLoadError(uuid);
+        return;
+      }
+      text += piece.text;
+      more = piece.clipped === true;
+    }
+    const shown = Array.from(this.shownConversationRecords()).find((record) => record.uuid === uuid && record.reply !== undefined);
+    const action = pastRecordAction(shown, { text });
+    const record = this.labelledRecords(".block.assistant-turn > .assistant-seg", this.convEl).find((r) => r.uuid === uuid);
+    if (action.kind !== "complete" || record === undefined) return;
+    const around = this.convViewAnchor(record.seg);
+    const anchor = around === record.seg ? record.seg.nextElementSibling ?? record.seg.parentElement?.nextElementSibling ?? record.seg : around;
+    preservingViewAt(logsEl, this.convEl, anchor, () => {
+      this.completeShownReply(uuid, action.prefix);
+    });
+    this.noteConvContentShift();
+    if (this.tabId === activeTabId) refreshFind();
+  }
+
+  private showReplyLoadError(uuid: string): void {
+    const record = this.labelledRecords(".block.assistant-turn > .assistant-seg", this.convEl).find((r) => r.uuid === uuid);
+    if (record === undefined) return;
+    const error = messageLoadError();
+    const retry = document.createElement("button");
+    retry.type = "button";
+    retry.className = "conv-clipped-more";
+    retry.textContent = l10n.t("Retry");
+    retry.addEventListener("click", () => void this.completeShownReplyFromRecord(uuid));
+    error.append(" ", retry);
+    record.seg.after(error);
+    this.replyLoadErrors.set(uuid, error);
+  }
+
+  onConversationMessageText(msg: { requestId: string } & Partial<ClippedPiece>): void {
+    this.clippedTextRequests.get(msg.requestId)?.(msg.text === undefined || msg.offset === undefined ? undefined : { offset: msg.offset, text: msg.text, clipped: msg.clipped });
   }
 
   installHistoryHead(): HTMLElement {
@@ -6609,7 +6969,7 @@ export class Tab {
       case "turn_started":
         return this.renderPastTurnStart(ev);
       case "user_message":
-        return this.notePastHumanHeadline(ev.text, ev.turnId) ? "applied" : "skipped";
+        return ev.cancelled !== true && this.notePastHumanHeadline(ev.text, ev.turnId) ? "applied" : "skipped";
       case "tool_call_started":
         return this.renderPastToolStarted(ev);
       case "tool_call_finished": {
@@ -6763,12 +7123,7 @@ export class Tab {
     this.markReplayStart();
     for (const msg of messages) {
       if (msg.role === "user") {
-        const block = this.addBlock("user replayed", msg.text);
-        if (msg.imageRefs && msg.imageRefs.length > 0) {
-          for (const info of msg.imageRefs) {
-            block.appendChild(createImageSlot(this.tabId, info.ref));
-          }
-        }
+        appendImageSlots(this.addBlock("user replayed", msg.text), this.tabId, msg.imageRefs);
       } else {
         if (msg.model) {
           this.lastObservedModel = this.observeModelSwitch(msg.model, this.lastObservedModel, (key) => this.addModelDivider(key));

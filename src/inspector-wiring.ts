@@ -17,8 +17,9 @@ import {
 } from "./protocol";
 import { inspectorSessionFile, inspectorSessionFileLookup, sessionIdForOutput } from "./session-files";
 import type { SessionStore } from "./store-surfaces";
+import { latestRequests } from "./history-serving";
 
-const inspectorRequests = new WeakMap<vscode.Webview, Map<string, string>>();
+const inspectorRequests = latestRequests();
 const inspectorSurfaceIds = new WeakMap<vscode.Webview, string>();
 
 function inspectorSurfaceId(sender: vscode.Webview): string {
@@ -30,18 +31,6 @@ function inspectorSurfaceId(sender: vscode.Webview): string {
   return id;
 }
 
-function setLatestInspectorRequest(sender: vscode.Webview, tabId: string, requestId: string): void {
-  let byTab = inspectorRequests.get(sender);
-  if (!byTab) {
-    byTab = new Map();
-    inspectorRequests.set(sender, byTab);
-  }
-  byTab.set(tabId, requestId);
-}
-
-function isLatestInspectorRequest(sender: vscode.Webview, tabId: string, requestId: string): boolean {
-  return inspectorRequests.get(sender)?.get(tabId) === requestId;
-}
 
 function findInspectorAgent(roots: readonly WorkAgentNode[], agentId: string): WorkAgentNode | undefined {
   const stack = [...roots];
@@ -92,7 +81,7 @@ export async function handleInspectorMessage(
       const sessionLookup = inspectorSessionFileLookup(session);
       const sessionFile = sessionLookup.path;
       const agent = inspectorAgentForSession(session, msg.agentId);
-      setLatestInspectorRequest(sender, session.tabId, msg.requestId);
+      inspectorRequests.set(sender, session.tabId, msg.requestId);
       if (!sessionFile) {
         const reason: AgentInspectorErrorReason =
           sessionLookup.reason === "scan_failed" ? "session-scan-failed" : "session-unavailable";
@@ -112,7 +101,7 @@ export async function handleInspectorMessage(
         const current = st.sessions.get(session.tabId);
         const currentAgent = current ? inspectorAgentForSession(current, msg.agentId) : undefined;
         return current === session && !session.closed && session.generation === generation &&
-          isLatestInspectorRequest(sender, session.tabId, msg.requestId) &&
+          inspectorRequests.isLatest(sender, session.tabId, msg.requestId) &&
           currentAgent?.toolUseId === toolUseId && inspectorSessionFile(current) === sessionFile;
       };
       try {
@@ -156,7 +145,7 @@ export async function handleInspectorMessage(
         );
         if (requestStillValid()) {
           await postInspectorError(st, sender, session, msg.agentId, msg.requestId, reason);
-        } else if (isLatestInspectorRequest(sender, session.tabId, msg.requestId)) {
+        } else if (inspectorRequests.isLatest(sender, session.tabId, msg.requestId)) {
           await postInspectorError(st, sender, session, msg.agentId, msg.requestId, "stale-request");
         }
       }

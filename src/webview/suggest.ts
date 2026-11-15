@@ -3,6 +3,15 @@ import { isComposingKey } from "./composing";
 import * as l10n from "@vscode/l10n";
 import { inputEl, suggestEl, vscode } from "./dom";
 import { activeTab, persistState } from "./main";
+import { isComposerSendKey } from "./menu";
+import { fileSuggestCancelled, fileSuggestEnter, fileSuggestResult, fileSuggestTyped, type FileSuggest } from "./suggest-state";
+import { composerFileReference } from "../composer-file-reference";
+import type { FileSuggestRow } from "../protocol";
+import { fileLinkHostPlatform } from "../markdown-ast";
+
+export function composerReferenceText(absolutePath: string): string {
+  return composerFileReference(absolutePath, activeTab()?.cwd ?? "", fileLinkHostPlatform());
+}
 
 type SuggestKind = "command" | "file";
 interface SuggestState {
@@ -16,10 +25,11 @@ interface SuggestState {
 let suggestState: SuggestState | null = null;
 let fileQuerySeq = 0;
 let fileQueryTimer: ReturnType<typeof setTimeout> | null = null;
-let latestFileReqId = -1;
+let fileState: FileSuggest | null = null;
 
 export function closeSuggest(): void {
   suggestState = null;
+  if (fileState !== null) fileState = fileSuggestCancelled(fileState);
   suggestEl.classList.add("hidden");
   suggestEl.textContent = "";
   if (fileQueryTimer) {
@@ -92,7 +102,7 @@ export function insertFilePaths(paths: readonly string[]): void {
   const caret = inputEl.selectionStart ?? inputEl.value.length;
   const before = inputEl.value.slice(0, caret);
   const after = inputEl.value.slice(caret);
-  const replacement = paths.map((path) => `@${path} `).join("");
+  const replacement = paths.map((path) => `@${composerReferenceText(path)} `).join("");
   inputEl.value = before + replacement + after;
   const next = before.length + replacement.length;
   inputEl.setSelectionRange(next, next);
@@ -117,6 +127,7 @@ function updateCommandSuggest(triggerIndex: number, query: string): void {
     const alias = !command.name.startsWith(query) && command.aliases?.find((value) => value.startsWith(query));
     descriptions.set(command.name, alias ? l10n.t("{0} (alias: /{1})", command.description, alias) : command.description);
   }
+  fileState = null;
   suggestState = {
     kind: "command",
     triggerIndex,
@@ -127,27 +138,32 @@ function updateCommandSuggest(triggerIndex: number, query: string): void {
   renderSuggest();
 }
 
+function showFileState(state: FileSuggest): void {
+  fileState = state;
+  suggestState = { kind: "file", triggerIndex: state.triggerIndex, items: state.items.map((row) => row.text), descriptions: new Map(), selected: state.selected };
+  renderSuggest();
+}
+
 function updateFileSuggest(triggerIndex: number, query: string): void {
-  suggestState = {
-    kind: "file",
-    triggerIndex,
-    items: [],
-    descriptions: new Map(),
-    selected: 0,
-  };
+  const reqId = ++fileQuerySeq;
+  showFileState(fileSuggestTyped(suggestState?.kind === "file" ? fileState : null, triggerIndex, reqId, query, Date.now()));
   if (fileQueryTimer) clearTimeout(fileQueryTimer);
   fileQueryTimer = setTimeout(() => {
-    const reqId = ++fileQuerySeq;
-    latestFileReqId = reqId;
-    vscode.postMessage({ type: "queryFiles", reqId, query });
+    const tab = activeTab();
+    if (tab) vscode.postMessage({ type: "queryFiles", tabId: tab.tabId, reqId, query });
   }, 150);
 }
 
-export function handleFilesResponse(reqId: number, paths: string[]): void {
-  if (reqId !== latestFileReqId) return;
-  if (!suggestState || suggestState.kind !== "file") return;
-  suggestState.items = paths;
-  suggestState.selected = 0;
+export function handleFilesResponse(reqId: number, rows: readonly FileSuggestRow[]): void {
+  if (fileState === null || suggestState?.kind !== "file") return;
+  const next = fileSuggestResult(fileState, reqId, rows);
+  if (next !== fileState) showFileState(next);
+}
+
+function selectSuggest(selected: number): void {
+  if (!suggestState) return;
+  suggestState.selected = selected;
+  if (suggestState.kind === "file" && fileState !== null) fileState = { ...fileState, selected };
   renderSuggest();
 }
 
@@ -205,22 +221,33 @@ export function initSuggest(): void {
   inputEl.addEventListener(
     "keydown",
     (e) => {
-      if (!suggestState || suggestEl.classList.contains("hidden")) return;
       if (isComposingKey(e)) return;
+      if (suggestState?.kind === "file" && fileState !== null) {
+        if (e.key === "Escape" && suggestEl.classList.contains("hidden")) {
+          closeSuggest();
+          return;
+        }
+        if (e.key === "Enter" || e.key === "Tab") {
+          const action = fileSuggestEnter(fileState, Date.now());
+          if (action === "commit" || action === "hold" && isComposerSendKey(e)) {
+            e.preventDefault();
+            e.stopImmediatePropagation();
+            if (action === "commit") commitSuggest(fileState.selected);
+            return;
+          }
+          closeSuggest();
+          return;
+        }
+      }
+      if (!suggestState || suggestEl.classList.contains("hidden")) return;
       if (e.key === "ArrowDown") {
         e.preventDefault();
         e.stopImmediatePropagation();
-        if (suggestState.items.length > 0) {
-          suggestState.selected = (suggestState.selected + 1) % suggestState.items.length;
-          renderSuggest();
-        }
+        if (suggestState.items.length > 0) selectSuggest((suggestState.selected + 1) % suggestState.items.length);
       } else if (e.key === "ArrowUp") {
         e.preventDefault();
         e.stopImmediatePropagation();
-        if (suggestState.items.length > 0) {
-          suggestState.selected = (suggestState.selected - 1 + suggestState.items.length) % suggestState.items.length;
-          renderSuggest();
-        }
+        if (suggestState.items.length > 0) selectSuggest(((suggestState.selected < 0 ? 0 : suggestState.selected) - 1 + suggestState.items.length) % suggestState.items.length);
       } else if (e.key === "Enter" || e.key === "Tab") {
         if (suggestState.items.length > 0) {
           e.preventDefault();

@@ -92,16 +92,34 @@ function stepPlainAskHold(hold: PlainAskHold, line: string, previous: string, fe
   return afterBlank && !NESTED_BULLET_ITEM.test(line) ? "none" : hold;
 }
 
+const continuesBlock = (line: string): boolean => /^[ \t]/.test(line) || ORDERED_ITEM.test(line) || BULLET_ITEM.test(line);
+const LIST_MARKER_PREFIX = /^ {0,3}(?:\d{1,9}[.)]?|[-+*])$/;
+
 export function findCommitBoundary(buf: string, committedLen: number): number {
   let boundary = -1;
   let fence: { char: string; len: number } | null = null;
   let hold: PlainAskHold = "none";
+  let open = false;
+  let openBlankEnd = -1;
   let previous = "";
   let pos = committedLen;
   const lines = buf.slice(committedLen).split("\n");
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i];
+    const blank = line.trim() === "";
     if (fence === null) {
+      const afterBlank = previous.trim() === "";
+      if (open && !blank && afterBlank) {
+        if (i === lines.length - 1 && LIST_MARKER_PREFIX.test(line)) break;
+        if (!continuesBlock(line)) {
+          open = false;
+          if (openBlankEnd !== -1) boundary = openBlankEnd;
+        }
+      }
+      if (!open && (ORDERED_ITEM.test(line) || BULLET_ITEM.test(line) || (afterBlank && !blank && CODE_INDENT.test(line)))) {
+        open = true;
+        openBlankEnd = -1;
+      }
       const opening = fenceOpening(line);
       if (opening) fence = { char: opening.marker[0], len: opening.marker.length };
       hold = stepPlainAskHold(hold, line, previous, opening !== null);
@@ -110,7 +128,12 @@ export function findCommitBoundary(buf: string, committedLen: number): number {
     }
     previous = line;
     pos += line.length + 1;
-    if (fence === null && hold === "none" && line.trim() === "" && pos > committedLen) boundary = pos;
+    if (fence === null && hold === "none" && blank && pos > committedLen) {
+      if (open) openBlankEnd = pos;
+      else boundary = pos;
+    } else if (blank && open) {
+      openBlankEnd = -1;
+    }
   }
   return boundary >= buf.length ? -1 : boundary;
 }

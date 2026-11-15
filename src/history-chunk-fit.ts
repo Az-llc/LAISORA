@@ -1,5 +1,6 @@
 import type { NormalizedEvent } from "./protocol";
 import * as l10n from "@vscode/l10n";
+import { surrogateSafeEnd } from "./text-clip";
 
 export function transportTruncatedNote(): string {
   return l10n.t("\n\n… (truncated here because a single item was too large)");
@@ -16,13 +17,6 @@ function truncatableField(item: NormalizedEvent): TruncatableField | undefined {
     default:
       return undefined;
   }
-}
-
-function safeCut(text: string, at: number): number {
-  if (at <= 0) return 0;
-  if (at >= text.length) return text.length;
-  const code = text.charCodeAt(at - 1);
-  return code >= 0xd800 && code <= 0xdbff ? at - 1 : at;
 }
 
 function bytesOf(value: unknown): number {
@@ -44,7 +38,7 @@ export function fitEventForTransport(item: NormalizedEvent, budgetBytes: number)
   let best = 0;
   while (lo <= hi) {
     const mid = (lo + hi) >> 1;
-    const cut = safeCut(original, mid);
+    const cut = surrogateSafeEnd(original, mid);
     if (bytesOf(withText(original.slice(0, cut) + note)) <= budgetBytes) {
       best = cut;
       lo = mid + 1;

@@ -5,7 +5,7 @@ import { progressSubjectKey } from "./progress-protocol";
 import { isHistoryEvent, isObservedTime, type NormalizedEvent } from "./protocol";
 import { redactAbsolutePaths } from "./path-redaction";
 import { planItemLabel } from "./plan-steps";
-import { HUMAN_REJECTED_TOOL_RESULT_RE, isInterruptedWhileRunning } from "./tool-result-signals";
+import { HUMAN_REJECTED_TOOL_RESULT_RE, isHumanRejectedToolResult, taskNotificationOutcome } from "./tool-result-signals";
 import type { SteeringSignalSummary } from "./steering-envelope";
 import { conductorStopTarget } from "./tool-intent";
 
@@ -115,6 +115,7 @@ export interface GuardrailState {
   assignments: GuardrailAssignment[];
   openTurn?: { turnId: string; startedAt: number };
   conductorStoppedTaskIds?: string[];
+  delegationStopWindow?: { turnOpen: boolean; heldSignalIds: string[]; afterInterrupt: boolean };
 }
 
 export type GuardrailLevel = 0 | 1 | 2 | 3 | 4;
@@ -222,6 +223,12 @@ export function touchedSignalIds(before: GuardrailState, after: GuardrailState):
   return out;
 }
 
+export function pruneRetractedLiveIds(liveSignalIds: Set<string>, before: GuardrailState, after: GuardrailState): void {
+  if (before === after) return;
+  const kept = new Set(after.signals.map((s) => s.signalId));
+  for (const s of before.signals) if (!kept.has(s.signalId)) liveSignalIds.delete(s.signalId);
+}
+
 export function recordLedger(ledger: GuardrailActionLedger, signalIds: readonly string[], level: GuardrailLevel): GuardrailActionLedger {
   const next: GuardrailActionLedger = { ...ledger };
   for (const id of signalIds) {
@@ -276,7 +283,7 @@ export function createGuardrailState(): GuardrailState {
 }
 
 export function clearProcessEphemeral(state: GuardrailState): GuardrailState {
-  const next = structuredClone(state);
+  const next = settleStopWindow(state, true, { turnOpen: false, heldSignalIds: [], afterInterrupt: false });
   for (const sub of Object.values(next.subjects)) {
     sub.openTools = {};
   }
@@ -353,7 +360,7 @@ function foldEvent(state: GuardrailState, ev: NormalizedEvent): GuardrailState {
     if (usageLimit && state.subjects[`agent:${ev.toolUseId}`]) {
       discardRecoveredFailures(state, `agent:${ev.toolUseId}`, ev.turnId);
     }
-    if (isInterruptedWhileRunning(ev) || usageLimit) {
+    if (isHumanRejectedToolResult(ev) || usageLimit) {
       return state;
     }
 
@@ -779,9 +786,29 @@ export function foldGuardrail(state: GuardrailState, input: GuardrailInput): Gua
   return next;
 }
 
-const STOPPED_TASK_STATUSES: ReadonlySet<string> = new Set(["stopped", "killed"]);
+const TURN_END_KINDS: ReadonlySet<NormalizedEvent["kind"]> = new Set<NormalizedEvent["kind"]>(["turn_completed", "turn_interrupted", "turn_failed", "conversation_closed"]);
+
+export function isDelegationFoldEvent(event: NormalizedEvent): boolean {
+  return event.kind === "tool_call_started" || event.kind === "tool_call_finished" || event.kind === "turn_started" || TURN_END_KINDS.has(event.kind);
+}
+
+function settleStopWindow(state: GuardrailState, retractHeld: boolean, window: NonNullable<GuardrailState["delegationStopWindow"]>): GuardrailState {
+  const held = state.delegationStopWindow?.heldSignalIds ?? [];
+  const next = structuredClone(state);
+  if (retractHeld) next.signals = next.signals.filter((s) => !held.includes(s.signalId));
+  next.delegationStopWindow = window;
+  return next;
+}
+
+export function isReportableLiveSignal(state: GuardrailState, liveSignalIds: ReadonlySet<string>, signalId: string): boolean {
+  return liveSignalIds.has(signalId) && !(state.delegationStopWindow?.heldSignalIds.includes(signalId) ?? false);
+}
 
 function foldDelegation(state: GuardrailState, event: NormalizedEvent, stepOf: () => number | undefined): GuardrailState {
+  if (event.kind === "turn_started" || TURN_END_KINDS.has(event.kind)) {
+    const interrupted = event.kind === "turn_interrupted" || (event.kind === "turn_completed" && event.endedByInterrupt === true);
+    return settleStopWindow(state, interrupted, { turnOpen: event.kind === "turn_started", heldSignalIds: [], afterInterrupt: interrupted });
+  }
   if (event.kind === "tool_call_started") {
     const taskId = event.parentToolUseId ? undefined : conductorStopTarget(event.toolName, event.inputPreview);
     if (taskId === undefined || state.conductorStoppedTaskIds?.includes(taskId)) return state;
@@ -796,8 +823,8 @@ function foldDelegation(state: GuardrailState, event: NormalizedEvent, stepOf: (
     return next;
   }
   const notification = event.taskNotification;
-  if (notification === undefined || !STOPPED_TASK_STATUSES.has(notification.status ?? "")) return state;
-  if (state.conductorStoppedTaskIds?.includes(notification.agentId)) return state;
+  if (notification === undefined || taskNotificationOutcome(notification.status) !== "stopped") return state;
+  if (state.conductorStoppedTaskIds?.includes(notification.agentId) || state.delegationStopWindow?.afterInterrupt) return state;
   const signalId = `delegation_stopped:${notification.agentId}`;
   if (state.signals.some((s) => s.signalId === signalId)) return state;
   const step = stepOf();
@@ -819,6 +846,7 @@ function foldDelegation(state: GuardrailState, event: NormalizedEvent, stepOf: (
     confidence: "observed",
     evidence: {},
   });
+  if (next.delegationStopWindow?.turnOpen) next.delegationStopWindow.heldSignalIds.push(signalId);
   return next;
 }
 
@@ -939,7 +967,7 @@ export function planReportBatch(
 ): PlanReportBatchOutput {
   const currentPending = [...pendingSignalIds];
   for (const s of signals) {
-    if (liveSignalIds.has(s.signalId) && !reportedSignalIds.has(s.signalId)) {
+    if (isReportableLiveSignal(state, liveSignalIds, s.signalId) && !reportedSignalIds.has(s.signalId)) {
       if (!currentPending.includes(s.signalId)) {
         currentPending.push(s.signalId);
       }
@@ -1089,4 +1117,24 @@ export function settleReportSend(
     droppedPendingCount,
     ...(logLine !== undefined ? { logLine } : {}),
   };
+}
+
+export interface UndeliveredReports {
+  readonly turnStarts: number;
+  readonly sentAtTurnStarts: ReadonlyMap<string, number>;
+}
+
+export const NO_UNDELIVERED_REPORTS: UndeliveredReports = { turnStarts: 0, sentAtTurnStarts: new Map() };
+
+export function noteReportsQueued(state: UndeliveredReports, signalIds: readonly string[]): UndeliveredReports {
+  const sentAtTurnStarts = new Map(state.sentAtTurnStarts);
+  for (const id of signalIds) sentAtTurnStarts.set(id, state.turnStarts);
+  return { ...state, sentAtTurnStarts };
+}
+
+export function noteReportTurnEvent(state: UndeliveredReports, kind: string): UndeliveredReports {
+  if (kind === "turn_started") return { ...state, turnStarts: state.turnStarts + 1 };
+  if (kind !== "turn_completed") return state;
+  const sentAtTurnStarts = new Map([...state.sentAtTurnStarts].filter(([, sentAt]) => sentAt >= state.turnStarts));
+  return sentAtTurnStarts.size === state.sentAtTurnStarts.size ? state : { ...state, sentAtTurnStarts };
 }

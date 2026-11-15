@@ -2,13 +2,7 @@ import * as l10n from "@vscode/l10n";
 import { askAnswerLine, askOptionLetter, askOtherChoice, askQualityIssues, type AskBlock, type AskOption } from "../ask-parser";
 import { bindUserLabel } from "./user-label";
 import { isRejectedAsk } from "../markdown-ast";
-
-function part<K extends keyof HTMLElementTagNameMap>(tag: K, cls: string, text?: string): HTMLElementTagNameMap[K] {
-  const el = document.createElement(tag);
-  el.className = cls;
-  if (text !== undefined) el.textContent = text;
-  return el;
-}
+import { element as part } from "./element";
 
 export function askHeading(kind: "decide" | "check", title: string, counter: string, header?: string): HTMLElement[] {
   const rail = part("span", "ask-rail");
@@ -42,6 +36,7 @@ export interface AskRenderContext {
   turnId?: string;
   rejected?(key: string): boolean;
   choose(text: string, askKey: string, title: string): void;
+  choiceLocked?(): boolean;
   checked(id: string, step: number): boolean;
   check(id: string, step: number, checked: boolean): void;
 }
@@ -51,8 +46,20 @@ function renderComposerChoice(title: string, block: HTMLElement, context: AskRen
   button.type = "button";
   button.append(part("span", "ask-letter"), part("span", "ask-option-label", choice), part("span", "ask-effect", hint));
   button.disabled = !context;
+  if (context?.choiceLocked?.() === true) lockAskChoice(button, true);
   button.onclick = () => { if (block.id) context?.choose(askAnswerLine(title, choice, ""), block.id, title); };
   return button;
+}
+
+export function lockAskChoice(button: HTMLButtonElement, locked: boolean): void {
+  if (locked) {
+    if (button.disabled) return;
+    button.disabled = true;
+    button.dataset.lockDisabled = "";
+  } else if (button.dataset.lockDisabled !== undefined) {
+    button.disabled = false;
+    delete button.dataset.lockDisabled;
+  }
 }
 
 export function goalLabel(): HTMLElement {
@@ -72,6 +79,14 @@ const renderedAsks = new WeakMap<HTMLElement, AskBlock>();
 
 function uncheckedNote(): HTMLElement {
   return part("div", "ask-unchecked-note", l10n.t("This decision did not pass the writing check"));
+}
+
+export function markReplacedCheck(block: HTMLElement, replaced: boolean): void {
+  if (block.classList.contains("ask-replaced") === replaced) return;
+  block.classList.toggle("ask-replaced", replaced);
+  block.querySelectorAll<HTMLInputElement>(".ask-checkbox").forEach((box) => { box.disabled = replaced; });
+  if (replaced) block.querySelector(".ask-steps")?.before(part("div", "ask-unchecked-note ask-replaced-note", l10n.t("A newer copy of this check below replaces it")));
+  else block.querySelector(".ask-replaced-note")?.remove();
 }
 
 function hideRejected(block: HTMLElement): void {
@@ -131,6 +146,7 @@ export function renderAsk(ask: AskBlock, offset: number, context?: AskRenderCont
       button.type = "button";
       button.append(...askOptionContent(index, option.label, option.effect, option));
       button.disabled = !context;
+      if (context?.choiceLocked?.() === true) lockAskChoice(button, true);
       button.onclick = () => { if (block.id) context?.choose(askAnswerLine(ask.title, button.querySelector(".ask-letter")!.textContent!, option.label), block.id, ask.title); };
       options.append(button);
     });

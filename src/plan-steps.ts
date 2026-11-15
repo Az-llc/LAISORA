@@ -96,6 +96,30 @@ export function planMemberDelegationCount(members: PlanFrameMembers | undefined)
       + (members?.nested?.filter(entry => entry.extRun !== undefined).length ?? 0) });
 }
 
+export function planRowsBelow(ranges: ReadonlyMap<string, PlanNestedRange> | undefined, toolUseId: string): number {
+  return ranges?.get(toolUseId)?.count ?? 0;
+}
+
+export function planFoldedRowCount(ranges: ReadonlyMap<string, PlanNestedRange> | undefined, toolUseIds: readonly string[]): number {
+  return toolUseIds.reduce((sum, toolUseId) => sum + 1 + planRowsBelow(ranges, toolUseId), 0);
+}
+
+export function unknownLauncherGroups<E extends { toolUseIds: readonly string[] }>(view: Pick<TimeBucketView, "nestedAgents" | "nestedExternalRuns" | "unknownLaunchers">,
+  groups: readonly E[]): Array<E & { foldCount?: number }> {
+  const launchers = view.unknownLaunchers ?? [];
+  const members = new Set(launchers.map(launcher => launcher.toolUseId));
+  const { nestedRanges } = planNestedMembers(view)(launchers);
+  return groups.map(group => group.toolUseIds.every(id => members.has(id)) ? { ...group, foldCount: planFoldedRowCount(nestedRanges, group.toolUseIds) } : group);
+}
+
+export function unknownLauncherDetail(foldCount: number | undefined, open: boolean): string {
+  return [l10n.t("Subagent"), open || foldCount === undefined ? "" : `+${foldCount}`].filter(Boolean).join(" · ");
+}
+
+export function droppedWorkBlockCount(view: Pick<TimeBucketView, "droppedBlockCount"> | undefined): number {
+  return view?.droppedBlockCount ?? 0;
+}
+
 export interface PlanFrameRow {
   key: string;
   kind: "block" | "item";
@@ -578,12 +602,14 @@ export function planRowPeriods(view: Pick<TimeBucketView, "blocks" | "agents" | 
   }));
 }
 
-export function planContextOf(block: { blockId: string; text: string; start: number; durationMs?: number | null; workEndedAt?: number; running?: boolean; goal?: string; steps?: ReadonlyArray<PlanStepTiming & { number: number }>;
+export function planContextOf(block: { blockId: string; text: string; start: number; durationMs?: number | null; workEndedAt?: number; running?: boolean; goal?: string; steps?: ReadonlyArray<PlanStepTiming & PlanStepMarks & { number: number }>;
   metrics?: { provisional?: boolean } }, end: number, running: boolean, periods: ReadonlyMap<string, PlanRowPeriod>): PlanContext {
   return { blockId: block.blockId, text: block.text, start: block.start, ...(block.goal === undefined ? {} : { goal: block.goal }),
-    steps: (block.steps ?? []).map(({ key, number, title, status, removed, startedAt, endedAt }) => {
+    steps: (block.steps ?? []).map(step => {
+      const { key, number, title, status, removed, startedAt, endedAt } = step;
       const period = periods.get(planItemRowKey(block.blockId, key));
-      return { key, number, title, status, removed, startedAt, endedAt, ...(period === undefined ? {} : { period: { spans: period.spans, running: period.running } }) };
+      return { key, number, title, ...planStepMarks(step), status, removed, startedAt, endedAt,
+        ...(period === undefined ? {} : { period: { spans: period.spans, running: period.running } }) };
     }),
     end: Math.max(block.start, end), ...(block.durationMs === undefined ? {} : { durationMs: block.durationMs }),
     ...(block.workEndedAt === undefined ? {} : { workEndedAt: block.workEndedAt }),
@@ -641,6 +667,12 @@ export function planPlacedStep<S extends { number: number; key: string; transiti
 export interface PlanStepTiming {
   key: string; title: string; status: TaskStatus; removed: boolean;
   startedAt: number | null; endedAt: number | null;
+}
+export interface PlanStepMarks { activeForm?: string; added?: true; addedAt?: number }
+
+export function planStepMarks(step: PlanStepMarks): PlanStepMarks {
+  return { ...(step.activeForm === undefined ? {} : { activeForm: step.activeForm }), ...(step.added ? { added: true as const } : {}),
+    ...(step.addedAt === undefined ? {} : { addedAt: step.addedAt }) };
 }
 // settled: from this transition on the step is completed or removed.
 export interface PlanStepTransition { at: number; active: boolean; order: number; settled?: true }

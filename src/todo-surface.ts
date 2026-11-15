@@ -31,7 +31,11 @@ import {
   type TodoTurnRevert,
   type TodoWorkView,
   type WebviewToHost,
+  handoffSendLockedText,
+  transcriptWriteLockedText,
 } from "./protocol";
+import { handoffInProgress } from "./handoff-runs";
+import { transcriptWriteLockedForNewTab } from "./transcript-write-lock";
 import * as l10n from "@vscode/l10n";
 import { askOtherChoice } from "./ask-parser";
 import { randomUUID } from "node:crypto";
@@ -40,12 +44,12 @@ import { handoffWorkMemoOf, type HandoffWorkMemo } from "./handoff-envelope";
 import { openSessionById } from "./resume-hydration";
 import { normalizeTitleValue } from "./session-display-title";
 import { displayTitleFromSummary } from "./session-list";
-import type { Session } from "./session";
+import { turnRunning, type Session } from "./session";
 import type { ClaudeConversation } from "./claudeHost";
 import { openNewConversationTab, type SessionStore } from "./store-surfaces";
-import { todoMarkChanges, todoRevertUnitBlock, isClaudeOwnChange, linkedTodoItem, parseTodoChangeId, memoStaleSince, newestConversation, todoChildBriefs, todoScopeIds, todoSessionLinks, todoStartOf, todoTabStart, runClaimedStart, singleFlight, TODO_CONVERSATION_SEEN_REFRESH_MS, todoConversationTarget, todoGroupsOf, todoTemplatesOf, todoTemplateSize, TODO_BRIEF_MAX, TODO_DELETED_RETENTION_MS, TODO_IMAGE_EXTENSIONS, todoLinkDoc, conversationLiveElsewhere, todoAskDismissals, todoAsksClosedInTodo, todoDecisionsToMigrate, type TodoAddNode, todoLinkedSessions, todoRecordAskSources, todoTabLinks, todoAskSourceKept, type TodoAskSourceShown, type TodoConversationLink, type TodoTabConversation, type TodoImageMediaType, WORK_MEMO_SECTIONS, type TodoChange, type TodoDocument, type TodoItem, type TodoOperation } from "./todo-model";
+import { todoMarkChanges, todoRevertUnitBlock, isTodoGenerationChain, todoGenerationHead, todoDeletedWithParent, todoRestoredWith, isClaudeOwnChange, linkedTodoItem, parseTodoChangeId, memoStaleSince, newestConversation, todoChildBriefs, todoScopeIds, todoSessionLinks, todoStartOf, todoTabStart, runClaimedStart, singleFlight, TODO_CONVERSATION_SEEN_REFRESH_MS, todoConversationTarget, todoGroupsOf, todoTemplatesOf, todoTemplateSize, TODO_BRIEF_MAX, TODO_DELETED_RETENTION_MS, TODO_IMAGE_EXTENSIONS, todoLinkDoc, conversationLiveElsewhere, todoAskDismissals, todoAsksTicked, todoAsksClosedInTodo, todoDecisionsToMigrate, type TodoAddNode, todoLinkedSessions, todoRecordAskSources, todoTabLinks, todoAskSourceKept, type TodoAskSourceShown, type TodoConversationLink, type TodoTabConversation, type TodoImageMediaType, WORK_MEMO_SECTIONS, type TodoChange, type TodoDocument, type TodoItem, type TodoOperation } from "./todo-model";
 import { setTodoWorkspaceRoots, type TodoLinkedItem } from "./todo-mcp";
-import { todoChangeView, todoClaudeChanges, todoClaudeRecent, todoRecentClaudeUnits, todoRevertView, todoRevisionChanges, todoRevisionUnitOf } from "./todo-change-view";
+import { changeGeneration, todoChangeView, todoClaudeChanges, todoClaudeRecent, todoRecentClaudeUnits, todoRevertView, todoRevisionChanges, todoRevisionUnitOf } from "./todo-change-view";
 import { sharedTodoStore, TODO_ENABLED_SETTING, TodoStoreError, type TodoStore } from "./todo-store";
 import { todoFromReplyInstruction, todoItemsAddedInTurn, todoReplyExcerpt, todoReplyText } from "./todo-reply";
 import { readConversationMessages } from "./session-transcript";
@@ -92,7 +96,7 @@ export function todoListItems(document: TodoDocument, running: ReadonlySet<strin
           const view = todoChangeView(document, entry);
           return { field: entry.field, before: view.before, after: view.after };
         });
-        return { id: change.id, ids: unit.map(entry => entry.id), at: change.at, parts };
+        return { id: change.id, ...changeGeneration(document, change.id), ids: unit.map(entry => entry.id), at: change.at, parts };
       }) } : {}),
       ...(item.captured && item.captured.text !== item.title ? { captured: { text: item.captured.text, at: item.captured.at, via: item.captured.via } } : {}),
       ...(running.has(item.id) ? { talk: "running" as const } : newestConversation(item) ? { talk: "linked" as const } : {}),
@@ -108,10 +112,6 @@ function openTabs(): TodoTabConversation[] {
   return [...(store?.sessions.values() ?? [])].filter(s => !s.closed).map(s => ({
     tabId: s.tabId, itemId: s.todoItemId, sessionId: sessionRecordId(s), running: sessionWorking(s), turnRunning: turnRunning(s),
   }));
-}
-
-function turnRunning(s: Session): boolean {
-  return (s.conversation?.state ?? "idle") !== "idle";
 }
 
 function sessionWorking(s: Session): boolean {
@@ -334,7 +334,7 @@ async function todoSnapshotMessage(seq: number): Promise<TodoSnapshotMessage> {
     const links = todoTabLinks(document.items, tabs);
     message = {
       type: "todoSnapshot", seq, enabled: true, revision: document.revision, items: todoListItems(document, links.running), groups: todoGroupColors(document), templates: todoTemplateViews(document),
-      tabItems: links.tabItems.map(entry => tabItemView(document, entry, tabs)), askSources: await askSourceRefs(document, tabs), askDismissals: todoAskDismissals(document.items), askClosedInTodo: todoAsksClosedInTodo(document.items),
+      tabItems: links.tabItems.map(entry => tabItemView(document, entry, tabs)), askSources: await askSourceRefs(document, tabs), askDismissals: todoAskDismissals(document.items), askClosedInTodo: todoAsksClosedInTodo(document.items), askTicked: todoAsksTicked(document.items),
       deletedTabs: links.deleted, sessions: todoSessionLinks(document.items), claudeRecent: todoClaudeRecent(document),
     };
   } catch (error) {
@@ -514,16 +514,18 @@ function todoStartBrief(item: TodoItem, parent: TodoItem | undefined, continued:
   return lines.join("\n").trim().slice(0, TODO_BRIEF_MAX);
 }
 
+function generationOf(document: TodoDocument): { generation?: string } {
+  const generation = todoGenerationHead(document);
+  return generation ? { generation } : {};
+}
+
 function deletedItems(document: TodoDocument): TodoDeletedView[] {
   const byId = new Map(document.items.map(item => [item.id, item]));
   const heads = document.items.filter(item => item.deletedAt !== undefined
-    && (item.parentId === null || byId.get(item.parentId)?.deletedAt !== item.deletedAt));
-  const descendants = (id: string, deletedAt: number): number => document.items
-    .filter(item => item.parentId === id && item.deletedAt === deletedAt)
-    .reduce((count, item) => count + 1 + descendants(item.id, deletedAt), 0);
+    && !todoDeletedWithParent(document.changes, item, item.parentId === null ? undefined : byId.get(item.parentId)));
   return heads.sort((a, b) => b.deletedAt! - a.deletedAt!).map(item => ({
     id: item.id, title: item.title, ...(item.group ? { group: item.group } : {}),
-    deletedAt: item.deletedAt!, expiresAt: item.deletedAt! + TODO_DELETED_RETENTION_MS, descendants: descendants(item.id, item.deletedAt!),
+    deletedAt: item.deletedAt!, expiresAt: item.deletedAt! + TODO_DELETED_RETENTION_MS, descendants: todoRestoredWith(document.items, document.changes, item).size - 1,
   }));
 }
 
@@ -541,9 +543,12 @@ function sectionOrder(): TodoDetailSection[] {
 
 async function operationOf(edit: TodoEdit, todoStore: TodoStore): Promise<{ operation: TodoOperation; written?: string } | TodoEditError> {
   switch (edit.kind) {
-    case "undo": return { operation: { kind: "revert", mode: "undo", revision: edit.revision } };
-    case "revertClaude": return { operation: "revisions" in edit ? { kind: "revert", mode: "claude", revisions: edit.revisions }
-      : { kind: "revert", mode: "claude", changeIds: "changeIds" in edit ? edit.changeIds : [edit.changeId] } };
+    case "undo": return { operation: { kind: "revert", mode: "undo", revision: edit.revision, ...(edit.generation ? { generation: edit.generation } : {}) } };
+    case "revertClaude": {
+      const generation = edit.generation ? { generation: edit.generation } : {};
+      return { operation: "revisions" in edit ? { kind: "revert", mode: "claude", revisions: edit.revisions, ...generation }
+        : { kind: "revert", mode: "claude", changeIds: "changeIds" in edit ? edit.changeIds : [edit.changeId], ...generation } };
+    }
     case "addLink": {
       const doc = todoLinkDoc(edit.target, edit.label, process.platform === "win32");
       return typeof doc === "string" ? doc : { operation: { kind: "addDoc", id: edit.id, doc } };
@@ -575,7 +580,7 @@ async function openDoc(todoStore: TodoStore, itemId: string, docId: string, send
   await openFileLink(cwd, doc.target, store?.panel?.webview === sender);
 }
 
-type TodoMessage = Extract<WebviewToHost, { type: "todoEdit" | "todoDetailRequest" | "todoLogRequest" | "todoSectionOrder" | "todoImageRequest" | "todoOpenDoc" | "todoAskSourceRequest" | "todoAskDismiss" | "todoChangesRequest" }>;
+type TodoMessage = Extract<WebviewToHost, { type: "todoEdit" | "todoDetailRequest" | "todoLogRequest" | "todoSectionOrder" | "todoImageRequest" | "todoOpenDoc" | "todoAskSourceRequest" | "todoAskDismiss" | "todoAskUntick" | "todoChangesRequest" }>;
 
 export const TODO_DRAWER_KEY_CONTEXT = "laisora.todoDrawerKey";
 let drawerKeyWebview: vscode.Webview | null = null;
@@ -636,7 +641,7 @@ export async function handleTodoMessage(msg: TodoMessage, sender: vscode.Webview
       const turns: TodoTurnRevert[] = (msg.revisions ?? []).map(group => ({ revisions: group, revert: todoRevertView(todoRevertUnitBlock(document, todoRevisionChanges(document, group))) }));
       for (let start = 0; start === 0 || start < changes.length; start += TODO_CHANGES_REQUEST_MAX) {
         const last = start + TODO_CHANGES_REQUEST_MAX >= changes.length;
-        reply({ type: "todoChanges", requestId: msg.requestId, revision: document.revision, changes: changes.slice(start, start + TODO_CHANGES_REQUEST_MAX),
+        reply({ type: "todoChanges", requestId: msg.requestId, revision: document.revision, ...(isTodoGenerationChain(document.generations) ? { generations: [...document.generations] } : {}), changes: changes.slice(start, start + TODO_CHANGES_REQUEST_MAX),
           ...(last && turns.length ? { turns } : {}), ...(last ? {} : { more: true as const }) });
       }
       return;
@@ -644,6 +649,11 @@ export async function handleTodoMessage(msg: TodoMessage, sender: vscode.Webview
     if (msg.type === "todoAskDismiss") {
       const result = await todoStore.apply({ kind: "dismissAsk", id: msg.itemId, message: msg.message, place: msg.place }, "human");
       if (!result.ok) output.appendLine(`[todo] dismissAsk was not applied: ${result.error}`);
+      return;
+    }
+    if (msg.type === "todoAskUntick") {
+      const result = await todoStore.apply({ kind: "untickAsk", id: msg.itemId, message: msg.message }, "human");
+      if (!result.ok) output.appendLine(`[todo] untickAsk was not applied: ${result.error}`);
       return;
     }
     if (msg.type === "todoImageRequest") {
@@ -669,7 +679,7 @@ export async function handleTodoMessage(msg: TodoMessage, sender: vscode.Webview
       });
       if (!result.ok && prepared.written) await todoStore.removeImage(prepared.written);
       reply(result.ok
-        ? { type: "todoEditResult", requestId: msg.requestId, ok: true, revision: result.document.revision, changed: result.changed, skipped: result.skipped ?? 0 }
+        ? { type: "todoEditResult", requestId: msg.requestId, ok: true, revision: result.document.revision, ...generationOf(result.document), changed: result.changed, skipped: result.skipped ?? 0 }
         : { type: "todoEditResult", requestId: msg.requestId, ok: false, error: result.error });
       return;
     }
@@ -690,7 +700,7 @@ export async function handleTodoMessage(msg: TodoMessage, sender: vscode.Webview
     output.appendLine(`[todo] ${msg.type} failed: ${String(error instanceof TodoStoreError ? error.detail ?? error : error)}`);
     if (msg.type === "todoEdit") reply({ type: "todoEditResult", requestId: msg.requestId, ok: false, error: "store" });
     else if (msg.type === "todoAskSourceRequest") reply({ type: "todoAskSource", sessionId: msg.sessionId, requestId: msg.requestId, key: null });
-    else if (msg.type === "todoChangesRequest") reply({ type: "todoChanges", requestId: msg.requestId, revision: 0, changes: [] });
+    else if (msg.type === "todoChangesRequest") reply({ type: "todoChanges", requestId: msg.requestId, unreadable: true });
   }
 }
 
@@ -847,6 +857,10 @@ async function openTodoConversationNow(st: SessionStore, msg: Extract<WebviewToH
     }
     return;
   }
+  if (await transcriptWriteLockedForNewTab()) {
+    void vscode.window.showWarningMessage(transcriptWriteLockedText());
+    return;
+  }
   const started = await runClaimedStart(operation => applyHostTodoOperation(read.todoStore, operation, "human"), item.id, TODO_WINDOW_ID, randomUUID(), async () => {
     const session = openNewConversationTab(st, s => {
       s.todoItemId = item.id;
@@ -860,8 +874,7 @@ async function openTodoConversationNow(st: SessionStore, msg: Extract<WebviewToH
     const parent = liveItem(read.document, item.parentId);
     const brief = todoStartBrief(item, parent, item.conversations !== undefined);
     await applyHostTodoOperation(read.todoStore, { kind: "recordStart", id: item.id, start: parent ? "child" : item.conversations !== undefined || msg.fresh ? "continue" : "start", brief, tab: todoTabKey(session.tabId) }, "human");
-    await sendLaisoraInput(session, { kind: "todo", title: item.title }, brief);
-    return true;
+    return await sendLaisoraInput(session, { kind: "todo", title: item.title }, brief) || !session.transcriptWriteLocked;
   });
   if (started === "elsewhere") showOpenElsewhere();
 }
@@ -896,6 +909,8 @@ export async function todoFromReply(st: SessionStore, msg: Extract<WebviewToHost
     if (notice !== undefined) st.post({ type: "tabNotice", tabId: s.tabId, text: notice });
   };
   if (replyRequests.has(s)) return refuse("a request from this tab is still being prepared");
+  if (handoffInProgress(s.tabId)) return refuse("the conversation is being handed off", handoffSendLockedText());
+  if (s.transcriptWriteLocked) return refuse("the conversation record is not written", transcriptWriteLockedText());
   const admission = replyAdmission(s);
   if (!admission.ok) return refuse(admission.message);
   if (liveConversation(s)?.hasTodoTools === false) {
@@ -912,6 +927,7 @@ export async function todoFromReply(st: SessionStore, msg: Extract<WebviewToHost
     if (text === undefined) return refuse("the reply is not in the conversation record", l10n.t("Could not find this reply in the conversation record, so nothing was added to ToDo."));
     const again = replyAdmission(s);
     if (!again.ok) return refuse(again.message);
+    if (handoffInProgress(s.tabId)) return refuse("the conversation is being handed off", handoffSendLockedText());
     const linked = liveItem(read.document, linkedTodoItemIdOf(s));
     const instruction = todoFromReplyInstruction({ excerpt: todoReplyExcerpt(text), ...(linked ? { linked: { id: linked.id, title: linked.title } } : {}), start: msg.start });
     if (msg.start) replyStarts.set(s, { sinceRevision: read.document.revision, st, ...(sender ? { from: sender } : {}) });
@@ -919,6 +935,7 @@ export async function todoFromReply(st: SessionStore, msg: Extract<WebviewToHost
     let started = false;
     try {
       started = await sendLaisoraInput(s, { kind: "todoFromReply", start: msg.start }, instruction);
+      if (!started && s.transcriptWriteLocked) refuse("the conversation record is not written", transcriptWriteLockedText());
     } finally {
       if (!started && replyStarts.delete(s)) output.appendLine("[todo] todoFromReply: the request did not start a turn, so no item is opened");
     }

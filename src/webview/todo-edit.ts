@@ -1,11 +1,13 @@
 import * as l10n from "@vscode/l10n";
 import { TODO_GROUP_MAX, type TodoBatchRevert, type TodoChangeView, type TodoMarkInfo, type TodoDeletedView, type TodoEdit, type TodoEditError, type TodoEditResultMessage, type TodoListItem, type WebviewToHost } from "../protocol";
-import { parseTodoChangeId, TODO_LAISORA, type TodoCaptured, type TodoPlacementBasis, TODO_CLAUDE_DEPTH_MAX, TODO_RECENT_CLAUDE_MS, TODO_DELETED_RETENTION_MS, TODO_DOC_TARGET_MAX, TODO_PRIORITIES, TODO_STATES, TODO_TITLE_MAX, WORK_MEMO_SECTIONS, type TodoPriority, type TodoRevertBlock, type TodoState, type WorkMemoSection } from "../todo-model";
+import { isTodoDate, parseTodoChangeId, TODO_LAISORA, type TodoCaptured, type TodoPlacementBasis, TODO_CLAUDE_DEPTH_MAX, TODO_RECENT_CLAUDE_MS, TODO_DELETED_RETENTION_MS, TODO_DOC_TARGET_MAX, TODO_PRIORITIES, TODO_STATES, TODO_TITLE_MAX, WORK_MEMO_SECTIONS, type TodoPriority, type TodoRevertBlock, type TodoState, type WorkMemoSection } from "../todo-model";
 import { closeGlyphButton } from "./close-button";
 import { isComposingKey } from "./composing";
 import { formatDateTime, uiLocale } from "./l10n";
 import { addDaysKey, dateOfKey, localDateKey } from "./todo-rows";
 import { MARKS } from "./marks";
+import { element as todoEl } from "./element";
+import { todoGroupLabel } from "../todo-labels";
 
 const SVG_NS = "http://www.w3.org/2000/svg";
 const TODO_UNDO_DEPTH = 100;
@@ -15,6 +17,14 @@ export const TODO_STATE_LABELS: Record<TodoState, () => string> = {
   doing: () => l10n.t("Doing"),
   done: () => l10n.t("Done"),
 };
+
+export function todoStatePressLabel(state: TodoState): string {
+  return l10n.t("State: {0} (press to change)", TODO_STATE_LABELS[state]());
+}
+
+export function todoTitleLabel(): string {
+  return l10n.t("Title");
+}
 
 export const TODO_STATE_KEYS: Readonly<Record<string, TodoState>> = { "1": TODO_STATES[0], "2": TODO_STATES[1], "3": TODO_STATES[2] };
 
@@ -32,13 +42,6 @@ export const TODO_MEMO_LABELS: Record<WorkMemoSection, () => string> = {
   open: () => l10n.t("Open points"),
   files: () => l10n.t("Files and outputs"),
 };
-
-export function todoEl<K extends keyof HTMLElementTagNameMap>(tag: K, className: string, text?: string): HTMLElementTagNameMap[K] {
-  const node = document.createElement(tag);
-  node.className = className;
-  if (text !== undefined) node.textContent = text;
-  return node;
-}
 
 const TODO_CONTROLS = "button, input, textarea, select, a[href], label, [contenteditable]:not([contenteditable='false']), [role='button'], [role='menuitem']";
 
@@ -172,6 +175,35 @@ export function readImageAsBase64(file: Blob): Promise<string> {
 
 export function isTextEntryTarget(target: EventTarget | null): boolean {
   return target instanceof HTMLElement && (target.isContentEditable || target.matches("input, textarea, select"));
+}
+
+function holdsTextRenderLoses(target: Element | null, edited: WeakSet<EventTarget>): boolean {
+  if (!isTextEntryTarget(target)) return false;
+  const field = target as HTMLElement;
+  if (field.dataset.focusKey !== undefined) return false;
+  return !((field instanceof HTMLInputElement || field instanceof HTMLTextAreaElement) && field.value === "" && !edited.has(field));
+}
+
+export class TodoTypingGuard {
+  private deferred = false;
+  private readonly edited = new WeakSet<EventTarget>();
+
+  constructor(private readonly scope: HTMLElement, private readonly render: () => void) {
+    scope.addEventListener("input", (e) => { if (e.target !== null) this.edited.add(e.target); });
+    // A task, not a microtask: blur-time commits queued as tasks (src/webview/todo-row-view.ts#TodoRowRenderer group rename) must run before this render.
+    scope.addEventListener("focusout", () => setTimeout(() => {
+      if (this.deferred && !holdsTextRenderLoses(document.activeElement, this.edited)) render();
+    }, 0));
+  }
+
+  update(): void {
+    if (this.scope.contains(document.activeElement) && holdsTextRenderLoses(document.activeElement, this.edited)) this.deferred = true;
+    else this.render();
+  }
+
+  rendered(): void {
+    this.deferred = false;
+  }
 }
 
 export interface TodoMenuInput {
@@ -515,7 +547,7 @@ export function todoGroupSelect(value: string | undefined, groups: readonly stri
     node.textContent = text;
     select.append(node);
   };
-  option("", l10n.t("No group"));
+  option("", todoGroupLabel());
   for (const name of new Set([...groups, ...(value ? [value] : [])])) option(name, name);
   option(NEW_GROUP, l10n.t("＋ New group…"));
   select.value = value ?? "";
@@ -737,11 +769,13 @@ type TodoEditDone = (ok: boolean, changed: boolean) => void;
 type Pending = { readonly role: "edit" | "revert" | "undo" | "redo"; readonly timer: ReturnType<typeof setTimeout>; done?: TodoEditDone };
 export const TODO_REPLY_WAIT_MS = 20_000;
 
+type TodoUndoEntry = { readonly revision: number; readonly generation?: string };
+
 export class TodoEditClient {
   private seq = 0;
   private readonly pending = new Map<string, Pending>();
-  private undoStack: number[] = [];
-  private redoStack: number[] = [];
+  private undoStack: TodoUndoEntry[] = [];
+  private redoStack: TodoUndoEntry[] = [];
 
   constructor(private readonly post: (message: WebviewToHost) => void, private readonly notify: (notice: string | null) => void) {}
 
@@ -750,13 +784,13 @@ export class TodoEditClient {
   }
 
   undo(): void {
-    const revision = this.undoStack.pop();
-    if (revision !== undefined) this.request({ kind: "undo", revision }, "undo");
+    const entry = this.undoStack.pop();
+    if (entry !== undefined) this.request({ kind: "undo", ...entry }, "undo");
   }
 
   redo(): void {
-    const revision = this.redoStack.pop();
-    if (revision !== undefined) this.request({ kind: "undo", revision }, "redo");
+    const entry = this.redoStack.pop();
+    if (entry !== undefined) this.request({ kind: "undo", ...entry }, "redo");
   }
 
   receive(message: TodoEditResultMessage): void {
@@ -772,8 +806,9 @@ export class TodoEditClient {
       return;
     }
     if (message.changed && pending.role !== "revert") {
-      if (pending.role === "undo") this.redoStack = [...this.redoStack, message.revision].slice(-TODO_UNDO_DEPTH);
-      else this.undoStack = [...this.undoStack, message.revision].slice(-TODO_UNDO_DEPTH);
+      const entry: TodoUndoEntry = { revision: message.revision, ...(message.generation ? { generation: message.generation } : {}) };
+      if (pending.role === "undo") this.redoStack = [...this.redoStack, entry].slice(-TODO_UNDO_DEPTH);
+      else this.undoStack = [...this.undoStack, entry].slice(-TODO_UNDO_DEPTH);
       if (pending.role === "edit") this.redoStack = [];
     }
     this.notify(message.skipped > 0 ? l10n.t("Some fields were left as they are because they were changed again afterwards.") : null);
@@ -803,7 +838,7 @@ function changeValueText(field: string, value: string | null): string {
   if (field === "estimate") return l10n.t("{0} h", value);
   if (field === "state" && (value === "todo" || value === "doing" || value === "done")) return TODO_STATE_LABELS[value]();
   if (field === "priority" && value in TODO_PRIORITY_LABELS) return value.toUpperCase();
-  if ((field === "due" || field === "start") && /^\d{4}-\d{2}-\d{2}$/.test(value)) return formatTodoDay(value);
+  if ((field === "due" || field === "start") && isTodoDate(value)) return formatTodoDay(value);
   return value;
 }
 
@@ -887,10 +922,12 @@ export function describeTodoChange(change: Pick<TodoChangeView, "field" | "befor
 
 export interface TodoChangeRowActions {
   readonly open?: (itemId: string) => void;
-  readonly revert: (changeIds: readonly string[]) => void;
+  readonly revert: (changeIds: readonly string[], generation: string | undefined) => void;
   readonly acknowledge?: (changeIds: readonly string[]) => void;
-  readonly revertRevision?: (revision: number) => void;
+  readonly revertRevision?: (revision: number, generation: string | undefined) => void;
 }
+
+export const todoGenerationField = (generation: string | undefined): { generation?: string } => generation ? { generation } : {};
 
 export function todoRevertUnit(changes: readonly TodoChangeView[], change: TodoChangeView): TodoChangeView[] {
   if (change.author !== "claude" || change.cascade || change.itemId === "") return [change];
@@ -918,7 +955,7 @@ export function todoChangeRow(change: TodoChangeView, actions: TodoChangeRowActi
   if (basis) what.append(todoEl("span", "todo-change-basis", TODO_BASIS_LABELS[basis]()));
   row.append(what);
   if (change.revert === "ok") {
-    row.append(todoButton("todo-link todo-change-revert", l10n.t("Revert this change"), () => actions.revert(ids),
+    row.append(todoButton("todo-link todo-change-revert", l10n.t("Revert this change"), () => actions.revert(ids, change.generation),
       l10n.t("Change back only this change by Claude")));
     const acknowledge = actions.acknowledge;
     if (acknowledge && unit.some(entry => !entry.acknowledged)) {
@@ -955,7 +992,7 @@ export function todoClaudeChangesView(changes: readonly TodoChangeView[], batche
       offered.add(revision);
       const head = todoEl("li", "todo-change todo-change-batch");
       head.append(todoEl("span", "todo-change-at", formatDateTime(change.at)), todoEl("span", "todo-change-what", l10n.t("{0} changes in one go", together.length)),
-        todoButton("todo-link todo-change-revert", l10n.t("Take all back"), () => revertRevision(revision), l10n.t("Take back every change of this step at once")));
+        todoButton("todo-link todo-change-revert", l10n.t("Take all back"), () => revertRevision(revision, change.generation), l10n.t("Take back every change of this step at once")));
       list.append(head);
     }
     const unit = todoRevertUnit(changes, change);

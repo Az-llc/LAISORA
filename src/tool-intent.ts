@@ -1,6 +1,8 @@
 import { redactAbsolutePaths } from "./path-redaction";
 import { isExternalRunTool } from "./orchestration-executors";
 import { isDelegationTool } from "./claude-tool-names";
+import { isShellTool } from "./shell-tools";
+import { isFileWritingTool } from "./file-writing-tools";
 
 const INTENT_FIELDS = ["description", "subagent_type", "agent_key", "effort", "target", "prompt", "file_path", "pattern", "url", "query", "summary"] as const;
 export type ToolIntentInput = Partial<Record<typeof INTENT_FIELDS[number], string>>;
@@ -27,14 +29,18 @@ export function isToolIntentInput(value: unknown): value is ToolIntentInput {
 export const basename = (value: string): string => value.split(/[\\/]/).filter(Boolean).at(-1) ?? value;
 export const firstLine = (value: string): string => value.split(/\r?\n/).map(line => line.trim()).find(Boolean) ?? "";
 
+export function capturesFilePath(name: string): boolean {
+  return name === "Read" || isFileWritingTool(name);
+}
+
 export function captureToolIntentInput(name: string, input: unknown): ToolIntentInput | undefined {
   if (!input || typeof input !== "object" || Array.isArray(input)) return undefined;
   const source = input as Record<string, unknown>;
   const fields: readonly (typeof INTENT_FIELDS[number])[] = isExternalRunTool(name)
     ? ["target", "description", "prompt"]
     : isDelegationTool(name) ? ["description", "subagent_type", "agent_key", "effort"]
-    : name === "Bash" || name === "PowerShell" ? ["description"]
-    : name === "Read" || name === "Edit" || name === "Write" ? ["file_path"]
+    : isShellTool(name) ? ["description"]
+    : capturesFilePath(name) ? ["file_path"]
     : name === "Grep" || name === "Glob" ? ["pattern"]
     : name === "WebFetch" ? ["url"] : name === "WebSearch" ? ["query"] : name === "SendMessage" ? ["summary"] : [];
   const result: ToolIntentInput = {};

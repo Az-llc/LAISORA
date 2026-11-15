@@ -1,14 +1,19 @@
 import { isComposingKey } from "./composing";
+import { handleSegmentedArrow } from "./segmented-keys";
+import { fieldLeaveCommits, settleFieldEdit, type FieldEdit, type FieldReply } from "./field-edit";
 import { CLOSE_GLYPH } from "./close-button";
 import { appearanceSectionTitle, createAccentSettings } from "./accent-settings";
-import { bindUserLabel, setDisplayName } from "./user-label";
+import { bindUserLabel, setDisplayName, turnLabel } from "./user-label";
+import { askHeading } from "./ask-view";
+import { YouList } from "./you-list";
+import type { YouItem } from "./you-items";
 import { DISPLAY_NAME_MAX, displayNameLength, normalizeDisplayName } from "../display-name";
 import { normalizeSystemAppExtension } from "../file-link-open-mode";
 import { EVENT_LIMIT_DEFAULT, EVENT_LIMIT_MIN, EVENT_LIMIT_MAX, isEventLimit } from "../event-limits";
 import { TRANSCRIPT_RETENTION_DAYS_MIN, isTranscriptRetentionDays, type TranscriptRetentionFallback } from "../transcript-retention";
-import { EXECUTORS, EXTERNAL_EXECUTORS, DEFAULT_EXECUTOR, canonicalExecutorEfforts, claudeModelIdLabel, executorModelList, modelSelectionState, isExecutorId, isExternalExecutorId, rowEfforts, rowComplete, type ExecutorId, type ExecutorRow, type ExternalModels } from "../orchestration-executors";
-import { findModelRow, modelListStatusText, shortModelDisplayName } from "../model-display-name";
-import { resolveOrchestrationCacheTtl, emptyOrchestrationRole, externalExecutorName, isExternalModel, isExternalTimeout, orchestrationVariants, orchestrationExternalTargets } from "../orchestration-roster";
+import { EXECUTORS, EXTERNAL_EXECUTORS, DEFAULT_EXECUTOR, canonicalExecutorEfforts, claudeModelIdLabel, EXTERNAL_TIMEOUT_MAX_MINUTES, EXTERNAL_TIMEOUT_MIN_MINUTES, executorModelList, modelSelectionState, isExecutorId, isExternalExecutorId, rowEfforts, rowComplete, type ExecutorId, type ExecutorRow, type ExternalModels } from "../orchestration-executors";
+import { findModelRow, modelListStatusText, modelsLoadingText, shortModelDisplayName } from "../model-display-name";
+import { resolveOrchestrationCacheTtl, emptyOrchestrationRole, externalExecutorName, isExternalModel, isExternalTimeout, isRoleName, orchestrationVariants, orchestrationExternalTargets, ROSTER_ROWS_MAX } from "../orchestration-roster";
 import { type OrchestrationSettingRow, type RecommendedRosterChange } from "../orchestration-roster";
 import * as l10n from "@vscode/l10n";
 import { uiLocale } from "./l10n";
@@ -20,6 +25,7 @@ import {
   HANDOFF_AUTO_PERCENT_MAX,
   HANDOFF_AUTO_PERCENT_MIN,
   HANDOFF_AUTO_TOKENS_MIN,
+  handoffContinuesWork,
   isHandoffAutoSettingValue,
   isHostToSettingsPage,
   isWaitNotifySettingValue,
@@ -38,6 +44,8 @@ import {
   type SettingWriteFailure,
   type SettingWriteFailureAction,
 } from "../protocol";
+import { element } from "./element";
+import { row, rowNote, section, select, switchButton } from "./settings-rows";
 
 declare function acquireVsCodeApi(): { postMessage(message: SettingsPageToHost): void; getState(): { category?: string } | undefined; setState(state: { category: string }): void };
 
@@ -65,92 +73,6 @@ export function deriveRosterPriceRows(enabled: boolean, agents: readonly Orchest
 }
 
 type SettingsState = Extract<HostToSettingsPage, { type: "settingsState" }>;
-
-let rowSerial = 0;
-
-function element<K extends keyof HTMLElementTagNameMap>(tag: K, className: string, text?: string): HTMLElementTagNameMap[K] {
-  const el = document.createElement(tag);
-  el.className = className;
-  if (text !== undefined) el.textContent = text;
-  return el;
-}
-
-function section(root: HTMLElement, title: string): HTMLElement {
-  const id = `settings-section-${++rowSerial}`;
-  const wrap = element("section", "settings-section");
-  wrap.setAttribute("aria-labelledby", id);
-  const heading = element("h2", "settings-section-title", title);
-  heading.id = id;
-  const card = element("div", "settings-card");
-  wrap.append(heading, card);
-  root.appendChild(wrap);
-  return card;
-}
-
-function row(card: HTMLElement, label: string, description: string, control: HTMLElement, focusTarget?: () => HTMLElement | undefined): HTMLElement {
-  const serial = ++rowSerial;
-  const line = element("div", "settings-row");
-  const text = element("div", "settings-row-text");
-  const name = element("label", "settings-row-label", label);
-  name.id = `settings-label-${serial}`;
-  if (focusTarget) name.addEventListener("click", () => focusTarget()?.focus());
-  else name.htmlFor = control.id;
-  const desc = element("div", "settings-row-description", description);
-  desc.id = `settings-description-${serial}`;
-  text.append(name, desc);
-  control.setAttribute("aria-labelledby", name.id);
-  control.setAttribute("aria-describedby", desc.id);
-  const holder = element("div", "settings-row-control");
-  holder.appendChild(control);
-  line.append(text, holder);
-  card.appendChild(line);
-  return text;
-}
-
-function rowNote(text: HTMLElement, className: string, note: string): HTMLElement {
-  const el = element("div", className, note);
-  el.id = `settings-note-${++rowSerial}`;
-  text.appendChild(el);
-  return el;
-}
-
-function switchButton(id: string): HTMLButtonElement {
-  const button = element("button", "l-switch");
-  button.id = id;
-  button.type = "button";
-  button.setAttribute("role", "switch");
-  button.disabled = true;
-  button.appendChild(element("span", "l-switch-thumb"));
-  return button;
-}
-
-function handleSegmentedArrow(event: KeyboardEvent, radios: HTMLButtonElement[], activate: (radio: HTMLButtonElement) => void, canNavigate: () => boolean = () => true): void {
-  if (event.ctrlKey || event.metaKey || event.altKey) return;
-  const step = event.key === "ArrowRight" || event.key === "ArrowDown" ? 1 : event.key === "ArrowLeft" || event.key === "ArrowUp" ? -1 : 0;
-  if (step === 0) return;
-  event.preventDefault();
-  const from = radios.findIndex((radio) => radio === document.activeElement);
-  if (from < 0 || !canNavigate()) return;
-  const target = radios[(from + step + radios.length) % radios.length];
-  target.focus();
-  activate(target);
-}
-
-function select<V extends string>(options: Array<[V, string]>): HTMLSelectElement {
-  const el = element("select", "settings-select");
-  const unknown = element("option", "settings-option-unknown", "");
-  unknown.value = "";
-  unknown.disabled = true;
-  el.appendChild(unknown);
-  for (const [value, text] of options) {
-    const option = element("option", "", text);
-    option.value = value;
-    el.appendChild(option);
-  }
-  el.value = "";
-  el.disabled = true;
-  return el;
-}
 
 const root = document.getElementById("settings-root") ?? document.body;
 const status = element("p", "settings-status", l10n.t("Loading…"));
@@ -284,27 +206,31 @@ displayNameInput.setAttribute("aria-labelledby", displayNameField.getAttribute("
 displayNameInput.setAttribute("aria-describedby", `${displayNameField.getAttribute("aria-describedby")} ${displayNameNotice.id}`);
 displayNameField.removeAttribute("aria-labelledby");
 displayNameField.removeAttribute("aria-describedby");
-displayNameRow.appendChild(displayNamePreview());
+displayNameRow.appendChild(displayNamePreview(displayNameText.querySelector(".settings-row-description")!.id));
 let pendingDisplayName: number | null = null;
 let queuedDisplayName: string | null = null;
 let displayNameEdited = false;
-function displayNamePreview(): HTMLElement {
+function displayNamePreview(rowDescriptionId: string): HTMLElement {
   const preview = element("div", "settings-name-preview");
   preview.setAttribute("role", "group");
   const caption = element("div", "l-label settings-preview-caption", l10n.t("Where it appears"));
   caption.id = "setting-display-name-preview";
   preview.setAttribute("aria-labelledby", caption.id);
-  const chat = element("div", "settings-preview-chat");
-  const turn = (role: "user" | "assistant", text: string): HTMLElement => {
-    const block = element("div", `settings-preview-turn ${role}`);
-    const label = element("div", "turn-label");
-    label.appendChild(role === "user" ? bindUserLabel(element("span", "turn-label-name")) : element("span", "turn-label-name", "Claude"));
-    block.append(label, element("div", "settings-preview-message", text));
-    return block;
+  const decision = l10n.t("Should it also mark todos hidden by the current filter?");
+  const check = l10n.t("Check the footer buttons in the app");
+  const conversation = element("div", "panel-conv");
+  const user = element("div", "block user", l10n.t("Add a Mark all done button to the footer."));
+  user.prepend(turnLabel(bindUserLabel(element("span", ""))));
+  const card = (kind: "decide" | "check", title: string): HTMLElement => {
+    const ask = element("div", "laisora-ask");
+    ask.append(...askHeading(kind, title, ""));
+    return ask;
   };
-  chat.append(element("div", "l-label settings-preview-place", l10n.t("Chat")),
-    turn("user", l10n.t("Add a Mark all done button to the footer.")),
-    turn("assistant", l10n.t("Should it also mark todos hidden by the current filter?")));
+  const assistant = element("div", "block assistant");
+  assistant.append(turnLabel(element("span", "", "Claude")), card("decide", decision), card("check", check));
+  conversation.append(user, assistant);
+  const chat = element("div", "settings-preview-chat");
+  chat.append(element("div", "l-label settings-preview-place", l10n.t("Chat")), conversation);
   const markdown = element("div", "settings-preview-export");
   const markdownHeading = element("span", "settings-preview-md-name");
   const markdownLine = element("pre", "settings-preview-md");
@@ -312,26 +238,20 @@ function displayNamePreview(): HTMLElement {
   markdown.append(element("div", "l-label settings-preview-place", l10n.t("Markdown export")), markdownLine);
   const left = element("div", "settings-preview-left");
   left.append(chat, markdown);
+  const items: YouItem[] = [
+    { id: "decide", kind: "decide", title: decision, createdAt: 0, anchor: { id: "decide" } },
+    { id: "check", kind: "check", title: check, createdAt: 0, anchor: { id: "check" } },
+  ];
+  const youList = new YouList({ get: () => items, subscribe: () => () => {} }, () => {});
   const youColumn = element("div", "settings-preview-you");
-  const youHead = element("div", "settings-preview-you-head");
-  youHead.append(bindUserLabel(element("span", "you-label")), element("div", "you-heading", l10n.t("Your decisions, approvals and checks")));
-  const card = (kind: string, title: string): HTMLElement => {
-    const item = element("div", "settings-preview-card");
-    const square = element("span", "you-square");
-    square.setAttribute("aria-hidden", "true");
-    const body = element("div", "settings-preview-card-body");
-    const label = element("div", "ask-label");
-    label.append(bindUserLabel(element("span", "ask-label-name")), element("span", "ask-label-kind", ` · ${kind}`));
-    body.append(label, element("div", "settings-preview-card-title", title));
-    item.append(square, body);
-    return item;
-  };
-  youColumn.append(element("div", "l-label settings-preview-place", l10n.t("YOU column")), youHead,
-    card(l10n.t("Decision"), l10n.t("Should it also mark todos hidden by the current filter?")),
-    card(l10n.t("Machine check"), l10n.t("Check the footer buttons in the app")));
+  youColumn.append(element("div", "l-label settings-preview-place", l10n.t("YOU column")), youList.element);
+  const description = element("p", "l-visually-hidden", l10n.t("A non-interactive sample."));
+  description.id = "setting-display-name-preview-description";
+  preview.setAttribute("aria-describedby", `${rowDescriptionId} ${description.id}`);
   const grid = element("div", "settings-preview-grid");
+  grid.inert = true;
   grid.append(left, youColumn);
-  preview.append(caption, grid);
+  preview.append(caption, description, grid);
   return preview;
 }
 function displayNameInputValue(): string {
@@ -415,7 +335,82 @@ const todoCard = section(generalCategory, "ToDo");
 const todoSwitch = switchButton("setting-todo-enabled");
 const todoText = row(todoCard, l10n.t("Enable ToDo"), l10n.t("The ToDo tab and drawer switch right away. Claude's ToDo tools are available from the next conversation you start or resume."), todoSwitch);
 
-const handoffAutoCard = section(generalCategory, l10n.t("Automatic handoff"));
+const handoffAutoTitle = l10n.t("Automatic handoff");
+const handoffClosingSummaryLabel = l10n.t("After a handoff, summarize the continued work when it ends");
+const handoffAutoCard = section(generalCategory, handoffAutoTitle);
+type TextControl = HTMLInputElement | HTMLTextAreaElement;
+interface EditedField {
+  control: TextControl;
+  saved: string;
+  written: string | null;
+  tried: string | null;
+  request: number | null;
+  invalid: string | null;
+  commit: () => FieldCommit;
+}
+type FieldCommit = number | "invalid" | undefined;
+let rosterRebuilding = false;
+function editedField(control: TextControl, commit: () => FieldCommit): EditedField {
+  const field: EditedField = { control, saved: control.value, written: null, tried: null, request: null, invalid: null, commit };
+  bindEditedField(field, control);
+  return field;
+}
+function fieldEditOf(field: EditedField): FieldEdit {
+  return { text: field.control.value, dirty: field.control.value !== field.saved, written: field.written };
+}
+function bindEditedField(field: EditedField, control: TextControl): void {
+  field.control = control;
+  control.addEventListener("input", () => {
+    if (field.control === control) field.tried = null;
+  });
+  const leave = (event: Event) => {
+    if (field.control !== control || rosterRebuilding) return;
+    if (fieldLeaveCommits(fieldEditOf(field), field.tried)) {
+      field.tried = control.value;
+      const result = field.commit();
+      if (result === "invalid") field.invalid = control.value;
+      else if (result !== undefined) {
+        field.request = result;
+        field.written = control.value;
+      }
+    }
+    if (event.type !== "blur" || field.invalid !== control.value) return;
+    field.invalid = null;
+    field.tried = null;
+    setTextKeepingSelection(control, field.saved);
+  };
+  control.addEventListener("change", leave);
+  control.addEventListener("blur", leave);
+}
+function showEditedField(field: EditedField, saved: string, state: SettingsState): void {
+  const reply: FieldReply = field.request === null || state.replyTo !== field.request ? "none" : state.writeFailure ? "failed" : "saved";
+  if (reply !== "none") field.request = null;
+  const next = settleFieldEdit(fieldEditOf(field), reply, saved);
+  field.saved = saved;
+  field.written = next.written;
+  if (!next.dirty) {
+    field.tried = null;
+    field.invalid = null;
+  }
+  setTextKeepingSelection(field.control, next.text);
+}
+type TextSelection = { start: number; end: number; direction: "forward" | "backward" | "none" };
+function selectionOf(control: Element | null): TextSelection | undefined {
+  if (!(control instanceof HTMLInputElement || control instanceof HTMLTextAreaElement)) return undefined;
+  const { selectionStart, selectionEnd, selectionDirection } = control;
+  return selectionStart === null || selectionEnd === null ? undefined : { start: selectionStart, end: selectionEnd, direction: selectionDirection ?? "none" };
+}
+function restoreSelection(control: TextControl, selection: TextSelection | undefined): void {
+  if (selection === undefined || control.selectionStart === null) return;
+  const length = control.value.length;
+  control.setSelectionRange(Math.min(selection.start, length), Math.min(selection.end, length), selection.direction);
+}
+function setTextKeepingSelection(control: TextControl, text: string): void {
+  if (control.value === text) return;
+  const selection = document.activeElement === control ? selectionOf(control) : undefined;
+  control.value = text;
+  restoreSelection(control, selection);
+}
 function numberInput(id: string, min: number | undefined, max: number | undefined, step: string): HTMLInputElement {
   const input = element("input", "settings-input");
   input.id = id;
@@ -437,7 +432,10 @@ const handoffAutoControls = {
   mode: handoffAutoModeSelect,
   percent: numberInput("setting-handoff-auto-percent", HANDOFF_AUTO_PERCENT_MIN, HANDOFF_AUTO_PERCENT_MAX, "1"),
   tokens: numberInput("setting-handoff-auto-tokens", HANDOFF_AUTO_TOKENS_MIN, undefined, "1"),
+  continueWork: switchButton("setting-handoff-auto-continue-work"),
+  closingSummary: switchButton("setting-handoff-auto-closing-summary"),
   cacheExpiryEnabled: switchButton("setting-handoff-cache-expiry-enabled"),
+  closeSourceTab: switchButton("setting-handoff-close-source-tab"),
 } satisfies Record<HandoffAutoSettingName, HTMLElement>;
 const handoffAutoTexts: Record<HandoffAutoSettingName, HTMLElement> = {
   enabled: row(handoffAutoCard, l10n.t("Hand off automatically when the context is large"), l10n.t("When a conversation finishes its turn and is waiting with a context at or above the threshold below, hand it off to a new conversation. It starts only when nothing runs in the background, no message is waiting to be sent and the message box is empty, and at most once per conversation."), handoffAutoControls.enabled),
@@ -448,7 +446,10 @@ const handoffAutoTexts: Record<HandoffAutoSettingName, HTMLElement> = {
   tokens: row(handoffAutoCard, l10n.t("Token count"), HANDOFF_AUTO_TOKENS_MIN !== undefined
     ? l10n.t("Context tokens, {0} or more.", HANDOFF_AUTO_TOKENS_MIN.toLocaleString(uiLocale()))
     : l10n.t("Token count"), handoffAutoControls.tokens),
+  continueWork: row(handoffAutoCard, l10n.t("After an automatic handoff, continue unfinished work"), l10n.t("When a handoff that started automatically because of the context size completes and the previous conversation had an unfinished PLAN step and no unanswered decision, ask Claude in the new conversation to continue that work instead of waiting for your message. Claude does not start steps that wait for your approval and does not decide open decisions for you. A handoff before the prompt cache expires does not continue."), handoffAutoControls.continueWork),
+  closingSummary: row(handoffAutoCard, handoffClosingSummaryLabel, l10n.t("Needs automatic handoff and continuing unfinished work. When the work Claude continued after an automatic handoff ends, or has completely stopped to wait for you with nothing still running, Claude ends its last reply with a short summary of the whole work since your last work instruction, including what the earlier conversations did. In a conversation linked to a ToDo item, Claude also writes it into the item's work memo. Applies from the next time LAISORA asks Claude to continue after an automatic handoff."), handoffAutoControls.closingSummary),
   cacheExpiryEnabled: row(handoffAutoCard, l10n.t("Hand off before the prompt cache expires"), l10n.t("When a waiting conversation's last reply was cached for 1 hour, work is unfinished (a PLAN step or an unanswered decision) and the context holds at least {0} tokens, hand it off {1} minutes before that cache expires unless you send a message first. The same background and message box conditions apply.", CACHE_EXPIRY_MIN_TOTAL_TOKENS.toLocaleString(uiLocale()), CACHE_EXPIRY_LEAD_MS / 60_000), handoffAutoControls.cacheExpiryEnabled),
+  closeSourceTab: row(handoffAutoCard, l10n.t("Close the previous conversation's tab after a handoff"), l10n.t("When a handoff completes, manual or automatic, close the previous conversation's tab. It stays open when its message box holds unsent text or attachments, a turn is running or a message waits to be sent, background work (agents, commands, external runs) is running, or the handoff fails or is cancelled. Open it again from the handoff card or the history."), handoffAutoControls.closeSourceTab),
 };
 handoffAutoControls.percent.parentElement?.appendChild(element("span", "settings-input-unit", "%"));
 function settingGroup<N extends string, V>(controls: Record<N, { disabled: boolean }>, isValue: (setting: N, value: V) => boolean,
@@ -456,17 +457,18 @@ function settingGroup<N extends string, V>(controls: Record<N, { disabled: boole
   const pending = Object.fromEntries(Object.keys(controls).map((name) => [name, null])) as Record<N, number | null>;
   return {
     pending,
-    request(setting: N, value: V): void {
-      if (!loaded() || pending[setting] !== null) return;
+    request(setting: N, value: V): FieldCommit {
+      if (!loaded() || pending[setting] !== null) return undefined;
       if (!isValue(setting, value)) {
         const control = controls[setting];
         if (control instanceof HTMLInputElement) control.reportValidity();
-        return;
+        return "invalid";
       }
       const requestId = nextRequestId();
       pending[setting] = requestId;
       controls[setting].disabled = true;
       send(requestId, setting, value);
+      return requestId;
     },
     settle(replyTo: number | undefined): void {
       for (const name of Object.keys(pending) as N[]) if (pending[name] === replyTo) pending[name] = null;
@@ -481,24 +483,33 @@ function renderHandoffAuto(state: SettingsState): void {
   const settings = state.handoffAuto;
   handoffAutoGroup.settle(state.replyTo);
   if (settings === undefined) return;
-  const { enabled, mode, percent, tokens, cacheExpiryEnabled } = handoffAutoControls;
+  const { enabled, mode, percent, tokens, cacheExpiryEnabled, continueWork, closingSummary, closeSourceTab } = handoffAutoControls;
   enabled.setAttribute("aria-checked", String(settings.enabled));
   enabled.disabled = pendingHandoffAuto.enabled !== null;
   mode.querySelector(".settings-option-unknown")?.remove();
   if (pendingHandoffAuto.mode === null) mode.value = settings.mode;
   mode.disabled = pendingHandoffAuto.mode !== null || !settings.enabled;
-  if (pendingHandoffAuto.percent === null && document.activeElement !== percent) percent.value = String(settings.percent);
+  showEditedField(handoffPercentField, String(settings.percent), state);
   percent.disabled = pendingHandoffAuto.percent !== null || !settings.enabled || settings.mode !== "ratio";
-  if (pendingHandoffAuto.tokens === null && document.activeElement !== tokens) tokens.value = String(settings.tokens);
+  showEditedField(handoffTokensField, String(settings.tokens), state);
   tokens.disabled = pendingHandoffAuto.tokens !== null || !settings.enabled || settings.mode !== "tokens";
   cacheExpiryEnabled.setAttribute("aria-checked", String(settings.cacheExpiryEnabled));
   cacheExpiryEnabled.disabled = pendingHandoffAuto.cacheExpiryEnabled !== null;
+  continueWork.setAttribute("aria-checked", String(settings.continueWork));
+  continueWork.disabled = pendingHandoffAuto.continueWork !== null || !settings.enabled;
+  closingSummary.setAttribute("aria-checked", String(settings.closingSummary));
+  closingSummary.disabled = pendingHandoffAuto.closingSummary !== null || !handoffContinuesWork(settings);
+  closeSourceTab.setAttribute("aria-checked", String(settings.closeSourceTab));
+  closeSourceTab.disabled = pendingHandoffAuto.closeSourceTab !== null;
 }
 handoffAutoControls.enabled.addEventListener("click", () => requestHandoffAutoSetting("enabled", current?.handoffAuto?.enabled !== true));
 handoffAutoControls.cacheExpiryEnabled.addEventListener("click", () => requestHandoffAutoSetting("cacheExpiryEnabled", current?.handoffAuto?.cacheExpiryEnabled !== true));
+handoffAutoControls.continueWork.addEventListener("click", () => requestHandoffAutoSetting("continueWork", current?.handoffAuto?.continueWork !== true));
+handoffAutoControls.closingSummary.addEventListener("click", () => requestHandoffAutoSetting("closingSummary", current?.handoffAuto?.closingSummary !== true));
+handoffAutoControls.closeSourceTab.addEventListener("click", () => requestHandoffAutoSetting("closeSourceTab", current?.handoffAuto?.closeSourceTab !== true));
 handoffAutoControls.mode.addEventListener("change", () => requestHandoffAutoSetting("mode", handoffAutoControls.mode.value));
-handoffAutoControls.percent.addEventListener("change", () => requestHandoffAutoSetting("percent", handoffAutoControls.percent.valueAsNumber));
-handoffAutoControls.tokens.addEventListener("change", () => requestHandoffAutoSetting("tokens", handoffAutoControls.tokens.valueAsNumber));
+const handoffPercentField = editedField(handoffAutoControls.percent, () => requestHandoffAutoSetting("percent", handoffAutoControls.percent.valueAsNumber));
+const handoffTokensField = editedField(handoffAutoControls.tokens, () => requestHandoffAutoSetting("tokens", handoffAutoControls.tokens.valueAsNumber));
 
 const waitNotifyCard = section(generalCategory, l10n.t("Mobile notifications"));
 const waitNotifyControls = {
@@ -511,6 +522,9 @@ const waitNotifyTexts: Record<WaitNotifySettingName, HTMLElement> = {
     ? l10n.t("Counted from the end of the turn, from {0} to {1} minutes.", WAIT_NOTIFY_MINUTES_MIN, WAIT_NOTIFY_MINUTES_MAX)
     : l10n.t("Counted from the end of the turn."), waitNotifyControls.minutes),
 };
+const waitNotifyDescribedBy = waitNotifyControls.enabled.getAttribute("aria-describedby") ?? "";
+const waitNotifyTelemetryHint = rowNote(waitNotifyTexts.enabled, "settings-row-hint", l10n.t("Unavailable because Claude Code's telemetry is disabled, and Claude Code cannot send phone notifications then. It is disabled while VS Code's telemetry.telemetryLevel setting is not \"all\" or while DISABLE_TELEMETRY is set for Claude Code. To use it, set telemetry.telemetryLevel to \"all\" and remove DISABLE_TELEMETRY."));
+waitNotifyTelemetryHint.hidden = true;
 const waitNotifyGroup = settingGroup<WaitNotifySettingName, boolean | number>(waitNotifyControls, isWaitNotifySettingValue,
   () => current?.waitNotify !== undefined, (requestId, setting, value) => post({ type: "setWaitNotifySetting", requestId, setting, value }));
 const pendingWaitNotify = waitNotifyGroup.pending;
@@ -520,13 +534,16 @@ function renderWaitNotify(state: SettingsState): void {
   const settings = state.waitNotify;
   if (settings === undefined) return;
   const { enabled, minutes } = waitNotifyControls;
+  const telemetryOff = state.waitNotifyTelemetryOff === true;
   enabled.setAttribute("aria-checked", String(settings.enabled));
-  enabled.disabled = pendingWaitNotify.enabled !== null;
-  if (pendingWaitNotify.minutes === null && document.activeElement !== minutes) minutes.value = String(settings.minutes);
+  enabled.disabled = pendingWaitNotify.enabled !== null || telemetryOff;
+  showEditedField(waitNotifyMinutesField, String(settings.minutes), state);
   minutes.disabled = pendingWaitNotify.minutes !== null || !settings.enabled;
+  waitNotifyTelemetryHint.hidden = !telemetryOff;
+  enabled.setAttribute("aria-describedby", telemetryOff ? `${waitNotifyDescribedBy} ${waitNotifyTelemetryHint.id}`.trim() : waitNotifyDescribedBy);
 }
 waitNotifyControls.enabled.addEventListener("click", () => requestWaitNotifySetting("enabled", current?.waitNotify?.enabled !== true));
-waitNotifyControls.minutes.addEventListener("change", () => requestWaitNotifySetting("minutes", waitNotifyControls.minutes.valueAsNumber));
+const waitNotifyMinutesField = editedField(waitNotifyControls.minutes, () => requestWaitNotifySetting("minutes", waitNotifyControls.minutes.valueAsNumber));
 
 const sendKeySelect = select<ComposerSendKey>([
   ["enter", "Enter"],
@@ -562,7 +579,7 @@ function renderInitialModel(state: SettingsState): void {
   initialModelSelect.disabled = false;
   initialModelNote.textContent = missing
     ? l10n.t("The configured model is not in the available list. New and resumed conversations will request this ID; Claude may reject it.")
-    : list?.state !== "ok" ? l10n.t("Loading models. This may take a few seconds after starting a conversation.") : "";
+    : list?.state !== "ok" ? modelsLoadingText() : "";
   if (!missing && list?.state === "failed") initialModelNote.textContent = modelListStatusText(list, state.externalDetection.claude);
   initialModelNote.hidden = !initialModelNote.textContent;
 }
@@ -595,16 +612,17 @@ eventLimitInput.required = true;
 eventLimitInput.disabled = true;
 const eventLimitText = row(chatCard, l10n.t("Events kept per conversation"), l10n.t("The official Claude Code VS Code extension keeps about 600 chat rows. LAISORA keeps more because SUMMARY and ANALYSIS read the log. Higher values use more memory and make long conversations slower. Events older than the limit drop out of the live log."), eventLimitInput);
 let pendingEventLimit: number | null = null;
-eventLimitInput.addEventListener("change", () => {
+const eventLimitField = editedField(eventLimitInput, () => {
   const value = eventLimitInput.valueAsNumber;
-  if (pendingEventLimit !== null) return;
+  if (pendingEventLimit !== null) return undefined;
   if (!isEventLimit(value)) {
     eventLimitInput.reportValidity();
-    return;
+    return "invalid";
   }
   pendingEventLimit = nextRequestId();
   eventLimitInput.disabled = true;
   post({ type: "setEventLimit", requestId: pendingEventLimit, value });
+  return pendingEventLimit;
 });
 const retentionDaysInput = element("input", "settings-input");
 retentionDaysInput.id = "setting-transcript-retention-days";
@@ -620,16 +638,17 @@ function transcriptRetentionFallbackText(fallback: TranscriptRetentionFallback):
     ? l10n.t("{0} (~/.claude/settings.json)", fallback.days)
     : l10n.t("{0} (Claude Code default)", fallback.days);
 }
-retentionDaysInput.addEventListener("change", () => {
-  if (pendingRetentionDays !== null) return;
+const retentionDaysField = editedField(retentionDaysInput, () => {
+  if (pendingRetentionDays !== null) return undefined;
   const value = retentionDaysInput.value.trim() === "" ? null : retentionDaysInput.valueAsNumber;
   if (retentionDaysInput.validity.badInput || value !== null && !isTranscriptRetentionDays(value)) {
     retentionDaysInput.reportValidity();
-    return;
+    return "invalid";
   }
   pendingRetentionDays = nextRequestId();
   retentionDaysInput.disabled = true;
   post({ type: "setTranscriptRetentionDays", requestId: pendingRetentionDays, value });
+  return pendingRetentionDays;
 });
 
 const autoContinueSwitch = switchButton("setting-auto-continue-usage-limit");
@@ -703,6 +722,7 @@ const fileLinkCard = section(fileCategory, l10n.t("File links"));
 const fileLinkSwitches: Record<FileLinkBooleanSetting, HTMLButtonElement> = {
   fileLinkInstruction: switchButton("setting-file-link-instruction"),
   planInstruction: switchButton("setting-plan-instruction"),
+  closingSummary: switchButton("setting-closing-summary"),
   chromeIntegration: chromeIntegrationSwitch,
   mcpElicitation: mcpElicitationSwitch,
   writesLostNotice: writesLostNoticeSwitch,
@@ -722,6 +742,12 @@ row(
   l10n.t("Ask Claude to show plans, decisions and checks"),
   l10n.t("Applies to conversations started or resumed afterwards. Running conversations are not changed, because changing the system prompt mid-conversation invalidates the prompt cache and the next reply would resend the whole conversation."),
   fileLinkSwitches.planInstruction
+);
+row(
+  fileLinkCard,
+  l10n.t("Ask Claude to summarize work when it ends"),
+  l10n.t("When work you asked for in a conversation ends or stops to wait for you, Claude ends its last reply with a short summary: the result, what was done, what was verified and what was not, and what is left or waits for you. In a conversation linked to a ToDo item, Claude also writes it into the item's work memo. Work Claude continued after an automatic handoff follows \"{1}\" under \"{0}\" instead. Applies to conversations started or resumed afterwards.", handoffAutoTitle, handoffClosingSummaryLabel),
+  fileLinkSwitches.closingSummary
 );
 row(
   fileLinkCard,
@@ -873,7 +899,7 @@ recommendApply.addEventListener("click", () => {
   const requestId = nextRequestId();
   pendingOrchestration = requestId;
   pendingRecommend = requestId;
-  settingsRosterFocusId = recommendButton.id;
+  settingsRosterFocus = { id: recommendButton.id };
   lockOrchestration();
   post({ type: "applyRecommendedRoster", requestId, revision });
 });
@@ -1070,8 +1096,8 @@ timeoutGroup.id = "setting-timeout-group";
 const externalTimeout = element("input", "settings-input");
 externalTimeout.id = "setting-external-timeout";
 externalTimeout.type = "number";
-externalTimeout.min = "1";
-externalTimeout.max = "120";
+externalTimeout.min = String(EXTERNAL_TIMEOUT_MIN_MINUTES);
+externalTimeout.max = String(EXTERNAL_TIMEOUT_MAX_MINUTES);
 externalTimeout.step = "any";
 externalTimeout.disabled = true;
 timeoutGroup.append(externalTimeout, element("span", "", "min"));
@@ -1081,10 +1107,11 @@ externalTimeout.setAttribute("aria-labelledby", timeoutText.querySelector("label
 externalTimeout.setAttribute("aria-describedby", timeoutText.querySelector(".settings-row-description")!.id);
 externalBlock.append(detectionHeader, element("p", "settings-row-description settings-environment-help", l10n.t("CLIs installed on this PC. Conversations use Claude; agent roster rows can also use Antigravity and Codex. With a row's switch on, LAISORA updates that CLI in the background once a conversation is ready and no turn is running (Antigravity and Codex also wait for external runs to finish). Claude Code: native install only, following its own update settings. Codex and Antigravity: only the copy from their own installer.")), detectionCard);
 cliCategory.appendChild(externalBlock);
-externalTimeout.addEventListener("change", () => {
+const externalTimeoutField = editedField(externalTimeout, () => {
   const value = Number(externalTimeout.value);
-  if (isExternalTimeout(value)) writeOrchestration("externalTimeoutMinutes", value);
-  else externalTimeout.reportValidity();
+  if (isExternalTimeout(value)) return writeOrchestration("externalTimeoutMinutes", value);
+  externalTimeout.reportValidity();
+  return "invalid";
 });
 
 function settingsProbeReason(reason: string): string {
@@ -1114,25 +1141,38 @@ function renderExternal(state: SettingsState): void {
   externalRecheck.disabled = Object.values(EXECUTORS).some(({ id }) => state.externalDetection[id].state === "checking"
     || state.externalModels[id].state === "checking" || state.externalModels[id].state === "ok" && state.externalModels[id].refresh === "checking");
   externalTimeout.disabled = false;
-  externalTimeout.value = String(state.externalTimeoutMinutes);
+  showEditedField(externalTimeoutField, String(state.externalTimeoutMinutes), state);
 }
 let pendingOrchestration: number | null = null;
-let settingsRosterFocusId: string | undefined;
-function orchestrationFocusId(): string | undefined {
-  return [rosterCategory, cliCategory].some((category) => category.contains(document.activeElement)) ? document.activeElement?.id : undefined;
+type OrchestrationFocus = { role: string; suffix: string } | { id: string };
+let settingsRosterFocus: OrchestrationFocus | undefined;
+function orchestrationFocus(): OrchestrationFocus | undefined {
+  const active = document.activeElement;
+  if (!active?.id || ![rosterCategory, cliCategory].some((category) => category.contains(active))) return undefined;
+  const role = active.closest(".settings-role-card")?.getAttribute("aria-label");
+  const suffix = /^roster-\d+-(.+)$/.exec(active.id)?.[1];
+  return role && suffix ? { role, suffix } : { id: active.id };
+}
+function orchestrationFocusTarget(focus: OrchestrationFocus, agents: readonly OrchestrationSettingRow[]): HTMLElement | null {
+  if ("id" in focus) return document.getElementById(focus.id);
+  const index = agents.findIndex((entry) => entry.role === focus.role);
+  return index < 0 ? null : document.getElementById(`roster-${index}-${focus.suffix}`);
 }
 const settingsRosterDrafts = new Map<string, ExecutorRow>();
+const rosterFields = new Map<string, EditedField & { whenGone?: (state: SettingsState, text: string) => void }>();
+const goneRosterEdits: Array<(state: SettingsState) => void> = [];
 
-function writeOrchestration(setting: "enabled" | "agents" | "conductorPolicy" | "externalTimeoutMinutes", value: unknown): void {
-  if (!current || pendingOrchestration !== null) return;
+function writeOrchestration(setting: "enabled" | "agents" | "conductorPolicy" | "externalTimeoutMinutes", value: unknown): number | undefined {
+  if (!current || pendingOrchestration !== null) return undefined;
   const requestId = nextRequestId();
   pendingOrchestration = requestId;
-  settingsRosterFocusId = orchestrationFocusId();
+  settingsRosterFocus = orchestrationFocus();
   lockOrchestration();
   post({ type: "setOrchestrationSetting", requestId, setting, value });
+  return requestId;
 }
-function writeRoster(rows: readonly OrchestrationSettingRow[]): void {
-  writeOrchestration("agents", rows.map((entry) => ({ ...entry, rows: entry.rows.map((rosterRow) => ({ ...rosterRow, efforts: canonicalExecutorEfforts(rosterRow.executor, rosterRow.efforts) })) })));
+function writeRoster(rows: readonly OrchestrationSettingRow[]): number | undefined {
+  return writeOrchestration("agents",rows.map((entry) => ({ ...entry, rows: entry.rows.map((rosterRow) => ({ ...rosterRow, efforts: canonicalExecutorEfforts(rosterRow.executor, rosterRow.efforts) })) })));
 }
 function lockOrchestration(): void {
   if (pendingOrchestration !== null) {
@@ -1173,8 +1213,15 @@ function renderOrchestration(state: SettingsState): void {
   }
   orchestrationSwitch.disabled = false;
   orchestrationSwitch.setAttribute("aria-checked", String(state.orchestrationEnabled));
-  const focusedId = settingsRosterFocusId ?? orchestrationFocusId();
-  rosterRows.replaceChildren();
+  const focus = settingsRosterFocus ?? orchestrationFocus();
+  const focusSelection = selectionOf(document.activeElement);
+  const seenRosterFields = new Set<string>();
+  rosterRebuilding = true;
+  try {
+    rosterRows.replaceChildren();
+  } finally {
+    rosterRebuilding = false;
+  }
   rosterCacheNote.hidden = state.orchestrationAgents.length === 0;
   renderRosterPrices(state);
   state.orchestrationAgents.forEach((entry, index) => {
@@ -1216,7 +1263,7 @@ function renderOrchestration(state: SettingsState): void {
     description.type = "text";
     description.value = entry.description;
     description.disabled = controlsDisabled;
-    description.addEventListener("change", () => update({ description: description.value }));
+    rosterField(`description:${entry.role}`, description, entry.description, state, seenRosterFields, () => update({ description: description.value }));
     card.append(header, settingsHiddenLabel(description, l10n.t("Description")), description);
     const cacheGroup = element("div", "settings-segmented");
     cacheGroup.id = `roster-${index}-cache-ttl`;
@@ -1261,18 +1308,19 @@ function renderOrchestration(state: SettingsState): void {
     visibleRows.forEach((executorRow, rowIndex) => {
       const definition = EXECUTORS[executorRow.executor];
       const isDraft = rowIndex === entry.rows.length;
-      const updateRow = (patch: Partial<ExecutorRow>) => {
-        if (controlsDisabled || pendingOrchestration !== null) return;
+      const updateRow = (patch: Partial<ExecutorRow>): number | undefined => {
+        if (controlsDisabled || pendingOrchestration !== null) return undefined;
         const nextRow = { ...executorRow, ...patch };
         if (isDraft) {
           if (!nextRow.model) {
             settingsRosterDrafts.set(entry.role, nextRow);
             renderOrchestration(state);
-            return;
+            return undefined;
           }
           settingsRosterDrafts.delete(entry.role);
-          update({ rows: [...entry.rows, nextRow] });
-        } else update({ rows: entry.rows.map((value, i) => i === rowIndex ? nextRow : value) });
+          return update({ rows: [...entry.rows, nextRow] });
+        }
+        return update({ rows: entry.rows.map((value, i) => i === rowIndex ? nextRow : value) });
       };
       const modelField = element("div", "settings-model-field");
       const cascade = element("select", "settings-select settings-cascade");
@@ -1336,11 +1384,11 @@ function renderOrchestration(state: SettingsState): void {
         input.type = "text";
         input.value = executorRow.model;
         input.disabled = controlsDisabled;
-        input.addEventListener("change", () => {
-          input.setCustomValidity(isExternalModel(input.value) ? "" : l10n.t("Use a model ID starting with a letter or digit, followed by letters, digits, dots, underscores, colons or hyphens."));
-          if (entry.rows.some((value, i) => i !== rowIndex && value.executor === executorRow.executor && value.model === input.value)) input.setCustomValidity(l10n.t("This model already exists."));
-          if (input.reportValidity()) updateRow({ model: input.value, efforts: [] });
-        });
+        const savedModel = isDraft ? null : executorRow.model;
+        rosterField(`model:${entry.role}:${executorRow.executor}/${savedModel ?? ""}:${isDraft ? "draft" : "row"}`, input, executorRow.model, state, seenRosterFields, () => {
+          input.setCustomValidity(modelIdProblem(entry.rows, isDraft ? -1 : rowIndex, executorRow.executor, input.value) ?? "");
+          return input.reportValidity() ? updateRow({ model: input.value, efforts: [] }) : "invalid";
+        }, (next, text) => commitGoneModelEdit(next, entry.role, executorRow.executor, savedModel, text));
         modelField.append(settingsHiddenLabel(input, `${definition.displayName} Model`), input,
           element("span", "settings-muted", l10n.t("model list unavailable — type a model ID")));
       }
@@ -1390,7 +1438,7 @@ function renderOrchestration(state: SettingsState): void {
     const addRow = element("button", "settings-link settings-add-row", l10n.t("+ Add row"));
     addRow.id = `roster-${index}-add-row`;
     addRow.type = "button";
-    addRow.disabled = controlsDisabled || !!draft || visibleRows.length >= 12;
+    addRow.disabled = controlsDisabled || !!draft || visibleRows.length >= ROSTER_ROWS_MAX;
     addRow.addEventListener("click", () => {
       settingsRosterDrafts.set(entry.role, { executor: DEFAULT_EXECUTOR, model: "", efforts: [] });
       renderOrchestration(state);
@@ -1407,21 +1455,66 @@ function renderOrchestration(state: SettingsState): void {
     rosterRows.appendChild(card);
   });
   for (const control of [roleInput, addButton, defaultsButton, policyInput]) control.disabled = !state.orchestrationEnabled;
-  policyInput.value = state.conductorPolicy;
-  renderPolicyCounter(state.conductorPolicy, state.conductorPolicyDefault);
+  showEditedField(policyField, state.conductorPolicy, state);
+  renderPolicyCounter(policyInput.value, state.conductorPolicyDefault);
   renderPolicyDefaults(state);
   previewRequest = 0;
   renderInstructionPreview(state);
+  if (fieldEditOf(policyField).dirty) requestInstructionPreview();
   renderExternal(state);
   lockOrchestration();
-  if (focusedId) document.getElementById(focusedId)?.focus();
-  if (pendingOrchestration === null) settingsRosterFocusId = undefined;
+  for (const [key, field] of rosterFields) {
+    if (seenRosterFields.has(key)) continue;
+    rosterFields.delete(key);
+    const text = field.control.value;
+    const whenGone = field.whenGone;
+    if (fieldEditOf(field).dirty && text !== field.written && whenGone) goneRosterEdits.push((next) => whenGone(next, text));
+  }
+  const focusTarget = focus === undefined ? null : orchestrationFocusTarget(focus, state.orchestrationAgents);
+  if (focusTarget !== null) {
+    focusTarget.focus();
+    if (focusTarget instanceof HTMLInputElement || focusTarget instanceof HTMLTextAreaElement) restoreSelection(focusTarget, focusSelection);
+  }
+  if (pendingOrchestration === null) settingsRosterFocus = undefined;
+  while (pendingOrchestration === null && goneRosterEdits.length > 0) goneRosterEdits.shift()!(state);
+}
+function rosterField(key: string, control: HTMLInputElement, saved: string, state: SettingsState, seen: Set<string>,
+  commit: () => FieldCommit, whenGone?: (state: SettingsState, text: string) => void): void {
+  seen.add(key);
+  const existing = rosterFields.get(key);
+  if (existing === undefined) {
+    rosterFields.set(key, Object.assign(editedField(control, commit), { whenGone }));
+    return;
+  }
+  const text = existing.control.value;
+  existing.commit = commit;
+  existing.whenGone = whenGone;
+  bindEditedField(existing, control);
+  control.value = text;
+  showEditedField(existing, saved, state);
+}
+function modelIdProblem(rows: readonly ExecutorRow[], rowIndex: number, executor: ExecutorId, model: string): string | undefined {
+  if (!isExternalModel(model)) return l10n.t("Use a model ID starting with a letter or digit, followed by letters, digits, dots, underscores, colons or hyphens.");
+  if (rows.some((value, i) => i !== rowIndex && value.executor === executor && value.model === model)) return l10n.t("This model already exists.");
+  return undefined;
+}
+function commitGoneModelEdit(next: SettingsState, role: string, executor: ExecutorId, savedModel: string | null, text: string): void {
+  const entry = next.orchestrationAgents.find((item) => item.role === role);
+  if (entry === undefined) return;
+  const rowIndex = savedModel === null ? -1 : entry.rows.findIndex((row) => row.executor === executor && row.model === savedModel);
+  if (savedModel === null ? settingsRosterDrafts.get(role)?.executor !== executor : rowIndex < 0) return;
+  if (modelIdProblem(entry.rows, rowIndex, executor, text) !== undefined) return;
+  const rows = savedModel === null
+    ? [...entry.rows, { executor, model: text, efforts: [] }]
+    : entry.rows.map((row, i) => i === rowIndex ? { ...row, model: text, efforts: [] } : row);
+  if (savedModel === null) settingsRosterDrafts.delete(role);
+  writeRoster(next.orchestrationAgents.map((item) => item === entry ? { ...item, rows } : item));
 }
 orchestrationSwitch.addEventListener("click", () => writeOrchestration("enabled", !current?.orchestrationEnabled));
 function addRole(): void {
   if (!current?.orchestrationEnabled || pendingOrchestration !== null) return;
   const role = roleInput.value;
-  if (!/^[a-z][a-z0-9-]*$/.test(role)) {
+  if (!isRoleName(role)) {
     roleError.textContent = l10n.t("Use a lowercase letter first, then lowercase letters, digits or hyphens.");
     return;
   }
@@ -1438,7 +1531,7 @@ roleInput.addEventListener("keydown", (event) => {
 });
 defaultsButton.addEventListener("click", () => { if (current) { const defaults = current.orchestrationDefaults; writeRoster(current.orchestrationAgents.filter((entry) => defaults.some((role) => role.role === entry.role))); } });
 policyDefaultsButton.addEventListener("click", () => { if (current) writeOrchestration("conductorPolicy", current.conductorPolicyDefault); });
-policyInput.addEventListener("change", () => writeOrchestration("conductorPolicy", policyInput.value));
+const policyField = editedField(policyInput, () => writeOrchestration("conductorPolicy", policyInput.value));
 policyInput.addEventListener("input", () => { renderPolicyCounter(); if (current) { renderPolicyDefaults(current); requestInstructionPreview(); } });
 
 const footer = element("div", "settings-footer");
@@ -1455,6 +1548,7 @@ const pendingAutoUpdate = new Map<ExecutorId, number>();
 const pendingFileLink: Record<FileLinkBooleanSetting, number | null> = {
   fileLinkInstruction: null,
   planInstruction: null,
+  closingSummary: null,
   chromeIntegration: null,
   mcpElicitation: null,
   writesLostNotice: null,
@@ -1555,10 +1649,10 @@ function render(state: SettingsState): void {
   renderDisplayName(state);
   if (pendingEventLimit === state.replyTo) pendingEventLimit = null;
   eventLimitInput.disabled = pendingEventLimit !== null;
-  if (pendingEventLimit === null) eventLimitInput.value = String(state.eventLimit ?? EVENT_LIMIT_DEFAULT);
+  showEditedField(eventLimitField, String(state.eventLimit ?? EVENT_LIMIT_DEFAULT), state);
   if (pendingRetentionDays === state.replyTo) pendingRetentionDays = null;
   retentionDaysInput.disabled = pendingRetentionDays !== null;
-  if (pendingRetentionDays === null) retentionDaysInput.value = state.transcriptRetentionDays === undefined ? "" : String(state.transcriptRetentionDays);
+  showEditedField(retentionDaysField, state.transcriptRetentionDays === undefined ? "" : String(state.transcriptRetentionDays), state);
   retentionDaysInput.placeholder = transcriptRetentionFallbackText(state.transcriptRetentionFallback);
   renderAccent(state.appearance, state.replyTo);
   if (pending.autoContinue === state.replyTo) pending.autoContinue = null;
@@ -1595,6 +1689,7 @@ function render(state: SettingsState): void {
   }
   fileLinkSwitches.fileLinkInstruction.disabled = false;
   fileLinkSwitches.planInstruction.disabled = false;
+  fileLinkSwitches.closingSummary.disabled = false;
   fileLinkSwitches.chromeIntegration.disabled = false;
   fileLinkSwitches.mcpElicitation.disabled = false;
   fileLinkSwitches.writesLostNotice.disabled = false;
@@ -1891,23 +1986,37 @@ function revealSetting(target: SettingsRevealTarget): void {
   requestAnimationFrame(() => place().scrollIntoView({ block: "center" }));
 }
 
-window.addEventListener("message", (event: MessageEvent<unknown>) => {
-  if (!isHostToSettingsPage(event.data)) return;
-  if (event.data.type === "revealSetting") revealSetting(event.data.target);
-  else if (event.data.type === "conductorPreview") {
-    if (event.data.requestId !== previewRequest) return;
-    instructionPreview.textContent = event.data.text;
-    instructionTokens.textContent = l10n.t("≈ {0} tokens", event.data.tokens);
-  } else if (event.data.type === "recommendedRoster") renderRecommendation(event.data.revision, event.data.changes);
-  else if (event.data.type === "migrationState") renderMigration(event.data);
-  else if (event.data.type === "migrationProgress") {
-    migrationProgress = event.data.progress;
+function applyHostMessage(message: HostToSettingsPage): void {
+  if (message.type === "revealSetting") revealSetting(message.target);
+  else if (message.type === "conductorPreview") {
+    if (message.requestId !== previewRequest) return;
+    instructionPreview.textContent = message.text;
+    instructionTokens.textContent = l10n.t("≈ {0} tokens", message.tokens);
+  } else if (message.type === "recommendedRoster") renderRecommendation(message.revision, message.changes);
+  else if (message.type === "migrationState") renderMigration(message);
+  else if (message.type === "migrationProgress") {
+    migrationProgress = message.progress;
     renderMigrationProgress();
   }
   else {
-    render(event.data);
+    render(message);
     if (pendingReveal !== undefined) revealSetting(pendingReveal);
   }
+}
+let composingText = false;
+const deferredMessages: HostToSettingsPage[] = [];
+window.addEventListener("message", (event: MessageEvent<unknown>) => {
+  if (!isHostToSettingsPage(event.data)) return;
+  if (composingText) deferredMessages.push(event.data);
+  else applyHostMessage(event.data);
+});
+document.addEventListener("compositionstart", () => { composingText = true; });
+document.addEventListener("compositionend", () => {
+  composingText = false;
+  setTimeout(() => {
+    if (composingText) return;
+    for (const message of deferredMessages.splice(0)) applyHostMessage(message);
+  }, 0);
 });
 renderSettingsToc();
 post({ type: "settingsPageReady" });

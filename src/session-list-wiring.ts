@@ -1,13 +1,13 @@
 import * as vscode from "vscode";
 import * as l10n from "@vscode/l10n";
 import { readdirSync, statSync } from "node:fs";
-import { open } from "node:fs/promises";
+import { open, type FileHandle } from "node:fs/promises";
 import { join } from "node:path";
 import type * as ClaudeCodeSdk from "@anthropic-ai/claude-agent-sdk" with { "resolution-mode": "import" };
 
 import { AccountUsageFetcher, rateLimitsViaUsageCommand } from "./account-usage";
 import { claudeConfigDir, claudeProjectsDir } from "./claude-env";
-import { configuredClaudeExecutablePath, existingFolderOrHome, getLaisoraConfiguration, resolveSessionCwd } from "./claude-settings";
+import { configuredApiKeyPolicy, configuredClaudeExecutablePath, existingFolderOrHome, getLaisoraConfiguration, newSessionCwd, resolveSessionCwd } from "./claude-settings";
 import { resolveClaudeCodeExecutable } from "./claudeCliResolver";
 import type { ClaudeConversation } from "./claudeHost";
 import type { Session } from "./extension";
@@ -15,7 +15,8 @@ import { extensionContext, output, sinceActivation, store } from "./host-context
 import {
   ACCOUNT_USAGE_TIMEOUT_MS,
   SESSION_ID_RE,
-  normalizeApiKeyPolicy,
+  renameUsageText,
+  transcriptWriteLockedText,
   type ImageAttachment,
   type SessionListItem,
   type SessionScanDegradation,
@@ -30,8 +31,7 @@ import {
 } from "./session-files";
 import {
   HandoffRunner,
-  IN_FLIGHT_KEY,
-  ORPHANS_KEY,
+  foldLegacyHandoffRegistries,
   handoffForkState,
   heldForkTabAction,
   heldForkTabNotice,
@@ -44,32 +44,63 @@ import {
   type HeldForkTab,
   type HeldForkTabEvent,
 } from "./handoff-runner";
-import { handoffFs, handoffPersist, readHandoffRecords } from "./handoff-wiring";
-import { openResumedSession } from "./resume-hydration";
+import { globalStorageRoot, handoffContextUsage, handoffFs, handoffPersist, handoffRegistry, readHandoffRecords } from "./handoff-wiring";
+import { asObject, foldLegacyEntries, isStateFileId, usedSessionFiles, type UsedSessionStore } from "./state-files";
+import { openResumedSession, readRecordedSessionCwd } from "./resume-hydration";
 import { normalizeTitleValue } from "./session-display-title";
 import { sessionRecordId } from "./session-record";
 import type { SessionCandidate } from "./session-list";
 import { SESSION_RESOLVE_BATCH, candidatePathIndex, displayTitleFromSummary, rankSessionCandidates, streamSessionRows } from "./session-list";
 import { reorderSessionTabs, type SessionStore } from "./store-surfaces";
 import { postTodoSnapshot } from "./todo-surface";
+import { judgeTranscriptWriteLock, transcriptWriteLockedAt } from "./transcript-write-lock";
+
+function warnImageOpenFailed(): void {
+  void vscode.window.showWarningMessage(l10n.t("LAISORA: Could not open the image."));
+}
 
 const USED_SESSIONS_KEY = "history.laisoraSessions";
-let usedSessions: Record<string, string> | undefined;
-function usedSessionPaths(): Record<string, string> {
-  return usedSessions ??= extensionContext?.globalState.get<Record<string, string>>(USED_SESSIONS_KEY, {}) ?? {};
+function usedSessions(): UsedSessionStore {
+  return usedSessionFiles(globalStorageRoot());
 }
-export function rememberSession(session: Session): void {
+export function rememberSession(session: Session): Promise<void> {
   const id = sessionRecordId(session);
-  if (!id) return;
-  if (!usedSessionPaths()[id]) {
-    const ref = sessionTranscriptRef(session);
-    if (ref) {
-      usedSessionPaths()[ref.sessionId] = ref.file;
-      void extensionContext?.globalState.update(USED_SESSIONS_KEY, { ...usedSessionPaths() }).then(undefined,
-        error => output.appendLine(`[history] Could not save LAISORA session index: ${String(error)}`));
-    }
-  }
+  if (!id) return Promise.resolve();
+  const ref = sessionTranscriptRef(session);
+  const written = ref ? usedSessionsFolded().then(() => usedSessions().add(ref.sessionId)).then(undefined,
+    error => output.appendLine(`[history] Could not save LAISORA session index: ${String(error)}`)) : Promise.resolve();
   void persistOpenTabs();
+  return written;
+}
+async function usedSessionIds(): Promise<Set<string>> {
+  await usedSessionsFolded();
+  try {
+    return new Set(await usedSessions().ids());
+  } catch (error) {
+    output.appendLine(`[history] Could not read LAISORA session index: ${errText(error)}`);
+    return new Set();
+  }
+}
+const LEGACY_USED_SESSIONS_FOLD_PARALLEL = 16;
+async function foldLegacyUsedSessions(): Promise<void> {
+  const legacy = handoffPersist();
+  const stored = legacy.get(USED_SESSIONS_KEY);
+  if (stored === undefined) return;
+  const sessionIds = Object.keys(asObject(stored) ?? {}).filter(isStateFileId);
+  await foldLegacyEntries(legacy, USED_SESSIONS_KEY, sessionIds, (sessionId) => usedSessions().add(sessionId), (sessionId, error) =>
+    output.appendLine(`[history] Could not move a LAISORA session index entry to its file: ${sessionId}: ${errText(error)}`),
+  LEGACY_USED_SESSIONS_FOLD_PARALLEL);
+}
+let usedSessionsFold: Promise<void> | undefined;
+function usedSessionsFolded(): Promise<void> {
+  return usedSessionsFold ??= foldLegacyUsedSessions().catch((error) =>
+    output.appendLine(`[startup] LAISORA session index could not be moved out of globalState: ${errText(error)}`));
+}
+let handoffRegistryFold: Promise<void> | undefined;
+function handoffRegistriesFolded(): Promise<void> {
+  const log = (line: string): void => output.appendLine(line);
+  return handoffRegistryFold ??= foldLegacyHandoffRegistries(handoffPersist(), handoffRegistry(), log).catch((error) =>
+    log(`[startup] handoff registries could not be moved out of globalState: ${errText(error)}`));
 }
 
 const OPEN_TABS_KEY = "history.laisoraOpenTabs";
@@ -98,7 +129,7 @@ function openTabEntries(): PersistedOpenTab[] {
     const sessionId = sessionRecordId(s);
     if (!sessionId || seen.has(sessionId)) continue;
     seen.add(sessionId);
-    const filePath = s.resumeSessionId && s.resumeFilePath ? s.resumeFilePath : usedSessionPaths()[sessionId];
+    const filePath = s.resumeSessionId && s.resumeFilePath ? s.resumeFilePath : undefined;
     entries.push({
       sessionId,
       ...(filePath ? { filePath } : {}),
@@ -156,16 +187,35 @@ export function readPersistedOpenTabs(): PersistedOpenTab[] {
   }
   return entries.sort((a, b) => a.order - b.order);
 }
-function handoffRegistries(): { inFlight: unknown; orphans: unknown } {
-  const globalState = extensionContext?.globalState;
-  return { inFlight: globalState?.get<unknown>(IN_FLIGHT_KEY), orphans: globalState?.get<unknown>(ORPHANS_KEY) };
+export type HandoffForkStateIn = (sessionId: string) => HandoffForkState | undefined;
+export async function handoffRegistries(): Promise<HandoffForkStateIn> {
+  await handoffRegistriesFolded();
+  const registry = handoffRegistry();
+  const [inFlight, orphans] = [await registry.list("inFlight"), await registry.list("orphans")];
+  if (inFlight.unreadable || orphans.unreadable) output.appendLine("[history] a handoff registry folder or file could not be read; the copies it names are not hidden");
+  const now = Date.now();
+  return (sessionId) => handoffForkState(inFlight.entries, orphans.entries, sessionId, now);
 }
-export function handoffForkStateOf(sessionId: string, now: number): HandoffForkState | undefined {
-  const { inFlight, orphans } = handoffRegistries();
-  return handoffForkState(inFlight, orphans, sessionId, now);
+export async function handoffForkStateOf(sessionId: string): Promise<HandoffForkState | undefined> {
+  return (await handoffRegistries())(sessionId);
 }
-export function handoffForkInFlight(sessionId: string, now: number): boolean {
-  return isHandoffForkHidden(handoffForkStateOf(sessionId, now));
+async function hiddenHandoffForks(): Promise<(sessionId: string) => boolean> {
+  const stateOf = await handoffRegistries();
+  return (sessionId) => isHandoffForkHidden(stateOf(sessionId));
+}
+const restoreForkChecks = new Set<Promise<unknown>>();
+let openForkCheckTail: Promise<unknown> = Promise.resolve();
+export function handoffForkStateForOpen(sessionId: string, restoreEntry?: PersistedOpenTab): Promise<HandoffForkState | undefined> {
+  const check = openForkCheckTail.then(() => handoffForkStateOf(sessionId)).then((state) => {
+    if (restoreEntry !== undefined && isHandoffForkHidden(state)) holdHandoffForkTab(restoreEntry, state!);
+    return state;
+  });
+  openForkCheckTail = check.catch(() => undefined);
+  if (restoreEntry !== undefined) {
+    restoreForkChecks.add(check);
+    void check.finally(() => restoreForkChecks.delete(check)).catch(() => undefined);
+  }
+  return check;
 }
 export function postSessionListChanged(): void {
   store?.post({ type: "sessionListChanged" });
@@ -174,19 +224,26 @@ export function postSessionListChanged(): void {
 let startupSweep: Promise<void> | undefined;
 
 export function sweepHandoffForksAtStartup(): Promise<void> {
-  startupSweep ??= sweepHandoffForks();
+  startupSweep ??= handoffRegistriesFolded().then(sweepHandoffForks);
   return startupSweep;
 }
 
 export async function settleHeldForkTabsAfterSweep(post: (message: string) => void = noticeInFirstTab): Promise<void> {
   await startupSweep;
-  settleHeldForkTabs(post);
+  await Promise.allSettled([...restoreForkChecks]);
+  await settleHeldForkTabs(post);
 }
 
 async function sweepHandoffForks(): Promise<void> {
   try {
     const result = await HandoffRunner.sweepOrphans(
-      { fs: handoffFs, persist: handoffPersist(), readRecords: readHandoffRecords, log: (line) => output.appendLine(line) },
+      {
+        fs: handoffFs,
+        registry: handoffRegistry(),
+        contextUsage: handoffContextUsage(),
+        readRecords: readHandoffRecords,
+        log: (line) => output.appendLine(line),
+      },
       claudeProjectsDir()
     );
     if (result.deleted.length + result.kept.length + result.failed.length > 0) postSessionListChanged();
@@ -234,12 +291,13 @@ function dropHeldForkTab(tab: PersistedOpenTab, message: string, post: (message:
   post(message);
 }
 
-function settleHeldForkTabs(post: (message: string) => void): void {
+async function settleHeldForkTabs(post: (message: string) => void): Promise<void> {
+  const stateOf = await handoffRegistries();
   for (const held of heldForkTabs) {
     const tab = held.tab;
     if (reopeningForkTabs.has(tab.sessionId) || settledForkTabs.has(tab.sessionId)) continue;
     settledForkTabs.add(tab.sessionId);
-    const state = handoffForkStateOf(tab.sessionId, Date.now());
+    const state = stateOf(tab.sessionId);
     const lookup = state === undefined ? lookupSessionFile(tab.sessionId) : undefined;
     const action = heldForkTabAction(
       state,
@@ -308,7 +366,7 @@ interface HistoryListing {
 }
 const historyPages = new Map<string, HistoryListing>();
 
-const originCache = new Map<string, HistoricalOrigin>();
+const originCache = new Map<string, { mtime: number; origin: HistoricalOrigin }>();
 type HistoricalOrigin = "claude" | "claude-fork" | "unknown";
 const CLAUDE_CODE_ENTRYPOINTS: ReadonlySet<string> = new Set(["cli", "claude-vscode", "claude-desktop"]);
 function historySourceOf(origin: HistoricalOrigin | "failed", indexedByLaisora: boolean): HistorySource | undefined {
@@ -317,28 +375,149 @@ function historySourceOf(origin: HistoricalOrigin | "failed", indexedByLaisora: 
   if (origin === "failed") return indexedByLaisora ? "laisora" : undefined;
   return "laisora";
 }
-async function historicalOrigin(file: string, probes?: { count: number; bytes: number }): Promise<HistoricalOrigin | "failed"> {
-  const cached = originCache.get(file);
-  if (cached) return cached;
-  const handle = await open(file, "r").catch(() => undefined);
-  if (!handle) return "failed";
-  let origin: HistoricalOrigin = "unknown";
-  try {
-    const buffer = Buffer.alloc(65536);
-    const { bytesRead } = await handle.read(buffer, 0, buffer.length, 0);
-    if (probes) { probes.count++; probes.bytes += bytesRead; }
-    for (const line of buffer.subarray(0, bytesRead).toString("utf8").split("\n")) {
-      try {
-        const record = JSON.parse(line);
-        if (record.type !== "user" && record.type !== "assistant") continue;
-        if (typeof record.entrypoint !== "string") continue;
-        origin = !CLAUDE_CODE_ENTRYPOINTS.has(record.entrypoint) ? "unknown" : record.forkedFrom ? "claude-fork" : "claude";
-        break;
-      } catch { }
+const ORIGIN_READ_BYTES = 65536;
+const ORIGIN_SCAN_MAX_BYTES = 32 * 1024 * 1024;
+const ORIGIN_FIELD_MAX_BYTES = 64;
+type OriginField = "type" | "entrypoint" | "forkedFrom";
+const ORIGIN_FIELDS: ReadonlySet<string> = new Set<OriginField>(["type", "entrypoint", "forkedFrom"]);
+class RecordFieldScanner {
+  private depth = 0;
+  private inString = false;
+  private escaped = false;
+  private phase: "key" | "colon" | "value" | "next" = "key";
+  private key: string | undefined;
+  private captureFor: "key" | OriginField | undefined;
+  private captured: number[] = [];
+  private overflow = false;
+  private touched = false;
+  type: string | undefined;
+  entrypoint: string | undefined;
+  forked = false;
+
+  reset(): void {
+    this.depth = 0; this.inString = false; this.escaped = false; this.phase = "key"; this.key = undefined;
+    this.captureFor = undefined; this.captured = []; this.overflow = false; this.touched = false;
+    this.type = undefined; this.entrypoint = undefined; this.forked = false;
+  }
+
+  get pending(): boolean { return this.touched; }
+
+  get complete(): boolean { return this.touched && this.depth === 0 && !this.inString; }
+
+  skipStringBody(buf: Buffer, from: number, end: number): number {
+    if (!this.inString || this.escaped || this.captureFor !== undefined) return from;
+    let i = from;
+    while (i < end) {
+      const c = buf[i];
+      if (c === 34 || c === 92 || c === 10) break;
+      i++;
     }
-    originCache.set(file, origin);
-  } catch { return "failed"; } finally { await handle.close(); }
-  return origin;
+    return i;
+  }
+
+  push(b: number): void {
+    this.touched = true;
+    if (this.inString) {
+      if (this.escaped) this.escaped = false;
+      else if (b === 92) this.escaped = true;
+      else if (b === 34) { this.inString = false; this.endString(); return; }
+      if (this.captureFor !== undefined) {
+        if (this.captured.length < ORIGIN_FIELD_MAX_BYTES) this.captured.push(b); else this.overflow = true;
+      }
+      return;
+    }
+    if (b === 32 || b === 9 || b === 13) return;
+    const top = this.depth === 1;
+    if (b === 34) {
+      this.inString = true;
+      this.captured = []; this.overflow = false;
+      this.captureFor = !top ? undefined : this.phase === "key" ? "key"
+        : this.phase === "value" && this.key !== undefined && ORIGIN_FIELDS.has(this.key) ? this.key as OriginField : undefined;
+      if (top && this.phase === "value" && this.captureFor === undefined) this.phase = "next";
+      return;
+    }
+    if (b === 123 || b === 91) {
+      if (top && this.phase === "value") { if (this.key === "forkedFrom") this.forked = true; this.phase = "next"; }
+      this.depth++;
+      if (this.depth === 1) this.phase = "key";
+      return;
+    }
+    if (b === 125 || b === 93) { this.depth--; return; }
+    if (!top) return;
+    if (b === 58 && this.phase === "colon") { this.phase = "value"; return; }
+    if (b === 44) { this.phase = "key"; return; }
+    if (this.phase === "value") {
+      if (this.key === "forkedFrom") this.forked = b === 116 || (b >= 49 && b <= 57) || b === 45;
+      this.phase = "next";
+    }
+  }
+
+  private endString(): void {
+    const field = this.captureFor;
+    this.captureFor = undefined;
+    if (field === undefined) return;
+    const text = this.overflow ? undefined : Buffer.from(this.captured).toString("utf8");
+    if (field === "key") { this.key = text; this.phase = "colon"; return; }
+    this.phase = "next";
+    if (field === "type") this.type = text;
+    else if (field === "entrypoint") this.entrypoint = text;
+    else this.forked = this.captured.length > 0;
+  }
+}
+function originOfScannedRecord(scan: RecordFieldScanner): { conversation: boolean; origin?: HistoricalOrigin } {
+  if (!scan.complete || (scan.type !== "user" && scan.type !== "assistant")) return { conversation: false };
+  if (scan.entrypoint === undefined) return { conversation: true };
+  return {
+    conversation: true,
+    origin: !CLAUDE_CODE_ENTRYPOINTS.has(scan.entrypoint) ? "unknown" : scan.forked ? "claude-fork" : "claude",
+  };
+}
+async function scanHistoricalOrigin(
+  handle: FileHandle,
+  probes?: { count: number; bytes: number }
+): Promise<{ origin: HistoricalOrigin; settled: boolean }> {
+  const chunk = Buffer.alloc(ORIGIN_READ_BYTES);
+  const scan = new RecordFieldScanner();
+  let position = 0;
+  let lineStart = 0;
+  let scanEnd = ORIGIN_SCAN_MAX_BYTES;
+  while (lineStart < scanEnd && position < ORIGIN_SCAN_MAX_BYTES) {
+    const { bytesRead } = await handle.read(chunk, 0, chunk.length, position);
+    if (probes) { probes.count++; probes.bytes += bytesRead; }
+    if (bytesRead === 0) {
+      if (!scan.pending) return { origin: "unknown", settled: true };
+      const last = originOfScannedRecord(scan);
+      return { origin: last.origin ?? "unknown", settled: last.origin !== undefined };
+    }
+    for (let i = 0; i < bytesRead && lineStart < scanEnd; i++) {
+      i = scan.skipStringBody(chunk, i, bytesRead);
+      if (i >= bytesRead) break;
+      const b = chunk[i];
+      if (b !== 10) { scan.push(b); continue; }
+      const line = originOfScannedRecord(scan);
+      if (line.origin !== undefined) return { origin: line.origin, settled: true };
+      scan.reset();
+      lineStart = position + i + 1;
+      if (line.conversation) scanEnd = Math.min(scanEnd, lineStart + ORIGIN_READ_BYTES);
+    }
+    position += bytesRead;
+  }
+  return { origin: "unknown", settled: true };
+}
+async function historicalOrigin(
+  file: string,
+  mtime: number,
+  probes?: { count: number; bytes: number }
+): Promise<{ origin: HistoricalOrigin | "failed"; settled: boolean }> {
+  const cached = originCache.get(file);
+  if (cached && cached.mtime === mtime) return { origin: cached.origin, settled: true };
+  const handle = await open(file, "r").catch(() => undefined);
+  if (!handle) return { origin: "failed", settled: true };
+  try {
+    const { origin, settled } = await scanHistoricalOrigin(handle, probes);
+    if (settled) originCache.set(file, { mtime, origin });
+    return { origin, settled };
+  } catch { return { origin: "failed", settled: true }; } finally { await handle.close(); }
 }
 
 let sessionSdk: Pick<typeof ClaudeCodeSdk, "getSessionInfo"> | undefined;
@@ -381,7 +560,7 @@ export async function refreshTabTitle(session: Session): Promise<void> {
   const generation = session.logicalGeneration;
   try {
     if (!sessionId) return;
-    rememberSession(session);
+    void rememberSession(session);
     const summary = await sessionSummaryOf(sessionId);
     if (summary === undefined) return;
     if (session.logicalGeneration !== generation || session.closed) return;
@@ -413,8 +592,7 @@ async function listPastSessions(
   const listStartT = Date.now();
   const root = claudeProjectsDir();
   const entries: SessionCandidate[] = [];
-  for (const session of store?.sessions.values() ?? []) rememberSession(session);
-  const known = usedSessionPaths();
+  await Promise.all([...(store?.sessions.values() ?? [])].map(rememberSession));
   const hidden = hiddenSessionIds();
   const source = options.source ?? "claude";
   const pageKey = `${source}:${options.showHidden === true}`;
@@ -472,10 +650,12 @@ async function listPastSessions(
     output.appendLine(`[history] stat できないファイル ${degradation.statFailed} 件（候補から除外・req ${requestId}）`);
   }
   const scanDoneT = Date.now();
+  const forkHidden = continuation ? undefined : await hiddenHandoffForks();
   const candidates = continuation ? entries : rankSessionCandidates(entries).filter(c =>
-    (options.showHidden === true || !hidden.has(c.sessionId)) && !handoffForkInFlight(c.sessionId, scanDoneT));
+    (options.showHidden === true || !hidden.has(c.sessionId)) && !forkHidden?.(c.sessionId));
   const token = continuation?.token ?? requestId;
-  const knownIds = continuation?.knownIds ?? new Set(Object.keys(known));
+  const known = await usedSessionIds();
+  const knownIds = continuation?.knownIds ?? known;
   const origins = continuation?.origins ?? new Map<string, HistoricalOrigin | "failed">();
   if (!continuation) historyPages.set(pageKey, {token, candidates, knownIds, origins, degradation});
   const pathBySessionId = candidatePathIndex(candidates);
@@ -492,9 +672,10 @@ async function listPastSessions(
     let origin = origins.get(c.sessionId);
     if (origin === undefined) {
       const t = Date.now();
-      origin = await historicalOrigin(c.filePath, originProbes);
+      const read = await historicalOrigin(c.filePath, c.mtime, originProbes);
       originMs += Date.now() - t;
-      origins.set(c.sessionId, origin);
+      origin = read.origin;
+      if (read.settled) origins.set(c.sessionId, origin);
       if (origin === "failed" && historySourceOf(origin, indexed) === undefined && source === "claude") {
         degradation.statFailed++;
         output.appendLine(`[history] 由来を読めません（一覧から除外）: ${c.sessionId}・req ${requestId}`);
@@ -543,7 +724,7 @@ async function listPastSessions(
         );
       }
       for (const row of sessions) {
-        if (source === "laisora" && !known[row.sessionId]) row.originUnverified = true;
+        if (source === "laisora" && !known.has(row.sessionId)) row.originUnverified = true;
         if (hidden.has(row.sessionId)) row.hidden = true;
       }
       const t = Date.now();
@@ -590,7 +771,7 @@ function liveTitleCli(s: Session, ref: { sessionId: string } | null): ClaudeConv
 
 export function writeHeldChosenTitle(s: Session): Promise<void> {
   const pending = s.unpersistedChosenTitle;
-  if (pending === null) return Promise.resolve();
+  if (pending === null || s.transcriptWriteLocked) return Promise.resolve();
   const ref = sessionTranscriptRef(s);
   s.unpersistedChosenTitle = null;
   if (ref === null) return Promise.resolve();
@@ -602,7 +783,7 @@ export function writeHeldChosenTitle(s: Session): Promise<void> {
 
 export async function flushChosenTitle(s: Session): Promise<void> {
   const pending = s.unpersistedChosenTitle;
-  if (pending === null) return;
+  if (pending === null || s.transcriptWriteLocked) return;
   const ref = sessionTranscriptRef(s);
   let outcome: "cli" | "file" | "pending";
   try {
@@ -660,6 +841,7 @@ async function renameOpenSession(
     s.pushEvent({ kind: "error", message: reason, fatal: false });
     return { reason };
   };
+  if (await judgeTranscriptWriteLock(s)) return refuse(transcriptWriteLockedText());
   if (target === null) return refuse(l10n.t("/rename can be used once the session file is determined (try again after the first response)."));
   if (!renameTargetIsCurrent(s, target)) {
     output.appendLine(`[history] Dropped a rename for a session the tab no longer shows: ${target.ref.sessionId}`);
@@ -668,7 +850,7 @@ async function renameOpenSession(
   }
   const { ref, generation } = target;
   const title = normalizeTitleValue(rawTitle);
-  if (title === null) return refuse(l10n.t("Usage: /rename <new name>"));
+  if (title === null) return refuse(renameUsageText());
   const starting = s.starting;
   let outcome: "cli" | "file" | "pending" = "pending";
   if (starting === null) {
@@ -706,6 +888,8 @@ async function renameListedSession(st: SessionStore, msg: Extract<WebviewToHost,
     }
     return;
   }
+  const recorded = await readRecordedSessionCwd(msg.filePath).catch(() => undefined);
+  if (await transcriptWriteLockedAt(recorded?.cwd ?? newSessionCwd())) { fail(transcriptWriteLockedText()); return; }
   const title = normalizeTitleValue(msg.title);
   if (title === null) { fail(l10n.t("Enter a name.")); return; }
   try {
@@ -766,7 +950,7 @@ export async function handleSessionFileMessage(
     case "requestAccountUsage": {
       const conversation = target?.conversation && !target.conversation.isClosed ? target.conversation : undefined;
       const cfg = getLaisoraConfiguration();
-      const apiKeyPolicy = normalizeApiKeyPolicy(cfg.get<string>("claude.apiKeyPolicy")!);
+      const apiKeyPolicy = configuredApiKeyPolicy(cfg);
       const snapshot = await accountUsageFetcher.request(sender, {
         identity: JSON.stringify([claudeConfigDir(), apiKeyPolicy, target?.auth?.credentialSource ?? null, target?.auth?.apiKeySource ?? null]),
         ...(conversation ? { viaConversation: (signal: AbortSignal) => conversation.planUsageRateLimits(ACCOUNT_USAGE_TIMEOUT_MS, signal) } : {}),
@@ -810,7 +994,7 @@ export async function handleSessionFileMessage(
     case "openSessionImage": {
       const session = target;
       if (!session || !extensionContext) {
-        void vscode.window.showWarningMessage(l10n.t("LAISORA: Could not open the image."));
+        warnImageOpenFailed();
         break;
       }
       try {
@@ -819,7 +1003,7 @@ export async function handleSessionFileMessage(
         if (msg.ref) {
           const res = await resolveSessionImage(session, msg.ref);
           if ("error" in res) {
-            void vscode.window.showWarningMessage(l10n.t("LAISORA: Could not open the image."));
+            warnImageOpenFailed();
             break;
           }
           imageBytes = res;
@@ -831,7 +1015,7 @@ export async function handleSessionFileMessage(
           fileKey = `${session.tabId}-inline-${Date.now()}`;
         }
         if (!imageBytes) {
-          void vscode.window.showWarningMessage(l10n.t("LAISORA: Could not open the image."));
+          warnImageOpenFailed();
           break;
         }
         const extMap: Record<ImageAttachment["mediaType"], string> = {
@@ -848,7 +1032,7 @@ export async function handleSessionFileMessage(
         await vscode.workspace.fs.writeFile(fileUri, buffer);
         await vscode.commands.executeCommand("vscode.open", fileUri);
       } catch {
-        void vscode.window.showWarningMessage(l10n.t("LAISORA: Could not open the image."));
+        warnImageOpenFailed();
       }
       break;
     }

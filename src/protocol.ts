@@ -1,3 +1,5 @@
+import { SKIP_PROMPT_HISTORY_ENV } from "./skip-prompt-history-env";
+import { clipText } from "./text-clip";
 import { isToolIntentInput, type ToolIntentInput } from "./tool-intent";
 import { isAccentSettings, isAccentSettingValue, type AccentSettings, type AccentSetting } from "./accent";
 import { isDisplayName } from "./display-name";
@@ -12,7 +14,7 @@ import type { FailureSummaryView } from "./exec-log-marks";
 import type { HandoffCompactStats } from "./handoff-envelope";
 import type { HandoffNoticeFacts } from "./steering-envelope";
 import type { AnalysisPlansView, RoleSummaryView } from "./role-summary";
-import { EXECUTORS, externalRunStatus, isExecutorId, isExternalRunOutcome, type ExecutorId, type ExternalRunOutcome } from "./orchestration-executors";
+import { EXECUTORS, externalRunStatus, isExecutorId, isExternalRunOutcome, isOrchestrationEffort, type ExecutorId, type ExternalRunOutcome, type OrchestrationEffort } from "./orchestration-executors";
 import { isDelegationTool } from "./claude-tool-names";
 import { isAskUnansweredKind, type AskUnansweredKind } from "./ask-unanswered";
 import { ELICITATION_CONTENT_LIMITS, elicitationTextLength, type ElicitationAction, type ElicitationSpec, type ElicitationValue } from "./elicitation";
@@ -26,9 +28,9 @@ import * as l10n from "@vscode/l10n";
 import { FILE_LINK_TARGET_MAX_LEN } from "./file-link-target";
 export { FILE_LINK_TARGET_MAX_LEN } from "./file-link-target";
 import { agentRuns, findToolPlacement, findWorkSegment, phaseStateOf, runningMainPlacement } from "./work-model";
-import { ANALYSIS_TIME_PART_KEYS, MAIN_PROCESSING_BUCKETS, planCurrentSteps } from "./plan-steps";
+import { ANALYSIS_TIME_PART_KEYS, MAIN_PROCESSING_BUCKETS, planCurrentSteps, type PlanStepMarks } from "./plan-steps";
 import { BACKGROUND_ACTIVITY_LIST_MAX, type BackgroundActivitySnapshot } from "./background-activity";
-import { isTodoAskIdentity, isTodoTime, isTodoDocLabel, isTodoImageName, isTodoGroupName, isTodoFolderPath, isTodoLinkTarget, TODO_ITEM_SHAPES, TODO_CHANGE_FIELDS, isTodoChangeRecord, isTodoGroupAlias, isTodoBriefText, isTodoDocFields, isTodoGuessReason, isTodoId, isTodoMemoEntry, isTodoMemoText, isTodoSessionId, todoItemFieldValid, TODO_OPERATION_ERRORS, TODO_REVERT_BLOCKS, type TodoPlacementBasis, type TodoChangePlace, type TodoCaptured, TODO_ASK_PLACES, type TodoAskPlace, TODO_ASK_SOURCE_MESSAGES_MAX, TODO_BATCH_MAX, type TodoBatchStep, TODO_GROUP_COLOR_COUNT, TODO_TEMPLATE_NAME_MAX, TODO_ACKNOWLEDGE_MAX, TODO_IMAGE_EXTENSIONS, TODO_TITLE_MAX, WORK_MEMO_SECTIONS, TODO_START_KINDS, type TodoStartKind, type TodoAuthor, type TodoCompletion, type TodoDocKind, type TodoImageMediaType, type TodoOperationError, type TodoPriority, type TodoRevertBlock, type TodoState, type WorkMemoSection, type TodoDecision, type TodoItemBy, type TodoChange } from "./todo-model";
+import { isTodoAskIdentity, isTodoGenerationChain, isTodoGenerationId, type TodoGeneration, isTodoTime, isTodoDocLabel, isTodoImageName, isTodoGroupName, isTodoFolderPath, isTodoLinkTarget, TODO_ITEM_SHAPES, TODO_CHANGE_FIELDS, isTodoChangeRecord, isTodoGroupAlias, isTodoBriefText, isTodoDocFields, isTodoGuessReason, isTodoId, isTodoMemoEntry, isTodoMemoText, isTodoSessionId, todoItemFieldValid, TODO_OPERATION_ERRORS, TODO_REVERT_BLOCKS, type TodoPlacementBasis, type TodoChangePlace, type TodoCaptured, TODO_ASK_PLACES, type TodoAskPlace, TODO_ASK_SOURCE_MESSAGES_MAX, TODO_ASK_SOURCE_TEXT_MAX, TODO_BATCH_MAX, type TodoBatchStep, TODO_GROUP_COLOR_COUNT, TODO_TEMPLATE_NAME_MAX, TODO_ACKNOWLEDGE_MAX, TODO_CHANGE_LOG_LIMIT, TODO_IMAGE_EXTENSIONS, TODO_TITLE_MAX, WORK_MEMO_SECTIONS, TODO_START_KINDS, type TodoStartKind, type TodoAuthor, type TodoCompletion, type TodoDocKind, type TodoImageMediaType, type TodoOperationError, type TodoPriority, type TodoRevertBlock, type TodoState, type WorkMemoSection, type TodoDecision, type TodoItemBy, type TodoChange } from "./todo-model";
 export { BACKGROUND_ACTIVITY_LIST_MAX } from "./background-activity";
 export type { BackgroundActivitySnapshot } from "./background-activity";
 import type {
@@ -103,6 +105,10 @@ export interface EventEnvelope {
 }
 
 export type NormalizedEvent = EventEnvelope & NormalizedEventBody;
+
+export function userMessageTurnId(ev: { readonly turnId?: string | null; readonly absorbedInto?: string }): string | null {
+  return ev.absorbedInto ?? ev.turnId ?? null;
+}
 
 export interface ModelRefusalFallback {
   originalModel: string;
@@ -292,7 +298,7 @@ export type NormalizedEventBody =
     | { kind: "turn_started"; turnId: string; cliInserted?: true; laisoraInput?: true; laisoraWake?: true }
     | { kind: "auto_resume"; state: "pending"; at: number }
     | { kind: "auto_resume"; state: "cancelled" | "fired" | "exhausted" }
-    | { kind: "turn_completed"; turnId: string; usage?: UsageSnapshot }
+    | { kind: "turn_completed"; turnId: string; usage?: UsageSnapshot; endedByInterrupt?: true }
     | { kind: "turn_interrupted"; turnId: string }
     | {
         kind: "turn_failed";
@@ -330,7 +336,10 @@ export type NormalizedEventBody =
         imageRefs?: ImageRefInfo[];
         sentAt?: number;
         priorGeneration?: true;
+        cancelled?: true;
+        remote?: true;
       }
+    | { kind: "user_message_cancelled"; uuids: string[] }
     | {
         kind: "replayed_message";
         role: "user" | "assistant" | "system";
@@ -341,6 +350,7 @@ export type NormalizedEventBody =
         recordedAt?: number;
         sentAt?: number;
         restoredApproval?: RestoredApprovalCard;
+        remote?: true;
       }
     | {
         kind: "tool_call_started";
@@ -466,6 +476,7 @@ export interface RestoredApprovalCard {
   requestId: string;
   toolName: string;
   inputJson: string;
+  inputClipped?: true;
   questions?: AskUserQuestionSpec;
   answers?: Record<string, string>;
   resolution: typeof RESTORED_APPROVAL_RESOLUTIONS[number];
@@ -527,7 +538,7 @@ export interface AuthStatus {
   apiProvider?: string;
   tokenSource?: string;
   model?: string;
-  effort?: "low" | "medium" | "high" | "xhigh" | "max" | null;
+  effort?: OrchestrationEffort | null;
   sessionId?: string;
   verifiedAt: number;
   status: "verified" | "pending" | "error";
@@ -538,6 +549,12 @@ export interface AuthStatus {
 export interface ImageAttachment {
   mediaType: "image/png" | "image/jpeg" | "image/gif" | "image/webp";
   data: string;
+}
+
+export interface FileSuggestRow {
+  text: string;
+  workspaceRelative: string;
+  insideCwd: boolean;
 }
 
 export type SessionImageRef =
@@ -658,7 +675,7 @@ export function isInternalSlashCommand(cmd: SlashCommandInfo): boolean {
 export const TOOL_SUMMARY_MAX = 60;
 
 export function clipSummary(s: string, n = TOOL_SUMMARY_MAX): string {
-  return s.length > n ? `${s.slice(0, n)}…` : s;
+  return clipText(s, n);
 }
 
 export function summarizeToolInput(toolName: string, input: unknown): string | null {
@@ -813,7 +830,7 @@ export function normalizeComposerSendKey(v: unknown): ComposerSendKey {
   return v === "shiftEnter" ? "shiftEnter" : "enter";
 }
 
-export const FILE_LINK_BOOLEAN_SETTINGS = ["fileLinkInstruction", "planInstruction", "chromeIntegration", "mcpElicitation", "writesLostNotice", "revealInExplorer", "allowOutsideWorkspace", "confirmOutsideWorkspace", "openOutsideReadOnly"] as const;
+export const FILE_LINK_BOOLEAN_SETTINGS = ["fileLinkInstruction", "planInstruction", "closingSummary", "chromeIntegration", "mcpElicitation", "writesLostNotice", "revealInExplorer", "allowOutsideWorkspace", "confirmOutsideWorkspace", "openOutsideReadOnly"] as const;
 export const FILE_LINK_SETTINGS = [...FILE_LINK_BOOLEAN_SETTINGS, "openWithSystemApp"] as const;
 export type FileLinkBooleanSetting = (typeof FILE_LINK_BOOLEAN_SETTINGS)[number];
 export type FileLinkSetting = (typeof FILE_LINK_SETTINGS)[number];
@@ -830,6 +847,9 @@ export const HANDOFF_AUTO_SETTING_KEYS = {
   percent: "handoff.auto.percent",
   tokens: "handoff.auto.tokens",
   cacheExpiryEnabled: "handoff.cacheExpiry.enabled",
+  continueWork: "handoff.auto.continueWork",
+  closingSummary: "handoff.auto.closingSummary",
+  closeSourceTab: "handoff.closeSourceTab",
 } as const;
 
 export interface HandoffAutoSettings {
@@ -838,14 +858,28 @@ export interface HandoffAutoSettings {
   percent: number;
   tokens: number;
   cacheExpiryEnabled: boolean;
+  continueWork: boolean;
+  closingSummary: boolean;
+  closeSourceTab: boolean;
 }
 
 export type HandoffAutoSettingName = keyof HandoffAutoSettings;
+
+export function handoffContinuesWork(settings: Pick<HandoffAutoSettings, "enabled" | "continueWork">): boolean {
+  return settings.enabled && settings.continueWork;
+}
+
+export function closingSummaryAfterHandoffOn(settings: Pick<HandoffAutoSettings, "enabled" | "continueWork" | "closingSummary">): boolean {
+  return handoffContinuesWork(settings) && settings.closingSummary;
+}
 
 export function isHandoffAutoSettingValue(setting: unknown, value: unknown): boolean {
   switch (setting) {
     case "enabled":
     case "cacheExpiryEnabled":
+    case "continueWork":
+    case "closingSummary":
+    case "closeSourceTab":
       return typeof value === "boolean";
     case "mode":
       return (HANDOFF_AUTO_MODES as readonly unknown[]).includes(value);
@@ -1015,7 +1049,7 @@ export type HostToSettingsPage =
   | { type: "revealSetting"; target: SettingsRevealTarget }
   | { type: "migrationState"; scan?: MigrationScan; busy: boolean; notice?: MigrationNotice }
   | { type: "migrationProgress"; progress: MigrationProgress }
-  | ({ type: "settingsState"; appearance?: AccentSettings; displayName?: string; eventLimit?: number; transcriptRetentionDays?: number; transcriptRetentionFallback: TranscriptRetentionFallback; composerSendKey: ComposerSendKey; apiKeyPolicy: ApiKeyPolicy; restoreTabsOnStartup: boolean; cliAutoUpdate: Record<ExecutorId, boolean>; initialModel?: string; autoContinueAtUsageLimit: boolean; guardEnabled: boolean; memoryBlockProjectType: boolean; todoEnabled: boolean; editSummaryEnabled: boolean; remoteControlCard: boolean; improvementMenu: boolean; welcome?: WelcomeSettings; handoffAuto?: HandoffAutoSettings; waitNotify?: WaitNotifySettings; reloadNeeded: boolean; replyTo?: number; writeFailure?: SettingWriteFailure }
+  | ({ type: "settingsState"; appearance?: AccentSettings; displayName?: string; eventLimit?: number; transcriptRetentionDays?: number; transcriptRetentionFallback: TranscriptRetentionFallback; composerSendKey: ComposerSendKey; apiKeyPolicy: ApiKeyPolicy; restoreTabsOnStartup: boolean; cliAutoUpdate: Record<ExecutorId, boolean>; initialModel?: string; autoContinueAtUsageLimit: boolean; guardEnabled: boolean; memoryBlockProjectType: boolean; todoEnabled: boolean; editSummaryEnabled: boolean; remoteControlCard: boolean; improvementMenu: boolean; welcome?: WelcomeSettings; handoffAuto?: HandoffAutoSettings; waitNotify?: WaitNotifySettings; waitNotifyTelemetryOff?: true; reloadNeeded: boolean; replyTo?: number; writeFailure?: SettingWriteFailure }
     & SettingsProfileProjection & Record<FileLinkBooleanSetting, boolean> & { openWithSystemApp: string[] } & { orchestrationEnabled: boolean; orchestrationAgents: OrchestrationSettingRow[]; orchestrationDefaults: OrchestrationSettingRow[]; conductorPolicy: string; conductorPolicyDefault: string; externalTimeoutMinutes: number; externalDetection: Record<ExecutorId, ExternalDetection>; externalModels: ExternalModels });
 
 function isSettingsRequestId(v: unknown): v is number {
@@ -1154,6 +1188,7 @@ export function isHostToSettingsPage(v: unknown): v is HostToSettingsPage {
       && (m.welcome === undefined || isWelcomeSettings(m.welcome))
       && (m.handoffAuto === undefined || isSettingsGroup<HandoffAutoSettings>(m.handoffAuto, HANDOFF_AUTO_SETTING_KEYS, isHandoffAutoSettingValue))
       && (m.waitNotify === undefined || isSettingsGroup<WaitNotifySettings>(m.waitNotify, WAIT_NOTIFY_SETTING_KEYS, isWaitNotifySettingValue))
+      && (m.waitNotifyTelemetryOff === undefined || m.waitNotifyTelemetryOff === true)
       && typeof m.orchestrationEnabled === "boolean" && typeof m.conductorPolicy === "string"
       && typeof m.conductorPolicyDefault === "string"
       && isOrchestrationSettingRoster(m.orchestrationAgents) && isOrchestrationSettingRoster(m.orchestrationDefaults)
@@ -1162,14 +1197,82 @@ export function isHostToSettingsPage(v: unknown): v is HostToSettingsPage {
       && Array.isArray(m.openWithSystemApp) && m.openWithSystemApp.every((item) => typeof item === "string")
       && (m.replyTo === undefined || isSettingsRequestId(m.replyTo))
       && (m.writeFailure === undefined || m.replyTo !== undefined && isSettingWriteFailure(m.writeFailure))
-      && hasOnlyKeys(m, ["type", "initialModel", "appearance", "displayName", "eventLimit", "transcriptRetentionDays", "transcriptRetentionFallback", "composerSendKey", "apiKeyPolicy", "restoreTabsOnStartup", "cliAutoUpdate", "autoContinueAtUsageLimit", "guardEnabled", "memoryBlockProjectType", "todoEnabled", "editSummaryEnabled", "remoteControlCard", "improvementMenu", "welcome", "handoffAuto", "waitNotify", "reloadNeeded", ...FILE_LINK_SETTINGS, "orchestrationEnabled", "orchestrationAgents", "orchestrationDefaults", "conductorPolicy", "conductorPolicyDefault", "externalTimeoutMinutes", "externalDetection", "externalModels", "replyTo", "writeFailure", "conductorPreview", "recommendedRosterSame"]);
+      && hasOnlyKeys(m, ["type", "initialModel", "appearance", "displayName", "eventLimit", "transcriptRetentionDays", "transcriptRetentionFallback", "composerSendKey", "apiKeyPolicy", "restoreTabsOnStartup", "cliAutoUpdate", "autoContinueAtUsageLimit", "guardEnabled", "memoryBlockProjectType", "todoEnabled", "editSummaryEnabled", "remoteControlCard", "improvementMenu", "welcome", "handoffAuto", "waitNotify", "waitNotifyTelemetryOff", "reloadNeeded", ...FILE_LINK_SETTINGS, "orchestrationEnabled", "orchestrationAgents", "orchestrationDefaults", "conductorPolicy", "conductorPolicyDefault", "externalTimeoutMinutes", "externalDetection", "externalModels", "replyTo", "writeFailure", "conductorPreview", "recommendedRosterSame"]);
   }
   t satisfies never;
   return false;
 }
 
+export interface AskMarks {
+  readonly dismissed: readonly string[];
+  readonly resolved: readonly string[];
+  readonly checked: Readonly<Record<string, readonly boolean[]>>;
+  readonly checkedTags: Readonly<Record<string, string>>;
+  readonly checkedPosted: Readonly<Record<string, true>>;
+}
+
+export const EMPTY_ASK_MARKS: AskMarks = { dismissed: [], resolved: [], checked: {}, checkedTags: {}, checkedPosted: {} };
+
+export const ASK_MARKS_MAX = 500;
+
+export function isAskMarks(v: unknown): v is AskMarks {
+  if (typeof v !== "object" || v === null || Array.isArray(v)) return false;
+  const m = v as Record<string, unknown>;
+  const record = (x: unknown, value: (y: unknown) => boolean): boolean =>
+    typeof x === "object" && x !== null && !Array.isArray(x) && Object.keys(x).length <= ASK_MARKS_MAX && Object.values(x).every(value);
+  return hasOnlyKeys(m, ["dismissed", "resolved", "checked", "checkedTags", "checkedPosted"])
+    && isAskMarkStrings(m.dismissed) && isAskMarkStrings(m.resolved)
+    && record(m.checked, (steps) => Array.isArray(steps) && steps.every((step) => typeof step === "boolean"))
+    && record(m.checkedTags, (tag) => typeof tag === "string")
+    && record(m.checkedPosted, (posted) => posted === true);
+}
+
+export interface AskStateKey { readonly message: string; readonly tag: string; readonly onlyInRecord: boolean }
+
+export type AskMarkEdit =
+  | { readonly kind: "check"; readonly key: AskStateKey; readonly steps: readonly boolean[]; readonly posted: boolean; readonly ifAbsent?: true }
+  | { readonly kind: "dismiss"; readonly messages: readonly string[] }
+  | { readonly kind: "resolve"; readonly records: readonly string[]; readonly withdrawn: readonly string[] }
+  | { readonly kind: "legacy"; readonly marks: AskMarks };
+
+export interface AskMarksOrigin { readonly client: string; readonly seq: number }
+
+function isAskMarkStrings(x: unknown): x is string[] {
+  return Array.isArray(x) && x.length <= ASK_MARKS_MAX && x.every((s) => typeof s === "string");
+}
+
+function isAskMarkEdit(v: unknown): v is AskMarkEdit {
+  if (typeof v !== "object" || v === null || Array.isArray(v)) return false;
+  const e = v as Record<string, unknown>;
+  switch (e.kind) {
+    case "check": {
+      const key = e.key as Record<string, unknown> | null;
+      return hasOnlyKeys(e, ["kind", "key", "steps", "posted", "ifAbsent"])
+        && typeof key === "object" && key !== null && hasOnlyKeys(key, ["message", "tag", "onlyInRecord"])
+        && typeof key.message === "string" && typeof key.tag === "string" && typeof key.onlyInRecord === "boolean"
+        && Array.isArray(e.steps) && e.steps.length <= ASK_MARKS_MAX && e.steps.every((step) => typeof step === "boolean")
+        && typeof e.posted === "boolean" && (e.ifAbsent === undefined || e.ifAbsent === true);
+    }
+    case "dismiss":
+      return hasOnlyKeys(e, ["kind", "messages"]) && isAskMarkStrings(e.messages);
+    case "resolve":
+      return hasOnlyKeys(e, ["kind", "records", "withdrawn"]) && isAskMarkStrings(e.records) && isAskMarkStrings(e.withdrawn);
+    case "legacy":
+      return hasOnlyKeys(e, ["kind", "marks"]) && isAskMarks(e.marks);
+    default:
+      return false;
+  }
+}
+
+function isAskMarksOrigin(v: unknown): v is AskMarksOrigin {
+  if (typeof v !== "object" || v === null || Array.isArray(v)) return false;
+  const o = v as Record<string, unknown>;
+  return hasOnlyKeys(o, ["client", "seq"]) && typeof o.client === "string" &&Number.isSafeInteger(o.seq) && (o.seq as number) > 0;
+}
+
 export type WebviewToHost =
   | { type: "ready"; cursor: { generation: number; seq: number } | null }
+  | { type: "askMarkEdit"; client: string; seq: number; edit: AskMarkEdit }
   | { type: "send"; tabId: string; text: string; clientToken?: string; images?: ImageAttachment[] }
   | { type: "attachImage"; tabId: string; mediaType: ImageAttachment["mediaType"]; data: string }
   | { type: "removeAttachment"; tabId: string; attachmentId: string }
@@ -1196,7 +1299,7 @@ export type WebviewToHost =
   | { type: "setMode"; tabId: string; mode: PermissionModeId }
   | { type: "setModel"; tabId: string; model: string | null }
   | { type: "setEffort"; tabId: string; effort: string | null }
-  | { type: "queryFiles"; reqId: number; query: string }
+  | { type: "queryFiles"; tabId: string; reqId: number; query: string }
   | { type: "pickFiles"; reqId: number; imageSlots: number }
   | { type: "openFile"; tabId: string; target: string }
   | { type: "openEditDiff"; tabId: string; firstToolUseId: string; lastToolUseId: string }
@@ -1245,7 +1348,14 @@ export type WebviewToHost =
       tabId: string;
       requestId: string;
       cursor?: string;
-      anchorUuid?: string;
+      anchorUuids?: string[];
+    }
+  | {
+      type: "conversationMessageTextRequest";
+      tabId: string;
+      requestId: string;
+      uuid: string;
+      offset: number;
     }
   | {
       type: "sessionImageRequest";
@@ -1273,6 +1383,7 @@ export type WebviewToHost =
   | { type: "resumeSession"; sessionId: string; filePath: string; intoTabId?: string }
   | { type: "resumeHydrationRetry"; tabId: string }
   | { type: "activeTab"; tabId: string; user?: true }
+  | { type: "conversationHidden" }
   | { type: "todoEdit"; requestId: string; edit: TodoEdit }
   | { type: "todoDetailRequest"; id: string }
   | { type: "todoLogRequest"; view: TodoLogView }
@@ -1283,6 +1394,7 @@ export type WebviewToHost =
   | { type: "todoFromReply"; tabId: string; replyId: string; start: boolean }
   | { type: "todoAskSourceRequest"; sessionId: string; requestId: number }
   | { type: "todoAskDismiss"; itemId: string; message: string; place: TodoAskPlace }
+  | { type: "todoAskUntick"; itemId: string; message: string }
   | { type: "todoChangesRequest"; requestId: number; ids: string[]; revisions?: number[][] }
   | { type: "todoDrawerFocus"; focused: boolean }
   | { type: "reorderTabs"; order: string[] };
@@ -1325,10 +1437,10 @@ export type TodoEdit =
   | { kind: "addLink"; id: string; target: string; label?: string }
   | { kind: "addImage"; id: string; mediaType: TodoImageMediaType; data: string; label?: string }
   | { kind: "removeDoc"; id: string; docId: string }
-  | { kind: "undo"; revision: number }
-  | { kind: "revertClaude"; changeId: string }
-  | { kind: "revertClaude"; changeIds: string[] }
-  | { kind: "revertClaude"; revisions: number[] };
+  | { kind: "undo"; revision: number; generation?: string }
+  | { kind: "revertClaude"; changeId: string; generation?: string }
+  | { kind: "revertClaude"; changeIds: string[]; generation?: string }
+  | { kind: "revertClaude"; revisions: number[]; generation?: string };
 
 const TODO_BATCH_KINDS: readonly unknown[] = ["update", "setState", "move", "delete"] satisfies ReadonlyArray<TodoBatchStep["kind"]>;
 
@@ -1336,6 +1448,7 @@ export type TodoEditError = TodoOperationError | "invalid-doc" | "link-too-long"
 
 export interface TodoChangeView {
   readonly id: string;
+  readonly generation?: string;
   readonly at: number;
   readonly author: TodoAuthor;
   readonly itemId: string;
@@ -1454,6 +1567,14 @@ export function rejectedTodoEditId(value: unknown): string | undefined {
   if (typeof value !== "object" || value === null) return undefined;
   const message = value as Record<string, unknown>;
   return message.type === "todoEdit" && isTodoId(message.requestId) ? message.requestId : undefined;
+}
+
+export function rejectedSend(value: unknown): { tabId: string; clientToken: string; tooLong: boolean } | undefined {
+  if (typeof value !== "object" || value === null) return undefined;
+  const message = value as Record<string, unknown>;
+  return message.type === "send" && typeof message.tabId === "string" && typeof message.clientToken === "string"
+    ? { tabId: message.tabId, clientToken: message.clientToken, tooLong: typeof message.text === "string" && message.text.length > SEND_TEXT_MAX_LEN }
+    : undefined;
 }
 export type TodoDetailMessage = Extract<HostToWebview, { type: "todoDetail" }>;
 export type TodoWorkMessage = Extract<HostToWebview, { type: "todoWork" }>;
@@ -1622,10 +1743,13 @@ interface AgentInspectorPageBase {
   nextCursor?: string;
 }
 
+export const AGENT_INSPECTOR_REPORT_SOURCES = ["handback", "text", "none"] as const;
+export type AgentInspectorReportSource = typeof AGENT_INSPECTOR_REPORT_SOURCES[number];
+
 export type AgentInspectorPage =
   | (AgentInspectorPageBase & { section: "overview"; overview: AgentInspectorOverview })
   | (AgentInspectorPageBase & { section: "tools"; tools: AgentInspectorToolItem[] })
-  | (AgentInspectorPageBase & { section: "messages"; messages: AgentInspectorMessageItem[] })
+  | (AgentInspectorPageBase & { section: "messages"; messages: AgentInspectorMessageItem[]; reportSource: AgentInspectorReportSource })
   | (AgentInspectorPageBase & { section: "report"; text: string });
 
 export type AgentInspectorErrorReason =
@@ -1670,6 +1794,9 @@ export interface ConversationHistoryMessagePayload {
   imageRefs?: ImageRefInfo[];
   model?: string;
   restoredApproval?: RestoredApprovalCard;
+  clipped?: true;
+  asksPastCut?: true;
+  remote?: true;
 }
 
 export interface ConversationHistoryPagePayload {
@@ -1773,6 +1900,26 @@ export function workEndStatus(agent: { status: WorkStatus; stopped?: true }): Wo
   return agent.status === "stale" && agent.stopped === true ? "stopped" : agent.status;
 }
 
+export function workEndStatusWord(status: WorkEndStatus | "pending" | ExternalRunOutcome): string {
+  switch (status) {
+    case "running": return l10n.t("Running");
+    case "completed": return l10n.t("Completed");
+    case "failed": return l10n.t("Failed");
+    case "stale": return l10n.t("Tracking stopped");
+    case "stopped": return l10n.t("Stopped");
+    case "unknown": return l10n.t("Unknown");
+    case "pending": return l10n.t("Not started");
+    case "ok": return l10n.t("Succeeded");
+    case "timeout": return l10n.t("Timed out");
+    case "refused": return l10n.t("Refused");
+  }
+}
+
+export function externalRunStatusWord(run: { running: boolean; outcome: ExternalRunOutcome | null }): string {
+  const end = externalRunEndStatus(run);
+  return workEndStatusWord(end === "running" || end === "stale" || run.outcome === null ? end : run.outcome);
+}
+
 export function externalRunEndStatus(run: { running: boolean; outcome: ExternalRunOutcome | null }): WorkEndStatus {
   return run.running ? "running" : run.outcome === null ? "stale" : externalRunStatus(run.outcome);
 }
@@ -1818,7 +1965,7 @@ export interface WorkEventInfo {
   turnToolCount?: number;
 }
 
-export interface PlanContextStep {
+export interface PlanContextStep extends PlanStepMarks {
   key: string; number: number; title: string; status: import("./work-model").TaskStatus; removed: boolean; startedAt: number | null; endedAt: number | null;
   period?: Pick<import("./plan-steps").PlanRowPeriod, "spans" | "running">;
   tokens?: PlanContextTokens | null;
@@ -1836,11 +1983,23 @@ export interface PlanContextExternalRun {
 }
 
 // stepKey null: the lane is not on a step of this PLAN. agentId names a delegation's subagent for lanes known only by it.
-// resumes and tokens: present when a resume moved runs to another item (src/time-buckets.ts#RunPlacement). resumes lists
-// only the resumes whose runs belong to this PLAN's block, each with its step or null; a resume it does not list is placed
-// in another block. tokens are the lane's own runs' (the launch's for the placement, the resume's for an entry).
-export interface PlanContextPlacement { toolUseId: string; agentId?: string; stepKey: string | null; tokens?: PlanContextTokens | null;
-  resumes?: { at: number; stepKey: string | null; tokens: PlanContextTokens | null }[] }
+// resumes: present when a resume moved runs to another item (src/time-buckets.ts#RunPlacement). It lists only the resumes
+// whose runs belong to this PLAN's block, each with its step or null; a resume it does not list is placed in another block.
+// runTokens: present for a resumed delegation; only the runs this PLAN's block counts (src/role-summary.ts#countedRunTokens),
+// from null for the launch's, else the resume's at; tokens null for a counted run that is not measured.
+export type PlanRunTokens = { from: number | null; tokens: PlanContextTokens | null };
+export interface PlanContextPlacement { toolUseId: string; agentId?: string; stepKey: string | null;
+  resumes?: { at: number; stepKey: string | null }[]; runTokens?: PlanRunTokens[] }
+
+export function planLaneTokens(runs: readonly PlanRunTokens[], drawnResumes: ReadonlySet<number>):
+  { launch: PlanContextTokens | null; resume: (at: number) => PlanContextTokens | null } {
+  const rest = runs.filter(run => run.from === null || !drawnResumes.has(run.from));
+  const measured = rest.flatMap(run => run.tokens === null ? [] : [run.tokens]);
+  const partial = measured.length < rest.length || measured.some(tokens => tokens.partial === true);
+  const launch = measured.length === 0 ? null : { tokens: measured.reduce((sum, tokens) => sum + tokens.tokens, 0),
+    cacheRead: measured.every(tokens => tokens.cacheRead !== null) ? measured.reduce((sum, tokens) => sum + tokens.cacheRead!, 0) : null, ...(partial ? { partial: true } : {}) };
+  return { launch, resume: at => runs.find(run => run.from === at)?.tokens ?? null };
+}
 
 export interface PlanContext {
   blockId: string; start: number; end: number; durationMs?: number | null; workEndedAt?: number; provisional?: boolean; blockRunning?: boolean; text: string; goal?: string; running: boolean; steps?: PlanContextStep[];
@@ -1855,13 +2014,12 @@ export interface PlanContext {
 export interface WorkModelPayload {
   requests?: import("./work-model").WorkRequestTotals[];
   planHistory?: import("./work-model").PlanHistoryEntry[];
-  planHistoryTruncated?: boolean;
   planHistoryLostThrough?: number;
   planContext?: PlanContext;
   requestOpen?: true;
   earlierPlans?: PlanContext[];
   blockTotals?: import("./role-summary").BlockTokenTotals[];
-  unknownLaunchers?: Array<{ turnId: string; toolUseIds: string[] }>;
+  unknownLaunchers?: Array<{ turnId: string; toolUseIds: string[]; foldCount?: number }>;
   externalRuns?: Array<{ label: string; run: import("./role-summary").RoleRunView }>;
   planTools?: Array<{ id: string; name: string; description: string; startedAt: number; intentInput?: ToolIntentInput }>;
   runningMainTools?: Array<{ id: string; name: string; startedAt: number; intentInput?: ToolIntentInput }>;
@@ -2170,7 +2328,6 @@ export function projectWorkModel(
     requests: state.coverage.summary === "complete" && !state.coverage.hydrationUnconfirmed
       ? state.requests?.filter(request => !request.incomplete).map(({ command: _command, cliInserted: _cliInserted, incomplete: _incomplete, ...request }) => request) : undefined,
     planHistory: state.planHistory,
-    planHistoryTruncated: state.planHistoryTruncated,
     planHistoryLostThrough: state.planHistoryLostThrough,
     planTools: state.runningToolUseIds.flatMap(id => {
       const tool = runningMainPlacement(state, id);
@@ -2517,14 +2674,14 @@ export function isWorkModelPayload(v: unknown): v is WorkModelPayload {
   const checks: { [K in keyof WorkModelPayload]-?: () => boolean } = {
     requests: () => m.requests === undefined || isArrayOf(m.requests, isWorkRequestView),
     planHistory: () => m.planHistory === undefined || isArrayOf(m.planHistory, isWorkPlanHistoryEntry),
-    planHistoryTruncated: () => m.planHistoryTruncated === undefined || typeof m.planHistoryTruncated === "boolean",
     planHistoryLostThrough: () => m.planHistoryLostThrough === undefined || isNumber(m.planHistoryLostThrough),
     planContext: () => m.planContext === undefined || isPlanContext(m.planContext),
     requestOpen: () => m.requestOpen === undefined || m.requestOpen === true,
     earlierPlans: () => m.earlierPlans === undefined || isArrayOf(m.earlierPlans, isPlanContext),
     blockTotals: () => m.blockTotals === undefined || isArrayOf(m.blockTotals, isBlockTokenTotals),
     unknownLaunchers: () => m.unknownLaunchers === undefined || isArrayOf(m.unknownLaunchers, value => typeof value === "object" && value !== null
-      && typeof (value as Record<string, unknown>).turnId === "string" && isArrayOf((value as Record<string, unknown>).toolUseIds, item => typeof item === "string")),
+      && typeof (value as Record<string, unknown>).turnId === "string" && isArrayOf((value as Record<string, unknown>).toolUseIds, item => typeof item === "string")
+      && ((value as Record<string, unknown>).foldCount === undefined || Number.isSafeInteger((value as Record<string, unknown>).foldCount) && ((value as Record<string, unknown>).foldCount as number) >= 0)),
     externalRuns: () => m.externalRuns === undefined || isArrayOf(m.externalRuns, value => !!value && typeof value === "object"
       && typeof (value as { label?: unknown }).label === "string" && isRoleRunView((value as { run?: unknown }).run)),
     runningMainTools: () => m.runningMainTools === undefined || isArrayOf(m.runningMainTools, isRunningMainToolView),
@@ -2542,6 +2699,14 @@ export function isWorkModelPayload(v: unknown): v is WorkModelPayload {
   return Object.values(checks).every(check => check());
 }
 
+function planStepMarkChecks(row: Record<string, unknown>): { [K in keyof PlanStepMarks]-?: () => boolean } {
+  return {
+    activeForm: () => row.activeForm === undefined || typeof row.activeForm === "string",
+    added: () => row.added === undefined || row.added === true,
+    addedAt: () => row.addedAt === undefined || isNumber(row.addedAt),
+  };
+}
+
 function isPlanContextStep(value: unknown): boolean {
   if (!value || typeof value !== "object") return false;
   const row = value as Record<string, unknown>;
@@ -2549,6 +2714,7 @@ function isPlanContextStep(value: unknown): boolean {
     key: () => typeof row.key === "string",
     number: () => isNumber(row.number),
     title: () => typeof row.title === "string",
+    ...planStepMarkChecks(row),
     status: () => TASK_STATUSES.includes(row.status as string),
     removed: () => typeof row.removed === "boolean",
     startedAt: () => row.startedAt === null || isNumber(row.startedAt),
@@ -2610,10 +2776,11 @@ function isPlanContextPlacement(value: unknown): boolean {
   const row = value as Record<string, unknown>;
   return typeof row.toolUseId === "string" && (row.agentId === undefined || typeof row.agentId === "string")
     && (row.stepKey === null || typeof row.stepKey === "string")
-    && (row.tokens === undefined || row.tokens === null || isPlanContextTokens(row.tokens))
     && (row.resumes === undefined || isArrayOf(row.resumes, resume => typeof resume === "object" && resume !== null && isNumber((resume as Record<string, unknown>).at)
-      && ((resume as Record<string, unknown>).stepKey === null || typeof (resume as Record<string, unknown>).stepKey === "string")
-      && ((resume as Record<string, unknown>).tokens === null || isPlanContextTokens((resume as Record<string, unknown>).tokens))));
+      && ((resume as Record<string, unknown>).stepKey === null || typeof (resume as Record<string, unknown>).stepKey === "string")))
+    && (row.runTokens === undefined || isArrayOf(row.runTokens, run => typeof run === "object" && run !== null
+      && ((run as Record<string, unknown>).from === null || isNumber((run as Record<string, unknown>).from))
+      && ((run as Record<string, unknown>).tokens === null || isPlanContextTokens((run as Record<string, unknown>).tokens))));
 }
 
 function isPlanContext(value: unknown): boolean {
@@ -3143,6 +3310,7 @@ function isPlanBlockStep(v: unknown): boolean {
     Number.isSafeInteger(step.number) &&
     (step.number as number) >= 0 &&
     typeof step.title === "string" &&
+    Object.values(planStepMarkChecks(step)).every(check => check()) &&
     ["unknown", "pending", "in_progress", "completed"].includes(step.status as string) &&
     typeof step.removed === "boolean" &&
     typeof step.longest === "boolean" &&
@@ -3318,7 +3486,8 @@ export interface ResumeHydrationSendDisposition {
 
 export type HostToWebview =
   | { type: "orchestrationView"; tabId: string; state: OrchestrationView }
-  | { type: "init"; protocolVersion: number; tabs: TabSnapshot[]; hostWindows?: boolean; systemAppExtensions?: string[]; activeTabId?: string }
+  | { type: "init"; protocolVersion: number; tabs: TabSnapshot[]; hostWindows?: boolean; systemAppExtensions?: string[]; activeTabId?: string; askMarks?: AskMarks }
+  | { type: "askMarksChanged"; marks: AskMarks; origin: AskMarksOrigin }
   | { type: "events"; tabId: string; events: NormalizedEvent[] }
   | {
       type: "resumeHydrationState";
@@ -3353,7 +3522,7 @@ export type HostToWebview =
   | { type: "tabOrder"; order: string[] }
   | { type: "activateTab"; tabId: string }
   | { type: "pasteText"; text: string }
-  | { type: "tabCleared"; tab: TabSnapshot }
+  | { type: "tabCleared"; tab: TabSnapshot; replaced?: true }
   | { type: "tabRestored"; tab: TabSnapshot }
   | { type: "tabRenamed"; tabId: string; title: string }
   | {
@@ -3365,7 +3534,6 @@ export type HostToWebview =
       progress?: { heartbeats: number; elapsedMs: number; since: "compact_start" | "result" };
       reason?: string;
       detail?: string;
-      message: string;
       source: { sessionId: string; title: string };
       fork?: { sessionId: string; tabId: string; title: string };
       compact?: HandoffCompactStats;
@@ -3374,6 +3542,8 @@ export type HostToWebview =
       unreadableLineCount?: number;
       auto?: HandoffAutoStart | HandoffAutoNotice;
     }
+  | { type: "handoffSendLock"; tabId: string; locked: boolean }
+  | { type: "transcriptWriteLock"; tabId: string; locked: boolean }
   | {
       type: "handoffDetail";
       tabId: string;
@@ -3393,7 +3563,7 @@ export type HostToWebview =
   | { type: "modelChanged"; tabId: string; model: string | null; notice?: string; applied?: boolean }
   | { type: "effortChanged"; tabId: string; effort: string | null; notice?: string }
   | { type: "configuredEffortChanged"; tabId: string; effort: string | null; model?: string | null; defaultEffort?: string | null; appliedModel?: string | null; appliedEffort?: string | null }
-  | { type: "files"; reqId: number; paths: string[] }
+  | { type: "files"; reqId: number; rows: FileSuggestRow[] }
   | { type: "pickedFiles"; reqId: number; paths: string[]; images: ImageAttachment[] }
   | { type: "copyFilePathResult"; reqId: number; ok: boolean }
   | { type: "attachments"; tabId: string; items: PendingAttachmentInfo[] }
@@ -3472,6 +3642,21 @@ export type HostToWebview =
       reason: ConversationHistoryErrorReason;
     }
   | {
+      type: "conversationMessageTextResult";
+      tabId: string;
+      requestId: string;
+      uuid: string;
+      offset: number;
+      text: string;
+      clipped?: true;
+    }
+  | {
+      type: "conversationMessageTextError";
+      tabId: string;
+      requestId: string;
+      reason: ConversationHistoryErrorReason;
+    }
+  | {
       type: "sessionImageResult";
       tabId: string;
       requestId: string;
@@ -3486,14 +3671,15 @@ export type HostToWebview =
     }
   | ({ type: "accountUsage"; replyTo: string } & AccountUsageSnapshot)
   | { type: "todoSnapshot"; seq: number; enabled: false }
-  | { type: "todoSnapshot"; seq: number; enabled: true; revision: number; items: TodoListItem[]; groups: TodoGroupColor[]; templates: TodoTemplateView[]; tabItems: TodoTabItem[]; askSources: TodoAskSourceRef[]; askDismissals: string[]; askClosedInTodo: string[];
+  | { type: "todoSnapshot"; seq: number; enabled: true; revision: number; items: TodoListItem[]; groups: TodoGroupColor[]; templates: TodoTemplateView[]; tabItems: TodoTabItem[]; askSources: TodoAskSourceRef[]; askDismissals: string[]; askClosedInTodo: string[]; askTicked: string[];
       deletedTabs: string[]; sessions: TodoSessionLinkView[]; claudeRecent: number[] }
-  | { type: "todoChanges"; requestId: number; revision: number; changes: TodoChangeView[]; turns?: TodoTurnRevert[]; more?: true }
+  | { type: "todoChanges"; requestId: number; revision: number; generations?: TodoGeneration[]; changes: TodoChangeView[]; turns?: TodoTurnRevert[]; more?: true }
+  | { type: "todoChanges"; requestId: number; unreadable: true }
   | { type: "todoToggleDrawer" }
   | { type: "todoSnapshot"; seq: number; enabled: true; unreadable: true }
   | { type: "todoAskSource"; sessionId: string; requestId: number; key: string; endedAt: number; messages: TodoAskSourceMessage[] }
   | { type: "todoAskSource"; sessionId: string; requestId: number; key: null }
-  | { type: "todoEditResult"; requestId: string; ok: true; revision: number; changed: boolean; skipped: number }
+  | { type: "todoEditResult"; requestId: string; ok: true; revision: number; generation?: string; changed: boolean; skipped: number }
   | { type: "todoEditResult"; requestId: string; ok: false; error: TodoEditError }
   | { type: "todoDetail"; id: string; revision: number; item: TodoDetailItem | null; sectionOrder: TodoDetailSection[] }
   | { type: "todoWork"; id: string; revision: number; work?: TodoWorkView }
@@ -3543,6 +3729,7 @@ export interface TodoMarkPart {
 
 export interface TodoMarkInfo {
   readonly id: string;
+  readonly generation?: string;
   readonly ids: readonly string[];
   readonly at: number;
   readonly parts: readonly TodoMarkPart[];
@@ -3597,10 +3784,28 @@ export interface TodoAskSourceMessage {
   readonly role: "user" | "assistant";
   readonly text: string;
   readonly timestamp: number;
+  readonly remote?: true;
 }
 
 export type TodoSnapshotMessage = Extract<HostToWebview, { type: "todoSnapshot" }>;
 export type TodoAskSourceMessageEnvelope = Extract<HostToWebview, { type: "todoAskSource" }>;
+
+export function clearDuringTurnText(): string {
+  return l10n.t("Cannot use /clear during a turn. Wait for completion or interrupt, then try again.");
+}
+
+export function renameUsageText(): string {
+  return l10n.t("Usage: /rename <new name>");
+}
+
+export function handoffSendLockedText(): string {
+  return l10n.t("This conversation is being handed off. Input is unavailable until the handoff finishes or is cancelled.");
+}
+
+
+export function transcriptWriteLockedText(): string {
+  return l10n.t("LAISORA needs the conversation record for history, resume and analysis, so it cannot be used while {0} is on. Remove it from your environment variables or from the env block of Claude Code's settings (settings.json), then restart VS Code.", SKIP_PROMPT_HISTORY_ENV);
+}
 
 export interface TabSnapshot {
   tabId: string;
@@ -3629,6 +3834,9 @@ export interface ConversationSnapshot {
   resumeSessionId?: string;
   resumeFilePath?: string;
   handoffSource?: HandoffSourceSnapshot;
+  handoffSendLocked?: true;
+  transcriptWriteLocked?: true;
+  laisoraPurpose?: true;
   welcome?: WelcomeTab;
   resumeHydration?: ResumeHydrationSnapshotState;
   workModel?: WorkModelPayload;
@@ -3702,6 +3910,10 @@ export function isWebviewToHost(v: unknown): v is WebviewToHost {
     const m = v as Record<string, unknown>;
     return hasOnlyKeys(m, ["type", "itemId", "message", "place"]) && isTodoId(m.itemId) && isTodoAskIdentity(m.message) && (TODO_ASK_PLACES as readonly unknown[]).includes(m.place);
   }
+  if (t === "todoAskUntick") {
+    const m = v as Record<string, unknown>;
+    return hasOnlyKeys(m, ["type", "itemId", "message"]) && isTodoId(m.itemId) && isTodoAskIdentity(m.message);
+  }
   if (t === "todoChangesRequest") {
     const m = v as Record<string, unknown>;
     return hasOnlyKeys(m, ["type", "requestId", "ids", "revisions"]) && isRevision(m.requestId) && Array.isArray(m.ids) && m.ids.length <= TODO_CHANGES_REQUEST_MAX && m.ids.every(isTodoId)
@@ -3711,6 +3923,7 @@ export function isWebviewToHost(v: unknown): v is WebviewToHost {
     const m = v as Record<string, unknown>;
     return hasOnlyKeys(m, ["type", "focused"]) && typeof m.focused === "boolean";
   }
+  if (t === "conversationHidden") return hasOnlyKeys(v as Record<string, unknown>, ["type"]);
   if (t === "reorderTabs") {
     const m = v as Record<string, unknown>;
     return hasOnlyKeys(m, ["type", "order"]) && isTabOrder(m.order);
@@ -3722,6 +3935,10 @@ export function isWebviewToHost(v: unknown): v is WebviewToHost {
   if (t === "composerDrafts") {
     const m = v as Record<string, unknown>;
     return hasOnlyKeys(m, ["type", "tabIds"]) && isTabOrder(m.tabIds);
+  }
+  if (t === "askMarkEdit") {
+    const m = v as Record<string, unknown>;
+    return hasOnlyKeys(m, ["type", "client", "seq", "edit"]) && isAskMarksOrigin({ client: m.client, seq: m.seq }) && isAskMarkEdit(m.edit);
   }
   if (t === "youWaiting") {
     const m = v as Record<string, unknown>;
@@ -3878,7 +4095,7 @@ export function isWebviewToHost(v: unknown): v is WebviewToHost {
   }
   if (t === "conversationHistoryRequest") {
     const message = v as Record<string, unknown>;
-    const allowed = new Set(["type", "tabId", "requestId", "cursor", "anchorUuid"]);
+    const allowed = new Set(["type", "tabId", "requestId", "cursor", "anchorUuids"]);
     if (!Object.keys(message).every((key) => allowed.has(key))) return false;
     if (typeof message.tabId !== "string" || message.tabId.length === 0 || message.tabId.length > TAB_ID_MAX) {
       return false;
@@ -3890,7 +4107,7 @@ export function isWebviewToHost(v: unknown): v is WebviewToHost {
     ) {
       return false;
     }
-    if (message.cursor !== undefined && message.anchorUuid !== undefined) return false;
+    if (message.cursor !== undefined && message.anchorUuids !== undefined) return false;
     if (
       message.cursor !== undefined &&
       !(typeof message.cursor === "string" && message.cursor.length > 0 && message.cursor.length <= 512)
@@ -3898,10 +4115,25 @@ export function isWebviewToHost(v: unknown): v is WebviewToHost {
       return false;
     }
     return (
-      message.anchorUuid === undefined ||
-      (typeof message.anchorUuid === "string" &&
-        message.anchorUuid.length > 0 &&
-        message.anchorUuid.length <= 100)
+      message.anchorUuids === undefined ||
+      (Array.isArray(message.anchorUuids) &&
+        message.anchorUuids.length > 0 &&
+        message.anchorUuids.length <= CONVERSATION_ANCHOR_UUIDS_MAX &&
+        message.anchorUuids.every((uuid) => typeof uuid === "string" && uuid.length > 0 && uuid.length <= 100))
+    );
+  }
+  if (t === "conversationMessageTextRequest") {
+    const message = v as Record<string, unknown>;
+    return (
+      hasOnlyKeys(message, ["type", "tabId", "requestId", "uuid", "offset"]) &&
+      typeof message.tabId === "string" &&
+      message.tabId.length > 0 &&
+      message.tabId.length <= TAB_ID_MAX &&
+      typeof message.requestId === "string" &&
+      message.requestId.length > 0 &&
+      message.requestId.length <= 100 &&
+      isConversationUuid(message.uuid) &&
+      isTextOffset(message.offset)
     );
   }
   if (t === "sessionImageRequest") {
@@ -3972,11 +4204,12 @@ export function isWebviewToHost(v: unknown): v is WebviewToHost {
     const effort = (v as { effort?: unknown }).effort;
     return (
       typeof tabId === "string" &&
-      (effort === null || ["low", "medium", "high", "xhigh", "max"].includes(effort as string))
+      (effort === null || isOrchestrationEffort(effort))
     );
   }
   if (t === "queryFiles") {
     return (
+      typeof tabId === "string" &&
       typeof (v as { reqId?: unknown }).reqId === "number" &&
       typeof (v as { query?: unknown }).query === "string" &&
       (v as { query: string }).query.length <= 200
@@ -4120,7 +4353,8 @@ function isAgentInspectorPage(value: unknown): value is AgentInspectorPage {
     return isArrayOf(page.tools, isAgentInspectorToolItem);
   }
   if (page.section === "messages") {
-    return isArrayOf(page.messages, isAgentInspectorMessageItem);
+    return isArrayOf(page.messages, isAgentInspectorMessageItem) &&
+      (AGENT_INSPECTOR_REPORT_SOURCES as readonly unknown[]).includes(page.reportSource);
   }
   return page.section === "report" && typeof page.text === "string";
 }
@@ -4207,8 +4441,16 @@ export function isImageRefInfoArray(v: unknown): v is ImageRefInfo[] {
   return Array.isArray(v) && v.every(isImageRefInfo);
 }
 
-const CONVERSATION_TEXT_MAX = 20000;
+export const CONVERSATION_TEXT_MAX = 20000;
+export const CONVERSATION_ANCHOR_UUIDS_MAX = 32;
 const CONVERSATION_ITEMS_MAX = 500;
+const isConversationUuid = (value: unknown): value is string => typeof value === "string" && value.length > 0 && value.length <= 100;
+const isConversationText = (value: unknown, max = CONVERSATION_TEXT_MAX): value is string => typeof value === "string" && value.length <= max;
+const isTextOffset = (value: unknown): value is number => typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
+const CONVERSATION_HISTORY_ERROR_REASONS: readonly ConversationHistoryErrorReason[] = [
+  "invalid-cursor", "unknown-anchor", "history-unavailable", "invalid-request", "session-unavailable",
+  "session-scan-failed", "read-failed", "stale-request", "response-too-large", "host-error",
+];
 
 function isElicitationContentMessage(value: unknown): boolean {
   if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
@@ -4228,6 +4470,7 @@ function isRestoredApprovalCard(value: unknown): boolean {
     !!card.requestId &&
     typeof card.toolName === "string" &&
     typeof card.inputJson === "string" &&
+    (card.inputClipped === undefined || card.inputClipped === true) &&
     (RESTORED_APPROVAL_RESOLUTIONS as readonly unknown[]).includes(card.resolution) &&
     (card.resolution === "unanswered" ? isAskUnansweredKind(card.unanswered) : card.unanswered === undefined) &&
     (card.answers === undefined || typeof card.answers === "object" && card.answers !== null && !Array.isArray(card.answers) && Object.values(card.answers).every(answer => typeof answer === "string")) &&
@@ -4235,17 +4478,20 @@ function isRestoredApprovalCard(value: unknown): boolean {
   );
 }
 
-function isConversationHistoryMessage(value: unknown): boolean {
+function isConversationHistoryMessage(value: unknown, textMax = CONVERSATION_TEXT_MAX): boolean {
   if (typeof value !== "object" || value === null) return false;
   const m = value as Record<string, unknown>;
   return (
-    typeof m.uuid === "string" && m.uuid.length > 0 && m.uuid.length <= 100 &&
+    isConversationUuid(m.uuid) &&
     (m.role === "user" || m.role === "assistant" || m.role === "system") &&
-    typeof m.text === "string" && m.text.length <= CONVERSATION_TEXT_MAX &&
+    isConversationText(m.text, textMax) &&
     typeof m.timestamp === "number" &&
     (m.imageRefs === undefined || isImageRefInfoArray(m.imageRefs)) &&
     (m.model === undefined || (typeof m.model === "string" && m.model.length > 0)) &&
-    (m.restoredApproval === undefined || isRestoredApprovalCard(m.restoredApproval))
+    (m.restoredApproval === undefined || isRestoredApprovalCard(m.restoredApproval)) &&
+    (m.clipped === undefined || m.clipped === true) &&
+    (m.asksPastCut === undefined || (m.asksPastCut === true && m.clipped === true)) &&
+    (m.remote === undefined || m.remote === true)
   );
 }
 
@@ -4258,7 +4504,7 @@ function isConversationHistoryPage(value: unknown): boolean {
     typeof page.hasMore === "boolean" &&
     Array.isArray(page.items) &&
     page.items.length <= CONVERSATION_ITEMS_MAX &&
-    page.items.every(isConversationHistoryMessage)
+    page.items.every(item => isConversationHistoryMessage(item))
   );
 }
 
@@ -4340,9 +4586,13 @@ function isPlausibleNormalizedEvent(x: unknown): x is NormalizedEvent {
     if (e.imageRefs !== undefined && !isImageRefInfoArray(e.imageRefs)) {
       return false;
     }
+    if (e.cancelled !== undefined && e.cancelled !== true) return false;
+    if (e.remote !== undefined && e.remote !== true) return false;
   }
+  if (e.kind === "user_message_cancelled" && !(Array.isArray(e.uuids) && e.uuids.every((uuid) => typeof uuid === "string"))) return false;
   if (e.kind === "replayed_message") {
     if (e.restoredApproval !== undefined && !isRestoredApprovalCard(e.restoredApproval)) return false;
+    if (e.remote !== undefined && e.remote !== true) return false;
     if (e.imageRefs !== undefined && !isImageRefInfoArray(e.imageRefs)) {
       return false;
     }
@@ -4425,7 +4675,8 @@ function isTodoListItem(value: unknown): value is TodoListItem {
     && (item.guess === undefined || isTodoGuessView(item.guess))
     && (item.marks === undefined || (Array.isArray(item.marks) && item.marks.length <= TODO_ACKNOWLEDGE_MAX && item.marks.every(isTodoId)))
     && (item.markInfo === undefined || (Array.isArray(item.markInfo) && item.markInfo.length <= TODO_ACKNOWLEDGE_MAX
-      && item.markInfo.every(info => typeof info === "object" && info !== null && hasOnlyKeys(info as Record<string, unknown>, ["id", "ids", "at", "parts"])
+      && item.markInfo.every(info => typeof info === "object" && info !== null && hasOnlyKeys(info as Record<string, unknown>, ["id", "generation", "ids", "at", "parts"])
+        && ((info as Record<string, unknown>).generation === undefined || isTodoGenerationId((info as Record<string, unknown>).generation))
         && isTodoId((info as { id?: unknown }).id) && isTodoTime((info as { at?: unknown }).at)
         && Array.isArray((info as { ids?: unknown }).ids) && (info as { ids: unknown[] }).ids.length > 0 && (info as { ids: unknown[] }).ids.length <= TODO_CHANGES_REQUEST_MAX && (info as { ids: unknown[] }).ids.every(isTodoId)
         && Array.isArray((info as { parts?: unknown }).parts) && (info as { parts: unknown[] }).parts.length <= TODO_CHANGES_REQUEST_MAX && (info as { parts: unknown[] }).parts.every(isTodoMarkPart))))
@@ -4497,7 +4748,7 @@ function isTodoAskSourceRef(value: unknown): value is TodoAskSourceRef {
 function isTodoAskSourceMessage(value: unknown): value is TodoAskSourceMessage {
   if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
   const m = value as Record<string, unknown>;
-  return hasOnlyKeys(m, ["uuid", "role", "text", "timestamp"]) && (m.role === "user" || m.role === "assistant") && isConversationHistoryMessage(m);
+  return hasOnlyKeys(m, ["uuid", "role", "text", "timestamp", "remote"]) && (m.role === "user" || m.role === "assistant") && isConversationHistoryMessage(m, TODO_ASK_SOURCE_TEXT_MAX);
 }
 const isRevision = (value: unknown) => typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
 const isTodoTitle = (value: unknown) => typeof value === "string" && value.trim().length > 0 && value.length <= TODO_TITLE_MAX;
@@ -4544,12 +4795,13 @@ function isTodoEdit(value: unknown): value is TodoEdit {
     case "restore":
       return hasOnlyKeys(edit, ["kind", "id"]) && isTodoId(edit.id);
     case "undo":
-      return hasOnlyKeys(edit, ["kind", "revision"]) && isRevision(edit.revision) && (edit.revision as number) > 0;
+      return hasOnlyKeys(edit, ["kind", "revision", "generation"]) && isRevision(edit.revision) && (edit.revision as number) > 0 && (edit.generation === undefined || isTodoGenerationId(edit.generation));
     case "revertClaude":
-      return (hasOnlyKeys(edit, ["kind", "changeId"]) && isTodoId(edit.changeId))
-        || (hasOnlyKeys(edit, ["kind", "changeIds"]) && Array.isArray(edit.changeIds) && edit.changeIds.length > 0 && edit.changeIds.length <= TODO_CHANGES_REQUEST_MAX
+      if (edit.generation !== undefined && !isTodoGenerationId(edit.generation)) return false;
+      return (hasOnlyKeys(edit, ["kind", "changeId", "generation"]) && isTodoId(edit.changeId))
+        || (hasOnlyKeys(edit, ["kind", "changeIds", "generation"]) && Array.isArray(edit.changeIds) && edit.changeIds.length > 0 && edit.changeIds.length <= TODO_CHANGES_REQUEST_MAX
           && edit.changeIds.every(isTodoId) && new Set(edit.changeIds).size === edit.changeIds.length)
-        || (hasOnlyKeys(edit, ["kind", "revisions"]) && Array.isArray(edit.revisions) && edit.revisions.length > 0 && edit.revisions.length <= TODO_CHANGES_REQUEST_MAX
+        || (hasOnlyKeys(edit, ["kind", "revisions", "generation"]) && Array.isArray(edit.revisions) && edit.revisions.length > 0 && edit.revisions.length <= TODO_CHANGES_REQUEST_MAX
           && edit.revisions.every(revision => isRevision(revision) && (revision as number) > 0) && new Set(edit.revisions).size === edit.revisions.length);
     case "addLink":
       return hasOnlyKeys(edit, ["kind", "id", "target", "label"]) && isTodoId(edit.id)
@@ -4582,7 +4834,7 @@ function isTodoEdit(value: unknown): value is TodoEdit {
       return hasOnlyKeys(edit, ["kind", "id", "docId", "label"]) && isTodoId(edit.id) && isTodoId(edit.docId) && isTodoDocLabel(edit.label);
     case "acknowledge":
       return hasOnlyKeys(edit, ["kind", "changeIds"]) && Array.isArray(edit.changeIds) && edit.changeIds.length > 0
-        && edit.changeIds.length <= TODO_ACKNOWLEDGE_MAX && edit.changeIds.every(isTodoId);
+        && edit.changeIds.length <= TODO_CHANGE_LOG_LIMIT && edit.changeIds.every(isTodoId);
   }
   return false;
 }
@@ -4590,7 +4842,8 @@ function isTodoEdit(value: unknown): value is TodoEdit {
 function isTodoChangeView(value: unknown): value is TodoChangeView {
   if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
   const change = value as Record<string, unknown>;
-  return hasOnlyKeys(change, ["id", "at", "author", "itemId", "itemTitle", "field", "before", "after", "cascade", "revert", "acknowledged", "basis", "by", "from", "to"])
+  return hasOnlyKeys(change, ["id", "generation", "at", "author", "itemId", "itemTitle", "field", "before", "after", "cascade", "revert", "acknowledged", "basis", "by", "from", "to"])
+    && (change.generation === undefined || isTodoGenerationId(change.generation))
     && (change.from === undefined || isTodoChangePlace(change.from)) && (change.to === undefined || isTodoChangePlace(change.to))
     && isTodoChangeRecord(change) && typeof change.itemTitle === "string"
     && (change.before === null || typeof change.before === "string") && (change.after === null || typeof change.after === "string")
@@ -4843,8 +5096,13 @@ export function isHostToWebview(v: unknown): v is HostToWebview {
         extensions.every((item) => typeof item === "string" && normalizeSystemAppExtension(item) === item))) &&
       Array.isArray(tabs) &&
       (tabs as unknown[]).every(isTabSnapshotShape) &&
-      ((v as { activeTabId?: unknown }).activeTabId === undefined || typeof (v as { activeTabId?: unknown }).activeTabId === "string")
+      ((v as { activeTabId?: unknown }).activeTabId === undefined || typeof (v as { activeTabId?: unknown }).activeTabId === "string") &&
+      ((v as { askMarks?: unknown }).askMarks === undefined || isAskMarks((v as { askMarks?: unknown }).askMarks))
     );
+  }
+  if (t === "askMarksChanged") {
+    const m = v as Record<string, unknown>;
+    return hasOnlyKeys(m, ["type", "marks", "origin"]) && isAskMarks(m.marks) && isAskMarksOrigin(m.origin);
   }
   if (t === "events") {
     const events = (v as { events?: unknown }).events;
@@ -4870,7 +5128,10 @@ export function isHostToWebview(v: unknown): v is HostToWebview {
     return hasOnlyKeys(v as Record<string, unknown>, ["type", "text"])
       && typeof (v as { text?: unknown }).text === "string";
   }
-  if (t === "tabCleared") return isTabSnapshotShape((v as { tab?: unknown }).tab);
+  if (t === "tabCleared") {
+    const replaced = (v as { replaced?: unknown }).replaced;
+    return (replaced === undefined || replaced === true) && isTabSnapshotShape((v as { tab?: unknown }).tab);
+  }
   if (t === "tabRestored") return isTabSnapshotShape((v as { tab?: unknown }).tab);
   if (t === "tabRenamed") {
     return typeof tabId === "string" && typeof (v as { title?: unknown }).title === "string";
@@ -4885,7 +5146,6 @@ export function isHostToWebview(v: unknown): v is HostToWebview {
       typeof tabId === "string" &&
       typeof m.runId === "string" &&
       (s === "running" || s === "failed" || s === "done") &&
-      typeof m.message === "string" &&
       (m.phase === undefined || typeof m.phase === "string") &&
       (progress === undefined ||
         isHandoffStatusProgress(progress)) &&
@@ -4900,6 +5160,10 @@ export function isHostToWebview(v: unknown): v is HostToWebview {
       isUnreadableLineCount(m.unreadableLineCount) &&
       (m.auto === undefined || isHandoffAutoStart(m.auto))
     );
+  }
+  if (t === "handoffSendLock" || t === "transcriptWriteLock") {
+    return hasOnlyKeys(v as Record<string, unknown>, ["type", "tabId", "locked"]) &&
+      typeof tabId === "string" && typeof (v as { locked?: unknown }).locked === "boolean";
   }
   if (t === "handoffDetail") {
     const m = v as Record<string, unknown>;
@@ -4961,21 +5225,21 @@ export function isHostToWebview(v: unknown): v is HostToWebview {
     if (model !== undefined && model !== null && typeof model !== "string") return false;
     const defaultEffort = (v as { defaultEffort?: unknown }).defaultEffort;
     if (defaultEffort !== undefined && defaultEffort !== null &&
-      !(typeof defaultEffort === "string" && ["low", "medium", "high", "xhigh", "max"].includes(defaultEffort))) return false;
+      !isOrchestrationEffort(defaultEffort)) return false;
     const appliedModel = (v as { appliedModel?: unknown }).appliedModel;
     if (appliedModel !== undefined && appliedModel !== null && typeof appliedModel !== "string") return false;
     const appliedEffort = (v as { appliedEffort?: unknown }).appliedEffort;
     if (appliedEffort !== undefined && appliedEffort !== null &&
-      !(typeof appliedEffort === "string" && ["low", "medium", "high", "xhigh", "max"].includes(appliedEffort))) return false;
+      !isOrchestrationEffort(appliedEffort)) return false;
     return typeof tabId === "string" && (effort === null ||
-      (typeof effort === "string" && ["low", "medium", "high", "xhigh", "max"].includes(effort)));
+      isOrchestrationEffort(effort));
   }
   if (t === "files") {
-    const paths = (v as { paths?: unknown }).paths;
+    const rows = (v as { rows?: unknown }).rows;
     return (
       typeof (v as { reqId?: unknown }).reqId === "number" &&
-      Array.isArray(paths) &&
-      (paths as unknown[]).every((p) => typeof p === "string")
+      Array.isArray(rows) &&
+      (rows as unknown[]).every(isFileSuggestRow)
     );
   }
   if (t === "copyFilePathResult") {
@@ -5082,7 +5346,7 @@ export function isHostToWebview(v: unknown): v is HostToWebview {
     if (m.enabled === false) return hasOnlyKeys(m, ["type", "seq", "enabled"]);
     if (m.enabled !== true) return false;
     if (m.unreadable !== undefined) return m.unreadable === true && hasOnlyKeys(m, ["type", "seq", "enabled", "unreadable"]);
-    return hasOnlyKeys(m, ["type", "seq", "enabled", "revision", "items", "groups", "templates", "tabItems", "askSources", "askDismissals", "askClosedInTodo", "deletedTabs", "sessions", "claudeRecent"])
+    return hasOnlyKeys(m, ["type", "seq", "enabled", "revision", "items", "groups", "templates", "tabItems", "askSources", "askDismissals", "askClosedInTodo", "askTicked", "deletedTabs", "sessions", "claudeRecent"])
       && Array.isArray(m.claudeRecent) && m.claudeRecent.length <= TODO_ACKNOWLEDGE_MAX && m.claudeRecent.every(isTodoTime)
       && Array.isArray(m.deletedTabs) && m.deletedTabs.every(id => typeof id === "string" && id.length > 0)
       && Array.isArray(m.sessions) && m.sessions.every(isTodoSessionLinkView)
@@ -5093,11 +5357,14 @@ export function isHostToWebview(v: unknown): v is HostToWebview {
       && Array.isArray(m.tabItems) && m.tabItems.every(isTodoTabItem)
       && Array.isArray(m.askSources) && m.askSources.every(isTodoAskSourceRef)
       && Array.isArray(m.askDismissals) && m.askDismissals.every(isTodoAskIdentity)
-      && Array.isArray(m.askClosedInTodo) && m.askClosedInTodo.every(isTodoAskIdentity);
+      && Array.isArray(m.askClosedInTodo) && m.askClosedInTodo.every(isTodoAskIdentity)
+      && Array.isArray(m.askTicked) && m.askTicked.every(isTodoAskIdentity);
   }
   if (t === "todoChanges") {
     const m = v as Record<string, unknown>;
-    return hasOnlyKeys(m, ["type", "requestId", "revision", "changes", "turns", "more"]) && isRevision(m.requestId) && isRevision(m.revision)
+    if (m.unreadable !== undefined) return m.unreadable === true && hasOnlyKeys(m, ["type", "requestId", "unreadable"]) && isRevision(m.requestId);
+    return hasOnlyKeys(m, ["type", "requestId", "revision", "generations", "changes", "turns", "more"]) && isRevision(m.requestId) && isRevision(m.revision)
+      && (m.generations === undefined || isTodoGenerationChain(m.generations))
       && Array.isArray(m.changes) && m.changes.length <= TODO_CHANGES_REQUEST_MAX && m.changes.every(isTodoChangeView)
       && (m.turns === undefined || (Array.isArray(m.turns) && m.turns.length <= TODO_CHANGES_REQUEST_MAX && m.turns.every(isTodoTurnRevert)))
       && (m.more === undefined || m.more === true);
@@ -5113,7 +5380,8 @@ export function isHostToWebview(v: unknown): v is HostToWebview {
   if (t === "todoEditResult") {
     const m = v as Record<string, unknown>;
     if (!isTodoId(m.requestId)) return false;
-    if (m.ok === true) return hasOnlyKeys(m, ["type", "requestId", "ok", "revision", "changed", "skipped"]) && isRevision(m.revision) && typeof m.changed === "boolean" && isRevision(m.skipped);
+    if (m.ok === true) return hasOnlyKeys(m, ["type", "requestId", "ok", "revision", "generation", "changed", "skipped"]) && isRevision(m.revision) && (m.generation === undefined || isTodoGenerationId(m.generation))
+      && typeof m.changed === "boolean" && isRevision(m.skipped);
     return m.ok === false && hasOnlyKeys(m, ["type", "requestId", "ok", "error"]) && (TODO_EDIT_ERRORS as readonly unknown[]).includes(m.error);
   }
   if (t === "todoDetail") {
@@ -5221,11 +5489,28 @@ export function isHostToWebview(v: unknown): v is HostToWebview {
     const message = v as Record<string, unknown>;
     return typeof tabId === "string" && typeof message.requestId === "string" &&
       typeof message.generation === "number" &&
-      ["invalid-cursor", "unknown-anchor", "history-unavailable", "invalid-request",
-        "session-unavailable", "session-scan-failed", "read-failed", "stale-request",
-        "response-too-large", "host-error"].includes(
-          message.reason as string
-        );
+      (CONVERSATION_HISTORY_ERROR_REASONS as readonly unknown[]).includes(message.reason);
+  }
+  if (t === "conversationMessageTextResult") {
+    const m = v as Record<string, unknown>;
+    return (
+      hasOnlyKeys(m, ["type", "tabId", "requestId", "uuid", "offset", "text", "clipped"]) &&
+      typeof tabId === "string" &&
+      typeof m.requestId === "string" &&
+      isConversationUuid(m.uuid) &&
+      isTextOffset(m.offset) &&
+      isConversationText(m.text) &&
+      (m.clipped === undefined || m.clipped === true)
+    );
+  }
+  if (t === "conversationMessageTextError") {
+    const m = v as Record<string, unknown>;
+    return (
+      hasOnlyKeys(m, ["type", "tabId", "requestId", "reason"]) &&
+      typeof tabId === "string" &&
+      typeof m.requestId === "string" &&
+      (CONVERSATION_HISTORY_ERROR_REASONS as readonly unknown[]).includes(m.reason)
+    );
   }
   if (t === "sessionImageResult") {
     const m = v as Record<string, unknown>;
@@ -5294,15 +5579,11 @@ function isWorkPlanHistoryEntry(entry: unknown): boolean {
   const row = entry as Record<string, unknown>;
   const checks: { [K in KeysOfUnion<NonNullable<WorkModelPayload["planHistory"]>[number]>]-?: () => boolean } = {
     at: () => isNumber(row.at),
-    kind: () => row.kind === "user" || row.kind === "todos" || row.kind === "resume",
-    source: () => row.kind !== "todos" || row.source === undefined || row.source === "tasks",
-    created: () => row.kind !== "todos" || row.created === undefined || typeof row.created === "boolean",
-    removed: () => row.kind !== "todos" || row.removed === undefined || typeof row.removed === "boolean",
-    items: () => row.kind !== "todos" || isArrayOf(row.items, isWorkTaskItemView),
-    agentId: () => row.kind !== "resume" || typeof row.agentId === "string",
-    description: () => row.kind !== "resume" || typeof row.description === "string",
-    status: () => row.kind !== "resume" || WORK_STATUSES.includes(row.status as string) || row.status === "stopped",
-    endedAt: () => row.kind !== "resume" || row.endedAt === undefined || isNumber(row.endedAt),
+    kind: () => row.kind === "resume",
+    agentId: () => typeof row.agentId === "string",
+    description: () => typeof row.description === "string",
+    status: () => WORK_STATUSES.includes(row.status as string) || row.status === "stopped",
+    endedAt: () => row.endedAt === undefined || isNumber(row.endedAt),
   };
   return Object.values(checks).every(check => check());
 }
@@ -5441,7 +5722,7 @@ function isConversationSnapshot(value: unknown): boolean {
     appliedModel: () => s.appliedModel === undefined || typeof s.appliedModel === "string",
     modelFallback: () => s.modelFallback === undefined || isModelFallbackState(s.modelFallback),
     appliedEffort: () => s.appliedEffort === undefined || s.appliedEffort === null ||
-      (typeof s.appliedEffort === "string" && ["low", "medium", "high", "xhigh", "max"].includes(s.appliedEffort)),
+      isOrchestrationEffort(s.appliedEffort),
     recordedModel: () => s.recordedModel === undefined || typeof s.recordedModel === "string",
     sessionSummary: () => s.sessionSummary === undefined ||
       isSessionSummarySnapshot(s.sessionSummary),
@@ -5453,6 +5734,9 @@ function isConversationSnapshot(value: unknown): boolean {
     remoteControl: () => s.remoteControl === undefined || isRemoteControlView(s.remoteControl),
     welcome: () => s.welcome === undefined || isWelcomeTab(s.welcome),
     handoffSource: () => s.handoffSource === undefined || isHandoffSource(s.handoffSource),
+    handoffSendLocked: () => s.handoffSendLocked === undefined || s.handoffSendLocked === true,
+    transcriptWriteLocked: () => s.transcriptWriteLocked === undefined || s.transcriptWriteLocked === true,
+    laisoraPurpose: () => s.laisoraPurpose === undefined || s.laisoraPurpose === true,
     events: () => (Array.isArray(s.events)) && ((s.events as unknown[]).every(isPlausibleNormalizedEvent)),
     configModel: () => true,
     configEffort: () => true,
@@ -5532,6 +5816,7 @@ function isTimeAgentView(value: unknown): boolean {
     runMeasures: () => row.runMeasures === undefined || isArrayOf(row.runMeasures, measure => typeof measure === "object" && measure !== null
       && ["toolCount", "failCount", "toolMs", "generateMs"].every(key => isNumber((measure as Record<string, unknown>)[key]))),
     runSliceKey: () => row.runSliceKey === undefined || typeof row.runSliceKey === "string",
+    resumeStarts: () => row.resumeStarts === undefined || isArrayOf(row.resumeStarts, isNumber),
     open: () => true,
     isBackground: () => true,
     description: () => true,
@@ -5610,6 +5895,15 @@ function isModelInfo(value: unknown): boolean {
     typeof row.description === "string" &&
     (row.olderVersion === undefined || typeof row.olderVersion === "boolean")
   );
+}
+
+function isFileSuggestRow(value: unknown): boolean {
+  if (typeof value !== "object" || value === null) return false;
+  const row = value as Record<string, unknown>;
+  return hasOnlyKeys(row, ["text", "workspaceRelative", "insideCwd"]) &&
+    typeof row.text === "string" && row.text.length > 0 &&
+    typeof row.workspaceRelative === "string" &&
+    typeof row.insideCwd === "boolean";
 }
 
 function isPickedImageAttachment(value: unknown): boolean {

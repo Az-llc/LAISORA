@@ -1,4 +1,4 @@
-import { getLaisoraConfiguration } from "./claude-settings";
+import { configuredApiKeyPolicy, getLaisoraConfiguration } from "./claude-settings";
 import * as vscode from "vscode";
 import * as l10n from "@vscode/l10n";
 import { formatHandoffTokens } from "./handoff-format";
@@ -11,8 +11,13 @@ import { claudeConfigDir } from "./claude-env";
 import { transcriptRetentionSettings } from "./transcript-retention";
 import { resolveHandoffRuntime, type ClaudeConversation } from "./claudeHost";
 import { signalWaitNotify } from "./wait-notify-signal";
+import { abandonWaitNotifyCarry, dropWaitNotifyEpisode, noteWaitNotifyCarryTurn, seedWaitNotifyCarry, skipWaitNotifyCarry, waitNotifyCarryOf, waitNotifyPushToolOf } from "./wait-notify-wiring";
+import { WAIT_NOTIFY_CARRY_INSTRUCTION, waitNotifyCarrySkip } from "./wait-notify";
+import { requestRemoteControlAuto } from "./remote-control-wiring";
+import { waitNotifySettings } from "./gateway-host-actions";
+import type { LaisoraInput } from "./laisora-input";
 import { openResumedSession, openSessionById } from "./resume-hydration";
-import type { Session, StartMeasurement } from "./session";
+import { launchingOrTurnRunning, turnRunning, type Session, type StartMeasurement } from "./session";
 import {
   handoffContextUsageKey,
   handoffUnreadableLinesKey,
@@ -24,17 +29,21 @@ import {
   HandoffRunner,
   buildHandoffDetailParts,
   extractHandoffDetail,
+  handoffSourceBusy,
   parseHandoffRecords,
-  shouldActivateForkTab,
+  forkTabActivationTargets,
   type HandoffDetail,
   type HandoffOutcome,
   type HandoffRecordsRead,
   COMPACT_HEARTBEAT_GRACE_MS,
 } from "./handoff-runner";
 import { extensionContext, output, store } from "./host-context";
+import { handoffInProgress, handoffRuns, type HandoffRunReservation } from "./handoff-runs";
+import { judgeTranscriptWriteLock } from "./transcript-write-lock";
 import { liveBackgroundTasks, runningDelegationIds } from "./background-activity";
 import { pendingAttachments } from "./pending-attachments";
-import { buildHandoffNoticeEnvelope, handoffNoticeTitle } from "./steering-envelope";
+import { buildHandoffNoticeEnvelope, handoffContinueMessage, handoffNoticeTitle } from "./steering-envelope";
+import { continuedWorkSummaryAfterSend } from "./closing-summary";
 import {
   CACHE_EXPIRY_MIN_TOTAL_TOKENS,
   HANDED_OFF_SOURCES_KEY,
@@ -51,7 +60,11 @@ import {
   noteNoticeTurnInterrupted,
   cacheExpiryAutoStart,
   cacheExpiryDeadline,
+  continueAfterHandoff,
+  continueMissedLineShown,
   decisionPendingSinceUserSend,
+  handoffContinueBlock,
+  type HandoffContinueBlock,
   noteAutoHandoffRefused,
   activeNotice,
   autoStartDisplay,
@@ -68,38 +81,55 @@ import {
   planHasUnfinishedStep,
   resolveHandoffAutoSettings,
   sizeAutoDecision,
+  sourceTabCloseBlock,
   type AutoHandoffGateInput,
+  type BackgroundWork,
   type CliActivity,
   type AutoHandoffMemory,
 } from "./handoff-auto";
 import {
-  normalizeApiKeyPolicy,
   restoredHandoffRunId,
   type AssistantUsage,
   type HandoffAutoSettings,
   type HandoffAutoNotice,
   type HandoffAutoStart,
   type HostToWebview,
+  type WaitReportItem,
   type NormalizedEventBody,
   type WebviewToHost,
 } from "./protocol";
 import { lookupSessionFile } from "./session-files";
 import { sessionRecordId } from "./session-record";
+import { handoffContextFiles, handoffRegistryFiles, type HandoffContextStore, type HandoffRegistry, type LegacyMemento } from "./state-files";
 import { handoffForkStateOf, postSessionListChanged, sessionDisplayTitleOf } from "./session-list-wiring";
-import type { SessionStore } from "./store-surfaces";
+import { closeConversationTab, type SessionStore } from "./store-surfaces";
 import { linkedTodoItemIdOf, relinkTodoConversation, todoHandoffMemo } from "./todo-surface";
 
 export const handoffDetailSources = new Map<string, { runId: string; detail: HandoffDetail }>();
 
-const handoffRuns = new Map<string, { runId: string; runner: HandoffRunner | null }>();
+function postHandoffSendLock(st: SessionStore, tabId: string): void {
+  st.post({ type: "handoffSendLock", tabId, locked: handoffInProgress(tabId) });
+}
 
-export function handoffPersist(): { get(k: string): unknown; update(k: string, v: unknown): Promise<void> } {
+export function handoffPersist(): LegacyMemento {
   return {
     get: (k) => extensionContext?.globalState.get(k),
     update: async (k, v) => {
       await extensionContext?.globalState.update(k, v);
     },
   };
+}
+
+export function globalStorageRoot(): string | undefined {
+  return extensionContext?.globalStorageUri?.fsPath;
+}
+
+export function handoffRegistry(): HandoffRegistry {
+  return handoffRegistryFiles(globalStorageRoot());
+}
+
+export function handoffContextUsage(): HandoffContextStore {
+  return handoffContextFiles(globalStorageRoot(), handoffPersist(), handoffContextUsageKey);
 }
 
 export const handoffFs = {
@@ -120,8 +150,92 @@ export async function readHandoffRecords(filePath: string): Promise<HandoffRecor
 }
 
 const autoFolderMissingShown = new WeakMap<Session, string>();
+const sourceActivity = new WeakMap<Session, number>();
 
-async function runHandoff(st: SessionStore, sender: vscode.Webview | null, target: Session, auto?: HandoffAutoStart | HandoffAutoNotice): Promise<boolean | undefined> {
+type DestinationSend = ({ sent: true; turnId: string | null } | { sent: false; reason: HandoffContinueBlock | "rejected" }) & { settingOn: boolean };
+
+async function settleDestinationStart(fork: Session, firstStartSucceeded: boolean): Promise<void> {
+  while (firstStartSucceeded && fork.starting) await fork.starting;
+}
+
+async function sendToHandoffDestination(fork: Session, generation: number, firstStartSucceeded: boolean, settingOn: () => boolean, compose: () => { input: LaisoraInput; text: string }): Promise<DestinationSend> {
+  await settleDestinationStart(fork, firstStartSucceeded);
+  const conv = fork.conversation;
+  const forkSessionId = sessionRecordId(fork);
+  const setting = settingOn();
+  const blockOf = (): HandoffContinueBlock | undefined => handoffContinueBlock({
+    firstStartSucceeded,
+    settingOn: setting,
+    sameGeneration: fork.logicalGeneration === generation,
+    handedOff: forkSessionId !== undefined && handedOffSources().includes(forkSessionId),
+    gate: autoHandoffGateOf(fork),
+    turnsEnded: fork.conversation?.turnsEnded ?? 0,
+  });
+  const block = blockOf();
+  if (block !== undefined || conv === null) return { sent: false, reason: block ?? "gate_closed", settingOn: setting };
+  const message = compose();
+  let lateBlock: HandoffContinueBlock | undefined;
+  const sent = await conv.sendAutomatic(message.input, () => {
+    lateBlock = blockOf();
+    return lateBlock === undefined ? message.text : undefined;
+  });
+  return sent ? { sent: true, turnId: conv.runningTurnId, settingOn: setting } : { sent: false, reason: lateBlock ?? "rejected", settingOn: setting };
+}
+
+async function sendHandoffContinue(fork: Session, generation: number, firstStartSucceeded: boolean, todoItemId: string | undefined): Promise<boolean> {
+  let settings: HandoffAutoSettings | undefined;
+  let input: LaisoraInput | undefined;
+  const result = await sendToHandoffDestination(fork, generation, firstStartSucceeded, () => (settings = readAutoHandoffSettings()).continueWork, () => {
+    const message = handoffContinueMessage(todoItemId, settings ?? readAutoHandoffSettings());
+    input = message.input;
+    return message;
+  });
+  if (continuedWorkSummaryAfterSend({ sent: result.sent, sameGeneration: fork.logicalGeneration === generation, input })) fork.continuedWorkSummary = true;
+  output.appendLine(result.sent
+    ? `[${fork.title}] continuation after the automatic handoff sent`
+    : `[${fork.title}] continuation after the automatic handoff not sent: ${result.reason}`);
+  if (continueMissedLineShown({ settingOn: result.settingOn, sent: result.sent, sameGeneration: fork.logicalGeneration === generation, closed: fork.closed })) {
+    fork.pushEvent({ kind: "local_command_output", text: l10n.t("LAISORA could not ask Claude to continue the unfinished work after the automatic handoff."), uuid: randomUUID() }, undefined, { timestamp: Date.now() });
+  }
+  return result.sent;
+}
+
+async function sendWaitNotifyCarry(fork: Session, generation: number, firstStartSucceeded: boolean, items: readonly WaitReportItem[], continued: boolean): Promise<void> {
+  await settleDestinationStart(fork, firstStartSucceeded);
+  const skipOf = () => waitNotifyCarrySkip({
+    continued,
+    settingOn: waitNotifySettings().enabled,
+    pushTool: waitNotifyPushToolOf(fork),
+    transcriptWriteLocked: fork.transcriptWriteLocked,
+  });
+  const skip = skipOf();
+  if (skip !== undefined) {
+    output.appendLine(`[${fork.title}] mobile notification carried over from the handoff skipped: ${skip}`);
+    return;
+  }
+  seedWaitNotifyCarry(fork, items);
+  let result: DestinationSend;
+  let lateSkip: ReturnType<typeof skipOf>;
+  try {
+    result = await sendToHandoffDestination(fork, generation, firstStartSucceeded, () => (lateSkip = skipOf()) === undefined,
+      () => ({ input: { kind: "waitNotifyCarry" }, text: WAIT_NOTIFY_CARRY_INSTRUCTION }));
+  } catch (error) {
+    abandonWaitNotifyCarry(fork, items, String(error));
+    return;
+  }
+  if (!result.sent && lateSkip !== undefined) {
+    skipWaitNotifyCarry(fork, lateSkip);
+    return;
+  }
+  if (!result.sent) {
+    abandonWaitNotifyCarry(fork, items, result.reason);
+    return;
+  }
+  noteWaitNotifyCarryTurn(fork, result.turnId);
+  output.appendLine(`[${fork.title}] short turn sent for the mobile notification carried over from the handoff`);
+}
+
+async function runHandoff(st: SessionStore, sender: vscode.Webview | null, target: Session, auto?: HandoffAutoStart | HandoffAutoNotice, continueWork = false): Promise<boolean | undefined> {
   const runId = randomUUID();
   const profile = inheritedProfile(target);
   const source = { sessionId: sessionRecordId(target) ?? "", title: target.title };
@@ -133,14 +247,10 @@ async function runHandoff(st: SessionStore, sender: vscode.Webview | null, targe
       state: "failed",
       reason,
       detail,
-      message:
-        reason === "tab_failed"
-          ? l10n.t("The handoff was already created. You can open it from the history.")
-          : l10n.t("Handoff aborted ({0})", `${reason}${detail === undefined ? "" : `: ${detail}`}`),
       source,
     });
   };
-  const busy = (): boolean => (target.conversation?.state ?? "idle") !== "idle";
+  const busy = (): boolean => handoffSourceBusy({ turnRunning: turnRunning(target), unsentSendCount: target.unsentSends.size });
   const sourceConversation = target.conversation;
   const sourceGeneration = target.logicalGeneration;
   const contextUsage: HandoffContextUsage = { before: null, after: "pending" };
@@ -152,17 +262,21 @@ async function runHandoff(st: SessionStore, sender: vscode.Webview | null, targe
     else fail(reason, detail);
     return undefined;
   };
+  if (await judgeTranscriptWriteLock(target)) return refuse("transcript_write_forbidden");
   if (busy()) return refuse("source_busy");
   if (handoffRuns.has(target.tabId)) return refuse("already_running");
-  const reservation: { runId: string; runner: HandoffRunner | null } = { runId, runner: null };
+  const reservation: HandoffRunReservation = { runId, runner: null };
+  let handedOff = false;
+  let carry: readonly WaitReportItem[] | undefined;
   handoffRuns.set(target.tabId, reservation);
   try {
+    postHandoffSendLock(st, target.tabId);
+    const cfg = getLaisoraConfiguration();
+    const cwd = resolveSessionCwd(target);
     if (source.sessionId.length === 0) {
       fail("fork_failed", "no_session_id");
       return false;
     }
-    const cfg = getLaisoraConfiguration();
-    const cwd = resolveSessionCwd(target);
     if (cwd === undefined) {
       fail("fork_failed", "no_cwd");
       return false;
@@ -177,7 +291,7 @@ async function runHandoff(st: SessionStore, sender: vscode.Webview | null, targe
     try {
       runtime = await resolveHandoffRuntime(
         configuredClaudeExecutablePath(cfg),
-        normalizeApiKeyPolicy(cfg.get<string>("claude.apiKeyPolicy")!)
+        configuredApiKeyPolicy(cfg)
       );
     } catch (e) {
       fail("fork_failed", String(e));
@@ -197,7 +311,7 @@ async function runHandoff(st: SessionStore, sender: vscode.Webview | null, targe
       readRecords: readHandoffRecords,
       fs: handoffFs,
       writeDiagnostic: writeHandoffDiagnostic,
-      persist: handoffPersist(),
+      registry: handoffRegistry(),
       now: () => Date.now(),
       timeoutMs: COMPACT_HEARTBEAT_GRACE_MS,
       log: (line) => output.appendLine(`[${target.title}] ${line}`),
@@ -208,14 +322,13 @@ async function runHandoff(st: SessionStore, sender: vscode.Webview | null, targe
           runId,
           state: "running",
           phase,
-          message: l10n.t("Handing off"),
           source,
           ...(auto === undefined ? {} : { auto }),
         });
       },
       onForkCreated: (forkSessionId) => {
         snapshotPending = true;
-        snapshotWrite = handoffPersist().update(handoffContextUsageKey(forkSessionId), { ...contextUsage }).catch((error) =>
+        snapshotWrite = handoffContextUsage().write(forkSessionId, { ...contextUsage }).catch((error) =>
           output.appendLine("[handoff] context snapshot could not be saved: " + String(error))).finally(() => { snapshotPending = false; });
       },
       onProgress: (info) => {
@@ -226,7 +339,6 @@ async function runHandoff(st: SessionStore, sender: vscode.Webview | null, targe
           state: "running",
           phase: info.phase,
           progress: { heartbeats: info.heartbeats, elapsedMs: info.elapsedMs, since: info.since },
-          message: l10n.t("Handing off"),
           source,
           ...(auto === undefined ? {} : { auto }),
         });
@@ -244,25 +356,25 @@ async function runHandoff(st: SessionStore, sender: vscode.Webview | null, targe
     contextUsage.before = sourceUnchanged() ? before : null;
     const workMemo = await todoHandoffMemo(source.sessionId);
     if (busy()) return refuse("source_busy");
+    const activityAtFork = sourceActivity.get(target) ?? 0;
     const outcome: HandoffOutcome = await runner.run({
       sourceSessionId: source.sessionId,
       sourceTitle: source.title,
       runId,
-      sourceBusy: busy,
+      sourceBusy: () => busy() || (sourceActivity.get(target) ?? 0) !== activityAtFork,
       ...(workMemo !== undefined ? { workMemo } : {}),
     });
     if (!outcome.ok && quietAutoRefusal(auto !== undefined, outcome.reason)) return undefined;
     if (!outcome.ok) {
       const forkSessionId = outcome.forkSessionId;
-      if (forkSessionId !== undefined && handoffForkStateOf(forkSessionId, Date.now()) === "cleanup_failed") postSessionListChanged();
+      if (forkSessionId !== undefined && (await handoffForkStateOf(forkSessionId)) === "cleanup_failed") postSessionListChanged();
       if (forkSessionId !== undefined && (await lookupSessionFile(forkSessionId)).reason === "not_found") {
-        void snapshotWrite.then(() => handoffPersist().update(handoffContextUsageKey(forkSessionId), undefined)).catch((error) =>
+        void snapshotWrite.then(() => handoffContextUsage().remove(forkSessionId)).catch((error) =>
           output.appendLine("[handoff] context snapshot could not be removed: " + String(error)));
       }
       fail(outcome.reason, outcome.detail);
       return false;
     }
-    const contextUsageKey = handoffContextUsageKey(outcome.forkSessionId);
     if (outcome.unreadableLineCount > 0) {
       void handoffPersist().update(handoffUnreadableLinesKey(outcome.forkSessionId), outcome.unreadableLineCount).catch((error) =>
         output.appendLine("[handoff] unreadable line count could not be saved: " + String(error)));
@@ -270,11 +382,18 @@ async function runHandoff(st: SessionStore, sender: vscode.Webview | null, targe
     await rememberHandedOff(source.sessionId);
     await relinkTodoConversation(source.sessionId, outcome.forkSessionId);
     const startMeasurement = createStartMeasurement();
+    const activateIn = (): vscode.Webview[] => forkTabActivationTargets({
+      auto: auto !== undefined,
+      sender,
+      surfaces: (auto !== undefined ? st.attachedWebviews() : sender === null ? [] : [sender])
+        .map((surface) => ({ surface, activeTabId: st.shownTabIdOf(surface) })),
+      sourceTabId: target.tabId,
+    });
     const opened = await openResumedSession(st, {
       sessionId: outcome.forkSessionId,
       filePath: outcome.forkFilePath,
-      activate: shouldActivateForkTab(sender === null ? undefined : st.activeTabIdOf(sender), target.tabId),
-      activateIn: sender,
+      activate: activateIn().length > 0,
+      activateIn,
       inherit: profile,
       knownCwd: cwd,
       startMeasurement,
@@ -302,13 +421,6 @@ async function runHandoff(st: SessionStore, sender: vscode.Webview | null, targe
       runId,
       state: "done",
       contextUsage,
-      message:
-        outcome.unreadableLineCount > 0
-          ? l10n.t(
-              "Handoff complete ({0} lines of the record could not be read; some messages may be missing)",
-              outcome.unreadableLineCount
-            )
-          : l10n.t("Handoff complete"),
       source,
       fork: { sessionId: outcome.forkSessionId, tabId: forkSession.tabId, title: forkSession.title },
       ...(outcome.compact !== undefined ? { compact: outcome.compact } : {}),
@@ -325,7 +437,7 @@ async function runHandoff(st: SessionStore, sender: vscode.Webview | null, targe
       if (!target.closed) st.post({ ...done, tabId: target.tabId });
       if (forkSession.logicalGeneration === generation && !forkSession.closed) st.post({ ...done, tabId: forkSession.tabId });
       const saveFinal = async (): Promise<void> => {
-        await handoffPersist().update(contextUsageKey, { ...contextUsage });
+        await handoffContextUsage().write(outcome.forkSessionId, { ...contextUsage });
       };
       if (snapshotPending) {
         void snapshotWrite.then(saveFinal).catch((error) =>
@@ -336,13 +448,57 @@ async function runHandoff(st: SessionStore, sender: vscode.Webview | null, targe
       output.appendLine("[handoff] context snapshot could not be saved: " + String(error));
       if (forkSession.logicalGeneration === generation && !forkSession.closed) st.post({ ...done, tabId: forkSession.tabId });
     });
+    const carried = waitNotifyCarryOf(target);
+    carry = carried;
+    if (continueWork || carried !== undefined) {
+      void startMeasurement.firstStart.then(async (started) => {
+        const continued = continueWork ? await sendHandoffContinue(forkSession, generation, started, workMemo?.item.id) : false;
+        if (carried !== undefined) await sendWaitNotifyCarry(forkSession, generation, started, carried, continued);
+      }).catch((error) => output.appendLine(`[${forkSession.title}] input after the handoff not sent: ${String(error)}`));
+    }
+    handedOff = true;
     return true;
   } catch (e) {
     fail("commit_failed", String(e));
     return false;
   } finally {
     if (handoffRuns.get(target.tabId)?.runId === runId) handoffRuns.delete(target.tabId);
-    signalWaitNotify(target);
+    try {
+      postHandoffSendLock(st, target.tabId);
+    } catch (error) {
+      output.appendLine(`[${target.title}] handoff send lock release could not be posted: ${String(error)}`);
+    }
+    if (handedOff) {
+      target.conversation?.cancelAutoResume();
+      target.guardrailRunner.abandonHeldReports();
+      if (carry !== undefined) requestRemoteControlAuto(target, "handedOff");
+      dropWaitNotifyEpisode(target);
+      closeHandedOffSource(st, sender, target, busy());
+    } else {
+      target.guardrailRunner.scheduleGuardrailRefresh();
+      signalWaitNotify(target);
+    }
+  }
+}
+
+function closeHandedOffSource(st: SessionStore, sender: vscode.Webview | null, source: Session, busy: boolean): void {
+  const block = sourceTabCloseBlock({
+    settingOn: readAutoHandoffSettings().closeSourceTab,
+    closed: source.closed,
+    gate: { composerHasText: composerHasText(source.tabId) },
+    busy,
+    background: backgroundWorkOf(source),
+  });
+  if (block === "setting_off") return;
+  if (block !== undefined) {
+    output.appendLine(`[${source.title}] source tab kept open after the handoff: ${block}`);
+    return;
+  }
+  try {
+    closeConversationTab(st, source, sender, { offerReopen: false });
+    output.appendLine(`[${source.title}] source tab closed after the handoff`);
+  } catch (error) {
+    output.appendLine(`[${source.title}] source tab could not be closed after the handoff: ${String(error)}`);
   }
 }
 
@@ -481,7 +637,6 @@ export async function handleHandoffMessage(
           runId: msg.runId,
           state: "failed",
           reason: "cancelled",
-          message: l10n.t("Cancelled"),
           source: { sessionId: sessionRecordId(target!) ?? "", title: target!.title },
         });
       }
@@ -515,9 +670,12 @@ export function createStartMeasurement(): StartMeasurement {
   let pending = true;
   let resolve!: (value: HandoffContextMeasurement | null | undefined) => void;
   const result = new Promise<HandoffContextMeasurement | null | undefined>((r) => { resolve = r; });
+  let decideFirstStart!: (succeeded: boolean) => void;
+  const firstStart = new Promise<boolean>((r) => { decideFirstStart = r; });
   const settle = (value: HandoffContextMeasurement | null | undefined): void => {
     if (!pending) return;
     pending = false;
+    decideFirstStart(true);
     resolve(value);
   };
   return {
@@ -527,7 +685,12 @@ export function createStartMeasurement(): StartMeasurement {
       void initialContextUsageWithin(conversation).then(settle);
       await result;
     },
-    abandon: () => settle(undefined),
+    abandon: () => {
+      decideFirstStart(false);
+      settle(undefined);
+    },
+    firstStart,
+    startFailed: () => decideFirstStart(false),
   };
 }
 
@@ -605,21 +768,27 @@ function autoHandoffPermittedFor(s: Session, tab: AutoHandoffTab): boolean {
   return autoHandoffPermitted(tab.memory, sessionRecordId(s), handedOffSources());
 }
 
+function backgroundWorkOf(s: Session): BackgroundWork {
+  return {
+    runningAgents: runningDelegationIds(s.backgroundActivity).length,
+    runningBackgroundTasks: liveBackgroundTasks(s.backgroundActivity).length,
+    runningExternalRuns: s.conversation?.runningExternalRunCount ?? 0,
+  };
+}
+
 export function cliActivityOf(s: Session): CliActivity {
   const conv = s.conversation;
   return {
-    idle: conv !== null && !conv.isClosed && conv.state === "idle" && s.starting === null && !s.closed && !s.clearing
+    idle: conv !== null && !conv.isClosed && !launchingOrTurnRunning(s) && !s.closed && !s.clearing
       && s.hydration?.buffering !== true,
-    runningAgents: runningDelegationIds(s.backgroundActivity).length,
-    runningBackgroundTasks: liveBackgroundTasks(s.backgroundActivity).length,
-    runningExternalRuns: conv?.runningExternalRunCount ?? 0,
+    ...backgroundWorkOf(s),
     queuedMessages: conv?.queuedInputCount ?? 0,
   };
 }
 
 function quietGateOf(s: Session): Omit<AutoHandoffGateInput, "composerHasText"> {
   const activity = cliActivityOf(s);
-  return { ...activity, queuedMessages: activity.queuedMessages + s.unsentSends.size, handoffRunning: handoffRuns.has(s.tabId) };
+  return { ...activity, queuedMessages: activity.queuedMessages + s.unsentSends.size, handoffRunning: handoffInProgress(s.tabId) };
 }
 
 function autoHandoffGateOf(s: Session): AutoHandoffGateInput {
@@ -634,8 +803,12 @@ export function autoHandoffDue(s: Session): boolean {
   return autoHandoffTabs.get(s)?.candidate !== undefined;
 }
 
+function planUnfinishedOf(s: Session): boolean {
+  return planHasUnfinishedStep(s.evidenceIndex.timeBuckets.blocks);
+}
+
 function unfinishedWorkOf(s: Session): boolean {
-  return planHasUnfinishedStep(s.evidenceIndex.timeBuckets.blocks) || decisionPendingSinceUserSend(s.events);
+  return planUnfinishedOf(s) || decisionPendingSinceUserSend(s.events);
 }
 
 function tryAutoHandoff(s: Session): void {
@@ -675,9 +848,10 @@ function tryAutoHandoff(s: Session): void {
     return;
   }
   tab.memory = noteAutoHandoffStarted(tab.memory);
-  output.appendLine(`[${s.title}] automatic handoff: ${JSON.stringify(start)}`);
+  const continueWork = continueAfterHandoff({ trigger: start.trigger, planUnfinished: planUnfinishedOf(s), decisionPending: decisionPendingSinceUserSend(s.events) });
+  output.appendLine(`[${s.title}] automatic handoff: ${JSON.stringify({ ...start, continueWork })}`);
   const generation = s.logicalGeneration;
-  void runHandoff(st, st.activeWebview, s, autoStartDisplay(start, notice, handoffNoticeTitle)).then((completed) => {
+  void runHandoff(st, st.activeWebview, s, autoStartDisplay(start, notice, handoffNoticeTitle), continueWork).then((completed) => {
     if (completed !== undefined) noteAutoHandoffSettled(s, completed, generation);
     else if (s.logicalGeneration === generation) autoHandoffTab(s).memory = noteAutoHandoffRefused(autoHandoffTab(s).memory);
   }).catch((error: unknown) => output.appendLine(`[${s.title}] automatic handoff failed: ${String(error)}`));
@@ -700,7 +874,14 @@ function sendAutoHandoffNotice(s: Session, tab: AutoHandoffTab, start: HandoffAu
     return;
   }
   tab.memory = noteHandoffNoticeSent(tab.memory, facts, Date.now());
-  output.appendLine(`[${s.title}] automatic handoff notice sent: ${JSON.stringify(facts)}`);
+  void result.handedOff.then((handedOff) => {
+    if (handedOff) {
+      output.appendLine(`[${s.title}] automatic handoff notice sent: ${JSON.stringify(facts)}`);
+      return;
+    }
+    output.appendLine(`[${s.title}] automatic handoff notice not sent: withdrawn`);
+    if (tab.noticeTurn === NOTICE_TURN_PENDING) noteNoticeTurnEnded(s, tab, undefined, true);
+  });
 }
 
 function noteAutoHandoffSettled(s: Session, completed: boolean, generation: number): void {
@@ -769,6 +950,7 @@ function noteNoticeTurnEnded(s: Session, tab: AutoHandoffTab, turnId: string | u
 }
 
 export function noteAutoHandoffEvent(s: Session, ev: NormalizedEventBody): void {
+  if (ev.kind === "turn_started" || ev.kind === "user_message") sourceActivity.set(s, (sourceActivity.get(s) ?? 0) + 1);
   const tab = autoHandoffTab(s);
   switch (ev.kind) {
     case "assistant_usage":
@@ -802,7 +984,7 @@ export function noteAutoHandoffEvent(s: Session, ev: NormalizedEventBody): void 
       return;
     case "context_usage": {
       const conv = s.conversation;
-      if (tab.turnEnded && conv !== null && conv.state === "idle") {
+      if (tab.turnEnded && conv !== null && !turnRunning(s)) {
         if (!postTurnMeasurement(conv.contextUsageTurnsEnded, conv.turnsEnded)) return;
         tab.turnEnded = false;
         evaluateAutoHandoff(s, tab, ev);

@@ -1,7 +1,7 @@
 import { toolIntentLabel } from "./status-line";
-import { agentElapsedMs, externalRunEndStatus, flattenAgents, workEndStatus, type OrchestrationView, type PlanContext, type PlanContextStep, type PlanContextTokens, type PlanContextWork, type WorkAgentNode, type WorkEndStatus, type WorkModelPayload } from "../protocol";
+import { agentElapsedMs, externalRunEndStatus, flattenAgents, planLaneTokens, workEndStatus, type OrchestrationView, type PlanContext, type PlanContextStep, type PlanContextTokens, type PlanContextWork, type WorkAgentNode, type WorkEndStatus, type WorkModelPayload } from "../protocol";
 import type { TaskStatus } from "../work-model";
-import { planHeading, planItemNumber, planStepKey, transitionPlanStep } from "../plan-steps";
+import { planHeading } from "../plan-steps";
 export { normalizePlanContent, planStepKey } from "../plan-steps";
 
 export interface PlanLane {
@@ -72,63 +72,13 @@ export function derivePlanView(model: WorkModelPayload | undefined, orchestratio
   const view: PlanView = { block: context?.blockId, goal: heading?.text ?? "", goalDeclared: heading?.declared ?? false, name: context?.text ?? "", steps: [], now: [], current: null,
     completed: 0, work: context?.work ?? null,
     workProvisional: context?.work?.provisional === true,
-    claude: null, external: null, externalRunCount: 0, partial: context !== undefined && model?.planHistoryLostThrough !== undefined &&
-      model.planHistoryLostThrough >= context.start || model?.coverage.summary === "prefix-truncated" };
-  const members = context?.steps === undefined ? undefined : new Set(context.steps.map(step => step.key));
+    claude: null, external: null, externalRunCount: 0, partial: model?.coverage.summary === "prefix-truncated" };
   const unit = context ?? { start: Number.POSITIVE_INFINITY, end: nowMs, running: false, steps: [] };
-  const history = (model?.planHistory ?? []).filter(entry => entry.at >= unit.start && entry.at <= unit.end);
-  let hasPlan = false;
-  let hasStartedPlan = false;
-  let userAfterPlan = false;
-  const itemKeys = (unit.steps ?? []).map(step => step.key);
-  for (const entry of history) {
-    if (entry.kind === "user") { if (hasPlan) userAfterPlan = true; continue; }
-    if (entry.kind === "resume") continue;
-    const present = new Set<string>();
-    for (const item of entry.items) {
-      const key = planStepKey(entry, item);
-      if (members !== undefined && !members.has(key)) continue;
-      if (present.has(key)) continue;
-      present.add(key);
-      const number = planItemNumber(itemKeys, key);
-      let step = view.steps.find(value => value.key === key);
-      if (entry.removed) {
-        if (step) {
-          transitionPlanStep(step, entry.at, step.status, true);
-        }
-        continue;
-      }
-      if (!step) {
-        if (entry.source !== "tasks" && item.status === "completed") continue;
-        step = { key, number, title: item.description, status: "unknown", removed: false,
-          added: hasPlan && (entry.source !== "tasks" || hasStartedPlan || userAfterPlan),
-          addedAt: hasPlan && userAfterPlan ? entry.at : null, ahead: false,
-          startedAt: null, endedAt: null, work: null, tokens: null, lanes: [] };
-        view.steps.push(step);
-      }
-      transitionPlanStep(step, entry.at, item.status);
-      step.status = item.status;
-      step.activeForm = item.activeForm;
-      step.removed = false;
-      if (entry.source === "tasks") step.title = item.description;
-    }
-    for (const step of view.steps) {
-      if (entry.source === "tasks" || present.has(step.key) || step.removed) continue;
-      transitionPlanStep(step, entry.at, step.status, true);
-    }
-    hasPlan = true;
-    hasStartedPlan ||= entry.items.some(item => item.status === "in_progress" || item.status === "completed");
-  }
-  if (unit.steps !== undefined) {
-    const reconstructed = new Map(view.steps.map(step => [step.key, step]));
-    view.steps = unit.steps.map(record => {
-      const step = reconstructed.get(record.key) ?? { key: record.key, number: record.number, title: record.title, status: record.status,
-        removed: record.removed, added: false, addedAt: null, ahead: false, startedAt: null, endedAt: null, work: null, tokens: null, lanes: [] };
-      Object.assign(step, { number: record.number, title: record.title, status: record.status, removed: record.removed,
-        startedAt: record.startedAt, endedAt: record.endedAt, period: record.period, tokens: record.tokens ?? null, work: record.work ?? null });
-      return step;
-    });
-  }
+  view.steps = (unit.steps ?? []).map(record => ({ key: record.key, number: record.number, title: record.title,
+    ...(record.activeForm === undefined ? {} : { activeForm: record.activeForm }), status: record.status, removed: record.removed,
+    added: record.added === true, addedAt: record.addedAt ?? null, ahead: false, startedAt: record.startedAt, endedAt: record.endedAt,
+    period: record.period, tokens: record.tokens ?? null, work: record.work ?? null, lanes: [] }));
+  if (view.steps.length > 0 && context !== undefined && model?.planHistoryLostThrough !== undefined && model.planHistoryLostThrough >= context.start) view.partial = true;
   const resumes = new Map<string, Array<{ at: number; status: WorkEndStatus; endedAt?: number }>>();
   if (view.steps.length) for (const entry of model?.planHistory ?? []) {
     if (entry.kind === "resume") resumes.set(entry.agentId, [...resumes.get(entry.agentId) ?? [], { at: entry.at, status: entry.status, endedAt: entry.endedAt }]);
@@ -140,7 +90,8 @@ export function derivePlanView(model: WorkModelPayload | undefined, orchestratio
       .map(placement => placement.toolUseId)));
   const resumeSteps = new Map((context?.placements ?? []).flatMap(placement => placement.resumes === undefined ? []
     : [[placement.toolUseId, new Map(placement.resumes.map(resume => [resume.at, resume]))] as const]));
-  const launchTokens = new Map((context?.placements ?? []).flatMap(placement => placement.tokens === undefined ? [] : [[placement.toolUseId, placement.tokens] as const]));
+  const runTokens = new Map((context?.placements ?? []).flatMap(placement => placement.runTokens === undefined ? []
+    : [[placement.toolUseId, placement.runTokens] as const]));
   const laneTokens = (tokens: PlanContextTokens | null): Pick<PlanLane, "tokens" | "tokensPartial" | "cacheRead"> =>
     ({ tokens: tokens?.tokens ?? null, ...(tokens?.partial ? { tokensPartial: true } : {}), cacheRead: tokens?.cacheRead ?? null });
   const agents = flattenAgents(model?.phases ?? [], model?.unlinkedAgents);
@@ -179,23 +130,23 @@ export function derivePlanView(model: WorkModelPayload | undefined, orchestratio
   const counted = context?.counted === undefined ? undefined : new Set(context.counted);
   const visit = (agent: WorkAgentNode): void => {
     const measures = counted === undefined || counted.has(agent.toolUseId) ? agent.roleRun : undefined;
-    const split = agent.toolUseId === undefined ? undefined : launchTokens.get(agent.toolUseId);
+    const resumed = resumes.get(agent.agentId);
+    const runs = agent.toolUseId === undefined ? undefined : runTokens.get(agent.toolUseId);
+    const drawn = new Set<number>();
     const lane: PlanLane = { id: `agent:${agent.transcriptAgentId ?? agent.agentId}`, agent: agent.role ?? agent.agentType ?? agent.modelMeasured ?? agent.modelDeclared ?? "Claude",
       title: agent.status === "running" && agent.intentInput ? toolIntentLabel("Agent", agent.intentInput) : agent.description, start: agent.startedAt ?? null,
       elapsed: agent.status === "running" && agent.startedAt !== undefined && (context === undefined || unit.running)
         ? agentElapsedMs(agent, nowMs)
         : agent.status === "running" ? agent.elapsedMs : agent.roleRun?.elapsedMs ?? null,
-      status: workEndStatus(agent), ...(split !== undefined ? laneTokens(split)
+      status: workEndStatus(agent), ...(runs !== undefined ? { tokens: null, cacheRead: null }
         : { tokens: measures?.tokens ?? null, ...(measures?.tokensPartial ? { tokensPartial: true } : {}), cacheRead: measures?.cacheRead ?? null }),
       ...(agent.tokens === undefined ? {} : { contextTokens: agent.tokens }), external: false,
       ...(agent.description ? { description: agent.description } : {}) };
-    const resumed = resumes.get(agent.agentId);
     const owner = { toolUseId: agent.toolUseId, agentId: agent.transcriptAgentId ?? agent.agentId };
-    if (!resumed) attach(lane, owner);
-    else {
-      const first = resumed[0];
-      const placed = attach({ ...lane, title: agent.description, status: first.status,
-        elapsed: first.endedAt === undefined || agent.startedAt === undefined ? null : Math.max(0, first.endedAt - agent.startedAt) }, owner);
+    const launch = resumed === undefined ? lane : { ...lane, title: agent.description, status: resumed[0].status,
+      elapsed: resumed[0].endedAt === undefined || agent.startedAt === undefined ? null : Math.max(0, resumed[0].endedAt - agent.startedAt) };
+    const placed = attach(launch, owner);
+    if (resumed) {
       const elsewhere = placed === undefined && agent.toolUseId !== undefined && shownEarlier.has(agent.toolUseId);
       const own = agent.toolUseId === undefined ? undefined : resumeSteps.get(agent.toolUseId);
       resumed.forEach(({ at }, position) => {
@@ -207,13 +158,15 @@ export function derivePlanView(model: WorkModelPayload | undefined, orchestratio
         const end = segmentEnd(agent.agentId, position);
         const until = end.status === "running" ? runningUntil : end.endedAt;
         const segment: PlanLane = { ...lane, id, title: agent.description, start: at, resumedAt: at, status: end.status,
-          elapsed: until === undefined ? null : Math.max(0, until - at), tokens: null, tokensPartial: false, cacheRead: null, contextTokens: undefined,
-          ...(ownResume === undefined ? {} : laneTokens(ownResume.tokens)) };
+          elapsed: until === undefined ? null : Math.max(0, until - at), tokensPartial: false, contextTokens: undefined,
+          ...laneTokens(runs === undefined ? null : planLaneTokens(runs, drawn).resume(at)) };
         if (seen.has(id) || lanes === undefined && !inWindow(segment)) return;
         seen.add(id);
+        drawn.add(at);
         (lanes ?? view.now).push(segment);
       });
     }
+    if (runs !== undefined) Object.assign(launch, laneTokens(planLaneTokens(runs, drawn).launch));
   };
   agents.forEach(visit);
   for (const agent of orchestration?.agents ?? []) {

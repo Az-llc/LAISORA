@@ -1,10 +1,11 @@
 import * as l10n from "@vscode/l10n";
-import { askOtherChoice, type AskBlock } from "../ask-parser";
+import type { AskBlock } from "../ask-parser";
 import { parseMarkdown } from "../markdown-ast";
-import type { TodoAskSourceMessage, TodoAskSourceMessageEnvelope, TodoAskSourceRef, TodoAskWhere, TodoTabItem, WebviewToHost } from "../protocol";
-import { todoButton, todoEl as el } from "./todo-edit";
-import { createYouItems, isWaitingYouItem, type AskIdentity, type YouItem, type YouItemsReader } from "./you-items";
-import { youWaitingKindLabel } from "./you-list";
+import type { AskMarks, TodoAskSourceMessage, TodoAskSourceMessageEnvelope, TodoAskSourceRef, TodoAskWhere, TodoTabItem, WebviewToHost } from "../protocol";
+import { todoButton } from "./todo-edit";
+import { askStale, askStateLookup, createYouItems, isDeclaredAsk, isWaitingYouItem, nextAskStaleAt, type AskIdentity, type AskStale, type AskStateKey, type YouItem, type YouItemsReader } from "./you-items";
+import { askStaleLabel, youKindLabel } from "./you-list";
+import { element as el } from "./element";
 
 export const TODO_ASK_OPEN_WAIT_MS = 60_000;
 const TODO_ASK_JUMP_POLL_MS = 500;
@@ -22,30 +23,82 @@ export function askNodesIn(text: string): Array<{ ask: AskBlock; offset: number 
   return found.sort((a, b) => a.offset - b.offset);
 }
 
-export interface SavedMessageAskState {
-  readonly dismissed: readonly string[];
-  readonly resolved: readonly string[];
+export interface AskCheckState {
   readonly checked: Readonly<Record<string, readonly boolean[]>>;
+  readonly checkedTags: Readonly<Record<string, string>>;
+  readonly checkedPosted?: Readonly<Record<string, true>>;
 }
 
-export function recordAskStore(sessionId: string, messages: readonly TodoAskSourceMessage[], saved: SavedMessageAskState, otherChoice?: string) {
-  const store = createYouItems(`record:${sessionId}`, { messages: saved.dismissed, resolvedMessages: saved.resolved }, (replyId) => ({ message: replyId, start: 0 }), otherChoice);
-  let turn = 0;
+export type SavedMessageAskState = AskMarks;
+
+let sharedTicked: ReadonlySet<string> = new Set();
+let linkedAskTabs: ReadonlySet<string> = new Set();
+const askSharingListeners = new Set<() => void>();
+
+export function onAskCheckSharing(listener: () => void): () => void {
+  askSharingListeners.add(listener);
+  return () => askSharingListeners.delete(listener);
+}
+
+function sameSet(a: ReadonlySet<string>, b: ReadonlySet<string>): boolean {
+  return a.size === b.size && [...a].every(value => b.has(value));
+}
+
+function setAskCheckSharing(ticked: ReadonlySet<string>, linked: ReadonlySet<string>): boolean {
+  if (sameSet(ticked, sharedTicked) && sameSet(linked, linkedAskTabs)) return false;
+  sharedTicked = ticked;
+  linkedAskTabs = linked;
+  for (const listener of askSharingListeners) listener();
+  return true;
+}
+
+export function isAskTabLinked(tabId: string): boolean {
+  return linkedAskTabs.has(tabId);
+}
+
+export interface AskCheckReading { readonly ticks: readonly boolean[]; readonly resolved: boolean; readonly post: boolean }
+
+export interface OwnAskChecks { readonly steps: readonly boolean[]; readonly posted: boolean }
+
+export function readAskCheck(stepCount: number, own: OwnAskChecks | undefined, linked: boolean, marked: boolean): AskCheckReading {
+  if (linked && marked) return { ticks: Array.from({ length: stepCount }, () => true), resolved: true, post: false };
+  const ticks = Array.from({ length: stepCount }, (_, step) => own?.steps[step] === true);
+  const complete = stepCount > 0 && ticks.every(Boolean);
+  return { ticks, resolved: !linked && complete, post: linked && complete && own?.posted !== true };
+}
+
+export function askCheckReading(key: AskStateKey | undefined, stepCount: number, own: OwnAskChecks | undefined, linked: boolean): AskCheckReading {
+  return readAskCheck(stepCount, own, linked && key !== undefined, key !== undefined && sharedTicked.has(key.message));
+}
+
+export function ownAskChecks(key: AskStateKey | undefined, local: AskCheckState): OwnAskChecks | undefined {
+  const found = key === undefined ? undefined : askStateLookup(key, local.checked, local.checkedTags);
+  return found === undefined ? undefined : { steps: found.value, posted: local.checkedPosted?.[found.message] === true };
+}
+
+export function recordAskStore(sessionId: string, messages: readonly TodoAskSourceMessage[], saved: SavedMessageAskState) {
+  const store = createYouItems(`record:${sessionId}`, { messages: saved.dismissed, resolvedMessages: saved.resolved }, (replyId) => ({ message: replyId, start: 0 }));
+  const checks: string[] = [];
   for (const message of messages) {
     if (message.role === "user") {
-      turn++;
-      store.reply(message.uuid, message.timestamp, undefined, undefined, message.text);
+      store.reply(message.uuid, message.timestamp, undefined, undefined, message.text, message.remote === true);
       continue;
     }
     for (const { ask, offset } of askNodesIn(message.text)) {
-      const anchor = store.ask(ask, { replyId: message.uuid, offset, createdAt: message.timestamp, turn: `turn:${turn}` });
-      store.tick(anchor, (step) => saved.checked[store.messageOf(anchor) ?? ""]?.[step] === true);
+      const anchor = store.ask(ask, { replyId: message.uuid, offset, createdAt: message.timestamp });
+      if (ask.kind === "check") checks.push(anchor);
     }
   }
-  return store;
+  const retick = (local: AskCheckState): void => {
+    for (const anchor of checks) {
+      const key = store.stateKeyOf(anchor);
+      const steps = store.reader.get().find(item => item.anchor.id === anchor)?.steps?.length ?? 0;
+      store.tick(anchor, askCheckReading(key, steps, ownAskChecks(key, local), true).resolved);
+    }
+  };
+  retick(saved);
+  return Object.assign(store, { retick });
 }
-
-const isDeclaredAsk = (item: YouItem): boolean => item.anchor.approvalRef === undefined && item.resolution !== "historical";
 
 export interface TodoAskTabView {
   readonly items: readonly YouItem[];
@@ -57,9 +110,8 @@ export interface TodoAskRecordView extends TodoAskTabView {
 }
 
 function withTabState(item: YouItem, tab: YouItem): YouItem {
-  const { resolvedAt: _resolvedAt, resolution: _resolution, awaitingDetail: _awaitingDetail, ...rest } = item;
-  return { ...rest, ...(tab.resolvedAt !== undefined ? { resolvedAt: tab.resolvedAt } : {}), ...(tab.resolution !== undefined ? { resolution: tab.resolution } : {}),
-    ...(tab.awaitingDetail ? { awaitingDetail: true as const } : {}) };
+  const { resolvedAt: _resolvedAt, resolution: _resolution, ...rest } = item;
+  return { ...rest, ...(tab.resolvedAt !== undefined ? { resolvedAt: tab.resolvedAt } : {}), ...(tab.resolution !== undefined ? { resolution: tab.resolution } : {}) };
 }
 
 export function todoAskTabMerge(record: TodoAskRecordView | undefined, tabs: readonly TodoAskTabView[]): { record: YouItem[]; tabs: YouItem[][] } {
@@ -98,7 +150,6 @@ export interface TodoAskSource {
   readonly unreadable?: boolean;
 }
 
-export type TodoAskStale = "age" | "moved-on";
 
 export interface TodoAskRow {
   readonly key: string;
@@ -107,17 +158,7 @@ export interface TodoAskRow {
   readonly origin: TodoAskOrigin;
   readonly message?: string;
   readonly answerOnly: boolean;
-  readonly stale: TodoAskStale | null;
-}
-
-export const TODO_ASK_STALE_LATER_REPLIES = 2;
-export const TODO_ASK_STALE_MS = 7 * 24 * 60 * 60_000;
-
-export function todoAskStale(item: YouItem, siblings: readonly YouItem[], now: number): TodoAskStale | null {
-  if (!isDeclaredAsk(item) || item.createdAt <= 0) return null;
-  if (now - item.createdAt >= TODO_ASK_STALE_MS) return "age";
-  const later = new Set(siblings.filter(other => isDeclaredAsk(other) && other.createdAt > item.createdAt && other.turn !== item.turn).map(other => other.turn ?? other.id));
-  return later.size >= TODO_ASK_STALE_LATER_REPLIES ? "moved-on" : null;
+  readonly stale: AskStale | null;
 }
 
 const originKey = (origin: TodoAskOrigin): string => origin.kind === "tab" ? `tab:${origin.tabId}` : `record:${origin.sessionId}`;
@@ -126,7 +167,6 @@ export function todoAskRows(sources: readonly TodoAskSource[], now: number): { b
   const byItem = new Map<string, TodoAskRow[]>();
   const unreadable = new Set<string>();
   let count = 0;
-  let nextStaleAt: number | null = null;
   for (const source of sources) {
     if (source.unreadable) unreadable.add(source.itemId);
     const siblings = source.entries.flatMap(entry => entry.items);
@@ -135,18 +175,17 @@ export function todoAskRows(sources: readonly TodoAskSource[], now: number): { b
         if (!isWaitingYouItem(item)) continue;
         let rows = byItem.get(source.itemId);
         if (!rows) byItem.set(source.itemId, rows = []);
-        const stale = todoAskStale(item, siblings, now);
+        const stale = askStale(item, siblings, now);
         const message = entry.message?.(item);
         rows.push({ key: `${originKey(entry.origin)}|${item.id}`, itemId: source.itemId, item, origin: entry.origin, ...(message !== undefined ? { message } : {}),
           answerOnly: item.anchor.approvalRef !== undefined, stale });
         if (stale) continue;
         count++;
-        if (isDeclaredAsk(item) && item.createdAt > 0) nextStaleAt = Math.min(nextStaleAt ?? Infinity, item.createdAt + TODO_ASK_STALE_MS);
       }
     }
   }
   for (const rows of byItem.values()) rows.sort((a, b) => Number(a.stale !== null) - Number(b.stale !== null) || a.item.createdAt - b.item.createdAt || a.key.localeCompare(b.key));
-  return { byItem, count, nextStaleAt, unreadable };
+  return { byItem, count, nextStaleAt: nextAskStaleAt(sources.flatMap(source => source.entries.flatMap(entry => entry.items)), now), unreadable };
 }
 
 export interface TodoAskTab {
@@ -217,8 +256,9 @@ export class TodoAskBoard {
 
   constructor(private readonly host: TodoAskHost, private readonly changed: () => void) {}
 
-  apply(tabItems: readonly TodoTabItem[], refs: readonly TodoAskSourceRef[], dismissals: readonly string[], closed: readonly string[]): void {
+  apply(tabItems: readonly TodoTabItem[], refs: readonly TodoAskSourceRef[], dismissals: readonly string[], closed: readonly string[], ticked: readonly string[]): void {
     setClosedInTodo(closed);
+    if (setAskCheckSharing(new Set(ticked), new Set(tabItems.map(entry => entry.tabId)))) this.retickRecords();
     this.tabItems = tabItems;
     this.refs = refs;
     const wanted = new Map(refs.map(ref => [ref.sessionId, ref]));
@@ -248,6 +288,7 @@ export class TodoAskBoard {
   }
 
   clear(): void {
+    setAskCheckSharing(new Set(), new Set());
     this.tabItems = [];
     this.refs = [];
     this.dismissals.clear();
@@ -271,7 +312,7 @@ export class TodoAskBoard {
       this.failed.delete(message.sessionId);
       const saved = this.host.savedState();
       this.records.set(message.sessionId, { key: message.key, endedAt: message.endedAt,
-        store: recordAskStore(message.sessionId, message.messages, { ...saved, dismissed: [...saved.dismissed, ...this.dismissals] }, askOtherChoice()) });
+        store: recordAskStore(message.sessionId, message.messages, { ...saved, dismissed: [...saved.dismissed, ...this.dismissals] }) });
     }
     this.schedule();
     this.tryJump();
@@ -286,6 +327,30 @@ export class TodoAskBoard {
     if (place === "todo") setClosedInTodo([...closedInTodo, identity.message]);
     for (const record of this.records.values()) record.store.dismissMessages([identity.message]);
     this.host.post({ type: "todoAskDismiss", itemId, message: identity.message, place });
+    this.schedule();
+  }
+
+  noteTabCheck(tabId: string, key: AskStateKey, steps: readonly boolean[]): void {
+    const itemId = this.tabItems.find(entry => entry.tabId === tabId)?.itemId;
+    if (itemId === undefined) return;
+    const complete = steps.length > 0 && steps.every(Boolean);
+    if (complete === sharedTicked.has(key.message)) return;
+    const next = new Set(sharedTicked);
+    if (complete) next.add(key.message); else next.delete(key.message);
+    if (setAskCheckSharing(next, linkedAskTabs)) this.retickRecords();
+    this.host.post(complete ? { type: "todoAskDismiss", itemId, message: key.message, place: "ticked" } : { type: "todoAskUntick", itemId, message: key.message });
+    this.schedule();
+  }
+
+  private retickRecords(): void {
+    const local = this.host.savedState();
+    for (const record of this.records.values()) record.store.retick(local);
+  }
+
+  rereadMarks(): void {
+    const local = this.host.savedState();
+    for (const record of this.records.values()) record.store.adoptSaved({ messages: local.dismissed, resolvedMessages: local.resolved });
+    this.retickRecords();
     this.schedule();
   }
 
@@ -462,7 +527,7 @@ export function todoAskRowEl(row: TodoAskRow, depth: number, actions: TodoAskAct
   square.setAttribute("aria-hidden", "true");
   const meta = el("div", "todo-ask-meta");
   if (row.stale) {
-    const tag = el("span", "todo-ask-stale", l10n.t("Probably not needed"));
+    const tag = el("span", "todo-ask-stale", askStaleLabel());
     tag.title = row.stale === "age"
       ? l10n.t("Asked a week or more ago and still not answered. It is not counted as waiting; mark it as done if it is settled.")
       : l10n.t("The conversation has moved on since this question. It is not counted as waiting; mark it as done if it is settled.");
@@ -482,6 +547,6 @@ export function todoAskRowEl(row: TodoAskRow, depth: number, actions: TodoAskAct
     done.dataset.focusKey = focusKey("ask-done", row.key);
     acts.append(done);
   }
-  node.append(square, el("span", "you-kind", youWaitingKindLabel(row.item)), el("div", "todo-ask-q", row.item.title), meta, acts);
+  node.append(square, el("span", "you-kind", youKindLabel(row.item)), el("div", "todo-ask-q", row.item.title), meta, acts);
   return node;
 }

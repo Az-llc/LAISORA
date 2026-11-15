@@ -2,10 +2,19 @@ import { isComposingKey } from "./composing";
 import * as l10n from "@vscode/l10n";
 import type { TodoEdit } from "../protocol";
 import { TODO_GROUP_MAX, TODO_TITLE_MAX, type TodoState } from "../todo-model";
-import { formatTodoDay, openTodoMenu, todoCapturedText, todoMarkText, todoRecentMarks, TODO_PRIORITY_LABELS, TODO_STATE_KEYS as STATE_KEYS, TODO_STATE_LABELS, todoButton, todoControlPressed, todoDateEl, todoPlayButton, todoEl as el, todoGuessMark, todoStateIcon, todoStateMenu, todoMenuToggle, todoTalkMark, todoTitleEdit } from "./todo-edit";
+import { formatTodoDay, openTodoMenu, todoGenerationField, todoStatePressLabel, todoTitleLabel, todoCapturedText, todoMarkText, todoRecentMarks, TODO_PRIORITY_LABELS, TODO_STATE_KEYS as STATE_KEYS, TODO_STATE_LABELS, todoButton, todoControlPressed, todoDateEl, todoPlayButton, todoGuessMark, todoStateIcon, todoStateMenu, todoMenuToggle, todoTalkMark, todoTitleEdit } from "./todo-edit";
 import { todoAskNoteEl, todoAskRowEl, type TodoAskActions, type TodoAskRow } from "./todo-asks";
 import { TODO_GRIP_CLASS, todoRowPressDrags } from "./todo-drag";
 import { localDateKey, type TodoFamilyView, type TodoRowView, type TodoSectionView } from "./todo-rows";
+import { element as el } from "./element";
+import { todoGroupLabel } from "../todo-labels";
+
+export const TODO_ROW_FLASH_MS = 2400;
+
+export function todoFlashList(list: HTMLElement): HTMLElement {
+  list.style.setProperty("--todo-flash-duration", `${TODO_ROW_FLASH_MS}ms`);
+  return list;
+}
 
 export const todoGroupColor = (color: number | null) => color === null ? "" : `var(--l-todo-group-${color})`;
 
@@ -234,7 +243,7 @@ export class TodoRowRenderer {
     bar.setAttribute("aria-hidden", "true");
     head.append(bar);
     const groups = this.host.groups;
-    const name = section.group ?? l10n.t("No group");
+    const name = todoGroupLabel(section.group);
     const count = el("span", "todo-group-count", section.count === 1 ? l10n.t("1 item · {0} open", section.open) : l10n.t("{0} items · {1} open", section.count, section.open));
     if (!groups) {
       head.append(el("span", "todo-group-name", name), count);
@@ -334,7 +343,7 @@ export class TodoRowRenderer {
     input.value = row.title;
     input.maxLength = TODO_TITLE_MAX;
     input.spellcheck = false;
-    input.setAttribute("aria-label", l10n.t("Title"));
+    input.setAttribute("aria-label", todoTitleLabel());
     let done = false;
     const finish = (save: boolean) => {
       if (done) return;
@@ -440,7 +449,7 @@ export class TodoRowRenderer {
     const recent = todoRecentMarks(row.claude ?? [], this.host.claudeSeenAt?.() ?? 0, Date.now());
     if (recent.length) {
       const dot = todoButton("todo-claude-dot", "", () => openTodoMenu(dot, recent.map(info => ({ label: todoMarkText(info), value: l10n.t("Take back"),
-        run: () => this.host.edit({ kind: "revertClaude", changeIds: [...info.ids] }) })), l10n.t("Changed by Claude")));
+        run: () => this.host.edit({ kind: "revertClaude", changeIds: [...info.ids], ...todoGenerationField(info.generation) }) })), l10n.t("Changed by Claude")));
       dot.title = recent.map(todoMarkText).join("\n");
       dot.setAttribute("aria-label", l10n.t("Changed by Claude: {0}", dot.title));
       marks.push(dot);
@@ -456,7 +465,7 @@ export class TodoRowRenderer {
   private stateEl(row: TodoRowView): HTMLElement {
     const state = todoButton("todo-state todo-state-btn", "", () => this.setState(row, TODO_NEXT_STATE[row.state]));
     state.dataset.focusKey = this.key("state", row.id);
-    state.setAttribute("aria-label", l10n.t("State: {0} (press to change)", TODO_STATE_LABELS[row.state]()));
+    state.setAttribute("aria-label", todoStatePressLabel(row.state));
     state.title = state.getAttribute("aria-label")!;
     state.append(todoStateIcon(row.state));
     return state;

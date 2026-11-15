@@ -3,11 +3,12 @@ import { contributes } from "../../package.json";
 import type { TodoEdit, TodoListItem } from "../protocol";
 import { todoScopeIds } from "../todo-model";
 import { openTodoDetail } from "./todo-app";
-import { todoButton, todoCloseButton, todoEl as el, todoOverlayTop, todoStateIcon } from "./todo-edit";
+import { todoButton, todoCloseButton, todoOverlayTop, todoStateIcon, TodoTypingGuard } from "./todo-edit";
 import type { TodoAskActions, TodoAskRow } from "./todo-asks";
-import { TodoRowRenderer } from "./todo-row-view";
+import { TODO_ROW_FLASH_MS, todoFlashList, TodoRowRenderer } from "./todo-row-view";
 import type { TodoAttention } from "./todo-view";
 import { deriveTodoList, localDateKey, todoDrawerScope, type TodoDrawerScope } from "./todo-rows";
+import { element as el } from "./element";
 
 export interface TodoDrawerSource {
   readonly enabled: boolean;
@@ -30,8 +31,6 @@ export interface TodoDrawerPlace {
   readonly composer: HTMLElement;
   showInTodoTab(itemId: string | undefined): void;
 }
-
-const TODO_DRAWER_FLASH_MS = 2400;
 
 const DRAWER_BINDING: { readonly key: string; readonly mac?: string } | undefined = contributes.keybindings.find(binding => binding.command === "laisora.todoToggleDrawer");
 const onMac = () => /Mac|iPhone|iPad/.test(navigator.platform);
@@ -68,6 +67,7 @@ export class TodoDrawer {
   private readonly marksEl: HTMLElement;
   private readonly listEl: HTMLElement;
   private readonly rows: TodoRowRenderer;
+  private readonly typing: TodoTypingGuard;
   private readonly scopes = new Map<string, TodoDrawerScope>();
   private readonly collapsed = new Set<string>();
   private tabId: string | null = null;
@@ -125,8 +125,9 @@ export class TodoDrawer {
     head.append(bar, sub);
     this.marksEl = el("div", "todo-drawer-marks");
     this.marksEl.hidden = true;
-    this.listEl = el("div", "todo-list todo-drawer-list");
+    this.listEl = todoFlashList(el("div", "todo-list todo-drawer-list"));
     this.root.append(head, this.marksEl, this.listEl);
+    this.typing = new TodoTypingGuard(this.listEl, () => this.render());
     this.rows = new TodoRowRenderer({
       openDetail: id => { openTodoDetail(id); },
       edit: edit => this.source.edit(edit),
@@ -185,7 +186,7 @@ export class TodoDrawer {
     if (!row) return;
     row.classList.add("flash");
     row.scrollIntoView({ block: "nearest" });
-    setTimeout(() => row.classList.remove("flash"), TODO_DRAWER_FLASH_MS);
+    setTimeout(() => row.classList.remove("flash"), TODO_ROW_FLASH_MS);
   }
 
   private scopeSet(): ReadonlySet<string> | null {
@@ -270,7 +271,7 @@ export class TodoDrawer {
       else this.linkButton.style.removeProperty("--todo-ic");
     }
     if (!available) this.setOpen(false, false);
-    else if (this.openNow) { this.place(); this.render(); }
+    else if (this.openNow) { this.place(); this.typing.update(); }
   }
 
   private renderScope(linked: string | undefined, chosen: TodoDrawerScope): void {
@@ -294,6 +295,7 @@ export class TodoDrawer {
 
   render(): void {
     if (!this.openNow) return;
+    this.typing.rendered();
     const linked = this.linkedItemId();
     const chosen = this.tabId === null ? undefined : this.scopes.get(this.tabId);
     const scope = todoDrawerScope(linked, chosen);
@@ -306,12 +308,12 @@ export class TodoDrawer {
     this.waitingBtn.hidden = attention.waitingCount === 0;
     this.waitingBtn.textContent = l10n.t("{0} waiting for you", attention.waitingCount);
     const shown = new Set(view.sections.flatMap(section => section.ids));
-    const marks = this.source.items.filter(item => shown.has(item.id)).flatMap(item => item.marks ?? []);
+    const marks = this.source.items.filter(item => shown.has(item.id)).flatMap(item => item.markInfo ?? []);
     this.marksEl.hidden = marks.length === 0;
     this.marksEl.replaceChildren();
     if (marks.length > 0) {
       this.marksEl.append(el("span", "todo-drawer-marks-label", l10n.t("Changed by Claude: {0}", marks.length)),
-        todoButton("todo-link", l10n.t("Mark all as checked"), () => this.source.edit({ kind: "acknowledge", changeIds: marks }), l10n.t("Clear the “changed by Claude” marks and keep the changes")));
+        todoButton("todo-link", l10n.t("Mark all as checked"), () => this.source.edit({ kind: "acknowledge", changeIds: marks.flatMap(mark => [...mark.ids]) }), l10n.t("Clear the “changed by Claude” marks and keep the changes")));
     }
     this.listEl.replaceChildren();
     if (view.total === 0) this.listEl.append(el("p", "todo-note", l10n.t("No ToDo items yet. Add them in the ToDo tab or ask Claude in a conversation.")));

@@ -1,5 +1,33 @@
 # Changelog
 
+## 1.18.0
+
+- **Closing summary.** A new setting has Claude end finished or waiting work with a short summary
+  card: the result, what was done, what was verified and what was not, and what waits for you.
+  Waiting items link to their decision or check card. Off by default for single conversations.
+- **Automatic handoff continues the work.** After a handoff that started because of the context
+  size, the new conversation continues an unfinished PLAN without waiting for your message, and
+  ends with a summary of the whole work. Steps that wait for your approval and open decisions are
+  left to you. Both can be turned off in the settings.
+- A new setting closes the previous conversation's tab when a handoff completes. Off by default.
+- A very long message in a reopened conversation is shown shortened with a "show more" control;
+  copying and decision cards use the full text.
+- A message you cancel with Stop before Claude receives it is marked as cancelled and kept out of
+  the work record. A send that is refused or dropped returns to the message box.
+- Each tab keeps its draft, and question cards and MCP forms keep partial answers, when the view is
+  shown again. Settings fields keep text you are still editing.
+- Answering a decision from outside the LAISORA window (claude.ai, the mobile app) closes its card.
+  A check card closes only when every step is ticked or you dismiss it.
+- LAISORA conversations pass your own `CLAUDE_CODE_*` environment variables to Claude Code, and
+  write no record of their own while `CLAUDE_CODE_SKIP_PROMPT_HISTORY` is on.
+- Phone notifications are shown as unavailable while Claude Code telemetry is disabled, because
+  Claude Code then has no notification tool.
+- ToDo change cards keep a steady height and their rows while Claude writes several changes in one
+  turn. Importing a migration ZIP keeps ToDo images and follows linked settings files.
+- The file placement guard reads more PowerShell, node and python forms, so fewer writes to
+  protected files slip through and fewer harmless commands are stopped.
+- Updated the Claude Agent SDK to 0.3.325 (Claude Code 2.1.325).
+
 ## 1.17.0
 
 - **Phone notifications.** A new setting notifies your phone through the Claude app when a

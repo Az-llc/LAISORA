@@ -1,7 +1,7 @@
 import * as vscode from "vscode";
 import * as l10n from "@vscode/l10n";
 
-import { readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { readFileSync, statSync } from "node:fs";
 import { join } from "node:path";
 import { homedir } from "node:os";
 
@@ -9,8 +9,12 @@ import { claudeConfigDir, normalizeDriveLetter } from "./claude-env";
 import { normalizeDisplayName } from "./display-name";
 import { EVENT_LIMIT_DEFAULT, resolveEventLimit } from "./event-limits";
 import { extensionContext, output } from "./host-context";
-import { isPermissionModeId, PermissionModeId } from "./protocol";
+import { isPermissionModeId, normalizeApiKeyPolicy, PermissionModeId, type ApiKeyPolicy } from "./protocol";
+import { isOrchestrationEffort, type OrchestrationEffort } from "./orchestration-executors";
 import { writesLostNoticeEnabled } from "./session-writes-lost";
+import { resumableSessionId } from "./session-record";
+import { replaceFileThroughLinks } from "./replace-file-through-links";
+import { claudeModelParts, isMajorMinorVersion, withoutExtendedContext } from "./model-display-name";
 import type { ModelInfo } from "./protocol";
 import type { Session } from "./extension";
 import type * as ClaudeCodeSdk from "@anthropic-ai/claude-agent-sdk" with { "resolution-mode": "import" };
@@ -31,10 +35,6 @@ function mergeSettingsPatch(current: Record<string, unknown>, patch: SettingsPat
       Object.defineProperty(current, key, { value: nested, enumerable: true, configurable: true, writable: true });
     } else Object.defineProperty(current, key, { value, enumerable: true, configurable: true, writable: true });
   }
-}
-
-function tmpPathNotSharedWithOtherWindows(file: string): string {
-  return `${file}.laisora.${process.pid}.tmp`;
 }
 
 export type SettingsWriteResult =
@@ -65,35 +65,32 @@ export function updateClaudeCodeSettings(patch: SettingsPatch): SettingsWriteRes
     }
     if (Object.keys(rows).length === 0) delete current.modelSettings;
   }
-  const tmp = tmpPathNotSharedWithOtherWindows(file);
   try {
-    writeFileSync(tmp, `${JSON.stringify(current, null, 2)}\n`, "utf8");
-    renameSync(tmp, file);
-    output.appendLine(`[settings] 保存: ${JSON.stringify(patch)}`);
-    invalidateClaudeCodeSettingsCache();
-    if ("autoContinueAtUsageLimit" in patch) notifyAutoContinueSettingChange();
-    return { ok: true };
+    replaceFileThroughLinks(file, `${JSON.stringify(current, null, 2)}\n`);
   } catch (e) {
     output.appendLine(`[settings] 保存に失敗: ${String(e)}`);
-    try {
-      rmSync(tmp, { force: true });
-    } catch {
-    }
     return { ok: false, reason: "write_failed", detail: String(e) };
   }
+  output.appendLine(`[settings] 保存: ${JSON.stringify(patch)}`);
+  invalidateClaudeCodeSettingsCache();
+  if ("autoContinueAtUsageLimit" in patch) notifyAutoContinueSettingChange();
+  return { ok: true };
 }
 
 function modelSettingsKey(resolvedModel: string): string {
-  return resolvedModel.endsWith("[1m]") ? resolvedModel.slice(0, -"[1m]".length) : resolvedModel;
+  return withoutExtendedContext(resolvedModel, false);
 }
 
-const BUILTIN_CANONICAL_MODEL = /^claude-(?:opus|sonnet|haiku|fable)-\d+(?:-\d{1,2})?$/;
+function isBuiltinCanonicalModel(id: string): boolean {
+  const parts = claudeModelParts(id);
+  return parts !== undefined && parts.exactCase && parts.date === undefined && !parts.extended && isMajorMinorVersion(parts);
+}
 
 function settingsKeysForModel(selected: string, models: readonly Pick<ModelInfo, "id" | "resolvedModel">[]): Set<string> {
   const keys = new Set(models.filter((row) => row.id === selected || row.resolvedModel === selected)
     .map((row) => row.resolvedModel).filter((key): key is string => typeof key === "string" && key.length > 0)
     .map(modelSettingsKey));
-  if (keys.size === 0 && BUILTIN_CANONICAL_MODEL.test(modelSettingsKey(selected))) keys.add(modelSettingsKey(selected));
+  if (keys.size === 0 && isBuiltinCanonicalModel(modelSettingsKey(selected))) keys.add(modelSettingsKey(selected));
   return keys;
 }
 
@@ -103,7 +100,7 @@ export function canonicalEffortModel(s: Session): string | undefined {
   if (!selected) return undefined;
   const keys = settingsKeysForModel(selected, s.modelsFromLastRun ? [] : s.models);
   const key = keys.size === 1 ? [...keys][0] : undefined;
-  return key && BUILTIN_CANONICAL_MODEL.test(key) ? key : undefined;
+  return key && isBuiltinCanonicalModel(key) ? key : undefined;
 }
 
 export function saveClaudeModelEffort(model: string, effort: Session["effortOverride"] | null): SettingsWriteResult | null {
@@ -111,7 +108,7 @@ export function saveClaudeModelEffort(model: string, effort: Session["effortOver
   return updateClaudeCodeSettings({ modelSettings: { [model]: { effortLevel: effort } } });
 }
 
-export type ConfiguredEffort = "low" | "medium" | "high" | "xhigh" | "max";
+export type ConfiguredEffort = OrchestrationEffort;
 
 export interface ConfiguredEffortSnapshot {
   environmentSpecified: boolean;
@@ -122,12 +119,10 @@ export interface ConfiguredEffortSnapshot {
   resolvedModel?: string;
 }
 
-const CONFIGURED_EFFORT_RESOLVE_TIMEOUT_MS = 3_000;
+const SETTINGS_RESOLVE_TIMEOUT_MS = 3_000;
 
 function configuredEffort(value: unknown): ConfiguredEffort | undefined {
-  return value === "low" || value === "medium" || value === "high" || value === "xhigh" || value === "max"
-    ? value
-    : undefined;
+  return isOrchestrationEffort(value) ? value : undefined;
 }
 
 export function configuredEffortFromSnapshot(
@@ -182,10 +177,10 @@ export function effortDisplayFromSnapshot(
   return fallback === undefined ? {} : { default: fallback };
 }
 
-export async function resolveConfiguredEffortSnapshot(
+async function resolveEffectiveSettings(
   cwd: string,
   settingSources: Array<"user" | "project" | "local">
-): Promise<ConfiguredEffortSnapshot | undefined> {
+): Promise<Record<string, unknown>> {
   const sdk = require("@anthropic-ai/claude-agent-sdk") as Pick<typeof ClaudeCodeSdk, "resolveSettings">;
   let timeout: NodeJS.Timeout | undefined;
   try {
@@ -193,53 +188,75 @@ export async function resolveConfiguredEffortSnapshot(
       sdk.resolveSettings({ cwd, settingSources }),
       new Promise<never>((_, reject) => {
         timeout = setTimeout(
-          () => reject(new Error(`resolveSettings timeout (${CONFIGURED_EFFORT_RESOLVE_TIMEOUT_MS}ms)`)),
-          CONFIGURED_EFFORT_RESOLVE_TIMEOUT_MS
+          () => reject(new Error(`resolveSettings timeout (${SETTINGS_RESOLVE_TIMEOUT_MS}ms)`)),
+          SETTINGS_RESOLVE_TIMEOUT_MS
         );
       }),
     ]);
-    const effective = resolved.effective as Record<string, unknown>;
-    const env = effective.env;
-    const environmentSpecified =
-      typeof env === "object" &&
-      env !== null &&
-      Object.prototype.hasOwnProperty.call(env, "CLAUDE_CODE_EFFORT_LEVEL");
-    const environmentEffort = environmentSpecified
-      ? configuredEffort((env as Record<string, unknown>).CLAUDE_CODE_EFFORT_LEVEL)
-      : undefined;
-    const rawModelSettings = effective.modelSettings;
-    const hasModelSettings =
-      typeof rawModelSettings === "object" &&
-      rawModelSettings !== null &&
-      !Array.isArray(rawModelSettings) &&
-      Object.keys(rawModelSettings).length > 0;
-    const modelEfforts: Record<string, ConfiguredEffort> = {};
-    if (hasModelSettings) {
-      for (const [model, rawRow] of Object.entries(rawModelSettings as Record<string, unknown>)) {
-        if (typeof rawRow !== "object" || rawRow === null || Array.isArray(rawRow)) continue;
-        const effort = configuredEffort((rawRow as Record<string, unknown>).effortLevel);
-        if (effort !== undefined) modelEfforts[model] = effort;
-      }
-    }
-    const globalEffort = configuredEffort(effective.effortLevel);
-    const modelSetting = process.env.ANTHROPIC_MODEL || effective.model;
-    const resolvedModel = typeof modelSetting === "string" && modelSetting.length > 0
-      ? modelSetting
-      : undefined;
-    return {
-      environmentSpecified,
-      ...(environmentEffort === undefined ? {} : { environmentEffort }),
-      ...(globalEffort === undefined ? {} : { globalEffort }),
-      hasModelSettings,
-      modelEfforts,
-      ...(resolvedModel === undefined ? {} : { resolvedModel }),
-    };
-  } catch (error) {
-    output.appendLine(`[settings] configured effort resolution failed: ${String(error)}`);
-    return undefined;
+    return resolved.effective as Record<string, unknown>;
   } finally {
     if (timeout !== undefined) clearTimeout(timeout);
   }
+}
+
+export type ResolvedClaudeSettings = Readonly<Record<string, unknown>>;
+
+export async function resolveClaudeSettings(
+  cwd: string,
+  settingSources: Array<"user" | "project" | "local">
+): Promise<ResolvedClaudeSettings | undefined> {
+  try {
+    return await resolveEffectiveSettings(cwd, settingSources);
+  } catch (error) {
+    output.appendLine(`[settings] settings resolution failed: ${String(error)}`);
+    return undefined;
+  }
+}
+
+export function configuredEffortSnapshotOf(effective: ResolvedClaudeSettings): ConfiguredEffortSnapshot {
+  const env = effective.env;
+  const environmentSpecified =
+    typeof env === "object" &&
+    env !== null &&
+    Object.prototype.hasOwnProperty.call(env, "CLAUDE_CODE_EFFORT_LEVEL");
+  const environmentEffort = environmentSpecified
+    ? configuredEffort((env as Record<string, unknown>).CLAUDE_CODE_EFFORT_LEVEL)
+    : undefined;
+  const rawModelSettings = effective.modelSettings;
+  const hasModelSettings =
+    typeof rawModelSettings === "object" &&
+    rawModelSettings !== null &&
+    !Array.isArray(rawModelSettings) &&
+    Object.keys(rawModelSettings).length > 0;
+  const modelEfforts: Record<string, ConfiguredEffort> = {};
+  if (hasModelSettings) {
+    for (const [model, rawRow] of Object.entries(rawModelSettings as Record<string, unknown>)) {
+      if (typeof rawRow !== "object" || rawRow === null || Array.isArray(rawRow)) continue;
+      const effort = configuredEffort((rawRow as Record<string, unknown>).effortLevel);
+      if (effort !== undefined) modelEfforts[model] = effort;
+    }
+  }
+  const globalEffort = configuredEffort(effective.effortLevel);
+  const modelSetting = process.env.ANTHROPIC_MODEL || effective.model;
+  const resolvedModel = typeof modelSetting === "string" && modelSetting.length > 0
+    ? modelSetting
+    : undefined;
+  return {
+    environmentSpecified,
+    ...(environmentEffort === undefined ? {} : { environmentEffort }),
+    ...(globalEffort === undefined ? {} : { globalEffort }),
+    hasModelSettings,
+    modelEfforts,
+    ...(resolvedModel === undefined ? {} : { resolvedModel }),
+  };
+}
+
+export async function resolveConfiguredEffortSnapshot(
+  cwd: string,
+  settingSources: Array<"user" | "project" | "local">
+): Promise<ConfiguredEffortSnapshot | undefined> {
+  const effective = await resolveClaudeSettings(cwd, settingSources);
+  return effective === undefined ? undefined : configuredEffortSnapshotOf(effective);
 }
 
 export const PERMISSION_MODE_KEY = "laisora.permissionMode.v1";
@@ -266,11 +283,22 @@ export function configuredClaudeExecutablePath(cfg: vscode.WorkspaceConfiguratio
 
 export { normalizeDriveLetter } from "./claude-env";
 
+function configuredSessionCwd(): string | undefined {
+  return getLaisoraConfiguration().get<string>("defaultCwd") || vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+}
+
+export function newSessionCwd(): string {
+  return normalizeDriveLetter(configuredSessionCwd() || homedir());
+}
+
+export function configuredSettingSources(): Array<"user" | "project" | "local"> {
+  return getLaisoraConfiguration().get<Array<"user" | "project" | "local">>("claude.settingSources")!;
+}
+
 export function resolveSessionCwd(s: Session): string | undefined {
-  const cfg = getLaisoraConfiguration();
-  const configured = cfg.get<string>("defaultCwd") || vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
-  const pinnedByResume = s.resumeFilePath !== undefined && s.cwd.length > 0 ? s.cwd : undefined;
-  const cwd = pinnedByResume || configured || s.cwd || homedir() || undefined;
+  const configured = configuredSessionCwd();
+  const pinned = (s.resumeFilePath !== undefined || resumableSessionId(s) !== undefined) && s.cwd.length > 0 ? s.cwd : undefined;
+  const cwd = pinned || configured || s.cwd || homedir() || undefined;
   return cwd === undefined ? undefined : normalizeDriveLetter(cwd);
 }
 
@@ -298,6 +326,10 @@ export function sessionBackgroundCwd(s: Session): string {
 
 export function getLaisoraConfiguration(): vscode.WorkspaceConfiguration {
   return vscode.workspace.getConfiguration("laisora");
+}
+
+export function configuredApiKeyPolicy(cfg: vscode.WorkspaceConfiguration = getLaisoraConfiguration()): ApiKeyPolicy {
+  return normalizeApiKeyPolicy(cfg.get<string>("claude.apiKeyPolicy"));
 }
 
 export function writesLostNoticeOn(): boolean {

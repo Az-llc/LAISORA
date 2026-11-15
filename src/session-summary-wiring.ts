@@ -1,9 +1,9 @@
 import * as l10n from "@vscode/l10n";
-import { getLaisoraConfiguration } from "./claude-settings";
+import { configuredApiKeyPolicy, getLaisoraConfiguration } from "./claude-settings";
 
 import { configuredClaudeExecutablePath, launchFolderMissing, sessionBackgroundCwd } from "./claude-settings";
 import { extensionContext, output } from "./host-context";
-import { normalizeApiKeyPolicy, type NormalizedEventBody } from "./protocol";
+import type { NormalizedEventBody } from "./protocol";
 import { buildSessionDigest, buildSummaryPrompt, buildSessionNamePrompt, sanitizeSessionName, generateSessionSummaryViaSdk } from "./session-summary";
 import { isInSessionStore, sessionTranscriptRef } from "./session-files";
 import { readSessionHistory } from "./session-transcript";
@@ -39,14 +39,14 @@ function localizedSummaryInputFailure(kind: SummaryInputFailure["kind"]): string
   }
 }
 
-function summaryInputFromEvents(
+export function summaryInputFromEvents(
   events: readonly NormalizedEventBody[]
 ): { userTexts: string[]; toolCalls: number; agentCount: number } {
   const userTexts: string[] = [];
   let toolCalls = 0;
   let agentCount = 0;
   for (const ev of events) {
-    if (ev.kind === "user_message" && ev.text.trim().length > 0) userTexts.push(ev.text);
+    if (ev.kind === "user_message" && ev.cancelled !== true && ev.text.trim().length > 0) userTexts.push(ev.text);
     else if (ev.kind === "replayed_message" && ev.role === "user" && ev.text.trim().length > 0) userTexts.push(ev.text);
     else if (ev.kind === "tool_call_started") {
       if (bookkeepingIntent(ev) === undefined) toolCalls += 1;
@@ -181,7 +181,7 @@ export class SessionSummaryWiring {
       output.appendLine(`[${this.host.title}] 要約を開始します（トークンを消費します・モデル: ${modelId}）`);
       const result = await generateSessionSummaryViaSdk({
         modelId,
-        apiKeyPolicy: normalizeApiKeyPolicy(getLaisoraConfiguration().get<string>("claude.apiKeyPolicy")!),
+        apiKeyPolicy: configuredApiKeyPolicy(),
         cwd,
         prompt: (naming ? buildSessionNamePrompt : buildSummaryPrompt)(buildSessionDigest(userTexts, toolCalls, agentCount)),
         signal: abort.signal,

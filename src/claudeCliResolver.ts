@@ -4,7 +4,8 @@ import { access, readFile, realpath } from "node:fs/promises";
 import { homedir } from "node:os";
 import { delimiter, dirname, extname, isAbsolute, join, posix, resolve, win32 } from "node:path";
 import * as l10n from "@vscode/l10n";
-import { envNameKey, envValueOf } from "./claude-env";
+import { buildClaudeEnv, cliEnvTruthy, envNameKey, envValueOf } from "./claude-env";
+import type { ApiKeyPolicy } from "./protocol";
 
 export interface ResolvedClaudeCodeExecutable {
   path: string;
@@ -183,9 +184,9 @@ export function sdkCliLaunch(executablePath: string, args: readonly string[], en
   return runtime === undefined ? undefined : { command: runtime, args: [executablePath, ...args], env: childEnv };
 }
 
-export function checkClaudeCodeVersion(executablePath: string, timeoutMs = VERSION_TIMEOUT_MS): Promise<string | undefined> {
+export function checkClaudeCodeVersion(executablePath: string, apiKeyPolicy: ApiKeyPolicy | undefined, timeoutMs = VERSION_TIMEOUT_MS): Promise<string | undefined> {
   return new Promise((resolveVersion) => {
-    const invocation = sdkCliLaunch(executablePath, ["--version"], process.env);
+    const invocation = sdkCliLaunch(executablePath, ["--version"], buildClaudeEnv(process.env, "claudeCli", apiKeyPolicy).env);
     let stdout = "";
     let stderr = "";
     let settled = false;
@@ -222,8 +223,6 @@ export function checkClaudeCodeVersion(executablePath: string, timeoutMs = VERSI
   });
 }
 
-const TRUTHY_ENV_VALUES = ["1", "true", "yes", "on"];
-
 export type ClaudeCliUpdateDecision =
   | { run: true }
   | { run: false; reason: "notNative" | "disabled" };
@@ -237,14 +236,9 @@ export interface ClaudeCliUpdateInputs {
 
 function envDisablesUpdates(env: Readonly<Record<string, unknown>> | undefined, platform: NodeJS.Platform): boolean {
   if (!env || typeof env !== "object") return false;
-  return envTruthy(envValueOf(env, "DISABLE_UPDATES", platform))
-    || envTruthy(envValueOf(env, "DISABLE_AUTOUPDATER", platform))
+  return cliEnvTruthy(envValueOf(env, "DISABLE_UPDATES", platform))
+    || cliEnvTruthy(envValueOf(env, "DISABLE_AUTOUPDATER", platform))
     || !!envValueOf(env, "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", platform);
-}
-
-function envTruthy(value: unknown): boolean {
-  if (typeof value === "boolean") return value;
-  return !!value && TRUTHY_ENV_VALUES.includes(String(value).toLowerCase().trim());
 }
 
 function globalConfigDisablesUpdates(config: unknown): boolean {

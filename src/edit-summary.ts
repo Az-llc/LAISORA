@@ -5,6 +5,7 @@ import { basenameOf } from "./path-redaction";
 import { isFileWritingTool } from "./file-writing-tools";
 import { isShellTool } from "./shell-tools";
 import type { FileEdit } from "./protocol";
+import { pathRootOf, relativeInside, type PathRoot } from "./composer-file-reference";
 
 export const EDIT_SUMMARY_SETTING = "editSummary.enabled";
 
@@ -87,14 +88,6 @@ export function singleToolUseResult(content: unknown, toolUseResult: unknown): u
 export type GitEntryProbe = (dir: string) => boolean;
 export type WorkFolderLookup = (dir: string) => string | undefined;
 
-type PathRoot = "drive" | "unc" | "posix" | "relative";
-
-function pathRootOf(path: string): PathRoot {
-  if (/^[a-z]:\//i.test(path)) return "drive";
-  if (path.startsWith("//")) return "unc";
-  return path.startsWith("/") ? "posix" : "relative";
-}
-
 function pathKey(path: string): string {
   return pathRootOf(path) === "drive" ? path.toLowerCase() : path;
 }
@@ -131,12 +124,8 @@ export function hostWorkFolderOf(dir: string): string | undefined {
 export function editDisplayPath(filePath: string, cwd: string, workFolderOf: WorkFolderLookup): string {
   const file = canonicalizeArtifactPath(filePath, cwd);
   const root = cwd.trim().length > 0 ? canonicalizeArtifactPath(cwd, "") : "";
-  if (root.length > 0) {
-    const prefix = root.endsWith("/") ? root : `${root}/`;
-    const caseless = ["drive", "unc"].includes(pathRootOf(prefix));
-    const inside = caseless ? file.toLowerCase().startsWith(prefix.toLowerCase()) : file.startsWith(prefix);
-    if (inside && file.length > prefix.length) return file.slice(prefix.length);
-  }
+  const inside = root.length > 0 ? relativeInside(file, root) : undefined;
+  if (inside !== undefined) return inside;
   const cut = file.lastIndexOf("/");
   const folder = cut > 0 ? workFolderOf(file.slice(0, cut)) : undefined;
   return folder !== undefined ? file.slice(folder.lastIndexOf("/") + 1) : basenameOf(filePath);

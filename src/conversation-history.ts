@@ -1,5 +1,8 @@
-import { randomUUID } from "node:crypto";
+import { holdsAskAnswerLine } from "./ask-parser";
+import { askBlocksIn } from "./markdown-ast";
 import type { ImageRefInfo, RestoredApprovalCard } from "./protocol";
+import { surrogateSafeEnd } from "./text-clip";
+import { createScopedCursors } from "./scoped-cursors";
 
 export const CONVERSATION_CURSOR_MAX = 512;
 
@@ -25,6 +28,7 @@ export interface ConversationMessage {
   imageRefs?: ImageRefInfo[];
   model?: string;
   restoredApproval?: RestoredApprovalCard;
+  remote?: true;
 }
 
 export interface ConversationChunkRequest {
@@ -58,33 +62,7 @@ interface Registration {
   bytes: number;
 }
 
-interface CursorState {
-  scopeKey: string;
-  index: number;
-}
-
-const scopes = new Map<string, Registration>();
-const cursors = new Map<string, CursorState>();
-const cursorTokens = new Map<string, string>();
-
-function dedupeKey(scopeKey: string, index: number): string {
-  return `${scopeKey} ${index}`;
-}
-
-function dropCursor(token: string): void {
-  const state = cursors.get(token);
-  cursors.delete(token);
-  if (state === undefined) return;
-  const key = dedupeKey(state.scopeKey, state.index);
-  if (cursorTokens.get(key) === token) cursorTokens.delete(key);
-}
-
-function dropScope(scopeKey: string): void {
-  scopes.delete(scopeKey);
-  for (const [token, state] of cursors) {
-    if (state.scopeKey === scopeKey) dropCursor(token);
-  }
-}
+const store = createScopedCursors<Registration, number>(CONVERSATION_CURSOR_MAX, () => new ConversationHistoryError("history-unavailable"));
 
 export function registerConversationHistory(
   scopeKey: string,
@@ -93,43 +71,61 @@ export function registerConversationHistory(
 ): void {
   let bytes = 0;
   for (const m of messages) bytes += m.text.length * 2 + m.uuid.length * 2 + 32 + (m.imageRefs ? m.imageRefs.length * 80 : 0) + (m.model ? m.model.length * 2 : 0) + (m.restoredApproval ? JSON.stringify(m.restoredApproval).length * 2 : 0);
-  scopes.delete(scopeKey);
-  scopes.set(scopeKey, { messages: messages.slice(), bytes });
-  while (scopes.size > scopeMax) {
-    const oldest = scopes.keys().next().value as string | undefined;
-    if (oldest === undefined) break;
-    dropScope(oldest);
-  }
+  store.register(scopeKey, { messages: messages.slice(), bytes }, scopeMax);
 }
 
 export function releaseConversationHistory(scopeKey: string): void {
-  dropScope(scopeKey);
+  store.release(scopeKey);
 }
 
 export function hasConversationHistory(scopeKey: string): boolean {
-  return scopes.has(scopeKey);
+  return store.has(scopeKey);
 }
 
 export function conversationCursorBeforeUuid(scopeKey: string, uuid: string): string | undefined {
   return conversationCursorBeforeAnyUuid(scopeKey, [uuid]);
 }
 
-export function conversationCursorBeforeAnyUuid(
-  scopeKey: string,
-  uuids: readonly string[]
-): string | undefined {
-  const reg = touchScope(scopeKey);
+export function conversationCursorBeforeAnyUuid(scopeKey: string, uuids: readonly string[]): string | undefined {
+  const found = firstKnownAnchorIndex(scopeKey, uuids);
+  return found === 0 ? undefined : store.cursorFor(scopeKey, found);
+}
+
+export function conversationCursorThroughAnyUuid(scopeKey: string, uuids: readonly string[]): string {
+  return store.cursorFor(scopeKey, firstKnownAnchorIndex(scopeKey, uuids) + 1);
+}
+
+function firstKnownAnchorIndex(scopeKey: string, uuids: readonly string[]): number {
+  const reg = store.touch(scopeKey);
   if (uuids.length === 0) throw new ConversationHistoryError("invalid-request");
   const at = new Map<string, number>();
   for (let i = 0; i < reg.messages.length; i++) at.set(reg.messages[i].uuid, i);
   for (const uuid of uuids) {
     if (typeof uuid !== "string" || uuid.length === 0) continue;
     const found = at.get(uuid);
-    if (found === undefined) continue;
-    if (found === 0) return undefined;
-    return cursorFor(scopeKey, found);
+    if (found !== undefined) return found;
   }
   throw new ConversationHistoryError("unknown-anchor");
+}
+
+export function clipConversationText<T extends { text: string }>(m: T, limit: number): T & { clipped?: true } {
+  if (m.text.length <= limit) return m;
+  return { ...m, text: m.text.slice(0, surrogateSafeEnd(m.text, limit)), clipped: true };
+}
+
+export function clipConversationMessage<T extends { role: "user" | "assistant" | "system"; text: string }>(
+  m: T,
+  limit: number
+): T & { clipped?: true; asksPastCut?: true } {
+  const cut = clipConversationText(m, limit);
+  if (!cut.clipped) return cut;
+  const asksPastCut = m.role === "user" ? holdsAskAnswerLine(m.text.slice(m.text.lastIndexOf("\n", cut.text.length - 1) + 1))
+    : m.role === "assistant" && JSON.stringify(askBlocksIn(m.text)) !== JSON.stringify(askBlocksIn(cut.text));
+  return asksPastCut ? { ...cut, asksPastCut: true } : cut;
+}
+
+export function conversationMessageByUuid(scopeKey: string, uuid: string): ConversationMessage | undefined {
+  return store.touch(scopeKey).messages.find((m) => m.uuid === uuid);
 }
 
 export function nextConversationChunk(request: ConversationChunkRequest): ConversationChunkPage {
@@ -137,18 +133,18 @@ export function nextConversationChunk(request: ConversationChunkRequest): Conver
   if (!Number.isInteger(maxItems) || maxItems < 1) {
     throw new ConversationHistoryError("invalid-request");
   }
-  const reg = touchScope(scopeKey);
-  const state = cursors.get(cursor);
+  const reg = store.touch(scopeKey);
+  const state = store.cursorAt(cursor);
   if (state === undefined || state.scopeKey !== scopeKey) {
     throw new ConversationHistoryError("invalid-cursor");
   }
-  const end = Math.min(state.index, reg.messages.length);
+  const end = Math.min(state.position, reg.messages.length);
   const start = Math.max(0, end - maxItems);
   const items = reg.messages.slice(start, end);
   const hasMore = start > 0;
   return {
     items,
-    nextCursor: hasMore ? cursorFor(scopeKey, start) : undefined,
+    nextCursor: hasMore ? store.cursorFor(scopeKey, start) : undefined,
     hasMore,
     coverage: {
       returnedCount: items.length,
@@ -160,39 +156,14 @@ export function nextConversationChunk(request: ConversationChunkRequest): Conver
 
 export function conversationHistoryStats(): ConversationHistoryStats {
   let messages = 0;
-  let estimatedBytes = cursors.size * CURSOR_ENTRY_BYTES;
-  for (const reg of scopes.values()) {
+  let estimatedBytes = store.cursorCount() * CURSOR_ENTRY_BYTES;
+  for (const reg of store.scopes.values()) {
     messages += reg.messages.length;
     estimatedBytes += reg.bytes;
   }
-  return { scopes: scopes.size, messages, cursors: cursors.size, estimatedBytes };
+  return { scopes: store.scopes.size, messages, cursors: store.cursorCount(), estimatedBytes };
 }
 
 export function clearConversationHistoryForTest(): void {
-  scopes.clear();
-  cursors.clear();
-  cursorTokens.clear();
-}
-
-function touchScope(scopeKey: string): Registration {
-  const reg = scopes.get(scopeKey);
-  if (reg === undefined) throw new ConversationHistoryError("history-unavailable");
-  scopes.delete(scopeKey);
-  scopes.set(scopeKey, reg);
-  return reg;
-}
-
-function cursorFor(scopeKey: string, index: number): string {
-  const key = dedupeKey(scopeKey, index);
-  const existing = cursorTokens.get(key);
-  if (existing !== undefined && cursors.has(existing)) return existing;
-  const token = randomUUID();
-  cursors.set(token, { scopeKey, index });
-  cursorTokens.set(key, token);
-  while (cursors.size > CONVERSATION_CURSOR_MAX) {
-    const oldest = cursors.keys().next().value as string | undefined;
-    if (oldest === undefined) break;
-    dropCursor(oldest);
-  }
-  return token;
+  store.clear();
 }

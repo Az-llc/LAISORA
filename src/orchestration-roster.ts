@@ -1,7 +1,7 @@
 import { configurationDefault } from "./configuration-defaults";
 import { CONDUCTOR_CONTROL_LINE } from "./placement-line";
 import { EXECUTORS, EXTERNAL_EXECUTORS, CLAUDE_EFFORTS, CODEX_EFFORTS, canonicalExecutorEfforts, isOrchestrationEffort, claudeAgentName,
-  executorModelList, isExecutorId, isExternalExecutorId, isExternalModel, rowComplete,
+  executorModelList, isExecutorId, isExternalExecutorId, isExternalModel, rowComplete, EXTERNAL_MODEL_LIST_MAX, EXTERNAL_TIMEOUT_MAX_MINUTES, EXTERNAL_TIMEOUT_MIN_MINUTES,
   type ExecutorId, type ExecutorRow, type ExternalExecutorId, type ExternalModel, type ExternalModels, type ExternalDetection, type OrchestrationEffort } from "./orchestration-executors";
 export * from "./orchestration-executors";
 export interface OrchestrationRow {
@@ -12,6 +12,10 @@ export interface OrchestrationRow {
   readonly rows: readonly ExecutorRow[];
 }
 export type OrchestrationSettingRow = OrchestrationRow;
+export const ROSTER_ROWS_MAX = 12;
+export function isRoleName(value: unknown): value is string {
+  return typeof value === "string" && /^[a-z][a-z0-9-]*$/.test(value);
+}
 export function emptyOrchestrationRole(role: string): OrchestrationSettingRow {
   return { role, enabled: true, description: "", rows: [] };
 }
@@ -28,7 +32,7 @@ function roleHeader(value: unknown): value is Record<string, unknown> & { role: 
   if (!value || typeof value !== "object" || Array.isArray(value)) return false;
   const row = value as Record<string, unknown>;
   const checks: { [K in keyof OrchestrationRow]-?: () => boolean } = {
-    role: () => (typeof row.role === "string") && (/^[a-z][a-z0-9-]*$/.test(row.role)),
+    role: () => isRoleName(row.role),
     enabled: () => typeof row.enabled === "boolean",
     description: () => typeof row.description === "string",
     cacheTtl: () => row.cacheTtl === undefined || row.cacheTtl === "5m" || row.cacheTtl === "1h",
@@ -71,7 +75,7 @@ export function orchestrationSettingRows(raw: unknown, log?: (message: string) =
         || Object.keys(candidate).some((key) => !["executor", "model", "efforts"].includes(key));
       if (row.model === "") { normalized = true; continue; }
       const key = `${row.executor}/${row.model}`;
-      if (used.has(key) || rows.length >= 12) { normalized = true; continue; }
+      if (used.has(key) || rows.length >= ROSTER_ROWS_MAX) { normalized = true; continue; }
       used.add(key);
       rows.push(row);
     }
@@ -281,7 +285,7 @@ export function conductorInstruction(roster: readonly OrchestrationRow[], policy
   ].filter(Boolean).join("\n\n");
 }
 export function isExternalTimeout(value: unknown): value is number {
-  return typeof value === "number" && Number.isFinite(value) && value >= 1 && value <= 120;
+  return typeof value === "number" && Number.isFinite(value) && value >= EXTERNAL_TIMEOUT_MIN_MINUTES && value <= EXTERNAL_TIMEOUT_MAX_MINUTES;
 }
 export function isExternalModels(value: unknown): value is ExternalModels {
   if (!rosterObject(value, Object.keys(EXECUTORS))) return false;
@@ -313,7 +317,7 @@ function isExternalModelState(entry: unknown): boolean {
     (checking || failed || row.fetchedAt === undefined || typeof row.fetchedAt === "number" && Number.isFinite(row.fetchedAt) && row.fetchedAt > 0) &&
     (checking || failed || row.refresh === undefined || row.refresh === "checking" || row.refresh === "failed") &&
     (checking || failed || row.refreshReason === undefined || row.refresh === "failed" && typeof row.refreshReason === "string") &&
-    (checking || failed || Array.isArray(row.models) && row.models.length <= 100 && row.models.every(isExternalModelInfo))
+    (checking || failed || Array.isArray(row.models) && row.models.length <= EXTERNAL_MODEL_LIST_MAX && row.models.every(isExternalModelInfo))
   );
 }
 
@@ -335,8 +339,8 @@ function isExternalModelInfo(value: unknown): boolean {
 function isOrchestrationSettingRow(value: unknown): boolean {
   if (!rosterObject(value, ["role", "enabled", "description", "rows", ...(value && typeof value === "object" && "cacheTtl" in value ? ["cacheTtl"] : [])])) return false;
   const checks: { [K in keyof OrchestrationSettingRow]-?: () => boolean } = {
-    rows: () => (Array.isArray(value.rows)) && (value.rows.length <= 12) && (value.rows.every(validExecutorRow)) && (new Set(value.rows.map(row => `${row.executor}/${row.model}`)).size === value.rows.length),
-    role: () => typeof value.role === "string" && /^[a-z][a-z0-9-]*$/.test(value.role),
+    rows: () => (Array.isArray(value.rows)) && (value.rows.length <= ROSTER_ROWS_MAX) && (value.rows.every(validExecutorRow)) && (new Set(value.rows.map(row => `${row.executor}/${row.model}`)).size === value.rows.length),
+    role: () => isRoleName(value.role),
     enabled: () => typeof value.enabled === "boolean",
     description: () => typeof value.description === "string",
     cacheTtl: () => value.cacheTtl === undefined || value.cacheTtl === "5m" || value.cacheTtl === "1h",
@@ -348,8 +352,7 @@ function isExternalRow(value: unknown): boolean {
   if (!value || typeof value !== "object") return false;
   const entry = value as Record<string, unknown>;
   return (
-    typeof entry.role === "string" &&
-    /^[a-z][a-z0-9-]*$/.test(entry.role) &&
+    isRoleName(entry.role) &&
     typeof entry.enabled === "boolean" &&
     isExternalExecutorId(entry.executor) &&
     isExternalModel(entry.model) &&

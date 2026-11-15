@@ -1,7 +1,13 @@
-const SHELL_TOOLS: ReadonlySet<string> = new Set(["Bash", "PowerShell"]);
+export const SHELL_TOOLS: ReadonlySet<string> = new Set(["Bash", "PowerShell"]);
 
 export function isShellTool(tool: string): boolean {
   return SHELL_TOOLS.has(tool);
+}
+
+export const COMMAND_RUNNING_TOOLS: ReadonlySet<string> = new Set([...SHELL_TOOLS, "Monitor"]);
+
+export function runsShellCommand(tool: string): boolean {
+  return COMMAND_RUNNING_TOOLS.has(tool);
 }
 
 export type ShellDialect = "posix" | "powershell" | "cmd";
@@ -17,6 +23,8 @@ export interface ShellBlock { readonly index: number; readonly body: string; rea
 
 export type ShellSeparator = "start" | ";" | "&&" | "||" | "|" | "&" | "(" | ")" | "{" | "}" | "case" | "end";
 export interface ShellSubshell { readonly depth: number; readonly parent?: ShellSubshell }
+export interface ShellStringPart { readonly at: number; readonly text: string }
+export interface ShellCall { readonly word: number; readonly callee: string; readonly args: readonly string[] }
 
 export interface ShellSegment {
   readonly after: ShellSeparator;
@@ -33,6 +41,13 @@ export interface ShellSegment {
   readonly heredocs: readonly ShellHeredoc[];
   readonly piped: boolean;
   readonly listItems: ReadonlyMap<string, readonly string[]>;
+  readonly stringParts: ReadonlyMap<number, readonly ShellStringPart[]>;
+  readonly calls: readonly ShellCall[];
+}
+
+export function stringLiteral(segment: Pick<ShellSegment, "words" | "stringParts">, index: number): string | undefined {
+  const parts = segment.stringParts.get(index);
+  return parts?.length === 1 && parts[0].text === segment.words[index] ? parts[0].text : undefined;
 }
 
 export interface ShellSyntax {
@@ -42,9 +57,10 @@ export interface ShellSyntax {
   readonly exceeded: boolean;
 }
 
-interface Scan extends ShellSyntax { readonly end: number; readonly closed: boolean }
+interface Scan extends ShellSyntax { readonly end: number; readonly closed: boolean; readonly commas: readonly number[] }
 
 const CMD_SEPARATORS = ",;=";
+const HERE_STRING_PRECEDERS = ",=";
 const ONCE_BLOCK_KEYWORDS = new Set(["if", "elseif", "else", "try", "catch", "finally"]);
 const C_ESCAPES: Readonly<Record<string, string>> = { a: "\x07", b: "\b", e: "\x1b", E: "\x1b", f: "\f", n: "\n", r: "\r", t: "\t", v: "\v" };
 const POWERSHELL_ESCAPES: Readonly<Record<string, string>> = Object.fromEntries([...Object.entries(C_ESCAPES).filter(([name]) => name === name.toLowerCase()), ["0", "\0"]]);
@@ -141,9 +157,13 @@ function scan(source: string, start: number, dialect: ShellDialect, stop: ")" | 
   const posix = dialect === "posix", powershell = dialect === "powershell", cmd = dialect === "cmd";
   const segments: ShellSegment[] = [];
   let balanced = true, literalBackticks = false, exceeded = depth > MAX_SCRIPT_NESTING || budget.remaining < 0;
-  if (exceeded) return { segments, end: source.length, closed: false, balanced: false, literalBackticks, exceeded };
+  const commas: number[] = [];
+  if (exceeded) return { segments, end: source.length, closed: false, balanced: false, literalBackticks, exceeded, commas };
   let words: string[] = [], operators: number[] = [], quoted: number[] = [], quotedStart: number[] = [], commandStarts: number[] = [];
   let substitutions: string[] = [], blocks: ShellBlock[] = [], attached: ShellHeredoc[] = [];
+  let parts: ShellStringPart[] = [], stringParts = new Map<number, ShellStringPart[]>(), calls: ShellCall[] = [], calleeStart = 0;
+  const quotedPart = (piece: string) => { parts.push({ at: word.length, text: piece }); word += piece; calleeStart = word.length; };
+  const opensHereString = () => word.endsWith("@") && (word.length === 1 || HERE_STRING_PRECEDERS.includes(word[word.length - 2]));
   let listSeparators: number[] = [], wordListSeparators = new Map<number, number[]>(), stopParsing = false;
   let piped = false, nextPiped = false, word = "", inWord = false, wordQuoted = false, wordStartQuoted = false, afterParen = false, parens = 0, braces = 0, literalBracesUntil = -1, programFound = false;
   let casePattern = false, patternStart = 0;
@@ -215,6 +235,7 @@ function scan(source: string, start: number, dialect: ShellDialect, stop: ")" | 
       if (wordQuoted) quoted.push(words.length);
       if (wordStartQuoted) quotedStart.push(words.length);
       if (afterParen) commandStarts.push(words.length);
+      if (parts.length) stringParts.set(words.length, parts);
       words.push(word);
       afterParen = false;
       const subject = words.length - 3;
@@ -222,17 +243,17 @@ function scan(source: string, start: number, dialect: ShellDialect, stop: ")" | 
         cases.push({ parens, braces }); casePattern = true; patternStart = words.length;
       }
     }
-    word = ""; inWord = false; wordQuoted = false; wordStartQuoted = false;
+    word = ""; inWord = false; wordQuoted = false; wordStartQuoted = false; parts = []; calleeStart = 0;
   };
   const endSegment = (ended: ShellSeparator = ";") => {
     endWord();
     const listItems = new Map<string, string[]>();
     for (const [index, separators] of wordListSeparators) registerList(listItems, words[index], separators);
     if (words.length || blocks.length || substitutions.length || attached.length) {
-      segments.push({ after: separator, ended, grouped: grouped || cases.length > 0, subshell: segmentSubshell, words, operators, quoted, quotedStart, commandStarts, substitutions, blocks, heredocs: attached, piped, listItems });
+      segments.push({ after: separator, ended, grouped: grouped || cases.length > 0, subshell: segmentSubshell, words, operators, quoted, quotedStart, commandStarts, substitutions, blocks, heredocs: attached, piped, listItems, stringParts, calls });
       separator = ended;
     } else if (separator !== "&&" && separator !== "||" && separator !== "|") separator = ended;
-    words = []; operators = []; quoted = []; quotedStart = []; commandStarts = []; substitutions = []; blocks = []; attached = []; wordListSeparators = new Map();
+    words = []; operators = []; quoted = []; quotedStart = []; commandStarts = []; substitutions = []; blocks = []; attached = []; wordListSeparators = new Map(); stringParts = new Map(); calls = [];
     piped = nextPiped; nextPiped = false; afterParen = false; programFound = false; patternStart = 0;
     grouped = parens + braces > 0; segmentSubshell = subshell;
   };
@@ -240,6 +261,7 @@ function scan(source: string, start: number, dialect: ShellDialect, stop: ")" | 
     endWord();
     const kept = (index: number) => index < patternStart;
     words = words.slice(0, patternStart); quoted = quoted.filter(kept); quotedStart = quotedStart.filter(kept); operators = operators.filter(kept); commandStarts = commandStarts.filter(kept);
+    stringParts = new Map([...stringParts].filter(([index]) => kept(index))); calls = calls.filter(call => kept(call.word));
     casePattern = false;
     endSegment("case");
   };
@@ -276,7 +298,7 @@ function scan(source: string, start: number, dialect: ShellDialect, stop: ")" | 
     if (/\s/.test(source[at + 1] ?? "") && !hasProgram()) return "inline";
     return first === "function" || /\(\s*\)\s*$/.test(source.slice(Math.max(start, at - 64), at)) ? "block" : "word";
   };
-  const result = (end: number, closed: boolean): Scan => ({ segments, end, closed, balanced: balanced && !pending.length && !cases.length, literalBackticks, exceeded });
+  const result = (end: number, closed: boolean): Scan => ({ segments, end, closed, balanced: balanced && !pending.length && !cases.length, literalBackticks, exceeded, commas });
   let charged = start;
   for (let i = start; i < source.length; i++) {
     spend(i + 1 - charged);
@@ -291,12 +313,14 @@ function scan(source: string, start: number, dialect: ShellDialect, stop: ")" | 
         word += cmd ? source[++i] : literal(source[++i]); inWord = true; wordQuoted = true; continue;
       }
     }
-    if (powershell && (ch === "'" || ch === "\"") && inWord && word === "@" && source[i + 1] === "\n") {
+    if (powershell && (ch === "'" || ch === "\"") && inWord && source[i + 1] === "\n" && opensHereString()) {
       const close = source.indexOf("\n" + ch + "@", i + 1);
       const content = source.slice(i + 2, close < 0 ? source.length : close);
       if (close < 0) balanced = false;
       if (ch === "\"") expanded(content, substitutions);
-      word = ch === "\"" ? powershellUnescape(content) : content.replaceAll("$", LITERAL_DOLLAR); wordQuoted = true; wordStartQuoted = true;
+      if (word === "@") wordStartQuoted = true;
+      word = word.slice(0, -1);
+      quotedPart(ch === "\"" ? powershellUnescape(content) : content.replaceAll("$", LITERAL_DOLLAR)); wordQuoted = true;
       i = close < 0 ? source.length : close + 2;
       continue;
     }
@@ -312,12 +336,14 @@ function scan(source: string, start: number, dialect: ShellDialect, stop: ")" | 
         break;
       }
       if (end >= source.length) balanced = false;
-      word += (ansi ? unescapeSequences(raw) : raw).replaceAll("$", LITERAL_DOLLAR);
+      quotedPart((ansi ? unescapeSequences(raw) : raw).replaceAll("$", LITERAL_DOLLAR));
       inWord = true; wordQuoted = true; i = end;
       continue;
     }
     if (ch === "\"") {
       if (!inWord) wordStartQuoted = true;
+      const outer = word;
+      word = "";
       let end = i + 1;
       for (; end < source.length; end++) {
         const inner = source[end];
@@ -353,6 +379,9 @@ function scan(source: string, start: number, dialect: ShellDialect, stop: ")" | 
         word += inner;
       }
       if (end >= source.length && !cmd) balanced = false;
+      const piece = word;
+      word = outer;
+      quotedPart(piece);
       inWord = true; wordQuoted = true; i = cmd && source[end] === "\n" ? end - 1 : end;
       continue;
     }
@@ -446,6 +475,10 @@ function scan(source: string, start: number, dialect: ShellDialect, stop: ")" | 
       if (powershell || posix && inWord) {
         const inner = nested(source, i + 1, ")");
         if (!inner) { balanced = false; break; }
+        if (powershell && inWord && calleeStart < word.length) {
+          const args = [i, ...inner.commas].map((from, k, cuts) => source.slice(from + 1, cuts[k + 1] ?? inner.end).trim());
+          calls.push({ word: words.length, callee: word.slice(calleeStart), args: args.length === 1 && args[0] === "" ? [] : args });
+        }
         substitutions.push(source.slice(i + 1, inner.end));
         word += source.slice(i, inner.end + 1); inWord = true; i = inner.end;
         continue;
@@ -495,7 +528,7 @@ function scan(source: string, start: number, dialect: ShellDialect, stop: ")" | 
       const digitPrefix = inWord && !wordQuoted && (/^\d$/.test(word) || powershell && ch === ">" && word === "*");
       if (!digitPrefix) endWord();
       let op = digitPrefix ? word + ch : ch;
-      word = ""; inWord = false; wordQuoted = false;
+      word = ""; inWord = false; wordQuoted = false; parts = []; calleeStart = 0;
       if (source[i + 1] === ch) {
         op += ch; i++;
         if (ch === "<" && source[i + 1] === "<") { op += ch; i++; }
@@ -514,6 +547,7 @@ function scan(source: string, start: number, dialect: ShellDialect, stop: ")" | 
     }
     if (/\s/.test(ch)) { if (!listContinues()) endWord(); continue; }
     if (powershell && !stopParsing && ch === ",") {
+      commas.push(i);
       const last = words.length - 1;
       if (!inWord && last >= 1 && !operators.includes(last) && (quoted.includes(last) || !words[last].startsWith("-"))) {
         word = words.pop()!;
@@ -523,6 +557,9 @@ function scan(source: string, start: number, dialect: ShellDialect, stop: ")" | 
         quotedStart = quotedStart.filter(index => index !== last);
         listSeparators = wordListSeparators.get(last) ?? [];
         wordListSeparators.delete(last);
+        parts = stringParts.get(last) ?? [];
+        stringParts.delete(last);
+        calleeStart = word.length;
       }
       listSeparators.push(word.length);
     } else if (cmd && CMD_SEPARATORS.includes(ch)) listSeparators.push(word.length);

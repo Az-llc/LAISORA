@@ -13,10 +13,15 @@ import {
   decisionKey,
   normalizeAutoMaxLevel,
   classifyReportSendOutcome,
+  isReportableLiveSignal,
   planReportBatch,
   recordLedger,
   selectAutoActions,
   settleReportSend,
+  noteReportsQueued,
+  noteReportTurnEvent,
+  NO_UNDELIVERED_REPORTS,
+  type UndeliveredReports,
   touchedSignalIds,
   MAX_PENDING_REPORT_SIGNALS,
   MAX_SIGNALS,
@@ -28,13 +33,17 @@ import type { DivergenceReport } from "./l3-divergence";
 import type { SemanticModelPayload } from "./protocol";
 import type { SemanticModel } from "./semantic-model";
 import { SEMANTIC_MODEL_POST_INTERVAL_MS } from "./session-semantic";
+import { handoffInProgress } from "./handoff-runs";
+import type { SteeringSendResult } from "./claudeHost";
 import { STEER_LEVEL_BY_MODE, buildSteeringEnvelope, steeringInstruction, type SteeringMode } from "./steering-envelope";
 
 const GUARDRAIL_TICK_MS = 15_000;
 
 export interface SessionGuardrailHost {
+  readonly tabId: string;
   readonly title: string;
   readonly conversation: ClaudeConversation | null;
+  readonly transcriptWriteLocked: boolean;
   guardrail: GuardrailState;
   readonly liveGuardrailSignalIds: Set<string>;
   readonly guardrailLiveSince?: number;
@@ -48,7 +57,7 @@ export class SessionGuardrail {
   reportedSignalIds = new Set<string>();
   pendingReportSignalIds: string[] = [];
   lastReportedDroppedSignalCount = 0;
-  generationSentSignalIds = new Set<string>();
+  undeliveredReports: UndeliveredReports = NO_UNDELIVERED_REPORTS;
   readonly guardrailExecutor: GuardrailExecutor = {
     warn: (decision, signals) => {
       for (const signal of signals) {
@@ -121,11 +130,7 @@ export class SessionGuardrail {
       signals: summaries,
       instruction: steeringInstruction(mode, summaries),
     });
-    const conv = this.host.conversation;
-    const result =
-      conv !== null && !conv.isClosed
-        ? conv.sendSteeringEnvelope(envelope)
-        : ({ ok: false, reason: "closed", message: "会話が未接続です。", transient: true } as const);
+    const result = this.sendEnvelope((conv) => conv.sendSteeringEnvelope(envelope));
     output.appendLine(
       `[${this.host.title}] [guardrail] ${mode}: key=${key} level=${level} trigger=${trigger} ok=${result.ok}${result.ok ? "" : ` reason=${result.reason}`}`
     );
@@ -154,9 +159,21 @@ export class SessionGuardrail {
   private autoExecuteGuardrail(decisions: readonly GuardrailDecision[]): void {
     const conv = this.host.conversation;
     const running = conv !== null && !conv.isClosed && conv.state === "running";
-    for (const planned of selectAutoActions(decisions, this.host.guardrail.signals, (s) => this.host.liveGuardrailSignalIds.has(s.signalId), this.guardrailLedger, running)) {
+    for (const planned of selectAutoActions(decisions, this.host.guardrail.signals, (s) => isReportableLiveSignal(this.host.guardrail, this.host.liveGuardrailSignalIds, s.signalId), this.guardrailLedger, running)) {
       this.executeGuardrailAction(planned.action, "auto", planned.decision, planned.signals);
     }
+  }
+
+  abandonHeldReports(): void {
+    for (const id of this.pendingReportSignalIds) this.reportedSignalIds.add(id);
+    this.pendingReportSignalIds = [];
+  }
+
+  private sendEnvelope(send: (conv: ClaudeConversation) => SteeringSendResult): SteeringSendResult {
+    if (handoffInProgress(this.host.tabId)) return { ok: false, reason: "handoff", message: "引き継ぎ中です。", transient: true };
+    if (this.host.transcriptWriteLocked) return { ok: false, reason: "closed", message: "会話の記録を書かない設定のため送りません。", transient: true };
+    const conv = this.host.conversation;
+    return conv !== null && !conv.isClosed ? send(conv) : { ok: false, reason: "closed", message: "会話が未接続です。", transient: true };
   }
 
   private sendPendingGuardrailReports(): void {
@@ -192,14 +209,10 @@ export class SessionGuardrail {
       signals: sendSummaries,
       instruction: steeringInstruction("report", sendSummaries),
     });
-    const conv = this.host.conversation;
-    const result =
-      conv !== null && !conv.isClosed
-        ? conv.sendReportEnvelope(envelope)
-        : ({ ok: false, reason: "closed", message: "会話が未接続です。", transient: true } as const);
+    const result = this.sendEnvelope((conv) => conv.sendReportEnvelope(envelope));
     const outcome = classifyReportSendOutcome(result);
     if (outcome.kind === "sent") {
-      this.generationSentSignalIds = new Set(sendIds);
+      this.undeliveredReports = noteReportsQueued(this.undeliveredReports, sendIds);
     }
     const settled = settleReportSend(
       sendIds,
@@ -219,10 +232,14 @@ export class SessionGuardrail {
     }
   }
 
+  noteTurnEvent(kind: string): void {
+    this.undeliveredReports = noteReportTurnEvent(this.undeliveredReports, kind);
+  }
+
   settleConversationLost(): void {
-    if (this.generationSentSignalIds.size === 0) return;
-    const sent = [...this.generationSentSignalIds];
-    this.generationSentSignalIds.clear();
+    const sent = [...this.undeliveredReports.sentAtTurnStarts.keys()];
+    this.undeliveredReports = NO_UNDELIVERED_REPORTS;
+    if (sent.length === 0) return;
     const settled = settleReportSend(
       sent,
       "conversation_lost",
@@ -311,7 +328,7 @@ export class SessionGuardrail {
         if (this.host.guardrailLiveSince !== undefined) {
           for (const decision of decisions) {
             const liveSignals = this.host.guardrail.signals.filter(
-              (s) => decision.signalIds.includes(s.signalId) && this.host.liveGuardrailSignalIds.has(s.signalId)
+              (s) => decision.signalIds.includes(s.signalId) && isReportableLiveSignal(this.host.guardrail, this.host.liveGuardrailSignalIds, s.signalId)
             );
             if (liveSignals.length === 0) continue;
             if (decision.autoLevel >= 1) {

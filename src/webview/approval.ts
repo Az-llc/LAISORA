@@ -41,7 +41,7 @@ export function buildRestoredApprovalCard(card: RestoredApprovalCard, tabId: str
     const heading = document.createElement("summary");
     heading.textContent = l10n.t("Show raw data (JSON)");
     const pre = document.createElement("pre");
-    pre.textContent = card.inputJson;
+    pre.textContent = card.inputClipped ? withTruncatedMark(card.inputJson) : card.inputJson;
     raw.append(heading, pre);
     det.append(raw);
   }
@@ -136,6 +136,10 @@ export function approvalLead(text: string): HTMLElement {
   return el;
 }
 
+function withTruncatedMark(text: string): string {
+  return `${text}${l10n.t("… (truncated)")}`;
+}
+
 export function buildApprovalBody(toolName: string, inputJson?: string, inputSummary?: string): HTMLElement[] {
   let obj: Record<string, unknown> | null = null;
   if (inputJson) {
@@ -147,7 +151,7 @@ export function buildApprovalBody(toolName: string, inputJson?: string, inputSum
     }
   }
   const str = (v: unknown): string | null => (typeof v === "string" && v.length > 0 ? v : null);
-  const clip = (s: string, n: number): string => (s.length > n ? `${s.slice(0, n)}${l10n.t("… (truncated)")}` : s);
+  const clip = (s: string, n: number): string => (s.length > n ? withTruncatedMark(s.slice(0, n)) : s);
   if (!obj) {
     return [approvalLead(inputSummary ? `${toolName}: ${inputSummary}` : l10n.t("Allow {0} to run?", toolName))];
   }

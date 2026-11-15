@@ -1,6 +1,7 @@
 import * as l10n from "@vscode/l10n";
 import { DEFAULT_ACCENT_SETTINGS, isCustomAccent, resolveAccent, THEME_ACCENT, type AccentColor, type AccentSetting, type AccentSettings } from "../accent";
 import { installAccent } from "./accent";
+import { handleSegmentedArrow } from "./segmented-keys";
 import { onUserLabelChange, userLabel } from "./user-label";
 
 interface SettingsControls {
@@ -65,13 +66,7 @@ export function createAccentSettings(root: HTMLElement, write: (setting: AccentS
   };
   for (const { value, button } of swatches) button.addEventListener("click", () => choose(value));
   choice.addEventListener("keydown", (event: KeyboardEvent) => {
-    const step = event.key === "ArrowRight" || event.key === "ArrowDown" ? 1 : event.key === "ArrowLeft" || event.key === "ArrowUp" ? -1 : 0;
-    if (step === 0 || pending !== undefined) return;
-    event.preventDefault();
-    const from = swatches.findIndex(({ button }) => button === document.activeElement);
-    const next = swatches[(Math.max(from, 0) + step + swatches.length) % swatches.length];
-    next.button.focus();
-    choose(next.value);
+    handleSegmentedArrow(event, swatches.map(({ button }) => button), (button) => choose(button.dataset.value as AccentColor), () => pending === undefined);
   });
   const custom = document.createElement("div");
   custom.className = "settings-accent-custom";

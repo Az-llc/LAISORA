@@ -168,16 +168,20 @@ export interface FailureSummaryView {
   restCount: number;
 }
 
-export function deriveFailureSummary(
-  findings: readonly ExecLogFindingView[],
-  phases: ReadonlyArray<{ toolCount: number; childToolCount: number; failCount: number; childFailCount: number }>
-): FailureSummaryView {
+export type PhaseCallCounts = ReadonlyArray<{ toolCount: number; childToolCount: number; failCount: number; childFailCount: number }>;
+
+export function phaseCallTotals(phases: PhaseCallCounts): { toolCount: number; failCount: number } {
   let toolCount = 0;
   let failCount = 0;
   for (const p of phases) {
     toolCount += p.toolCount + p.childToolCount;
     failCount += p.failCount + p.childFailCount;
   }
+  return { toolCount, failCount };
+}
+
+export function deriveFailureSummary(findings: readonly ExecLogFindingView[], phases: PhaseCallCounts): FailureSummaryView {
+  const { toolCount, failCount } = phaseCallTotals(phases);
   const kinds = findings
     .filter((f) => f.family === "failure")
     .map((f): FailureKindView => ({ anchor: f.anchor, label: f.label, count: f.count }))

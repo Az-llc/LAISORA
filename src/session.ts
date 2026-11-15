@@ -12,6 +12,7 @@ import {
 } from "./background-activity";
 import { resolveInitialMode, type ConfiguredEffort, type ConfiguredEffortSnapshot } from "./claude-settings";
 import { ClaudeConversation } from "./claudeHost";
+import { isUnusedSession, turnRunning } from "./session-record";
 import { isConvMessageEvent, isConvRenderableEvent } from "./conv-renderable";
 import { welcomeSettings } from "./gateway-host-actions";
 import { releaseConversationHistory } from "./conversation-history";
@@ -26,6 +27,7 @@ import { windowEvents } from "./event-window";
 import type { ChildTranscriptSpan } from "./spans";
 import {
   createGuardrailState,
+  NO_UNDELIVERED_REPORTS,
   type GuardrailState,
 } from "./guardrail";
 import {
@@ -77,6 +79,7 @@ import {
 } from "./work-model";
 import type { HostArtifactAccess } from "./artifact-access";
 import type { WritesLostShown } from "./session-writes-lost";
+import { handoffInProgress } from "./handoff-runs";
 
 const RESUME_DISPLAY_BYPASS_KINDS: ReadonlySet<string> = new Set([
   "approval_request",
@@ -98,6 +101,8 @@ export interface StartMeasurement {
   readonly result: Promise<HandoffContextMeasurement | null | undefined>;
   measure(conversation: Pick<ClaudeConversation, "initialContextUsage">): Promise<void>;
   abandon(): void;
+  readonly firstStart: Promise<boolean>;
+  startFailed(): void;
 }
 
 export class Session {
@@ -132,6 +137,7 @@ export class Session {
   cliStartedAt?: number;
   startMeasurement: StartMeasurement | null = null;
   readonly unsentSends = new Set<() => void>();
+  sendTail: Promise<void> = Promise.resolve();
   starting: Promise<void> | null = null;
   resumePreparation: { ready: Promise<void>; release: () => void } | null = null;
   closed = false;
@@ -139,10 +145,12 @@ export class Session {
   expectedConversationId: string | null = null;
   readonly detachedConversationIds = new Set<string>();
   cwd = "";
+  transcriptWriteLocked = false;
   auth: AuthStatus | null = null;
   lastContextTotalTokens: number | null = null;
 
   awaitingLaisoraInput = false;
+  laisoraPurpose = false;
   autoTitled = false;
   unpersistedChosenTitle: { title: string; failedAttempts: number } | null = null;
   titleRefreshed = false;
@@ -156,7 +164,7 @@ export class Session {
   modelOverride: string | null | undefined;
   initialModel: string | null | undefined;
   effectiveModel: string | null | undefined;
-  effectiveEffort: "low" | "medium" | "high" | "xhigh" | "max" | undefined;
+  effectiveEffort: ConfiguredEffort | undefined;
   configuredEffort: ConfiguredEffort | undefined;
   configuredEffortSnapshot: ConfiguredEffortSnapshot | undefined;
   configuredEffortGeneration = 0;
@@ -172,6 +180,7 @@ export class Session {
   todoItemId: string | undefined;
   todoTurnStartedAt: number | undefined;
   handoffSource?: HandoffSourceSnapshot;
+  continuedWorkSummary = false;
   restoredWritesLost?: { sessionId: string; notice: WritesLostShown | undefined };
   resuming = false;
   hydration: ResumeHydration | null = null;
@@ -193,6 +202,7 @@ export class Session {
 
   resetLogicalSession(): void {
     this.welcome = undefined;
+    if (!this.awaitingLaisoraInput) this.laisoraPurpose = false;
     this.startMeasurement?.abandon();
     this.startMeasurement = null;
     void writeHeldChosenTitle(this);
@@ -246,6 +256,7 @@ export class Session {
       this.auth = auth;
     }
     this.handoffSource = undefined;
+    this.continuedWorkSummary = false;
     this.restoredWritesLost = undefined;
     this.resumeFilePath = undefined;
     this.remoteControl = initialTabRemoteControl(this.remoteControl.choice);
@@ -266,7 +277,7 @@ export class Session {
     this.guardrailRunner.reportedSignalIds.clear();
     this.guardrailRunner.pendingReportSignalIds = [];
     this.guardrailRunner.lastReportedDroppedSignalCount = 0;
-    this.guardrailRunner.generationSentSignalIds.clear();
+    this.guardrailRunner.undeliveredReports = NO_UNDELIVERED_REPORTS;
     this.guardrailRunner.clearGuardrailRefreshTimer();
     this.guardrailRunner.clearGuardrailTickTimer();
   }
@@ -510,20 +521,14 @@ export class Session {
     }
   }
 
-  snapshot(): TabSnapshot {
-    this.registerHistorySnapshot();
-    const semanticView = semanticViewEnabled();
-    const semanticModel = semanticView ? this.semantic.semanticModelPostPayload() : undefined;
+  private snapshotState(auth: AuthStatus | null, commands: SlashCommandInfo[], semanticView: boolean, own: Partial<TabSnapshot["state"]>): TabSnapshot["state"] {
     return {
-      tabId: this.tabId,
-      title: this.title,
-      state: {
         conversationId: this.conversation?.conversationId ?? null,
         cwd: this.cwd,
         turnState: this.conversation?.state ?? "idle",
-        auth: this.auth,
+        auth,
         permissionMode: this.permissionMode,
-        commands: this.commands.length > 0 ? this.commands : undefined,
+        commands: commands.length > 0 ? commands : undefined,
         models: this.models.length > 0 ? this.models : undefined,
         configEffort: this.configuredEffort,
         defaultEffort: this.defaultEffort,
@@ -537,18 +542,34 @@ export class Session {
         resumeSessionId: this.resumeSessionId,
         resumeFilePath: this.resumeFilePath,
         handoffSource: this.handoffSource,
-        ...(this.welcome === undefined || this.handoffSource !== undefined ? {} : { welcome: { ...this.welcome, ...welcomeSettings() } }),
-        workModel: this.semantic.projectedWorkModel(),
+        ...(this.transcriptWriteLocked ? { transcriptWriteLocked: true as const } : {}),
+        ...(this.laisoraPurpose ? { laisoraPurpose: true as const } : {}),
+        ...own,
         semanticView,
-        semanticModel,
         sessionSummary: this.summaryRunner.hydratedSessionSummary() ?? undefined,
         sessionSummaryRunning: this.summaryRun !== null,
         backgroundActivity: this.backgroundActivitySnapshot(),
         autoResumeAt: this.conversation?.pendingAutoResumeAt ?? null,
         remoteControl: remoteControlView(this),
-        events: this.events,
-        ...(this.hydration === null ? {} : { resumeHydration: this.hydrationSnapshotState() }),
-      },
+        events: [],
+    };
+  }
+
+  snapshot(): TabSnapshot {
+    this.registerHistorySnapshot();
+    const semanticView = semanticViewEnabled();
+    const semanticModel = semanticView ? this.semantic.semanticModelPostPayload() : undefined;
+    const own: Partial<TabSnapshot["state"]> = {
+      ...(handoffInProgress(this.tabId) ? { handoffSendLocked: true as const } : {}),
+      ...(this.welcome === undefined || this.handoffSource !== undefined ? {} : { welcome: { ...this.welcome, ...welcomeSettings() } }),
+      workModel: this.semantic.projectedWorkModel(),
+      semanticModel,
+    };
+    const state = this.snapshotState(this.auth, this.commands, semanticView, own);
+    return {
+      tabId: this.tabId,
+      title: this.title,
+      state: { ...state, events: this.events, ...(this.hydration === null ? {} : { resumeHydration: this.hydrationSnapshotState() }) },
     };
   }
 
@@ -613,48 +634,22 @@ export class Session {
     const loading = h.phase !== "failed";
     const base = this.semantic.baseWorkModel();
     const projected = this.hydrationProjected(h);
+    const state = this.snapshotState(projected.auth, projected.commands, semanticViewEnabled(), {
+      workModel: {
+        ...base,
+        coverage: {
+          ...base.coverage,
+          summary: "prefix-truncated",
+          details: "prefix-truncated",
+          hydrationUnconfirmed: loading ? "loading" : "failed",
+          ...(loading ? { source: "event-tail" as const } : {}),
+        },
+      },
+    });
     return {
       tabId: this.tabId,
       title: this.title,
-      state: {
-        conversationId: this.conversation?.conversationId ?? null,
-        cwd: this.cwd,
-        turnState: this.conversation?.state ?? "idle",
-        auth: projected.auth,
-        permissionMode: this.permissionMode,
-        commands: projected.commands.length > 0 ? projected.commands : undefined,
-        models: this.models.length > 0 ? this.models : undefined,
-        configEffort: this.configuredEffort,
-        defaultEffort: this.defaultEffort,
-        appliedModel: this.appliedModel,
-        modelFallback: this.modelFallback,
-        appliedEffort: this.appliedEffort,
-        recordedModel: this.recordedModel,
-        configModel: this.initialModel ? undefined : this.configuredEffortSnapshot?.resolvedModel,
-        modelOverride: this.modelOverride,
-        effortOverride: this.effortOverride,
-        resumeSessionId: this.resumeSessionId,
-        resumeFilePath: this.resumeFilePath,
-        handoffSource: this.handoffSource,
-        workModel: {
-          ...base,
-          coverage: {
-            ...base.coverage,
-            summary: "prefix-truncated",
-            details: "prefix-truncated",
-            hydrationUnconfirmed: loading ? "loading" : "failed",
-            ...(loading ? { source: "event-tail" as const } : {}),
-          },
-        },
-        semanticView: semanticViewEnabled(),
-        sessionSummary: this.summaryRunner.hydratedSessionSummary() ?? undefined,
-        sessionSummaryRunning: this.summaryRun !== null,
-        backgroundActivity: this.backgroundActivitySnapshot(),
-        autoResumeAt: this.conversation?.pendingAutoResumeAt ?? null,
-        remoteControl: remoteControlView(this),
-        events: loading ? [] : this.events,
-        resumeHydration: this.hydrationSnapshotState(),
-      },
+      state: { ...state, events: loading ? [] : this.events, resumeHydration: this.hydrationSnapshotState() },
     };
   }
 
@@ -663,34 +658,7 @@ export class Session {
       tabId: this.tabId,
       title: this.title,
       deferred: true,
-      state: {
-        conversationId: this.conversation?.conversationId ?? null,
-        cwd: this.cwd,
-        turnState: this.conversation?.state ?? "idle",
-        auth: this.auth,
-        permissionMode: this.permissionMode,
-        commands: this.commands.length > 0 ? this.commands : undefined,
-        models: this.models.length > 0 ? this.models : undefined,
-        configEffort: this.configuredEffort,
-        defaultEffort: this.defaultEffort,
-        appliedModel: this.appliedModel,
-        modelFallback: this.modelFallback,
-        appliedEffort: this.appliedEffort,
-        recordedModel: this.recordedModel,
-        configModel: this.initialModel ? undefined : this.configuredEffortSnapshot?.resolvedModel,
-        modelOverride: this.modelOverride,
-        effortOverride: this.effortOverride,
-        resumeSessionId: this.resumeSessionId,
-        resumeFilePath: this.resumeFilePath,
-        handoffSource: this.handoffSource,
-        semanticView: semanticViewEnabled(),
-        sessionSummary: this.summaryRunner.hydratedSessionSummary() ?? undefined,
-        sessionSummaryRunning: this.summaryRun !== null,
-        backgroundActivity: this.backgroundActivitySnapshot(),
-        autoResumeAt: this.conversation?.pendingAutoResumeAt ?? null,
-        remoteControl: remoteControlView(this),
-        events: [],
-      },
+      state: this.snapshotState(this.auth, this.commands, semanticViewEnabled(), {}),
     };
   }
 
@@ -840,17 +808,9 @@ export function historyTranscriptScopeKey(session: Session): string {
   return `${historyScopeKey(session)}:transcript`;
 }
 
-export function isUnusedSession(s: Session): boolean {
-  if (s.closed || s.clearing || s.resuming) return false;
-  if (s.conversation && s.conversation.state !== "idle") return false;
-  if (s.handoffSource !== undefined) return false;
-  const used = s.events.some(
-    (e) =>
-      e.kind === "user_message" ||
-      e.kind === "replayed_message" ||
-      e.kind === "assistant_text_delta" ||
-      e.kind === "tool_call_started" ||
-      e.kind === "turn_started"
-  );
-  return !used;
+export { isUnusedSession, turnRunning };
+
+export function launchingOrTurnRunning(s: { readonly starting: Promise<void> | null; readonly conversation: Pick<ClaudeConversation, "state"> | null }): boolean {
+  return s.starting !== null || turnRunning(s);
 }
+

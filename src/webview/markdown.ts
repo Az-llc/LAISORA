@@ -1,6 +1,7 @@
 import * as l10n from "@vscode/l10n";
 import { vscode } from "./dom";
 import { renderAsk, renderGoal, type AskRenderContext } from "./ask-view";
+import { renderSummary } from "./summary-view";
 import { fileLinkDisplayKind, parseHostFileLinkTarget, parseMarkdown, type MdNode } from "../markdown-ast";
 import { assembleCodeBlock, captureCodeFocus, codeActionIcon, codeBlockKey, restoreCodeFocus, svgElement, type CodeBlockDeps } from "./markdown-codeblock";
 
@@ -19,9 +20,9 @@ const COPY_REVERT_MS = 2000;
 export function createCopyButton(
   className: string,
   idleTitle: string,
-  source: () => string
+  source: () => string | Promise<string>
 ): { button: HTMLButtonElement; status: HTMLElement } {
-  return createCopyAction(className, idleTitle, () => navigator.clipboard.writeText(source()));
+  return createCopyAction(className, idleTitle, async () => navigator.clipboard.writeText(await source()));
 }
 
 const COPY_FILE_PATH_TIMEOUT_MS = 10_000;
@@ -181,6 +182,11 @@ export function renderMarkdownInto(container: HTMLElement, src: string, tabId?: 
       case "ask": {
         target.appendChild(renderAsk(node.ask, node.offset, askContext, node.rejected === true, renderAskInline));
         if (node.plain !== true) fencedIndex++;
+        break;
+      }
+      case "summary": {
+        target.appendChild(renderSummary(node.summary, renderAskInline));
+        fencedIndex++;
         break;
       }
       case "todoSplit": {

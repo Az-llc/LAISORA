@@ -7,9 +7,10 @@ export function configurationDefault<T>(key: ConfigurationKey): T {
   return properties[`laisora.${key}`].default as T;
 }
 
-export function configurationBound(key: ConfigurationKey, bound: "minimum" | "maximum"): number | undefined {
+export function configurationBound(key: ConfigurationKey, bound: "minimum" | "maximum"): number {
   const value = (properties[`laisora.${key}`] as Record<string, unknown> | undefined)?.[bound];
-  return typeof value === "number" && Number.isFinite(value) ? value : undefined;
+  if (typeof value !== "number" || !Number.isFinite(value)) throw new Error(`package.json laisora.${key} has no numeric ${bound}`);
+  return value;
 }
 
 export function resolveSettingGroup<T extends object>(keys: { readonly [K in keyof T]: ConfigurationKey }, isValue: (setting: unknown, value: unknown) => boolean, read: (key: string) => unknown): T {

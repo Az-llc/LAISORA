@@ -1,8 +1,8 @@
 import * as l10n from "@vscode/l10n";
-import { conductorModelAtEnd, PLAN_UNPLANNED_ROW_KEY, planConductorRunning, splitByConductorModel, planFrame, planItemRowKey, planLive, planNow, planPlacedStep, planBlockConductorMs, blockTimeProvisional, viewTimePartValues, PLAN_CONDUCTOR_BUCKETS, MAIN_PROCESSING_BUCKETS, ANALYSIS_TIME_PART_KEYS, timePartShown, analysisTimePart, planRowConductorParts, planRowPeriod, planRowProvisional, planRowsAt, planRowTime, UNMEASURED_LABEL, planMemberKey, planMemberSlices, planRunPlacementAt } from "./plan-steps";
+import { conductorModelAtEnd, PLAN_UNPLANNED_ROW_KEY, planConductorRunning, splitByConductorModel, planFrame, planItemRowKey, planLive, planNow, planPlacedStep, planBlockConductorMs, blockTimeProvisional, viewTimePartValues, PLAN_CONDUCTOR_BUCKETS, MAIN_PROCESSING_BUCKETS, ANALYSIS_TIME_PART_KEYS, timePartShown, analysisTimePart, planRowConductorParts, planRowPeriod, planRowProvisional, planRowsAt, planRowTime, UNMEASURED_LABEL, planMemberKey, planMemberSlices } from "./plan-steps";
 import { attestedExternalRun, type ExternalRunRecord } from "./orchestration-external";
 import { EXECUTORS, isOrchestrationEffort } from "./orchestration-roster";
-import { flattenAgents, launchedInGeneration, unknownLauncherAgents, type PlanContextExternalRun, type PlanContextPlacement, type PlanContextTokens, type PlanContextWork, type WorkAgentNode, type WorkAgentRunMeasures, type WorkPhaseView } from "./protocol";
+import { flattenAgents, launchedInGeneration, unknownLauncherAgents, type PlanContextExternalRun, type PlanContextPlacement, type PlanContextTokens, type PlanRunTokens, type PlanContextWork, type WorkAgentNode, type WorkAgentRunMeasures, type WorkPhaseView } from "./protocol";
 import { attributeSubagent, type RosterEvidence } from "./roster-evidence";
 import { externalTokens, summarizeMainTokens, type PlanTokenTotal, type PlanUsageAccumulator } from "./plan-usage";
 import { keyedGet, keyedValues, largestRemainder, type ConductorModel, type KeyedLog, type RequestBlockView,
@@ -167,10 +167,11 @@ export function subagentRunMeasures(agent: Pick<WorkAgentNode, "origin" | "statu
 }
 
 function subagentRunParts(member: AgentSpanView | undefined, usage: PlanUsageAccumulator | undefined, durationMs: number | null): RoleRunPart[] | undefined {
-  if (member?.runPlacements === undefined) return undefined;
-  const fromOf = (at: number): number | null => planRunPlacementAt(member, at)?.from ?? null;
+  const starts = member?.resumeStarts;
+  if (member === undefined || starts === undefined) return undefined;
+  const fromOf = (at: number): number | null => starts.filter(start => start <= at).at(-1) ?? null;
   const runs = runSpans(memberRunTimes(member));
-  return [null, ...member.runPlacements.map(placement => placement.from)].map(from => ({ from,
+  return [null, ...starts].map(from => ({ from,
     durationMs: durationMs === null ? null : unionMs(runs.filter(([start]) => fromOf(start) === from)),
     ...usageMeasures(usage, at => fromOf(at) === from) }));
 }
@@ -178,8 +179,13 @@ function subagentRunParts(member: AgentSpanView | undefined, usage: PlanUsageAcc
 const addMeasure = (a: number | null, b: number | null): number | null => a === null ? b : b === null ? a : a + b;
 const bothMeasured = (a: number | null, b: number | null): number | null => a === null || b === null ? null : a + b;
 
-const partTokens = (part: RoleRunPart | undefined): PlanContextTokens | null => part === undefined || part.tokens === null ? null
+const partTokens = (part: RoleRunPart): PlanContextTokens | null => part.tokens === null ? null
   : { tokens: part.tokens, cacheRead: part.cacheRead, ...(part.tokensPartial ? { partial: true } : {}) };
+
+export function countedRunTokens(parts: readonly RoleRunPart[], countedIn: ReadonlyMap<number | null, string> | undefined,
+  blockId: string): PlanRunTokens[] {
+  return parts.filter(part => countedIn?.get(part.from) === blockId).map(part => ({ from: part.from, tokens: partTokens(part) }));
+}
 
 function subagentRun(agent: WorkAgentNode, evidence: RosterEvidence, usage?: PlanUsageAccumulator, blockId: string | null = null, unknownLauncher = false,
   member?: AgentSpanView): RunDraft {
@@ -544,13 +550,17 @@ function analysisRows(view: TimeBucketView | undefined, roles: RoleSummaryView, 
   // The work block a run belongs to, by the same decision as its ANALYSIS row; the 00 row's block is not the run's.
   const runBlockId = (run: RunRef): string | undefined => runPlace(run).blockId ?? runRow(run)?.block.blockId;
   type Draft = Omit<RunDraft, "role">;
+  const partBlocks = new Map<string, Map<number | null, string>>();
   const runPieces = (run: RoleRunView): Map<Row, Draft> => {
     const owner = run.parts === undefined || run.toolUseId === undefined ? undefined : owners.get(run.toolUseId);
     const { parts, ...whole } = run;
     const pieces = new Map<Row, Draft>();
     if (owner === undefined || !("runPlacements" in owner) || owner.runPlacements === undefined || parts === undefined) {
       const row = runRow(run);
-      if (row) pieces.set(row, { ...whole, blockId: runBlockId(run) ?? row.block.blockId });
+      if (row === undefined) return pieces;
+      const counted = runBlockId(run) ?? row.block.blockId;
+      pieces.set(row, { ...whole, blockId: counted });
+      if (run.toolUseId !== undefined && parts !== undefined) partBlocks.set(run.toolUseId, new Map(parts.map(part => [part.from, counted])));
       return pieces;
     }
     const slices = planMemberSlices(owner);
@@ -566,6 +576,8 @@ function analysisRows(view: TimeBucketView | undefined, roles: RoleSummaryView, 
         : { ...prev, durationMs: addMeasure(prev.durationMs, part.durationMs), tokens: addMeasure(prev.tokens, part.tokens),
           cacheRead: bothMeasured(prev.cacheRead, part.cacheRead), outputTokens: bothMeasured(prev.outputTokens, part.outputTokens),
           tokensPartial: prev.tokensPartial || part.tokensPartial === true || (prev.tokens === null) !== (part.tokens === null) });
+      const counted = pieces.get(row)!.blockId;
+      if (run.toolUseId !== undefined && counted !== null) partBlocks.set(run.toolUseId, (partBlocks.get(run.toolUseId) ?? new Map()).set(part.from, counted));
     }
     return pieces;
   };
@@ -605,7 +617,7 @@ function analysisRows(view: TimeBucketView | undefined, roles: RoleSummaryView, 
       external: external.length === 0 ? null : contextTokens(sumRunTokens(external)), total: contextTokens(sumRunTokens([...claude, ...external])),
       work: contextWork(analysisTime(blockValues(block)), blockTimeProvisional(block)) };
   };
-  return { frameBlocks, rows, rowsAt, rowOf, ownerRow, owners, runRow, runBlockId, headerRuns, blockRuns, now, live, blockValues, rowTokens, rowTime, blockTotals };
+  return { frameBlocks, rows, rowsAt, rowOf, ownerRow, owners, runRow, runBlockId, headerRuns, blockRuns, partBlocks, now, live, blockValues, rowTokens, rowTime, blockTotals };
 }
 
 type TokenFields = Pick<RunDraft, "tokens" | "cacheRead" | "outputTokens" | "tokensPartial">;
@@ -647,7 +659,7 @@ const NO_ROLES: RoleSummaryView = { roles: [], omittedSubagentCount: 0 };
 // tokens and the block's external runs are the ANALYSIS rows' own.
 export function derivePlanPlacements(view: TimeBucketView | undefined, tools: KeyedLog<AnalysisToolRecord> | undefined,
   lanes: ReadonlyArray<{ toolUseId: string; start: number | null }>, roles: RoleSummaryView = NO_ROLES): ((blockId: string) => PlanPlacement) & { blockTotals: BlockTokenTotals[] } {
-  const { rows, owners, rowOf, runRow, rowTokens, rowTime, frameBlocks, blockTotals, blockRuns, now, live } = analysisRows(view, roles, tools);
+  const { rows, owners, rowOf, runRow, rowTokens, rowTime, frameBlocks, blockTotals, blockRuns, partBlocks, now, live } = analysisRows(view, roles, tools);
   const partsOf = new Map(roles.roles.flatMap(role => role.runs).flatMap(run => run.toolUseId === undefined || run.parts === undefined ? [] : [[run.toolUseId, run.parts] as const]));
   const externalByBlock = new Map<string, { run: RunDraft; stepKey: string | null }[]>();
   for (const row of rows) for (const run of row.runs) {
@@ -660,16 +672,14 @@ export function derivePlanPlacements(view: TimeBucketView | undefined, tools: Ke
     startedAt: run.startedAt, durationMs: run.durationMs, outcome: run.outcome, running: run.running,
     tokens: run.tokens, cacheRead: run.tokens === null ? null : run.cacheRead, stepKey }));
   type PlacedRow = (typeof rows)[number] | undefined;
-  const routed = new Map<string, { agentId?: string; row: PlacedRow; tokens?: PlanContextTokens | null;
-    resumes?: { at: number; blockId?: string; row: PlacedRow; tokens: PlanContextTokens | null }[] }>();
+  const routed = new Map<string, { agentId?: string; row: PlacedRow;
+    resumes?: { at: number; blockId?: string; row: PlacedRow }[] }>();
   for (const [toolUseId, owner] of owners) {
     const agentId = "transcriptAgentId" in owner ? owner.transcriptAgentId : undefined;
     const placements = "runPlacements" in owner ? owner.runPlacements : undefined;
-    const parts = partsOf.get(toolUseId);
     routed.set(toolUseId, { ...(agentId === undefined ? {} : { agentId }), row: runRow({ toolUseId, startedAt: owner.start, blockId: null }),
-      ...(placements === undefined ? {} : { tokens: partTokens(parts?.find(part => part.from === null)),
-        resumes: placements.map(placement => ({ at: placement.from, blockId: placement.blockId, row: rowOf(placement.blockId, placement.stepKey),
-          tokens: partTokens(parts?.find(part => part.from === placement.from)) })) }) });
+      ...(placements === undefined ? {} : { resumes: placements.map(placement => ({ at: placement.from, blockId: placement.blockId,
+        row: rowOf(placement.blockId, placement.stepKey) })) }) });
   }
   for (const lane of lanes) if (!routed.has(lane.toolUseId)) routed.set(lane.toolUseId, { row: runRow({ toolUseId: lane.toolUseId, startedAt: lane.start, blockId: null }) });
   const placementOf = (blockId: string): PlanPlacement => {
@@ -680,10 +690,13 @@ export function derivePlanPlacements(view: TimeBucketView | undefined, tools: Ke
       tokens: new Map(rows.filter(row => row.block.blockId === blockId && row.step !== undefined).map(row => [row.step!.key, contextTokens(rowTokens(row))])),
       work: new Map(rows.filter(row => row.block.blockId === blockId && row.step !== undefined).map(row => [row.step!.key, contextWork(rowTime(row), planRowProvisional(row.frame, planRowPeriod(row.frame, now, live)))])),
       blockWork: totals?.work ?? null,
-      placements: [...routed].map(([toolUseId, { agentId, row, tokens, resumes }]) => ({ toolUseId, ...(agentId === undefined ? {} : { agentId }),
-        stepKey: stepOn(row), ...(tokens === undefined ? {} : { tokens }),
-        ...(resumes === undefined ? {} : { resumes: resumes.filter(resume => resume.blockId === blockId)
-          .map(resume => ({ at: resume.at, stepKey: stepOn(resume.row), tokens: resume.tokens })) }) })),
+      placements: [...routed].map(([toolUseId, { agentId, row, resumes }]) => {
+        const parts = partsOf.get(toolUseId);
+        return { toolUseId, ...(agentId === undefined ? {} : { agentId }), stepKey: stepOn(row),
+          ...(resumes === undefined ? {} : { resumes: resumes.filter(resume => resume.blockId === blockId)
+            .map(resume => ({ at: resume.at, stepKey: stepOn(resume.row) })) }),
+          ...(parts === undefined ? {} : { runTokens: countedRunTokens(parts, partBlocks.get(toolUseId), blockId) }) };
+      }),
       claude: totals?.claude ?? null,
       counted: blockRuns.flatMap(run => run.blockId === blockId && run.toolUseId !== undefined ? [run.toolUseId] : []),
       external: totals?.external ?? null,
@@ -723,10 +736,12 @@ export function deriveAnalysisPlans(view: TimeBucketView | undefined, roles: Rol
   let headerToolCount = 0, headerFailCount = 0;
   for (const tool of tools ? keyedValues(tools) : []) {
     const counted = tool.bookkeeping !== true;
-    const calls = !counted || tool.startedAt === undefined ? [] : rowsAt(tool.startedAt);
+    const callRows = tool.startedAt === undefined ? [] : rowsAt(tool.startedAt);
+    const calls = counted ? callRows : [];
     for (const row of calls) row.toolCount++;
     if (calls.length) headerToolCount++;
-    const failures = tool.failed && tool.finishedAt !== undefined ? rowsAt(tool.finishedAt) : [];
+    const failedAt = tool.failed ? tool.finishedAt : undefined;
+    const failures = failedAt === undefined ? [] : callRows.length > 0 ? callRows : rowsAt(failedAt);
     for (const row of failures) { if (counted) row.failCount++; row.marks.push(...tool.marks); }
     if (failures.length) { if (counted) headerFailCount++; allMarks.push(...tool.marks); }
   }

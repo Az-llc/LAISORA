@@ -1,5 +1,4 @@
 import { z } from "zod";
-import * as l10n from "@vscode/l10n";
 import type * as Sdk from "@anthropic-ai/claude-agent-sdk" with { "resolution-mode": "import" };
 import type { RootGate, RootGateScope } from "./root-gate";
 import {
@@ -10,10 +9,11 @@ import {
   type TodoChange, type TodoOperation, type TodoOperationError, type TodoPlacementBasis, type TodoOperationFailure, type TodoOperationResult, type TodoRevertBlock, type TodoTidyStep,
 } from "./todo-model";
 import { TodoStoreError, type TodoStore } from "./todo-store";
-import { TODO_CLAUDE_CHANGES_MAX, todoClaudeChangeUnits, todoClipped } from "./todo-change-view";
+import { changeGeneration, TODO_CLAUDE_CHANGES_MAX, todoClaudeChangeUnits, todoClipped } from "./todo-change-view";
 import { TODO_CHANGES_REQUEST_MAX } from "./protocol";
 import { TODO_SPLIT_FENCE_INFO } from "./markdown-ast";
 import { MIGRATION_CATEGORIES } from "./migration-categories";
+import { todoGroupLabel } from "./todo-labels";
 
 export { TODO_SERVER_NAME } from "./todo-model";
 export const TODO_WRITE_TOOL_NAMES: readonly string[] = TODO_WRITE_TOOLS;
@@ -164,7 +164,8 @@ const TODO_INPUTS = {
     position: z.number().int().min(0).optional().describe("move: the group's new 0-based place in the group order.") },
   tidy: { steps: z.array(tidyStep).min(1).max(TODO_TIDY_STEPS_MAX).describe("The tidy-up, applied in this order.") },
   revert: { revisions: z.array(z.number().int().min(1)).min(1).max(TODO_CHANGES_REQUEST_MAX).optional().describe("Take back every change of yours written in these revisions (a write's revision from list changes or from the write's result); omit when changes is given."),
-    changes: z.array(z.string().regex(/^[0-9]+\.[0-9]+$/)).min(1).max(TODO_CHANGES_REQUEST_MAX).optional().describe("Take back these changes (the ids of one entry of list changes); instead of revisions.") },
+    changes: z.array(z.string().regex(/^[0-9]+\.[0-9]+$/)).min(1).max(TODO_CHANGES_REQUEST_MAX).optional().describe("Take back these changes (the ids of one entry of list changes); instead of revisions."),
+    generation: z.string().regex(/^[0-9a-f]{1,64}$/).optional().describe("The generation given with those revisions or change ids (in the write's result or the list changes entry). Required once the ToDo has been replaced by a migration import: without it the take-back is then refused.") },
 } satisfies Record<TodoToolKind, Record<string, z.ZodType>>;
 
 const TODO_DESCRIPTIONS: Record<TodoToolKind, string> = {
@@ -177,7 +178,7 @@ const TODO_DESCRIPTIONS: Record<TodoToolKind, string> = {
   delete: `Delete a TODO item together with all its sub-items, only when the user asks for it. They move to the user's recently deleted list, from which the user can restore them, and the user can take the deletion back from the conversation; when the user asks you to bring them back, use revert. ${TODO_ROOT_ONLY}`,
   group: `Create, rename, delete or reorder a group (a case). Create only when the request names a case that matches no existing group. A deleted group's items move to No group. The colour is the user's. Each change shows in the conversation and the user can take it back. ${TODO_ROOT_ONLY}`,
   tidy: `Tidy the TODO list now, as one change the user sees in the conversation as a before/after tree and can take back in one step: file items into their case and parent (move), rewrite rough titles as outcomes (rename; the original wording is kept), break an item down (add), merge duplicates (merge), fold a single-child parent (flatten) and set finished work done (foldDone). Use it when list shows tidy signals, especially items waiting in No group. ${TODO_STABLE_RULE} Running the same steps again changes nothing; a move to the parent an item already has, with no position, changes nothing. Sub-items with the same title as one in the item that stays are merged into it. Done items are never merged away; a merged item goes to recently deleted. ${TODO_TITLE_RULE} ${TODO_TIDY_ADD_FOLD} ${TODO_ROOT_ONLY}`,
-  revert: `Take back your own earlier ToDo changes, as the user taking them back would: a whole write by revisions, or one entry of list changes by its change ids. ${TODO_ASKED_REVERT} Taking back a deletion of yours, a tidy merge included, brings the item back from recently deleted with its sub-items, memos, references and conversations. ${TODO_REVERT_REACH} A change a later change has replaced, one already taken back, and a take-back itself are refused with the reason. The take-back is itself your change: it shows on the conversation's ToDo card and in the user's history, and the user can take it back. ${TODO_ROOT_ONLY}`,
+  revert: `Take back your own earlier ToDo changes, as the user taking them back would: a whole write by revisions, or one entry of list changes by its change ids. ${TODO_ASKED_REVERT} Taking back a deletion of yours, a tidy merge included, brings the item back from recently deleted with its sub-items, memos, references and conversations. ${TODO_REVERT_REACH} A change a later change has replaced, one already taken back, and a take-back itself are refused with the reason. The take-back is itself your change: it shows on the conversation's ToDo card and in the user's history, and the user can take it back. Pass the generation that came with the revisions or change ids; once the ToDo has been replaced by a migration import, a take-back without it is refused. ${TODO_ROOT_ONLY}`,
 };
 
 const REVERT_ERRORS: Record<TodoRevertBlock, string> = {
@@ -234,7 +235,7 @@ interface ListView {
 function listView(document: TodoDocument): ListView {
   const live = document.items.filter(item => item.deletedAt === undefined);
   const numbers = todoItemNumbers(live, todoGroupsOf(document).map(entry => entry.name));
-  return { live, numbers, path: itemId => todoPlaceText(todoPlaceOf(live, itemId, entry => numbers.get(entry) ?? ""), l10n.t("No group")) };
+  return { live, numbers, path: itemId => todoPlaceText(todoPlaceOf(live, itemId, entry => numbers.get(entry) ?? ""), todoGroupLabel()) };
 }
 
 function itemView(view: ListView, item: TodoItem, detail: boolean, hidden: ReadonlySet<string> = new Set()): Record<string, unknown> {
@@ -269,7 +270,7 @@ function groupViews(document: TodoDocument, view: ListView): Array<Record<string
   };
   const named = todoGroupsOf(document).map(entry => ({ name: entry.name, ...tally(entry.name), ...(entry.folders?.length ? { folders: entry.folders.map(folder => folder.path) } : {}) }));
   const loose = tally(null);
-  return loose.open + loose.done > 0 ? [...named, { name: null, label: l10n.t("No group"), ...loose }] : named;
+  return loose.open + loose.done > 0 ? [...named, { name: null, label: todoGroupLabel(), ...loose }] : named;
 }
 
 function contextView(document: TodoDocument, context: TodoConversationContext | undefined): Record<string, string> | undefined {
@@ -312,7 +313,7 @@ function treeView(view: ListView, input: Record<string, unknown>, context: Recor
     ...(omitted > 0 ? [`${omitted} top-level items were left out to keep this short; read one group with group.`] : []),
   ];
   return {
-    shown: chosen === undefined ? "all groups" : chosen ?? l10n.t("No group"), ...(input.done === true ? {} : { doneHidden: true }),
+    shown: chosen === undefined ? "all groups" : todoGroupLabel(chosen), ...(input.done === true ? {} : { doneHidden: true }),
     items: shownRoots.map(item => itemView(view, item, false, hidden)),
     ...(notes.length ? { note: notes.join(" ") } : {}),
     ...(Object.values(signals).some(entries => entries.length) || waiting ? { signals: { ...signals, ...(waiting ? { noGroup: waiting } : {}) } } : {}),
@@ -334,7 +335,7 @@ function changeUnitsView(document: TodoDocument, view: ListView, itemId: string 
         : claudeBlock(unit.write, document.changes.some(change => parseTodoChangeId(change.id).revision === unit.revision && isClaudeOwnChange(change) && todoClaudeNeverReverts(change)));
       const basis = unit.changes.find(entry => entry.basis !== undefined)?.basis;
       return {
-        revision: unit.revision, ids: unit.changes.map(entry => entry.id), at: new Date(first.at).toISOString(),
+        revision: unit.revision, ...changeGeneration(document, first.id), ids: unit.changes.map(entry => entry.id), at: new Date(first.at).toISOString(),
         ...(first.itemId === "" ? {} : view.live.some(entry => entry.id === first.itemId) ? { item: first.itemId, path: view.path(first.itemId) } : { item: first.itemId, title: first.itemTitle, deleted: true }),
         fields: unit.changes.map(entry => ({ field: entry.field, before: text(entry.before), after: text(entry.after) })),
         ...(basis ? { basis } : {}), ...(takesBack.length ? { takesBack } : {}),
@@ -466,7 +467,10 @@ function operationOf(kind: Exclude<TodoToolKind, "list">, input: Record<string, 
       default: return { kind: "groupDelete", name: value.name };
     }
     case "tidy": return { kind: "tidy", steps: (input.steps as Record<string, unknown>[]).map(tidyStepOf) };
-    case "revert": return Array.isArray(input.revisions) ? { kind: "revert", mode: "claude", revisions: input.revisions as number[] } : { kind: "revert", mode: "claude", changeIds: input.changes as string[] };
+    case "revert": {
+      const generation = typeof input.generation === "string" ? { generation: input.generation } : {};
+      return Array.isArray(input.revisions) ? { kind: "revert", mode: "claude", revisions: input.revisions as number[], ...generation } : { kind: "revert", mode: "claude", changeIds: input.changes as string[], ...generation };
+    }
   }
 }
 
@@ -526,7 +530,7 @@ function operationReply(kind: TodoToolKind, result: TodoOperationResult, input: 
       notice: "Taken back as one change of yours. The user sees it on the conversation's ToDo card and can take it back; tell them in one line what came back." }
     : kind === "delete" ? { ok: true, id: result.itemId, deleted: result.document.changes.filter(change => parseTodoChangeId(change.id).revision === result.document.revision && change.field === "deletedAt").length }
     : { ok: true, id: result.itemId, ...(item ? { path: view.path(item.id), ...((kind === "update" || kind === "move") ? twinWarning(item) : {}) } : {}), ...repeatPart, ...addedReference(own) };
-  return reply(todoWriteResultText(result.changed ? result.document.revision : null, groupIgnored ? { ...body, notice: TODO_CHILD_GROUP_NOTE } : body));
+  return reply(todoWriteResultText(result.changed ? result.document : null, groupIgnored ? { ...body, notice: TODO_CHILD_GROUP_NOTE } : body));
 }
 
 const TODO_REFERENCE_CHANGES = ["add_link", "remove_reference", "label_reference"] as const;
@@ -648,10 +652,10 @@ export function createTodoMcpServer(sdk: Pick<typeof Sdk, "createSdkMcpServer" |
       const view = listView(document);
       if (input.changes === true) return reply(JSON.stringify(changeUnitsView(document, view, typeof input.id === "string" ? input.id : undefined)));
       if (typeof input.id !== "string") {
-        const noGroupNames = [l10n.t("No group"), "No group"];
+        const noGroupNames = [todoGroupLabel(), "No group"];
         const names = todoGroupsOf(document).map(entry => entry.name);
         if (typeof input.group === "string" && !names.includes(input.group) && !noGroupNames.includes(input.group)) {
-          return reply(todoFailureResultText("unknown-group", `No group is named "${input.group}". Existing groups: ${names.join(", ") || "none"}; ${l10n.t("No group")} holds items without a group.`), true);
+          return reply(todoFailureResultText("unknown-group", `No group is named "${input.group}". Existing groups: ${names.join(", ") || "none"}; ${todoGroupLabel()} holds items without a group.`), true);
         }
         const context = contextView(document, contextOf());
         const aliases = aliasViews(document, view);

@@ -1,10 +1,12 @@
 import type { ToolIntentInput } from "./tool-intent";
 import { isHistoryEvent, workEndStatus, type NormalizedEvent, type ResumeHydrationPhase, type WorkEndStatus } from "./protocol";
 import * as l10n from "@vscode/l10n";
-import { isRequestMessage, mainCallTimeKind, MAX_TIME_TOOL_INTERVALS, toolTimeSpans, type UnknownLauncher } from "./time-buckets";
+import { mainCallTimeKind, MAX_TIME_TOOL_INTERVALS, toolTimeSpans, withoutLaunchedUnknown, type UnknownLauncher } from "./time-buckets";
 import { isFailedToolResult, isRejectedBeforeRun, taskNotificationOutcome, taskNotificationTerminal } from "./tool-result-signals";
 import { declaredBackgroundLaunch, DELEGATION_TOOL_NAMES, isCountedExternalRunCall, isMainExternalRun, TASK_TOOL_NAMES } from "./claude-tool-names";
 import { isPureCommandWrapper } from "./human-input-vocabulary";
+import { FILE_CHANGING_TOOL_SET } from "./file-writing-tools";
+import { SHELL_TOOLS } from "./shell-tools";
 import { PLAN_FENCE_INFO, parseMarkdown } from "./markdown-ast";
 import { appendRecordPart, findCommitBoundary, joinRecordTexts, type RecordTextPart } from "./commit-boundary";
 import { redactAbsolutePaths, redactOptional } from "./path-redaction";
@@ -16,9 +18,9 @@ export const MAX_PHASES = 256;
 
 const MAX_SEGMENTS = 512;
 const MAX_PHASE_REFS = 64;
-const MAX_PHASE_AGENTS = 64;
 const MAX_TASKS = 256;
 const MAX_TRACKED_TOOL_USES = 8192;
+const MAX_PHASE_AGENTS = MAX_TRACKED_TOOL_USES;
 export const MAX_EVICTED_LAUNCHES = 1024;
 const PLACEMENT_BUCKETS = 64;
 const MAX_TRACKED_APPROVALS = 256;
@@ -245,9 +247,8 @@ export interface WorkModelState {
   requests?: WorkRequestTotals[];
   requestOffset?: number;
   requestByTurn?: Record<string, number>;
-  requestHeadline?: { turnId: string | null; text: string };
+  requestHeadline?: { turnId: string | null; text: string; uuid?: string };
   planHistory?: PlanHistoryEntry[];
-  planHistoryTruncated?: boolean;
   planHistoryLostThrough?: number;
   revision: number;
   displayOnlySignalCount?: number;
@@ -366,9 +367,7 @@ function reconcileRequestCommands(d: Draft, turnId: string, text: string): void 
     if (nextIndex !== undefined && nextIndex !== placement.requestIndex) draftPlacement(d, placement.toolUseId)!.requestIndex = nextIndex;
   }
 }
-export type PlanHistoryEntry = { at: number; kind: "user" } | {
-  at: number; kind: "todos"; source?: "tasks"; created?: boolean; removed?: boolean; items: Extract<TaskIntent, { kind: "todo" }>["items"];
-} | {
+export type PlanHistoryEntry = {
   at: number; kind: "resume"; agentId: string; description: string; status: WorkEndStatus; endedAt?: number;
 };
 export type WorkSignal = Readonly<NormalizedEvent>;
@@ -381,7 +380,7 @@ export interface ToolVocabulary {
   mutate: ReadonlySet<string>;
   delegate: ReadonlySet<string>;
   task: ReadonlySet<string>;
-  shell?: { toolName: string; commandField: string };
+  shell?: { toolNames: ReadonlySet<string>; commandField: string };
   verifyCommands: readonly string[];
 }
 
@@ -389,10 +388,10 @@ const OPERATION_KINDS: OperationKind[] = ["observe", "mutate", "verify", "delega
 
 export const CLAUDE_VOCABULARY: ToolVocabulary = {
   observe: new Set(["Read", "Grep", "Glob", "WebFetch", "WebSearch"]),
-  mutate: new Set(["Edit", "Write", "NotebookEdit"]),
+  mutate: FILE_CHANGING_TOOL_SET,
   delegate: DELEGATION_TOOL_NAMES,
   task: TASK_TOOL_NAMES,
-  shell: { toolName: "Bash", commandField: "command" },
+  shell: { toolNames: SHELL_TOOLS, commandField: "command" },
   verifyCommands: [
     "(?:npm|pnpm|yarn|bun) (?:test|run lint)",
     "pytest",
@@ -560,7 +559,7 @@ export function classifyOperation(signal: WorkSignal, vocab: ToolVocabulary = CL
   if (vocab.observe.has(signal.toolName)) return "observe";
   if (vocab.mutate.has(signal.toolName)) return "mutate";
   if (vocab.delegate.has(signal.toolName)) return "delegated";
-  if (!vocab.shell || signal.toolName !== vocab.shell.toolName) return "neutral";
+  if (!vocab.shell || !vocab.shell.toolNames.has(signal.toolName)) return "neutral";
   const input = parseToolInput(signal.inputPreview);
   const command = input ? input[vocab.shell.commandField] : undefined;
   if (typeof command !== "string") return "neutral";
@@ -1021,6 +1020,10 @@ export function bookkeepingIntent(e: Pick<ToolStartedSignal, "toolName" | "taskI
   return observedTaskIntent(e.toolName, input, e.toolUseId);
 }
 
+export function countsAsPlanIntent(parentToolUseId: string | null | undefined): boolean {
+  return !isChildCall(parentToolUseId);
+}
+
 function applyTodoIntent(
   d: Draft,
   items: { taskKey: string; description: string; activeForm?: string; status: TaskStatus }[]
@@ -1391,7 +1394,8 @@ function addAgent(d: Draft, phase: WorkPhase, agent: WorkAgent): void {
   const isSettled = (candidate: WorkAgent): boolean =>
     candidate.status === "completed" || candidate.status === "failed";
   const settled = phase.agents.findIndex(isSettled);
-  phase.agents.splice(settled >= 0 ? settled : 0, 1);
+  if (settled < 0) return;
+  phase.agents.splice(settled, 1);
   markDetailsTruncated(d, 1);
 }
 
@@ -2054,10 +2058,10 @@ function activityAgent(state: WorkModelState, owner: WorkTool | undefined, at: n
   return agent === undefined || (usage && !childUsageCounts(agent.notifiedEndedAt, agent.woke === true, at)) ? undefined : agent;
 }
 
-function noteChildActivity(d: Draft, owner: WorkTool | undefined, at: number, usage: boolean): void {
+function noteChildActivity(d: Draft, owner: WorkTool | undefined, at: number, usage: boolean, activityStartedAt = at): void {
   const current = activityAgent(d.next, owner, at, usage);
   if (current === undefined) return;
-  const next = childActivity({ runStart: agentRunStart(current), earlierRuns: current.earlierRuns, stoppedAt: current.notifiedEndedAt, lastChildAt: current.lastChildAt }, at);
+  const next = childActivity({ runStart: agentRunStart(current), earlierRuns: current.earlierRuns, stoppedAt: current.notifiedEndedAt, lastChildAt: current.lastChildAt }, at, activityStartedAt);
   if (next.wokeAt === undefined && next.lastChildAt === current.lastChildAt) return;
   const agent = draftAgent(d, draftPhase(d, (owner!.phaseRef as { phaseId: string }).phaseId)!, owner!.agentId)!;
   agent.lastChildAt = next.lastChildAt;
@@ -2133,7 +2137,7 @@ function handleToolFinish(d: Draft, e: ToolFinishedSignal): void {
   if (e.resumedAgentId !== undefined && !e.isError) reopenBackground(d, e.resumedAgentId, e.timestamp);
   const placement = findToolPlacement(d.next, e.toolUseId);
   if (!placement) return;
-  noteChildActivity(d, launchingAgent(d.next, placement.parentToolUseId), e.timestamp, false);
+  noteChildActivity(d, launchingAgent(d.next, placement.parentToolUseId), e.timestamp, false, placement.startedAt);
   const backgroundTaskId =
     !e.isError && placement.taskIntent === undefined ? (e.asyncLaunchedAgentId ?? e.backgroundTaskId) : undefined;
   if (backgroundTaskId !== undefined) {
@@ -2154,21 +2158,8 @@ function handleToolFinish(d: Draft, e: ToolFinishedSignal): void {
   if (placement.agentId === undefined) deletePlacement(d, e.toolUseId);
   else Object.assign(draftPlacement(d, e.toolUseId)!, { ended: true, launchOnly: true });
   if (placement.taskIntent !== undefined) {
-    if (!e.isError && !isChildCall(placement.parentToolUseId) && placement.taskIntent.kind === "todo")
-      recordPlanHistory(d, { kind: "todos", at: e.timestamp, items: placement.taskIntent.items });
-    if (!e.isError) {
-      const intent = placement.taskIntent;
-      const taskKey = intent.kind === "create" ? taskCreateKeyFromResult(intent.toolUseId, e.resultPreview)
-        : intent.kind === "update" ? intent.taskKey : undefined;
-      const previousTask = d.next.tasks.find(task => task.taskKey === taskKey);
+    if (!e.isError && countsAsPlanIntent(placement.parentToolUseId)) {
       applyTaskIntent(d, placement.taskIntent, e);
-      if (!isChildCall(placement.parentToolUseId) && placement.taskIntent.kind !== "todo") {
-        const task = d.next.tasks.find(task => task.taskKey === taskKey) ?? previousTask;
-        if (task) recordPlanHistory(d, { kind: "todos", source: "tasks", at: e.timestamp,
-          ...(intent.kind === "create" ? { created: true } : {}),
-          ...(intent.kind === "update" && intent.deleted ? { removed: true } : {}),
-          items: [{ taskKey: task.taskKey, description: task.description, activeForm: task.activeForm, status: task.status }] });
-      }
     }
     return;
   }
@@ -2221,7 +2212,7 @@ function handleToolFinish(d: Draft, e: ToolFinishedSignal): void {
     return;
   }
   const tokens = parseSubagentTokens(e.resultPreview);
-  if (tokens !== undefined) target.totals.agentTokens += tokens;
+  if (tokens !== undefined) recordNotifiedTokens(d, e.toolUseId, tokens);
 
   const agent = target.phase ? draftAgent(d, target.phase, placement.agentId) : undefined;
   if (!agent) return;
@@ -2229,7 +2220,6 @@ function handleToolFinish(d: Draft, e: ToolFinishedSignal): void {
   agent.endedAt = e.timestamp;
   agent.elapsedMs = agentStoppedMs(agent);
   if (failed) agent.failCount++;
-  if (tokens !== undefined) agent.tokens = tokens;
 }
 
 export interface RequestActivity {
@@ -2402,7 +2392,6 @@ function recordPlanHistory(d: Draft, entry: PlanHistoryEntry): void {
   const history = [...(d.next.planHistory ?? []), entry];
   while (history.length > MAX_TASKS) {
     const [lost] = history.splice(0, 1);
-    d.next.planHistoryTruncated = true;
     d.next.planHistoryLostThrough = Math.max(d.next.planHistoryLostThrough ?? Number.NEGATIVE_INFINITY, lost.at);
   }
   d.next.planHistory = history;
@@ -2435,9 +2424,13 @@ export function foldPlanDeclarationText(previous: PlanTextState | undefined, tur
 
 function applySignal(d: Draft, signal: WorkSignal): void {
   switch (signal.kind) {
-    case "tool_call_started":
+    case "tool_call_started": {
+      const pending = Object.values(d.next.pendingUnknownLaunchers ?? {});
+      const kept = withoutLaunchedUnknown(pending, signal);
+      if (kept !== pending) d.next.pendingUnknownLaunchers = kept.length === 0 ? undefined : Object.fromEntries(kept.map(launcher => [launcher.toolUseId, launcher]));
       handleToolStart(d, signal);
       return;
+    }
     case "tool_call_finished":
       handleToolFinish(d, signal);
       return;
@@ -2490,17 +2483,20 @@ function applySignal(d: Draft, signal: WorkSignal): void {
       notePendingStale(d, signal.tasks, signal.timestamp);
       return;
     case "user_message":
-      d.next.requestHeadline = { turnId: signal.turnId, text: signal.text.split("\n").find(line => line.trim().length > 0)?.trim() ?? "" };
+      d.next.requestHeadline = { turnId: signal.turnId, text: signal.text.split("\n").find(line => line.trim().length > 0)?.trim() ?? "", ...(signal.uuid === undefined ? {} : { uuid: signal.uuid }) };
       if (signal.turnId !== null && d.next.requestByTurn?.[signal.turnId] !== undefined) {
         reconcileRequestCommands(d, signal.turnId, d.next.requestHeadline.text);
         d.next.requestHeadline = undefined;
       }
-      if (isRequestMessage(signal)) recordPlanHistory(d, { kind: "user", at: signal.timestamp });
       closeSegment(d, signal.timestamp);
       return;
     default:
       return;
   }
+}
+
+export function clearCancelledRequestHeadline(state: WorkModelState, uuid: string): WorkModelState {
+  return state.requestHeadline?.uuid === uuid ? { ...state, requestHeadline: undefined } : state;
 }
 
 export function markEventLogTrimmed(state: WorkModelState, droppedCount: number): WorkModelState {

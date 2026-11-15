@@ -1,4 +1,4 @@
-import { EXECUTORS, isExternalExecutorId, type ExternalExecutorId } from "./orchestration-executors";
+import { EXECUTORS, isExternalExecutorId, isRunMetadata, USAGE_KEYS, type ExternalExecutorId } from "./orchestration-executors";
 import type { AgentRunRecord, TokenUsage } from "./orchestration-external";
 import { orchestrationVariants, type ExternalRow, type OrchestrationRow } from "./orchestration-roster";
 import type { ClaudeConversation, ClaudeHostOptions } from "./claudeHost";
@@ -38,12 +38,7 @@ export function orchestrationViewFromStartingRoster(evidence: RosterEvidence): O
 
 interface OrchestrationVariantView { role: string; agentKey: string; model: string; effort?: string; efforts: string[] }
 
-const USAGE_KEYS = ["input_tokens", "cached_input_tokens", "output_tokens", "reasoning_output_tokens",
-  "cache_read_input_tokens", "cache_creation_input_tokens", "total_tokens", "thinking_tokens", "cache_read_tokens"];
-
-function metadata(value: unknown): value is string {
-  return typeof value === "string" && /^[A-Za-z0-9][A-Za-z0-9._:\[\]-]*$/.test(value);
-}
+const metadata = isRunMetadata;
 
 function observed(value: unknown): string | null { return metadata(value) ? value : null; }
 

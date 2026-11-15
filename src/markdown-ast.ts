@@ -4,6 +4,7 @@ import { afterAnyPlainAskMark, afterPlainAskMark, isPlainAskMarkOnly, opensPlain
 import { fenceOpening, isClosingFence } from "./commit-boundary";
 import { DEFAULT_SYSTEM_APP_EXTENSIONS } from "./file-link-open-mode";
 import { IMPROVEMENT_VERDICTS_FENCE } from "./improvement-brief";
+import { parseSummaryBlock, SUMMARY_FENCE_INFO, type SummaryBlock } from "./summary-block";
 import { parseFileLinkTarget, type FileLinkPlatform, type FileLinkTarget } from "./file-link-target";
 
 export type TableAlign = "left" | "center" | "right" | undefined;
@@ -113,6 +114,7 @@ export interface MdHardbreakNode {
 export type MdNode =
   | { type: "plan"; goal: string; offset: number }
   | { type: "ask"; ask: AskBlock; offset: number; rejected?: true; plain?: true }
+  | { type: "summary"; summary: SummaryBlock; offset: number }
   | { type: "todoSplit"; item: string; reason: string; offset: number }
   | MdHeadingNode
   | MdParagraphNode
@@ -145,8 +147,11 @@ export function fileLinkDisplayKind(target: string): "file" | "folder" | "app" {
   const extension = segment.slice(segment.lastIndexOf(".")).toLowerCase();
   return fileLinkSystemAppExtensions.has(extension) ? "app" : "file";
 }
-export function setFileLinkHostPlatform(windows: boolean): void {
-  hostPlatform.windows = windows;
+export function setFileLinkHostPlatform(windows: boolean | undefined): void {
+  hostPlatform.windows = windows ?? true;
+}
+export function fileLinkHostPlatform(): FileLinkPlatform {
+  return { windows: hostPlatform.windows };
 }
 export function parseHostFileLinkTarget(target: string): FileLinkTarget | null {
   return parseFileLinkTarget(target, hostPlatform);
@@ -280,7 +285,7 @@ function parseTodoSplit(content: string): { item: string; reason: string } | nul
 
 export const PLAN_FENCE_INFO = "laisora-plan";
 const LAISORA_FENCE_PREFIX = "laisora-";
-const NON_ASK_LAISORA_FENCES: readonly string[] = [PLAN_FENCE_INFO, TODO_SPLIT_FENCE_INFO, IMPROVEMENT_VERDICTS_FENCE];
+const NON_ASK_LAISORA_FENCES: readonly string[] = [PLAN_FENCE_INFO, TODO_SPLIT_FENCE_INFO, IMPROVEMENT_VERDICTS_FENCE, SUMMARY_FENCE_INFO];
 const FENCE_INFO_ANYWHERE = /(?:`{3,}|~{3,})([^\n`]*)/g;
 const ASK_FENCE_INFO_AT_END = new RegExp(`${LAISORA_FENCE_PREFIX}\\S*(?: rejected)?\\s*$`);
 
@@ -519,6 +524,11 @@ function askSpans(source: string): AskSpan[] {
 
 export function askBlocksIn(src: string): AskBlock[] {
   return askSpans(src).map((span) => span.ask);
+}
+
+export function askBlockSources(source: string): string[] {
+  const lines = closeAskFences(source).split("\n");
+  return askSpans(source).map((span) => lines.slice(span.startLine, span.endLine).join("\n"));
 }
 
 export const ASK_QUALITY_DENIAL_HEAD = "Rejected before display: these laisora-ask decisions were not shown to the user.";
@@ -768,6 +778,11 @@ export function parseMarkdown(source: string): MdNode[] {
         const split = token.info.trim() === TODO_SPLIT_FENCE_INFO && closed ? parseTodoSplit(token.content) : null;
         if (split) {
           currentContainer().push({ type: "todoSplit", ...split, offset });
+          continue;
+        }
+        const summary = token.info.trim() === SUMMARY_FENCE_INFO && closed ? parseSummaryBlock(token.content) : null;
+        if (summary) {
+          currentContainer().push({ type: "summary", summary, offset });
           continue;
         }
         const lang = token.info ? token.info.trim().split(/\s+/)[0].toLowerCase() : "";

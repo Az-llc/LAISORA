@@ -1,5 +1,6 @@
 import { posix, win32 } from "node:path";
 import { claudeProjectDirName, normalizeDriveLetter } from "./claude-env";
+import { escapeRegExp } from "./regexp-escape";
 import { isMigrationCategory, isProjectDirName, type MigrationCategory } from "./migration-categories";
 import { todoBindableFolderPath, type TodoDocument, type TodoGroup, type TodoGroupAlias, type TodoGroupFolder } from "./todo-model";
 
@@ -11,6 +12,8 @@ export const MIGRATION_SETTINGS = `${MIGRATION_DIR}/laisora-settings.json`;
 export const MIGRATION_MCP_SERVERS = `${MIGRATION_DIR}/mcp-servers.json`;
 export const MIGRATION_TODO = `${MIGRATION_DIR}/todo/todo.json`;
 export const MIGRATION_TODO_FILES = `${MIGRATION_DIR}/todo/files`;
+export const MIGRATION_PREVIOUS_TODO = "laisora-todo.json";
+export const MIGRATION_PREVIOUS_TODO_FILES = "laisora-todo-files";
 export const PROJECTS_DIR = "projects";
 export const MEMORY_DIR = "memory";
 export const MIGRATION_FORMAT = 1;
@@ -116,7 +119,8 @@ export function archiveExcludeList(platform: NodeJS.Platform, env: Readonly<Reco
   return memoryExcluded.filter(isProjectDirName).map(dirName => `${anchor}${projectMemoryDir(dirName)}/?*\n`).join("");
 }
 
-const isWindowsPath = (path: string) => /^[A-Za-z]:[\\/]/.test(path) || /^[A-Za-z]:$/.test(path);
+const isBareDrive = (path: string) => /^[A-Za-z]:$/.test(path);
+const isWindowsPath = (path: string) => /^[A-Za-z]:[\\/]/.test(path) || isBareDrive(path);
 
 const WINDOWS_DEVICE_PREFIX = /^[\\/]{2}[?.][\\/]/;
 
@@ -124,7 +128,7 @@ export function normalizedWorkFolder(path: string, platform: NodeJS.Platform = p
   const plain = WINDOWS_DEVICE_PREFIX.test(path) ? path.slice(4).replace(/^UNC[\\/]/i, "\\\\") : path;
   const windows = isWindowsPath(plain) || platform === "win32" && /^[\\/]/.test(plain);
   const trimmed = withoutTrailingSeparators((windows ? win32 : posix).resolve(plain));
-  if (/^[A-Za-z]:$/.test(trimmed)) return `${normalizeDriveLetter(trimmed)}\\`;
+  if (isBareDrive(trimmed)) return `${normalizeDriveLetter(trimmed)}\\`;
   return trimmed === "" ? "/" : normalizeDriveLetter(trimmed);
 }
 
@@ -134,8 +138,18 @@ export function sameFolderName(a: string, b: string, platform: NodeJS.Platform =
 
 type HomeForm = { readonly text: string; readonly render: (to: string) => string; readonly separator: "\\" | "/" };
 
+const isRootPath = (path: string) => path === "" || isBareDrive(path) || /^[\\/]{2}[^\\/]+(?:[\\/][^\\/]+)?$/.test(path);
+const isSeparator = (char: string | undefined) => char === "\\" || char === "/";
+
+function renderHome(form: HomeForm, target: string, followedBySeparator: boolean): string {
+  const rendered = form.render(target);
+  if (followedBySeparator) return rendered;
+  return rendered === "" ? posix.sep : isBareDrive(rendered) ? `${rendered}${form.separator}` : rendered;
+}
+
 function homeForms(home: string): HomeForm[] {
   const trimmed = withoutTrailingSeparators(home);
+  if (isRootPath(trimmed)) return [];
   if (!isWindowsPath(trimmed)) return [{ text: trimmed, render: to => to, separator: "/" }];
   const slashed = trimmed.replace(/\\/g, "/");
   const toSlashed = (to: string) => to.replace(/\\/g, "/");
@@ -146,14 +160,13 @@ function homeForms(home: string): HomeForm[] {
   ];
 }
 
-const escapeRegExp = (text: string) => text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 
 export function remapHomeInText(text: string, from: string, to: string): string {
   const target = withoutTrailingSeparators(to);
   let result = text;
   for (const form of homeForms(from)) {
     const pattern = new RegExp(`(?<![A-Za-z0-9_.-])${escapeRegExp(form.text)}(?![A-Za-z0-9_.-])`, isWindowsPath(from) ? "gi" : "g");
-    result = result.replace(pattern, () => form.render(target));
+    result = result.replace(pattern, (match: string, offset: number, whole: string) => renderHome(form, target, isSeparator(whole[offset + match.length])));
   }
   return result;
 }
@@ -173,7 +186,7 @@ export function remapPath(path: string, from: string, to: string): string | unde
     const same = windows ? head.toLowerCase() === form.text.toLowerCase() : head === form.text;
     const rest = path.slice(form.text.length);
     if (!same || (rest !== "" && rest[0] !== "\\" && rest[0] !== "/")) continue;
-    const rendered = form.render(target);
+    const rendered = renderHome(form, target, rest !== "");
     const separator = isWindowsPath(rendered) && !rendered.includes("/") ? win32.sep : posix.sep;
     return rendered + rest.replace(/[\\/]/g, separator);
   }
@@ -450,7 +463,7 @@ export function archiveCommands(platform: NodeJS.Platform, env: Readonly<Record<
     return [...(listed ? [{ command: "zip", args: ["-r", "-q", output, "-@", ...exclude], cwd: listed.dir, stdinFile: listed.file }] : []),
       ...used.map(root => ({ command: "zip", args: ["-r", "-q", output, ...root.names, ...exclude], cwd: root.dir }))];
   }
-  const args = ["-v", ...(excludeFile ? ["-X", excludeFile] : []), "--format", "zip", "--options", "zip:hdrcharset=UTF-8", "-cf", output,
+  const args = ["-v", "-L", ...(excludeFile ? ["-X", excludeFile] : []), "--format", "zip", "--options", "zip:hdrcharset=UTF-8", "-cf", output,
     ...(listed ? ["-C", listed.dir, "-T", listed.file, "--"] : []), ...used.flatMap(root => ["-C", root.dir, ...root.names])];
   return [{ command: tar, args, reportsEntries: true }];
 }
@@ -489,7 +502,7 @@ export function migrationReadme(manifest: MigrationManifest): string {
     "",
     "## What the import does and what it leaves to you",
     "",
-    "LAISORA's import tool (the Migration settings tab starts a conversation that uses it) copies this guide to `~/.claude/backups/laisora-import-<time>/` and replaces the exporting home folder with this PC's home folder in settings.json, settings.local.json, plugins/*.json, the MCP servers, LAISORA's settings, the ToDo folder bindings and each work folder above, places each work folder's conversations and memory under `~/.claude/projects/<encoded work folder>` with a `relocated` line naming the new work folder (a folder whose work folder is unknown keeps its folder name), and never replaces a file already under `~/.claude/projects/`. Any other existing Claude file whose content differs, `~/.claude.json` when MCP servers are added to it, and the previous ToDo (`laisora-todo.json`) are saved to `~/.claude/backups/laisora-import-<time>/` first.",
+    "LAISORA's import tool (the Migration settings tab starts a conversation that uses it) copies this guide to `~/.claude/backups/laisora-import-<time>/` and replaces the exporting home folder with this PC's home folder in settings.json, settings.local.json, plugins/*.json, the MCP servers, LAISORA's settings, the ToDo folder bindings and each work folder above, places each work folder's conversations and memory under `~/.claude/projects/<encoded work folder>` with a `relocated` line naming the new work folder (a folder whose work folder is unknown keeps its folder name), and never replaces a file already under `~/.claude/projects/`. Any other existing Claude file whose content differs, `~/.claude.json` when MCP servers are added to it, and the previous ToDo (`" + MIGRATION_PREVIOUS_TODO + "`, with its images in `" + MIGRATION_PREVIOUS_TODO_FILES + "/`) are saved to `~/.claude/backups/laisora-import-<time>/` first.",
     "",
     "Existing files under `~/.claude/projects/` are never replaced: a conversation whose record is already there keeps everything of that session, and existing memory files are kept as they were. To merge the archive's memory into a kept memory file, compare `projects/<folder>/memory/` in the archive with the file on this PC.",
     "",

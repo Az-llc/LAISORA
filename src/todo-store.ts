@@ -2,20 +2,37 @@ import { randomBytes } from "node:crypto";
 import { mkdirSync, watch } from "node:fs";
 import { link, mkdir, open, readdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
-import { applyTodoOperation, emptyTodoDocument, parseTodoDocument, todoDocumentJson, pruneDeletedItems, liveImageNames, TODO_IMAGE_EXTENSIONS, TODO_IMAGE_FILE, todoImageRefs, type TodoAuthor, type TodoImageRef, type TodoImageMediaType, type TodoDocument, type TodoOperation, type TodoOperationResult } from "./todo-model";
+import { processAlive } from "./process-alive";
+import { errorCode, retryTransient } from "./transient-fs";
+import { applyTodoOperation, emptyTodoDocument, parseTodoDocument, parseTodoChangeId, todoDocumentJson, todoGenerations, pruneDeletedItems, liveImageNames, TODO_IMAGE_EXTENSIONS, TODO_IMAGE_FILE, todoImageRefs, type TodoAuthor, type TodoImageRef, type TodoImageMediaType, type TodoDocument, type TodoOperation, type TodoOperationResult } from "./todo-model";
 
 export const TODO_KEPT_REVISIONS = 20;
 export const TODO_WRITE_WINDOW = 200;
 const TODO_WRITE_ATTEMPTS = 100;
 const TODO_READ_ATTEMPTS = 5;
 const TODO_WATCH_DEBOUNCE_MS = 50;
-const TRANSIENT_RETRY_MS = 2_000;
 const TODO_UNCOMMITTED_FILE_MS = 10 * 60_000;
-const TRANSIENT_FS_CODES = new Set(["EPERM", "EBUSY", "EACCES"]);
 const REVISION_FILE = /^todo\.(\d+)\.json$/;
 const TEMP_FILE = /^todo\.json\.(\d+)\.[0-9a-f]+\.tmp$/;
+const HOLD_FILE = /^todo\.hold\.(\d+)\.[0-9a-f]+\.json$/;
+const TODO_IMPORTED_REVISION_MAX = 2 ** 40;
 
 export const todoRevisionFile = (revision: number) => `todo.${revision}.json`;
+
+const newGenerationId = () => randomBytes(8).toString("hex");
+
+function parsedHold(text: string): string[] | undefined {
+  try {
+    const value: unknown = JSON.parse(text);
+    return Array.isArray(value) && value.every(entry => typeof entry === "string") ? value : undefined;
+  } catch { return undefined; }
+}
+
+export function todoImportable(document: Pick<TodoDocument, "revision" | "changes" | "tidy">): boolean {
+  const sane = (revision: number) => Number.isSafeInteger(revision) && revision >= 0 && revision <= document.revision;
+  return Number.isSafeInteger(document.revision) && document.revision >= 0 && document.revision <= TODO_IMPORTED_REVISION_MAX
+    && document.changes.every(change => sane(parseTodoChangeId(change.id).revision)) && (document.tidy ?? []).every(record => sane(record.revision));
+}
 
 export type TodoStoreErrorCode = "corrupt" | "conflict" | "uncertain" | "io";
 
@@ -26,23 +43,6 @@ export class TodoStoreError extends Error {
 }
 
 const delay = (ms: number) => new Promise<void>(resolve => setTimeout(resolve, ms));
-const errorCode = (error: unknown) => (error as NodeJS.ErrnoException | undefined)?.code ?? "";
-
-export async function retryTransient<T>(action: () => Promise<T>): Promise<T> {
-  const started = Date.now();
-  for (let attempt = 0; ; attempt++) {
-    try { return await action(); }
-    catch (error) {
-      if (!TRANSIENT_FS_CODES.has(errorCode(error)) || Date.now() - started >= TRANSIENT_RETRY_MS) throw error;
-      await delay(Math.min(10 * 2 ** attempt, 250));
-    }
-  }
-}
-
-function processAlive(pid: number): boolean {
-  try { process.kill(pid, 0); return true; }
-  catch (error) { return errorCode(error) === "EPERM"; }
-}
 
 export class TodoStore {
   private readonly corruptLogged = new Set<number>();
@@ -63,9 +63,43 @@ export class TodoStore {
   }
 
   async replace(imported: TodoDocument): Promise<TodoDocument> {
-    const result = await this.write(current => ({ ok: true, document: { ...imported, revision: current.revision + 1, writes: current.writes ?? [] }, itemId: "", changed: true }));
+    if (!todoImportable(imported)) throw new TodoStoreError("corrupt");
+    const result = await this.write(current => {
+      const revision = Math.max(current.revision, imported.revision) + 1;
+      const carried = todoGenerations(imported).filter(entry => entry.from <= imported.revision).map(entry => ({ id: entry.id || newGenerationId(), from: entry.from }));
+      return { ok: true, document: { ...imported, revision, generations: [...carried, { id: newGenerationId(), from: revision }], writes: current.writes ?? [] }, itemId: "", changed: true };
+    });
     if (!result.ok) throw new TodoStoreError("conflict");
     return result.document;
+  }
+
+  async holdImages(names: readonly string[]): Promise<() => Promise<void>> {
+    const hold = join(this.directory, `todo.hold.${process.pid}.${randomBytes(6).toString("hex")}.json`);
+    const temp = join(this.directory, `todo.json.${process.pid}.${randomBytes(6).toString("hex")}.tmp`);
+    try {
+      await mkdir(this.directory, { recursive: true });
+      await retryTransient(() => writeFile(temp, JSON.stringify(names)));
+      await retryTransient(() => rename(temp, hold));
+    } catch (error) {
+      await rm(temp, { force: true }).catch(() => undefined);
+      throw new TodoStoreError("io", error);
+    }
+    return () => rm(hold, { force: true }).catch(error => this.log(`[todo] could not remove ${hold}: ${String(error)}`));
+  }
+
+  private async heldImages(): Promise<Set<string> | undefined> {
+    const held = new Set<string>();
+    for (const name of await readdir(this.directory)) {
+      const match = HOLD_FILE.exec(name);
+      if (!match || !processAlive(Number(match[1]))) continue;
+      let text: string;
+      try { text = await retryTransient(() => readFile(join(this.directory, name), "utf8")); }
+      catch (error) { if (errorCode(error) === "ENOENT") continue; return undefined; }
+      const names = parsedHold(text);
+      if (!names) { await rm(join(this.directory, name), { force: true }).catch(() => undefined); continue; }
+      for (const entry of names) held.add(entry);
+    }
+    return held;
   }
 
   private async write(next: (current: TodoDocument) => TodoOperationResult): Promise<TodoOperationResult> {
@@ -76,9 +110,10 @@ export class TodoStore {
       const current = await this.read();
       const result = next(current);
       if (!result.ok || result.document === current) return result;
-      const document: TodoDocument = { ...result.document, writes: [...(current.writes ?? []), writeId].slice(-TODO_WRITE_WINDOW) };
+      const document: TodoDocument = { ...result.document, ...(result.document.generations === undefined ? { generations: [{ id: newGenerationId(), from: 0, legacy: true as const }] } : {}),
+        writes: [...(current.writes ?? []), writeId].slice(-TODO_WRITE_WINDOW) };
       if (await this.publish(document)) {
-        const placement = await this.placement(document.revision, writeId).catch(() => "uncertain" as const);
+        const placement = await this.placement(document.revision, writeId, current.writes?.at(-1)).catch(() => "uncertain" as const);
         if (placement === "visible") {
           await this.prune(document.revision);
           await this.collectFiles(document).catch(error => this.log(`[todo] could not clean up image files: ${String(error)}`));
@@ -177,9 +212,10 @@ export class TodoStore {
     }
   }
 
-  private async placement(revision: number, writeId: string): Promise<"visible" | "stray" | "uncertain"> {
+  private async placement(revision: number, writeId: string, base: string | undefined): Promise<"visible" | "stray" | "uncertain"> {
     const current = await this.read();
     if (current.writes?.includes(writeId)) return "visible";
+    if (base !== undefined && current.writes?.includes(base)) return "stray";
     return current.revision - revision < TODO_WRITE_WINDOW ? "stray" : "uncertain";
   }
 
@@ -242,6 +278,9 @@ export class TodoStore {
       }
       for (const name of liveImageNames(refs, now)) kept.add(name);
     }
+    const held = await this.heldImages();
+    if (!held) return;
+    for (const name of held) kept.add(name);
     for (const name of names) {
       const written = TODO_IMAGE_FILE.exec(name);
       if (!written || kept.has(name) || Date.now() - Number(written[1]) < TODO_UNCOMMITTED_FILE_MS) continue;
@@ -253,7 +292,7 @@ export class TodoStore {
     const names = await readdir(this.directory).catch(() => [] as string[]);
     for (const name of names) {
       const revision = REVISION_FILE.exec(name);
-      const temp = TEMP_FILE.exec(name);
+      const temp = TEMP_FILE.exec(name) ?? HOLD_FILE.exec(name);
       const stale = revision ? Number(revision[1]) <= written - TODO_KEPT_REVISIONS : temp ? !processAlive(Number(temp[1])) : false;
       if (stale) await rm(join(this.directory, name), { force: true }).catch(error => this.log(`[todo] could not remove ${name}: ${String(error)}`));
     }

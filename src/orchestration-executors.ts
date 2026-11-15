@@ -1,4 +1,6 @@
 import { redactAbsolutePaths } from "./path-redaction";
+import { configurationBound, configurationDefault } from "./configuration-defaults";
+import { claudeModelParts, withoutExtendedContext } from "./model-display-name";
 
 export const CLAUDE_EFFORTS = ["low", "medium", "high", "xhigh", "max"] as const;
 export type OrchestrationEffort = typeof CLAUDE_EFFORTS[number];
@@ -24,7 +26,10 @@ export function claudeAgentName(role: string, model: string): string {
 }
 
 export function claudeModelIdLabel(model: string): string {
-  return model.replace(/\[1m\]$/, "").replace(/-\d{8}$/, "");
+  const base = withoutExtendedContext(model, false);
+  const parts = claudeModelParts(base);
+  if (parts === undefined || parts.extended) return base.replace(/-\d{8}$/, "");
+  return parts.date === undefined ? base : base.slice(0, -(parts.date.length + 1));
 }
 
 export const EXTERNAL_RUN_TOOL_SUFFIX = "__laisora_external__run";
@@ -99,6 +104,11 @@ export function isExecutorId(value: unknown): value is ExecutorId {
 export function isExternalExecutorId(value: unknown): value is ExternalExecutorId {
   return isExecutorId(value) && EXECUTORS[value].kind === "external";
 }
+export const RUN_METADATA_MAX = 200;
+const RUN_METADATA = /^[A-Za-z0-9][A-Za-z0-9._:\[\]-]*$/;
+export function isRunMetadata(value: unknown): value is string {
+  return typeof value === "string" && value.length <= RUN_METADATA_MAX && RUN_METADATA.test(value);
+}
 export function isExternalModel(value: unknown): value is string {
   return typeof value === "string" && (value === "" || /^[A-Za-z0-9][A-Za-z0-9._:-]*$/.test(value));
 }
@@ -115,7 +125,10 @@ async function detectVersion(probe: ExecutorProbe): Promise<ExternalDetection> {
 }
 export const EXTERNAL_TIMEOUT_SETTING_KEY = "orchestration.externalTimeoutMinutes";
 export const EXTERNAL_TIMEOUT_SETTING = `laisora.${EXTERNAL_TIMEOUT_SETTING_KEY}`;
-export const EXTERNAL_TIMEOUT_DEFAULT_MINUTES = 10;
+export const EXTERNAL_TIMEOUT_DEFAULT_MINUTES = configurationDefault<number>(EXTERNAL_TIMEOUT_SETTING_KEY);
+export const EXTERNAL_TIMEOUT_MIN_MINUTES = configurationBound(EXTERNAL_TIMEOUT_SETTING_KEY, "minimum");
+export const EXTERNAL_TIMEOUT_MAX_MINUTES = configurationBound(EXTERNAL_TIMEOUT_SETTING_KEY, "maximum");
+export const EXTERNAL_MODEL_LIST_MAX = 100;
 export const EXTERNAL_FAILURE_DETAIL_MAX = 300;
 export const EXTERNAL_STDERR_TAIL_MAX = 8192;
 export const CODEX_SANDBOX_SETUP_ERROR = "helper_unknown_error";
@@ -178,10 +191,12 @@ export function codexCommandSandboxState(item: CodexCommandItem | undefined): "s
   if (output.startsWith(CODEX_SANDBOX_EXEC_FAILED) && (output.includes(CODEX_SANDBOX_SETUP_ERROR) || output.includes(CODEX_SANDBOX_PROCESS_REJECTED))) return "sandbox-failed";
   return typeof item.exit_code === "number" ? "ran" : undefined;
 }
+export const USAGE_KEYS: readonly string[] = ["input_tokens", "cached_input_tokens", "output_tokens", "reasoning_output_tokens",
+  "cache_read_input_tokens", "cache_creation_input_tokens", "total_tokens", "thinking_tokens", "cache_read_tokens"];
 export function tokenUsage(raw: unknown): TokenUsage | undefined {
   if (!raw || typeof raw !== "object") return undefined;
   const entries = Object.entries(raw).filter(([key, value]) =>
-    ["input_tokens", "cached_input_tokens", "output_tokens", "reasoning_output_tokens", "cache_read_input_tokens", "cache_creation_input_tokens", "total_tokens", "thinking_tokens", "cache_read_tokens"].includes(key)
+    USAGE_KEYS.includes(key)
     && typeof value === "number" && Number.isFinite(value) && value >= 0);
   return entries.length ? Object.freeze(Object.fromEntries(entries)) as TokenUsage : undefined;
 }
@@ -192,7 +207,7 @@ export function parseAgyModels(output: string): ExternalModelList {
     const id = line.split("\t")[0];
     if (!id || !isExternalModel(id) || models.some((model) => model.id === id)) continue;
     models.push({ id, label: id });
-    if (models.length === 100) break;
+    if (models.length === EXTERNAL_MODEL_LIST_MAX) break;
   }
   return models.length ? { state: "ok", models } : { state: "failed", reason: "empty-model-list" };
 }
@@ -212,7 +227,7 @@ export function parseCodexModels(result: unknown): (ExternalModelList & { nextCu
     }
     models.push({ id: item.id, label: typeof item.displayName === "string" ? item.displayName : item.id,
       efforts: CODEX_EFFORTS.filter((effort) => item.supportedReasoningEfforts.some((value: { reasoningEffort: string }) => value.reasoningEffort === effort)) });
-    if (models.length === 100) break;
+    if (models.length === EXTERNAL_MODEL_LIST_MAX) break;
   }
   return { state: "ok", models, nextCursor: page.nextCursor };
 }

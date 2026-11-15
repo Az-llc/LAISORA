@@ -8,13 +8,13 @@ import { createHash } from "node:crypto";
 import { homedir } from "node:os";
 import { delimiter, dirname, isAbsolute, join, relative, resolve } from "node:path";
 import { buildClaudeEnv, claudeConfigDir, envValueOf } from "./claude-env";
-import { gitInertEnv, isControlPath } from "./placement-guard";
-import { EXTERNAL_CAPABILITIES, externalExecutorName, isExternalRows, isExternalTimeout, type ExternalRow, type ExternalDetection, type ExternalModel, type ExternalModelList } from "./orchestration-roster";
+import { CONTROL_FILE_NAMES, gitInertEnv, isControlPath } from "./placement-guard";
+import { EXTERNAL_CAPABILITIES, externalExecutorName, isExternalRows, isRoleName, isExternalTimeout, type ExternalRow, type ExternalDetection, type ExternalModel, type ExternalModelList } from "./orchestration-roster";
 import type { ApiKeyPolicy } from "./protocol";
 
 export { isExternalRows, isExternalTimeout } from "./orchestration-roster";
 export type { ExternalRow } from "./orchestration-roster";
-import { EXECUTORS, EXTERNAL_EXECUTORS, EXTERNAL_STDERR_TAIL_MAX, externalTimeoutHint, isExternalExecutorId, isExternalModel, isExternalRunOutcome, tokenUsage, type ExternalRunOutcome, type TokenUsage, type ExecutorProbe } from "./orchestration-executors";
+import { EXECUTORS, EXTERNAL_EXECUTORS, EXTERNAL_MODEL_LIST_MAX, EXTERNAL_STDERR_TAIL_MAX, externalTimeoutHint, isExternalExecutorId, isExternalModel, isExternalRunOutcome, isRunMetadata, tokenUsage, type ExternalRunOutcome, type TokenUsage, type ExecutorProbe } from "./orchestration-executors";
 export { tokenUsage, parseAgyModels, parseCodexModels } from "./orchestration-executors";
 export type { TokenUsage } from "./orchestration-executors";
 export const WINDOWS_COMMAND_LINE_UTF16_LIMIT = 32767;
@@ -121,16 +121,16 @@ const timestamp = (value: unknown): value is string => typeof value === "string"
 export function decodeExternalRunRecord(raw: unknown): ExternalRunRecord | undefined {
   if (!raw || typeof raw !== "object" || Array.isArray(raw)) return undefined;
   const r = raw as Record<string, unknown>;
-  if (r.kind !== "external" || typeof r.role !== "string" || !/^[a-z][a-z0-9-]*$/.test(r.role) || !isExternalExecutorId(r.executor)) return undefined;
+  if (r.kind !== "external" || !isRoleName(r.role) || !isExternalExecutorId(r.executor)) return undefined;
   if (!timestamp(r.startedAt) || !timestamp(r.endedAt) || typeof r.durationMs !== "number" || !Number.isFinite(r.durationMs) || r.durationMs < 0) return undefined;
   if (!isExternalRunOutcome(r.outcome)) return undefined;
   if (r.model !== undefined && (!isExternalModel(r.model) || r.model === "")) return undefined;
-  if (r.effort !== undefined && (typeof r.effort !== "string" || !/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(r.effort))) return undefined;
+  if (r.effort !== undefined && !isRunMetadata(r.effort)) return undefined;
   if ((r.cwd !== undefined && typeof r.cwd !== "string") || (r.reason !== undefined && typeof r.reason !== "string")) return undefined;
   if ((r.runId !== undefined && typeof r.runId !== "string") || (r.sessionId !== undefined && typeof r.sessionId !== "string")) return undefined;
   const usage = tokenUsage(r.usage);
   for (const field of ["toolUseId", "conversation", "recipient", "dispatchId", "requestedModel", "requestedEffort", "observedModel", "observedEffort"]) {
-    if (r[field] !== undefined && (typeof r[field] !== "string" || !/^[A-Za-z0-9._:\[\]-]+$/.test(String(r[field])))) return undefined;
+    if (r[field] !== undefined && !isRunMetadata(r[field])) return undefined;
   }
   const attested = attestedExternalRun({ attestation: r.executor === "codex" ? decodeCodexAttestation(r.attestation) : undefined,
     observedModel: r.observedModel, observedEffort: r.observedEffort });
@@ -167,7 +167,7 @@ export function decodeAgentRunRecord(raw: unknown): AgentRunRecord | undefined {
     if (r[field] !== undefined && typeof r[field] !== "string") return undefined;
   }
   for (const field of ["role", "requestedModel", "requestedEffort", "model", "effort"]) {
-    if (r[field] !== undefined && !/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(r[field] as string)) return undefined;
+    if (r[field] !== undefined && !isRunMetadata(r[field])) return undefined;
   }
   return Object.freeze({ ...r, usage: tokenUsage(r.usage) }) as unknown as AgentRunRecord;
 }
@@ -364,7 +364,7 @@ export async function listExternalModels(executor: ExternalRow["executor"], poli
   try {
     const executable = (deps.resolve ?? resolveExternalExecutable)(executor);
     if (!executable) return { state: "failed", reason: "not-installed" };
-    const env = buildClaudeEnv(process.env, policy).env;
+    const env = buildClaudeEnv(process.env, "externalCli", policy).env;
     const limit = Math.min(deps.timeoutMs ?? 10_000, 10_000);
     return await EXECUTORS[executor].listModels!(executorProbe(executable, env, limit, deps));
   } catch (error) { return { state: "failed", reason: runFailureReason("model-list-failed", error) }; }
@@ -377,7 +377,7 @@ function executorProbe(executable: string, env: NodeJS.ProcessEnv, limit: number
 export async function detectExternalExecutor(executor: ExternalRow["executor"], policy?: ApiKeyPolicy, deps: ExternalDependencies = {}): Promise<ExternalDetection> {
   const path = (deps.resolve ?? resolveExternalExecutable)(executor);
   if (!path) return { state: "notInstalled" };
-  return EXECUTORS[executor].detect!(executorProbe(path, buildClaudeEnv(process.env, policy).env, deps.timeoutMs ?? 10_000, deps));
+  return EXECUTORS[executor].detect!(executorProbe(path, buildClaudeEnv(process.env, "externalCli", policy).env, deps.timeoutMs ?? 10_000, deps));
 }
 async function captureModelRpc(executable: string, env: NodeJS.ProcessEnv, limit: number, deps: ExternalDependencies,
   args: string[], initialize: object, initialized: object, method: string, parse: Parameters<ExecutorProbe["rpc"]>[4]): Promise<ExternalModelList> {
@@ -444,9 +444,9 @@ async function captureModelRpc(executable: string, env: NodeJS.ProcessEnv, limit
               } else {
                 const page = parse(response.result);
                 if (page.state === "failed") { finishList(page); return; }
-                for (const model of page.models) if (models.length < 100 && !models.some((entry) => entry.id === model.id)) models.push(model);
+                for (const model of page.models) if (models.length < EXTERNAL_MODEL_LIST_MAX && !models.some((entry) => entry.id === model.id)) models.push(model);
                 pages++;
-                if (page.nextCursor !== null && pages < 5 && models.length < 100) {
+                if (page.nextCursor !== null && pages < 5 && models.length < EXTERNAL_MODEL_LIST_MAX) {
                   sendList({ id: ++requestId, method, params: { cursor: page.nextCursor } });
                 } else finishList(models.length ? { state: "ok", models } : { state: "failed", reason: "empty-model-list" });
               }
@@ -536,7 +536,6 @@ async function controlGit(args: string[], cwd: string): Promise<string | undefin
   });
 }
 
-const CONTROL_NAMES = ["CLAUDE.md", "CLAUDE.local.md", "AGENTS.md"];
 const CONTROL_SKIP = new Set(["node_modules", ".git", "dist"]);
 const CONTROL_STAGED_ENTRY = /^(\d{6}) [0-9a-f]+ \d\t([\s\S]+)$/;
 const CONTROL_GIT_LINK_MODE = "120000";
@@ -612,7 +611,7 @@ async function controlFiles(cwd: string, configDir: string, tree: string | undef
     const listings = await controlAwait(() => Promise.all([
       controlGit(["ls-files", "-co", "-s", "--exclude-standard", "-z"], tree),
       controlGit(["ls-files", "--others", "--ignored", "--exclude-standard", "-z", "--",
-        ...[...CONTROL_NAMES, ".claude/**"].map(name => (process.platform === "win32" ? ":(glob,icase)**/" : ":(glob)**/") + name)], tree),
+        ...[...CONTROL_FILE_NAMES, ".claude/**"].map(name => (process.platform === "win32" ? ":(glob,icase)**/" : ":(glob)**/") + name)], tree),
     ]), budget);
     for (const [listing, listed] of listings.entries()) {
       if (listed === undefined) throw new Error("Control file work tree is unavailable.");
@@ -672,8 +671,8 @@ async function controlFiles(cwd: string, configDir: string, tree: string | undef
   if (!tree) await walk(cwd);
   for (const directory of linkedDirectories) await walk(directory);
   for (const directory of directories) {
-    if (!controlBudget(budget, CONTROL_NAMES.length + 2)) break;
-    for (const name of CONTROL_NAMES) files.add(join(directory, name));
+    if (!controlBudget(budget, CONTROL_FILE_NAMES.length + 2)) break;
+    for (const name of CONTROL_FILE_NAMES) files.add(join(directory, name));
     for (const name of ["settings.json", "settings.local.json"]) files.add(join(directory, ".claude", name));
     await walk(join(directory, ".claude"));
   }
@@ -993,7 +992,7 @@ async function runExternalUntracked(row: ExternalRow, input: ExternalInput, opti
     executable = (deps.resolve ?? resolveExternalExecutable)(row.executor);
     if (!executable) return completedRun();
     const base = externalPrompt(row.executor, input, row.role);
-    const env = buildClaudeEnv(process.env, options.apiKeyPolicy).env;
+    const env = buildClaudeEnv(process.env, "externalCli", options.apiKeyPolicy).env;
     const commandLineUsage = (prompt: string) => {
       const launch = externalLaunch(executable!, externalArgv(row, cwd!, options.timeoutMinutes, prompt), env);
       return windowsCommandLineUnits(launch.executable, launch.args);
@@ -1010,7 +1009,7 @@ async function runExternalUntracked(row: ExternalRow, input: ExternalInput, opti
   try {
     if (executable) {
       snapshot = await snapshotControlFiles(cwd, resolve(options.configDir ?? claudeConfigDir()));
-      const result = await capture(executable, args, cwd, buildClaudeEnv(process.env, options.apiKeyPolicy).env,
+      const result = await capture(executable, args, cwd, buildClaudeEnv(process.env, "externalCli", options.apiKeyPolicy).env,
         deps.timeoutMs ?? options.timeoutMinutes * 60_000, deps);
       if (row.executor === "codex") attestation = await observeCodexSession(result.output, started, Date.now(), deps.codexHome);
       parsed = result.status === "timeout" ? { outcome: "timeout", answer: `${result.reason ?? "External executor timed out."} ${externalTimeoutHint(options.timeoutMinutes)}` }

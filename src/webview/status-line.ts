@@ -1,6 +1,8 @@
 import * as l10n from "@vscode/l10n";
 import { agentElapsedMs, agentRunStart, flattenAgents, type WorkModelPayload } from "../protocol";
-import { basename, firstLine, type ToolIntentInput } from "../tool-intent";
+import { basename, capturesFilePath, firstLine, type ToolIntentInput } from "../tool-intent";
+import { isShellTool } from "../shell-tools";
+import { isFileWritingTool } from "../file-writing-tools";
 import { monthDayClock } from "./format";
 import { EXECUTORS, isExternalRunTool, parseExternalTargetKey } from "../orchestration-executors";
 import { isDelegationTool } from "../claude-tool-names";
@@ -26,13 +28,12 @@ export function toolIntentLabel(name: string, input: ToolIntentInput = {}): stri
     const agent = input.subagent_type?.trim() || input.agent_key?.trim();
     return agent ? l10n.t("Delegating to {0}: {1}", agent, description) : l10n.t("Delegating: {0}", description);
   }
+  if (isShellTool(name) && description) return description;
+  if (capturesFilePath(name) && input.file_path) {
+    const file = basename(input.file_path);
+    return name === "Write" ? l10n.t("Writing {0}", file) : isFileWritingTool(name) ? l10n.t("Editing {0}", file) : l10n.t("Reading {0}", file);
+  }
   switch (name) {
-    case "Bash": case "PowerShell":
-      if (description) return description;
-      break;
-    case "Read": if (input.file_path) return l10n.t("Reading {0}", basename(input.file_path)); break;
-    case "Edit": if (input.file_path) return l10n.t("Editing {0}", basename(input.file_path)); break;
-    case "Write": if (input.file_path) return l10n.t("Writing {0}", basename(input.file_path)); break;
     case "Grep": if (input.pattern) return l10n.t('Searching for "{0}"', input.pattern); break;
     case "Glob": if (input.pattern) return l10n.t('Searching for "{0}"', basename(input.pattern)); break;
     case "WebSearch": if (input.query) return l10n.t('Searching for "{0}"', input.query); break;
@@ -126,8 +127,12 @@ export function statusLineText(line: StatusLine): string {
     case "background":
       return line.count === 1 ? l10n.t("1 background task running") : l10n.t("{0} background tasks running", line.count);
     case "waiting":
-      return l10n.t("Waiting for your decision: {0}", line.count);
+      return waitingDecisionText(line.count);
     case "none":
       return "";
   }
+}
+
+export function waitingDecisionText(count: number): string {
+  return l10n.t("Waiting for your decision: {0}", count);
 }

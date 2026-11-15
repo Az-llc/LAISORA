@@ -8,15 +8,18 @@ import type {
   AgentInspectorErrorReason,
   AgentInspectorMessageItem,
   AgentInspectorPage,
+  AgentInspectorReportSource,
   AgentInspectorSection,
   AgentInspectorToolItem,
   AgentInspectorTruncatedReason,
 } from "./protocol";
 import { summarizeToolInput } from "./protocol";
 import { claudeProjectsDir } from "./claude-env";
+import { SUBAGENT_HANDBACK_TOOL } from "./orchestration-roster";
 import { extractResumeSignals } from "./tool-observation";
 import { isFailedToolResult } from "./tool-result-signals";
 import { withImagePlaceholders } from "./transcript-display";
+import { agentIdOfMetaName, forkLaunchOf, forkOwnStart, type ForkLaunch, isSubagentMetaName, readSubagentMeta, subagentDirOf, subagentLaunchToolUseId, subagentMetaName, subagentTranscriptName } from "./subagent-files";
 
 export const INSPECTOR_TOOL_PAGE_SIZE = 25;
 export const INSPECTOR_MESSAGE_PAGE_SIZE = 20;
@@ -114,11 +117,11 @@ export async function readAgentInspectorPage(
   const sessionPath = await realPath(request.sessionFilePath)
     .catch(notFoundOrReadFailed("session-unavailable"));
   await assertRegularFileInside(root, sessionPath, "session-unavailable");
-  if (!sessionPath.toLowerCase().endsWith(".jsonl")) {
+  const subagentDir = subagentDirOf(sessionPath);
+  if (subagentDir === undefined) {
     throw new AgentInspectorReadError("session-unavailable");
   }
 
-  const subagentDir = `${sessionPath.slice(0, -".jsonl".length)}/subagents`;
   const realSubagentDir = await realPath(subagentDir)
     .catch(notFoundOrReadFailed("agent-unavailable"));
   assertInside(root, realSubagentDir, "agent-unavailable");
@@ -157,7 +160,8 @@ export async function readAgentInspectorPage(
         transcriptPath,
         fileStat,
         cacheKey,
-        Math.max(0, INSPECTOR_READ_BYTES - located.bytesRead)
+        Math.max(0, INSPECTOR_READ_BYTES - located.bytesRead),
+        forkLaunchOf(located.meta)
       );
       rememberTranscript(cached);
     }
@@ -261,6 +265,7 @@ export async function readAgentInspectorPage(
         page: {
           section: "messages",
           messages: pageItems,
+          reportSource: finalReport(records).source,
           nextCursor: makeCursor(request, cacheKey, index + pageItems.length, messages.length),
           coverage: withCoverageLimits(
             baseCoverage(pageItems.length),
@@ -271,7 +276,7 @@ export async function readAgentInspectorPage(
       };
     }
 
-    const report = finalReport(records);
+    const report = finalReport(records).text;
     const chunk = sliceUtf8(report, index, INSPECTOR_CHUNK_BYTES);
     return {
       fingerprint,
@@ -296,11 +301,11 @@ async function locateAgent(
   agentTranscriptId?: string
 ): Promise<LocatedAgent> {
   const directName = agentTranscriptId && /^[A-Za-z0-9_-]+$/.test(agentTranscriptId)
-    ? `agent-${agentTranscriptId}.meta.json`
+    ? subagentMetaName(agentTranscriptId)
     : undefined;
   const allNames = directName
     ? [directName]
-    : (await readdir(realSubagentDir)).filter((name) => name.endsWith(".meta.json")).sort();
+    : (await readdir(realSubagentDir)).filter(isSubagentMetaName).sort();
   const names = allNames;
   const limited = names.slice(0, META_COUNT_MAX);
   let bytesRead = 0;
@@ -316,18 +321,12 @@ async function locateAgent(
       break;
     }
     bytesRead += metaStat.size;
-    let meta: Record<string, unknown> | null = null;
-    try {
-      const parsed: unknown = JSON.parse(await readFile(metaPath, "utf8"));
-      if (typeof parsed === "object" && parsed !== null && !Array.isArray(parsed)) {
-        meta = parsed as Record<string, unknown>;
-      }
-    } catch {}
-    if (meta?.toolUseId !== toolUseId) continue;
-    const match = /^agent-(.+)\.meta\.json$/.exec(name);
-    if (!match || match[1].includes("/") || match[1].includes("\\")) break;
+    const meta = await readSubagentMeta(metaPath, (p) => readFile(p, "utf8"));
+    if (meta === null || subagentLaunchToolUseId(meta) !== toolUseId) continue;
+    const agentId = agentIdOfMetaName(name);
+    if (agentId === undefined || agentId.includes("/") || agentId.includes("\\")) break;
     return {
-      transcriptPath: join(realSubagentDir, `agent-${match[1]}.jsonl`),
+      transcriptPath: join(realSubagentDir, subagentTranscriptName(agentId)),
       meta,
       metaLimitReached: names.length > META_COUNT_MAX,
       bytesRead,
@@ -343,7 +342,8 @@ async function readTranscriptSample(
   realPath: string,
   expected: FileIdentity,
   key: string,
-  readBudget: number
+  readBudget: number,
+  forkLaunch: ForkLaunch | undefined
 ): Promise<CachedTranscript> {
   const handle = await open(realPath, "r").catch(() => {
     throw new AgentInspectorReadError("read-failed");
@@ -351,20 +351,24 @@ async function readTranscriptSample(
   let lines: string[] = [];
   let bytesRead = 0;
   let skippedRecordCount = 0;
+  let malformedRecordCount = 0;
   const truncatedReasons: AgentInspectorTruncatedReason[] = [];
   try {
     const opened = await handle.stat();
     if (!sameFileIdentity(opened, expected)) throw new AgentInspectorReadError("read-failed");
-    if (expected.size <= readBudget) {
-      const buffer = Buffer.alloc(expected.size);
-      const read = expected.size > 0 ? await handle.read(buffer, 0, expected.size, 0) : { bytesRead: 0 };
+    const { offset: start, launchMissing } = await forkOwnStart(handle, expected.size, forkLaunch);
+    if (launchMissing) malformedRecordCount++;
+    const own = expected.size - start;
+    if (own <= readBudget) {
+      const buffer = Buffer.alloc(own);
+      const read = own > 0 ? await handle.read(buffer, 0, own, start) : { bytesRead: 0 };
       bytesRead = read.bytesRead;
       lines = buffer.toString("utf8", 0, read.bytesRead).split("\n");
     } else {
       const half = Math.floor(readBudget / 2);
       const head = Buffer.alloc(half);
       const tail = Buffer.alloc(readBudget - half);
-      const headRead = await handle.read(head, 0, head.length, 0);
+      const headRead = await handle.read(head, 0, head.length, start);
       const tailRead = await handle.read(tail, 0, tail.length, expected.size - tail.length);
       bytesRead = headRead.bytesRead + tailRead.bytesRead;
       const headText = head.toString("utf8", 0, headRead.bytesRead);
@@ -396,7 +400,7 @@ async function readTranscriptSample(
     mtimeMs: expected.mtimeMs,
     lines,
     bytesRead,
-    malformedRecordCount: 0,
+    malformedRecordCount,
     skippedRecordCount,
     truncatedReasons,
     cacheBytes: lines.reduce((sum, line) => sum + Buffer.byteLength(line, "utf8") + 1, 0),
@@ -534,14 +538,28 @@ function firstInstruction(records: readonly Record<string, unknown>[]): string {
   return "";
 }
 
-function finalReport(records: readonly Record<string, unknown>[]): string {
+function finalReport(records: readonly Record<string, unknown>[]): { text: string; source: AgentInspectorReportSource } {
+  const refused = new Set<string>();
+  for (const record of records) {
+    const content = asRecord(record.message)?.content;
+    if (!Array.isArray(content)) continue;
+    for (const block of content) {
+      const value = asRecord(block);
+      if (value?.type === "tool_result" && value.is_error === true && typeof value.tool_use_id === "string") refused.add(value.tool_use_id);
+    }
+  }
   for (let i = records.length - 1; i >= 0; i--) {
     const record = records[i];
     if (record.type !== "assistant") continue;
-    const text = extractText(asRecord(record.message)?.content);
-    if (text) return text;
+    const content = asRecord(record.message)?.content;
+    const handbacks = (Array.isArray(content) ? content : []).map(asRecord).filter(block => block?.type === "tool_use" &&
+      block.name === SUBAGENT_HANDBACK_TOOL && !refused.has(String(block.id)));
+    const message = handbacks.map(block => asRecord(block?.input)?.message).filter((m): m is string => typeof m === "string" && m.trim() !== "").pop();
+    if (message) return { text: message.trim(), source: "handback" };
+    const text = extractText(content);
+    if (text) return { text, source: "text" };
   }
-  return "";
+  return { text: "", source: "none" };
 }
 
 function firstString(

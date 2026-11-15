@@ -1,5 +1,7 @@
-import { AskAnswerTitles, askAnswerBody, askAnswerChoices, askAnswerParts, askOptionLetter, otherReplyAsksBack } from "./ask-parser";
-import { askBlocksIn, mayHoldAskBlock } from "./markdown-ast";
+import { AskAnswerTitles, askAnswerBody, askAnswerChoices, askAnswerParts, askAnswerShapedLines, askOptionLetter, wholeReplyOption } from "./ask-parser";
+import { askBlockSources, askBlocksIn, mayHoldAskBlock } from "./markdown-ast";
+import { clipText } from "./text-clip";
+import { escapeRegExp } from "./regexp-escape";
 import { parseFileLinkTarget } from "./file-link-target";
 
 export const TODO_STATES = ["todo", "doing", "done"] as const;
@@ -17,19 +19,20 @@ export const TODO_WRITE_TOOLS = TODO_TOOL_KINDS.filter(kind => kind !== "list").
 export const TODO_TIDY_TOOL = todoToolName("tidy");
 export const TODO_CARD_TOOLS = TODO_WRITE_TOOLS;
 const TODO_RESULT_CHANGES = /^\{"changes":\[((?:"[0-9]+\.[0-9]+",?)*)\]/;
-const TODO_RESULT_REVISION = /^\{"revision":([0-9]+)[,}]/;
+const TODO_RESULT_REVISION = /^\{"revision":([0-9]+)(?:,"generation":"([0-9a-f]{1,64})")?[,}]/;
 
-export function todoWriteResultText(revision: number | null, body: Record<string, unknown>): string {
-  return JSON.stringify({ revision: revision ?? 0, ...body });
+export function todoWriteResultText(written: Pick<TodoDocument, "revision" | "generations"> | null, body: Record<string, unknown>): string {
+  const generation = written ? todoGenerationHead(written) : undefined;
+  return JSON.stringify({ revision: written?.revision ?? 0, ...(generation ? { generation } : {}), ...body });
 }
 
-export type TodoWriteResultRef = { readonly revision: number } | { readonly ids: readonly string[] };
+export type TodoWriteResultRef = { readonly revision: number; readonly generation?: string } | { readonly ids: readonly string[] };
 
 export function todoWriteResultRef(text: string | undefined): TodoWriteResultRef | undefined {
   const trimmed = text?.trimStart();
   if (trimmed === undefined) return undefined;
   const revision = TODO_RESULT_REVISION.exec(trimmed);
-  if (revision) return Number(revision[1]) === 0 ? { ids: [] } : { revision: Number(revision[1]) };
+  if (revision) return Number(revision[1]) === 0 ? { ids: [] } : { revision: Number(revision[1]), ...(revision[2] ? { generation: revision[2] } : {}) };
   const legacy = TODO_RESULT_CHANGES.exec(trimmed);
   return legacy ? { ids: [...legacy[1].matchAll(/"([0-9]+\.[0-9]+)"/g)].map(entry => entry[1]) } : undefined;
 }
@@ -40,6 +43,34 @@ export function parseTodoChangeId(changeId: string): { readonly revision: number
 }
 
 const todoChangeId = (revision: number, index: number) => `${revision}.${index}`;
+
+export interface TodoGeneration { readonly id: string; readonly from: number; readonly legacy?: true }
+export const isTodoGenerationId = (value: unknown): value is string => typeof value === "string" && /^[0-9a-f]{1,64}$/.test(value);
+const TODO_LEGACY_GENERATIONS: readonly TodoGeneration[] = [{ id: "", from: 0, legacy: true }];
+
+export function isTodoGenerationChain(value: unknown): value is readonly TodoGeneration[] {
+  return Array.isArray(value) && value.length > 0 && value.every((entry, index) => isRecord(entry) && isTodoGenerationId(entry.id) && Number.isSafeInteger(entry.from)
+    && (entry.from as number) >= 0 && (entry.legacy === undefined || entry.legacy === true) && (index === 0 || (entry.from as number) > (value[index - 1] as TodoGeneration).from));
+}
+
+export function todoGenerations(document: Pick<TodoDocument, "generations">): readonly TodoGeneration[] {
+  return isTodoGenerationChain(document.generations) ? document.generations : TODO_LEGACY_GENERATIONS;
+}
+
+export const todoGenerationHead = (document: Pick<TodoDocument, "generations">): string | undefined => todoGenerations(document).at(-1)!.id || undefined;
+
+export const todoStoreReplaced = (generations: readonly TodoGeneration[]): boolean => generations.length > 1 || !generations.some(entry => entry.legacy === true);
+
+export function todoGenerationOf(generations: readonly TodoGeneration[], revision: number): string | undefined {
+  return generations.filter(entry => entry.from <= revision).at(-1)?.id || undefined;
+}
+
+export function todoRefResolves(generations: readonly TodoGeneration[], generation: string | undefined, revision: number): boolean {
+  const index = generations.findIndex(entry => generation === undefined ? entry.legacy === true : entry.id === generation);
+  if (index < 0) return false;
+  const next = generations[index + 1];
+  return revision >= generations[index].from && (next === undefined || revision < next.from);
+}
 
 export const isClaudeOwnChange = (change: Pick<TodoChange, "author" | "cascade">) => change.author === "claude" && !change.cascade;
 
@@ -90,9 +121,11 @@ export const TODO_DELETED_RETENTION_MS = 30 * 24 * 60 * 60_000;
 export const TODO_MEMO_HISTORY_LIMIT = 50;
 export const TODO_CHANGE_LOG_LIMIT = 1000;
 export const TODO_ASK_SOURCE_MESSAGES_MAX = 2000;
+export const TODO_ASK_SOURCE_TEXT_MAX = 20_000;
+export const TODO_DECISION_TEXT_MAX = 2_000;
 export const TODO_ASK_DISMISSALS_MAX = 2000;
 export const TODO_ASK_IDENTITY_MAX = 200;
-export const TODO_ASK_PLACES = ["todo", "chat"] as const;
+export const TODO_ASK_PLACES = ["todo", "chat", "ticked"] as const;
 export type TodoAskPlace = typeof TODO_ASK_PLACES[number];
 
 export interface TodoMemoVersion {
@@ -137,6 +170,7 @@ export interface TodoItem {
   readonly pendingStart?: TodoStartClaim;
   readonly dismissedAsks?: readonly string[];
   readonly asksClosedInTodo?: readonly string[];
+  readonly asksTicked?: readonly string[];
   readonly decisionLog?: readonly TodoDecision[];
   readonly createdAt: number;
   readonly updatedAt: number;
@@ -315,6 +349,7 @@ export interface TodoDocument {
   readonly items: readonly TodoItem[];
   readonly changes: readonly TodoChange[];
   readonly writes?: readonly string[];
+  readonly generations?: readonly TodoGeneration[];
   readonly groupColors?: Readonly<Record<string, number>>;
   readonly groups?: readonly TodoGroup[];
   readonly templates?: readonly TodoTemplate[];
@@ -389,13 +424,14 @@ export type TodoOperation =
   | { kind: "relinkConversation"; from: string; to: string }
   | { kind: "noteConversationWork"; sessionId: string; at: number }
   | { kind: "dismissAsk"; id: string; message: string; place: TodoAskPlace }
+  | { kind: "untickAsk"; id: string; message: string }
   | { kind: "recordDecisions"; sessionId: string; decisions: readonly TodoDecision[] }
   | { kind: "migrateDecisions" }
   | { kind: "seedWelcome"; items: readonly TodoAddNode[]; seeded: boolean }
-  | { kind: "revert"; mode: "undo"; revision: number }
-  | { kind: "revert"; mode: "claude"; changeId: string }
-  | { kind: "revert"; mode: "claude"; changeIds: readonly string[] }
-  | { kind: "revert"; mode: "claude"; revisions: readonly number[] };
+  | { kind: "revert"; mode: "undo"; revision: number; generation?: string }
+  | { kind: "revert"; mode: "claude"; changeId: string; generation?: string }
+  | { kind: "revert"; mode: "claude"; changeIds: readonly string[]; generation?: string }
+  | { kind: "revert"; mode: "claude"; revisions: readonly number[]; generation?: string };
 
 type TodoDecisionOperation = Extract<TodoOperation, { kind: "recordDecisions" | "migrateDecisions" }>;
 
@@ -789,7 +825,7 @@ export const TODO_STATE_WORDS = ["済", "済み", "完了", "WIP", "TODO", "DONE
 export const TODO_STATE_BRACKETS = [["【", "】"], ["[", "]"], ["(", ")"], ["（", "）"]] as const;
 export const TODO_STATE_TRAILING_WORDS = ["済", "済み", "完了"] as const;
 export const TODO_STATE_SEPARATORS = [":", "：", "/", "・", "-"] as const;
-const regexAlt = (words: readonly string[]) => `(?:${words.map(word => word.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")).join("|")})`;
+const regexAlt = (words: readonly string[]) => `(?:${words.map(escapeRegExp).join("|")})`;
 const regexClass = (chars: readonly string[]) => `[${chars.map(char => char.replace(/[\]\\^-]/g, "\\$&")).join("")}]`;
 const TODO_STATE_BRACKETED = `${regexClass(TODO_STATE_BRACKETS.map(([open]) => open))}${regexAlt(TODO_STATE_WORDS)}${regexClass(TODO_STATE_BRACKETS.map(([, close]) => close))}`;
 const TODO_TITLE_STATE = new RegExp(`^(?:${regexAlt(TODO_STATE_CHECKBOXES)}|${TODO_STATE_BRACKETED})|${TODO_STATE_BRACKETED}$|[\\s${regexClass(TODO_STATE_SEPARATORS).slice(1, -1)}]${regexAlt(TODO_STATE_TRAILING_WORDS)}$`, "u");
@@ -1311,15 +1347,16 @@ function step(items: TodoItem[], operation: TodoStepOperation, author: TodoAutho
       if (operation.title !== undefined && !title) return { ok: false, error: "empty-title" };
       if (title !== undefined && title.length > TODO_TITLE_MAX) return { ok: false, error: "title-too-long" };
       let nextMeta = meta;
+      const group = typeof operation.group === "string" ? operation.group.trim() || null : operation.group;
       if (judged) {
-        const regroup = item.parentId === null && typeof operation.group === "string" && operation.group.trim() !== "" && operation.group.trim() !== item.group ? operation.group.trim() : undefined;
-        const problem = (regroup !== undefined ? claudeGroupProblem(meta.groups, regroup, operation.newGroup) : undefined)
-          ?? (title !== undefined && title !== item.title ? todoTitleProblem(items, { title, parentId: item.parentId, group: regroup ?? item.group ?? null, self: item.id })
+        const regroup = item.parentId === null && group !== undefined && group !== (item.group ?? null) ? group : undefined;
+        const problem = (typeof regroup === "string" ? claudeGroupProblem(meta.groups, regroup, operation.newGroup) : undefined)
+          ?? (title !== undefined && title !== item.title ? todoTitleProblem(items, { title, parentId: item.parentId, group: regroup !== undefined ? regroup : item.group ?? null, self: item.id })
             : regroup !== undefined ? todoPlaceProblem(items, { title: item.title, parentId: null, group: regroup, self: item.id }) : undefined);
         if (problem) return { ...problem, detail: { ...problem.detail, title: problem.detail?.title ?? item.title } };
         const unstable = regroup !== undefined || (title !== undefined && title !== item.title) ? unstableFailure(items, meta, item, now, regroup !== undefined, operation.basis === "requested") : undefined;
         if (unstable) return unstable;
-        if (regroup !== undefined && !meta.groups.some(entry => entry.name === regroup)) nextMeta = { ...meta, groups: withNewGroup(meta.groups, regroup, log) };
+        if (typeof regroup === "string" && !meta.groups.some(entry => entry.name === regroup)) nextMeta = { ...meta, groups: withNewGroup(meta.groups, regroup, log) };
       }
       let updated: TodoItem = item;
       let touched = false;
@@ -1333,7 +1370,7 @@ function step(items: TodoItem[], operation: TodoStepOperation, author: TodoAutho
         updated = { ...rest, ...(value ? { [field]: value } : field === "userMemo" ? { userMemo: "" } : {}) } as TodoItem;
       };
       set("title", title);
-      if (item.parentId === null) set("group", typeof operation.group === "string" ? operation.group.trim() || null : operation.group);
+      if (item.parentId === null) set("group", group);
       set("due", operation.due);
       set("start", operation.start);
       set("priority", operation.priority);
@@ -1450,11 +1487,11 @@ function step(items: TodoItem[], operation: TodoStepOperation, author: TodoAutho
       const item = find(operation.id);
       if (!item) return { ok: false, error: "not-found" };
       if (item.deletedAt === undefined) return unchanged(item.id);
-      const ids = subtreeIds(items, item.id);
+      const restored = todoRestoredWith(items, meta.history ?? [], item);
       const parentId = liveParentIn(items, item.parentId) ? item.parentId : null;
       const formerRoot = item.parentId !== null && parentId === null ? rootOf(items, item.id)?.group : undefined;
       const next = items.map(entry => {
-        if (!ids.has(entry.id) || entry.deletedAt !== item.deletedAt) return entry;
+        if (!restored.has(entry.id)) return entry;
         log(entry.id, "deletedAt", entry.deletedAt, null, entry.id === item.id ? undefined : { cascade: true });
         const { deletedAt: _deleted, group: own, ...rest } = entry;
         const placed = entry.id === item.id ? { ...rest, parentId } : rest;
@@ -1463,7 +1500,6 @@ function step(items: TodoItem[], operation: TodoStepOperation, author: TodoAutho
         return kept !== undefined && placed.parentId === null ? { ...placed, group: kept } : placed;
       });
       if (parentId !== item.parentId) log(item.id, "position", { parentId: item.parentId }, { parentId });
-      const restored = new Set([...ids].filter(id => items.find(entry => entry.id === id)?.deletedAt === item.deletedAt));
       return { ok: true, items: next.map(entry => withoutCarriedDecisions(entry, restored)), itemId: item.id, reevaluate: [parentId] };
     }
     case "linkConversation": {
@@ -1527,12 +1563,20 @@ function step(items: TodoItem[], operation: TodoStepOperation, author: TodoAutho
       const item = find(operation.id);
       if (!item) return { ok: false, error: "not-found" };
       if (item.deletedAt !== undefined) return { ok: false, error: "deleted" };
-      if (item.dismissedAsks?.includes(operation.message)) return unchanged(item.id);
-      const dismissedAsks = [...(item.dismissedAsks ?? []), operation.message].slice(-TODO_ASK_DISMISSALS_MAX);
-      const kept = new Set(dismissedAsks);
-      const asksClosedInTodo = [...(item.asksClosedInTodo ?? []), ...(operation.place === "todo" ? [operation.message] : [])].filter(message => kept.has(message));
-      const { asksClosedInTodo: _previous, ...rest } = item;
-      const next: TodoItem = { ...rest, dismissedAsks, ...(asksClosedInTodo.length ? { asksClosedInTodo } : {}) };
+      const ticked = item.asksTicked?.includes(operation.message) === true;
+      if (item.dismissedAsks?.includes(operation.message) && (operation.place === "ticked" || !ticked)) return unchanged(item.id);
+      const dismissedAsks = [...(item.dismissedAsks ?? []).filter(message => message !== operation.message), operation.message].slice(-TODO_ASK_DISMISSALS_MAX);
+      const next = withAskLists(item, dismissedAsks,
+        [...(item.asksClosedInTodo ?? []), ...(operation.place === "todo" ? [operation.message] : [])],
+        operation.place === "ticked" ? [...(item.asksTicked ?? []), operation.message] : (item.asksTicked ?? []).filter(message => message !== operation.message));
+      return { ok: true, itemId: item.id, reevaluate: [], unlogged: true, items: items.map(entry => entry.id === item.id ? next : entry) };
+    }
+    case "untickAsk": {
+      const item = find(operation.id);
+      if (!item) return { ok: false, error: "not-found" };
+      if (item.deletedAt !== undefined) return { ok: false, error: "deleted" };
+      if (item.asksTicked?.includes(operation.message) !== true) return unchanged(item.id);
+      const next = withAskLists(item, (item.dismissedAsks ?? []).filter(message => message !== operation.message), item.asksClosedInTodo ?? [], item.asksTicked);
       return { ok: true, itemId: item.id, reevaluate: [], unlogged: true, items: items.map(entry => entry.id === item.id ? next : entry) };
     }
     case "noteConversationWork": {
@@ -1804,6 +1848,7 @@ const TODO_ITEM_SHAPE_TABLE = {
   conversations: eachOf(isTodoConversationLink),
   starts: eachOf(isTodoStart),
   dismissedAsks: eachOf(isTodoAskIdentity),
+  asksTicked: eachOf((value, item) => typeof value === "string" && Array.isArray(item?.dismissedAsks) && item.dismissedAsks.includes(value)),
   asksClosedInTodo: eachOf((value, item) => typeof value === "string" && Array.isArray(item?.dismissedAsks) && item.dismissedAsks.includes(value)),
   decisionLog: eachOf(isTodoDecision),
 } satisfies Partial<Record<keyof TodoItem, TodoFieldShape>>;
@@ -2305,8 +2350,24 @@ export function todoRecordAskSources(items: readonly TodoItem[]): Array<{ itemId
   return sources;
 }
 
+function withAskLists(item: TodoItem, dismissedAsks: readonly string[], asksClosedInTodo: readonly string[], asksTicked: readonly string[]): TodoItem {
+  const kept = new Set(dismissedAsks);
+  const closed = [...new Set(asksClosedInTodo)].filter(message => kept.has(message));
+  const ticked = [...new Set(asksTicked)].filter(message => kept.has(message));
+  const { asksClosedInTodo: _closed, asksTicked: _ticked, dismissedAsks: _dismissed, ...rest } = item;
+  return { ...rest, ...(dismissedAsks.length ? { dismissedAsks } : {}), ...(closed.length ? { asksClosedInTodo: closed } : {}), ...(ticked.length ? { asksTicked: ticked } : {}) };
+}
+
 export function todoAskDismissals(items: readonly TodoItem[]): string[] {
-  return items.flatMap(item => item.deletedAt === undefined ? item.dismissedAsks ?? [] : []);
+  return items.flatMap(item => {
+    if (item.deletedAt !== undefined) return [];
+    const ticked = new Set(item.asksTicked ?? []);
+    return (item.dismissedAsks ?? []).filter(message => !ticked.has(message));
+  });
+}
+
+export function todoAsksTicked(items: readonly TodoItem[]): string[] {
+  return items.flatMap(item => item.deletedAt === undefined ? item.asksTicked ?? [] : []);
 }
 
 export function todoAsksClosedInTodo(items: readonly TodoItem[]): string[] {
@@ -2317,10 +2378,13 @@ export function todoScopeIds(items: readonly Pick<TodoItem, "id" | "parentId">[]
   return items.some(item => item.id === rootId) ? subtreeIds(items as readonly TodoItem[], rootId) : new Set();
 }
 
-function memoVersionText(section: TodoMemoSection | undefined, version: number | null): string | undefined {
-  if (version === null) return "";
+export function memoTextAt(section: TodoMemoSection | undefined, version: number): string | undefined {
   if (section?.version === version) return section.text;
   return section?.history.find(entry => entry.version === version)?.text;
+}
+
+function memoVersionText(section: TodoMemoSection | undefined, version: number | null): string | undefined {
+  return version === null ? "" : memoTextAt(section, version);
 }
 
 const isRecord = (value: unknown): value is Record<string, unknown> => typeof value === "object" && value !== null;
@@ -2448,6 +2512,24 @@ function groupInUse(items: readonly TodoItem[], name: string): boolean {
   return items.some(entry => entry.deletedAt === undefined && entry.group === name);
 }
 
+export function todoDeletedWithParent(history: readonly TodoChange[], entry: TodoItem, parent: TodoItem | undefined): boolean {
+  if (entry.deletedAt === undefined || parent?.deletedAt !== entry.deletedAt) return false;
+  for (let index = history.length - 1; index >= 0; index--) {
+    const change = history[index];
+    if (change.itemId === entry.id && change.field === "deletedAt" && change.after === entry.deletedAt) return change.cascade === true;
+  }
+  return true;
+}
+
+export function todoRestoredWith(items: readonly TodoItem[], history: readonly TodoChange[], root: TodoItem): Set<string> {
+  const byId = new Map(items.map(item => [item.id, item]));
+  const restored = new Set([root.id]);
+  for (const id of restored) {
+    for (const entry of items) if (entry.parentId === id && !restored.has(entry.id) && todoDeletedWithParent(history, entry, byId.get(id))) restored.add(entry.id);
+  }
+  return restored;
+}
+
 export function todoRestoredBy(changes: readonly TodoChange[]): Set<string> {
   return new Set(changes.filter(change => change.field === "deletedAt" && change.before === null).map(change => change.itemId));
 }
@@ -2536,9 +2618,12 @@ function revertibleCascades(changes: readonly TodoChange[], reverted: readonly T
   });
 }
 
-function revertTargets(changes: readonly TodoChange[], operation: Extract<TodoOperation, { kind: "revert" }>, author: TodoAuthor): TodoChange[] | TodoRevertBlock | TodoOperationFailure {
+function revertTargets(changes: readonly TodoChange[], generations: readonly TodoGeneration[], operation: Extract<TodoOperation, { kind: "revert" }>, author: TodoAuthor): TodoChange[] | TodoRevertBlock | TodoOperationFailure {
   const claudeTakesBack = (targets: TodoChange[]): TodoChange[] | TodoOperationFailure =>
     author === "claude" && targets.some(todoClaudeNeverReverts) ? { ok: false, error: "not-target", detail: { takeBack: true } } : targets;
+  const referenced = operation.mode === "undo" ? [operation.revision] : "revisions" in operation ? operation.revisions
+    : ("changeIds" in operation ? operation.changeIds : [operation.changeId]).map(id => parseTodoChangeId(id).revision);
+  if (operation.generation === undefined ? todoStoreReplaced(generations) : !referenced.every(revision => todoRefResolves(generations, operation.generation, revision))) return "gone";
   if (operation.mode === "claude" && "revisions" in operation) {
     const revisions = new Set(operation.revisions);
     const written = changes.filter(entry => revisions.has(parseTodoChangeId(entry.id).revision));
@@ -2655,7 +2740,7 @@ export function applyTodoOperation(document: TodoDocument, operation: TodoOperat
       tidy = [...proposals, { id: itemId, at: now, steps, revision: document.revision + 1 }].slice(-TODO_TIDY_KEPT);
     }
   } else if (operation.kind === "revert") {
-    const found = revertTargets(document.changes, operation, author);
+    const found = revertTargets(document.changes, todoGenerations(document), operation, author);
     if (typeof found === "string") return { ok: false, error: found };
     if (!Array.isArray(found)) return found;
     const current = { items, changes: document.changes, groups: meta.groups, templates: meta.templates };
@@ -2669,7 +2754,8 @@ export function applyTodoOperation(document: TodoDocument, operation: TodoOperat
     const whole = operation.mode === "undo" ? new Set(targets.map(change => change.itemId)).size > 1 : targets.length > 1;
     if (whole && open.length < targets.length) return { ok: false, error: blocks.find(block => block !== null)! };
     skipped = targets.length - open.length;
-    const deleting = new Set(open.filter(change => change.field === "deletedAt").map(change => change.itemId));
+    const takesBackRestore = (change: TodoChange) => change.field === "deletedAt" && change.before !== null;
+    const deleting = new Set(open.filter(takesBackRestore).map(change => change.itemId));
     let failure: TodoOperationError | undefined;
     const applied: TodoChange[] = [];
     const ordered = [...open].reverse();
@@ -2687,7 +2773,7 @@ export function applyTodoOperation(document: TodoDocument, operation: TodoOperat
     };
     const middle = ordered.filter(entry => createdGroupOf(entry) === undefined && !bringsGroupBack(entry));
     for (const change of [...ordered.filter(bringsGroupBack), ...middle, ...ordered.filter(entry => createdGroupOf(entry) !== undefined)]) {
-      if (change.field === "deletedAt" && hasAncestorIn(items, change.itemId, deleting)) { applied.push(change); continue; }
+      if (takesBackRestore(change) && hasAncestorIn(items, change.itemId, deleting)) { applied.push(change); continue; }
       const created = createdGroupOf(change);
       if (created !== undefined && groupInUse(next, created)) {
         if (whole || open.length === 1) return { ok: false, error: "in-use" };
@@ -2939,6 +3025,7 @@ export interface TodoRecordMessage {
   readonly role: string;
   readonly text: string;
   readonly timestamp: number;
+  readonly remote?: true;
 }
 
 export function todoAskSourceMessages(messages: readonly TodoRecordMessage[]): Array<TodoRecordMessage & { role: "user" | "assistant" }> {
@@ -2946,36 +3033,52 @@ export function todoAskSourceMessages(messages: readonly TodoRecordMessage[]): A
   const first = spoken.findIndex(m => m.role === "assistant" && mayHoldAskBlock(m.text));
   if (first < 0) return [];
   return spoken.slice(first).filter(m => m.role === "user" || mayHoldAskBlock(m.text))
-    .slice(-TODO_ASK_SOURCE_MESSAGES_MAX).map(m => ({ uuid: m.uuid, role: m.role, text: m.text, timestamp: m.timestamp }));
+    .slice(-TODO_ASK_SOURCE_MESSAGES_MAX).map(m => ({ uuid: m.uuid, role: m.role, text: todoAskSourceText(m), timestamp: m.timestamp, ...(m.remote ? { remote: true as const } : {}) }));
 }
 
-function todoAskAnswer(choice: string, labels: readonly string[], otherChoice: string): Pick<TodoDecision, "label" | "text"> | undefined {
-  if (otherReplyAsksBack(choice, otherChoice)) return undefined;
-  const parts = askAnswerParts(choice);
+function todoAskSourceText(message: TodoRecordMessage & { role: "user" | "assistant" }): string {
+  const [parts, gap] = message.role === "user" ? [askAnswerShapedLines(message.text), "\n"] : [askBlockSources(message.text), "\n\n"];
+  let text = "";
+  for (const part of parts) {
+    const next = text === "" ? part : `${text}${gap}${part}`;
+    if (next.length > TODO_ASK_SOURCE_TEXT_MAX) break;
+    text = next;
+  }
+  return text;
+}
+
+function todoAskAnswer(choice: string, labels: readonly string[], otherChoice: string, titles: AskAnswerTitles): Pick<TodoDecision, "label" | "text"> | undefined {
+  const parts = askAnswerParts(choice, titles);
   const label = parts === undefined ? undefined : labels.find((_, index) => askOptionLetter(index) === parts.choice);
   if (parts === undefined || (parts.choice !== otherChoice && label === undefined)) {
-    const text = askAnswerBody(choice).trim();
+    const text = askAnswerBody(choice, titles).trim();
     const letter = parts === undefined ? labels.find((_, index) => askOptionLetter(index) === text) : undefined;
-    return letter !== undefined ? { label: letter } : text ? { text } : undefined;
+    return letter !== undefined ? { label: letter } : freeAnswer(text);
   }
   const answer = parts.answer.trim();
   if (parts.choice !== otherChoice && label !== undefined && answer.startsWith(label)) {
-    const notes = answer.slice(label.length).trim();
-    return { label, ...(notes ? { text: notes } : {}) };
+    return { label, ...freeAnswer(answer.slice(label.length)) };
   }
-  return answer ? { text: answer } : undefined;
+  return freeAnswer(answer);
+}
+
+function freeAnswer(text: string): Pick<TodoDecision, "text"> | undefined {
+  const answer = text.trim();
+  return answer ? { text: clipText(answer, TODO_DECISION_TEXT_MAX) } : undefined;
 }
 
 export interface TodoAskDecisionTracker {
   add(messages: readonly TodoRecordMessage[]): void;
   decisions(): readonly TodoDecision[];
   asks(): TodoDecisionAsk[];
+  latest(): TodoDecisionAsk[];
 }
 
 export type TodoDecisionAsk = readonly [title: string, labels: readonly string[]];
 
-export function todoAskDecisionTracker(sessionId: string, otherChoice: string, known: readonly TodoDecisionAsk[] = []): TodoAskDecisionTracker {
+export function todoAskDecisionTracker(sessionId: string, otherChoice: string, known: readonly TodoDecisionAsk[] = [], knownLatest: readonly TodoDecisionAsk[] = []): TodoAskDecisionTracker {
   const asks = new Map<string, readonly string[]>(known);
+  let latest: TodoDecisionAsk[] = [...knownLatest];
   let titles: AskAnswerTitles | undefined;
   const seen = new Set<string>();
   const out: TodoDecision[] = [];
@@ -2989,20 +3092,41 @@ export function todoAskDecisionTracker(sessionId: string, otherChoice: string, k
             if (ask.kind !== "decide") continue;
             asks.delete(ask.title);
             asks.set(ask.title, ask.options.map(option => option.label));
+            latest.push([ask.title, ask.options.map(option => option.label)]);
             titles = undefined;
           }
           continue;
         }
-        if (message.role !== "user" || !isTodoTime(message.timestamp)) continue;
+        if (message.role !== "user") continue;
+        const replied = latest;
+        latest = [];
+        if (!isTodoTime(message.timestamp)) continue;
+        if (message.remote) {
+          const record = (title: string, answer: Pick<TodoDecision, "label" | "text">) => out.push({ at: message.timestamp, from: "card", title, ...answer, sessionId, message: message.uuid });
+          if (replied.length === 1) {
+            const [title, labels] = replied[0];
+            const index = wholeReplyOption(message.text, labels, true);
+            const answer = index !== undefined ? { label: labels[index] } : freeAnswer(message.text);
+            if (answer) record(title, answer);
+          } else {
+            const named = replied.flatMap(([title, labels]) => {
+              const index = wholeReplyOption(message.text, labels, false);
+              return index === undefined ? [] : [{ title, label: labels[index] }];
+            });
+            if (named.length === 1) record(named[0].title, { label: named[0].label });
+          }
+          continue;
+        }
         for (const [title, labels] of asks) {
-          titles ??= new AskAnswerTitles(asks.keys());
-          const answer = askAnswerChoices(title, message.text, titles).map(choice => todoAskAnswer(choice, labels, otherChoice)).find(entry => entry !== undefined);
+          const known = titles ??= new AskAnswerTitles(asks.keys());
+          const answer = askAnswerChoices(title, message.text, known).map(choice => todoAskAnswer(choice, labels, otherChoice, known)).find(entry => entry !== undefined);
           if (answer) out.push({ at: message.timestamp, from: "card", title, ...answer, sessionId, message: message.uuid });
         }
       }
     },
     decisions: () => out,
     asks: () => [...asks],
+    latest: () => [...latest],
   };
 }
 

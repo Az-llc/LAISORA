@@ -8,14 +8,16 @@ import type {
   AgentInspectorTruncatedReason,
   HostToWebview,
 } from "../protocol";
+import { workEndStatusWord } from "../protocol";
 import { formatDateTime, uiLocale } from "./l10n";
-import { approxDuration } from "./format";
+import { approxDuration, secondsClock } from "./format";
 import { vscode } from "./dom";
 import { closeGlyphButton } from "./close-button";
 import { failureCount } from "./failure-count";
 import { createLoader } from "./loader";
 import { termSpan, type TermKey } from "./term";
 import { MARKS } from "./marks";
+import { element } from "./element";
 
 type UiTabId = "basic" | "instruction" | "report" | "messages" | "tools";
 
@@ -80,18 +82,6 @@ export interface InspectorTarget {
   meta?: string;
   axis?: InspectorAxis;
   stats?: { toolCount?: number; failCount?: number; run?: { start?: number; end?: number; running: boolean; elapsedMs: number; approximate: boolean } };
-}
-
-function element<K extends keyof HTMLElementTagNameMap>(tag: K, className: string, text?: string): HTMLElementTagNameMap[K] {
-  const node = document.createElement(tag);
-  node.className = className;
-  if (text !== undefined) node.textContent = text;
-  return node;
-}
-
-function clock(ms: number): string {
-  const d = new Date(ms);
-  return `${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}:${String(d.getSeconds()).padStart(2, "0")}`;
 }
 
 export class AgentInspector {
@@ -198,12 +188,12 @@ export class AgentInspector {
     const sameAgent = this.target?.agentId === target.agentId;
     this.target = target;
     this.opener = opener;
+    this.pages.clear();
+    this.pending = undefined;
+    this.lastError = undefined;
+    this.retryCursor = undefined;
     if (!sameAgent) {
-      this.pages.clear();
       this.toolOpen.clear();
-      this.pending = undefined;
-      this.lastError = undefined;
-      this.retryCursor = undefined;
       this.activeTab = "basic";
     }
     this.visible = true;
@@ -244,9 +234,7 @@ export class AgentInspector {
     this.lastError = undefined;
     this.retryCursor = undefined;
     this.render();
-    if (merged.nextCursor !== undefined && this.visible && this.activeSection() === merged.section) {
-      this.request(merged.nextCursor);
-    }
+    this.requestIfNeeded();
   }
 
   handleError(message: Extract<HostToWebview, { type: "agentInspectorError" }>): void {
@@ -259,6 +247,7 @@ export class AgentInspector {
       this.retryCursor = undefined;
     }
     this.render();
+    if (this.activeSection() !== failedSection) this.requestIfNeeded();
   }
 
   private activeSection(): AgentInspectorSection | undefined {
@@ -312,8 +301,10 @@ export class AgentInspector {
   private requestIfNeeded(): void {
     const section = this.activeSection();
     if (!this.visible || section === undefined || this.target === undefined) return;
-    if (this.pages.has(section) || this.pending) return;
-    this.request();
+    if (this.pending) return;
+    const page = this.pages.get(section);
+    if (page === undefined) this.request();
+    else if (page.nextCursor !== undefined) this.request(page.nextCursor);
   }
 
   private request(cursor?: string): void {
@@ -439,14 +430,14 @@ export class AgentInspector {
     const line = element("div", "wi-axis-line");
     const code = element("span", "wi-code");
     code.append(element("b", "", "SPAN"), element("span", "", l10n.t("Position within the graph's visible range")));
-    line.append(code, element("span", "wi-axis-w", `${clock(axis.start)} – ${clock(axis.end)}`));
+    line.append(code, element("span", "wi-axis-w", `${secondsClock(axis.start)} – ${secondsClock(axis.end)}`));
     const row = element("div", "wi-axis-row");
     const track = element("div", "wi-axis-t");
     const me = element("div", "wi-axis-me");
     me.style.left = `${x(axis.start)}%`;
     me.style.width = `${Math.max(1, x(axis.end) - x(axis.start))}%`;
     track.appendChild(me);
-    row.append(element("span", "wi-axis-c", clock(axis.windowStart)), track, element("span", "wi-axis-c", clock(axis.windowEnd)));
+    row.append(element("span", "wi-axis-c", secondsClock(axis.windowStart)), track, element("span", "wi-axis-c", secondsClock(axis.windowEnd)));
     this.axisEl.append(line, row);
   }
 
@@ -508,7 +499,7 @@ export class AgentInspector {
       replies.forEach((message, index) => {
         const item = element("article", "wi-message");
         const body = element("div", "wi-message-body");
-        if (message.timestamp !== undefined) body.append(element("span", "wi-message-at", clock(message.timestamp)));
+        if (message.timestamp !== undefined) body.append(element("span", "wi-message-at", secondsClock(message.timestamp)));
         body.append(pre("wi-message-text", message.text));
         item.append(element("span", "wi-message-no", String(index + 1).padStart(2, "0")), body);
         list.append(item);
@@ -546,15 +537,15 @@ export class AgentInspector {
       summary.dataset.focusKey = `tool:${key}`;
       const completed = tool.isError === false && tool.backgroundLaunch !== true;
       const mark = element("span", "wi-tool-mark", tool.isError === true ? "✗" : completed ? "✓" : "");
-      if (tool.isError === true || completed) mark.setAttribute("aria-label", tool.isError ? l10n.t("Failed") : l10n.t("Completed"));
+      if (tool.isError === true || completed) mark.setAttribute("aria-label", workEndStatusWord(tool.isError ? "failed" : "completed"));
       const name = element("span", "wi-tool-name", tool.toolName);
       name.title = tool.toolName;
       const preview = element("span", "wi-tool-summary", tool.inputSummary ?? "");
       const tail = element("span", "wi-tool-tail");
       tail.append(preview);
-      if (tool.isError === true) tail.append(element("span", "wi-tool-failtag", l10n.t("Failed")));
+      if (tool.isError === true) tail.append(element("span", "wi-tool-failtag", workEndStatusWord("failed")));
       else if (tool.backgroundLaunch === true) tail.append(element("span", "wi-tool-bgtag", l10n.t("Background")));
-      summary.append(element("span", "wi-tool-at", tool.timestamp !== undefined ? clock(tool.timestamp) : ""), mark, name, tail);
+      summary.append(element("span", "wi-tool-at", tool.timestamp !== undefined ? secondsClock(tool.timestamp) : ""), mark, name, tail);
       row.append(summary, labelledPre("wi-preview", tool.inputPreview, l10n.t("INPUT")));
       if (tool.resultPreview) {
         row.append(tool.isError === true
@@ -592,7 +583,7 @@ function patchText(live: Node, next: Node): boolean {
 
 function intermediateReplies(page: Extract<AgentInspectorPage, { section: "messages" }>): AgentInspectorMessageItem[] {
   const assistant = page.messages.filter((m) => m.role === "assistant");
-  return page.nextCursor === undefined ? assistant.slice(0, -1) : assistant;
+  return page.nextCursor === undefined && page.reportSource === "text" ? assistant.slice(0, -1) : assistant;
 }
 
 function mergePage(previous: AgentInspectorPage | undefined, next: AgentInspectorPage): AgentInspectorPage {

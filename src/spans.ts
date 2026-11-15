@@ -166,9 +166,10 @@ export function runEnd(runs: DelegationRuns, child: ChildTranscriptSpan | undefi
   return stoppedRunEnd(runs.runStart, stop.at, lastChildAt);
 }
 
-export function childActivity(run: { runStart: number; earlierRuns?: readonly Span[]; stoppedAt?: number; lastChildAt?: number }, at: number):
-  { lastChildAt: number; wokeAt?: number; earlierRuns?: Span[] } {
+export function childActivity(run: { runStart: number; earlierRuns?: readonly Span[]; stoppedAt?: number; lastChildAt?: number }, at: number,
+  activityStartedAt = at): { lastChildAt?: number; wokeAt?: number; earlierRuns?: Span[] } {
   if (run.stoppedAt !== undefined && at > run.stoppedAt) {
+    if (activityStartedAt <= run.stoppedAt) return { lastChildAt: run.lastChildAt };
     return { lastChildAt: at, wokeAt: at, earlierRuns: closeRun(run.earlierRuns, run.runStart, run.stoppedAt, run.lastChildAt, at) };
   }
   return { lastChildAt: Math.max(run.lastChildAt ?? at, at) };

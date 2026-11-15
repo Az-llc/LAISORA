@@ -14,6 +14,7 @@ import type {
 import { extractHumanUserText, extractImageRefs } from "./human-input-vocabulary";
 import { captureToolIntentInput } from "./tool-intent";
 import { assistantUsageFromRaw, isSyntheticModel, summarizeToolInput } from "./protocol";
+import { isOrchestrationEffort } from "./orchestration-executors";
 import type { HostArtifactAccess } from "./artifact-access";
 import { extractResumeSignals, extractStage0ToolFields, isResumeSignalToolName } from "./tool-observation";
 import { redactAbsolutePaths, redactOptional } from "./path-redaction";
@@ -79,10 +80,14 @@ export const OWN_INPUT_MEMORY_MAX = 200;
 
 export interface InboundHumanInput { uuid: string; text: string; imageRefs?: ImageRefInfo[] }
 
+export function isRemoteHumanRecord(record: Record<string, unknown>): boolean {
+  return (record.origin as { kind?: unknown } | undefined)?.kind === "human";
+}
+
 export function inboundHumanInput(record: Record<string, unknown>): InboundHumanInput | null {
   if (record.type !== "user" || record.isReplay !== true || record.isSynthetic === true) return null;
   if (record.parent_tool_use_id !== undefined && record.parent_tool_use_id !== null) return null;
-  if ((record.origin as { kind?: unknown } | undefined)?.kind !== "human") return null;
+  if (!isRemoteHumanRecord(record)) return null;
   const uuid = parseWireUuid(record);
   const text = uuid === null ? null : extractHumanUserText(record);
   if (uuid === null || text === null) return null;
@@ -317,6 +322,11 @@ export function formatRefusalReason(category: string | null): string {
 
 export function isRefusalErrorProse(record: Record<string, unknown>, message: unknown): boolean {
   return parseRefusalStop(message) !== null && isApiErrorFrame(record);
+}
+
+export function recordedModelOf(message: { model?: unknown } | null | undefined): string | undefined {
+  const model = message?.model;
+  return typeof model === "string" && model.length > 0 && !isSyntheticModel(model) ? model : undefined;
 }
 
 export function isReplacedErrorProse(record: Record<string, unknown>, message: unknown): boolean {
@@ -556,8 +566,7 @@ export class ClaudeLiveNormalizer {
             apiKeySource: typeof record.apiKeySource === "string" ? record.apiKeySource : undefined,
             model: typeof record.model === "string" ? record.model : undefined,
             effort: record.effort === null ? null
-              : typeof record.effort === "string" && ["low", "medium", "high", "xhigh", "max"].includes(record.effort)
-                ? record.effort as AuthStatus["effort"] : undefined,
+              : isOrchestrationEffort(record.effort) ? record.effort : undefined,
             sessionId: typeof record.session_id === "string" ? record.session_id : undefined,
             verifiedAt: Date.now(),
             status: "verified",
@@ -819,35 +828,27 @@ export class ClaudeLiveNormalizer {
           this.emit({ kind: "assistant_usage", turnId: this.currentTurnId ?? this.lastCompletedTurnId ?? `subagent:${parentToolUseId}`, parentToolUseId,
             messageId: msgObj.id, usage: assistantUsageFromRaw(msgObj.usage, true) }, defaultMeta);
         }
-        if (
-          parentToolUseId === null &&
-          typeof msgObj?.model === "string" &&
-          !isSyntheticModel(msgObj.model) &&
-          msgObj.model !== this.lastRootModel
-        ) {
-          this.lastRootModel = msgObj.model;
+        const rootModel = parentToolUseId === null ? recordedModelOf(msgObj) : undefined;
+        if (rootModel !== undefined && rootModel !== this.lastRootModel) {
+          this.lastRootModel = rootModel;
           this.emit(
             {
               kind: "model_observed",
               turnId: this.currentTurnId,
-              model: msgObj.model,
+              model: rootModel,
             },
             defaultMeta
           );
         }
-        if (
-          typeof parentToolUseId === "string" &&
-          typeof msgObj?.model === "string" &&
-          !isSyntheticModel(msgObj.model) &&
-          !this.subagentModelReported.has(parentToolUseId)
-        ) {
+        const subagentModel = parentToolUseId === null ? undefined : recordedModelOf(msgObj);
+        if (parentToolUseId !== null && subagentModel !== undefined && !this.subagentModelReported.has(parentToolUseId)) {
           this.subagentModelReported.add(parentToolUseId);
           this.emit(
             {
               kind: "subagent_info",
               turnId: this.currentTurnId,
               toolUseId: parentToolUseId,
-              model: msgObj.model,
+              model: subagentModel,
             },
             defaultMeta
           );
@@ -1062,7 +1063,7 @@ export class ClaudeLiveNormalizer {
           this.laisoraWakeExpected = false;
           const turnId = this.currentTurnId ?? this.startTurn(undefined, defaultMeta);
           this.emit({
-            kind: "user_message", turnId, text: inbound.text, uuid: inbound.uuid,
+            kind: "user_message", turnId, text: inbound.text, uuid: inbound.uuid, remote: true,
             ...(inbound.imageRefs === undefined ? {} : { imageRefs: inbound.imageRefs }),
             ...(ownTs === undefined ? {} : { sentAt: ownTs }),
           }, defaultMeta);
@@ -1175,14 +1176,13 @@ export class ClaudeLiveNormalizer {
           },
           defaultMeta
         );
-        const successAborted =
-          record.subtype === "success" &&
+        const aborted =
+          (record.subtype === "success" || record.subtype === "error_during_execution") &&
           typeof record.terminal_reason === "string" &&
           record.terminal_reason.startsWith("aborted");
         const interrupted =
-          successAborted ||
-          (this.turnState === "interrupting" && record.subtype !== "success") ||
-          (record.subtype === "error_during_execution" && record.terminal_reason === "aborted_tools");
+          aborted ||
+          (this.turnState === "interrupting" && record.subtype !== "success");
         if (interrupted) {
           this.endTurn("turn_interrupted", undefined, defaultMeta);
         } else if (this.refusalWithoutFallback !== null) {

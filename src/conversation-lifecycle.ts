@@ -1,9 +1,10 @@
 import { EXTERNAL_TIMEOUT_SETTING_KEY } from "./orchestration-executors";
 import { applyFallbackModel, fallbackCoalesces, fallbackOriginalModel, fallbackTurnKey, fallbackUnresolved, reportedPermissionMode, resolveFallbackByChoice, type EventProvenance, type FallbackRevertOutcome, type NormalizedEventBody, type PermissionModeId, type PermissionModeRequest } from "./protocol";
 import { randomUUID } from "node:crypto";
-import { getLaisoraConfiguration, writesLostNoticeOn } from "./claude-settings";
+import { configuredApiKeyPolicy, getLaisoraConfiguration, writesLostNoticeOn } from "./claude-settings";
 import { placementSettingsOf } from "./placement-line";
 import { cachedExternalModels, noteRunningExecutorVersion } from "./gateway-host-actions";
+import { closingSummaryEnabled } from "./closing-summary";
 import { noteCliUpdateOpportunity } from "./claude-cli-update";
 import { transcriptRetentionSettings } from "./transcript-retention";
 import { chromeIntegrationEnabled } from "./chrome-integration";
@@ -19,13 +20,16 @@ import {
   effortDisplayFromSnapshot,
   invalidateClaudeCodeSettingsCache,
   resolveSessionCwd,
+  resolveClaudeSettings,
   resolveConfiguredEffortSnapshot,
+  configuredEffortSnapshotOf,
+  type ResolvedClaudeSettings,
   saveClaudeModelEffort,
   updateClaudeCodeSettings,
   type SettingsWriteResult,
 } from "./claude-settings";
 import { createBackgroundActivityState } from "./background-activity";
-import { ClaudeConversation, interruptDiscardNotice } from "./claudeHost";
+import { ClaudeConversation } from "./claudeHost";
 import { OrchestrationViewPublisher, orchestrationViewForConversation, orchestrationViewFromStartingRoster } from "./orchestration-view";
 import { orchestrationRunsDirectoryOf } from "./orchestration-external";
 import { orchestrationPluginDirectoryOf } from "./orchestration-plugin";
@@ -37,16 +41,19 @@ import { flushChosenTitle } from "./session-list-wiring";
 import { cliActivityOf, noteAutoHandoffEvent, noteAutoHandoffUserSend } from "./handoff-wiring";
 import { noteLaisoraWindowInput, noteWaitNotifyEvent, noteWaitNotifyHumanInput, waitNotifyLaunchOptions } from "./wait-notify-wiring";
 import * as l10n from "@vscode/l10n";
-import { isUnusedSession, type Session } from "./session";
+import type { Session } from "./session";
+import { resumableSessionId } from "./session-record";
 import { applyLiveDiscoveredModels, modelsMessage } from "./gateway-models";
-import { resolveModelDisplayName } from "./model-display-name";
+import { EXTENDED_CONTEXT_SUFFIX, hasExtendedContext, resolveModelDisplayName, withoutExtendedContext } from "./model-display-name";
 import { claudeAiSignInExpired, isAccountErrorReason } from "./account-error";
 import { cliReplaceable } from "./handoff-auto";
-import { clearProcessEphemeral } from "./guardrail";
+import { clearProcessEphemeral, pruneRetractedLiveIds } from "./guardrail";
 import { extensionContext, output, sinceActivation, store } from "./host-context";
 import { INJECTED_TAG_RE as HUMAN_INPUT_INJECTED_TAG_RE, isNonHumanCommandInput } from "./human-input-vocabulary";
 import { normalizeProgressTracking } from "./progress-protocol";
-import { normalizeApiKeyPolicy, type ModelInfo, type WebviewToHost } from "./protocol";
+import { handoffSendLockedText, type ModelInfo, type WebviewToHost } from "./protocol";
+import { judgeTranscriptWriteLock, noteTranscriptWriteLock, TranscriptWriteForbiddenError, transcriptWriteLockOf } from "./transcript-write-lock";
+import { handoffInProgress } from "./handoff-runs";
 import { displayTitleFromSummary } from "./session-list";
 import type { SessionStore } from "./store-surfaces";
 import { completionVerdict, numberedLaunchVerdict, resumeVerdict } from "./time-buckets";
@@ -55,7 +62,23 @@ import { parseLaisoraInput, type LaisoraInput } from "./laisora-input";
 import { flushRemoteControlRecord, noteBridgeState, noteRemoteControlClosed, setRemoteControl, startRemoteControlAtLaunch } from "./remote-control-wiring";
 import { signalWaitNotify } from "./wait-notify-signal";
 
+function logicalSessionChangedError(): Error {
+  return new Error(l10n.t("The logical session of this tab changed while the conversation was starting (restore or clear)."));
+}
+
 const orchestrationPublishers = new WeakMap<ClaudeConversation, OrchestrationViewPublisher>();
+
+function orchestrationSettingsOf(cfg: ReturnType<typeof getLaisoraConfiguration>) {
+  const placementSettings = placementSettingsOf(cfg);
+  return {
+    orchestrationEnabled: cfg.get<boolean>("orchestration.enabled")! === true,
+    guardEnabled: placementSettings.guardEnabled,
+    memoryBlockProjectType: placementSettings.blockProjectType,
+    orchestrationAgents: cfg.get<unknown>("orchestration.agents"),
+    externalTimeoutMinutes: cfg.get<number>(EXTERNAL_TIMEOUT_SETTING_KEY)!,
+    conductorPolicy: cfg.get<string>("orchestration.conductorPolicy")!,
+  };
+}
 
 export function postOrchestrationView(s: Session): void {
   const conv = s.conversation;
@@ -70,17 +93,9 @@ export function postOrchestrationView(s: Session): void {
   if (publisher === undefined) {
     publisher = new OrchestrationViewPublisher(() => {
       if (s.closed || s.conversation !== conv) return undefined;
-      const current = getLaisoraConfiguration();
-      const placementSettings = placementSettingsOf(current);
+      const current = orchestrationSettingsOf(getLaisoraConfiguration());
       const evidence = s.semantic.rosterEvidence();
-      return orchestrationViewForConversation(conv, {
-        orchestrationEnabled: current.get<boolean>("orchestration.enabled")!,
-        guardEnabled: placementSettings.guardEnabled,
-        memoryBlockProjectType: placementSettings.blockProjectType,
-        orchestrationAgents: current.get<unknown>("orchestration.agents"),
-        externalTimeoutMinutes: current.get<number>(EXTERNAL_TIMEOUT_SETTING_KEY)!,
-        conductorPolicy: current.get<string>("orchestration.conductorPolicy")!,
-      }, (agent) => conv.attributedRole(agent, evidence));
+      return orchestrationViewForConversation(conv, current, (agent) => conv.attributedRole(agent, evidence));
     }, (state) => store?.post({ type: "orchestrationView", tabId: s.tabId, state }));
     orchestrationPublishers.set(conv, publisher);
   }
@@ -117,7 +132,8 @@ function refreshConfiguredEffort(
   s: Session,
   cwd: string,
   settingSources: Array<"user" | "project" | "local">,
-  conv: ClaudeConversation
+  conv: ClaudeConversation,
+  launchSettings?: ResolvedClaudeSettings
 ): void {
   const refreshGeneration = ++s.configuredEffortGeneration;
   const logicalGeneration = s.logicalGeneration;
@@ -132,7 +148,8 @@ function refreshConfiguredEffort(
     s.logicalGeneration === logicalGeneration &&
     s.generation === processGeneration &&
     s.conversation === conv;
-  void resolveConfiguredEffortSnapshot(cwd, settingSources).then((snapshot) => {
+  const resolved = launchSettings === undefined ? resolveConfiguredEffortSnapshot(cwd, settingSources) : Promise.resolve(configuredEffortSnapshotOf(launchSettings));
+  void resolved.then((snapshot) => {
     if (snapshot === undefined || !current()) return;
     s.configuredEffortSnapshot = snapshot;
     rederiveConfiguredEffort(st, s);
@@ -153,12 +170,12 @@ function launchModelResolved(id: string, rows: readonly ModelInfo[]): string | u
   const trimmed = id.trim();
   const exact = rows.find((m) => m.id === trimmed && m.id !== "default");
   if (exact !== undefined) return exact.resolvedModel ?? (trimmed.startsWith("claude-") ? trimmed : undefined);
-  const extended = /\[1m\]$/i.test(trimmed);
-  const base = trimmed.replace(/\[1m\]$/i, "");
+  const extended = hasExtendedContext(trimmed, true);
+  const base = withoutExtendedContext(trimmed, true);
   const row = rows.find((m) => m.id === base && m.id !== "default");
   const resolved = row?.resolvedModel ?? (base.startsWith("claude-") ? base : undefined);
   if (resolved === undefined) return undefined;
-  return extended && !/\[1m\]$/i.test(resolved) ? `${resolved}[1m]` : resolved;
+  return extended && !hasExtendedContext(resolved, true) ? `${resolved}${EXTENDED_CONTEXT_SUFFIX}` : resolved;
 }
 
 function observeLaunchModel(st: SessionStore | null | undefined, s: Session, conv: ClaudeConversation, model: string | undefined, listSettled = false): void {
@@ -522,8 +539,15 @@ function launchModel(s: Session): string | null | undefined {
 }
 
 export async function sendLaisoraInput(s: Session, input: LaisoraInput, text: string): Promise<boolean> {
-  await ensureConversation(s);
-  if (s.closed || s.clearing || !s.conversation) return false;
+  if (handoffInProgress(s.tabId)) return false;
+  if (conversationAlive(s) && await judgeTranscriptWriteLock(s)) return false;
+  try {
+    await ensureConversation(s);
+  } catch (e) {
+    if (e instanceof TranscriptWriteForbiddenError) return false;
+    throw e;
+  }
+  if (s.closed || s.clearing || !s.conversation || handoffInProgress(s.tabId)) return false;
   const sent = s.conversation.send(text, undefined, Date.now(), input);
   s.awaitingLaisoraInput = false;
   if (sent) noteLaisoraWindowInput(s);
@@ -558,6 +582,11 @@ export async function handleConversationMessage(
         disposition("rejected");
         break;
       }
+      if (handoffInProgress(target!.tabId)) {
+        target!.pushEvent({ kind: "error", message: handoffSendLockedText(), fatal: false });
+        disposition("rejected");
+        break;
+      }
       if (HUMAN_INPUT_INJECTED_TAG_RE.test(msg.text.trimStart()) || parseLaisoraInput(msg.text) !== undefined) {
         target!.pushEvent({
           kind: "error",
@@ -588,52 +617,68 @@ export async function handleConversationMessage(
         disposition("rejected");
       };
       target!.unsentSends.add(reject);
-      try {
-        await ensureConversation(target!);
-      } catch (e) {
-        if (target!.unsentSends.delete(reject)) reject();
-        if (!(e instanceof ConversationFolderMissingError)) throw e;
-        reportLaunchFolderMissing(target!, e, true);
-        break;
-      }
-      if (!target!.unsentSends.delete(reject)) break;
-      if (target!.closed || target!.clearing || target!.conversation === null) {
-        reject();
-        break;
-      }
-      if (!target!.autoTitled) {
-        const firstLine = msg.text.trim().split("\n")[0];
-        if (firstLine) {
-          const hydrating = target!.hydration;
-          if (hydrating !== null && hydrating.buffering) {
-            hydrating.liveTitleCandidate = firstLine;
-          } else {
-            target!.title = displayTitleFromSummary(firstLine, target!.tabId);
-            target!.autoTitled = true;
-            st.post({ type: "tabRenamed", tabId: target!.tabId, title: target!.title });
+      await inSendOrder(target!, async () => {
+        const refuse = (): void => { if (target!.unsentSends.delete(reject)) reject(); };
+        if (conversationAlive(target!)) {
+          if (await judgeTranscriptWriteLock(target!)) return refuse();
+        } else {
+          try {
+            await ensureConversation(target!);
+          } catch (e) {
+            refuse();
+            if (e instanceof TranscriptWriteForbiddenError) return;
+            if (!(e instanceof ConversationFolderMissingError)) throw e;
+            reportLaunchFolderMissing(target!, e, true);
+            return;
           }
         }
-      }
-      msg.images = images;
-      const messageUuid = randomUUID();
-      const sentAt = Date.now();
-      target!.conversation!.answerPendingQuestionsInChat(msg.text);
-      if (!isNonHumanCommandInput(msg.text)) {
-        disposition("accepted-human");
-        const absorbedInto = target!.conversation!.runningTurnId;
-        target!.pushEvent(
-          { kind: "user_message", turnId: null, ...(absorbedInto === null ? {} : { absorbedInto }), text: msg.text, images: msg.images, sentAt, uuid: messageUuid, provenance: { path: "live" } },
-          undefined,
-          { timestamp: sentAt },
-          clientToken
-        );
-      } else {
-        disposition("accepted-nonhuman");
-      }
-      target!.welcome = undefined;
-      noteAutoHandoffUserSend(target!);
-      noteWaitNotifyHumanInput(target!);
-      target!.conversation!.send(msg.text, msg.images, sentAt, false, messageUuid);
+        if (handoffInProgress(target!.tabId) && target!.unsentSends.has(reject)) {
+          target!.pushEvent({ kind: "error", message: handoffSendLockedText(), fatal: false });
+          return refuse();
+        }
+        if (!target!.unsentSends.delete(reject)) return;
+        if (target!.closed || target!.clearing || target!.conversation === null) {
+          reject();
+          return;
+        }
+        if (!target!.conversation.admitSend()) {
+          reject();
+          return;
+        }
+        if (!target!.autoTitled) {
+          const firstLine = msg.text.trim().split("\n")[0];
+          if (firstLine) {
+            const hydrating = target!.hydration;
+            if (hydrating !== null && hydrating.buffering) {
+              hydrating.liveTitleCandidate = firstLine;
+            } else {
+              target!.title = displayTitleFromSummary(firstLine, target!.tabId);
+              target!.autoTitled = true;
+              st.post({ type: "tabRenamed", tabId: target!.tabId, title: target!.title });
+            }
+          }
+        }
+        msg.images = images;
+        const messageUuid = randomUUID();
+        const sentAt = Date.now();
+        target!.conversation!.answerPendingQuestionsInChat(msg.text);
+        if (!isNonHumanCommandInput(msg.text)) {
+          disposition("accepted-human");
+          const absorbedInto = target!.conversation!.runningTurnId;
+          target!.pushEvent(
+            { kind: "user_message", turnId: null, ...(absorbedInto === null ? {} : { absorbedInto }), text: msg.text, images: msg.images, sentAt, uuid: messageUuid, provenance: { path: "live" } },
+            undefined,
+            { timestamp: sentAt },
+            clientToken
+          );
+        } else {
+          disposition("accepted-nonhuman");
+        }
+        target!.welcome = undefined;
+        noteAutoHandoffUserSend(target!);
+        noteWaitNotifyHumanInput(target!);
+        target!.conversation!.send(msg.text, msg.images, sentAt, false, messageUuid);
+      });
       break;
     }
     case "cancelAutoResume":
@@ -644,7 +689,6 @@ export async function handleConversationMessage(
       const unsent = [...target!.unsentSends].reverse();
       target!.unsentSends.clear();
       for (const reject of unsent) reject();
-      if (unsent.length > 0) target!.pushEvent({ kind: "error", message: interruptDiscardNotice(unsent.length), fatal: false });
       noteLaisoraWindowInput(target!);
       await target!.conversation?.interrupt();
       break;
@@ -679,8 +723,37 @@ function processReplaced(s: Session): boolean {
   return s.conversation !== null && (s.conversation.isClosed || restartsAfterSignIn(s));
 }
 
+function inSendOrder(s: Session, run: () => Promise<void>): Promise<void> {
+  const next = s.sendTail.then(run, run);
+  s.sendTail = next.catch(() => {});
+  return next;
+}
+
+function queueAutomaticInput(s: Session, conv: ClaudeConversation, queue: () => boolean): Promise<boolean> {
+  const pending = (): void => {};
+  s.unsentSends.add(pending);
+  return new Promise<boolean>((resolve) => {
+    void inSendOrder(s, async () => {
+      let queued = false;
+      try {
+        const forbidden = s.unsentSends.has(pending) && await judgeTranscriptWriteLock(s);
+        queued = !forbidden && s.unsentSends.delete(pending) && s.conversation === conv && !handoffInProgress(s.tabId) && queue();
+      } catch (e) {
+        output.appendLine(`[${s.title}] automatic input not sent: ${String(e)}`);
+      } finally {
+        s.unsentSends.delete(pending);
+        resolve(queued);
+      }
+    });
+  });
+}
+
+function conversationAlive(s: Session): boolean {
+  return s.conversation !== null && !processReplaced(s);
+}
+
 function crashResumeSessionIdOf(s: Session): string | undefined {
-  return processReplaced(s) && !isUnusedSession(s) ? s.auth?.sessionId ?? undefined : undefined;
+  return processReplaced(s) ? resumableSessionId(s) : undefined;
 }
 
 const pendingCliStarts = new WeakMap<Session, { started: Promise<void>; resolve: () => void }>();
@@ -708,6 +781,12 @@ function reportLaunchFolderMissing(s: Session, missing: ConversationFolderMissin
   s.pushEvent({ kind: "error", message: missing.message, fatal: false });
 }
 
+export function rejudgeTranscriptWriteLock(s: Session): void {
+  if (!s.transcriptWriteLocked || s.closed) return;
+  if (conversationAlive(s)) void judgeTranscriptWriteLock(s);
+  else void warmup(s);
+}
+
 export function warmup(s: Session): Promise<void> {
   if ((s.conversation && !s.conversation.isClosed) || s.closed || s.clearing) return Promise.resolve();
   return ensureConversation(s).catch((e: unknown) => {
@@ -728,10 +807,10 @@ async function ensureConversation(s: Session): Promise<void> {
   if (s.resumePreparation !== null) await s.resumePreparation.ready;
   while (s.starting) await s.starting;
   if (s.closed || s.logicalGeneration !== logicalGeneration) {
-    throw new Error(l10n.t("The logical session of this tab changed while the conversation was starting (restore or clear)."));
+    throw logicalSessionChangedError();
   }
   const p = ensureConversationInner(s, requestedAt);
-  s.starting = p.catch(() => {}).then(() => {
+  s.starting = p.catch(() => { s.startMeasurement?.startFailed(); }).then(() => {
     s.starting = null;
   });
   return p;
@@ -750,7 +829,9 @@ async function ensureConversationInner(s: Session, requestedAt: number): Promise
     s.generation += 1;
     s.clearLiveDelegations();
     s.backgroundActivity = createBackgroundActivityState();
-    s.guardrail = clearProcessEphemeral(s.guardrail);
+    const settledGuardrail = clearProcessEphemeral(s.guardrail);
+    pruneRetractedLiveIds(s.liveGuardrailSignalIds, s.guardrail, settledGuardrail);
+    s.guardrail = settledGuardrail;
     s.lastContextTotalTokens = null;
   }
   if (s.conversation) return;
@@ -767,6 +848,8 @@ async function ensureConversationInner(s: Session, requestedAt: number): Promise
   const missingFolder = launchFolderMissing(cwd);
   if (missingFolder !== undefined) throw missingFolder;
   s.reportedMissingFolder = undefined;
+  const launchSettings = await resolveClaudeSettings(cwd, settingSources);
+  if (noteTranscriptWriteLock(s, transcriptWriteLockOf(launchSettings))) throw new TranscriptWriteForbiddenError();
 
   invalidateClaudeCodeSettingsCache();
   if (s.initialModel === undefined) {
@@ -775,11 +858,11 @@ async function ensureConversationInner(s: Session, requestedAt: number): Promise
   s.effectiveModel = launchModel(s);
   s.effectiveEffort = undefined;
 
-  const placementSettings = placementSettingsOf(cfg);
+  const orchestrationSettings = orchestrationSettingsOf(cfg);
   const todoEnabled = todoFeatureEnabled(cfg);
   const todoLinkedItem = todoEnabled ? await todoLinkedItemAtStart(s) : undefined;
   if (s.closed || s.logicalGeneration !== logicalGenerationAtStart) {
-    throw new Error(l10n.t("The logical session of this tab changed while the conversation was starting (restore or clear)."));
+    throw logicalSessionChangedError();
   }
   const launchPermissionMode = s.permissionMode;
   const conv = new ClaudeConversation({
@@ -797,9 +880,11 @@ async function ensureConversationInner(s: Session, requestedAt: number): Promise
     mcpElicitation: mcpElicitationEnabled((key) => cfg.get<unknown>(key)),
     progressTracking: normalizeProgressTracking(cfg.get<string>("progressTracking")!),
     claudeCodeExecutablePath: configuredClaudeExecutablePath(cfg),
-    apiKeyPolicy: normalizeApiKeyPolicy(cfg.get<string>("claude.apiKeyPolicy")!),
+    apiKeyPolicy: configuredApiKeyPolicy(cfg),
     fileLinkInstruction: cfg.get<boolean>("claude.fileLinkInstruction")! !== false,
     planInstruction: cfg.get<boolean>("claude.planInstruction")! !== false,
+    closingSummary: closingSummaryEnabled((key) => cfg.get<unknown>(key)),
+    continuedWorkSummary: () => s.continuedWorkSummary,
     askQualityCheck: cfg.get<boolean>("claude.askQualityCheck") === true,
     todoStore: todoEnabled ? hostTodoStore() : undefined,
     todoLinkedItem,
@@ -809,21 +894,18 @@ async function ensureConversationInner(s: Session, requestedAt: number): Promise
       id => isRunningLane(s.workModel, id), summary),
     planCompletionVerdict: (toolName, input, toolUseId, admittedLaunches) => completionVerdict(s.evidenceIndex.timeBuckets, toolName, input, toolUseId,
       id => isRunningLane(s.workModel, id), admittedLaunches),
-    orchestrationEnabled: cfg.get<boolean>("orchestration.enabled")! === true,
-    guardEnabled: placementSettings.guardEnabled,
-    memoryBlockProjectType: placementSettings.blockProjectType,
-    orchestrationAgents: cfg.get<unknown>("orchestration.agents"),
+    ...orchestrationSettings,
     externalModels: cachedExternalModels(),
-    externalTimeoutMinutes: cfg.get<number>(EXTERNAL_TIMEOUT_SETTING_KEY)!,
     orchestrationRunsDirectory: orchestrationRunsDirectoryOf(extensionContext?.globalStorageUri?.fsPath),
     orchestrationPluginDirectory: orchestrationPluginDirectoryOf(extensionContext?.globalStorageUri?.fsPath),
     rosterEvidenceDirectory: store?.rosterEvidenceDirectory,
-    conductorPolicy: cfg.get<string>("orchestration.conductorPolicy")!,
     onOrchestrationChanged: () => {
       if (s.conversation === conv) postOrchestrationView(s);
     },
     onCliVersion: (version) => noteRunningExecutorVersion("claude", version),
     onBridgeState: (connection) => noteBridgeState(s, conv, connection),
+    sendBlocked: () => handoffInProgress(s.tabId) || s.transcriptWriteLocked,
+    orderInput: (queue: () => boolean): Promise<boolean> => queueAutomaticInput(s, conv, queue),
     onSessionWritesLost: (loss) => {
       const failed = (error: unknown): void => output.appendLine(`[${s.title}] could not save the lost-writes mark: ${String(error)}`);
       void Promise.resolve().then(() => recordWritesLost(extensionContext?.globalState, loss, Date.now())).then(undefined, failed);
@@ -851,6 +933,7 @@ async function ensureConversationInner(s: Session, requestedAt: number): Promise
       s.pushEvent(ev, conversationId, meta);
       if (own && ev.kind === "conversation_closed") noteRemoteControlClosed(s, conv);
       if (own && ev.kind === "auth_status") flushRemoteControlRecord(s);
+      if (own) s.guardrailRunner.noteTurnEvent(ev.kind);
       if (own) noteAutoHandoffEvent(s, ev);
       if (own) noteWaitNotifyEvent(s, ev);
       if (own) settleFallbackRevert(store, s, conv, ev);
@@ -892,7 +975,7 @@ async function ensureConversationInner(s: Session, requestedAt: number): Promise
     );
     if (s.closed || s.logicalGeneration !== logicalGenerationAtStart) {
       void conv.dispose();
-      throw new Error(l10n.t("The logical session of this tab changed while the conversation was starting (restore or clear)."));
+      throw logicalSessionChangedError();
     }
     s.conversation = conv;
     noteCliStarted(s);
@@ -904,7 +987,7 @@ async function ensureConversationInner(s: Session, requestedAt: number): Promise
     void flushChosenTitle(s);
     postOrchestrationView(s);
     if (todoLinkedItem) postTodoSnapshot();
-    refreshConfiguredEffort(store, s, cwd, settingSources, conv);
+    refreshConfiguredEffort(store, s, cwd, settingSources, conv, launchSettings);
     void conv.supportedCommands().then((cmds) => {
       if (s.conversation !== conv || cmds.length === 0) return;
       s.applyCommandList(cmds);

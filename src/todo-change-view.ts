@@ -1,7 +1,7 @@
-import * as l10n from "@vscode/l10n";
 import type { TodoBatchRevert, TodoChangeView } from "./protocol";
-import { isClaudeOwnChange, isTodoGroupName, TODO_ACKNOWLEDGE_MAX, todoChangeReverted, parseTodoChangeId, revertBlock, TODO_RECENT_CLAUDE_MS, todoGroupsOf, todoItemNumbers, todoItemPath, todoParentPlace, todoPlaceText, todoRevertUnitBlock, WORK_MEMO_SECTIONS,
+import { isClaudeOwnChange, isTodoGroupName, todoGenerationOf, todoGenerations, memoTextAt, TODO_ACKNOWLEDGE_MAX, todoChangeReverted, parseTodoChangeId, revertBlock, TODO_RECENT_CLAUDE_MS, todoGroupsOf, todoItemNumbers, todoItemPath, todoParentPlace, todoPlaceText, todoRevertUnitBlock, WORK_MEMO_SECTIONS,
   type TodoChange, type TodoChangePlace, type TodoDocument, type TodoItem, type TodoMemoSection, type TodoRevertBlock } from "./todo-model";
+import { todoGroupLabel } from "./todo-labels";
 
 export const TODO_CLAUDE_CHANGES_MAX = 200;
 const TODO_CHANGE_TEXT_MAX = 400;
@@ -38,8 +38,7 @@ export function todoClaudeRecent(document: TodoDocument): number[] {
 
 function memoVersionText(section: TodoMemoSection | undefined, version: unknown): string | null {
   if (typeof version !== "number" || !section) return null;
-  if (section.version === version) return section.text;
-  return section.history.find(entry => entry.version === version)?.text ?? null;
+  return memoTextAt(section, version) ?? null;
 }
 
 function changeValue(document: TodoDocument, item: TodoItem | undefined, change: TodoChange, value: unknown): string | null {
@@ -61,7 +60,7 @@ function changeValue(document: TodoDocument, item: TodoItem | undefined, change:
     if (record.parentId !== null && typeof record.parentId !== "string") return null;
     const numbers = numbersOf(document);
     const group = "placeGroup" in record ? typeof record.placeGroup === "string" ? record.placeGroup : null : typeof record.group === "string" ? record.group : item?.parentId === null ? item.group ?? null : null;
-    return todoPlaceText(todoParentPlace(document.items, { parentId: record.parentId, group: group ?? undefined }, id => numbers.get(id) ?? ""), l10n.t("No group"));
+    return todoPlaceText(todoParentPlace(document.items, { parentId: record.parentId, group: group ?? undefined }, id => numbers.get(id) ?? ""), todoGroupLabel());
   }
   const section = WORK_MEMO_SECTIONS.find(entry => change.field === `workMemo.${entry}`);
   return section ? memoVersionText(item?.workMemo[section], record.version) : null;
@@ -109,13 +108,18 @@ function changePlaces(document: TodoDocument, item: TodoItem | undefined, change
 
 const isRecord = (value: unknown): value is Record<string, unknown> => typeof value === "object" && value !== null;
 
+export function changeGeneration(document: TodoDocument, changeId: string): { generation?: string } {
+  const generation = todoGenerationOf(todoGenerations(document), parseTodoChangeId(changeId).revision);
+  return generation ? { generation } : {};
+}
+
 export function todoChangeView(document: TodoDocument, change: TodoChange, revert?: TodoRevertBlock | null): TodoChangeView {
   const item = document.items.find(entry => entry.id === change.itemId);
   const block = revert !== undefined ? revert : isClaudeOwnChange(change) ? revertBlock(document, change, "claude") : undefined;
   const max = change.field.startsWith("workMemo.") ? TODO_MEMO_VERSION_TEXT_MAX : TODO_CHANGE_TEXT_MAX;
   const basis = change.basis ?? (item?.placement && item.placement.at === change.at && (change.field === "item" || change.field === "position" || change.field === "group") ? item.placement.basis : undefined);
   return {
-    id: change.id, at: change.at, author: change.author, itemId: change.itemId, itemTitle: item?.title ?? "", field: change.field,
+    id: change.id, ...changeGeneration(document, change.id), at: change.at, author: change.author, itemId: change.itemId, itemTitle: item?.title ?? "", field: change.field,
     before: todoClipped(changeValue(document, item, change, change.before), max), after: todoClipped(changeValue(document, item, change, change.after), max),
     ...(change.cascade ? { cascade: true as const } : {}),
     ...(block !== undefined ? { revert: todoRevertView(block) } : {}),

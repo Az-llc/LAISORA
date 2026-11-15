@@ -2,10 +2,12 @@ import { delegatedRunsText } from "./status-line";
 import * as l10n from "@vscode/l10n";
 import type { TodoEdit, TodoListItem, TodoSessionLinkView, TodoTabItem, WebviewToHost } from "../protocol";
 import { todoAgentItemId } from "../todo-model";
-import { TODO_STATE_LABELS, todoButton, todoEl as el } from "./todo-edit";
+import { TODO_STATE_LABELS, todoButton } from "./todo-edit";
 import { todoGroupColor } from "./todo-row-view";
 import { todoItemPath } from "./todo-rows";
 import { MARKS } from "./marks";
+import { element as el } from "./element";
+import { todoGroupLabel } from "../todo-labels";
 
 export interface TodoLinkHub {
   enabled(): boolean;
@@ -108,7 +110,7 @@ export function renderTodoCrumbs(container: HTMLElement, tabId: string): void {
   const dot = el("span", "todo-dot todo-crumb-dot");
   dot.setAttribute("aria-hidden", "true");
   dot.style.setProperty("--todo-gc", todoGroupColor(links.groupColorOf(root.group)));
-  container.append(dot, el("span", "todo-crumb-group", root.group ?? l10n.t("No group")));
+  container.append(dot, el("span", "todo-crumb-group", todoGroupLabel(root.group)));
   const sep = () => { const node = el("span", "todo-crumb-sep", MARKS.pathSeparator); node.setAttribute("aria-hidden", "true"); return node; };
   if (item.parentId !== null) {
     container.append(sep(), todoButton("todo-crumb todo-crumb-up", `↑ ${todoItemLabel(root)}`, () => {

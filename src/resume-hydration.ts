@@ -19,10 +19,10 @@ import {
   type FoldEventResult,
 } from "./event-fold";
 import {
-  handoffContextUsageKey,
   handoffUnreadableLinesKey,
   restoredHandoffUnreadableLineCount,
 } from "./handoff-envelope";
+import { handoffContextUsage } from "./handoff-wiring";
 import { extensionContext, output } from "./host-context";
 import {
   EventProvenance,
@@ -41,10 +41,9 @@ import { isInSessionStore, lookupSessionFile } from "./session-files";
 import { recordCwds } from "./session-display-title";
 import { lastRelocatedCwd, readCwdWindowLines } from "./transcript-cwd";
 import { displayTitleFromSummary } from "./session-list";
-import { isHandoffForkHidden, type HandoffForkState } from "./handoff-runner";
+import type { HandoffForkState } from "./handoff-runner";
 import {
-  handoffForkStateOf,
-  holdHandoffForkTab,
+  handoffForkStateForOpen,
   holdsChosenTitle,
   noteHandoffForkTab,
   rememberSession,
@@ -85,6 +84,7 @@ import {
 } from "./session";
 import {
   SessionStore,
+  type ActivationRequest,
   currentScopeMax,
   tabLimit,
   warnTabLimit,
@@ -157,7 +157,7 @@ function ancestorMatchingStore(dirName: string, candidate: string | undefined): 
 
 type RecordedCwdSource = "record-matched" | "ancestor-matched" | "unconfirmed";
 
-async function readRecordedSessionCwd(
+export async function readRecordedSessionCwd(
   filePath: string
 ): Promise<{ cwd: string | undefined; source: RecordedCwdSource; malformedRelocationLines: number }> {
   const lines = await readCwdWindowLines(filePath);
@@ -260,7 +260,7 @@ export async function openResumedSession(
     filePath: string;
     intoTabId?: string;
     activate: boolean;
-    activateIn?: vscode.Webview | null;
+    activateIn?: ActivationRequest;
     inherit?: { model: string | null | undefined; effort: Session["effortOverride"] };
     knownCwd?: string;
     startMeasurement?: StartMeasurement;
@@ -273,12 +273,10 @@ export async function openResumedSession(
     void vscode.window.showWarningMessage(l10n.t("LAISORA: Logs outside the session store cannot be restored."));
     return { tabPosted, session: undefined };
   }
-  const forkState = handoffForkStateOf(req.sessionId, Date.now());
+  const forkState = await handoffForkStateForOpen(req.sessionId, req.restoreEntry);
   if (forkState !== undefined) {
     output.appendLine(`[drop] resume of a handoff copy (${forkState}): ${req.sessionId}`);
-    if (req.restoreEntry !== undefined) {
-      if (isHandoffForkHidden(forkState)) holdHandoffForkTab(req.restoreEntry, forkState);
-    } else {
+    if (req.restoreEntry === undefined) {
       void vscode.window.showWarningMessage(forkState === "handing_off"
         ? l10n.t("LAISORA: This conversation is still being handed off. Open it after the handoff finishes.")
         : l10n.t("LAISORA: This conversation is a copy left by a handoff that did not finish, so it cannot be opened."));
@@ -398,7 +396,7 @@ export async function openResumedSession(
     s.hydration = hydration;
     s.hydrationCoverageUnconfirmed = false;
     const preview = s.resumePreviewSnapshot(hydration);
-    if (canReuse) st.post({ type: "tabCleared", tab: preview });
+    if (canReuse) st.post({ type: "tabCleared", tab: preview, replaced: true });
     else if (req.activate) st.postActivating(req.activateIn, s.tabId, activate => ({ type: "tabCreated", tab: preview, activate }));
     else st.post({ type: "tabCreated", tab: preview, activate: false });
     tabPosted = !canReuse;
@@ -483,7 +481,7 @@ export async function openResumedSession(
     if (preparation !== undefined) s.finishResumePreparation(preparation);
     lagProbe.stop();
   }
-  rememberSession(s);
+  void rememberSession(s);
   return { tabPosted, session: s };
 }
 
@@ -666,17 +664,25 @@ export function restoredMessagePlan(
   messages: readonly TranscriptMessage[],
   history: { readonly events: readonly HistoryEvent[] }
 ): { head: TranscriptMessage[]; after: Map<string, TranscriptMessage[]>; tail: TranscriptMessage[] } {
-  const drawn = new Set<string>();
+  const drawnOrder: string[] = [];
   for (const ev of history.events) {
     const uuid = restoredRecordUuid(ev.body);
-    if (uuid !== undefined && !("priorGeneration" in ev.body && ev.body.priorGeneration === true)) drawn.add(uuid);
+    if (uuid !== undefined && !("priorGeneration" in ev.body && ev.body.priorGeneration === true)) drawnOrder.push(uuid);
   }
-  const head: TranscriptMessage[] = [];
+  const drawn = new Set(drawnOrder);
+  let head: TranscriptMessage[] = [];
   const after = new Map<string, TranscriptMessage[]>();
   let pending = head;
   for (const m of messages) {
     if (m.role !== "system" && m.restoredApproval === undefined && m.uuid !== undefined && drawn.has(m.uuid)) {
-      pending = [];
+      if (pending === head && head.length > 0) {
+        const preceding = drawnOrder[drawnOrder.indexOf(m.uuid) - 1];
+        if (preceding !== undefined) {
+          after.set(preceding, [...(after.get(preceding) ?? []), ...head]);
+          head = [];
+        }
+      }
+      pending = after.get(m.uuid) ?? [];
       after.set(m.uuid, pending);
       continue;
     }
@@ -695,6 +701,7 @@ function replayedMessageEvent(m: TranscriptMessage): NormalizedEventBody {
     ...(m.imageRefs && m.imageRefs.length > 0 ? { imageRefs: m.imageRefs } : {}),
     ...(m.model ? { model: m.model } : {}),
     ...(m.timestamp > 0 ? { recordedAt: m.timestamp } : {}),
+    ...(m.remote ? { remote: true } : {}),
   };
 }
 
@@ -1155,9 +1162,15 @@ async function runResumeHydrationStages(
 
   if (forkEnvelope !== undefined) {
     const sourceId = forkEnvelope.snapshot.sourceSessionId;
-    const sourceTitle = await sessionDisplayTitleOf(sourceId);
+    const [sourceTitle, storedContextUsage] = await Promise.all([
+      sessionDisplayTitleOf(sourceId),
+      handoffContextUsage().read(h.sessionId).catch((error) => {
+        output.appendLine(`[${s.title}] handoff context usage could not be read: ${String(error)}`);
+        return undefined;
+      }),
+    ]);
     if (invalidated()) return abort("引き継ぎ元の題名の読み取り中にセッションが変化しました");
-    const restoredContextUsage = restoredHandoffContextUsage(extensionContext?.globalState.get(handoffContextUsageKey(h.sessionId)));
+    const restoredContextUsage = restoredHandoffContextUsage(storedContextUsage);
     const unreadableLineCount = restoredHandoffUnreadableLineCount(extensionContext?.globalState.get(handoffUnreadableLinesKey(h.sessionId)));
     s.handoffSource = {
       sessionId: sourceId,
@@ -1191,6 +1204,7 @@ async function runResumeHydrationStages(
   h.phase = "complete";
   h.liveCommitCursor = h.journal.length;
   commitHydrationDraft(s, draft, sink.commandsTouched);
+  if (conversation.continuedWorkSummary === true && !invalidated()) s.continuedWorkSummary = true;
   refreshFallbackAppliedModel(st, s);
   s.restoredAgents = restored.agents;
   s.childSpans = draft.childSpans;

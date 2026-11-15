@@ -4,10 +4,10 @@ import type { ClaudeConversation } from "./claudeHost";
 import type { HostArtifactAccess } from "./artifact-access";
 import { applyActivityEvent, type BackgroundActivityState } from "./background-activity";
 import { attachTimeBucketRequestNumbers, foldTimeBuckets, inProgressStepOfDelegation } from "./time-buckets";
-import { foldEvidence, type SemanticEvidenceIndex } from "./evidence-index";
+import { clearCancelledFirstHumanMessage, foldEvidence, type SemanticEvidenceIndex } from "./evidence-index";
 import { windowEvents } from "./event-window";
 import type { ChildTranscriptSpan } from "./spans";
-import { foldGuardrail, touchedSignalIds, type GuardrailState } from "./guardrail";
+import { foldGuardrail, isDelegationFoldEvent, pruneRetractedLiveIds, touchedSignalIds, type GuardrailState } from "./guardrail";
 import {
   AuthStatus,
   EventProvenance,
@@ -22,7 +22,7 @@ import {
   UNOBSERVED_TIME,
 } from "./protocol";
 import { foldSessionFacts, type SessionFactsAccumulator } from "./session-facts";
-import { backgroundAgentDispatch, backgroundTaskLaunchedSince, markEventLogTrimmed, noteChildUsage, reduceWorkModel, type WorkModelState } from "./work-model";
+import { backgroundAgentDispatch, backgroundTaskLaunchedSince, clearCancelledRequestHeadline, markEventLogTrimmed, noteChildUsage, reduceWorkModel, type WorkModelState } from "./work-model";
 import { configuredEventLimit } from "./claude-settings";
 
 export function trimEventLog(events: NormalizedEvent[], max = configuredEventLimit()): NormalizedEvent[] {
@@ -248,6 +248,7 @@ export function foldEventState(
       }
     }
   }
+  if (ev.kind === "user_message_cancelled") noteCancelledUserMessages(draft, ev.uuids);
   foldReaders(draft, ev, false, meta?.hostArtifacts, effects);
   if (ev.provenance?.path === "live") {
     effects.push({ type: "schedule_guardrail_tick" });
@@ -288,6 +289,21 @@ export function foldEventState(
     effects.push({ type: "schedule_semantic_model_post" });
   }
   return { draft, normalizedEvent: ev, effects };
+}
+
+export function cancelUserMessages(events: readonly NormalizedEvent[], uuids: readonly string[]): NormalizedEvent[] {
+  const ids = new Set(uuids);
+  return events.map((ev) => ev.kind === "user_message" && ev.cancelled !== true && ev.uuid !== undefined && ids.has(ev.uuid) && !isHistoryEvent(ev)
+    ? { ...ev, cancelled: true as const }
+    : ev);
+}
+
+function noteCancelledUserMessages(draft: EventFoldDraft, uuids: readonly string[]): void {
+  draft.events = cancelUserMessages(draft.events, uuids);
+  for (const uuid of uuids) {
+    draft.workModel = clearCancelledRequestHeadline(draft.workModel, uuid);
+    draft.evidenceIndex = clearCancelledFirstHumanMessage(draft.evidenceIndex, uuid);
+  }
 }
 
 function foldReaders(draft: EventFoldDraft, ev: NormalizedEvent, guardrailOnly: boolean,
@@ -353,7 +369,7 @@ function foldReaders(draft: EventFoldDraft, ev: NormalizedEvent, guardrailOnly: 
   try {
     const before = draft.guardrail;
     draft.guardrail = foldGuardrail(draft.guardrail, { type: "event", event: ev });
-    if (ev.kind === "tool_call_started" || ev.kind === "tool_call_finished") {
+    if (isDelegationFoldEvent(ev)) {
       const workModel = draft.workModel;
       const timeBuckets = draft.evidenceIndex.timeBuckets;
       draft.guardrail = foldGuardrail(draft.guardrail, { type: "delegation", event: ev, inProgressStep: () => {
@@ -367,6 +383,7 @@ function foldReaders(draft: EventFoldDraft, ev: NormalizedEvent, guardrailOnly: 
       backgroundTaskLaunchedSince(previousWorkModel, notification.agentId, draft.cliStartedAt))) {
       for (const id of touchedSignalIds(before, draft.guardrail)) draft.liveGuardrailSignalIds.add(id);
     }
+    pruneRetractedLiveIds(draft.liveGuardrailSignalIds, before, draft.guardrail);
   } catch (error) {
     effects.push({
       type: "log",

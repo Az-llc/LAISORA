@@ -1,7 +1,7 @@
 import * as l10n from "@vscode/l10n";
 import { plainAskFormat } from "./ask-plain-form";
 import { resolveSettingGroup } from "./configuration-defaults";
-import { WAIT_NOTIFY_SETTING_KEYS, isWaitNotifySettingValue, type WaitNotifySettings, type WaitReportItem } from "./protocol";
+import { WAIT_NOTIFY_MINUTES_MIN, WAIT_NOTIFY_SETTING_KEYS, isWaitNotifySettingValue, userMessageTurnId, type WaitNotifySettings, type WaitReportItem } from "./protocol";
 import type { RemoteControlState } from "./remote-control";
 
 export const PUSH_NOTIFICATION_TOOL = "PushNotification";
@@ -22,13 +22,17 @@ export const WAIT_NOTIFY_WAKE_TURN_CAP_MS = 5 * 60_000;
 export const WAIT_NOTIFY_WAKE_FILE = "wake";
 export const WAIT_NOTIFY_EPOCH_FILE = "epoch";
 export const WAIT_NOTIFY_ARMED_FILE = "armed";
+export const waitNotifyWakeFile = (epoch: number | string) => `${WAIT_NOTIFY_WAKE_FILE}-${epoch}`;
 export const WAIT_NOTIFY_ALIVE_PREFIX = "alive-";
 export const WAIT_NOTIFY_HEARTBEAT_FRESH_MS = 3 * WAIT_NOTIFY_BELL_POLL_SECONDS * 1000;
 export const WAIT_NOTIFY_CONNECT_MS = 30_000;
 export const WAIT_NOTIFY_INPUT_GRACE_MS = 30_000;
 
-export function resolveWaitNotifySettings(read: (key: string) => unknown): WaitNotifySettings {
-  return resolveSettingGroup<WaitNotifySettings>(WAIT_NOTIFY_SETTING_KEYS, isWaitNotifySettingValue, read);
+export interface WaitNotifyGate { readonly settings: WaitNotifySettings; readonly telemetryOff: boolean }
+
+export function resolveWaitNotifySettings(read: (key: string) => unknown, claudeTelemetryOff: boolean): WaitNotifyGate {
+  const stored = resolveSettingGroup<WaitNotifySettings>(WAIT_NOTIFY_SETTING_KEYS, isWaitNotifySettingValue, read);
+  return { settings: claudeTelemetryOff ? { ...stored, enabled: false } : stored, telemetryOff: claudeTelemetryOff };
 }
 
 export interface HumanMark { readonly generation: number; readonly seq: number; readonly at: number }
@@ -42,16 +46,35 @@ export function freshWaitItems(report: WaitReport | undefined, human: HumanMark)
 export interface WaitEpisode {
   readonly human: HumanMark;
   readonly notified: boolean;
+  readonly sent?: true;
   readonly openCount: number;
   readonly attempts: number;
   readonly since?: number;
   readonly connect?: WaitConnect;
+  readonly carried?: readonly WaitReportItem[];
 }
 
 export interface WaitConnect { readonly asked: boolean; readonly connectingSince?: number }
 
 export function waitEpisodeAfterHuman(human: HumanMark): WaitEpisode {
   return { human, notified: false, openCount: 0, attempts: 0 };
+}
+
+export function waitNotifyCarry(episode: WaitEpisode, items: readonly WaitReportItem[]): readonly WaitReportItem[] | undefined {
+  return episode.notified && episode.sent === true && items.length > 0 && items.length >= episode.openCount ? items : undefined;
+}
+
+export function waitEpisodeCarried(human: HumanMark, carried: readonly WaitReportItem[]): WaitEpisode {
+  return { ...waitEpisodeAfterHuman(human), carried };
+}
+
+export function waitEpisodeWithoutCarry(episode: WaitEpisode): WaitEpisode {
+  const { carried: _carried, ...rest } = episode;
+  return rest;
+}
+
+export function waitItemsOf(episode: WaitEpisode, fresh: readonly WaitReportItem[]): WaitReportItem[] {
+  return [...(episode.carried ?? []), ...fresh];
 }
 
 export function waitEpisodeOnLaunch(episode: WaitEpisode): WaitEpisode {
@@ -86,15 +109,17 @@ function withoutStarts(episode: WaitEpisode): WaitEpisode {
 
 export function waitNotifyStep(episode: WaitEpisode, facts: WaitNotifyFacts): { episode: WaitEpisode; action: WaitNotifyAction } {
   const openCount = facts.items.length;
+  const { sent: _sent, ...unsent } = episode;
   const counted: WaitEpisode = openCount < episode.openCount
-    ? { ...episode, openCount, notified: false, attempts: 0 }
+    ? { ...unsent, openCount, notified: false, attempts: 0 }
     : { ...episode, openCount };
   const waiting = facts.settings.enabled && facts.launchedWithPush && facts.remoteControl !== "refused" && openCount > 0 && !counted.notified;
   if (!waiting) return { episode: withoutStarts(counted), action: { kind: "none" } };
   const ready = facts.quiet && facts.lastTurnCompleted && !facts.autoResumePending;
   if (!ready) return { episode: counted, action: { kind: "none" } };
   const since = counted.since ?? facts.now;
-  const at = since + facts.settings.minutes * 60_000;
+  const minutes = counted.carried === undefined ? facts.settings.minutes : WAIT_NOTIFY_MINUTES_MIN;
+  const at = since + minutes * 60_000;
   if (facts.now < at) return { episode: { ...counted, since }, action: { kind: "arm", at } };
   if (!facts.hookAlive) return { episode: { ...counted, since }, action: { kind: "awaitHook" } };
   const attempted: WaitEpisode = { ...withoutStarts(counted), notified: true, attempts: counted.attempts + 1 };
@@ -118,7 +143,8 @@ export function inputNeedStep(pendingSince: readonly number[], laisoraInputAt: n
 }
 
 export function noteWaitNotifyResult(episode: WaitEpisode, pushSent: boolean): WaitEpisode {
-  return pushSent || episode.attempts >= WAIT_NOTIFY_MAX_ATTEMPTS ? episode : { ...episode, notified: false };
+  if (pushSent) return { ...episode, sent: true };
+  return episode.attempts >= WAIT_NOTIFY_MAX_ATTEMPTS ? episode : { ...episode, notified: false };
 }
 
 export function pushOutcome(resultText: string, isError: boolean): boolean {
@@ -150,13 +176,17 @@ function clip(text: string, max: number): string {
   return max <= CLIP_MARK.length ? CLIP_MARK.slice(0, Math.max(0, max)) : `${points.slice(0, max - CLIP_MARK.length).join("")}${CLIP_MARK}`;
 }
 
-export function waitNotificationMessage(conversation: string, items: readonly WaitReportItem[]): string {
+export function waitNotificationMessage(conversation: string, items: readonly WaitReportItem[], carried = false): string {
   const name = oneLine(conversation);
   const title = oneLine(items[0]?.title ?? "");
   const more = Math.max(0, items.length - 1);
-  const format = (n: string, t: string): string => more > 0
-    ? l10n.t("\"{0}\" is waiting for you: {1} (+{2} more)", n, t, more)
-    : l10n.t("\"{0}\" is waiting for you: {1}", n, t);
+  const format = (n: string, t: string): string => carried
+    ? more > 0
+      ? l10n.t("\"{0}\" was handed off and still waits for you: {1} (+{2} more)", n, t, more)
+      : l10n.t("\"{0}\" was handed off and still waits for you: {1}", n, t)
+    : more > 0
+      ? l10n.t("\"{0}\" is waiting for you: {1} (+{2} more)", n, t, more)
+      : l10n.t("\"{0}\" is waiting for you: {1}", n, t);
   let shownName = name;
   let shownTitle = title;
   let message = format(shownName, shownTitle);
@@ -173,6 +203,34 @@ export function waitNotificationMessage(conversation: string, items: readonly Wa
 
 export function waitNotifyRewakeText(message: string, titles: readonly string[]): string {
   return `${WAIT_NOTIFY_REWAKE_HEAD} call the PushNotification tool once. Its message is the whole last line of this notice after the "Message: " label that starts that line; send it unchanged, even if it contains that label again. Then ${WAIT_NOTIFY_WAKE_REPLY}\n\nWaiting, as JSON strings in order: ${titles.map((title) => JSON.stringify(oneLine(title))).join(", ")}\n\n${plainAskFormat()}\n\nMessage: ${message}`;
+}
+
+export const WAIT_NOTIFY_CARRY_INSTRUCTION = "This is not a message from the user. LAISORA needs this conversation to end one short turn before it can send a mobile notification about what still waits for the user. Reply with only OK. Do not use any tools, and do not start, continue or plan any work in this turn.";
+
+export type PushTool = "offered" | "missing" | "unknown";
+
+export function waitNotifyPushTool(launchedWithHook: boolean, initTools: readonly string[] | undefined): PushTool {
+  if (!launchedWithHook) return "missing";
+  if (initTools === undefined) return "unknown";
+  return initTools.includes(PUSH_NOTIFICATION_TOOL) ? "offered" : "missing";
+}
+
+export type WaitNotifyClosed = "setting_off" | "not_launched";
+
+export function waitNotifyClosed(settingOn: boolean, pushTool: PushTool): WaitNotifyClosed | undefined {
+  if (!settingOn) return "setting_off";
+  if (pushTool === "missing") return "not_launched";
+  return undefined;
+}
+
+export type WaitNotifyCarrySkip = "continued" | WaitNotifyClosed | "transcript_locked";
+
+export function waitNotifyCarrySkip(input: { continued: boolean; settingOn: boolean; pushTool: PushTool; transcriptWriteLocked: boolean }): WaitNotifyCarrySkip | undefined {
+  if (input.continued) return "continued";
+  const closed = waitNotifyClosed(input.settingOn, input.pushTool);
+  if (closed !== undefined) return closed;
+  if (input.transcriptWriteLocked) return "transcript_locked";
+  return undefined;
 }
 
 export const STOP_HOOK_FEEDBACK_PREFIX = "Stop hook blocking error from command \"Stop\": ";
@@ -227,8 +285,8 @@ export function foldWakeVisibility(state: WakeVisibility, ev: WakeVisibilityEven
     return { state: new Map(state).set(ev.turnId, false) };
   }
   if (ev.kind !== "user_message") return { state };
-  const turnId = ev.absorbedInto ?? ev.turnId;
-  if (turnId === null || turnId === undefined || state.get(turnId) !== false) return { state };
+  const turnId = userMessageTurnId(ev);
+  if (turnId === null || state.get(turnId) !== false) return { state };
   return { state: new Map(state).set(turnId, true), revealed: turnId };
 }
 
@@ -263,13 +321,13 @@ export function waitNotifyBell(platform: NodeJS.Platform): WaitNotifyBell {
       text: [
         "param([string]$Dir)",
         `$epochFile = Join-Path $Dir '${WAIT_NOTIFY_EPOCH_FILE}'`,
-        `$wakeFile = Join-Path $Dir '${WAIT_NOTIFY_WAKE_FILE}'`,
         `$armedFile = Join-Path $Dir '${WAIT_NOTIFY_ARMED_FILE}'`,
         `$alive = Join-Path $Dir ('${WAIT_NOTIFY_ALIVE_PREFIX}' + $PID)`,
         "function Leave([int]$code) { Remove-Item -LiteralPath $alive -ErrorAction SilentlyContinue; exit $code }",
         "$parent = (Get-CimInstance Win32_Process -Filter \"ProcessId=$PID\").ParentProcessId",
         "$started = Get-Date",
         "$start = if (Test-Path -LiteralPath $epochFile) { [IO.File]::ReadAllText($epochFile) } else { '' }",
+        `$wakeFile = Join-Path $Dir ('${waitNotifyWakeFile("")}' + $start)`,
         "[IO.File]::WriteAllText($alive, '')",
         "while ($true) {",
         `  Start-Sleep -Seconds ${WAIT_NOTIFY_BELL_POLL_SECONDS}`,
@@ -315,7 +373,7 @@ export function waitNotifyBell(platform: NodeJS.Platform): WaitNotifyBell {
       `  now=$(cat "$dir/${WAIT_NOTIFY_EPOCH_FILE}" 2>/dev/null)`,
       '  [ "$now" = "$start" ] || exit 0',
       '  : > "$alive"',
-      `  if mv "$dir/${WAIT_NOTIFY_WAKE_FILE}" "$dir/claimed-$$" 2>/dev/null; then`,
+      `  if mv "$dir/${waitNotifyWakeFile("$start")}" "$dir/claimed-$$" 2>/dev/null; then`,
       '    cat "$dir/claimed-$$" >&2',
       '    rm -f "$dir/claimed-$$"',
       "    exit 2",

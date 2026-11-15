@@ -2,14 +2,14 @@ import { isHistoryEvent, isObservedTime, type NormalizedEvent, type NormalizedEv
 import { redactAbsolutePaths } from "./path-redaction";
 import { IMAGE_PLACEHOLDER } from "./transcript-display";
 import { isPureCommandWrapper, INJECTED_TAG_RE, STEER_TAG_RE } from "./human-input-vocabulary";
-import { bookkeepingIntent, foldPlanDeclarationText, observedTaskIntent, taskCreateKeyFromResult, type TaskIntent, type PlanTextState } from "./work-model";
-import { foregroundExternalCalls, MAIN_PROCESSING_BUCKETS, planBlockName, planMemberPlacementAt, planItemNumber, planItemNumberOf, planNumberedStep, planPlacedStep, planStepActiveSpans, planStepKey, planStepTaskKey, planSuccessorStep, planWorkEnd, TASK_KEY_PREFIX, TASK_PENDING_KEY_PREFIX, transitionPlanStep, type PlanSpan, type PlanStepSettle, type PlanStepTiming, type PlanStepTransition, type PlanStepUpdate } from "./plan-steps";
+import { bookkeepingIntent, countsAsPlanIntent, foldPlanDeclarationText, observedTaskIntent, taskCreateKeyFromResult, type TaskIntent, type PlanTextState } from "./work-model";
+import { foregroundExternalCalls, MAIN_PROCESSING_BUCKETS, planBlockName, planMemberPlacementAt, planItemNumber, planItemNumberOf, planNumberedStep, planPlacedStep, planStepActiveSpans, planStepKey, planStepMarks, planStepTaskKey, planSuccessorStep, planWorkEnd, TASK_KEY_PREFIX, TASK_PENDING_KEY_PREFIX, transitionPlanStep, type PlanSpan, type PlanStepMarks, type PlanStepSettle, type PlanStepTiming, type PlanStepTransition, type PlanStepUpdate } from "./plan-steps";
 import type { PlanUsage, PlanTokenTotal } from "./plan-usage";
 import { isExternalRunTool } from "./orchestration-executors";
 import { declaredBackgroundLaunch, delegationCount, isCountedExternalRunCall, isDelegationLaunchTool, isDelegationTool } from "./claude-tool-names";
 import { isFailedToolResult, isRejectedBeforeRun, taskNotificationTerminal } from "./tool-result-signals";
 import { conductorStopTarget } from "./tool-intent";
-import { callLane, unfinishedCallEnd, launchlessRunSpan, moreRuns, type RecordedRuns, childActivity, childRecordEnd, childUsageCounts, closeRun, currentRunStart, delegationRuns, intersectSpans, measureSpans, memberRunTimes, runElapsedMs, runEnd, runSpans, subtractSpans, unionSpans, type CallLane, type ChildTranscriptSpan, type RunStop, type RunTimes, type Span, isChildCall, launchedUnder, launcherOwning, descendantStopAt, resumedRunStop } from "./spans";
+import { callLane, unfinishedCallEnd, launchlessRunSpan, moreRuns, childActivity, childRecordEnd, childUsageCounts, closeRun, currentRunStart, delegationRuns, intersectSpans, measureSpans, memberRunTimes, runElapsedMs, runEnd, runSpans, subtractSpans, unionSpans, type CallLane, type ChildTranscriptSpan, type RunStop, type RunTimes, type Span, isChildCall, launchedUnder, launcherOwning, descendantStopAt, resumedRunStop } from "./spans";
 
 export type TimeBucket = "generate" | "tool" | "delegation" | "confirm" | "reply";
 export type TimeLane = CallLane;
@@ -194,6 +194,11 @@ export function unknownLaunchers(restored: readonly RestoredAgent[], records: re
       ...((agent.modelMeasured ?? agent.modelDeclared) === undefined ? {} : { model: agent.modelMeasured ?? agent.modelDeclared }) }));
 }
 
+export function withoutLaunchedUnknown<T extends { toolUseId: string }>(launchers: readonly T[], event: { kind: string; toolUseId?: string }): readonly T[] {
+  return event.kind === "tool_call_started" && launchers.some(launcher => launcher.toolUseId === event.toolUseId)
+    ? launchers.filter(launcher => launcher.toolUseId !== event.toolUseId) : launchers;
+}
+
 export function seedUnknownLaunchers(state: TimeBucketState, launchers: readonly UnknownLauncher[]): TimeBucketState {
   return launchers.length === 0 ? state : { ...state, unknownLaunchers: launchers };
 }
@@ -240,7 +245,7 @@ export interface ExternalRunCallView {
 
 export type RequestBlockKind = "say" | "command" | "interrupt" | "plan";
 
-export interface PlanBlockStepRecord extends PlanStepTiming {
+export interface PlanBlockStepRecord extends PlanStepTiming, PlanStepMarks {
   number: number;
   taskKey: string;
   transitions: PlanStepTransition[];
@@ -251,7 +256,7 @@ export interface PlanBlockMetrics {
   generateMs: number | null; toolMs: number | null; subagentWaitMs: number | null; subagentOnlyMs: number | null; backgroundOnlyMs: number | null;
   decisionWaitMs: number | null; replyWaitMs: number | null; tokens: PlanTokenTotal | null;
 }
-export interface PlanBlockStepView extends PlanStepTiming, Omit<PlanBlockMetrics, "tokens"> {
+export interface PlanBlockStepView extends PlanStepTiming, PlanStepMarks, Omit<PlanBlockMetrics, "tokens"> {
   conductorIntervals?: TimeBucketInterval[];
   conductorTail?: number | null;
   number: number; end: number | null; durationMs: number | null; longest: boolean; parallel: boolean;
@@ -270,6 +275,8 @@ export interface RequestBlockRecord {
   goal?: string;
   steps?: PlanBlockStepRecord[];
   seenSteps?: string[];
+  planDeclaredAt?: number;
+  planStarted?: true;
   // requestId: the request's message uuid, so a request absorbed into a later block names that block.
   userMessages?: { at: number; requestId?: string }[];
 }
@@ -465,12 +472,15 @@ function applyPlanTask(state: TimeBucketState, intent: TaskIntent, at: number, t
   const steps = (block.steps ?? []).map(step => ({ ...step, transitions: [...step.transitions] }));
   const source = intent.kind === "todo" ? {} : { source: "tasks" as const };
   const items = intent.kind === "todo" ? intent.items : intent.kind === "create"
-    ? [{ taskKey: taskCreateKeyFromResult(intent.toolUseId, result), description: intent.subject, status: intent.status }]
+    ? [{ taskKey: taskCreateKeyFromResult(intent.toolUseId, result), description: intent.subject, activeForm: intent.activeForm, status: intent.status }]
     : [];
   if (intent.kind === "update") {
     const existing = steps.find(step => step.taskKey === intent.taskKey)!;
-    items.push({ taskKey: intent.taskKey, description: intent.subject ?? existing.title, status: intent.status ?? existing.status });
+    items.push({ taskKey: intent.taskKey, description: intent.subject ?? existing.title, activeForm: intent.activeForm ?? existing.activeForm,
+      status: intent.status ?? existing.status });
   }
+  const declaredAt = block.planDeclaredAt;
+  const requestSinceDeclared = declaredAt !== undefined && (block.userMessages ?? []).some(message => message.at > declaredAt && message.at <= at);
   let order = lastTransitionOrder(steps);
   const present = new Set<string>();
   const seen = [...block.seenSteps ?? steps.map(step => step.key)];
@@ -483,10 +493,16 @@ function applyPlanTask(state: TimeBucketState, intent: TaskIntent, at: number, t
     if (!step) {
       if (intent.kind === "todo" && item.status === "completed") continue;
       step = { key, number, taskKey: item.taskKey,
-        title: redactAbsolutePaths(item.description), status: "unknown", removed: false, startedAt: null, endedAt: null, transitions: [] };
+        title: redactAbsolutePaths(item.description), status: "unknown", removed: false, startedAt: null, endedAt: null, transitions: [],
+        ...(declaredAt !== undefined && (intent.kind === "todo" || block.planStarted || requestSinceDeclared) ? { added: true as const } : {}),
+        ...(requestSinceDeclared ? { addedAt: at } : {}) };
       steps.push(step);
     }
     const removed = intent.kind === "update" && intent.deleted === true;
+    if (!removed) {
+      if (item.activeForm === undefined) delete step.activeForm;
+      else step.activeForm = item.activeForm;
+    }
     if (transitionPlanStep(step, at, item.status, removed)) step.transitions.push({ at, active: !removed && item.status === "in_progress", order: ++order,
       ...(removed || item.status === "completed" ? { settled: true as const } : {}) });
     // Sending in_progress again (a TaskUpdate carrying the status, a TodoWrite listing it) selects the item for the current
@@ -502,7 +518,8 @@ function applyPlanTask(state: TimeBucketState, intent: TaskIntent, at: number, t
     step.transitions.push({ at, active: false, order: ++order, settled: true });
   }
   const blocks = intent.kind === "todo" ? settleEarlierTodoSteps(state.blocks, index, intent.items, at, block.blockId) : [...state.blocks];
-  blocks[index] = { ...block, steps, seenSteps: seen, text: planBlockName({ goal: block.goal, steps }) ?? block.text };
+  blocks[index] = { ...block, steps, seenSteps: seen, text: planBlockName({ goal: block.goal, steps }) ?? block.text, planDeclaredAt: declaredAt ?? at,
+    ...(block.planStarted || items.some(item => item.status === "in_progress" || item.status === "completed") ? { planStarted: true as const } : {}) };
   return { ...state, blocks };
 }
 
@@ -658,8 +675,8 @@ function delegationResumeStop(state: TimeBucketState, d: DelegationSpan): number
     foregroundEndedAt: d.ackEndedAt ?? state.openTools[d.toolUseId]?.staleAt });
 }
 
-function afterChildActivity(d: DelegationSpan, at: number): DelegationSpan {
-  const next = childActivity({ runStart: delegationRunStart(d), earlierRuns: d.earlierRuns, stoppedAt: d.notifiedEndedAt, lastChildAt: d.lastChildAt }, at);
+function afterChildActivity(d: DelegationSpan, at: number, activityStartedAt = at): DelegationSpan {
+  const next = childActivity({ runStart: delegationRunStart(d), earlierRuns: d.earlierRuns, stoppedAt: d.notifiedEndedAt, lastChildAt: d.lastChildAt }, at, activityStartedAt);
   if (next.wokeAt === undefined) return next.lastChildAt === d.lastChildAt ? d : { ...d, lastChildAt: next.lastChildAt };
   return { ...d, lastChildAt: next.lastChildAt, earlierRuns: next.earlierRuns, resumedAt: next.wokeAt, notifiedEndedAt: undefined, woke: true };
 }
@@ -928,6 +945,8 @@ export function foldTimeBuckets(state: TimeBucketState, event: NormalizedEvent, 
       return n;
     }
     case "tool_call_started": {
+      const unknownKept = state.unknownLaunchers === undefined ? undefined : withoutLaunchedUnknown(state.unknownLaunchers, event);
+      if (unknownKept !== state.unknownLaunchers) touch().unknownLaunchers = unknownKept!.length > 0 ? unknownKept : undefined;
       if (ts === undefined) return next;
       const n = touch();
       const lane = callLane(event.parentToolUseId);
@@ -1044,11 +1063,11 @@ export function foldTimeBuckets(state: TimeBucketState, event: NormalizedEvent, 
       const parentKey = open.lane === "main" ? event.toolUseId : open.parentToolUseId;
       const d = parentKey !== null ? (keyedGet(n.delegations, parentKey) ?? keyedGet(state.delegations, parentKey)) : undefined;
       if (d !== undefined) {
-        putDelegation(n, n.delegations, open.lane === "main" ? ackedDelegation(d, interval, event) : { ...d, ...afterChildActivity(d, interval.end) });
+        putDelegation(n, n.delegations, open.lane === "main" ? ackedDelegation(d, interval, event) : { ...d, ...afterChildActivity(d, interval.end, interval.start) });
       }
       const launched = open.lane === "sub" ? keyedGet(n.delegations, event.toolUseId) : undefined;
       if (launched !== undefined) putDelegation(n, n.delegations, ackedDelegation(launched, interval, event));
-      return open.lane === "main" && open.taskIntent && !event.isError
+      return countsAsPlanIntent(open.parentToolUseId) && open.taskIntent && !event.isError
         ? applyPlanTask(n, open.taskIntent, ts, open.turnId, event.resultPreview, { live: !isHistoryEvent(event), toolUseId: event.toolUseId }) : n;
     }
     case "subagent_info": {
@@ -1110,6 +1129,7 @@ export interface AgentSpanView {
   // One per run of src/spans.ts#runSpans, in that order; present with runPlacements.
   runMeasures?: RunMeasure[];
   runSliceKey?: string;
+  resumeStarts?: number[];
   start: number;
   end: number;
   earlierRuns?: Span[];
@@ -1596,6 +1616,7 @@ export function deriveTimeBuckets(
       ...(d.parentToolUseId !== undefined ? { parentToolUseId: d.parentToolUseId } : {}),
       ...runMeasure(toolUnion, memberRunTimes(runs), generatedUntil, calls),
       ...(runMeasures === undefined ? {} : { runMeasures }),
+      ...(d.resumes?.length ? { resumeStarts: d.resumes.map(resume => resume.at) } : {}),
       endSource: open ? "open" : endSource,
     };
   };
@@ -1670,7 +1691,7 @@ export function deriveTimeBuckets(
     if (o.lane === "main") externalRunCalls.push(openCallView(toolUseId, o));
   }
   const agentsById = new Map(agents.map(agent => [agent.toolUseId, agent]));
-  const unknownLaunchers = (state.unknownLaunchers ?? []).filter(launcher => delegationRoot(state.delegations, launcher.toolUseId).root === undefined).map((launcher): AgentSpanView => {
+  const unknownLaunchers = (state.unknownLaunchers ?? []).map((launcher): AgentSpanView => {
     const { start, end: stop } = launchlessRunSpan(childByToolUseId.get(launcher.toolUseId), launcher, firstAt ?? 0);
     const toolUnion = unionSpans((subToolsByAgent.get(launcher.toolUseId) ?? []).map((t) => [t.start, t.end] as Span));
     return { toolUseId: launcher.toolUseId, turnId: "", start, end: stop, open: false, isBackground: false, description: launcher.description,
@@ -1788,7 +1809,7 @@ export function deriveTimeBuckets(
     const workEndedAt = running ? undefined : planWorkEnd(b.steps, start, bEnd, intersectSpans(activeUnion, bspan).at(-1)?.[1]);
     const steps: PlanBlockStepView[] = (b.steps ?? []).map(step => {
       const stop = step.startedAt === null ? null : Math.min(step.endedAt ?? end, end);
-      return { key: step.key, number: step.number, title: redactAbsolutePaths(step.title), status: step.status, removed: step.removed,
+      return { key: step.key, number: step.number, title: redactAbsolutePaths(step.title), ...planStepMarks(step), status: step.status, removed: step.removed,
         ...(step.carriedTo === undefined ? {} : { carriedTo: step.carriedTo }),
         startedAt: step.startedAt, endedAt: step.endedAt, end: stop, activeSpans: planStepActiveSpans(step.transitions, end),
         settles: step.transitions.map(({ at, settled }) => settled ? { at, settled } : { at }),
@@ -1938,7 +1959,7 @@ export type CompletionVerdict = { kind: "allow" } | { kind: "running-lanes"; ste
 
 function withMessagePlanCalls(state: TimeBucketState, except?: string): TimeBucketState {
   const current = state.mainMessageId;
-  return Object.entries(state.openTools).reduce((next, [toolUseId, tool]) => toolUseId !== except && tool.lane === "main" && tool.taskIntent !== undefined
+  return Object.entries(state.openTools).reduce((next, [toolUseId, tool]) => toolUseId !== except && countsAsPlanIntent(tool.parentToolUseId) && tool.taskIntent !== undefined
     && tool.taskIntent.kind !== "create" && current !== undefined && tool.messageId === current && tool.turnId === state.openTurn?.turnId
     ? applyPlanTask(next, tool.taskIntent, tool.at, tool.turnId, "", { live: true, toolUseId }) : next, state);
 }
@@ -2166,10 +2187,29 @@ export function overlayLiveTimeBucketState(measured: TimeBucketView, live: TimeB
   const view = overlayLiveTimeBucketStateCore(measured, live);
   if ((live.generationBoundaryAt ?? 0) > (measured.generationBoundaryAt ?? 0)) return view;
   const liveSpans = live.mainModelSpans ?? [];
-  const covered = unionSpans(liveSpans.map(span => [span.start, span.end]));
-  const mainModelSpans = [...(measured.mainModelSpans ?? []).flatMap(span =>
-    subtractSpans([[span.start, span.end]], covered).map(([start, end]) => ({ ...span, start, end }))), ...liveSpans];
+  const measuredSpans = (measured.mainModelSpans ?? []).flatMap(span => withLiveEffort(span, liveSpans));
+  const measuredThrough: Span[] = measured.firstAt === null || measured.lastAt === null ? [] : [[measured.firstAt, measured.lastAt]];
+  const covered = unionSpans([...measuredThrough, ...measuredSpans.map((span): Span => [span.start, span.end])]);
+  const mainModelSpans = [...measuredSpans, ...liveSpans.flatMap(span =>
+    subtractSpans([[span.start, span.end]], covered).map(([start, end]) => ({ ...span, start, end })))].sort((a, b) => a.start - b.start);
   return { ...view, mainModelSpans };
+}
+
+function withLiveEffort(span: MainModelSpan, live: readonly MainModelSpan[]): MainModelSpan[] {
+  if (span.effort !== undefined) return [span];
+  const cuts = [...new Set(live.flatMap(other => [other.start, other.end]).filter(at => at > span.start && at < span.end))].sort((a, b) => a - b);
+  const bounds = [span.start, ...cuts, span.end];
+  return bounds.slice(1).map((end, i) => {
+    const start = bounds[i];
+    const effort = live.find(other => other.start <= start && other.end >= end)?.effort;
+    return { ...span, start, end, ...(effort === undefined ? {} : { effort }) };
+  });
+}
+
+function liveRunsAndMeasures(live: AgentSpanView, measured: AgentSpanView): boolean {
+  if (moreRuns(measured, live) === live) return true;
+  if (moreRuns(live, measured) === measured) return false;
+  return live.toolCount > measured.toolCount || live.toolCount === measured.toolCount && (live.open || measured.open);
 }
 
 function overlayAgentViews(measured: readonly AgentSpanView[], live: readonly AgentSpanView[]): AgentSpanView[] {
@@ -2177,14 +2217,15 @@ function overlayAgentViews(measured: readonly AgentSpanView[], live: readonly Ag
   const agents: AgentSpanView[] = measured.map((a) => {
     const l = liveAgents.get(a.toolUseId);
     if (l === undefined) return a;
-    const liveRuns: RecordedRuns = { earlierRuns: l.earlierRuns, resumedAt: l.resumedAt };
-    const runs = moreRuns<RecordedRuns>({ earlierRuns: a.earlierRuns, resumedAt: a.resumedAt }, liveRuns);
-    const measuresOf = runs === liveRuns && l.runMeasures !== undefined ? l : a;
-    const { runPlacements: _measuredPlacements, runMeasures: _measuredMeasures, ...measuredRest } = a;
-    const runPlacements = (a.runPlacements?.length ?? 0) > (l.runPlacements?.length ?? 0) ? a.runPlacements : l.runPlacements;
-    const attributed = { ...measuredRest, blockId: l.blockId, stepKey: l.stepKey, ...runs, ...(runPlacements === undefined ? {} : { runPlacements }),
-      ...(measuresOf.runMeasures === undefined ? {} : { runMeasures: measuresOf.runMeasures, toolCount: measuresOf.toolCount, failCount: measuresOf.failCount,
-        toolMs: measuresOf.toolMs, generateMs: measuresOf.generateMs }) };
+    const source = liveRunsAndMeasures(l, a) ? l : a;
+    const { runPlacements: _measuredPlacements, runMeasures: _measuredMeasures, earlierRuns: _measuredEarlier, resumedAt: _measuredResumed,
+      resumeStarts: _measuredResumeStarts, ...measuredRest } = a;
+    const attributed = { ...measuredRest, blockId: l.blockId, stepKey: l.stepKey,
+      ...(source.resumeStarts === undefined ? {} : { resumeStarts: source.resumeStarts }),
+      ...(source.earlierRuns === undefined ? {} : { earlierRuns: source.earlierRuns }), ...(source.resumedAt === undefined ? {} : { resumedAt: source.resumedAt }),
+      ...(source.runPlacements === undefined ? {} : { runPlacements: source.runPlacements }),
+      ...(source.runMeasures === undefined ? {} : { runMeasures: source.runMeasures }),
+      toolCount: source.toolCount, failCount: source.failCount, toolMs: source.toolMs, generateMs: source.generateMs };
     if (l.open === a.open) return l.open ? { ...attributed, end: Math.max(a.end, l.end) } : attributed;
     if (l.open) return { ...attributed, open: true, end: Math.max(a.end, l.end), endSource: "open" };
     return { ...attributed, open: false, end: l.end, endSource: l.endSource };
@@ -2281,9 +2322,10 @@ function overlayLiveTimeBucketStateCore(measured: TimeBucketView, live: TimeBuck
   const shown = new Set(blocks.map(block => block.blockId));
   const measuredSpans = new Map<string, { blockId?: string; stepKey?: string }>([...measured.agents, ...measured.backgroundTasks, ...measured.externalRunCalls ?? [],
     ...measured.nestedAgents ?? [], ...measured.nestedExternalRuns ?? [], ...measured.unknownLaunchers ?? []].map(span => [span.toolUseId, span]));
-  const placed = <T extends { toolUseId: string; blockId?: string; stepKey?: string; runPlacements?: RunPlacement[] }>(given: T): T => {
-    const span = given.runPlacements === undefined || given.runPlacements.every(placement => placement.blockId === undefined || shown.has(placement.blockId)) ? given
-      : { ...given, runPlacements: given.runPlacements.filter(placement => placement.blockId === undefined || shown.has(placement.blockId)) };
+  const placed = <T extends { toolUseId: string; blockId?: string; stepKey?: string; runPlacements?: RunPlacement[]; resumeStarts?: number[] }>(given: T): T => {
+    const hidden = new Set((given.runPlacements ?? []).filter(placement => placement.blockId !== undefined && !shown.has(placement.blockId)).map(placement => placement.from));
+    const span = hidden.size === 0 ? given : { ...given, runPlacements: given.runPlacements!.filter(placement => !hidden.has(placement.from)),
+      ...(given.resumeStarts === undefined ? {} : { resumeStarts: given.resumeStarts.filter(at => !hidden.has(at)) }) };
     if (span.blockId === undefined || shown.has(span.blockId)) return span;
     const { blockId: _blockId, stepKey: _stepKey, ...unplaced } = span;
     const kept = measuredSpans.get(span.toolUseId);

@@ -1,11 +1,9 @@
+import { escapeRegExp } from "./regexp-escape";
+
 export const VERBATIM_UTTERANCE_MAX_CHARS = 1000;
 
 const CUT_BEFORE = "\n[... ";
 const CUT_AFTER = " characters omitted here; the full text is in the previous session's transcript ...]\n";
-
-function escapeRegExp(text: string): string {
-  return text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-}
 
 const CUT_RE = new RegExp(`${escapeRegExp(CUT_BEFORE)}(\\d+)${escapeRegExp(CUT_AFTER)}`, "g");
 

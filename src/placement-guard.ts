@@ -1,4 +1,4 @@
-import { ASSIGNMENT_RE, POWERSHELL_ASSIGNMENT_RE, withDollars, programName, segmentProgram, isFdDuplication, shellSyntax, isShellTool, toolDialect, unescapeSequences, hashtableStatements, MAX_SCRIPT_NESTING, QUERY_OPTIONS, type ScanBudget, type ShellDialect, type ShellSegment, type ShellSubshell, type ShellSyntax } from "./shell-tools";
+import { ASSIGNMENT_RE, POWERSHELL_ASSIGNMENT_RE, withDollars, programName, segmentProgram, isFdDuplication, shellSyntax, runsShellCommand, toolDialect, unescapeSequences, hashtableStatements, stringLiteral, MAX_SCRIPT_NESTING, QUERY_OPTIONS, type ScanBudget, type ShellDialect, type ShellSegment, type ShellSubshell, type ShellSyntax } from "./shell-tools";
 import { CLAUDE_EFFORTS, CODEX_EFFORTS, AGY_EFFORTS } from "./orchestration-executors";
 import { resolve, relative as relativePath, isAbsolute, join, basename, dirname, win32, posix } from "node:path";
 import fs, { readdirSync, statSync, readFileSync } from "node:fs";
@@ -7,7 +7,9 @@ import { execFileSync, spawnSync, type ExecFileSyncOptionsWithStringEncoding } f
 import { realPathOrNearestSync, resolveNearestRealPathSync, expandHomePath } from "./path-containment";
 
 export type ProtectedKind = "memory" | "CLAUDE.md" | "AGENTS.md" | "rules";
-export type GuardReason = "cooccurrence" | "model-name" | "shell";
+export type GuardReason = "cooccurrence" | "model-name" | "shell" | "edit-not-applied";
+export const CONTROL_FILE_NAMES: readonly string[] = ["CLAUDE.md", "CLAUDE.local.md", "AGENTS.md"];
+const CONTROL_FILE_NAMES_FOLDED = CONTROL_FILE_NAMES.map(name => name.toLowerCase());
 
 import { MODEL_NOTES_RULE, DELEGATE_CONTROL_RULE, DELEGATE_MEMORY_RULE, DELEGATE_PROPOSAL, type Placement } from "./placement-line";
 export { placementOf } from "./placement-line";
@@ -55,6 +57,7 @@ export function delegateControlRefusal(refusal: ControlRefusal = CONTROL_WRITE):
 }
 
 export const PLACEMENT_UNREADABLE_REFUSAL = `${PLACEMENT_GUARD_REASON_PREFIX} the current content of this protected file could not be read, so the edit cannot be checked. Retry once the file is readable.`;
+export const PLACEMENT_EDIT_NOT_APPLIED_REFUSAL = `${PLACEMENT_GUARD_REASON_PREFIX} old_string was not found in the current content of this protected file, so the edit cannot be checked. Read the file again and resend the edit with old_string copied exactly from it.`;
 export const PLACEMENT_GUARD_REFUSAL = `${PLACEMENT_GUARD_REASON_PREFIX} this write targets persistent instructions. Session-only instructions are not persisted; keep them in this conversation. ${MODEL_NOTES_RULE}; standing model choices belong in roster or conductor policy settings. Please do not retry by removing or paraphrasing names. Please use Write or Edit for shell writes so the content can be checked.`;
 
 export const PLACEMENT_EFFORT_WORDS: readonly string[] = Object.freeze([...new Set<string>([...CLAUDE_EFFORTS, ...CODEX_EFFORTS, ...AGY_EFFORTS])]);
@@ -104,16 +107,22 @@ function modelContext(text: string): boolean {
   return MODEL_WORD_RE.test(text) || new Set(text.match(CAPITALISED_ALIAS_RE) ?? []).size >= 2;
 }
 
+const comparableText = (line: string): string => line.normalize("NFKC").replace(/\p{Cf}/gu, "");
+
 export function lineVerdict(line: string, vocabulary: CompiledVocabulary): LineVerdict {
-  const products = line.replace(PRODUCT_TERMS_RE, " ");
+  const products = comparableText(line).replace(PRODUCT_TERMS_RE, " ");
   const text = modelContext(products) ? products : products.replace(BARE_ALIAS_RE, " ");
   const cooccurrence = !!vocabulary.names?.test(text) && (!!vocabulary.qualifiers?.test(text) || STRENGTH_CLAIM_RE.test(text));
   const modelName = MODEL_NAME_PATTERNS.some((re) => re.test(text)) || !!vocabulary.listed?.test(text);
   return { cooccurrence, modelName };
 }
 
+function lfText(text: string): string {
+  return text.replace(/\r\n?/g, "\n");
+}
+
 function splitLines(text: string): string[] {
-  return text.replace(/\r\n?/g, "\n").split("\n");
+  return lfText(text).split("\n");
 }
 
 export function addedLines(before: string | undefined, after: string): string[] {
@@ -133,22 +142,42 @@ export interface EditOperation {
   readonly replace_all?: boolean;
 }
 
-export function applyEdits(content: string, edits: readonly EditOperation[]): string | undefined {
-  let result = content;
+const straightQuotes = (text: string): string => text.replace(/[‘’]/g, "'").replace(/[“”]/g, '"');
+
+function matchedText(content: string, searched: string): string | undefined {
+  if (content.includes(searched)) return searched;
+  const at = straightQuotes(content).indexOf(straightQuotes(searched));
+  return at < 0 ? undefined : content.slice(at, at + searched.length);
+}
+
+export function applyEdits(content: string | undefined, edits: readonly EditOperation[]): string | undefined {
+  let result = lfText(content ?? "");
   for (const edit of edits) {
-    if (typeof edit.old_string !== "string" || typeof edit.new_string !== "string" || edit.old_string === "" || !result.includes(edit.old_string)) return undefined;
-    result = edit.replace_all ? result.split(edit.old_string).join(edit.new_string) : result.replace(edit.old_string, () => edit.new_string);
+    if (typeof edit?.old_string !== "string" || typeof edit.new_string !== "string") return undefined;
+    const searched = lfText(edit.old_string), after = lfText(edit.new_string);
+    if (searched === "") {
+      if (result.trim() !== "") return undefined;
+      result = after;
+      continue;
+    }
+    const before = matchedText(result, searched);
+    if (before === undefined) return undefined;
+    result = edit.replace_all ? result.split(before).join(after) : result.replace(before, () => after);
   }
   return result;
 }
+
+const foldsCase = (platform: NodeJS.Platform): boolean => platform === "win32" || platform === "darwin";
 
 function normalizedPath(value: string, platform: NodeJS.Platform): string {
   let text = value.trim().replace(/\\/g, "/");
   if (platform === "win32") {
     const msys = /^\/([a-zA-Z])(\/.*)?$/.exec(text);
     if (msys) text = `${msys[1]}:${msys[2] ?? "/"}`;
-    text = text.toLowerCase();
+    const parts = text.split("/");
+    text = parts.map((part, i) => /^\.+$/.test(part) ? part : part.replace(i === parts.length - 1 ? /[. ]+$/ : /\.+$/, "")).join("/");
   }
+  if (foldsCase(platform)) text = text.toLowerCase();
   return text.replace(/\/+/g, "/");
 }
 
@@ -227,20 +256,22 @@ export function controlFileContext(configDir: string) {
 }
 type ControlFileContext = ReturnType<typeof controlFileContext>;
 
+function lexicalProtectedKind(path: string, configDir: string, platform: NodeJS.Platform): ProtectedKind | undefined {
+  const config = normalizedPath(configDir, platform).replace(/\/$/, "");
+  const target = normalizedPath(path, platform);
+  const name = target.split("/").pop() ?? "";
+  const fold = (value: string) => foldsCase(platform) ? value.toLowerCase() : value;
+  const underConfig = (sub: string) => target === `${config}/${sub}` || target.startsWith(`${config}/${sub}/`) || target.startsWith(`~/.claude/${sub}/`) || target.startsWith(`$home/.claude/${sub}/`);
+  if (new RegExp(`^${escape(config)}/projects/[^/]+/memory(?:/|$)`).test(target) || /(^|\/)\.claude\/projects\/[^/]+\/memory(?:\/|$)/.test(target)) return "memory";
+  if ([fold("CLAUDE.md"), fold("CLAUDE.local.md")].includes(name)) return "CLAUDE.md";
+  if (name === fold("AGENTS.md")) return "AGENTS.md";
+  if (underConfig("rules") || /(^|\/)\.claude\/rules(?:\/|$)/.test(target)) return "rules";
+  return undefined;
+}
+
 export function protectedDestination(filePath: string, configDir: string, platform: NodeJS.Platform = process.platform, context?: ControlFileContext): ProtectedKind | undefined {
   const requested = platform === process.platform ? placementPath(filePath, process.cwd(), false) ?? filePath : filePath;
-  const config = normalizedPath(configDir, platform).replace(/\/$/, "");
-  const classify = (path: string): ProtectedKind | undefined => {
-    const target = normalizedPath(path, platform);
-    const name = target.split("/").pop() ?? "";
-    const fold = (value: string) => platform === "win32" ? value.toLowerCase() : value;
-    const underConfig = (sub: string) => target === `${config}/${sub}` || target.startsWith(`${config}/${sub}/`) || target.startsWith(`~/.claude/${sub}/`) || target.startsWith(`$home/.claude/${sub}/`);
-    if (new RegExp(`^${escape(config)}/projects/[^/]+/memory(?:/|$)`).test(target) || /(^|\/)\.claude\/projects\/[^/]+\/memory(?:\/|$)/.test(target)) return "memory";
-    if ([fold("CLAUDE.md"), fold("CLAUDE.local.md")].includes(name)) return "CLAUDE.md";
-    if (name === fold("AGENTS.md")) return "AGENTS.md";
-    if (underConfig("rules") || /(^|\/)\.claude\/rules(?:\/|$)/.test(target)) return "rules";
-    return undefined;
-  };
+  const classify = (path: string) => lexicalProtectedKind(path, configDir, platform);
   const lexical = classify(requested);
   if (lexical || platform !== process.platform) return lexical;
   const canonical = canonicalPlacement(requested);
@@ -277,7 +308,7 @@ export function protectedDestination(filePath: string, configDir: string, platfo
 export function isControlPath(filePath: string, configDir: string, platform: NodeJS.Platform = process.platform): boolean {
   const target = normalizedPath(filePath, platform);
   const config = normalizedPath(configDir, platform).replace(/\/$/, "");
-  const names = platform === "win32" ? ["claude.md", "claude.local.md", "agents.md"] : ["CLAUDE.md", "CLAUDE.local.md", "AGENTS.md"];
+  const names = foldsCase(platform) ? CONTROL_FILE_NAMES_FOLDED : CONTROL_FILE_NAMES;
   return names.includes(target.slice(target.lastIndexOf("/") + 1))
     || /(^|\/)\.claude$/.test(target)
     || /(^|\/)\.claude\/(?:settings(?:\.local)?\.json$|(?:rules|hooks)(?:\/|$)|projects\/[^/]+\/memory(?:\/|$))/.test(target)
@@ -320,7 +351,6 @@ export interface GuardDecision {
   readonly reasons: readonly GuardReason[];
   readonly examinedLines: number;
   readonly blockedLines: readonly string[];
-  readonly skipped?: "edit-does-not-apply";
   readonly refusal?: ControlRefusal;
 }
 
@@ -328,17 +358,25 @@ function inputRecord(input: unknown): Record<string, unknown> {
   return input && typeof input === "object" ? input as Record<string, unknown> : {};
 }
 
-export function resultingContent(tool: string, input: unknown, current: string | undefined): string | undefined {
-  const value = inputRecord(input);
-  if (tool === "Write") return typeof value.content === "string" ? value.content : undefined;
-  if (current === undefined) return undefined;
-  if (tool === "Edit") return applyEdits(current, [value as unknown as EditOperation]);
-  if (tool === "MultiEdit") return Array.isArray(value.edits) ? applyEdits(current, value.edits as EditOperation[]) : undefined;
+function editOperations(tool: string, value: Record<string, unknown>): EditOperation[] | undefined {
+  if (tool === "Edit") return [value as unknown as EditOperation];
+  if (tool === "MultiEdit") return Array.isArray(value.edits) ? value.edits as EditOperation[] : undefined;
   return undefined;
 }
 
+type WrittenContent = { readonly after: string } | { readonly unapplied: true } | undefined;
+
+function writtenContent(tool: string, input: unknown, current: string | undefined): WrittenContent {
+  const value = inputRecord(input);
+  if (tool === "Write") return typeof value.content === "string" ? { after: value.content } : undefined;
+  const edits = editOperations(tool, value);
+  if (!edits) return undefined;
+  const after = applyEdits(current, edits);
+  return after === undefined ? { unapplied: true } : { after };
+}
+
 export type MemoryActor = "conductor" | "delegate";
-export type MemoryReason = "delegate" | "untyped" | "type" | "index-target-missing" | "index-line";
+export type MemoryReason = "delegate" | "untyped" | "type" | "index-target-missing" | "index-line" | "edit-not-applied";
 
 export interface MemoryDecision {
   readonly destination?: "memory";
@@ -346,7 +384,6 @@ export interface MemoryDecision {
   readonly reasons: MemoryReason[];
   readonly blockedLines: string[];
   readonly type?: string;
-  readonly skipped?: "edit-does-not-apply";
 }
 
 const MEMORY_METADATA_KEY = "metadata";
@@ -370,8 +407,13 @@ function memoryTopicType(content: string, memoryTypes: readonly string[]): { typ
   return { type, reason: types.length === 1 && /^[a-z]+$/.test(type) && memoryTypes.includes(type) ? undefined : "type" };
 }
 
+export function readGuardedFile(path: string): string {
+  const bytes = readFileSync(path);
+  return bytes.toString(bytes[0] === 0xff && bytes[1] === 0xfe ? "utf16le" : "utf8");
+}
+
 function readMemoryFile(path: string): string | undefined {
-  try { return readFileSync(path, "utf8"); } catch { return undefined; }
+  try { return readGuardedFile(path); } catch { return undefined; }
 }
 
 export function judgeMemoryWrite(tool: string, input: unknown, current: string | undefined, actor: MemoryActor, memoryTypes: readonly string[], configDir: string,
@@ -380,9 +422,10 @@ export function judgeMemoryWrite(tool: string, input: unknown, current: string |
   if (typeof filePath !== "string" || protectedDestination(filePath, configDir, platform) !== "memory") return { blocked: false, reasons: [], blockedLines: [] };
   const destination = "memory";
   if (actor === "delegate") return { destination, blocked: true, reasons: ["delegate"], blockedLines: [] };
-  const after = resultingContent(tool, input, current);
-  if (after === undefined) return { destination, blocked: false, reasons: [], blockedLines: [], skipped: "edit-does-not-apply" };
-  if (after.trim() === "") return { destination, blocked: false, reasons: [], blockedLines: [] };
+  const content = writtenContent(tool, input, current);
+  if (content && "unapplied" in content) return { destination, blocked: true, reasons: ["edit-not-applied"], blockedLines: [] };
+  if (content === undefined || content.after.trim() === "") return { destination, blocked: false, reasons: [], blockedLines: [] };
+  const after = content.after;
   const additions = addedLines(current?.replace(/^﻿/, ""), after.replace(/^﻿/, "")).filter(line => line.trim() !== "");
   if (!additions.length) return { destination, blocked: false, reasons: [], blockedLines: [] };
   const path = platform === "win32" ? win32 : posix;
@@ -422,6 +465,7 @@ export function judgeMemoryWrite(tool: string, input: unknown, current: string |
 }
 
 export function memoryGuardReason(decision: MemoryDecision, placement: Placement): string {
+  if (decision.reasons.includes("edit-not-applied")) return PLACEMENT_EDIT_NOT_APPLIED_REFUSAL;
   const reason = decision.reasons.includes("delegate") ? `${DELEGATE_MEMORY_RULE}; delegates must not write memory` : "this memory write has an invalid topic type or index entry";
   return `${PLACEMENT_GUARD_REASON_PREFIX} ${reason}. ${placement.memoryDestination}. Topic frontmatter must contain only single-line key: value lines (top level, or indented two spaces under metadata:) with one plain type in [${placement.memoryTypes.join(", ")}]; index additions must link to existing, typed topic files in the same directory. Do not retry by changing the type.`;
 }
@@ -431,10 +475,10 @@ export function judgeFileWrite(tool: string, input: unknown, current: string | u
   const filePath = inputRecord(input).file_path;
   const destination = typeof filePath === "string" ? protectedDestination(filePath, configDir, platform) : undefined;
   if (destination === undefined) return { blocked: false, reasons: [], examinedLines: 0, blockedLines: [] };
-  const after = resultingContent(tool, input, current);
-  if (after === undefined) return { destination, blocked: false, reasons: [], examinedLines: 0, blockedLines: [], skipped: "edit-does-not-apply" };
-  if (!vocabulary) return { destination, blocked: false, reasons: [], examinedLines: 0, blockedLines: [] };
-  const lines = addedLines(current, after);
+  const content = writtenContent(tool, input, current);
+  if (content && "unapplied" in content) return { destination, blocked: true, reasons: ["edit-not-applied"], examinedLines: 0, blockedLines: [] };
+  if (content === undefined || !vocabulary) return { destination, blocked: false, reasons: [], examinedLines: 0, blockedLines: [] };
+  const lines = addedLines(current, content.after);
   const reasons = new Set<GuardReason>();
   const blockedLines: string[] = [];
   for (const line of lines) {
@@ -449,19 +493,67 @@ export function judgeFileWrite(tool: string, input: unknown, current: string | u
 const REDIRECT_RE = /^(?:\d*|&|\*)>>?[|&]?$/;
 const INPUT_REDIRECT_RE = /^\d*<(?:&[\d-]*)?$/;
 const CONTENT_CMDLETS = new Set(["set-content", "add-content", "clear-content", "out-file", "new-item", "tee", "tee-object"]);
-const POWERSHELL_CMDLET_ALIASES: ReadonlyMap<string, string> = new Map([
-  ["ni", "new-item"], ["sc", "set-content"], ["ac", "add-content"], ["clc", "clear-content"], ["rni", "rename-item"], ["ren", "rename-item"],
-  ["rm", "remove-item"], ["del", "remove-item"], ["erase", "remove-item"], ["ri", "remove-item"], ["rmdir", "remove-item"], ["rd", "remove-item"],
-]);
+const CONTENT_FROM_PIPELINE_CMDLETS: ReadonlySet<string> = new Set(["set-content", "add-content", "clear-content", "new-item"]);
+const POWERSHELL_ALIASES: ReadonlyMap<string, string> = new Map(`
+  %=foreach-object ?=where-object ac=add-content asnp=add-pssnapin cat=get-content cd=set-location cfs=convertfrom-string chdir=set-location clc=clear-content clear=clear-host
+  clhy=clear-history cli=clear-item clp=clear-itemproperty cls=clear-host clv=clear-variable cnsn=connect-pssession compare=compare-object copy=copy-item cp=copy-item cpi=copy-item
+  cpp=copy-itemproperty curl=invoke-webrequest cvpa=convert-path dbp=disable-psbreakpoint del=remove-item diff=compare-object dir=get-childitem dnsn=disconnect-pssession
+  ebp=enable-psbreakpoint echo=write-output epal=export-alias epcsv=export-csv epsn=export-pssession erase=remove-item etsn=enter-pssession exsn=exit-pssession fc=format-custom
+  fhx=format-hex fl=format-list ft=format-table fw=format-wide gal=get-alias gbp=get-psbreakpoint gc=get-content gci=get-childitem gcm=get-command gcs=get-pscallstack
+  gdr=get-psdrive ghy=get-history gi=get-item gjb=get-job gl=get-location gm=get-member gmo=get-module gp=get-itemproperty gps=get-process gpv=get-itempropertyvalue group=group-object
+  gsn=get-pssession gsnp=get-pssnapin gsv=get-service gu=get-unique gv=get-variable gwmi=get-wmiobject h=get-history history=get-history icm=invoke-command iex=invoke-expression
+  ihy=invoke-history ii=invoke-item ipal=import-alias ipcsv=import-csv ipmo=import-module ipsn=import-pssession irm=invoke-restmethod ise=powershell_ise.exe iwmi=invoke-wmimethod
+  iwr=invoke-webrequest kill=stop-process lp=out-printer ls=get-childitem man=help md=mkdir measure=measure-object mi=move-item mount=new-psdrive move=move-item mp=move-itemproperty
+  mv=move-item nal=new-alias ndr=new-psdrive ni=new-item nmo=new-module npssc=new-pssessionconfigurationfile nsn=new-pssession nv=new-variable ogv=out-gridview oh=out-host
+  popd=pop-location ps=get-process pushd=push-location pwd=get-location r=invoke-history rbp=remove-psbreakpoint rcjb=receive-job rcsn=receive-pssession rd=remove-item
+  rdr=remove-psdrive ren=rename-item ri=remove-item rjb=remove-job rm=remove-item rmdir=remove-item rmo=remove-module rni=rename-item rnp=rename-itemproperty rp=remove-itemproperty
+  rsn=remove-pssession rsnp=remove-pssnapin rujb=resume-job rv=remove-variable rvpa=resolve-path rwmi=remove-wmiobject sajb=start-job sal=set-alias saps=start-process
+  sasv=start-service sbp=set-psbreakpoint sc=set-content select=select-object set=set-variable shcm=show-command si=set-item sl=set-location sleep=start-sleep sls=select-string
+  sort=sort-object sp=set-itemproperty spjb=stop-job spps=stop-process spsv=stop-service start=start-process sujb=suspend-job sv=set-variable swmi=set-wmiinstance tee=tee-object
+  trcm=trace-command type=get-content wget=invoke-webrequest where=where-object wjb=wait-job write=write-output
+`.trim().split(/\s+/).map(entry => entry.split("=") as [string, string]));
+const CROSS_DIALECT_CMDLETS: ReadonlyMap<string, string> = new Map(["ni", "sc", "ac", "clc", "rni", "ren", "iwr", "irm", "rm", "del", "erase", "ri", "rmdir", "rd"]
+  .map(alias => [alias, POWERSHELL_ALIASES.get(alias)!]));
+const ALIAS_DEFINING_CMDLETS: ReadonlySet<string> = new Set(["set-alias", "new-alias"]);
+const ALIAS_HOPS = 8;
+
+function commandName(word: string, dialect: ShellDialect, scope?: ShellScope): string {
+  let name = programName(word);
+  if (dialect !== "powershell") return CROSS_DIALECT_CMDLETS.get(name) ?? name;
+  for (let hop = 0; hop < ALIAS_HOPS; hop++) {
+    const next = (scope && scopeEntry(scope, current => current.aliases, name)) ?? POWERSHELL_ALIASES.get(name);
+    if (next === undefined || next === null) break;
+    name = next;
+  }
+  return name;
+}
 const COPY_PROGRAMS = new Set(["cp", "mv", "ln", "copy", "move"]);
-const COPY_CMDLETS = new Set(["copy-item", "move-item", "cpi", "mi"]);
+const COPY_CMDLETS = new Set(["copy-item", "move-item"]);
 const GIT_VALUE_OPTIONS = new Set(["-C", "-c", "--git-dir", "--work-tree", "--namespace", "--config-env"]);
 const POWERSHELL_PROGRAMS: ReadonlySet<string> = new Set(["pwsh", "powershell"]);
 const INLINE_RUNNERS = new Set(["python", "python3", "node", ...POWERSHELL_PROGRAMS]);
 const INLINE_FLAGS = new Set(["-c", "-e", "-command", "--eval", "-p"]);
+const PYTHON_STRING_PREFIX = "(?:[rRbBuU]{1,2})?";
+const PYTHON_WRITE_MODE = String.raw`${PYTHON_STRING_PREFIX}['"](?:[wax][bt+]*|r[bt]*\+[bt+]*)['"]`;
+const PYTHON_KEYWORD_ARGUMENT = String.raw`[A-Za-z_]\w*\s*=\s*(?:'[^'\n]*'|"[^"\n]*"|[\w.-]+)\s*,\s*`;
+const PYTHON_WRITE_PATTERNS: readonly RegExp[] = [
+  new RegExp(String.raw`\bopen\s*\(\s*(?:file\s*=\s*)?${PYTHON_STRING_PREFIX}(['"])(?<path>(?:(?!\1)[^\n])*)\1\s*,\s*(?:(?:${PYTHON_KEYWORD_ARGUMENT})*mode\s*=\s*)?${PYTHON_WRITE_MODE}`, "g"),
+  new RegExp(String.raw`\b(?:Path|pathlib\.Path)\s*\(\s*${PYTHON_STRING_PREFIX}(['"])(?<path>(?:(?!\1)[^\n])*)\1\s*\)\.(?:write_text|write_bytes)\s*\(`, "g"),
+];
+const NODE_WRITE_PATTERNS: readonly RegExp[] = [
+  /(?<![\w$])(?:writeFile(?:Sync)?|appendFile(?:Sync)?|createWriteStream)\s*\(\s*(['"`])(?<path>(?:(?!\1|\$\{)[^\n])*)\1/g,
+];
+const INLINE_VALUE_OPTIONS: ReadonlySet<string> = new Set(["-W", "-X", "--check-hash-based-pycs", "-r", "--require", "--import", "--input-type"]);
+const NODE_SCRIPT_FILE = /\.[cm]?[jt]sx?$/i;
+
+export function optionValueUnknown(program: string, option: string): boolean {
+  return program === "node" && option.startsWith("-") && !option.includes("=") && !option.startsWith("--no-") && !INLINE_VALUE_OPTIONS.has(option);
+}
 const POWERSHELL_COMMON_VALUES = ["erroraction", "warningaction", "informationaction", "errorvariable", "warningvariable", "informationvariable", "outvariable", "outbuffer", "pipelinevariable"];
 const POWERSHELL_PROVIDER_VALUES = ["path", "literalpath", "filter", "include", "exclude", "credential"];
 const POWERSHELL_WRITE_SWITCHES = ["force", "whatif", "confirm", "usetransaction"];
+const ANY_CMDLET = "*", EXPORT_CMDLET = "export-*";
+const CMDLET_NAME = /^[a-z]+-[a-z]/;
 const POWERSHELL_PARAMETERS: Record<string, { values: readonly string[]; switches: readonly string[] }> = {
   "set-content": { values: [...POWERSHELL_PROVIDER_VALUES, "value", "encoding", "stream"], switches: [...POWERSHELL_WRITE_SWITCHES, "passthru", "nonewline"] },
   "add-content": { values: [...POWERSHELL_PROVIDER_VALUES, "value", "encoding", "stream"], switches: [...POWERSHELL_WRITE_SWITCHES, "passthru", "nonewline"] },
@@ -473,6 +565,11 @@ const POWERSHELL_PARAMETERS: Record<string, { values: readonly string[]; switche
   "rename-item": { values: ["path", "literalpath", "newname", "credential"], switches: [...POWERSHELL_WRITE_SWITCHES, "passthru"] },
   "new-item": { values: ["path", "name", "itemtype", "value", "credential"], switches: POWERSHELL_WRITE_SWITCHES },
   "tee-object": { values: ["filepath", "literalpath", "inputobject", "variable"], switches: ["append"] },
+  "join-path": { values: ["path", "childpath", "additionalchildpath", "credential"], switches: ["resolve"] },
+  "set-alias": { values: ["name", "value", "description", "option", "scope"], switches: ["passthru", "force", "whatif", "confirm"] },
+  "new-alias": { values: ["name", "value", "description", "option", "scope"], switches: ["passthru", "force", "whatif", "confirm"] },
+  [ANY_CMDLET]: { values: ["outfile"], switches: [] },
+  [EXPORT_CMDLET]: { values: ["path", "literalpath", "filepath", "outfile"], switches: [] },
 };
 const POWERSHELL_PARAMETER_ALIASES: Record<string, string> = {
   pspath: "literalpath", nooverwrite: "noclobber", type: "itemtype", target: "value", vb: "verbose", db: "debug",
@@ -504,25 +601,104 @@ function powershellArguments(program: string, args: readonly string[]) {
   return { named, positional, uncertain };
 }
 
-function executablePositions(script: string): (position: number) => boolean {
-  let quote = "", comment = "", i = 0;
-  return position => {
-    for (; i < position; i++) {
-      if (comment) {
-        if (comment === "line" && script[i] === "\n") comment = "";
-        else if (comment === "block" && script[i] === "*" && script[i + 1] === "/") { comment = ""; i++; }
-        continue;
+type ScriptLanguage = "python" | "node" | "shell";
+type ScanMode = "code" | "'" | '"' | "`" | "'''" | '"""' | "line" | "block" | "regex" | "class";
+interface ScanFrame { readonly mode: ScanMode; readonly interpolated: boolean; readonly depth: number }
+interface ScanState { readonly mode: ScanMode; readonly interpolated: boolean; readonly frames: readonly ScanFrame[]; readonly skip: number }
+
+const NODE_KEYWORDS_BEFORE_REGEX: ReadonlySet<string> = new Set(["return", "typeof", "instanceof", "case", "do", "else", "in", "of", "void", "yield", "await", "delete", "throw", "new", "extends"]);
+const MAX_SCAN_STATES = 16;
+const MAX_SCAN_FRAMES = 16;
+const CODE_STATE: ScanState = { mode: "code", interpolated: false, frames: [], skip: 0 };
+
+function slashReading(script: string, at: number): "regex" | "division" | "either" {
+  let end = at - 1;
+  while (end >= 0 && /\s/.test(script[end])) end--;
+  if (end < 0) return "regex";
+  const last = script[end];
+  if (/[\w$]/.test(last)) {
+    let start = end;
+    while (start > 0 && /[\w$]/.test(script[start - 1])) start--;
+    const word = script.slice(start, end + 1);
+    return !/^\d/.test(word) && NODE_KEYWORDS_BEFORE_REGEX.has(word) && script[start - 1] !== "." ? "either" : "division";
+  }
+  if ("'\"`".includes(last)) return "division";
+  if (")]}/".includes(last) || (last === "+" || last === "-") && script[end - 1] === last) return "either";
+  return "regex";
+}
+
+function pythonInterpolated(script: string, quote: number): boolean {
+  let start = quote;
+  while (start > quote - 2 && start > 0 && /[A-Za-z]/.test(script[start - 1])) start--;
+  return !(start > 0 && /\w/.test(script[start - 1])) && /[ft]/i.test(script.slice(start, quote));
+}
+
+function scanStep(state: ScanState, script: string, i: number, language: ScriptLanguage, slash: () => ReturnType<typeof slashReading>): ScanState[] {
+  if (state.skip) return [{ ...state, skip: state.skip - 1 }];
+  const ch = script[i], next = script[i + 1];
+  const to = (mode: ScanMode, skip = 0, interpolated = false): ScanState => ({ mode, interpolated, frames: state.frames, skip });
+  const open = (skip: number): ScanState => ({ mode: "code", interpolated: false, frames: [...state.frames, { mode: state.mode, interpolated: state.interpolated, depth: 0 }], skip });
+  switch (state.mode) {
+    case "code": {
+      if (ch === "#" && (language !== "node" || i === 0 && next === "!")) return [to("line")];
+      if (language !== "python" && ch === "/" && next === "/") return [to("line")];
+      if (language !== "python" && ch === "/" && next === "*") return [to("block", 1)];
+      if (ch === "'" || ch === '"') {
+        const interpolated = language === "python" && pythonInterpolated(script, i);
+        if (language === "python" && script[i + 1] === ch && script[i + 2] === ch) return [to(ch === "'" ? "'''" : '"""', 2, interpolated)];
+        return [to(ch, 0, interpolated)];
       }
-      if (quote) { if (script[i] === "\\") i++; else if (script[i] === quote) quote = ""; continue; }
-      if (script[i] === "#" || script[i] === "/" && script[i + 1] === "/") { comment = "line"; continue; }
-      if (script[i] === "/" && script[i + 1] === "*") { comment = "block"; i++; continue; }
-      if (["'", '"', "`"].includes(script[i])) quote = script[i];
+      if (ch === "`" && language !== "python") return [to("`", 0, language === "node")];
+      if (ch === "/" && language === "node") {
+        const reading = slash();
+        return reading === "regex" ? [to("regex")] : reading === "either" ? [to("regex"), state] : [state];
+      }
+      const top = state.frames[state.frames.length - 1];
+      if (top && ch === "{") return [{ ...state, frames: [...state.frames.slice(0, -1), { ...top, depth: top.depth + 1 }] }];
+      if (top && ch === "}") return [top.depth ? { ...state, frames: [...state.frames.slice(0, -1), { ...top, depth: top.depth - 1 }] }
+        : { mode: top.mode, interpolated: top.interpolated, frames: state.frames.slice(0, -1), skip: 0 }];
+      return [state];
     }
-    return !quote && !comment;
+    case "'": case '"': case "`": case "'''": case '"""': {
+      if (ch === "\\") return [{ ...state, skip: 1 }];
+      if (state.mode.length === 3 ? script.startsWith(state.mode, i) : ch === state.mode) return [to("code", state.mode.length - 1)];
+      if (ch === "\n" && state.mode.length === 1 && state.mode !== "`" && language !== "shell") return [to("code")];
+      if (!state.interpolated) return [state];
+      if (state.mode === "`") return ch === "$" && next === "{" ? [open(1)] : [state];
+      if (ch === "{") return next === "{" ? [{ ...state, skip: 1 }] : [open(0)];
+      return [state];
+    }
+    case "line": return [ch === "\n" ? to("code") : state];
+    case "block": return [ch === "*" && next === "/" ? to("code", 1) : state];
+    case "regex": return ch === "\\" ? [{ ...state, skip: 1 }] : ch === "[" ? [to("class")] : ch === "/" ? [to("code")] : ch === "\n" ? [] : [state];
+    case "class": return ch === "\\" ? [{ ...state, skip: 1 }] : ch === "]" ? [to("regex")] : ch === "\n" ? [] : [state];
+  }
+}
+
+const scanKey = (state: ScanState): string => `${state.mode}${state.interpolated ? "i" : ""}${state.skip}${state.frames.map(frame => `/${frame.mode}${frame.interpolated ? "i" : ""}${frame.depth}`).join("")}`;
+
+function executablePositions(script: string, language: ScriptLanguage): (position: number) => boolean {
+  let states: ScanState[] = [CODE_STATE], i = 0, everything = false;
+  return position => {
+    for (; i < position && !everything; i++) {
+      let slash: ReturnType<typeof slashReading> | undefined;
+      const reading = () => slash ??= slashReading(script, i);
+      const stepped = states.flatMap(state => scanStep(state, script, i, language, reading));
+      const seen = new Set<string>();
+      states = stepped.length === 1 ? stepped : stepped.filter(state => { const key = scanKey(state); return !seen.has(key) && !!seen.add(key); });
+      if (!states.length) states = [CODE_STATE];
+      everything = states.length > MAX_SCAN_STATES || states.some(state => state.frames.length > MAX_SCAN_FRAMES);
+    }
+    return everything || states.some(state => state.mode === "code" && !state.skip);
   };
 }
 
 const CONTROL_SCAN_LIMIT = 20_000;
+
+function stdinBodies(segment: ShellSegment): { body: string; expands: boolean }[] {
+  if (segment.heredocs.length) return segment.heredocs.map(doc => ({ body: doc.body, expands: !doc.literal }));
+  return segment.operators.filter(i => segment.words[i] === "<<<" && i + 1 < segment.words.length).map(i => ({ body: segment.words[i + 1], expands: true }));
+}
 
 function pathListItems(segment: ShellSegment, word: string): string[] {
   return [...new Set([...segment.listItems.get(word) ?? [], word])];
@@ -562,9 +738,9 @@ function containsControlLocation(path: string, configDir: string): FolderControl
     try { entries = readdirSync(real, { withFileTypes: true }); } catch { return { kind: "folder-unreadable", path: relative || "." }; }
     for (const entry of entries) {
       if (++entriesSeen > CONTROL_SCAN_LIMIT) return { kind: "folder-scan-limit", path: "." };
-      const name = process.platform === "win32" ? entry.name.toLowerCase() : entry.name;
+      const name = foldsCase(process.platform) ? entry.name.toLowerCase() : entry.name;
       const childRelative = below(relative, entry.name);
-      if ((process.platform === "win32" ? [".claude", "claude.md", "claude.local.md", "agents.md"] : [".claude", "CLAUDE.md", "CLAUDE.local.md", "AGENTS.md"]).includes(name)) {
+      if ([".claude", ...(foldsCase(process.platform) ? CONTROL_FILE_NAMES_FOLDED : CONTROL_FILE_NAMES)].includes(name)) {
         return { kind: name === ".claude" ? "folder-control-dir" : "folder-control-file", path: childRelative };
       }
       const child = join(real, entry.name);
@@ -594,7 +770,7 @@ function globCouldMatch(pattern: string, name: string, platform: NodeJS.Platform
     else if (char === "," && braces) expression += "|";
     else expression += escape(char);
   }
-  try { return new RegExp("^" + expression + "$", platform === "win32" ? "i" : "").test(name); }
+  try { return new RegExp("^" + expression + "$", foldsCase(platform) ? "i" : "").test(name); }
   catch { return true; }
 }
 
@@ -647,8 +823,8 @@ function recursiveCopyControls(source: string, destination: string, configDir: s
   return false;
 }
 
-const CONTROL_PATHSPECS = ["**/CLAUDE.md", "**/CLAUDE.local.md", "**/AGENTS.md", "**/.claude", "**/.claude/settings*.json", "**/.claude/rules/**", "**/.claude/hooks/**", "**/.claude/projects/*/memory/**"]
-  .map(path => (process.platform === "win32" ? ":(top,glob,icase)" : ":(top,glob)") + path);
+const CONTROL_PATHSPECS = [...CONTROL_FILE_NAMES.map(name => `**/${name}`), "**/.claude", "**/.claude/settings*.json", "**/.claude/rules/**", "**/.claude/hooks/**", "**/.claude/projects/*/memory/**"]
+  .map(path => (foldsCase(process.platform) ? ":(top,glob,icase)" : ":(top,glob)") + path);
 
 type GitCache = Map<string, ControlRefusal | false>;
 
@@ -742,7 +918,7 @@ const STASH_ROUND_TRIP_GIT = new Set(["stash", ...GIT_READ_ONLY]);
 const STASH_ROUND_TRIP_ACTIONS = new Set(["push", "save", "pop", "apply", "list", "show", "drop"]);
 const SCRIPT_SHELLS = new Set(["bash", "sh", "zsh", "dash", "ksh", "fish"]);
 const STDIN_SHELLS = new Set([...SCRIPT_SHELLS, "cmd", ...POWERSHELL_PROGRAMS]);
-const POWERSHELL_SCRIPT_RUNNERS = new Set(["iex", "invoke-expression"]);
+const POWERSHELL_SCRIPT_RUNNERS = new Set(["invoke-expression"]);
 const SCRIPT_RUNNERS = new Set([...POWERSHELL_SCRIPT_RUNNERS, "eval", "trap"]);
 const OPAQUE_RUNNERS = new Set([...STDIN_SHELLS, ...SCRIPT_RUNNERS, "source", ".", "xargs", "parallel", "find",
   "alias", "function", "start-process"]);
@@ -775,8 +951,27 @@ function parenthesizedLiteral(word: string, budget: ScanBudget): string | undefi
   if (start === 0) return undefined;
   const syntax = shellSyntax(word.slice(start, end), "powershell", budget);
   const [segment] = syntax.segments;
-  return syntax.balanced && syntax.segments.length === 1 && segment.words.length === 1 && segment.quoted.includes(0)
-    && !segment.substitutions.length && !segment.blocks.length && !segment.operators.length ? segment.words[0] : undefined;
+  return syntax.balanced && syntax.segments.length === 1 && segment.words.length === 1
+    && !segment.substitutions.length && !segment.blocks.length && !segment.operators.length ? stringLiteral(segment, 0) : undefined;
+}
+
+function joinPathWord(word: string, budget: ScanBudget): string | undefined {
+  const inner = /^\s*\(([\s\S]*)\)\s*$/.exec(word)?.[1];
+  if (inner === undefined) return undefined;
+  const syntax = shellSyntax(inner, "powershell", budget);
+  const [segment] = syntax.segments;
+  if (!syntax.balanced || syntax.segments.length !== 1 || segment.words[0]?.toLowerCase() !== "join-path"
+    || segment.blocks.length || segment.operators.length) return undefined;
+  const args = segment.words.slice(1).map(arg => parenthesizedLiteral(arg, budget) ?? /^\(\s*(\$(?:env:)?[A-Za-z_]\w*)\s*\)$/i.exec(arg)?.[1] ?? arg);
+  if (args.some(arg => arg.startsWith("(") || arg.includes("$("))) return undefined;
+  const parsed = powershellArguments("join-path", args);
+  if (parsed.uncertain) return undefined;
+  const positional = [...parsed.positional];
+  const parent = parsed.named.get("-path") ?? positional.shift();
+  const child = parsed.named.get("-childpath") ?? positional.shift();
+  const extra = parsed.named.get("-additionalchildpath");
+  const parts = [parent, child, ...(extra === undefined ? [] : [extra]), ...positional];
+  return parts.every((part): part is string => part !== undefined) ? parts.join("/") : undefined;
 }
 
 function segmentText(segment: ShellSegment): string {
@@ -804,21 +999,63 @@ function xargsLongOption(word: string): string | undefined {
   return matches.includes(word) ? word : matches.length === 1 ? matches[0] : undefined;
 }
 
-function xargsCommandStart(words: readonly string[], from: number): number {
-  let i = from;
+const PIPED_INPUT = "$(piped input)";
+const DOTNET_FILE_CALLEE = /\[(?:System\.)?IO\.(?:File|Directory)\]::(\w+)(?:\.Invoke)?$/i;
+const DOTNET_READ_METHOD = /^(?:read|get|exists|enumerate|open(?:read|text)$)/i;
+const DOTNET_OPEN_METHOD = /^open(?:handle)?$/i;
+const DOTNET_FILE_ENUM = /^\[(?:System\.)?IO\.File(?:Mode|Access)\]::(\w+)$/i;
+const POWERSHELL_VARIABLE_REFERENCE = /^\$(?:\{[^}]*\}|(?:env:)?[A-Za-z_]\w*)$/i;
+
+interface DotnetArgument { readonly raw: string; readonly literal?: string; readonly word?: string }
+
+function dotnetArgument(raw: string, budget: ScanBudget): DotnetArgument {
+  const syntax = shellSyntax(raw, "powershell", budget);
+  const [segment] = syntax.segments;
+  if (!syntax.balanced || syntax.segments.length !== 1 || segment.words.length !== 1 || segment.operators.length || segment.blocks.length) return { raw };
+  const word = segment.words[0], literal = stringLiteral(segment, 0);
+  if (literal !== undefined) return { raw, literal, word };
+  const parenthesized = segment.substitutions.length === 1 && word.startsWith("(") && word.endsWith(")");
+  return !segment.quoted.length && (POWERSHELL_VARIABLE_REFERENCE.test(word) || parenthesized) ? { raw, word } : { raw };
+}
+
+const dotnetEnumName = (argument: DotnetArgument | undefined): string | undefined =>
+  (argument?.literal ?? (argument && DOTNET_FILE_ENUM.exec(argument.raw)?.[1]))?.trim().toLowerCase();
+
+function opensForReading(args: readonly DotnetArgument[]): boolean {
+  const mode = dotnetEnumName(args[1]);
+  return dotnetEnumName(args[2]) === "read" && mode !== undefined && mode !== "openorcreate";
+}
+
+function expressionStrings(text: string, budget: ScanBudget, depth = 0): string[] {
+  if (depth > MAX_SCRIPT_NESTING) return [];
+  return shellSyntax(text, "powershell", budget).segments.flatMap(segment => [...[...segment.stringParts.values()].flat().map(part => part.text),
+    ...[...segment.substitutions, ...segment.blocks.map(block => block.body)].flatMap(inner => expressionStrings(inner, budget, depth + 1))]);
+}
+
+interface XargsInvocation { readonly start: number; readonly replacement?: string }
+
+function xargsInvocation(words: readonly string[], from: number): XargsInvocation {
+  let i = from, replacement: string | undefined;
   while (i < words.length) {
     const word = words[i];
-    if (word === "--") return i + 1;
-    if (!word.startsWith("-") || word === "-") return i;
-    if (word.startsWith("--")) { i += !word.includes("=") && XARGS_VALUE_OPTIONS.has(xargsLongOption(word) ?? "") ? 2 : 1; continue; }
+    if (word === "--") return { start: i + 1, replacement };
+    if (!word.startsWith("-") || word === "-") return { start: i, replacement };
+    if (word.startsWith("--")) {
+      const equals = word.indexOf("="), name = xargsLongOption(equals < 0 ? word : word.slice(0, equals));
+      if (name === "--replace") replacement = equals < 0 ? "{}" : word.slice(equals + 1);
+      i += equals < 0 && XARGS_VALUE_OPTIONS.has(name ?? "") ? 2 : 1;
+      continue;
+    }
     let next = i + 1;
     for (let k = 1; k < word.length; k++) {
+      if (word[k] === "i") { replacement = word.slice(k + 1) || "{}"; break; }
+      if (word[k] === "I") { replacement = word.slice(k + 1) || words[i + 1]; if (k === word.length - 1) next++; break; }
       if (XARGS_ATTACHED_FLAGS.includes(word[k])) break;
       if (XARGS_VALUE_FLAGS.includes(word[k])) { if (k === word.length - 1) next++; break; }
     }
     i = next;
   }
-  return i;
+  return { start: i, replacement };
 }
 
 function findStartIndex(args: readonly string[]): number {
@@ -904,7 +1141,7 @@ function findTouchedPaths(args: readonly string[]): string[] {
 }
 
 function runnerCommands(program: string, words: readonly string[]): (readonly [number, number])[] {
-  return program === "xargs" ? [[xargsCommandStart(words, 1), words.length]] : runnerArguments(program, words, 0);
+  return program === "xargs" ? [[xargsInvocation(words, 1).start, words.length]] : runnerArguments(program, words, 0);
 }
 
 const SHELL_EXPANSION = /"?(?<!\\)\$(?:\{[^}]*\}|[A-Za-z_]\w*|[#@*?!$0-9-])"?/g;
@@ -1035,13 +1272,21 @@ function gitReadOnly(args: readonly string[], argumentsMayFollow = false): boole
   return !writes.outputs.length && !writes.runsProgram;
 }
 
+const LITERAL_WRITERS: ReadonlySet<string> = new Set(["echo", "printf", "write-output"]);
+
+function carriesInlineText(segment: ShellSegment, dialect: ShellDialect): boolean {
+  const found = segmentProgram(segment);
+  return segment.heredocs.length > 0 || segment.operators.some(i => segment.words[i] === "<<<") || segment.words.length === 1 && segment.quoted.includes(0)
+    || found.index < segment.words.length && LITERAL_WRITERS.has(commandName(segment.words[found.index], dialect));
+}
+
 function pipedLiteral(segment: ShellSegment, dialect: ShellDialect): string | undefined {
   const found = segmentProgram(segment);
-  const program = programName(segment.words[found.index] ?? "");
+  const program = commandName(segment.words[found.index] ?? "", dialect);
   const args = segment.words.slice(found.index + 1);
   if (segment.operators.length || [segment.words[found.index] ?? "", ...args].some(word => /[$`]/.test(word))) return undefined;
   if (segment.words.length === 1 && segment.quoted.includes(0)) return segment.words[0];
-  if (dialect === "powershell" && (program === "echo" || program === "write-output")) return args.some(word => word.startsWith("-")) ? undefined : args.join("\n");
+  if (dialect === "powershell" && program === "write-output") return args.some(word => word.startsWith("-")) ? undefined : args.join("\n");
   if (program === "echo") {
     let decode = false;
     while (args.length && /^-[neE]+$/.test(args[0])) for (const flag of args.shift()!.slice(1)) if (flag !== "n") decode = flag === "e";
@@ -1130,7 +1375,7 @@ function stashRoundTripClassified(command: string, syntax: ShellSyntax, dialect:
     const hasGit = words.some(word => GIT_WORD.test(word));
     if (hasGit && (!gitAllowed || loop.inLoop)) return false;
     if (index >= words.length || loop.header) continue;
-    const program = programName(words[index]);
+    const program = commandName(words[index], dialect);
     if (program !== "git") {
       if (OPAQUE_RUNNERS.has(program) || hasGit) return false;
       continue;
@@ -1302,13 +1547,14 @@ interface ShellScope {
   readonly id: number;
   readonly values: Map<string, string | null>;
   readonly functions: Map<string, ShellFunction>;
+  readonly aliases: Map<string, string>;
   functionsVersion: number;
   opaque: boolean;
 }
 
 let scopeIds = 0;
 function childScope(parent?: ShellScope): ShellScope {
-  return { parent, id: ++scopeIds, values: new Map(), functions: new Map(), functionsVersion: 0, opaque: false };
+  return { parent, id: ++scopeIds, values: new Map(), functions: new Map(), aliases: new Map(), functionsVersion: 0, opaque: false };
 }
 
 function scopeEntry<T>(scope: ShellScope | undefined, pick: (scope: ShellScope) => Map<string, T>, key: string): T | null | undefined {
@@ -1331,6 +1577,11 @@ function setPosixVariable(scope: ShellScope, name: string, value: string | null,
 
 function defineFunction(scope: ShellScope, name: string, body: ShellFunction): void {
   scope.functions.set(name, body);
+  scope.functionsVersion++;
+}
+
+function defineAlias(scope: ShellScope, name: string, target: string): void {
+  scope.aliases.set(name, target);
   scope.functionsVersion++;
 }
 
@@ -1357,7 +1608,7 @@ function scopeFingerprint(scope: ShellScope, text: string): string {
   for (const match of text.matchAll(REFERENCED_NAME)) names.add(match[1] ?? match[2] ?? (match[3] ? "HOME" : "TMPDIR"));
   const values = [...names].sort().map(name => variableKeys(name).map(key => scopeEntry(scope, current => current.values, key) ?? 0));
   const functions: string[] = [];
-  for (let current: ShellScope | undefined = scope; current; current = current.parent) if (current.functions.size) functions.push(`${current.id}:${current.functionsVersion}`);
+  for (let current: ShellScope | undefined = scope; current; current = current.parent) if (current.functions.size || current.aliases.size) functions.push(`${current.id}:${current.functionsVersion}`);
   return JSON.stringify([[...names].sort(), values, functions]);
 }
 
@@ -1471,7 +1722,7 @@ function expandShellWord(word: string, scope: ShellScope | undefined, dialect: S
 
 const READING_PROGRAMS: ReadonlySet<string> = new Set(["read", "readarray", "mapfile", "getopts", "unset"]);
 const POSIX_DECLARATIONS: ReadonlySet<string> = new Set(["export", "declare", "typeset", "readonly", "local"]);
-const POWERSHELL_VARIABLE_COMMANDS: ReadonlySet<string> = new Set(["set-variable", "new-variable", "clear-variable", "remove-variable", "sv", "nv", "clv", "rv"]);
+const POWERSHELL_VARIABLE_COMMANDS: ReadonlySet<string> = new Set(["set-variable", "new-variable", "clear-variable", "remove-variable"]);
 const POWERSHELL_VARIABLE_OPTION = /^-(?:outvariable|ov|errorvariable|ev|warningvariable|wv|informationvariable|iv|pipelinevariable|pv)(?::(.*))?$/i;
 const POWERSHELL_VARIABLE_PROVIDER = /(?:^|[\s(])variable:|psvariable/i;
 const POSIX_ASSIGNED = /^([A-Za-z_]\w*)(?:\[[^\]]*\])?\+?=/;
@@ -1491,7 +1742,7 @@ function segmentAssignedNames(segment: ShellSegment, dialect: ShellDialect, scri
     if (inner) names.push(...inner);
     return inner !== null;
   };
-  const program = found.index < words.length ? programName(words[found.index]) : undefined;
+  const program = found.index < words.length ? commandName(words[found.index], dialect) : undefined;
   const args = program === undefined ? [] : commandArguments(segment, found.index + 1);
   const operands = args.filter(word => !word.startsWith("-"));
   if (dialect === "posix") {
@@ -1531,8 +1782,9 @@ function segmentAssignedNames(segment: ShellSegment, dialect: ShellDialect, scri
   for (let i = 0; i <= Math.min(found.index, words.length - 1); i++) {
     if (segment.quotedStart.includes(i)) continue;
     const attached = POWERSHELL_ATTACHED.exec(words[i]);
-    const target = POWERSHELL_ASSIGNMENT_RE.test(words[i + 1] ?? "") ? words[i] : attached ? attached[1] ?? attached[2] : undefined;
-    if (target === undefined || !/^[$([]/.test(target)) continue;
+    const bare = segment.stringParts.get(i)?.[0]?.at ?? Infinity;
+    const target = POWERSHELL_ASSIGNMENT_RE.test(words[i + 1] ?? "") ? words[i] : attached && (attached[1] ?? attached[2])!.length < bare ? attached[1] ?? attached[2] : undefined;
+    if (target === undefined || !/^(?:\[[\w.[\]]+\])*[$(]/.test(target)) continue;
     const name = POWERSHELL_TARGET.exec(target)?.[1];
     if (name === undefined) return null;
     names.push(name);
@@ -1561,10 +1813,10 @@ function loopValue(words: readonly string[], dialect: ShellDialect): string | nu
   return words.length === 1 ? words[0] : multipleValues(words);
 }
 
-function scriptWords(words: readonly string[], at: number, redirects: ReadonlySet<number>, end = words.length, raw = new Set<number>()): Set<number> {
+function scriptWords(words: readonly string[], at: number, redirects: ReadonlySet<number>, name: (word: string) => string, end = words.length, raw = new Set<number>()): Set<number> {
   const word = words[at];
   if (word === undefined || at >= end) return raw;
-  const program = POWERSHELL_CMDLET_ALIASES.get(programName(word)) ?? programName(word);
+  const program = name(word);
   const first = (test: (word: string) => boolean) => { for (let i = at + 1; i < end; i++) if (!redirects.has(i) && test(words[i])) return i; return -1; };
   const rest = (from: number) => { for (let i = from; i < end; i++) if (!redirects.has(i)) raw.add(i); };
   if (SCRIPT_SHELLS.has(program)) {
@@ -1580,14 +1832,32 @@ function scriptWords(words: readonly string[], at: number, redirects: ReadonlySe
     const run = first(option => INLINE_FLAGS.has(option.toLowerCase()));
     if (run >= 0) raw.add(run + 1);
   } else if (SCRIPT_RUNNERS.has(program) || program === "parallel" || program === "start-process") rest(at + 1);
-  else if (program === "xargs") scriptWords(words, xargsCommandStart(words.slice(0, end), at + 1), redirects, end, raw);
-  else if (program === "find") for (const [from, to] of runnerArguments(program, words.slice(0, end), at)) scriptWords(words, from, redirects, to, raw);
+  else if (program === "xargs") scriptWords(words, xargsInvocation(words.slice(0, end), at + 1).start, redirects, name, end, raw);
+  else if (program === "find") for (const [from, to] of runnerArguments(program, words.slice(0, end), at)) scriptWords(words, from, redirects, name, to, raw);
   return raw;
 }
 
-const WORKTREE_GIT: ReadonlySet<string> = new Set(["checkout", "switch", "restore", "reset", "clean", "stash", "merge", "rebase", "cherry-pick", "revert", "pull", "apply", "am", "rm", "mv"]);
-const DIRECTORY_CHANGES: ReadonlySet<string> = new Set(["cd", "chdir", "pushd", "popd", "set-location", "sl", "push-location", "pop-location"]);
+const WORKTREE_GIT: ReadonlySet<string> = new Set(["checkout", "switch", "restore", "reset", "clean", "stash", "merge", "rebase", "cherry-pick", "revert", "pull", "apply", "am", "rm", "mv",
+  "checkout-index", "read-tree", "sparse-checkout", "bisect"]);
+const PREVIOUS_BRANCH_GIT: ReadonlySet<string> = new Set(["checkout", "switch", "merge", "rebase", "cherry-pick"]);
+const PREVIOUS_BRANCH = "@{-1}";
+const DIRECTORY_CHANGES: ReadonlySet<string> = new Set(["cd", "chdir", "pushd", "popd", "set-location", "push-location", "pop-location"]);
 const POWERSHELL_ASSIGNMENT = /^(?:\[[\w.[\]]+\])*\$(env:)?([A-Za-z_]\w*)(=(?!=)(.*))?$/is;
+
+const ALIAS_DRIVE = /^(?:-\w+:)?alias:/i;
+const ALIAS_DRIVE_WRITERS: ReadonlySet<string> = new Set(["set-item", "new-item", "copy-item", "move-item", "rename-item"]);
+
+function aliasDefinition(segment: ShellSegment, scope: ShellScope): { readonly name: string; readonly target: string } | null | undefined {
+  const found = segmentProgram(segment);
+  if (found.index >= segment.words.length) return undefined;
+  const program = commandName(segment.words[found.index], "powershell", scope), args = commandArguments(segment, found.index + 1);
+  if (program === "import-alias" || ALIAS_DRIVE_WRITERS.has(program) && args.some(word => ALIAS_DRIVE.test(word))) return null;
+  if (!ALIAS_DEFINING_CMDLETS.has(program)) return undefined;
+  const parsed = powershellArguments(program, args), rest = [...parsed.positional];
+  const name = parsed.named.get("-name") ?? rest.shift(), target = parsed.named.get("-value") ?? rest.shift();
+  if (parsed.uncertain || name === undefined || target === undefined || [name, target].some(word => hasShellVariable(word, "powershell") || /[*?[\]]/.test(word))) return null;
+  return { name: name.toLowerCase(), target: programName(target) };
+}
 
 function functionDefinition(segment: ShellSegment, dialect: ShellDialect): string | undefined {
   const body = segment.blocks.filter(block => block.script);
@@ -1649,20 +1919,17 @@ export function shellProtectedWrite(command: string, configDir: string, platform
     return kind;
   };
   const runScript = (script: string, scriptDialect = dialect, scriptRepeating = repeating) => { recursed = true; return judgeNested(script, scriptDialect, scriptRepeating, commandScope); };
+  const expandedStage = (stage: ShellSegment): ShellSegment => ({ ...stage, words: stage.words.map(word => expandShellWord(word, scope, dialect, expansion) ?? word) });
+  const pipedScript = (pipeline: readonly ShellSegment[]) => pipeline.length === 1 ? pipedLiteral(expandedStage(pipeline[0]), dialect) : undefined;
+  const unreadableInline = (inline: readonly ShellSegment[]) => opaqueRisk(command) && inline.some(stage => expandedStage(stage).words.some(word => hasShellVariable(word, dialect)));
   const stdinScriptKind = (segment: ShellSegment, pipeline: readonly ShellSegment[], scriptDialect: ShellDialect): ShellWriteKind => {
-    for (const doc of segment.heredocs) {
-      const kind = runScript(doc.body, scriptDialect);
+    const bodies = stdinBodies(segment);
+    for (const { body, expands } of bodies) {
+      const kind = runScript(body, scriptDialect);
       if (kind) return kind;
-      if (includeControl && !doc.literal && /[$`]/.test(doc.body) && opaqueRisk(doc.body)) return refuse(judgement, UNREADABLE_COMMAND);
+      if (includeControl && expands && /[$`]/.test(body) && opaqueRisk(body)) return refuse(judgement, UNREADABLE_COMMAND);
     }
-    if (segment.heredocs.length) return undefined;
-    const strings = segment.operators.filter(i => segment.words[i] === "<<<" && i + 1 < segment.words.length).map(i => segment.words[i + 1]);
-    for (const text of strings) {
-      const kind = runScript(text, scriptDialect);
-      if (kind) return kind;
-      if (includeControl && /[$`]/.test(text) && opaqueRisk(text)) return refuse(judgement, UNREADABLE_COMMAND);
-    }
-    if (strings.length) return undefined;
+    if (bodies.length) return undefined;
     const redirect = segment.operators.filter(i => INPUT_REDIRECT_RE.test(segment.words[i])).pop();
     if (redirect !== undefined) {
       const source = segment.words[redirect + 1];
@@ -1671,13 +1938,15 @@ export function shellProtectedWrite(command: string, configDir: string, platform
       return includeControl && opaqueRisk(segmentText(segment)) ? refuse(judgement, UNREADABLE_COMMAND) : undefined;
     }
     if (!segment.piped) return undefined;
-    const literal = pipeline.length === 1 ? pipedLiteral(pipeline[0], dialect) : undefined;
+    const literal = pipedScript(pipeline);
     if (literal !== undefined) return runScript(literal, scriptDialect);
-    return includeControl && opaqueRisk([...pipeline, segment].map(segmentText).join(" ")) ? refuse(judgement, UNREADABLE_COMMAND) : undefined;
+    const unreadable = opaqueRisk([...pipeline, segment].map(segmentText).join(" ")) || unreadableInline(pipeline.filter(stage => carriesInlineText(stage, dialect)));
+    return includeControl && unreadable ? refuse(judgement, UNREADABLE_COMMAND) : undefined;
   };
   const unresolvedTarget = (word: string): "path-unresolved" | "directory-unresolved" | undefined => {
     if (!includeControl || dialect === "powershell" && /^\$null$/i.test(word)) return undefined;
-    if (hasShellVariable(word, dialect)) return "path-unresolved";
+    if (hasShellVariable(word, dialect) || dialect === "powershell" && /^\s*\(/.test(word)
+      && parenthesizedLiteral(word, judgement.budget) === undefined && joinPathWord(word, judgement.budget) === undefined) return "path-unresolved";
     return baseUnknown && !word.startsWith("-") && !isAbsolute(expandHomePath(word)) ? "directory-unresolved" : undefined;
   };
   const kindOf = (word: string | undefined): ProtectedKind | "control" | undefined => {
@@ -1687,7 +1956,13 @@ export function shellProtectedWrite(command: string, configDir: string, platform
   };
   const wordKind = (word: string | undefined): ProtectedKind | "control" | undefined => {
     if (word === undefined) return undefined;
+    const joined = dialect === "powershell" ? joinPathWord(word, judgement.budget) ?? parenthesizedLiteral(word, judgement.budget) : undefined;
+    if (joined !== undefined) return wordKind(joined);
     if (unresolvedTarget(word)) return "control";
+    if (dialect === "powershell" && /^\s*\(/.test(word)) {
+      const named = expressionStrings(word, judgement.budget).map(text => lexicalProtectedKind(text, configDir, platform)).find(kind => kind !== undefined);
+      if (named) return named;
+    }
     if (includeControl && GLOB_CHARACTERS.test(word)) {
       const normalized = word.replace(/\\/g, "/");
       const specific = /[^*?\[\]{}]/.test(normalized.split("/").pop() ?? "");
@@ -1707,8 +1982,7 @@ export function shellProtectedWrite(command: string, configDir: string, platform
         if (segment === "**" && next >= 0 && inspect(pattern.slice(0, slash + 1) + rest.slice(next + 1))) return true;
         if (next < 0) {
           if (isControlFile(path, configDir, platform)) return true;
-          const names = ["CLAUDE.md", "CLAUDE.local.md", "AGENTS.md"];
-          if (specific && names.some(name => globCouldMatch(segment, name, platform))) return true;
+          if (specific && CONTROL_FILE_NAMES.some(name => globCouldMatch(segment, name, platform))) return true;
           const directory = normalizedPath(path, platform).replace(/\/$/, "");
           const config = normalizedPath(configDir, platform).replace(/\/$/, "");
           if (directory.endsWith("/.claude") || directory === ".claude" || directory === config) {
@@ -1730,7 +2004,7 @@ export function shellProtectedWrite(command: string, configDir: string, platform
       if (inspect(normalized)) return "control";
       return undefined;
     }
-    if (/[$*?]/.test(word.replace(/^\$HOME/i, ""))) return includeControl && isControlPath(word, configDir, platform) ? "control" : undefined;
+    if (/[$*?]/.test(word.replace(/^\$HOME/i, ""))) return lexicalProtectedKind(word, configDir, platform) ?? (includeControl && isControlPath(word, configDir, platform) ? "control" : undefined);
     const path = platform === process.platform ? pathOf(word) : word;
     return path === undefined ? undefined : protectedDestination(path, configDir, platform)
       ?? (includeControl && isControlFile(path, configDir, platform) ? "control" : undefined);
@@ -1800,22 +2074,35 @@ export function shellProtectedWrite(command: string, configDir: string, platform
   };
   const inlineKind = (program: string, script: string): ProtectedKind | "control" | undefined => {
     if (POWERSHELL_PROGRAMS.has(program)) return runScript(script, "powershell");
-    const patterns = program === "node" ? [
-      /\bfs(?:\.promises)?\.(?:writeFile(?:Sync)?|appendFile(?:Sync)?|createWriteStream)\s*\(\s*(['"])(.*?)\1/g,
-    ] : [
-      /\bopen\s*\(\s*(['"])(.*?)\1\s*,\s*(?:mode\s*=\s*)?['"][wax][bt+]*['"]/g,
-      /\b(?:Path|pathlib\.Path)\s*\(\s*(['"])(.*?)\1\s*\)\.(?:write_text|write_bytes)\s*\(/g,
-    ];
-    for (const pattern of patterns) {
-      const executable = executablePositions(script);
+    for (const pattern of program === "node" ? NODE_WRITE_PATTERNS : PYTHON_WRITE_PATTERNS) {
+      const executable = executablePositions(script, program === "node" ? "node" : "python");
       for (const match of script.matchAll(pattern)) {
         if (!executable(match.index)) continue;
-        const kind = kindOf(match[2]); if (kind) return kind;
+        const kind = kindOf(match.groups?.path); if (kind) return kind;
       }
     }
     return undefined;
   };
-  const executableInCommand = executablePositions(command);
+  const inlineStdinKind = (program: string, args: readonly string[], segment: ShellSegment, pipeline: readonly ShellSegment[]): ProtectedKind | "control" | undefined => {
+    for (let i = 0; i < args.length; i++) {
+      if (INLINE_VALUE_OPTIONS.has(args[i])) i++;
+      else if (args[i] === "-") break;
+      else if (program !== "node" && /^-[a-zA-Z]*m/.test(args[i])) return undefined;
+      else if (!args[i].startsWith("-")) {
+        if (i > 0 && optionValueUnknown(program, args[i - 1]) && !NODE_SCRIPT_FILE.test(args[i])) continue;
+        return undefined;
+      }
+    }
+    const bodies = stdinBodies(segment).map(({ body }) => body);
+    const piped = !bodies.length && segment.piped ? pipedScript(pipeline) : undefined;
+    for (const body of piped === undefined ? bodies : [piped]) {
+      const kind = inlineKind(program, body); if (kind) return kind;
+    }
+    const inline = bodies.length || piped !== undefined || !segment.piped ? [] : pipeline.filter(stage => carriesInlineText(stage, dialect));
+    if (includeControl && (opaqueRisk(inline.map(segmentText).join(" ")) || unreadableInline(inline))) return refuse(judgement, UNREADABLE_COMMAND);
+    return undefined;
+  };
+  const executableInCommand = executablePositions(command, "shell");
   const parsedCommand = includeControl && dialect !== "cmd" ? command.replace(/@\{[^{}\s;&|<>]+\}|\{[^{}\s;&|<>,]*,[^{}\s;&|<>]*\}/g,
     (literal, offset: number) => executableInCommand(offset) ? literal.replace(/[{}]/g, (brace: string) => "'" + brace + "'") : literal) : command;
   const syntax = shellSyntax(parsedCommand, dialect, judgement.budget);
@@ -1890,9 +2177,17 @@ export function shellProtectedWrite(command: string, configDir: string, platform
       }
       return assigned;
     }
-    if (dialect !== "powershell" || segment.operators.length || words.length > 3) return undefined;
+    if (dialect !== "powershell" || segment.operators.length) return undefined;
     const target = POWERSHELL_ASSIGNMENT.exec(words[0] ?? "");
     if (!target || segment.quotedStart.includes(0)) return undefined;
+    if (!target[3] && words[1] === "=" && words[2]?.toLowerCase() === "join-path") {
+      const call = words.slice(2).map((word, i) => segment.quoted.includes(i + 2) || /\s/.test(word) ? `'${word.replace(/'/g, "''")}'` : word).join(" ");
+      const joined = joinPathWord(`(${call})`, judgement.budget);
+      setVariable(assigned, target[1] ? environmentKey(target[2]) : powershellKey(target[2]),
+        joined === undefined ? null : expandShellWord(joined, assigned, dialect, { ...expansion, partial: true }) ?? null);
+      return assigned;
+    }
+    if (words.length > 3) return undefined;
     const value = words.length === 3 ? words[1] === "=" ? words[2] : undefined : words.length === 2 ? target[3] === "=" ? words[1] : undefined : target[3] ? target[4] : undefined;
     if (value === undefined || segment.listItems.has(value)) return undefined;
     setVariable(assigned, target[1] ? environmentKey(target[2]) : powershellKey(target[2]), expandShellWord(value, assigned, dialect, expansion) ?? null);
@@ -1906,7 +2201,7 @@ export function shellProtectedWrite(command: string, configDir: string, platform
     const expandCode = (word: string) => expandShellWord(word, wordScope, dialect, { ...expansion, partial: true }) ?? word;
     const expandedWords = literal.words.map(expandWord);
     const redirects = redirectPositions(literal);
-    const code = parsedProgram.script === undefined ? scriptWords(literal.words.map((word, i) => i === programAt ? expandedWords[i] : word), programAt, redirects)
+    const code = parsedProgram.script === undefined ? scriptWords(literal.words.map((word, i) => i === programAt ? expandedWords[i] : word), programAt, redirects, word => commandName(word, dialect, scope))
       : new Set(literal.words.map((_, i) => i).filter(i => i >= parsedProgram.script! && !redirects.has(i)));
     const segment: ShellSegment = { ...literal, words: literal.words.map((word, i) => code.has(i) ? expandCode(word) : expandedWords[i]),
       listItems: new Map([...literal.listItems].map(([word, items]) => [expandWord(word), items.map(expandWord)])) };
@@ -1928,12 +2223,35 @@ export function shellProtectedWrite(command: string, configDir: string, platform
       if (kind) return kind;
     }
     if (found.script !== undefined) return runScript(commandArguments(segment, found.script).join(" "), "posix");
+    for (const call of dialect === "powershell" ? literal.calls : []) {
+      const method = DOTNET_FILE_CALLEE.exec(call.callee)?.[1].toLowerCase();
+      if (method === undefined || DOTNET_READ_METHOD.test(method)) continue;
+      const dotnetArgs = call.args.map(raw => dotnetArgument(raw, judgement.budget));
+      if (DOTNET_OPEN_METHOD.test(method) && opensForReading(dotnetArgs)) continue;
+      const values = dotnetArgs.map(argument => argument.word === undefined ? `(${argument.raw})` : expandWord(argument.word));
+      if (method === "createsymboliclink") { const kind = linkKind(values[0], values.slice(1, 2), false); if (kind) return kind; continue; }
+      const written = method === "delete" ? [] : method === "copy" || method === "move" ? values.slice(1, 2) : method === "replace" ? values.slice(1, 3) : values.slice(0, 1);
+      for (const value of written) { const kind = writeKind(value); if (kind) return kind; }
+      if (includeControl && ["delete", "move", "replace"].includes(method)) { const kind = uncertainKind(segment, values.slice(0, 1), true); if (kind) return kind; }
+    }
     const index = found.index;
     if (index >= words.length) return undefined;
     if (includeControl && dialect === "posix" && BRACE_EXPANSION.test(words[index])) return refuse(judgement, { kind: "brace-expansion", file: words[index] });
-    const program = POWERSHELL_CMDLET_ALIASES.get(programName(words[index])) ?? programName(words[index]);
+    const program = commandName(words[index], dialect, scope);
     const args = commandArguments(segment, index + 1);
     const positional = args.filter((word) => !word.startsWith("-"));
+    const alias = dialect === "powershell" ? aliasDefinition(segment, scope) : undefined;
+    if (alias === null && includeControl) return refuse(judgement, UNREADABLE_COMMAND);
+    if (alias) defineAlias(scope, alias.name, alias.target);
+    const pipedPaths = (): string[] => {
+      if (dialect !== "powershell" || !segment.piped) return [];
+      const previous = pipeline[pipeline.length - 1];
+      const at = previous ? segmentProgram(previous).index : 0;
+      if (!previous || commandName(previous.words[at] ?? "", dialect, scope) !== "join-path") return [PIPED_INPUT];
+      const joined = powershellArguments("join-path", previous.words.slice(at + 1));
+      if (joined.uncertain || joined.named.has("-path")) return [PIPED_INPUT];
+      return [[PIPED_INPUT, joined.named.get("-childpath"), joined.named.get("-additionalchildpath"), ...joined.positional].filter((part): part is string => part !== undefined).join("/")];
+    };
     const called = scopeEntry(scope, current => current.functions, program);
     const rejudged = called && !judgement.calling.has(program) && (includeControl || depth < MAX_SCRIPT_NESTING) ? called : undefined;
     if (rejudged) judgement.callBudget.remaining -= rejudged.body.length + 1;
@@ -1962,17 +2280,24 @@ export function shellProtectedWrite(command: string, configDir: string, platform
       }
     }
     hidesAssignments = program === "source" || program === "." || SCRIPT_RUNNERS.has(program) && program !== "trap" && args.some(word => hasShellVariable(word, dialect) || word.includes("`"));
+    if (dialect === "powershell" && CMDLET_NAME.test(program) && !Object.hasOwn(POWERSHELL_PARAMETERS, program)) {
+      const exporting = program.startsWith("export-");
+      const parsed = powershellArguments(exporting ? EXPORT_CMDLET : ANY_CMDLET, args);
+      const path = parsed.named.get("-literalpath") ?? parsed.named.get("-path") ?? parsed.named.get("-filepath");
+      const exported = !exporting ? [] : path !== undefined ? [path] : parsed.positional.slice(0, parsed.uncertain ? undefined : 1);
+      for (const value of [parsed.named.get("-outfile"), ...exported]) { const kind = writeKind(value); if (kind) return kind; }
+    }
     if (includeControl && program === "remove-item") {
       const parsed = powershellArguments("remove-item", args);
       const targets = [...parsed.positional, ...[parsed.named.get("-path"), parsed.named.get("-literalpath")].filter((value): value is string => value !== undefined)];
-      const kind = uncertainKind(segment, parsed.uncertain ? args : targets, true);
+      const kind = uncertainKind(segment, parsed.uncertain ? args : targets.length ? targets : pipedPaths(), true);
       if (kind) return kind;
     }
     if (program === "rename-item") {
       const parsed = powershellArguments("rename-item", args);
       if (parsed.uncertain) { const kind = uncertainKind(segment, args, includeControl); if (kind) return kind; }
       const named = parsed.named.get("-literalpath") ?? parsed.named.get("-path");
-      const source = named ?? parsed.positional[0];
+      const source = named ?? parsed.positional[0] ?? pipedPaths()[0];
       const name = parsed.named.get("-newname") ?? parsed.positional[named === undefined ? 1 : 0];
       if (includeControl && source !== undefined) { const kind = uncertainKind(segment, [source], true); if (kind) return kind; }
       if (source !== undefined && name !== undefined) { const kind = writeKind(join(dirname(source), name)); if (kind) return kind; }
@@ -1982,7 +2307,8 @@ export function shellProtectedWrite(command: string, configDir: string, platform
     } else if (CONTENT_CMDLETS.has(program)) {
       const parsed = powershellArguments(program, args);
       if (parsed.uncertain) { const kind = uncertainKind(segment, args); if (kind) return kind; }
-      const target = parsed.named.get("-literalpath") ?? parsed.named.get("-path") ?? parsed.named.get("-filepath") ?? parsed.positional[0];
+      const target = parsed.named.get("-literalpath") ?? parsed.named.get("-path") ?? parsed.named.get("-filepath") ?? parsed.positional[0]
+        ?? (CONTENT_FROM_PIPELINE_CMDLETS.has(program) ? pipedPaths()[0] : undefined);
       for (const value of target === undefined ? [] : pathListItems(segment, target)) { const kind = writeKind(value); if (kind) return kind; }
       const itemType = parsed.named.get("-itemtype")?.toLowerCase();
       const linkType = itemType ? ["symboliclink", "junction", "hardlink"].find(type => type.startsWith(itemType)) : undefined;
@@ -2047,12 +2373,13 @@ export function shellProtectedWrite(command: string, configDir: string, platform
       }
     }
     if (powershellCopy) {
-      const parsed = powershellArguments(program === "move-item" || program === "mi" || program === "mv" || program === "move" ? "move-item" : "copy-item", args);
+      const parsed = powershellArguments(program === "move-item" || program === "mv" || program === "move" ? "move-item" : "copy-item", args);
       if (parsed.uncertain) { const kind = uncertainKind(segment, args); if (kind) return kind; }
       const source = parsed.named.get("-literalpath") ?? parsed.named.get("-path");
       const destination = parsed.named.get("-destination") ?? parsed.positional[source === undefined ? 1 : 0];
-      const sources = source === undefined ? parsed.positional.slice(0, parsed.named.has("-destination") ? undefined : 1) : [source];
-      if (includeControl && ["move-item", "mi", "mv", "move"].includes(program)) { const kind = uncertainKind(segment, sources, true); if (kind) return kind; }
+      const listed = source === undefined ? parsed.positional.slice(0, parsed.named.has("-destination") ? undefined : 1) : [source];
+      const sources = listed.length ? listed : pipedPaths();
+      if (includeControl && ["move-item", "mv", "move"].includes(program)) { const kind = uncertainKind(segment, sources, true); if (kind) return kind; }
       const kind = copyKind(destination, sources.flatMap(value => pathListItems(segment, value)), false, args.some(word => /^-r(?:e(?:c(?:u(?:r(?:s(?:e)?)?)?)?)?)?(?::|$)/i.test(word)));
       if (kind) return kind;
     }
@@ -2065,6 +2392,9 @@ export function shellProtectedWrite(command: string, configDir: string, platform
       const flag = args.findIndex((word) => INLINE_FLAGS.has(word.toLowerCase()));
       if (flag >= 0 && flag + 1 < args.length && args[flag + 1] !== "-") {
         const kind = inlineKind(program, POWERSHELL_PROGRAMS.has(program) ? args.slice(flag + 1).join(" ") : args[flag + 1]);
+        if (kind) return kind;
+      } else if (flag < 0 && !POWERSHELL_PROGRAMS.has(program)) {
+        const kind = inlineStdinKind(program, args, segment, pipeline);
         if (kind) return kind;
       }
     }
@@ -2106,8 +2436,11 @@ export function shellProtectedWrite(command: string, configDir: string, platform
       const touched = program === "find" ? findTouchedPaths(args) : [];
       for (const [from, to] of runnerCommands(program, argv)) {
         if (from >= to || programName(argv[from]) === "git") continue;
+        const replacement = program === "xargs" ? xargsInvocation(argv, 1).replacement : undefined;
         for (const path of touched.length ? touched : [undefined]) {
-          const command = argv.slice(from, to).map(word => posixQuoted(path === undefined ? word : word.split("{}").join(path))).join(" ");
+          const quoted = argv.slice(from, to).map(word => path !== undefined ? posixQuoted(word.split("{}").join(path))
+            : replacement ? word.split(replacement).map(posixQuoted).join(PIPED_INPUT) : posixQuoted(word));
+          const command = [...quoted, ...program === "xargs" && !replacement ? [PIPED_INPUT] : []].join(" ");
           const kind = judgeNested(command, "posix", true);
           if (kind) return kind;
         }
@@ -2138,7 +2471,11 @@ export function shellProtectedWrite(command: string, configDir: string, platform
           worktreeKnown ||= isAbsolute(expandHomePath(option.value!));
         }
       }
-      const gitArgs = args.slice(invocation.sub);
+      const subAt = args.slice(invocation.sub).findIndex(word => !word.startsWith("-"));
+      const pathsAt = args.slice(invocation.sub).indexOf("--");
+      const given = args.slice(invocation.sub);
+      const previousAt = PREVIOUS_BRANCH_GIT.has(given[subAt]) ? given.findIndex((word, i) => i > subAt && (pathsAt < 0 || i < pathsAt) && word === "-") : -1;
+      const gitArgs = given.map((word, i) => i === previousAt ? PREVIOUS_BRANCH : word);
       const writes = gitWriteOptions(gitArgs[0], gitArgs.slice(1));
       if (includeControl && writes.runsProgram) return refuse(judgement, GIT_CONFIG);
       for (const output of writes.outputs) { const kind = writeKind(output); if (kind) return kind; }
@@ -2212,6 +2549,16 @@ export function shellProtectedWrite(command: string, configDir: string, platform
             const strip = Number(value(["-p"]) ?? options.find(word => /^-p\d+$/.test(word))?.slice(2) ?? 1);
             if (refused(patchControls(files, base, configDir, strip, value(["--directory"]) ?? ""))) return "control";
           }
+        } else if (sub === "checkout-index") {
+          if (value(["--prefix"]) !== undefined || options.includes("--stdin")) return refuse(judgement, { kind: "git-unlisted" });
+          if (options.some(word => word === "--all" || /^-[a-zA-Z]*a[a-zA-Z]*$/.test(word))) paths = [];
+          else if (pathArgs.length) paths = pathArgs;
+        } else if (sub === "read-tree" && options.includes("-u")) {
+          if (value(["--prefix"]) !== undefined) return refuse(judgement, { kind: "git-unlisted" });
+          refs = positional([]);
+          if (refused(refs.length ? gitControlPaths(base, [], configDir, gitCache) : gitListedControls(base, [], configDir, gitCache))) return "control";
+        } else if (sub === "sparse-checkout" && !["list", "check-rules"].includes(tail[0]) || sub === "bisect" && !["log", "visualize", "view", "terms", "help"].includes(tail[0])) {
+          if (refused(gitListedControls(base, [], configDir, gitCache))) return "control";
         }
         if (["checkout", "reset"].includes(sub) && refs.length) {
           if (dash < 0 && !refs[0].includes("@{") && (GLOB_CHARACTERS.test(refs[0]) || existingPath(refs[0]))) { paths = [...refs, ...(paths ?? [])]; refs = []; }
@@ -2249,6 +2596,10 @@ export function shellProtectedWrite(command: string, configDir: string, platform
     if (step.opened.some(frame => frame.kind === "loop") && !step.loopsBefore) poisonNames(loopNames(position));
     poisonNames([crude[position]]);
     const program = segmentProgram(parsed).index;
+    const aliased = dialect === "powershell" && program < parsed.words.length ? commandName(parsed.words[program], dialect, scope) : undefined;
+    if (aliased !== undefined && aliased !== commandName(parsed.words[program], dialect)) {
+      poisonNames([segmentAssignedNames({ ...parsed, words: parsed.words.map((word, i) => i === program ? aliased : word) }, dialect, scriptNames)]);
+    }
     const prefixes = parsed.words.slice(0, program).filter(word => ASSIGNMENT_RE.test(word));
     commandScope = scope;
     if (program < parsed.words.length && prefixes.length) {
@@ -2279,7 +2630,7 @@ export function shellProtectedWrite(command: string, configDir: string, platform
 
 export function judgeShellWrite(tool: string, input: unknown, configDir: string, platform: NodeJS.Platform = process.platform, cwd = process.cwd(), includeControl = false): GuardDecision {
   const command = inputRecord(input).command;
-  if (!isShellTool(tool) || typeof command !== "string") return { blocked: false, reasons: [], examinedLines: 0, blockedLines: [] };
+  if (!runsShellCommand(tool) || typeof command !== "string") return { blocked: false, reasons: [], examinedLines: 0, blockedLines: [] };
   const judgement = shellJudgement(command);
   const destination = shellProtectedWrite(command, configDir, platform, cwd, includeControl, judgement, 0, toolDialect(tool));
   return destination === undefined
