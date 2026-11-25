@@ -38,6 +38,7 @@ import {
   waitNotifyWakeFile,
   waitNotifyClosed,
   waitNotifyPushTool,
+  wakeTurnStart,
   type PushTool,
   type WaitEpisode,
   type WaitReport,
@@ -47,6 +48,7 @@ import {
 interface Wake {
   file: string;
   message: string;
+  before: WaitEpisode;
   turnId?: string;
   sent: boolean;
   pushCalls: Set<string>;
@@ -131,7 +133,17 @@ function clearWake(s: Session, tab: WaitTab): void {
   tab.wake = undefined;
   if (wake?.watchdog !== undefined) clearTimeout(wake.watchdog);
   if (wake !== undefined) removeTabFile(tab, wake.file);
-  s.conversation?.expectLaisoraWake(false);
+  s.conversation?.expectLaisoraWake(undefined);
+}
+
+function wakeSignalTaken(tab: WaitTab, wake: Wake): boolean {
+  return tab.wake === wake && tab.bellDir !== undefined && !bellFileExists(tab.bellDir, wake.file);
+}
+
+function withdrawRing(s: Session, tab: WaitTab, wake: Wake): void {
+  clearWake(s, tab);
+  tab.episode = waitEpisodeOnLaunch(wake.before);
+  output.appendLine(`[${s.title}] mobile notification put off: another turn started before the wake hook took the signal`);
 }
 
 function retireTabBellDir(s: Session, tab: WaitTab): void {
@@ -176,7 +188,8 @@ function evaluate(s: Session): void {
   const items = waitItemsOfTab(tab);
   const settings = waitNotifySettings();
   const remoteControl = remoteControlStateOfTab(s);
-  const { episode, action } = waitNotifyStep(tab.episode, {
+  const before = tab.episode;
+  const { episode, action } = waitNotifyStep(before, {
     now,
     settings,
     launchedWithPush: true,
@@ -196,7 +209,7 @@ function evaluate(s: Session): void {
     ...(action.kind === "awaitHook" && tab.lastTurnEndAt !== undefined && now - tab.lastTurnEndAt < WAIT_NOTIFY_ARM_GRACE_SECONDS * 1000 ? [now + WAIT_NOTIFY_BELL_POLL_SECONDS * 1000] : []),
   ];
   if (wakeAts.length > 0) tab.timer = setTimeout(() => evaluate(s), Math.max(0, Math.min(...wakeAts) - now));
-  if (action.kind === "ring") ring(s, tab, items);
+  if (action.kind === "ring") ring(s, tab, items, before);
   else if (action.kind === "notSent") {
     output.appendLine(`[${s.title}] mobile notification not sent: Remote Control did not connect`);
     showNotSent(s, messageOf(s, tab, items));
@@ -207,7 +220,7 @@ function evaluate(s: Session): void {
   }
 }
 
-function ring(s: Session, tab: WaitTab, items: readonly WaitReportItem[]): void {
+function ring(s: Session, tab: WaitTab, items: readonly WaitReportItem[], before: WaitEpisode): void {
   const message = messageOf(s, tab, items);
   const file = waitNotifyWakeFile(tab.epoch);
   if (!writeTabFile(tab, file, waitNotifyRewakeText(message, items.map((item) => item.title)))) {
@@ -215,7 +228,7 @@ function ring(s: Session, tab: WaitTab, items: readonly WaitReportItem[]): void 
     tab.episode = noteWaitNotifyResult(tab.episode, false);
     return;
   }
-  const wake: Wake = { file, message, sent: false, pushCalls: new Set() };
+  const wake: Wake = { file, message, before, sent: false, pushCalls: new Set() };
   const giveUp = (reason: string): void => {
     if (tab.wake !== wake || wake.turnId !== undefined) return;
     output.appendLine(`[${s.title}] mobile notification not sent: ${reason}`);
@@ -233,7 +246,7 @@ function ring(s: Session, tab: WaitTab, items: readonly WaitReportItem[]): void 
     wake.watchdog = setTimeout(() => giveUp("Claude Code did not start the wake turn"), WAIT_NOTIFY_WAKE_TURN_CAP_MS);
   }, WAIT_NOTIFY_WAKE_WATCHDOG_MS);
   tab.wake = wake;
-  s.conversation?.expectLaisoraWake(true);
+  s.conversation?.expectLaisoraWake(() => wakeSignalTaken(tab, wake));
   output.appendLine(`[${s.title}] waking Claude for a mobile notification`);
 }
 
@@ -315,7 +328,11 @@ export function noteWaitNotifyEvent(s: Session, ev: NormalizedEventBody): void {
   switch (ev.kind) {
     case "turn_started":
       writeEpoch(tab);
-      if (ev.laisoraWake === true && tab.wake !== undefined && tab.wake.turnId === undefined) tab.wake.turnId = ev.turnId;
+      if (tab.wake !== undefined && tab.wake.turnId === undefined) {
+        const start = wakeTurnStart(ev.laisoraWake === true, wakeSignalTaken(tab, tab.wake));
+        if (start === "bind") tab.wake.turnId = ev.turnId;
+        else if (start === "withdraw") withdrawRing(s, tab, tab.wake);
+      }
       tab.lastTurnCompleted = false;
       break;
     case "tool_call_started":

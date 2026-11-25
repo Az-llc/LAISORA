@@ -5,7 +5,7 @@ import {
   isClaudeOwnChange, linkedTodoItem, TODO_LAISORA, liveChildren, memoStaleSince, parseTodoChangeId, TODO_ADD_MANY_MAX, TODO_CLAUDE_DEPTH_MAX, TODO_ADD_PLACEMENT_BASES, TODO_TIDY_KINDS, TODO_TIDY_STEPS_MAX, type TodoAddNode, todoAgentMarker,
   todoBindableFolder, todoFailureResultText, todoClaudeNeverReverts, TODO_STABLE_TOUCH_MS, TODO_STABLE_PIN_MS, TODO_STABLE_REMOVE_MS,
   todoConversationFolder, todoDoneTwin, todoLinkDoc, TODO_DOC_LABEL_MAX, TODO_DOC_TARGET_MAX, TODO_ESTIMATE_PATTERN, TODO_REPEAT_PATTERN, TODO_TAGS_MAX, TODO_WAITING_MAX, type TodoLinkProblem, todoFinishedIds, todoTidySignals, todoFolderGroup, todoGroupsOf, todoItemNumbers, todoItemPath, todoPlaceOf, todoPlaceText, todoWriteResultText, TODO_DUE_PATTERN, TODO_GROUP_MAX, TODO_GUESS_REASON_MAX, TODO_MEMO_TEXT_MAX,
-  TODO_PRIORITIES, TODO_SERVER_NAME, TODO_STATE_BRACKETS, TODO_STATE_CHECKBOXES, TODO_STATE_SEPARATORS, TODO_STATE_TRAILING_WORDS, TODO_STATE_WORDS, TODO_TITLE_PARTICLES, todoTitlePlaceOf, todoTitleRepeat, TODO_TOOL_KINDS, todoToolName, type TodoToolKind, TODO_STATES, TODO_TITLE_MAX, TODO_WRITE_TOOLS, WORK_MEMO_SECTIONS, type WorkMemoSection, type TodoDocument, type TodoItem,
+  TODO_PRIORITIES, TODO_SERVER_NAME, TODO_STATE_BRACKETS, TODO_STATE_CHECKBOXES, TODO_STATE_SEPARATORS, TODO_STATE_TRAILING_WORDS, TODO_STATE_WORDS, TODO_TITLE_PARTICLES, todoTitlePlaceOf, todoTitleRepeat, TODO_TOOL_KINDS, todoToolName, type TodoToolKind, TODO_STATES, TODO_TITLE_MAX, TODO_WRITE_TOOLS, WORK_MEMO_SECTIONS, type WorkMemoSection, type TodoDocument, type TodoItem, type TodoMemoVersion,
   type TodoChange, type TodoOperation, type TodoOperationError, type TodoPlacementBasis, type TodoOperationFailure, type TodoOperationResult, type TodoRevertBlock, type TodoTidyStep,
 } from "./todo-model";
 import { TodoStoreError, type TodoStore } from "./todo-store";
@@ -89,6 +89,32 @@ export function todoLinkedInstruction(item: TodoLinkedItem): string {
     ]),
     `Set the item's state with ${todoToolName("set_state")} when the work on it starts and when it is done.`,
   ].join(" ");
+}
+
+export const TODO_PARENT_DECISIONS_MAX = 4000;
+
+export interface TodoDecisionsGiven {
+  readonly parentId: string;
+  readonly version: number;
+}
+
+export interface TodoParentDecisions {
+  readonly id: string;
+  readonly title: string;
+  readonly decisions?: Pick<TodoMemoVersion, "version" | "text">;
+}
+
+export function todoParentDecisionsContext(given: TodoDecisionsGiven | undefined, parent: TodoParentDecisions | undefined): { readonly text?: string; readonly given: TodoDecisionsGiven | undefined } {
+  const decisions = parent?.decisions;
+  if (!parent || !decisions || decisions.text.trim() === "") return { given };
+  if (given?.parentId === parent.id && decisions.version <= given.version) return { given };
+  const cut = decisions.text.length > TODO_PARENT_DECISIONS_MAX;
+  const text = [
+    `LAISORA attached this note to the user's message; the user did not type it. Below is the decisions section of the work memo of the parent TODO item "${parent.title}" (id ${parent.id}) as it stands now; it replaces any earlier copy LAISORA attached in this conversation.`,
+    `<parent-decisions>\n${todoClipped(decisions.text, TODO_PARENT_DECISIONS_MAX)}\n</parent-decisions>`,
+    ...(cut ? [`The section was cut after ${TODO_PARENT_DECISIONS_MAX} characters; read the rest with ${todoToolName("list")} (id ${parent.id}).`] : []),
+  ].join("\n\n");
+  return { text, given: { parentId: parent.id, version: decisions.version } };
 }
 
 const id = z.string().min(1).describe("Item id as shown by list.");

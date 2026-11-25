@@ -3,6 +3,7 @@ import { clipText } from "./text-clip";
 import { isToolIntentInput, type ToolIntentInput } from "./tool-intent";
 import { isAccentSettings, isAccentSettingValue, type AccentSettings, type AccentSetting } from "./accent";
 import { isDisplayName } from "./display-name";
+import { isWorkStageCast, isWorkStageCastSettingValue, isWorkStageCharacter, type WorkStageCast, type WorkStageCastSetting, type WorkStageCharacter } from "./work-stage-cast";
 import { isEventLimit } from "./event-limits";
 import { isTranscriptRetentionDays, isTranscriptRetentionFallback, type TranscriptRetentionFallback } from "./transcript-retention";
 import { configurationBound } from "./configuration-defaults";
@@ -19,6 +20,7 @@ import { isDelegationTool } from "./claude-tool-names";
 import { isAskUnansweredKind, type AskUnansweredKind } from "./ask-unanswered";
 import { ELICITATION_CONTENT_LIMITS, elicitationTextLength, type ElicitationAction, type ElicitationSpec, type ElicitationValue } from "./elicitation";
 import { isWritesLostErrorCode, isWritesLostKind, type WritesLostShown } from "./session-writes-lost";
+import { CONFIG_FILE_INVALID, INVALID_CONFIG_OPEN_TARGETS, isInvalidConfigEventRef, isInvalidConfigShown, type InvalidConfigOpenTarget, type InvalidConfigShown } from "./invalid-config-file";
 import { isAccountErrorReason, type AccountErrorReason } from "./account-error";
 import { isExternalTimeout, isExternalDetection, isExternalModels, type ExternalModels, type ExternalDetection } from "./orchestration-roster";
 import { isOrchestrationSettingRoster, type OrchestrationSettingRow, type RecommendedRosterChange } from "./orchestration-roster";
@@ -27,13 +29,14 @@ export type { OrchestrationView } from "./orchestration-view";
 import * as l10n from "@vscode/l10n";
 import { FILE_LINK_TARGET_MAX_LEN } from "./file-link-target";
 export { FILE_LINK_TARGET_MAX_LEN } from "./file-link-target";
-import { agentRuns, findToolPlacement, findWorkSegment, phaseStateOf, runningMainPlacement } from "./work-model";
+import { agentRuns, backgroundCommandViews, findToolPlacement, findWorkSegment, phaseStateOf, runningMainPlacement } from "./work-model";
 import { ANALYSIS_TIME_PART_KEYS, MAIN_PROCESSING_BUCKETS, planCurrentSteps, type PlanStepMarks } from "./plan-steps";
 import { BACKGROUND_ACTIVITY_LIST_MAX, type BackgroundActivitySnapshot } from "./background-activity";
 import { isTodoAskIdentity, isTodoGenerationChain, isTodoGenerationId, type TodoGeneration, isTodoTime, isTodoDocLabel, isTodoImageName, isTodoGroupName, isTodoFolderPath, isTodoLinkTarget, TODO_ITEM_SHAPES, TODO_CHANGE_FIELDS, isTodoChangeRecord, isTodoGroupAlias, isTodoBriefText, isTodoDocFields, isTodoGuessReason, isTodoId, isTodoMemoEntry, isTodoMemoText, isTodoSessionId, todoItemFieldValid, TODO_OPERATION_ERRORS, TODO_REVERT_BLOCKS, type TodoPlacementBasis, type TodoChangePlace, type TodoCaptured, TODO_ASK_PLACES, type TodoAskPlace, TODO_ASK_SOURCE_MESSAGES_MAX, TODO_ASK_SOURCE_TEXT_MAX, TODO_BATCH_MAX, type TodoBatchStep, TODO_GROUP_COLOR_COUNT, TODO_TEMPLATE_NAME_MAX, TODO_ACKNOWLEDGE_MAX, TODO_CHANGE_LOG_LIMIT, TODO_IMAGE_EXTENSIONS, TODO_TITLE_MAX, WORK_MEMO_SECTIONS, TODO_START_KINDS, type TodoStartKind, type TodoAuthor, type TodoCompletion, type TodoDocKind, type TodoImageMediaType, type TodoOperationError, type TodoPriority, type TodoRevertBlock, type TodoState, type WorkMemoSection, type TodoDecision, type TodoItemBy, type TodoChange } from "./todo-model";
 export { BACKGROUND_ACTIVITY_LIST_MAX } from "./background-activity";
 export type { BackgroundActivitySnapshot } from "./background-activity";
 import type {
+  BackgroundCommandView,
   OperationKind,
   PhaseOperation,
   TaskIntent,
@@ -304,7 +307,7 @@ export type NormalizedEventBody =
         kind: "turn_failed";
         turnId: string;
         reason: string;
-        errorKind?: "usage_limit" | "account";
+        errorKind?: "usage_limit" | "account" | typeof CONFIG_FILE_INVALID;
         resetsAt?: number | null;
         detail?: string;
       }
@@ -378,6 +381,7 @@ export type NormalizedEventBody =
     | { kind: "model_observed"; turnId: string | null; model: string; priorGeneration?: true }
     | { kind: "compact_boundary"; trigger: "auto" | "manual"; preTokens?: number; priorGeneration?: true }
     | ({ kind: "session_writes_lost" } & WritesLostShown)
+    | ({ kind: typeof CONFIG_FILE_INVALID } & InvalidConfigShown)
     | {
         kind: "tool_call_finished";
         priorGeneration?: true;
@@ -412,7 +416,7 @@ export type NormalizedEventBody =
         unanswered?: AskUnansweredKind;
         elicitation?: { mode: ElicitationSpec["mode"]; action: ElicitationAction };
       }
-    | { kind: "permission_denied"; turnId: string | null; toolName: string; toolUseId?: string; inDelegate?: true; reason: string; classifierUnavailable?: boolean }
+    | { kind: "permission_denied"; turnId: string | null; toolName: string; toolUseId?: string; inDelegate?: true; reason: string; classifierUnavailable?: boolean; hookChangedAfterReview?: true }
     | { kind: "usage_update"; scope: "turn" | "conversation"; turnId: string | null; usage: UsageSnapshot }
     | {
         kind: "assistant_usage";
@@ -724,7 +728,7 @@ export function summarizeToolInput(toolName: string, input: unknown): string | n
   }
 }
 
-export const HOST_ACTIONS = ["openSettings", "addClaudeModel", "signInAgain"] as const;
+export const HOST_ACTIONS = ["openSettings", "addClaudeModel", "signInAgain", "openInvalidConfigFile"] as const;
 export type HostAction = (typeof HOST_ACTIONS)[number];
 
 export const SETTINGS_REVEAL_TARGETS = ["handoffAuto", "orchestration", "appearance", "todo"] as const;
@@ -977,6 +981,8 @@ export type SettingsPageToHost =
   | { type: "setGuardEnabled"; requestId: number; enabled: boolean }
   | { type: "setMemoryBlockProjectType"; requestId: number; enabled: boolean }
   | { type: "setTodoEnabled"; requestId: number; enabled: boolean }
+  | { type: "setWorkStageEnabled"; requestId: number; enabled: boolean }
+  | { type: "setWorkStageCast"; requestId: number; setting: WorkStageCastSetting; value: unknown }
   | { type: "setEditSummaryEnabled"; requestId: number; enabled: boolean }
   | { type: "setRemoteControlCard"; requestId: number; enabled: boolean }
   | { type: "setImprovementMenu"; requestId: number; enabled: boolean }
@@ -1049,7 +1055,7 @@ export type HostToSettingsPage =
   | { type: "revealSetting"; target: SettingsRevealTarget }
   | { type: "migrationState"; scan?: MigrationScan; busy: boolean; notice?: MigrationNotice }
   | { type: "migrationProgress"; progress: MigrationProgress }
-  | ({ type: "settingsState"; appearance?: AccentSettings; displayName?: string; eventLimit?: number; transcriptRetentionDays?: number; transcriptRetentionFallback: TranscriptRetentionFallback; composerSendKey: ComposerSendKey; apiKeyPolicy: ApiKeyPolicy; restoreTabsOnStartup: boolean; cliAutoUpdate: Record<ExecutorId, boolean>; initialModel?: string; autoContinueAtUsageLimit: boolean; guardEnabled: boolean; memoryBlockProjectType: boolean; todoEnabled: boolean; editSummaryEnabled: boolean; remoteControlCard: boolean; improvementMenu: boolean; welcome?: WelcomeSettings; handoffAuto?: HandoffAutoSettings; waitNotify?: WaitNotifySettings; waitNotifyTelemetryOff?: true; reloadNeeded: boolean; replyTo?: number; writeFailure?: SettingWriteFailure }
+  | ({ type: "settingsState"; appearance?: AccentSettings; displayName?: string; eventLimit?: number; transcriptRetentionDays?: number; transcriptRetentionFallback: TranscriptRetentionFallback; composerSendKey: ComposerSendKey; apiKeyPolicy: ApiKeyPolicy; restoreTabsOnStartup: boolean; cliAutoUpdate: Record<ExecutorId, boolean>; initialModel?: string; autoContinueAtUsageLimit: boolean; guardEnabled: boolean; memoryBlockProjectType: boolean; todoEnabled: boolean; workStage?: WorkStageSettings; editSummaryEnabled: boolean; remoteControlCard: boolean; improvementMenu: boolean; welcome?: WelcomeSettings; handoffAuto?: HandoffAutoSettings; waitNotify?: WaitNotifySettings; waitNotifyTelemetryOff?: true; reloadNeeded: boolean; replyTo?: number; writeFailure?: SettingWriteFailure }
     & SettingsProfileProjection & Record<FileLinkBooleanSetting, boolean> & { openWithSystemApp: string[] } & { orchestrationEnabled: boolean; orchestrationAgents: OrchestrationSettingRow[]; orchestrationDefaults: OrchestrationSettingRow[]; conductorPolicy: string; conductorPolicyDefault: string; externalTimeoutMinutes: number; externalDetection: Record<ExecutorId, ExternalDetection>; externalModels: ExternalModels });
 
 function isSettingsRequestId(v: unknown): v is number {
@@ -1095,8 +1101,11 @@ export function isSettingsPageToHost(v: unknown): v is SettingsPageToHost {
     return isSettingsRequestId(m.requestId)
       && (API_KEY_POLICIES as readonly string[]).includes(m.policy as string) && hasOnlyKeys(m, ["type", "requestId", "policy"]);
   }
-  if (t === "setAutoContinueAtUsageLimit" || t === "setRestoreTabsOnStartup" || t === "setGuardEnabled" || t === "setMemoryBlockProjectType" || t === "setTodoEnabled" || t === "setEditSummaryEnabled" || t === "setRemoteControlCard" || t === "setImprovementMenu") {
+  if (t === "setAutoContinueAtUsageLimit" || t === "setRestoreTabsOnStartup" || t === "setGuardEnabled" || t === "setMemoryBlockProjectType" || t === "setTodoEnabled" || t === "setWorkStageEnabled" || t === "setEditSummaryEnabled" || t === "setRemoteControlCard" || t === "setImprovementMenu") {
     return isSettingsRequestId(m.requestId) && typeof m.enabled === "boolean" && hasOnlyKeys(m, ["type", "requestId", "enabled"]);
+  }
+  if (t === "setWorkStageCast") {
+    return isSettingsRequestId(m.requestId) && isWorkStageCastSettingValue(m.setting, m.value) && hasOnlyKeys(m, ["type", "requestId", "setting", "value"]);
   }
   if (t === "setWelcomeSetting") {
     return isSettingsRequestId(m.requestId) && (WELCOME_SETTINGS as readonly unknown[]).includes(m.setting) && typeof m.enabled === "boolean"
@@ -1186,6 +1195,7 @@ export function isHostToSettingsPage(v: unknown): v is HostToSettingsPage {
       && typeof m.autoContinueAtUsageLimit === "boolean" && typeof m.guardEnabled === "boolean" && typeof m.memoryBlockProjectType === "boolean" && typeof m.todoEnabled === "boolean"
       && typeof m.editSummaryEnabled === "boolean" && typeof m.remoteControlCard === "boolean" && typeof m.improvementMenu === "boolean" && typeof m.reloadNeeded === "boolean"
       && (m.welcome === undefined || isWelcomeSettings(m.welcome))
+      && (m.workStage === undefined || isWorkStageSettings(m.workStage))
       && (m.handoffAuto === undefined || isSettingsGroup<HandoffAutoSettings>(m.handoffAuto, HANDOFF_AUTO_SETTING_KEYS, isHandoffAutoSettingValue))
       && (m.waitNotify === undefined || isSettingsGroup<WaitNotifySettings>(m.waitNotify, WAIT_NOTIFY_SETTING_KEYS, isWaitNotifySettingValue))
       && (m.waitNotifyTelemetryOff === undefined || m.waitNotifyTelemetryOff === true)
@@ -1197,10 +1207,22 @@ export function isHostToSettingsPage(v: unknown): v is HostToSettingsPage {
       && Array.isArray(m.openWithSystemApp) && m.openWithSystemApp.every((item) => typeof item === "string")
       && (m.replyTo === undefined || isSettingsRequestId(m.replyTo))
       && (m.writeFailure === undefined || m.replyTo !== undefined && isSettingWriteFailure(m.writeFailure))
-      && hasOnlyKeys(m, ["type", "initialModel", "appearance", "displayName", "eventLimit", "transcriptRetentionDays", "transcriptRetentionFallback", "composerSendKey", "apiKeyPolicy", "restoreTabsOnStartup", "cliAutoUpdate", "autoContinueAtUsageLimit", "guardEnabled", "memoryBlockProjectType", "todoEnabled", "editSummaryEnabled", "remoteControlCard", "improvementMenu", "welcome", "handoffAuto", "waitNotify", "waitNotifyTelemetryOff", "reloadNeeded", ...FILE_LINK_SETTINGS, "orchestrationEnabled", "orchestrationAgents", "orchestrationDefaults", "conductorPolicy", "conductorPolicyDefault", "externalTimeoutMinutes", "externalDetection", "externalModels", "replyTo", "writeFailure", "conductorPreview", "recommendedRosterSame"]);
+      && hasOnlyKeys(m, ["type", "initialModel", "appearance", "displayName", "eventLimit", "transcriptRetentionDays", "transcriptRetentionFallback", "composerSendKey", "apiKeyPolicy", "restoreTabsOnStartup", "cliAutoUpdate", "autoContinueAtUsageLimit", "guardEnabled", "memoryBlockProjectType", "todoEnabled", "workStage", "editSummaryEnabled", "remoteControlCard", "improvementMenu", "welcome", "handoffAuto", "waitNotify", "waitNotifyTelemetryOff", "reloadNeeded", ...FILE_LINK_SETTINGS, "orchestrationEnabled", "orchestrationAgents", "orchestrationDefaults", "conductorPolicy", "conductorPolicyDefault", "externalTimeoutMinutes", "externalDetection", "externalModels", "replyTo", "writeFailure", "conductorPreview", "recommendedRosterSame"]);
   }
   t satisfies never;
   return false;
+}
+
+export interface WorkStageSettings {
+  enabled: boolean;
+  cast: WorkStageCast;
+  characters: WorkStageCharacter[];
+}
+
+function isWorkStageSettings(value: unknown): value is WorkStageSettings {
+  return isProfileObject(value) && hasOnlyKeys(value, ["enabled", "cast", "characters"]) && typeof value.enabled === "boolean"
+    && isWorkStageCast(value.cast)
+    && Array.isArray(value.characters) && value.characters.every(isWorkStageCharacter);
 }
 
 export interface AskMarks {
@@ -1318,6 +1340,7 @@ export type WebviewToHost =
   | { type: "welcomeAction"; action: "dismissNews"; version: string }
   | { type: "welcomeAction"; action: "hideTips" }
   | { type: "runHostAction"; action: "addClaudeModel" | "signInAgain"; tabId: string }
+  | { type: "runHostAction"; action: "openInvalidConfigFile"; tabId: string; generation: number; seq: number; file: InvalidConfigOpenTarget }
   | { type: "requestAccountUsage"; tabId: string; requestId: string }
   | { type: "requestAccountUsage"; requestId: string }
   | { type: "accountUsagePanelClosed" }
@@ -2023,6 +2046,7 @@ export interface WorkModelPayload {
   externalRuns?: Array<{ label: string; run: import("./role-summary").RoleRunView }>;
   planTools?: Array<{ id: string; name: string; description: string; startedAt: number; intentInput?: ToolIntentInput }>;
   runningMainTools?: Array<{ id: string; name: string; startedAt: number; intentInput?: ToolIntentInput }>;
+  backgroundCommands?: BackgroundCommandView[];
   version: number;
   revision: number;
   coverage: WorkCoverage;
@@ -2195,6 +2219,11 @@ function unknownLauncherRequests(state: WorkModelState, restoredAgents: readonly
   return byRequest.size === 0 ? {} : { unknownLaunchers: [...byRequest].map(([turnId, toolUseIds]) => ({ turnId, toolUseIds })) };
 }
 
+function backgroundCommandsOf(state: WorkModelState): Pick<WorkModelPayload, "backgroundCommands"> {
+  const commands = backgroundCommandViews(state);
+  return commands.length === 0 ? {} : { backgroundCommands: commands };
+}
+
 export function projectWorkModel(
   state: WorkModelState,
   restoredAgents: readonly RestoredAgent[] = [],
@@ -2339,6 +2368,7 @@ export function projectWorkModel(
       return tool && tool.background === undefined
         ? [{ id, name: tool.toolName, startedAt: tool.startedAt, intentInput: tool.intentInput }] : [];
     }).sort((a, b) => a.startedAt - b.startedAt),
+    ...backgroundCommandsOf(state),
     revision: state.revision,
     coverage:
       depthLimitedCount > 0
@@ -2686,6 +2716,7 @@ export function isWorkModelPayload(v: unknown): v is WorkModelPayload {
       && typeof (value as { label?: unknown }).label === "string" && isRoleRunView((value as { run?: unknown }).run)),
     runningMainTools: () => m.runningMainTools === undefined || isArrayOf(m.runningMainTools, isRunningMainToolView),
     planTools: () => m.planTools === undefined || isArrayOf(m.planTools, isPlanToolView),
+    backgroundCommands: () => m.backgroundCommands === undefined || isArrayOf(m.backgroundCommands, isBackgroundCommandView),
     version: () => isNumber(m.version),
     revision: () => isNumber(m.revision),
     coverage: () => isWorkCoverage(m.coverage),
@@ -3575,7 +3606,7 @@ export type HostToWebview =
   | { type: "editorContext"; path: string; startLine: number; endLine: number }
   | { type: "workModel"; tabId: string; model: WorkModelPayload }
   | { type: "semanticModel"; tabId: string; model: SemanticModelPayload }
-  | { type: "userSettings"; appearance?: AccentSettings; displayName?: string; composerSendKey: ComposerSendKey; askQualityCheck?: boolean; editSummaryEnabled: boolean; remoteControlCard?: boolean; waitNotify?: boolean; improvementMenu?: boolean; welcome?: WelcomeState }
+  | { type: "userSettings"; appearance?: AccentSettings; displayName?: string; composerSendKey: ComposerSendKey; askQualityCheck?: boolean; editSummaryEnabled: boolean; remoteControlCard?: boolean; waitNotify?: boolean; improvementMenu?: boolean; welcome?: WelcomeState; workStage?: boolean; workStageCast?: WorkStageCast }
   | { type: "remoteControlState"; tabId: string; state: RemoteControlView }
   | { type: "tabNotice"; tabId: string; text: string }
   | { type: "elicitationOpenFailed"; tabId: string; requestId: string }
@@ -4018,6 +4049,9 @@ export function isWebviewToHost(v: unknown): v is WebviewToHost {
     if (!(HOST_ACTIONS as readonly string[]).includes(action as string)) return false;
     if (action === "addClaudeModel" || action === "signInAgain") return typeof tabId === "string" && tabId.length > 0
       && Object.keys(m).every((key) => key === "type" || key === "action" || key === "tabId");
+    if (action === "openInvalidConfigFile") return typeof tabId === "string" && tabId.length > 0
+      && isInvalidConfigEventRef(m.generation, m.seq) && (INVALID_CONFIG_OPEN_TARGETS as readonly unknown[]).includes(m.file)
+      && hasOnlyKeys(m, ["type", "action", "tabId", "generation", "seq", "file"]);
     return (m.target === undefined || isSettingsRevealTarget(m.target)) && hasOnlyKeys(m, ["type", "action", "target"]);
   }
   if (t === "welcomeAction") {
@@ -4613,6 +4647,7 @@ function isPlausibleNormalizedEvent(x: unknown): x is NormalizedEvent {
   if (e.kind === "session_writes_lost") {
     if (!isWritesLostErrorCode(e.errorCode) || !Array.isArray(e.lost) || e.lost.length === 0 || !e.lost.every(isWritesLostKind)) return false;
   }
+  if (e.kind === CONFIG_FILE_INVALID && !isInvalidConfigShown(e)) return false;
   if (e.kind === "account_error") {
     if (!isAccountErrorReason(e.reason) || (e.turnId !== null && typeof e.turnId !== "string") || (e.detail !== undefined && typeof e.detail !== "string") ||
       (e.priorGeneration !== undefined && e.priorGeneration !== true)) return false;
@@ -5334,6 +5369,8 @@ export function isHostToWebview(v: unknown): v is HostToWebview {
       && [undefined, true, false].includes((v as { remoteControlCard?: unknown }).remoteControlCard as boolean | undefined)
       && [undefined, true, false].includes((v as { waitNotify?: unknown }).waitNotify as boolean | undefined)
       && [undefined, true, false].includes((v as { improvementMenu?: unknown }).improvementMenu as boolean | undefined)
+      && [undefined, true, false].includes((v as { workStage?: unknown }).workStage as boolean | undefined)
+      && ((v as { workStageCast?: unknown }).workStageCast === undefined || isWorkStageCast((v as { workStageCast?: unknown }).workStageCast))
       && ((v as { welcome?: unknown }).welcome === undefined || isWelcomeState((v as { welcome?: unknown }).welcome));
   }
   if (t === "remoteControlState") {
@@ -5569,6 +5606,20 @@ function isRunningMainToolView(tool: unknown): boolean {
     typeof row.id === "string" &&
     typeof row.name === "string" &&
     isNumber(row.startedAt)
+  );
+}
+
+const BACKGROUND_COMMAND_STATUSES: ReadonlySet<unknown> = new Set<BackgroundCommandView["status"]>(["running", "completed", "failed", "stale"]);
+
+function isBackgroundCommandView(command: unknown): boolean {
+  if (!command || typeof command !== "object") return false;
+  const row = command as Record<string, unknown>;
+  return (
+    typeof row.id === "string" &&
+    typeof row.description === "string" &&
+    isNumber(row.startedAt) &&
+    BACKGROUND_COMMAND_STATUSES.has(row.status) &&
+    (row.endedAt === undefined || isNumber(row.endedAt))
   );
 }
 

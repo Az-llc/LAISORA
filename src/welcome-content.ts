@@ -18,6 +18,10 @@ export interface WelcomeUiNames { menuGlyph: string; handoffItem: string; appear
 
 export function welcomeNews(): Readonly<Record<string, readonly WelcomeNewsItem[]>> {
   return {
+    "1.19.0": [
+      { kind: "new", text: l10n.t("When a Claude Code settings file is broken, the conversation shows one notice with the file, how to fix it, and buttons that open it.") },
+      { kind: "new", text: l10n.t("In a narrow window the message box wraps its controls to two rows, and the model stays visible.") },
+    ],
     "1.18.0": [
       { kind: "new", text: l10n.t("Claude can end finished or waiting work with a short summary card: the result, what was verified, and what waits for you. It is turned off at first; turn it on in the settings.") },
       { kind: "new", text: l10n.t("After an automatic handoff, the new conversation continues an unfinished PLAN without waiting for your message. You can turn it off in the settings."), setting: "handoffAuto" },

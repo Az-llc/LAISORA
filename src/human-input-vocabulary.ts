@@ -22,6 +22,7 @@ export const CLI_USER_INTERRUPTED_TEXTS: readonly string[] = [
 const CLI_SYNTHETIC_EXACT_TEXTS: readonly string[] = [
   ...CLI_USER_INTERRUPTED_TEXTS,
   "[Request interrupted: the session ended before this agent finished. Nobody asked it to stop.]",
+  "[This turn ended before it finished.]",
   "[Agent call interrupted: the process running this conversation stopped before this agent finished, so it returned no result. Nobody asked it to stop.]",
   "[Tool call did not complete: the turn was ended to deliver the message that follows. Nothing refused it; re-run it if still needed.]",
   "[Tool call interrupted: the session ended before this call's result was recorded, so its outcome is unknown. Check whether it took effect before relying on it or running it again.]",

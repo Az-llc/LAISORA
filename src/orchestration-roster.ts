@@ -1,7 +1,7 @@
 import { configurationDefault } from "./configuration-defaults";
 import { CONDUCTOR_CONTROL_LINE } from "./placement-line";
 import { EXECUTORS, EXTERNAL_EXECUTORS, CLAUDE_EFFORTS, CODEX_EFFORTS, canonicalExecutorEfforts, isOrchestrationEffort, claudeAgentName,
-  executorModelList, isExecutorId, isExternalExecutorId, isExternalModel, rowComplete, EXTERNAL_MODEL_LIST_MAX, EXTERNAL_TIMEOUT_MAX_MINUTES, EXTERNAL_TIMEOUT_MIN_MINUTES,
+  executorModelList, executorServesRole, isExecutorId, isExternalExecutorId, isExternalModel, rowComplete, EXTERNAL_MODEL_LIST_MAX, EXTERNAL_TIMEOUT_MAX_MINUTES, EXTERNAL_TIMEOUT_MIN_MINUTES,
   type ExecutorId, type ExecutorRow, type ExternalExecutorId, type ExternalModel, type ExternalModels, type ExternalDetection, type OrchestrationEffort } from "./orchestration-executors";
 export * from "./orchestration-executors";
 export interface OrchestrationRow {
@@ -222,7 +222,7 @@ export function orchestrationExternalTargets(roster: readonly OrchestrationRow[]
   const targets = roster.filter((entry) => entry.enabled).flatMap((entry) => entry.rows.flatMap((row) => {
     if (!isExternalExecutorId(row.executor)) return [];
     const executor = row.executor, definition = EXECUTORS[executor];
-    if (entry.role === "worker" && !definition.writable) { nonWritable.push(`${entry.role}/${executor}@${row.model}`); return []; }
+    if (!executorServesRole(entry.role, executor)) { nonWritable.push(`${entry.role}/${executor}@${row.model}`); return []; }
     const supported = definition.models(executorModelList(executor, models))?.find((choice) => choice.model === row.model)?.efforts;
     return selectedEfforts(row, models).flatMap((effort) => {
       const target = definition.targetKey(entry.role, row.model, effort);

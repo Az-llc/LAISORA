@@ -34,6 +34,10 @@ export function askStale(item: YouItem, siblings: readonly YouItem[], now: numbe
   return later.size >= ASK_STALE_LATER_REPLIES ? "moved-on" : null;
 }
 
+export function openYouItems(items: readonly YouItem[], now: number): YouItem[] {
+  return items.filter(item => isWaitingYouItem(item) && askStale(item, items, now) === null);
+}
+
 export function nextAskStaleAt(items: readonly YouItem[], now: number): number | null {
   let next: number | null = null;
   for (const item of items) {
@@ -41,6 +45,11 @@ export function nextAskStaleAt(items: readonly YouItem[], now: number): number |
     if (isWaitingYouItem(item) && isDeclaredAsk(item) && item.createdAt > 0 && at > now) next = Math.min(next ?? Infinity, at);
   }
   return next;
+}
+
+export function nextAskStaleDelay(items: readonly YouItem[], now: number): number | null {
+  const at = nextAskStaleAt(items, now);
+  return at === null ? null : Math.min(at - now + 1000, 2 ** 31 - 1);
 }
 
 export interface YouItemsReader {

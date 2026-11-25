@@ -47,6 +47,9 @@ export function externalRunStatus(outcome: ExternalRunOutcome): "completed" | "s
 }
 
 export const AGY_EFFORTS = ["low", "medium", "high"] as const;
+export const AGY_DENIED_ACTIONS = ["write_file", "command", "unsandboxed", "mcp", "execute_url", "download_url", "read_url"] as const;
+export const AGY_TOOL_PERMISSION = "request-review";
+export const AGY_READ_ONLY_SETTINGS = JSON.stringify({ toolPermission: AGY_TOOL_PERMISSION, permissions: { deny: AGY_DENIED_ACTIONS.map((action) => `${action}(*)`) } });
 export function splitAgyModel(id: string): { model: string; effort: string } {
   const at = id.lastIndexOf("-");
   const effort = id.slice(at + 1);
@@ -103,6 +106,10 @@ export function isExecutorId(value: unknown): value is ExecutorId {
 }
 export function isExternalExecutorId(value: unknown): value is ExternalExecutorId {
   return isExecutorId(value) && EXECUTORS[value].kind === "external";
+}
+const EDITING_ROLE = "worker";
+export function executorServesRole(role: string, executor: ExecutorId): boolean {
+  return role !== EDITING_ROLE || EXECUTORS[executor].writable;
 }
 export const RUN_METADATA_MAX = 200;
 const RUN_METADATA = /^[A-Za-z0-9][A-Za-z0-9._:\[\]-]*$/;
@@ -258,7 +265,7 @@ export const EXECUTORS: Record<ExecutorId, ExecutorDefinition> = {
     targetKey: (role, model, effort) => `${role}/agy@${model}${effort ? `-${effort}` : ""}`,
     localPath: ["agy", "bin"], detect: detectVersion,
     preamble: "You are a read-only reviewer. The command tool is unavailable and fails immediately. Do not list or search directories. Read only the absolute file paths listed below.",
-    argv: (model, effort, cwd, minutes, prompt) => ["--add-dir", cwd, "--print-timeout", `${minutes}m`, "--output-format", "json", "--model", `${model}${effort ? `-${effort}` : ""}`, `--print=${prompt}`],
+    argv: (model, effort, cwd, minutes, prompt) => ["--add-dir", cwd, "--settings", AGY_READ_ONLY_SETTINGS, "--print-timeout", `${minutes}m`, "--output-format", "json", "--model", `${model}${effort ? `-${effort}` : ""}`, `--print=${prompt}`],
     parseOutput: (output, code, stderr) => executorResult(output, code, stderr, (text) => {
       const value = JSON.parse(text);
       return { completed: typeof value.status === "string" && value.status.toUpperCase() === "SUCCESS", failed: !!value.error,

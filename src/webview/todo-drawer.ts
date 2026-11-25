@@ -3,7 +3,8 @@ import { contributes } from "../../package.json";
 import type { TodoEdit, TodoListItem } from "../protocol";
 import { todoScopeIds } from "../todo-model";
 import { openTodoDetail } from "./todo-app";
-import { todoButton, todoCloseButton, todoOverlayTop, todoStateIcon, TodoTypingGuard } from "./todo-edit";
+import { todoButton, todoCloseButton, todoStateIcon, TodoTypingGuard } from "./todo-edit";
+import type { DrawerOccupant, DrawerSlot } from "./drawer-slot";
 import type { TodoAskActions, TodoAskRow } from "./todo-asks";
 import { TODO_ROW_FLASH_MS, todoFlashList, TodoRowRenderer } from "./todo-row-view";
 import type { TodoAttention } from "./todo-view";
@@ -27,8 +28,6 @@ export interface TodoDrawerSource {
 }
 
 export interface TodoDrawerPlace {
-  rail(tabId: string): HTMLElement | null;
-  readonly composer: HTMLElement;
   showInTodoTab(itemId: string | undefined): void;
 }
 
@@ -51,7 +50,7 @@ export function todoDrawerKeyLabel(): string {
   return todoDrawerKeyParts().map(part => mac ? part.mac ?? part.label : part.label).join("+");
 }
 
-export class TodoDrawer {
+export class TodoDrawer implements DrawerOccupant {
   readonly button: HTMLButtonElement;
   readonly linkButton: HTMLButtonElement;
   readonly root: HTMLElement;
@@ -60,9 +59,6 @@ export class TodoDrawer {
   private readonly runningBtn: HTMLButtonElement;
   private readonly waitingBtn: HTMLButtonElement;
   private readonly cycle = { running: -1, waiting: -1 };
-  private hiddenRail: HTMLElement | null = null;
-  private readonly onResize = () => this.place();
-  private readonly composerResize = new ResizeObserver(this.onResize);
   private readonly headEl: HTMLElement;
   private readonly marksEl: HTMLElement;
   private readonly listEl: HTMLElement;
@@ -73,7 +69,7 @@ export class TodoDrawer {
   private tabId: string | null = null;
   private openNow = false;
 
-  constructor(private readonly source: TodoDrawerSource, private readonly where: TodoDrawerPlace) {
+  constructor(private readonly source: TodoDrawerSource, private readonly where: TodoDrawerPlace, private readonly slot: DrawerSlot) {
     this.button = todoButton("todo-drawer-btn", "", () => this.toggle());
     this.button.setAttribute("aria-keyshortcuts", todoDrawerKeyParts().map(part => part.aria).join("+"));
     this.button.id = "tododrawerbtn";
@@ -206,27 +202,14 @@ export class TodoDrawer {
   }
 
   private place(): void {
-    const rail = this.openNow && this.tabId !== null ? this.where.rail(this.tabId) : null;
-    if (this.hiddenRail && this.hiddenRail !== rail) { this.hiddenRail.style.visibility = ""; this.hiddenRail = null; }
-    this.root.classList.toggle("in-rail", rail !== null);
-    const composer = this.where.composer;
-    const composerTop = composer.getClientRects().length === 0 ? window.innerHeight : composer.getBoundingClientRect().top;
-    this.root.style.bottom = `${Math.max(window.innerHeight - composerTop, 0)}px`;
-    const overlayTop = todoOverlayTop();
-    if (!rail) {
-      for (const prop of ["left", "width"]) this.root.style.removeProperty(prop);
-      this.root.style.top = `${overlayTop}px`;
-      return;
-    }
-    const rect = rail.getBoundingClientRect();
-    this.root.style.left = `${rect.left}px`;
-    this.root.style.top = `${Math.max(overlayTop, Math.min(rect.top, composerTop - this.minHeight()))}px`;
-    this.root.style.width = `${rect.width}px`;
-    rail.style.visibility = "hidden";
-    this.hiddenRail = rail;
+    this.slot.place(this, this.tabId);
   }
 
-  private minHeight(): number {
+  release(): void {
+    this.setOpen(false, false);
+  }
+
+  minHeight(): number {
     const row = this.listEl.querySelector(".todo-row") ?? this.listEl.firstElementChild;
     const bottom = row ? row.getBoundingClientRect().bottom + this.listEl.scrollTop : this.listEl.getBoundingClientRect().top;
     return bottom - this.headEl.getBoundingClientRect().top;
@@ -236,15 +219,12 @@ export class TodoDrawer {
     this.openNow = open && this.available();
     this.root.hidden = !this.openNow;
     this.button.setAttribute("aria-expanded", this.openNow ? "true" : "false");
-    this.place();
     if (this.openNow) {
-      window.addEventListener("resize", this.onResize);
-      this.composerResize.observe(this.where.composer);
+      this.slot.open(this, this.tabId);
       this.render();
       queueMicrotask(() => (this.listEl.querySelector<HTMLElement>("[data-focus-key]") ?? this.root.querySelector<HTMLElement>("button"))?.focus());
     } else {
-      window.removeEventListener("resize", this.onResize);
-      this.composerResize.disconnect();
+      this.slot.close(this);
       if (refocus) this.button.focus();
     }
   }

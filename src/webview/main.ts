@@ -101,6 +101,8 @@ import { uiLocale } from "./l10n";
 import { isComposingKey } from "./composing";
 import { initTodoApp } from "./todo-app";
 import { TodoDrawer } from "./todo-drawer";
+import { DrawerSlot } from "./drawer-slot";
+import { WorkStageDrawer } from "./work-stage-drawer";
 import { openTodoMenu, readImageAsBase64, type TodoMenuEntry, type TodoMenuHandle } from "./todo-edit";
 import { TODO_TAB_LABEL, TodoTab } from "./todo-view";
 import { receiveTodoChanges, refreshTodoSplitCards, refreshTodoToolCards, todoSplitCard } from "./todo-chat";
@@ -119,7 +121,10 @@ export const MODE_LABELS: Record<PermissionModeId, string> = {
 
 const tabs = new Map<string, Tab>();
 const overviews = new Map<string, WorkOverview>();
-setOnTabActivity((tabId, active) => overviews.get(tabId)?.setActive(active));
+setOnTabActivity((tabId, active) => {
+  overviews.get(tabId)?.setActive(active);
+  workStageDrawer.refresh(tabId);
+});
 setOnConvViewShown((tabId) => resumeConversationChase(tabId));
 setOnAskDismissed((tabId, identity) => todoTab.noteTabDismissal(tabId, identity));
 setOnAskChecked((tabId, key, steps) => todoTab.noteTabAskCheck(tabId, key, steps));
@@ -187,15 +192,26 @@ const todoTab = new TodoTab(vscode.getState()?.todo, {
   },
   unreadOfTab: (tabId) => tabs.get(tabId)?.unreadCount ?? 0,
 }, todoApp);
-const todoDrawer = new TodoDrawer(todoTab, {
+const drawerSlot = new DrawerSlot({
   rail: (tabId) => tabs.get(tabId)?.rightRail() ?? null,
+  railElement: (tabId) => tabs.get(tabId)?.planPanel.aside ?? null,
   composer: document.getElementById("composer")!,
+});
+const todoDrawer = new TodoDrawer(todoTab, {
   showInTodoTab: (itemId) => {
     showTodoTab();
     if (itemId !== undefined) todoApp.open(itemId);
   },
-});
-histBtn.before(todoDrawer.linkButton, todoDrawer.button);
+}, drawerSlot);
+const workStageDrawer = new WorkStageDrawer({
+  source: (tabId) => tabs.get(tabId)?.stageSource(),
+  subscribe: (tabId, listener) => tabs.get(tabId)?.youItems.subscribe(listener),
+  persistOpen: (open) => {
+    const saved = vscode.getState();
+    vscode.setState({ ...saved, activeTabId: saved?.activeTabId ?? activeTabId, workStageOpen: open });
+  },
+}, drawerSlot, vscode.getState()?.workStageOpen === true);
+histBtn.before(todoDrawer.linkButton, todoDrawer.button, workStageDrawer.button);
 document.getElementById("app")!.append(todoDrawer.root);
 let pendingDrawerReveal: { itemId: string; until: number } | null = null;
 const TODO_REVEAL_WAIT_MS = 30_000;
@@ -405,6 +421,7 @@ export function setActiveTab(tabId: string, user = true): void {
   if (activeTabId !== tabId) inputEl.value = drafts.get(tabId) ?? "";
   activeTabId = tabId;
   todoDrawer.setActiveTab(tabId);
+  workStageDrawer.setActiveTab(tabId);
   if (tabs.get(tabId)!.clearUnread() && todoTab.enabled) todoTab.render();
   tryPendingDrawerReveal();
   tabActivationDepth += 1;
@@ -454,6 +471,7 @@ function showTodoTab(): void {
   activeTabId = null;
   vscode.postMessage({ type: "conversationHidden" });
   todoDrawer.setActiveTab(null);
+  workStageDrawer.setActiveTab(null);
   noteSurfaceChange();
   for (const t of tabs.values()) {
     t.tabBtn.classList.remove("active");
@@ -573,6 +591,7 @@ export function refreshChrome(): void {
 function renderMode(t: Tab | null): void {
   const mode = t?.permissionMode ?? "default";
   modeBtn.textContent = MODE_LABELS[mode];
+  modeBtn.title = MODE_LABELS[mode];
   modeBtn.className = mode === "bypassPermissions" ? "mode-chip mode-danger" : "mode-chip";
 }
 
@@ -2260,6 +2279,7 @@ function rebuildTabInPlace(snap: TabSnapshot, preserveScroll: boolean): void {
   logsEl.insertBefore(t.logEl, logNext);
   if (activeTabId === snap.tabId) setActiveTab(snap.tabId, false);
   else if (!preserveScroll) persistState();
+  drawerSlot.relayout();
 }
 
 function discardTab(tabId: string): void {
@@ -2463,10 +2483,12 @@ function initMessageBus(): void {
         const model = displayWorkModel(msg.tabId, msg.model);
         overviews.get(msg.tabId)?.update(model);
         tabs.get(msg.tabId)?.applyWorkModel(model);
+        workStageDrawer.refresh(msg.tabId);
         break;
       }
       case "orchestrationView": {
         applyOrchestrationView(msg.tabId, msg.state);
+        workStageDrawer.refresh(msg.tabId);
         break;
       }
       case "semanticModel": {
@@ -2481,6 +2503,7 @@ function initMessageBus(): void {
         applyUserSettings(msg);
         applyWelcomeState(msg.welcome);
         refreshComposer();
+        workStageDrawer.configure(msg.workStage === true, msg.workStageCast);
         break;
       }
       case "tabNotice": {
@@ -2818,7 +2841,11 @@ function initMessageBus(): void {
           persistState();
           const next = [...tabs.keys()][0] ?? null;
           if (!activeTabId && next && !todoTab.shown) setActiveTab(next, false);
-          else if (!activeTabId) refreshChrome();
+          else if (!activeTabId) {
+            workStageDrawer.setActiveTab(null);
+            drawerSlot.relayout();
+            refreshChrome();
+          }
         }
         break;
       }
@@ -3408,6 +3435,7 @@ function initTicker(): void {
     const nowMs = Date.now();
     activeTab()?.tickStrip();
     activeTab()?.planPanel.tick(nowMs);
+    workStageDrawer.refresh(activeTabId);
     if (activeTabId) {
       overviews.get(activeTabId)?.tick(nowMs);
     }

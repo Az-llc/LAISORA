@@ -15,6 +15,7 @@ export interface WebviewState {
   scrollAnchors?: Record<string, unknown>;
   codeWrap?: boolean;
   todo?: unknown;
+  workStageOpen?: boolean;
 }
 
 type VsCodeWebviewApi = {

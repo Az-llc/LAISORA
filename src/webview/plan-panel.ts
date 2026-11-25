@@ -2,10 +2,9 @@ import * as l10n from "@vscode/l10n";
 import { closeGlyphButton } from "./close-button";
 import { truncateToolIntent, waitingDecisionText } from "./status-line";
 import { workEndStatusWord, type OrchestrationView, type PlanContextWork, type WorkModelPayload } from "../protocol";
-import { deriveEarlierPlanViews, derivePlanView, planAllStepsDone, planCurrentStep, planLaneRunning, planStepCount, planStepFolds, type PlanLane, type PlanStep, type PlanView } from "./plan-view";
+import { deriveEarlierPlanViews, derivePlanView, planAllStepsDone, planBarFacts, planCurrentStep, planLaneRunning, planStepCount, planStepFolds, planStepLabel, type PlanLane, type PlanStep, type PlanView } from "./plan-view";
 import { createLoader } from "./loader";
 import { approx, formatDuration } from "./format";
-import { planItemLabel } from "../plan-steps";
 import { goalLabel } from "./ask-view";
 import { todoAgentLabel, todoAgentText } from "./todo-links";
 import { measuredSumNote } from "./term";
@@ -110,6 +109,7 @@ export class PlanPanel {
   setModel(model: WorkModelPayload | undefined): void { this.model = model; this.render(); }
   setOrchestration(view: OrchestrationView | undefined): void { this.orchestration = view; this.render(); }
   tick(nowMs: number): void { this.nowMs = nowMs; this.render(); }
+  inputs(): { model: WorkModelPayload | undefined; orchestration: OrchestrationView | undefined } { return { model: this.model, orchestration: this.orchestration }; }
   refreshTodo(): void { this.signature = ""; this.render(); }
 
   private render(): void {
@@ -119,11 +119,10 @@ export class PlanPanel {
     const signature = JSON.stringify([view, earlier, planRunning, this.nowStatus]);
     if (signature === this.signature) return;
     this.signature = signature;
-    const current = planCurrentStep(view, earlier);
-    const count = planStepCount(view, earlier);
+    const { current, number, title, count } = planBarFacts(view, earlier);
     this.barCount.textContent = count ? `${count.position}/${count.total}` : "";
-    this.barNumber.textContent = current ? itemNumber(current) : "";
-    this.barTitle.textContent = current?.title ?? "";
+    this.barNumber.textContent = number;
+    this.barTitle.textContent = title;
     const earlierLanes = earlier.flatMap(plan => plan.steps.flatMap(step => step.lanes));
     const running = [...view.now, ...view.steps.flatMap(step => step.lanes), ...earlierLanes].filter(planLaneRunning).length;
     this.barRunning.textContent = running ? l10n.t("Working {0}", running) : "";
@@ -134,8 +133,6 @@ export class PlanPanel {
   }
 
 }
-
-function itemNumber(step: PlanStep): string { return step.number === null ? "" : planItemLabel(step.number); }
 
 function renderLane(lane: PlanLane, slots: { readonly todo?: HTMLElement } = {}): HTMLElement {
   const row = node("div", "plan-lane");
@@ -278,6 +275,6 @@ export function renderPlanItem(step: PlanStep, current: PlanStep | undefined, op
     body.append(metric);
   }
   if (step.lanes.length) body.append(...laneFold(step.lanes, openLanes, `lanes\u0000${block}\u0000${step.key}`, laneLabel));
-  item.append(node("span", "plan-number", itemNumber(step)), body);
+  item.append(node("span", "plan-number", planStepLabel(step)), body);
   return item;
 }

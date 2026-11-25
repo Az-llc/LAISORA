@@ -1,5 +1,23 @@
 # Changelog
 
+## 1.19.0
+
+- **Broken Claude Code settings file.** When Claude Code cannot start because one of its settings
+  files is broken, the conversation shows one notice with the file's path, whether a backup exists,
+  how to fix it, and buttons that open the files, instead of a generic failure.
+- **Narrow windows.** The message box wraps its chips and buttons to two rows when they do not fit,
+  the model chip stays visible, and the model and usage popups stay inside the window. The
+  permission mode tooltip names the current mode.
+- In auto mode, a tool call that is issued again because a hook changed its input is no longer
+  shown as a failure.
+- A wake-up from the wait notification is shown as one LAISORA line, also in a reopened
+  conversation, and a turn you start yourself is not taken for the wake-up.
+- Antigravity delegates run with file writes, commands and MCP denied whatever settings you saved.
+  In the roster settings, a worker row cannot choose an executor that cannot edit files.
+- A conversation started from a ToDo sub-item receives the parent's decisions with your first
+  message, and again when they change.
+- Updated the Claude Agent SDK to 0.3.331 (Claude Code 2.1.331).
+
 ## 1.18.0
 
 - **Closing summary.** A new setting has Claude end finished or waiting work with a short summary

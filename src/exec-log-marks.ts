@@ -111,7 +111,7 @@ export function foldExecLogMarks(state: ExecLogMarkState, event: NormalizedEvent
   if (event.kind === "tool_call_finished") {
     if (!isFailedToolResult(event)) return state;
     const failure = classifyToolFailure(event.resultPreview, undefined);
-    if (failure.kind === "user_rejected") return state;
+    if (failure.kind === "user_rejected" || failure.kind === "hook_changed_after_review") return state;
     const rule = FAILURE_RULES.find((r) => r.matches(event.resultPreview, failure));
     if (rule === undefined) return state;
     return push(state, { toolUseId: event.toolUseId, turnId: event.turnId, family: "failure", label: rule.label, findingAnchor: rule.anchor });

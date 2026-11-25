@@ -147,6 +147,13 @@ export function noteWaitNotifyResult(episode: WaitEpisode, pushSent: boolean): W
   return episode.attempts >= WAIT_NOTIFY_MAX_ATTEMPTS ? episode : { ...episode, notified: false };
 }
 
+export type WakeTurnStart = "bind" | "withdraw" | "keep";
+
+export function wakeTurnStart(markedAsWake: boolean, signalTaken: boolean): WakeTurnStart {
+  if (markedAsWake) return "bind";
+  return signalTaken ? "keep" : "withdraw";
+}
+
 export function pushOutcome(resultText: string, isError: boolean): boolean {
   return !isError && resultText.trim().startsWith(PUSH_REQUESTED_RESULT);
 }

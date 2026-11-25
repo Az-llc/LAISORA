@@ -17,6 +17,8 @@ import {
   writeGuardEnabled,
   writeMemoryBlockProjectType,
   writeTodoEnabled,
+  writeWorkStageEnabled,
+  writeWorkStageCastSetting,
   writeEditSummaryEnabled,
   writeRemoteControlCard,
   writeImprovementMenu,
@@ -160,6 +162,12 @@ export async function handleSettingsPageMessage(webview: vscode.Webview, raw: un
       break;
     case "setTodoEnabled":
       writeFailure = await writeTodoEnabled(raw.enabled);
+      break;
+    case "setWorkStageEnabled":
+      writeFailure = await writeWorkStageEnabled(raw.enabled);
+      break;
+    case "setWorkStageCast":
+      writeFailure = await writeWorkStageCastSetting(raw.setting, raw.value);
       break;
     case "setEditSummaryEnabled":
       writeFailure = await writeEditSummaryEnabled(raw.enabled);

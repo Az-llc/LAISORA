@@ -8,6 +8,7 @@ import { askCheckReading, isAskTabLinked, onAskCheckSharing, onTodoAsksClosedInT
 import { addTodoToolCall, isTodoWriteTool, renderTodoHead, setTodoToolCardResult, todoToolCard } from "./todo-chat";
 import { renderTodoCrumbs, todoAgentLabel, todoAgentText, todoLinkHub, todoTabMarks } from "./todo-links";
 import { PlanPanel } from "./plan-panel";
+import type { StageSource } from "./work-stage-facts";
 import { agentElapsedMs, applyFallbackModel, fallbackNoticeOriginal, fallbackNoticeOutcome, flattenAgents, foldModelFallback, isHistoryEvent, resolveFallbackByChoice, workEndStatus, workEndStatusWord } from "../protocol";
 import type { ModelFallbackState, WelcomeTab, WorkAgentNode } from "../protocol";
 import { YouList } from "./you-list";
@@ -65,6 +66,7 @@ import { findCommitBoundary, joinRecordTexts, prependRecordParts, recordSeparato
 import { breaksParagraph, cardHome, compareTurnOrder, editSummaryPlace, labelPendingParts, legacyAskKeys, locateInParts, mergedParagraph, paragraphKey, paragraphText, prependTurnLayout, turnLabelModel, type ModelMark, type TurnItem, type TurnOrder, type TurnParagraph } from "./turn-layout";
 import { isConvMessageEvent, isConvRenderableEvent, permissionDeniedTarget } from "../conv-renderable";
 import { writesLostNotices, type WritesLostNotice } from "../session-writes-lost";
+import { CONFIG_FILE_INVALID, type InvalidConfigOpenTarget, type InvalidConfigShown } from "../invalid-config-file";
 import { accountErrorText, claudeAiSignInExpired, type AccountAuthSource } from "../account-error";
 import { isFailedToolResult, taskNotificationOutcome, taskNotificationTerminal } from "../tool-result-signals";
 import { MARKS } from "./marks";
@@ -618,9 +620,13 @@ function notifiedStaleText(status: string | undefined): string {
   return taskNotificationOutcome(status) === "stopped" ? workEndStatusWord("stopped") : unconfirmedStaleText();
 }
 
-function permissionDeniedText(ev: { toolName: string; reason: string; classifierUnavailable?: boolean }): string {
+function permissionDeniedText(ev: { toolName: string; reason: string; classifierUnavailable?: boolean; hookChangedAfterReview?: true }): string {
+  if (ev.hookChangedAfterReview) return l10n.t("Issuing {0} again: a hook changed its input after the safety review", ev.toolName);
   if (ev.classifierUnavailable) return l10n.t("Could not evaluate: {0} — safety classifier unavailable", ev.toolName);
   return l10n.t("Auto-denied: {0} — {1}", ev.toolName, ev.reason);
+}
+function permissionDeniedStyle(ev: { hookChangedAfterReview?: true }): "system" | "error" {
+  return ev.hookChangedAfterReview ? "system" : "error";
 }
 function compactBoundaryText(ev: { trigger: "auto" | "manual"; preTokens?: number }): string {
   const trigger = ev.trigger === "auto" ? l10n.t("auto") : l10n.t("manual");
@@ -656,6 +662,36 @@ function fillAccountErrorBlock(block: HTMLElement, ev: Extract<NormalizedEvent, 
   signIn.addEventListener("click", () => vscode.postMessage({ type: "runHostAction", action: "signInAgain", tabId }));
   row.append(signIn);
   block.append(row);
+}
+function invalidConfigLines(ev: InvalidConfigShown): string[] {
+  const backup = ev.backup === "found"
+    ? [l10n.t("A backup was found:"), ev.backupPath ?? "", l10n.t("The backup may also be damaged and unreadable, so check its contents before using it.")]
+    : [ev.backup === "none" ? l10n.t("No backup of this file was found.") : l10n.t("It is not known whether a backup of this file exists.")];
+  const fix = ev.backup === "found"
+    ? l10n.t("To fix it, correct the JSON in this file, restore it from the backup, or move the file aside so that Claude Code starts with default settings.")
+    : l10n.t("To fix it, correct the JSON in this file, or move the file aside so that Claude Code starts with default settings.");
+  return [l10n.t("Claude Code could not start because this configuration file is not valid JSON:"), ev.path, ...backup, fix];
+}
+function fillInvalidConfigBlock(block: HTMLElement, ev: Extract<NormalizedEvent, { kind: typeof CONFIG_FILE_INVALID }>, tabId: string): void {
+  block.textContent = "";
+  for (const line of invalidConfigLines(ev)) {
+    const row = document.createElement("div");
+    row.textContent = line;
+    block.append(row);
+  }
+  const actions = document.createElement("div");
+  actions.className = "approval-actions";
+  const open = (label: string, file: InvalidConfigOpenTarget, primary: boolean): void => {
+    const button = document.createElement("button");
+    button.type = "button";
+    if (primary) button.className = "primary";
+    button.textContent = label;
+    button.addEventListener("click", () => vscode.postMessage({ type: "runHostAction", action: "openInvalidConfigFile", tabId, generation: ev.generation, seq: ev.seq, file }));
+    actions.append(button);
+  };
+  open(l10n.t("Open the broken file"), "file", true);
+  if (ev.backup === "found") open(l10n.t("Open the backup"), "backup", false);
+  block.append(actions);
 }
 const APPROVAL_REF_SUFFIX = l10n.t(" (respond in the Conversation tab)");
 
@@ -2901,6 +2937,10 @@ export class Tab {
     return this.isTabActive();
   }
 
+  stageSource(): StageSource {
+    return { ...this.planPanel.inputs(), youItems: this.youItems.get(), turnActive: this.isActive() };
+  }
+
   private updateStripElapsed(): void {
     if (this.stripSince === null) {
       this.stripTimeEl.textContent = "";
@@ -4628,6 +4668,10 @@ export class Tab {
       case "session_writes_lost":
         for (const notice of writesLostNotices(ev)) this.addBlock("system", writesLostText(notice));
         break;
+      case CONFIG_FILE_INVALID:
+        fillInvalidConfigBlock(this.addBlock("error", ""), ev, this.tabId);
+        this.flagConvAttention();
+        break;
       case "account_error":
         if (isConvRenderableEvent(ev)) {
           this.placeAccountError(this.addBlock("error", ""), ev);
@@ -4685,7 +4729,7 @@ export class Tab {
     this.runningChildTools.clear();
     this.runningMainTools.clear();
     this.stripStartedAt = null;
-    if (ev.stopped !== true) this.addBlock("system", l10n.t("Conversation ended: {0}", ev.reason));
+    if (ev.stopped !== true && ev.reason !== CONFIG_FILE_INVALID) this.addBlock("system", l10n.t("Conversation ended: {0}", ev.reason));
     this.setTurnState("idle");
     this.updateStrip();
   }
@@ -5118,7 +5162,7 @@ export class Tab {
           : null;
       const head = ev.detail ? l10n.t("Limit reached: {0}", ev.detail) : l10n.t("Usage limit reached");
       this.addBlock("error", when ? l10n.t("{0} (resets at {1})", head, when) : head);
-    } else if (ev.errorKind !== "account") {
+    } else if (ev.errorKind !== "account" && ev.errorKind !== CONFIG_FILE_INVALID) {
       this.addBlock("error", l10n.t("Turn failed: {0}", ev.reason));
     }
     this.setTurnState("idle");
@@ -5896,7 +5940,7 @@ export class Tab {
   private onPermissionDenied(ev: Extract<NormalizedEvent, { kind: "permission_denied" }>): void {
     const target = this.permissionDeniedTargetOf(ev);
     if (target === null) return;
-    this.noteDenialRow(ev.toolUseId, this.addBlock("error", permissionDeniedText(ev), false, target));
+    this.noteDenialRow(ev.toolUseId, this.addBlock(permissionDeniedStyle(ev), permissionDeniedText(ev), false, target));
   }
 
   private permissionDeniedTargetOf(ev: Extract<NormalizedEvent, { kind: "permission_denied" }>): "conv" | "work" | null {
@@ -6490,7 +6534,7 @@ export class Tab {
     if (ev.kind === "permission_denied") {
       if (this.permissionDeniedTargetOf(ev) !== "conv") return "skipped";
       const div = document.createElement("div");
-      div.className = "block error";
+      div.className = `block ${permissionDeniedStyle(ev)}`;
       div.dataset.convPast = "1";
       div.textContent = permissionDeniedText(ev);
       frag.append(div);
@@ -6515,6 +6559,14 @@ export class Tab {
       div.className = "block error";
       div.dataset.convPast = "1";
       this.placeAccountError(div, ev);
+      frag.append(div);
+      return "created";
+    }
+    if (ev.kind === CONFIG_FILE_INVALID) {
+      const div = document.createElement("div");
+      div.className = "block error";
+      div.dataset.convPast = "1";
+      fillInvalidConfigBlock(div, ev, this.tabId);
       frag.append(div);
       return "created";
     }
@@ -7000,7 +7052,7 @@ export class Tab {
       }
       case "permission_denied": {
         if (this.permissionDeniedTargetOf(ev) !== "work") return "skipped";
-        return this.renderPastPlainRow(permissionDeniedText(ev), "error", (row) => this.noteDenialRow(ev.toolUseId, row));
+        return this.renderPastPlainRow(permissionDeniedText(ev), permissionDeniedStyle(ev), (row) => this.noteDenialRow(ev.toolUseId, row));
       }
       case "model_refusal_fallback":
         return this.renderPastPlainRow(() => this.fallbackLogText(ev), "system");

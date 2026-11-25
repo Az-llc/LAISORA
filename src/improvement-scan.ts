@@ -821,6 +821,8 @@ export function classify(rawText: string, rec: Record<string, unknown>, use: Too
   switch (failure.kind) {
     case "classifier_unavailable":
       return { kind: failure.kind, owner: "classifier:unavailable", detail: tool, sample: firstLine(text) };
+    case "hook_changed_after_review":
+      return { kind: failure.kind, owner: "classifier:hook-changed-after-review", detail: tool, sample: firstLine(text) };
     case "classifier_denial": {
       const reason = failure.reason ?? "?";
       return { kind: failure.kind, owner: "classifier", detail: norm(bracketFree(reason)).slice(0, 120), sample: reason };
@@ -2569,6 +2571,7 @@ export function renderIndex(r: ScanResult, ctx: IndexContext): string {
   out.push("## Counted but not listed", "");
   out.push(`- Claude Code built-in tool errors not listed above: ${total(builtinRest)} in ${convs(builtinRest)} conversations, ${builtinRest.length} patterns`);
   out.push(`- Auto mode classifier gave no verdict (transient, not a judgement): ${total(notListed("classifier_unavailable"))} in ${convs(notListed("classifier_unavailable"))} conversations`);
+  out.push(`- Auto mode asked for the call again because a hook changed its input after the review (not a failure): ${total(notListed("hook_changed_after_review"))}`);
   out.push(`- Refused or interrupted by the user: ${total(notListed("user_rejected"))}`);
   out.push(`- Questions the user left unanswered (not refusals; the call succeeded): ${ASK_UNANSWERED_KINDS.map((kind) => `${kind} ${r.unansweredQuestions[kind]}`).join(", ")}`);
   out.push(`- Failure classes (cross-command groupings) are in patterns.json (failureClasses); Causes above replace them in this index.`);

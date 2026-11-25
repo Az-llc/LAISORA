@@ -1,0 +1,10 @@
+{
+  "script": "work-stage/out/work-stage.js",
+  "data": "work-stage/out/stage-data.js",
+  "assets": "work-stage/assets",
+  "pictureDir": "work-stage/assets/chars",
+  "objectPictureDir": "work-stage/assets/objects",
+  "pictureSuffix": ".png",
+  "scriptGlobal": "LaisoraWorkStage",
+  "dataGlobal": "WORK_STAGE_MANIFEST"
+}

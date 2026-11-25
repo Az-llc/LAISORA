@@ -25,9 +25,18 @@ const HARNESS_DENIED = "Permission for this action was denied by";
 const INPUT_VALIDATION = "InputValidationError|Invalid arguments for tool";
 const AUTO_MODE_COULD_NOT_EVALUATE = "Auto mode could not evaluate this action";
 export const AUTO_MODE_UNEVALUATED = `${AUTO_MODE_COULD_NOT_EVALUATE} and is blocking it for safety`;
+export const SERVER_CLASSIFIER_SUBJECT = "The server-side auto mode classifier";
 const CLASSIFIER_GAVE_NO_VERDICT = "auto mode classifier gave no verdict";
-const CLASSIFIER_NO_VERDICT = `The server-side ${CLASSIFIER_GAVE_NO_VERDICT}`;
+const CLASSIFIER_NO_VERDICT = `${SERVER_CLASSIFIER_SUBJECT} gave no verdict`;
 const CLASSIFIER_UNAVAILABLE_RE = new RegExp([CLASSIFIER_GAVE_NO_VERDICT, "classifier:auto-mode:unavailable", AUTO_MODE_COULD_NOT_EVALUATE].map(escapeRegExp).join("|"));
+export const HOOK_CHANGED_AFTER_REVIEW = {
+  cause: "a hook changed this call's input after auto mode reviewed it",
+  reissue: { quoted: "The hook produced this input: ", recorded: "exactly as this conversation records it so auto mode reviews it" },
+} as const;
+const HOOK_CHANGED_AFTER_REVIEW_RE = new RegExp(String.raw`^${OPTIONAL_ERROR_PREFIX}${escapeRegExp(CLASSIFIER_NO_VERDICT)} for [^:\n]+: ${escapeRegExp(HOOK_CHANGED_AFTER_REVIEW.cause)}`);
+export function isHookChangedAfterReviewText(text: string): boolean {
+  return HOOK_CHANGED_AFTER_REVIEW_RE.test(text) && Object.values(HOOK_CHANGED_AFTER_REVIEW.reissue).some((marker) => text.includes(marker));
+}
 const CLASSIFIER_DENIAL_RE = /denied by the Claude Code auto mode classifier\. Reason: ([^\n]*?)(?:\. If you have| IMPORTANT|$)/;
 const SAFETY_CHECK = "built-in Claude Code safety check";
 const SAFETY_BOILERPLATE_RE = new RegExp(String.raw`^\s*Permission for this command was denied by a ${escapeRegExp(SAFETY_CHECK)}, not by the user\.\s*`);
@@ -88,6 +97,7 @@ export function isFailedToolResult(result: ToolResultSignal): boolean {
 
 export type ToolFailure =
   | { kind: "classifier_unavailable" }
+  | { kind: "hook_changed_after_review" }
   | { kind: "classifier_denial"; reason: string | undefined }
   | { kind: "safety_check"; message: string }
   | { kind: "permission_prompt"; prompt: string }
@@ -109,7 +119,9 @@ export function classifyToolFailure(rawText: string, toolName: string | undefine
   const denial = record.toolDenialKind;
   const hook = HOOK_ERROR_RE.exec(text);
   if (hook) return { kind: "hook_denial", event: hook[1] as HookEvent, body: hook[2] };
-  if (CLASSIFIER_UNAVAILABLE_RE.test(text) || denial === "automode-unavailable") return { kind: "classifier_unavailable" };
+  if (CLASSIFIER_UNAVAILABLE_RE.test(text) || denial === "automode-unavailable") {
+    return isHookChangedAfterReviewText(text) ? { kind: "hook_changed_after_review" } : { kind: "classifier_unavailable" };
+  }
   const classifier = CLASSIFIER_DENIAL_RE.exec(text);
   if (classifier || denial === "automode-blocked") {
     return { kind: "classifier_denial", reason: classifier ? classifier[1].replace(/^\[|\]$/g, "") : pd?.classifierCategory || undefined };

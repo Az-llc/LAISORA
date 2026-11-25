@@ -1,7 +1,7 @@
 import { toolIntentLabel } from "./status-line";
 import { agentElapsedMs, externalRunEndStatus, flattenAgents, planLaneTokens, workEndStatus, type OrchestrationView, type PlanContext, type PlanContextStep, type PlanContextTokens, type PlanContextWork, type WorkAgentNode, type WorkEndStatus, type WorkModelPayload } from "../protocol";
 import type { TaskStatus } from "../work-model";
-import { planHeading } from "../plan-steps";
+import { planHeading, planItemLabel } from "../plan-steps";
 export { normalizePlanContent, planStepKey } from "../plan-steps";
 
 export interface PlanLane {
@@ -59,6 +59,24 @@ export function planCurrentStep(view: PlanView, earlier: readonly PlanView[]): P
     if (step !== undefined) return step;
   }
   return undefined;
+}
+
+export function planStepLabel(step: { number: number | null }): string {
+  return step.number === null ? "" : planItemLabel(step.number);
+}
+
+export interface PlanBarFacts {
+  readonly current: PlanStep | undefined;
+  readonly number: string;
+  readonly title: string;
+  readonly count: { readonly position: number; readonly total: number; readonly done: number } | undefined;
+}
+
+export function planBarFacts(view: PlanView, earlier: readonly PlanView[]): PlanBarFacts {
+  const current = planCurrentStep(view, earlier);
+  const count = planStepCount(view, earlier);
+  const done = [...earlier, view].reduce((sum, plan) => sum + plan.steps.filter(step => planStepCounted(step) && planStepDone(step)).length, 0);
+  return { current, number: current ? planStepLabel(current) : "", title: current?.title ?? "", count: count && { ...count, done } };
 }
 
 export function deriveEarlierPlanViews(model: WorkModelPayload | undefined, orchestration: OrchestrationView | undefined,

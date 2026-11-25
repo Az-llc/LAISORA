@@ -34,6 +34,15 @@ const welcomeMarkLiteral = JSON.stringify(`url("data:image/svg+xml,${encodeURICo
 // ESM 出力で @vscode/l10n（CJS main.js）の require("fs") が Dynamic require になり落ちるので、node 向け ESM には require を先頭で与える
 const ESM_NODE_BANNER = { js: 'import { createRequire as __l10nCreateRequire } from "node:module"; const require = __l10nCreateRequire(import.meta.url);' };
 
+const noWorkStageImport = {
+  name: "no-work-stage-import",
+  setup(build) {
+    build.onResolve({ filter: /(^|[\\/])work-stage[\\/]/ }, (args) => ({
+      errors: [{ text: `${args.importer} imports ${args.path}; src/ reaches work-stage/ only through src/webview/work-stage-port.ts` }],
+    }));
+  },
+};
+
 const extensionCtx = await esbuild.context({
   entryPoints: ["src/extension.ts"],
   bundle: true,
@@ -47,6 +56,7 @@ const extensionCtx = await esbuild.context({
   banner: { js: '"use strict"; const __laisoraImportMetaUrl = require("node:url").pathToFileURL(__filename).href;' },
   outfile: "dist/extension.js",
   external: ["vscode"],
+  plugins: [noWorkStageImport],
   // map を出さない。理由は 2 つで、どちらも「出しても使えない」。
   // (1) `.map` は配布物に含めない方針なので、出すと配布された bundle の
   //     `//# sourceMappingURL=` が必ず存在しないファイルを指す（VSIX 検査はこれを
@@ -87,6 +97,7 @@ const webviewCtx = await esbuild.context({
   inject: ["src/webview/l10n-boot.ts"],
   define: { "__LAISORA_L10N_JA_BUNDLE__": jaL10nBundleLiteral, "__LAISORA_WELCOME_MARK__": welcomeMarkLiteral },
   outfile: "dist/webview.js",
+  plugins: [noWorkStageImport],
   sourcemap: false,
   metafile: true,
   logLevel: "info",
@@ -101,6 +112,7 @@ const settingsPageCtx = await esbuild.context({
   inject: ["src/webview/l10n-boot.ts"],
   define: { "__LAISORA_L10N_JA_BUNDLE__": jaL10nBundleLiteral },
   outfile: "dist/settings.js",
+  plugins: [noWorkStageImport],
   sourcemap: false,
   metafile: true,
   logLevel: "info",
@@ -360,6 +372,7 @@ const improvementCtx = await esbuild.context({
   banner: ESM_NODE_BANNER,
   target: "node20",
   outfile: "dist/improvement.mjs",
+  plugins: [noWorkStageImport],
   sourcemap: false,
   metafile: true,
   logLevel: "info",

@@ -20,9 +20,10 @@ import { extractResumeSignals, extractStage0ToolFields, isResumeSignalToolName }
 import { redactAbsolutePaths, redactOptional } from "./path-redaction";
 import { toolInputPreview } from "./tool-input-preview";
 import { countFileEdit, singleToolUseResult } from "./edit-summary";
-import { AUTO_MODE_UNEVALUATED } from "./tool-result-signals";
+import { AUTO_MODE_UNEVALUATED, isHookChangedAfterReviewText } from "./tool-result-signals";
 import { isDelegationTool } from "./claude-tool-names";
 import { sessionWritesLostOf, shownWritesLost, type SessionWritesLost } from "./session-writes-lost";
+import { CONFIG_FILE_INVALID, invalidConfigFileOf, shownInvalidConfig } from "./invalid-config-file";
 import { accountErrorOfRecord, type AccountErrorReason } from "./account-error";
 
 export function localizeLocalCommandReply(record: Record<string, unknown>, text: string): string {
@@ -59,6 +60,17 @@ export function permissionDeniedReason(record: Record<string, unknown>): string 
     if (typeof value === "string" && value.trim().length > 0) return redactAbsolutePaths(value.trim());
   }
   return redactAbsolutePaths(JSON.stringify(record));
+}
+
+export function permissionDeniedNoVerdict(record: Record<string, unknown>): { classifierUnavailable?: true; hookChangedAfterReview?: true } {
+  if (!(record.decision_reason_type === "classifier" && typeof record.decision_reason === "string" && (
+    record.decision_reason === "Classifier unavailable" ||
+    record.decision_reason === "Auto mode unavailable — stopped after repeated responses with no safety verdict" ||
+    (record.decision_reason.startsWith(`${AUTO_MODE_UNEVALUATED} —`) &&
+      !record.decision_reason.includes(" — a safety check separate from auto mode blocked this request because of earlier conversation content — it isn't about the action itself"))
+  ))) return {};
+  return typeof record.message === "string" && isHookChangedAfterReviewText(record.message)
+    ? { hookChangedAfterReview: true } : { classifierUnavailable: true };
 }
 
 export interface ClaudeLiveNormalizerOptions {
@@ -362,6 +374,7 @@ export class ClaudeLiveNormalizer {
   currentTurnId: string | null = null;
   turnState: "idle" | "running" | "interrupting" = "idle";
   initSlashCommands: string[] | null = null;
+  configFileInvalid = false;
 
   private sawMessageStartForTurn = false;
   private sessionCwd: string | undefined;
@@ -434,7 +447,7 @@ export class ClaudeLiveNormalizer {
   }
 
   private latestRateLimitReset: number | null = null;
-  laisoraWakeExpected = false;
+  laisoraWakeSignalTaken: (() => boolean) | undefined;
   private nextTurnAutomatic = false;
   private readonly automaticInputs = new Set<string>();
 
@@ -459,9 +472,9 @@ export class ClaudeLiveNormalizer {
       meta?.timestamp === undefined && this.lastObservedTimestamp !== undefined
         ? { ...meta, timestamp: this.lastObservedTimestamp }
         : meta;
-    const wake = !automatic && !this.nextTurnAutomatic && this.laisoraWakeExpected;
+    const wake = !automatic && !this.nextTurnAutomatic && this.laisoraWakeSignalTaken?.() === true;
     this.nextTurnAutomatic = false;
-    if (wake) this.laisoraWakeExpected = false;
+    if (wake) this.laisoraWakeSignalTaken = undefined;
     this.emit({ kind: "turn_started", turnId: id, ...(automatic || wake ? { cliInserted: true as const, laisoraInput: true as const } : {}),
       ...(wake ? { laisoraWake: true as const } : {}) }, startMeta);
     return id;
@@ -587,12 +600,7 @@ export class ClaudeLiveNormalizer {
               ...(typeof record.agent_id === "string" ||
                 (typeof record.tool_use_id === "string" && typeof this.rawToolUses.get(record.tool_use_id)?.parentToolUseId === "string")
                 ? { inDelegate: true as const } : {}),
-              ...(record.decision_reason_type === "classifier" && typeof record.decision_reason === "string" && (
-                record.decision_reason === "Classifier unavailable" ||
-                record.decision_reason === "Auto mode unavailable — stopped after repeated responses with no safety verdict" ||
-                (record.decision_reason.startsWith(`${AUTO_MODE_UNEVALUATED} —`) &&
-                  !record.decision_reason.includes(" — a safety check separate from auto mode blocked this request because of earlier conversation content — it isn't about the action itself"))
-              ) ? { classifierUnavailable: true } : {}),
+              ...permissionDeniedNoVerdict(record),
               reason: permissionDeniedReason(record),
             },
             defaultMeta
@@ -1060,7 +1068,7 @@ export class ClaudeLiveNormalizer {
         if (echoed !== null && this.ownInputs.delete(echoed)) break;
         const inbound = inboundHumanInput(record);
         if (inbound !== null) {
-          this.laisoraWakeExpected = false;
+          this.laisoraWakeSignalTaken = undefined;
           const turnId = this.currentTurnId ?? this.startTurn(undefined, defaultMeta);
           this.emit({
             kind: "user_message", turnId, text: inbound.text, uuid: inbound.uuid, remote: true,
@@ -1151,6 +1159,13 @@ export class ClaudeLiveNormalizer {
       }
 
       case "result": {
+        const invalidConfig = invalidConfigFileOf(record);
+        if (invalidConfig !== undefined) {
+          this.configFileInvalid = true;
+          this.emit({ kind: CONFIG_FILE_INVALID, ...shownInvalidConfig(invalidConfig) }, defaultMeta);
+          this.endTurn("turn_failed", { reason: CONFIG_FILE_INVALID, errorKind: CONFIG_FILE_INVALID }, defaultMeta);
+          break;
+        }
         if (!this.currentTurnId) break;
         const usageRaw = record.usage as Record<string, unknown> | undefined;
         const usage: UsageSnapshot = {

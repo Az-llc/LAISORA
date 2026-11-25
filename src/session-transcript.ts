@@ -2218,6 +2218,62 @@ interface ConversationRecordParser {
   };
 }
 
+interface WakeTrack { readonly uuid: string; readonly timestamp: number; readonly calls: ReadonlyMap<string, string>; readonly line?: WakeLine }
+
+function wakeTrackStep(open: WakeTrack | undefined, obj: Record<string, unknown>, timestamp: number): { open: WakeTrack | undefined; step: "wake" | "hide" | "pass" | "end"; ended?: WakeTrack } {
+  if (isLaisoraWakeRecord(obj)) return { open: { uuid: typeof obj.uuid === "string" ? obj.uuid : "", timestamp, calls: new Map() }, step: "wake", ended: open };
+  if (open === undefined) return { open, step: "pass" };
+  if (extractQueuedPromptRecord(obj) !== null) return { open: undefined, step: "end", ended: open };
+  const content = asRecord(obj.message)?.content;
+  if (obj.type === "assistant") {
+    const calls = new Map(open.calls);
+    for (const block of Array.isArray(content) ? content : []) {
+      const b = asRecord(block);
+      if (b?.type === "tool_use" && b.name === PUSH_NOTIFICATION_TOOL && typeof b.id === "string") calls.set(b.id, toolInputPreview(PUSH_NOTIFICATION_TOOL, b.input));
+    }
+    return { open: { ...open, calls }, step: "hide" };
+  }
+  if (obj.type !== "user") return { open, step: "pass" };
+  if (obj.isMeta === true) return { open, step: "hide" };
+  if (!Array.isArray(content) || !content.some((block) => asRecord(block)?.type === TOOL_RESULT_TYPE)) return { open: undefined, step: "end", ended: open };
+  let line = open.line;
+  for (const block of content) {
+    const b = asRecord(block);
+    const input = b?.type === TOOL_RESULT_TYPE && typeof b.tool_use_id === "string" ? open.calls.get(b.tool_use_id) : undefined;
+    if (input !== undefined) line = wakeLineAfterCall(line, input, joinTextBlocks(b!.content), b!.is_error === true);
+  }
+  return { open: { ...open, line }, step: "hide" };
+}
+
+function wakeTrackMessage(track: WakeTrack | undefined): ConversationMessage | undefined {
+  if (track === undefined || track.uuid.length === 0) return undefined;
+  return { uuid: track.uuid, role: "system", text: waitNotifyLine(track.line?.message, track.line?.sent === true), timestamp: track.timestamp };
+}
+
+interface WakeLineTracker {
+  step(obj: Record<string, unknown>, timestamp: number): { step: "wake" | "hide" | "pass" | "end"; line?: ConversationMessage };
+  end(): ConversationMessage | undefined;
+  pending(): ConversationMessage | undefined;
+}
+
+function createWakeLineTracker(): WakeLineTracker {
+  let open: WakeTrack | undefined;
+  return {
+    step(obj, timestamp) {
+      const tracked = wakeTrackStep(open, obj, timestamp);
+      open = tracked.open;
+      const line = wakeTrackMessage(tracked.ended);
+      return line === undefined ? { step: tracked.step } : { step: tracked.step, line };
+    },
+    end() {
+      const line = wakeTrackMessage(open);
+      open = undefined;
+      return line;
+    },
+    pending: () => wakeTrackMessage(open),
+  };
+}
+
 export function createConversationMessageParser(sessionId?: string, keep?: (message: ConversationMessage) => boolean): ConversationMessageParser {
   const parser = createConversationRecordParser(sessionId, keep);
   return {
@@ -2242,34 +2298,7 @@ function createConversationRecordParser(sessionId?: string, keep?: (message: Con
   let lastTimestamp = 0;
   let askTurnFrom = 0;
   const askRejections: AskRejection[] = [];
-  let wake: { uuid: string; timestamp: number; calls: Map<string, string>; line?: WakeLine } | undefined;
-  const wakeMessage = (open: NonNullable<typeof wake>): ConversationMessage =>
-    ({ uuid: open.uuid, role: "system", text: waitNotifyLine(open.line?.message, open.line?.sent === true), timestamp: open.timestamp });
-  const flushWake = (): void => {
-    if (wake !== undefined && wake.uuid.length > 0) messages.push(wakeMessage(wake));
-    wake = undefined;
-  };
-  const wakeStep = (obj: Record<string, unknown>): "hide" | "pass" | "end" => {
-    if (wake === undefined) return "pass";
-    if (extractQueuedPromptRecord(obj) !== null) return "end";
-    const content = asRecord(obj.message)?.content;
-    if (obj.type === "assistant") {
-      for (const block of Array.isArray(content) ? content : []) {
-        const b = asRecord(block);
-        if (b?.type === "tool_use" && b.name === PUSH_NOTIFICATION_TOOL && typeof b.id === "string") wake.calls.set(b.id, toolInputPreview(PUSH_NOTIFICATION_TOOL, b.input));
-      }
-      return "hide";
-    }
-    if (obj.type !== "user") return "pass";
-    if (obj.isMeta === true) return "hide";
-    if (!Array.isArray(content) || !content.some((block) => asRecord(block)?.type === TOOL_RESULT_TYPE)) return "end";
-    for (const block of content) {
-      const b = asRecord(block);
-      const input = b?.type === TOOL_RESULT_TYPE && typeof b.tool_use_id === "string" ? wake.calls.get(b.tool_use_id) : undefined;
-      if (input !== undefined) wake.line = wakeLineAfterCall(wake.line, input, joinTextBlocks(b!.content), b!.is_error === true);
-    }
-    return "hide";
-  };
+  const wake = createWakeLineTracker();
   const compactBeforeTurn = (): void => {
     if (keep === undefined) return;
     messages = messages.slice(cutFrom).filter(keep);
@@ -2298,6 +2327,8 @@ function createConversationRecordParser(sessionId?: string, keep?: (message: Con
         if (!acceptRecord(obj)) continue;
         if (obj.isSidechain === true) continue;
         if (isHandoffGenerationBoundary(obj, sessionId)) {
+          const sourceWakeLine = wake.end();
+          if (sourceWakeLine !== undefined) messages.push(sourceWakeLine);
           cutFrom = messages.length;
           askTurnFrom = messages.length;
           askRejections.length = 0;
@@ -2313,14 +2344,9 @@ function createConversationRecordParser(sessionId?: string, keep?: (message: Con
           messages.push({ uuid, role: "system", text: localOutput, timestamp: lastTimestamp });
           continue;
         }
-        if (isLaisoraWakeRecord(obj)) {
-          flushWake();
-          wake = { uuid: typeof obj.uuid === "string" ? obj.uuid : "", timestamp: lastTimestamp, calls: new Map() };
-          continue;
-        }
-        const step = wakeStep(obj);
-        if (step === "hide") continue;
-        if (step === "end") flushWake();
+        const tracked = wake.step(obj, lastTimestamp);
+        if (tracked.line !== undefined) messages.push(tracked.line);
+        if (tracked.step === "wake" || tracked.step === "hide") continue;
         const approvalMessages = extractRestoredApprovalMessages(obj, approvalResults, lastTimestamp);
         const prompt = extractHumanUserPrompt(obj, queuedSources, seenQueuedPrompts);
         const uuid = prompt?.uuid ?? (typeof obj.uuid === "string" ? obj.uuid : "");
@@ -2402,7 +2428,8 @@ function createConversationRecordParser(sessionId?: string, keep?: (message: Con
     },
     result() {
       const settled = messages.slice();
-      if (wake !== undefined && wake.uuid.length > 0) settled.push(wakeMessage(wake));
+      const openWakeLine = wake.pending();
+      if (openWakeLine !== undefined) settled.push(openWakeLine);
       resolveMessageAskRejections(settled, askTurnFrom, askRejections);
       return {
         messages: settled.slice(cutFrom),
@@ -2457,6 +2484,8 @@ export async function readSessionTranscript(
   parentRecords?: ParentRecordSource
 ): Promise<SessionTranscript> {
   const acceptNarrationRecord = createRecordUuidFilter();
+  const acceptWakeRecord = createRecordUuidFilter();
+  const wake = createWakeLineTracker();
   const messages: TranscriptMessage[] = [];
   let lastTimestamp = 0;
   let claudeCodeVersion: string | undefined;
@@ -2505,6 +2534,8 @@ export async function readSessionTranscript(
         const message = asRecord(obj.message);
         lastTimestamp = recordTimestamp(obj.timestamp, lastTimestamp);
         if (isHandoffGenerationBoundary(obj, sessionId)) {
+          const sourceWakeLine = wake.end();
+          if (sourceWakeLine !== undefined) messages.push(sourceWakeLine);
           cutFrom = messages.length;
           recordedModel = undefined;
           malformedLineCount = 0;
@@ -2514,6 +2545,10 @@ export async function readSessionTranscript(
           messages.push({ role: "system", text: localOutput,
             uuid: typeof obj.uuid === "string" ? obj.uuid : undefined, timestamp: lastTimestamp });
           continue;
+        }
+        if (obj.isSidechain !== true && acceptWakeRecord(obj)) {
+          const wakeLine = wake.step(obj, lastTimestamp).line;
+          if (wakeLine !== undefined) messages.push(wakeLine);
         }
         if (obj.type === "user" || obj.type === "attachment") {
           const prompt = extractHumanUserPrompt(obj, queuedSources, seenQueuedPrompts);
@@ -2546,6 +2581,8 @@ export async function readSessionTranscript(
         }
         messages.push(...extractRestoredApprovalMessages(obj, approvalResults, lastTimestamp));
       }
+      const openWakeLine = wake.end();
+      if (openWakeLine !== undefined) messages.push(openWakeLine);
     } catch (error) {
       readError = String(error);
     }

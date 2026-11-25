@@ -20,6 +20,7 @@ import { REMOTE_CONTROL_CARD_SETTING } from "./remote-control";
 import { IMPROVEMENT_MENU_SETTING } from "./improvement-brief";
 import { GUARD_ENABLED_SETTING, MEMORY_BLOCK_PROJECT_TYPE_SETTING } from "./placement-line";
 import { registerEditDiffProvider } from "./edit-diff-host";
+import { noteWorkStagePresence, WORK_STAGE_PACKET, WORK_STAGE_SETTINGS, workStagePresent, workStageRoots, workStageWebview } from "./work-stage-host";
 export { reduceWorkModelSafely, trimEventLog } from "./event-fold";
 export type { EventFoldDraft, FoldEffect, FoldEventResult } from "./event-fold";
 import {
@@ -221,6 +222,7 @@ function activateReady(context: vscode.ExtensionContext): void {
   setActivationT0(activatedAt);
   setExtensionContext(context);
   setOutput(vscode.window.createOutputChannel("LAISORA"));
+  noteWorkStagePresence(context.extensionPath);
   registerHomePathRoot();
   output.appendLine(`[startup] ${sinceActivation()} activate at ${localIsoTime(activatedAt)}`);
   sampleStartupLoopLag(activatedAt);
@@ -254,6 +256,10 @@ function activateReady(context: vscode.ExtensionContext): void {
     }
     const waitNotifyChanged = Object.values(WAIT_NOTIFY_SETTING_KEYS).some((key) => affectsProductConfiguration(e, key));
     if (waitNotifyChanged) waitNotifyAvailabilityChanged();
+    if (affectsProductConfiguration(e, WORK_STAGE_SETTINGS)) {
+      store?.post(userSettingsMessage());
+      postSettingsState();
+    }
     if (affectsProductConfiguration(e, "composer.sendKey") || affectsProductConfiguration(e, "appearance") || affectsProductConfiguration(e, "claude.askQualityCheck") || affectsProductConfiguration(e, EDIT_SUMMARY_SETTING) || affectsProductConfiguration(e, REMOTE_CONTROL_CARD_SETTING) || affectsProductConfiguration(e, IMPROVEMENT_MENU_SETTING) || welcomeSettingChanged((key) => affectsProductConfiguration(e, key))) store?.post(userSettingsMessage());
     if (
       affectsProductConfiguration(e, "appearance") ||
@@ -321,10 +327,7 @@ function activateReady(context: vscode.ExtensionContext): void {
           ensureInitialTabs(st);
           view.webview.options = {
             enableScripts: true,
-            localResourceRoots: [
-              vscode.Uri.joinPath(context.extensionUri, "dist"),
-              vscode.Uri.joinPath(context.extensionUri, "media"),
-            ],
+            localResourceRoots: chatResourceRoots(context),
           };
           st.attach(view.webview);
           view.webview.html = buildHtml(context, view.webview);
@@ -385,10 +388,7 @@ function openPanel(context: vscode.ExtensionContext): void {
   const panel = vscode.window.createWebviewPanel("laisora", "LAISORA", vscode.ViewColumn.One, {
     enableScripts: true,
     enableFindWidget: true,
-    localResourceRoots: [
-      vscode.Uri.joinPath(context.extensionUri, "dist"),
-      vscode.Uri.joinPath(context.extensionUri, "media"),
-    ],
+    localResourceRoots: chatResourceRoots(context),
   });
   st.panel = panel;
   st.attach(panel.webview);
@@ -408,7 +408,16 @@ function openPanel(context: vscode.ExtensionContext): void {
   context.subscriptions.push(panel);
 }
 
+function chatResourceRoots(context: vscode.ExtensionContext): vscode.Uri[] {
+  return ["dist", "media", ...workStageRoots(workStagePresent(), WORK_STAGE_PACKET)]
+    .map((dir) => vscode.Uri.joinPath(context.extensionUri, ...dir.split("/")));
+}
+
 function buildHtml(context: vscode.ExtensionContext, webview: vscode.Webview): string {
+  const stage = workStageWebview(workStagePresent(), WORK_STAGE_PACKET,
+    (relativePath) => String(webview.asWebviewUri(vscode.Uri.joinPath(context.extensionUri, ...relativePath.split("/")))), webview.cspSource);
+  const imgSrc = ["data:", ...stage.imgSrcExtra].join(" ");
+  const appAttributes = Object.entries(stage.dataAttributes).map(([name, value]) => ` ${name}="${value.replace(/&/g, "&amp;").replace(/"/g, "&quot;")}"`).join("");
   const nonce = randomBytes(16).toString("base64");
   const scriptUri = webview.asWebviewUri(
     vscode.Uri.joinPath(context.extensionUri, "dist", "webview.js")
@@ -496,13 +505,13 @@ function buildHtml(context: vscode.ExtensionContext, webview: vscode.Webview): s
 <html lang="${htmlLang}">
 <head>
 <meta charset="UTF-8">
-<meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src ${webview.cspSource}; script-src 'nonce-${nonce}'; img-src data:; form-action 'none'; base-uri 'none';">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src ${webview.cspSource}; script-src 'nonce-${nonce}'; img-src ${imgSrc}; form-action 'none'; base-uri 'none';">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <link rel="stylesheet" href="${cssUri}">
 <title>LAISORA</title>
 </head>
 <body>
-<div id="app"></div>
+<div id="app"${appAttributes}></div>
 <script nonce="${nonce}" data-laisora-bootstrap>${bootstrapScript}</script>
 <script id="laisora-main-script" nonce="${nonce}" src="${scriptUri}"></script>
 </body>

@@ -48,7 +48,7 @@ import { turnRunning, type Session } from "./session";
 import type { ClaudeConversation } from "./claudeHost";
 import { openNewConversationTab, type SessionStore } from "./store-surfaces";
 import { todoMarkChanges, todoRevertUnitBlock, isTodoGenerationChain, todoGenerationHead, todoDeletedWithParent, todoRestoredWith, isClaudeOwnChange, linkedTodoItem, parseTodoChangeId, memoStaleSince, newestConversation, todoChildBriefs, todoScopeIds, todoSessionLinks, todoStartOf, todoTabStart, runClaimedStart, singleFlight, TODO_CONVERSATION_SEEN_REFRESH_MS, todoConversationTarget, todoGroupsOf, todoTemplatesOf, todoTemplateSize, TODO_BRIEF_MAX, TODO_DELETED_RETENTION_MS, TODO_IMAGE_EXTENSIONS, todoLinkDoc, conversationLiveElsewhere, todoAskDismissals, todoAsksTicked, todoAsksClosedInTodo, todoDecisionsToMigrate, type TodoAddNode, todoLinkedSessions, todoRecordAskSources, todoTabLinks, todoAskSourceKept, type TodoAskSourceShown, type TodoConversationLink, type TodoTabConversation, type TodoImageMediaType, WORK_MEMO_SECTIONS, type TodoChange, type TodoDocument, type TodoItem, type TodoOperation } from "./todo-model";
-import { setTodoWorkspaceRoots, type TodoLinkedItem } from "./todo-mcp";
+import { setTodoWorkspaceRoots, todoParentDecisionsContext, type TodoDecisionsGiven, type TodoLinkedItem } from "./todo-mcp";
 import { changeGeneration, todoChangeView, todoClaudeChanges, todoClaudeRecent, todoRecentClaudeUnits, todoRevertView, todoRevisionChanges, todoRevisionUnitOf } from "./todo-change-view";
 import { sharedTodoStore, TODO_ENABLED_SETTING, TodoStoreError, type TodoStore } from "./todo-store";
 import { todoFromReplyInstruction, todoItemsAddedInTurn, todoReplyExcerpt, todoReplyText } from "./todo-reply";
@@ -774,10 +774,26 @@ export async function todoLinkedItemAtStart(s: Session): Promise<TodoLinkedItem 
   }
 }
 
+const parentDecisionsGiven = new Map<string, TodoDecisionsGiven>();
+
+export async function todoParentDecisionsFor(itemId: string, sessionId: string): Promise<string | undefined> {
+  if (!sessionId) return undefined;
+  const read = await readTodoDocument("parent decisions");
+  if (!read) return undefined;
+  const parent = liveItem(read.document, liveItem(read.document, itemId)?.parentId);
+  const decision = todoParentDecisionsContext(parentDecisionsGiven.get(sessionId),
+    parent && { id: parent.id, title: parent.title, decisions: parent.workMemo.decisions });
+  if (decision.given) parentDecisionsGiven.set(sessionId, decision.given);
+  return decision.text;
+}
+
 const linkedSessions = new WeakMap<Session, string>();
 const postedWorking = new WeakMap<Session, boolean>();
 
 export function noteTodoConversationEvent(s: Session, ev: { kind: string; auth?: { sessionId?: string } | null }): void {
+  if (ev.kind === "compact_boundary") {
+    for (const sessionId of [s.auth?.sessionId, sessionRecordId(s)]) if (sessionId) parentDecisionsGiven.delete(sessionId);
+  }
   if (!todoFeatureEnabled()) return;
   if (ev.kind === "auth_status") {
     const sessionId = ev.auth?.sessionId;

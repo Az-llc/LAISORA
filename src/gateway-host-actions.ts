@@ -46,12 +46,15 @@ import { TRANSCRIPT_RETENTION_DAYS_KEY, configuredTranscriptRetentionDays, isTra
 import { CHROME_INTEGRATION_SETTING_KEY, chromeIntegrationEnabled } from "./chrome-integration";
 import { MCP_ELICITATION_SETTING_KEY, mcpElicitationEnabled } from "./elicitation";
 import { WRITES_LOST_NOTICE_SETTING_KEY } from "./session-writes-lost";
+import { invalidConfigOpenPath, type InvalidConfigEventRef, type InvalidConfigOpenTarget } from "./invalid-config-file";
 import { CLOSING_SUMMARY_SETTING_KEY, closingSummaryEnabled } from "./closing-summary";
 import { isDisplayName } from "./display-name";
 import { extensionContext, output, store } from "./host-context";
 import { ADDITIONAL_MODELS_KEY, additionalClaudeModelIds, isClaudeVersionId, recomputeModelRows, modelsMessage } from "./gateway-models";
 import { restoreTabsOnStartupEnabled } from "./session-list-wiring";
 import { TODO_ENABLED_SETTING } from "./todo-store";
+import { WORK_STAGE_ENABLED_SETTING, workStageCastSettingKey, workStageCharacters, workStagePresent } from "./work-stage-host";
+import { workStageCastOf, workStageCastWrite, type WorkStageCast, type WorkStageCastSetting } from "./work-stage-cast";
 import { todoFeatureEnabled } from "./todo-surface";
 import { EDIT_SUMMARY_SETTING } from "./edit-summary";
 import { REMOTE_CONTROL_CARD_SETTING } from "./remote-control";
@@ -66,6 +69,16 @@ export function editSummarySettingEnabled(): boolean {
 
 export function improvementMenuEnabled(): boolean {
   return getLaisoraConfiguration().get<boolean>(IMPROVEMENT_MENU_SETTING) !== false;
+}
+
+function workStageEnabled(): boolean {
+  return getLaisoraConfiguration().get<boolean>(WORK_STAGE_ENABLED_SETTING) === true;
+}
+
+function workStageCast(): WorkStageCast {
+  const cfg = getLaisoraConfiguration();
+  return workStageCastOf((setting) => cfg.get<unknown>(workStageCastSettingKey(setting)), workStageCharacters(),
+    (setting) => configurationDefault<unknown>(workStageCastSettingKey(setting)));
 }
 
 export function remoteControlCardEnabled(): boolean {
@@ -176,6 +189,8 @@ export function userSettingsMessage(): Extract<HostToWebview, { type: "userSetti
     waitNotify: waitNotifySettings().enabled,
     improvementMenu: improvementMenuEnabled(),
     welcome: welcomeState(),
+    workStage: workStagePresent() && workStageEnabled(),
+    ...(workStagePresent() ? { workStageCast: workStageCast() } : {}),
   };
 }
 
@@ -340,6 +355,7 @@ export function settingsStateMessage(): Extract<HostToSettingsPage, { type: "set
     guardEnabled: placementSettings.guardEnabled,
     memoryBlockProjectType: placementSettings.blockProjectType,
     todoEnabled: todoFeatureEnabled(cfg),
+    ...(workStagePresent() ? { workStage: { enabled: workStageEnabled(), cast: workStageCast(), characters: [...workStageCharacters()] } } : {}),
     reloadNeeded: settingsReloadNeeded(cfg),
     editSummaryEnabled: editSummarySettingEnabled(),
     remoteControlCard: remoteControlCardEnabled(),
@@ -459,6 +475,15 @@ export async function writeTodoEnabled(enabled: boolean): Promise<SettingWriteFa
   return updateUserSetting(TODO_ENABLED_SETTING, enabled);
 }
 
+export async function writeWorkStageEnabled(enabled: boolean): Promise<SettingWriteFailure | undefined> {
+  return updateUserSetting(WORK_STAGE_ENABLED_SETTING, enabled);
+}
+
+export async function writeWorkStageCastSetting(setting: WorkStageCastSetting, value: unknown): Promise<SettingWriteFailure | undefined> {
+  const accepted = workStagePresent() ? workStageCastWrite(setting, value, workStageCharacters()) : undefined;
+  return accepted ? updateUserSetting(workStageCastSettingKey(setting), accepted.value) : undefined;
+}
+
 export async function writeEditSummaryEnabled(enabled: boolean): Promise<SettingWriteFailure | undefined> {
   return updateUserSetting(EDIT_SUMMARY_SETTING, enabled);
 }
@@ -540,10 +565,25 @@ export async function writeRestoreTabsOnStartup(enabled: boolean): Promise<Setti
   }
 }
 
+async function openInvalidConfigFile(tabId: string, ref: InvalidConfigEventRef, file: InvalidConfigOpenTarget): Promise<void> {
+  const target = invalidConfigOpenPath(store?.sessions.get(tabId)?.events ?? [], ref, file);
+  if (target === undefined) {
+    void vscode.window.showWarningMessage(l10n.t("LAISORA: The file this notice refers to can no longer be identified. Send a message to start Claude Code again and get a new notice."));
+    return;
+  }
+  try {
+    await vscode.window.showTextDocument(await vscode.workspace.openTextDocument(vscode.Uri.file(target)), { preview: false });
+  } catch (error) {
+    output.appendLine(`[invalid-config] open failed: ${String(error)}`);
+    void vscode.window.showWarningMessage(l10n.t("LAISORA: Could not open the file: {0}", target));
+  }
+}
+
 export async function runHostActionMessage(msg: Extract<WebviewToHost, { type: "runHostAction" }>, sender?: vscode.Webview): Promise<void> {
   if (msg.action === "openSettings" && sender) store?.requestSettingsFrom(sender);
   if (msg.action === "openSettings") await vscode.commands.executeCommand("laisora.openSettings", ...(msg.target === undefined ? [] : [msg.target]));
   if (msg.action === "signInAgain") await openSignInTerminal(store?.sessions.get(msg.tabId));
+  if (msg.action === "openInvalidConfigFile") await openInvalidConfigFile(msg.tabId, { generation: msg.generation, seq: msg.seq }, msg.file);
   if (msg.action === "addClaudeModel") {
     const target = store?.sessions.get(msg.tabId);
     if (!target) return;

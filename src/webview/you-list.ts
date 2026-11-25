@@ -1,6 +1,6 @@
 import * as l10n from "@vscode/l10n";
 import { CLOSE_GLYPH } from "./close-button";
-import { askStale, isWaitingYouItem, nextAskStaleAt, type YouItem, type YouItemsReader } from "./you-items";
+import { isWaitingYouItem, nextAskStaleDelay, openYouItems, type YouItem, type YouItemsReader } from "./you-items";
 import { bindUserLabel } from "./user-label";
 import { foldGlyph } from "./marks";
 import { textElement as node } from "./element";
@@ -28,14 +28,14 @@ export class YouList {
       const items = reader.get();
       const now = Date.now();
       const waiting = items.filter(isWaitingYouItem);
-      const stale = new Set(waiting.filter(item => askStale(item, items, now) !== null));
+      const open = openYouItems(items, now);
+      const stale = new Set(waiting.filter(item => !open.includes(item)));
       const next = JSON.stringify([items, [...stale].map(item => item.id)]);
       if (!force && signature === next) return;
       signature = next;
       clearTimeout(this.staleTimer);
-      const staleAt = nextAskStaleAt(items, now);
-      if (staleAt !== null) this.staleTimer = setTimeout(() => render(), Math.min(staleAt - now + 1000, 2 ** 31 - 1));
-      const open = waiting.filter(item => !stale.has(item));
+      const staleDelay = nextAskStaleDelay(items, now);
+      if (staleDelay !== null) this.staleTimer = setTimeout(() => render(), staleDelay);
       const resolved = items.filter(item => !isWaitingYouItem(item) && item.resolution !== "dismissed"
         && !(item.kind === "check" && item.resolution === "superseded"));
       const folded = this.element.dataset.resolvedOpen !== "true";

@@ -79,6 +79,7 @@ import {
 } from "./work-model";
 import type { HostArtifactAccess } from "./artifact-access";
 import type { WritesLostShown } from "./session-writes-lost";
+import type { InvalidConfigShown } from "./invalid-config-file";
 import { handoffInProgress } from "./handoff-runs";
 
 const RESUME_DISPLAY_BYPASS_KINDS: ReadonlySet<string> = new Set([
@@ -177,6 +178,7 @@ export class Session {
   defaultEffort: ConfiguredEffort | undefined;
   resumeSessionId: string | undefined;
   reportedMissingFolder: string | undefined = undefined;
+  reportedInvalidConfig: InvalidConfigShown | undefined = undefined;
   todoItemId: string | undefined;
   todoTurnStartedAt: number | undefined;
   handoffSource?: HandoffSourceSnapshot;
@@ -251,6 +253,7 @@ export class Session {
     this.summaryRunner.resetForLogicalSession();
     this.resumeSessionId = undefined;
     this.reportedMissingFolder = undefined;
+    this.reportedInvalidConfig = undefined;
     if (this.auth?.sessionId !== undefined) {
       const { sessionId: _clearedSessionId, ...auth } = this.auth;
       this.auth = auth;

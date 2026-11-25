@@ -11,7 +11,7 @@ import { DISPLAY_NAME_MAX, displayNameLength, normalizeDisplayName } from "../di
 import { normalizeSystemAppExtension } from "../file-link-open-mode";
 import { EVENT_LIMIT_DEFAULT, EVENT_LIMIT_MIN, EVENT_LIMIT_MAX, isEventLimit } from "../event-limits";
 import { TRANSCRIPT_RETENTION_DAYS_MIN, isTranscriptRetentionDays, type TranscriptRetentionFallback } from "../transcript-retention";
-import { EXECUTORS, EXTERNAL_EXECUTORS, DEFAULT_EXECUTOR, canonicalExecutorEfforts, claudeModelIdLabel, EXTERNAL_TIMEOUT_MAX_MINUTES, EXTERNAL_TIMEOUT_MIN_MINUTES, executorModelList, modelSelectionState, isExecutorId, isExternalExecutorId, rowEfforts, rowComplete, type ExecutorId, type ExecutorRow, type ExternalModels } from "../orchestration-executors";
+import { EXECUTORS, EXTERNAL_EXECUTORS, DEFAULT_EXECUTOR, canonicalExecutorEfforts, claudeModelIdLabel, EXTERNAL_TIMEOUT_MAX_MINUTES, EXTERNAL_TIMEOUT_MIN_MINUTES, executorModelList, executorServesRole, modelSelectionState, isExecutorId, isExternalExecutorId, rowEfforts, rowComplete, type ExecutorId, type ExecutorRow, type ExternalModels } from "../orchestration-executors";
 import { findModelRow, modelListStatusText, modelsLoadingText, shortModelDisplayName } from "../model-display-name";
 import { resolveOrchestrationCacheTtl, emptyOrchestrationRole, externalExecutorName, isExternalModel, isExternalTimeout, isRoleName, orchestrationVariants, orchestrationExternalTargets, ROSTER_ROWS_MAX } from "../orchestration-roster";
 import { type OrchestrationSettingRow, type RecommendedRosterChange } from "../orchestration-roster";
@@ -45,7 +45,8 @@ import {
   type SettingWriteFailureAction,
 } from "../protocol";
 import { element } from "./element";
-import { row, rowNote, section, select, switchButton } from "./settings-rows";
+import { capNameInput, row, rowNote, section, select, switchButton } from "./settings-rows";
+import { createWorkStageCastSettings } from "./work-stage-cast-settings";
 
 declare function acquireVsCodeApi(): { postMessage(message: SettingsPageToHost): void; getState(): { category?: string } | undefined; setState(state: { category: string }): void };
 
@@ -93,19 +94,24 @@ settingsToc.setAttribute("aria-label", l10n.t("On this page"));
 const settingsTocList = element("ol", "settings-toc-list");
 settingsToc.append(element("div", "l-label settings-toc-label", l10n.t("On this page")), settingsTocList);
 let settingsTocSections: Array<{ heading: HTMLElement; link: HTMLButtonElement }> = [];
-const settingsCategories = [
+const settingsBetaMark = (): HTMLElement => element("span", "settings-beta", l10n.t("Beta"));
+const settingsCategoryList: ReadonlyArray<{ key: string; title: string; beta?: true }> = [
   { key: "general", title: l10n.t("General") },
   { key: "files", title: l10n.t("File links") },
   { key: "roster", title: l10n.t("Agent roster") },
   { key: "cli", title: l10n.t("CLI") },
   { key: "migration", title: l10n.t("Migration") },
-].map((category, index) => {
+  { key: "workStage", title: l10n.t("Work stage"), beta: true },
+];
+const settingsCategories = settingsCategoryList.map((category, index) => {
   const button = element("button", "settings-tab");
   button.type = "button";
   button.id = `settings-nav-${category.key}`;
   const number = element("span", "settings-tab-number", String(index + 1).padStart(2, "0"));
   number.setAttribute("aria-hidden", "true");
-  button.append(number, element("span", "settings-tab-label", category.title));
+  const label = element("span", "settings-tab-label", category.title);
+  if (category.beta) label.append(" ", settingsBetaMark());
+  button.append(number, label);
   const panel = element("div", "settings-category");
   panel.id = `settings-category-${category.key}`;
   panel.setAttribute("aria-labelledby", button.id);
@@ -114,21 +120,25 @@ const settingsCategories = [
   settingsContent.appendChild(panel);
   return { ...category, button, panel };
 });
-function activateSettingsCategory(key: string): void {
+let requestedSettingsCategory: string | null = null;
+function activateSettingsCategory(requested: string): void {
+  const shown = settingsCategories.some((category) => category.key === requested && !category.button.hidden);
+  const key = shown ? requested : "general";
+  requestedSettingsCategory = shown || !settingsCategories.some((category) => category.key === requested) ? null : requested;
   for (const category of settingsCategories) {
     const active = category.key === key;
     category.panel.hidden = !active;
     if (active) category.button.setAttribute("aria-current", "page");
     else category.button.removeAttribute("aria-current");
-    if (active) settingsPageTitle.textContent = category.title;
+    if (active) settingsPageTitle.replaceChildren(category.title, ...category.beta ? [" ", settingsBetaMark()] : []);
   }
-  vscode.setState({ category: key });
+  if (shown) vscode.setState({ category: key });
   renderSettingsToc();
   if (key === "migration") vscode.postMessage({ type: "migrationScan" });
 }
 function renderSettingsToc(): void {
   const panel = settingsCategories.find((category) => !category.panel.hidden)?.panel;
-  const headings = panel ? Array.from(panel.querySelectorAll<HTMLElement>("h2")) : [];
+  const headings = panel ? Array.from(panel.querySelectorAll<HTMLElement>("h2")).filter((heading) => !heading.closest("[hidden]")) : [];
   settingsTocSections = headings.map((heading, index) => {
     const link = element("button", "settings-toc-link");
     link.type = "button";
@@ -157,7 +167,9 @@ function markSettingsToc(target?: HTMLElement): void {
   }
 }
 window.addEventListener("scroll", () => markSettingsToc(), { passive: true });
-for (const [index, category] of settingsCategories.entries()) {
+const workStageNav = settingsCategories.find((category) => category.key === "workStage")!;
+workStageNav.button.hidden = true;
+for (const category of settingsCategories) {
   category.button.addEventListener("click", () => activateSettingsCategory(category.key));
   category.button.addEventListener("keydown", (event) => {
     if (event.key === "Enter" || event.key === " ") {
@@ -167,16 +179,26 @@ for (const [index, category] of settingsCategories.entries()) {
     }
     if (event.key !== "ArrowUp" && event.key !== "ArrowDown") return;
     event.preventDefault();
-    settingsCategories[(index + (event.key === "ArrowDown" ? 1 : -1) + settingsCategories.length) % settingsCategories.length].button.focus();
+    const visible = settingsCategories.filter((entry) => !entry.button.hidden);
+    const index = visible.indexOf(category);
+    visible[(index + (event.key === "ArrowDown" ? 1 : -1) + visible.length) % visible.length].button.focus();
   });
 }
-const savedSettingsCategory = vscode.getState()?.category;
-activateSettingsCategory(settingsCategories.some((category) => category.key === savedSettingsCategory) ? savedSettingsCategory! : "general");
+activateSettingsCategory(vscode.getState()?.category ?? "general");
 settingsBody.append(settingsContent, settingsToc);
 settingsMain.append(settingsPageHead, settingsBody);
 settingsShell.append(settingsNav, settingsMain);
 root.appendChild(settingsShell);
-const [generalCategory, fileCategory, rosterCategory, cliCategory, migrationCategory] = settingsCategories.map((category) => category.panel);
+const [generalCategory, fileCategory, rosterCategory, cliCategory, migrationCategory, workStageCategory] = settingsCategories.map((category) => category.panel);
+const workStageCard = section(workStageCategory, l10n.t("Work stage"));
+const workStageSwitch = switchButton("setting-work-stage-enabled");
+const workStageText = row(workStageCard, l10n.t("Show the work stage"),
+  l10n.t("A button in the chat opens a drawer that shows the conversation's work as a room. Turning this off closes the drawer in every chat."), workStageSwitch);
+const workStageCast = createWorkStageCastSettings(workStageCategory, workStageCard, (setting, value) => {
+  const requestId = nextRequestId();
+  post({ type: "setWorkStageCast", requestId, setting, value });
+  return requestId;
+}, { row, rowNote, section });
 const accentCard = section(generalCategory, appearanceSectionTitle());
 const displayNameField = element("div", "settings-name-field");
 const displayNameInput = element("input", "settings-input settings-name-input");
@@ -266,20 +288,13 @@ function renderDisplayNameInput(): void {
   const markdownHeading = displayNameRow.querySelector(".settings-preview-md-name");
   if (markdownHeading) markdownHeading.textContent = displayNameInputValue() || "User";
 }
-function capDisplayNameInput(): void {
-  const raw = displayNameInput.value.replace(/[\r\n]+/g, " ");
-  const entered = displayNameLength(raw);
-  displayNameNotice.textContent = entered > DISPLAY_NAME_MAX ? l10n.t("{0} characters were entered, so the first {1} are used.", entered, DISPLAY_NAME_MAX) : "";
-  if (entered > DISPLAY_NAME_MAX) displayNameInput.value = normalizeDisplayName(raw);
-  else if (raw !== displayNameInput.value) displayNameInput.value = raw;
-}
 displayNameInput.addEventListener("input", (event) => {
   displayNameEdited = true;
-  if (!isComposingKey(event as InputEvent)) capDisplayNameInput();
+  if (!isComposingKey(event as InputEvent)) capNameInput(displayNameInput, displayNameNotice);
   renderDisplayNameInput();
 });
 displayNameInput.addEventListener("compositionend", () => {
-  capDisplayNameInput();
+  capNameInput(displayNameInput, displayNameNotice);
   renderDisplayNameInput();
 });
 function writeDisplayName(value: string): void {
@@ -1307,6 +1322,7 @@ function renderOrchestration(state: SettingsState): void {
     const visibleRows = draft ? [...entry.rows, draft] : entry.rows;
     visibleRows.forEach((executorRow, rowIndex) => {
       const definition = EXECUTORS[executorRow.executor];
+      const rowServed = executorServesRole(entry.role, executorRow.executor);
       const isDraft = rowIndex === entry.rows.length;
       const updateRow = (patch: Partial<ExecutorRow>): number | undefined => {
         if (controlsDisabled || pendingOrchestration !== null) return undefined;
@@ -1340,13 +1356,18 @@ function renderOrchestration(state: SettingsState): void {
         group.disabled = detected?.state === "notInstalled";
         const selection = modelSelectionState(candidate.id, list, state.externalDetection[candidate.id]);
         const choices = selection.choices;
+        const served = executorServesRole(entry.role, candidate.id);
         const option = (model: string, label: string) => {
           const item = element("option", "", label);
           item.value = `${candidate.id}/${model}`;
-          item.disabled = entry.rows.some((value, i) => i !== rowIndex && value.executor === candidate.id && value.model === model);
+          item.disabled = !served || entry.rows.some((value, i) => i !== rowIndex && value.executor === candidate.id && value.model === model);
           group.appendChild(item);
         };
-        if (selection.checking) {
+        if (!served) {
+          if (candidate.id !== executorRow.executor || !executorRow.model) continue;
+          const saved = choices?.find((choice) => choice.model === executorRow.model);
+          if (saved) option(saved.model, saved.label ?? saved.model);
+        } else if (selection.checking) {
           group.disabled = true;
           option("", l10n.t("checking…"));
           group.firstElementChild?.setAttribute("disabled", "");
@@ -1356,13 +1377,13 @@ function renderOrchestration(state: SettingsState): void {
         if (!group.disabled && candidate.id === executorRow.executor && executorRow.model && !choices?.some((choice) => choice.model === executorRow.model)) {
           option(executorRow.model, executorRow.model + l10n.t(" (not in list)"));
         }
-        if (selection.refreshFailed) {
+        if (served && selection.refreshFailed) {
           const unavailable = element("option", "", l10n.t("List not obtained (use Recheck to try again)"));
           unavailable.value = "";
           unavailable.disabled = true;
           group.appendChild(unavailable);
         }
-        cascade.appendChild(group);
+        if (served || group.childElementCount) cascade.appendChild(group);
       }
       if (executorRow.model && !Array.from(cascade.options).some((option) => option.value === `${executorRow.executor}/${executorRow.model}`)) {
         const saved = element("option", "", `${definition.displayName} — ${executorRow.model}${l10n.t(" (not in list)")}`);
@@ -1378,7 +1399,9 @@ function renderOrchestration(state: SettingsState): void {
       });
       modelField.append(settingsHiddenLabel(cascade, `${entry.role} Model`), cascade);
       const list = executorModelList(executorRow.executor, state.externalModels);
-      if (modelSelectionState(executorRow.executor, list, state.externalDetection[executorRow.executor]).manual) {
+      const workerNoteId = `roster-${index}-row-${rowIndex}-worker-note`;
+      if (!rowServed) cascade.setAttribute("aria-describedby", workerNoteId);
+      if (rowServed && modelSelectionState(executorRow.executor, list, state.externalDetection[executorRow.executor]).manual) {
         const input = element("input", "settings-input");
         input.id = `roster-${index}-row-${rowIndex}-model-id`;
         input.type = "text";
@@ -1399,8 +1422,9 @@ function renderOrchestration(state: SettingsState): void {
       } else {
         for (let column = 0; column < 6; column++) {
           const effort = definition.efforts[column];
-          const pressed = executorRow.efforts.includes(effort);
-          if (!executorRow.model || !effort || (!supported.includes(effort) && !pressed)) { matrix.appendChild(element("span", "settings-effort-slot")); continue; }
+          const saved = executorRow.efforts.includes(effort);
+          if (!executorRow.model || !effort || (!supported.includes(effort) && !saved)) { matrix.appendChild(element("span", "settings-effort-slot")); continue; }
+          const pressed = saved && rowServed;
           const button = element("button", "settings-segment settings-chip", `${pressed ? "✓ " : ""}${effort}`);
           button.id = `roster-${index}-row-${rowIndex}-${effort}`;
           button.type = "button";
@@ -1408,7 +1432,8 @@ function renderOrchestration(state: SettingsState): void {
           button.dataset.column = String(column + 2);
           button.setAttribute("aria-pressed", String(pressed));
           button.setAttribute("aria-label", `${entry.role} ${definition.displayName} ${cascade.selectedOptions[0]?.textContent ?? executorRow.model} ${effort}`);
-          button.disabled = controlsDisabled || !supported.includes(effort);
+          button.disabled = controlsDisabled || !rowServed || !supported.includes(effort);
+          if (!rowServed) button.setAttribute("aria-describedby", workerNoteId);
           if (!supported.includes(effort)) {
             button.classList.add("settings-unsupported");
             button.title = l10n.t(" (not supported by this model)");
@@ -1430,8 +1455,12 @@ function renderOrchestration(state: SettingsState): void {
         } else update({ rows: entry.rows.filter((_, i) => i !== rowIndex) });
       });
       matrix.appendChild(removeRow);
-      if (!rowComplete(executorRow, state.externalModels)) matrix.appendChild(element("div", "settings-matrix-caption settings-muted settings-incomplete-note", l10n.t("Select a Model and an Effort to enable this row")));
-      if (entry.role === "worker" && !definition.writable) matrix.appendChild(element("div", "settings-matrix-caption settings-muted settings-worker-note", l10n.t("This executor cannot edit files; use it for explorer or reviewer")));
+      if (rowServed && !rowComplete(executorRow, state.externalModels)) matrix.appendChild(element("div", "settings-matrix-caption settings-muted settings-incomplete-note", l10n.t("Select a Model and an Effort to enable this row")));
+      if (!rowServed) {
+        const workerNote = element("div", "settings-matrix-caption settings-muted settings-worker-note", l10n.t("This executor cannot edit files; use it for explorer or reviewer"));
+        workerNote.id = workerNoteId;
+        matrix.appendChild(workerNote);
+      }
       const unsupported = executorRow.efforts.filter((effort) => !supported.includes(effort));
       if (unsupported.length) matrix.appendChild(element("div", "settings-matrix-caption settings-muted settings-effort-warning", l10n.t("⚠ Unsupported Effort kept in settings and excluded from targets: {0}", unsupported.join(", "))));
     });
@@ -1543,7 +1572,7 @@ generalCategory.appendChild(footer);
 let current: SettingsState | null = null;
 let requestSerial = 0;
 const nextRequestId = (): number => ++requestSerial;
-const pending: { autoContinue: number | null; restore: number | null; apiKey: number | null; guard: number | null; memoryBlockProjectType: number | null; todo: number | null; editSummary: number | null; remoteControlCard: number | null; improvementMenu: number | null } = { autoContinue: null, restore: null, apiKey: null, guard: null, memoryBlockProjectType: null, todo: null, editSummary: null, remoteControlCard: null, improvementMenu: null };
+const pending: { autoContinue: number | null; restore: number | null; apiKey: number | null; guard: number | null; memoryBlockProjectType: number | null; todo: number | null; workStage: number | null; editSummary: number | null; remoteControlCard: number | null; improvementMenu: number | null } = { autoContinue: null, restore: null, apiKey: null, guard: null, memoryBlockProjectType: null, todo: null, workStage: null, editSummary: null, remoteControlCard: null, improvementMenu: null };
 const pendingAutoUpdate = new Map<ExecutorId, number>();
 const pendingFileLink: Record<FileLinkBooleanSetting, number | null> = {
   fileLinkInstruction: null,
@@ -1580,6 +1609,8 @@ function writeAnchor(message: SettingsPageToHost): HTMLElement | undefined {
     case "setGuardEnabled": return guardText;
     case "setMemoryBlockProjectType": return memoryBlockProjectTypeText;
     case "setTodoEnabled": return todoText;
+    case "setWorkStageEnabled": return workStageText;
+    case "setWorkStageCast": return workStageCast.anchor(message.setting);
     case "setEditSummaryEnabled": return editSummaryText;
     case "setRemoteControlCard": return remoteControlCardText;
     case "setImprovementMenu": return improvementMenuText;
@@ -1642,6 +1673,7 @@ function render(state: SettingsState): void {
   const anchor = state.replyTo === undefined ? undefined : requestAnchors.get(state.replyTo);
   if (anchor) {
     requestAnchors.delete(state.replyTo!);
+    for (const other of workStageCast.sameSettingRows(anchor)) renderRowError(other, undefined);
     renderRowError(anchor, state.writeFailure);
   }
   renderReloadNeeded(state.reloadNeeded);
@@ -1669,6 +1701,15 @@ function render(state: SettingsState): void {
   if (pending.todo === state.replyTo) pending.todo = null;
   todoSwitch.setAttribute("aria-checked", String(state.todoEnabled));
   todoSwitch.disabled = pending.todo !== null;
+  if (workStageNav.button.hidden !== (state.workStage === undefined)) {
+    workStageNav.button.hidden = state.workStage === undefined;
+    if (workStageNav.button.hidden && !workStageNav.panel.hidden) activateSettingsCategory("general");
+  }
+  if (requestedSettingsCategory !== null) activateSettingsCategory(workStageNav.button.hidden ? "general" : requestedSettingsCategory);
+  if (pending.workStage === state.replyTo) pending.workStage = null;
+  workStageSwitch.setAttribute("aria-checked", String(state.workStage?.enabled === true));
+  workStageSwitch.disabled = pending.workStage !== null || state.workStage === undefined;
+  if (workStageCast.render(state.workStage, state.replyTo) && !workStageNav.panel.hidden) renderSettingsToc();
   if (pending.editSummary === state.replyTo) pending.editSummary = null;
   editSummarySwitch.setAttribute("aria-checked", String(state.editSummaryEnabled));
   editSummarySwitch.disabled = pending.editSummary !== null;
@@ -1782,6 +1823,13 @@ todoSwitch.addEventListener("click", () => {
   pending.todo = requestId;
   todoSwitch.disabled = true;
   post({ type: "setTodoEnabled", requestId, enabled: !current.todoEnabled });
+});
+workStageSwitch.addEventListener("click", () => {
+  if (current?.workStage === undefined || pending.workStage !== null) return;
+  const requestId = nextRequestId();
+  pending.workStage = requestId;
+  workStageSwitch.disabled = true;
+  post({ type: "setWorkStageEnabled", requestId, enabled: !current.workStage.enabled });
 });
 editSummarySwitch.addEventListener("click", () => {
   if (current === null || pending.editSummary !== null) return;

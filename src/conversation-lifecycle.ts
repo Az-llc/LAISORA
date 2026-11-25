@@ -10,6 +10,7 @@ import { transcriptRetentionSettings } from "./transcript-retention";
 import { chromeIntegrationEnabled } from "./chrome-integration";
 import { mcpElicitationEnabled } from "./elicitation";
 import { recordWritesLost } from "./session-writes-lost";
+import { CONFIG_FILE_INVALID, invalidConfigNoticeShown } from "./invalid-config-file";
 
 import {
   PERMISSION_MODE_KEY,
@@ -33,7 +34,7 @@ import { ClaudeConversation } from "./claudeHost";
 import { OrchestrationViewPublisher, orchestrationViewForConversation, orchestrationViewFromStartingRoster } from "./orchestration-view";
 import { orchestrationRunsDirectoryOf } from "./orchestration-external";
 import { orchestrationPluginDirectoryOf } from "./orchestration-plugin";
-import { hostTodoStore, noteTodoConversationEvent, postTodoSnapshot, settleTodoReplyStart, todoFeatureEnabled, todoLinkedItemAtStart } from "./todo-surface";
+import { hostTodoStore, noteTodoConversationEvent, postTodoSnapshot, settleTodoReplyStart, todoFeatureEnabled, todoLinkedItemAtStart, todoParentDecisionsFor } from "./todo-surface";
 import { migrationTools } from "./migration-host";
 import { postAttachments } from "./composer-io";
 import { pendingAttachments } from "./pending-attachments";
@@ -662,7 +663,8 @@ export async function handleConversationMessage(
         const messageUuid = randomUUID();
         const sentAt = Date.now();
         target!.conversation!.answerPendingQuestionsInChat(msg.text);
-        if (!isNonHumanCommandInput(msg.text)) {
+        const human = !isNonHumanCommandInput(msg.text);
+        if (human) {
           disposition("accepted-human");
           const absorbedInto = target!.conversation!.runningTurnId;
           target!.pushEvent(
@@ -677,7 +679,7 @@ export async function handleConversationMessage(
         target!.welcome = undefined;
         noteAutoHandoffUserSend(target!);
         noteWaitNotifyHumanInput(target!);
-        target!.conversation!.send(msg.text, msg.images, sentAt, false, messageUuid);
+        target!.conversation!.send(msg.text, msg.images, sentAt, false, messageUuid, human);
       });
       break;
     }
@@ -888,6 +890,7 @@ async function ensureConversationInner(s: Session, requestedAt: number): Promise
     askQualityCheck: cfg.get<boolean>("claude.askQualityCheck") === true,
     todoStore: todoEnabled ? hostTodoStore() : undefined,
     todoLinkedItem,
+    ...(todoLinkedItem?.parent ? { todoParentDecisions: (sessionId: string) => todoParentDecisionsFor(todoLinkedItem.id, sessionId) } : {}),
     migrationTools,
     planLaunchVerdict: description => numberedLaunchVerdict(s.evidenceIndex.timeBuckets, description),
     planResumeVerdict: (to, namedToolUseId, toolUseId, summary) => resumeVerdict(s.evidenceIndex.timeBuckets, to, namedToolUseId, toolUseId,
@@ -918,6 +921,13 @@ async function ensureConversationInner(s: Session, requestedAt: number): Promise
         return;
       }
       if (raw.kind === "session_writes_lost" && !writesLostNoticeOn()) return;
+      if (own && raw.kind === "auth_status") s.reportedInvalidConfig = undefined;
+      if (own && raw.kind === CONFIG_FILE_INVALID) {
+        const failure = { path: raw.path, backup: raw.backup, backupPath: raw.backupPath };
+        const shown = invalidConfigNoticeShown(s.reportedInvalidConfig, failure, conv.runningTurnId !== null);
+        s.reportedInvalidConfig = failure;
+        if (!shown) return;
+      }
       const ev = own ? noteFallbackRevert(s, conv, raw) : raw;
       if (
         ev.kind === "auth_status" &&

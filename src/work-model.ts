@@ -3,7 +3,7 @@ import { isHistoryEvent, workEndStatus, type NormalizedEvent, type ResumeHydrati
 import * as l10n from "@vscode/l10n";
 import { mainCallTimeKind, MAX_TIME_TOOL_INTERVALS, toolTimeSpans, withoutLaunchedUnknown, type UnknownLauncher } from "./time-buckets";
 import { isFailedToolResult, isRejectedBeforeRun, taskNotificationOutcome, taskNotificationTerminal } from "./tool-result-signals";
-import { declaredBackgroundLaunch, DELEGATION_TOOL_NAMES, isCountedExternalRunCall, isMainExternalRun, TASK_TOOL_NAMES } from "./claude-tool-names";
+import { declaredBackgroundLaunch, DELEGATION_TOOL_NAMES, isCountedExternalRunCall, isDelegationLaunchTool, isMainExternalRun, TASK_TOOL_NAMES } from "./claude-tool-names";
 import { isPureCommandWrapper } from "./human-input-vocabulary";
 import { FILE_CHANGING_TOOL_SET } from "./file-writing-tools";
 import { SHELL_TOOLS } from "./shell-tools";
@@ -24,6 +24,7 @@ const MAX_PHASE_AGENTS = MAX_TRACKED_TOOL_USES;
 export const MAX_EVICTED_LAUNCHES = 1024;
 const PLACEMENT_BUCKETS = 64;
 const MAX_TRACKED_APPROVALS = 256;
+export const ENDED_BACKGROUND_COMMANDS_MAX = 32;
 
 export type OperationKind = "observe" | "mutate" | "verify" | "delegated" | "neutral" | "unknown";
 export type PhaseOperation = "unknown" | "delegated" | "observe" | "mutate" | "verify";
@@ -227,6 +228,23 @@ export interface BackgroundTaskEntry {
   terminal?: "completed" | "failed" | "stale";
   pendingStale?: true;
   pendingStaleAt?: number;
+  ended?: BackgroundToolEnd;
+}
+
+export interface BackgroundToolEnd {
+  toolName: string;
+  parentToolUseId: string | null;
+  description: string;
+  startedAt: number;
+  endedAt: number;
+}
+
+export interface BackgroundCommandView {
+  id: string;
+  description: string;
+  startedAt: number;
+  status: "running" | NonNullable<BackgroundTaskEntry["terminal"]>;
+  endedAt?: number;
 }
 
 export interface ToolPlacementIndex {
@@ -1420,7 +1438,7 @@ function markToolStale(d: Draft, toolUseId: string, timestamp: number, isAgent: 
     segment.runningCount--;
     segment.staleCount++;
   }
-  if (placement.background !== undefined) settleBackgroundStale(d, placement);
+  if (placement.background !== undefined) settleBackgroundStale(d, placement, stopEventAt);
   if (!isAgent) return;
   const target = draftTotals(d, placement.phaseRef);
   if (target) {
@@ -1713,12 +1731,18 @@ function markBackgroundStarted(d: Draft, toolUseId: string, taskId: string): voi
   }
 }
 
-function settleBackgroundStale(d: Draft, placement: WorkTool): void {
+function backgroundToolEnd(kind: BackgroundTaskEntry["kind"], placement: WorkTool | undefined, endedAt: number): { ended?: BackgroundToolEnd } {
+  if (kind !== "tool" || placement === undefined) return {};
+  const { toolName, parentToolUseId, description, startedAt } = placement;
+  return { ended: { toolName, parentToolUseId, description, startedAt, endedAt } };
+}
+
+function settleBackgroundStale(d: Draft, placement: WorkTool, endedAt: number): void {
   const taskId = placement.background?.taskId;
   if (taskId === undefined) return;
   const entry = d.next.backgroundTasks[taskId];
   if (entry !== undefined && entry.terminal === undefined) {
-    draftBackgroundTasks(d)[taskId] = { toolUseId: entry.toolUseId, kind: entry.kind, terminal: "stale" };
+    draftBackgroundTasks(d)[taskId] = { toolUseId: entry.toolUseId, kind: entry.kind, terminal: "stale", ...backgroundToolEnd(entry.kind, placement, endedAt) };
   }
   if (placement.agentId === undefined) {
     const target = draftTotals(d, placement.phaseRef);
@@ -1811,8 +1835,8 @@ function closeBackgroundByNotification(
   if (entry === undefined) return;
   if (entry.terminal === undefined) {
     const terminal = taskNotificationTerminal(status);
-    draftBackgroundTasks(d)[taskId] = { toolUseId: entry.toolUseId, kind: entry.kind, terminal };
     const placement = findToolPlacement(d.next, entry.toolUseId);
+    draftBackgroundTasks(d)[taskId] = { toolUseId: entry.toolUseId, kind: entry.kind, terminal, ...backgroundToolEnd(entry.kind, placement, timestamp) };
     if (placement) finishBackground(d, placement, timestamp, terminal, taskNotificationOutcome(status) === "stopped");
   } else if (entry.kind === "agent") closeLateRun(d, taskId, entry.toolUseId, status, timestamp);
   if (entry.kind === "agent" && tokens !== undefined) recordNotifiedTokens(d, entry.toolUseId, tokens);
@@ -1940,6 +1964,26 @@ function settlePendingStale(d: Draft, timestamp: number): void {
 export function runningMainPlacement(state: WorkModelState, toolUseId: string): WorkTool | undefined {
   const tool = findToolPlacement(state, toolUseId);
   return tool !== undefined && !tool.stale && !isChildCall(tool.parentToolUseId) ? tool : undefined;
+}
+
+function isBackgroundCommand(tool: Pick<WorkTool, "toolName" | "parentToolUseId">): boolean {
+  return !isChildCall(tool.parentToolUseId) && !isDelegationLaunchTool(tool.toolName);
+}
+
+export function backgroundCommandViews(state: WorkModelState): BackgroundCommandView[] {
+  const running: BackgroundCommandView[] = [];
+  const ended: BackgroundCommandView[] = [];
+  for (const entry of Object.values(state.backgroundTasks)) {
+    if (entry.kind !== "tool") continue;
+    if (entry.terminal === undefined) {
+      const tool = runningMainPlacement(state, entry.toolUseId);
+      if (tool !== undefined && isBackgroundCommand(tool)) running.push({ id: entry.toolUseId, description: tool.description, startedAt: tool.startedAt, status: "running" });
+    } else if (entry.ended !== undefined && isBackgroundCommand(entry.ended)) {
+      ended.push({ id: entry.toolUseId, description: entry.ended.description, startedAt: entry.ended.startedAt, status: entry.terminal, endedAt: entry.ended.endedAt });
+    }
+  }
+  ended.sort((a, b) => a.endedAt! - b.endedAt!);
+  return [...ended.slice(-ENDED_BACKGROUND_COMMANDS_MAX), ...running];
 }
 
 export function isRunningLane(state: WorkModelState, toolUseId: string): boolean {

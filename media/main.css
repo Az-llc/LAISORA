@@ -303,7 +303,8 @@ html, body {
   align-items: center;
   gap: 4px;
   min-width: 0;
-  flex: 1 1 auto;
+  /* basis は折り返しの判定幅。auto にするとチップが省略で収まる幅でも #composer-actions が 2 行になる */
+  flex: 1 1 9.5em;
 }
 /* 幅が足りないときはusageから省略（全文はtitleで見える） */
 #usage {
@@ -313,9 +314,7 @@ html, body {
   min-width: 3em;
   flex-shrink: 4; /* usageをauthより4倍速く縮め、省略を主にusage側へ寄せる */
 }
-/* 狭幅ではauthも省略可にする。flex 0 0 だとusageが潰れきった後に
-   右端の送信ボタンへはみ出して重なる（titleは認証詳細でありチップ本文の全文ではない。
-   モデル/effortの全文はモードメニュー側で確認できる） */
+/* 縮めないと #usage が潰れきった後に #composer-actions-right へはみ出して重なる */
 #auth {
   white-space: nowrap;
   flex: 0 1 auto;
@@ -325,7 +324,7 @@ html, body {
 }
 button#usage.chip { border: none; font: inherit; cursor: pointer; }
 button#usage.chip:hover { filter: brightness(1.15); }
-#usagepanel { left: auto; right: 0; min-width: 280px; }
+#usagepanel { left: auto; right: 0; min-width: min(280px, 100%); }
 .usage-line { font-size: 11px; padding: 3px 8px; }
 .usage-rl { padding-bottom: 4px; }
 .usage-bar-wrap {
@@ -359,8 +358,8 @@ button#auth.chip:hover { filter: brightness(1.15); }
   left: 0;
   bottom: 100%;
   margin-bottom: 4px;
-  min-width: 240px;
-  max-width: 320px;
+  min-width: min(240px, 100%);
+  max-width: min(320px, 100%);
   /* モデル一覧が伸びてもキーボードカーソルが画面外に出ないようスクロールさせる
      （.suggest-menu と同じ手当て。移動時に scrollIntoView で追従する） */
   max-height: 320px;
@@ -2270,22 +2269,28 @@ hr.md-hr {
 }
 #input:focus { outline: none; }
 
-/* 下段アクション行: 左端に＋（画像添付）+ モードセレクタ、右端に送信/停止 */
 #composer-actions {
   display: flex;
   align-items: center;
-  justify-content: space-between;
+  flex-wrap: wrap;
+  row-gap: 4px;
   padding: 4px 0 2px;
 }
 #composer-actions-right {
   display: flex;
   align-items: center;
   gap: 4px;
+  margin-left: auto;
+  min-width: 0;
+  max-width: 100%;
 }
 
 /* ---------- 権限モードセレクタ（chip風ボタン + 上向きポップアップ） ---------- */
 .mode-chip {
-  flex: 0 0 auto;
+  flex: 0 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
   height: 22px;
   padding: 0 8px;
   border-radius: 11px;
@@ -3811,7 +3816,7 @@ body:has(.todo-sheet:not([hidden])) .todo-pane.active { margin-right: 380px; }
 .todo-popmenu-back { color: var(--vscode-descriptionForeground); }
 .todo-popmenu-preview { min-height: 18px; padding: 0 12px; font-size: var(--l-note); line-height: 18px; color: var(--vscode-descriptionForeground); }
 .todo-popmenu-empty { padding: 2px 12px; font-size: var(--l-note); color: var(--vscode-descriptionForeground); }
-#tododrawerbtn {
+#tododrawerbtn, #workstagebtn {
   display: inline-grid;
   place-items: center;
   flex: 0 0 auto;
@@ -3825,9 +3830,9 @@ body:has(.todo-sheet:not([hidden])) .todo-pane.active { margin-right: 380px; }
   color: var(--vscode-foreground);
   cursor: pointer;
 }
-#tododrawerbtn:hover, #tododrawerbtn[aria-expanded="true"] { background: var(--vscode-toolbar-hoverBackground); }
-#tododrawerbtn[aria-expanded="true"] { border-color: var(--vscode-contrastActiveBorder, transparent); }
-#tododrawerbtn:focus-visible, .todo-link-chip:focus-visible, .todo-play:focus-visible { outline: 1px solid var(--vscode-focusBorder); outline-offset: 1px; }
+#tododrawerbtn:hover, #tododrawerbtn[aria-expanded="true"], #workstagebtn:hover, #workstagebtn[aria-expanded="true"] { background: var(--vscode-toolbar-hoverBackground); }
+#tododrawerbtn[aria-expanded="true"], #workstagebtn[aria-expanded="true"] { border-color: var(--vscode-contrastActiveBorder, transparent); }
+#tododrawerbtn:focus-visible, #workstagebtn:focus-visible, .todo-link-chip:focus-visible, .todo-play:focus-visible { outline: 1px solid var(--vscode-focusBorder); outline-offset: 1px; }
 .l-icon-checklist { --l-icon: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16' fill='none' stroke='black' stroke-width='1.1'%3E%3Cpath d='M2.5 4.2 3.7 5.4 5.8 3'/%3E%3Cpath d='M2.5 9.7 3.7 10.9 5.8 8.5'/%3E%3Cpath d='M8 4.5h5.5M8 10h5.5'/%3E%3C/svg%3E"); }
 .l-icon-chat { --l-icon: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16' fill='none' stroke='black' stroke-width='1.1' stroke-linejoin='round'%3E%3Cpath d='M2.5 3.5h11v7h-6l-3 2.5v-2.5h-2z'/%3E%3C/svg%3E"); }
 .todo-link-chip { display: inline-flex; align-items: center; gap: 4px; flex: 0 100 auto; min-width: 7em; max-width: 220px; overflow: hidden; height: 22px; margin: 0 2px; padding: 0 6px; border: 1px solid var(--vscode-panel-border); border-radius: 2px; background: transparent; color: var(--vscode-foreground); font-size: var(--l-note); cursor: pointer; }
@@ -3845,11 +3850,9 @@ body:has(.todo-sheet:not([hidden])) .todo-pane.active { margin-right: 380px; }
   .tab-todo-icon { margin-right: 0; }
   .tab-todo-count { margin-left: 0; }
 }
-@media (max-width: 420px) {
-  #auth { display: none; }
-}
-.todo-drawer { position: fixed; top: 0; right: 0; bottom: 0; z-index: var(--l-z-drawer); display: flex; flex-direction: column; width: min(440px, 100%); overflow: hidden; background: var(--vscode-editor-background); border-left: 1px solid var(--vscode-panel-border); box-shadow: -2px 0 8px var(--vscode-widget-shadow); container: todo-pane / inline-size; }
-.todo-drawer[hidden] { display: none; }
+.todo-drawer, .work-stage-drawer { position: fixed; top: 0; right: 0; bottom: 0; z-index: var(--l-z-drawer); display: flex; flex-direction: column; width: min(440px, 100%); overflow: hidden; background: var(--vscode-editor-background); border-left: 1px solid var(--vscode-panel-border); box-shadow: -2px 0 8px var(--vscode-widget-shadow); }
+.todo-drawer { container: todo-pane / inline-size; }
+.todo-drawer[hidden], .work-stage-drawer[hidden] { display: none; }
 .todo-drawer-head { flex: none; border-bottom: 1px solid var(--vscode-panel-border); font-size: var(--l-note); }
 .todo-drawer-bar { display: flex; align-items: center; gap: 8px; min-height: 48px; padding: 4px 12px 4px 16px; }
 .todo-drawer-title { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; }
@@ -4004,8 +4007,14 @@ button.todo-you-count:focus-visible { outline: 1px solid var(--vscode-focusBorde
 .hist-todo { display: flex; align-items: center; gap: 4px; min-width: 0; margin-top: 2px; font-size: var(--l-note); color: var(--vscode-descriptionForeground); }
 .hist-todo-text, .hist-todo-parent { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .hist-todo-parent::before { content: "· "; }
-.todo-drawer.in-rail { right: auto; box-shadow: none; border-left: 1px solid var(--vscode-panel-border); }
-#tododrawerbtn:disabled { opacity: var(--l-disabled-opacity); background: transparent; cursor: default; }
+.todo-drawer.in-rail, .work-stage-drawer.in-rail { right: auto; box-shadow: none; border-left: 1px solid var(--vscode-panel-border); }
+#tododrawerbtn:disabled, #workstagebtn:disabled { opacity: var(--l-disabled-opacity); background: transparent; cursor: default; }
+.work-stage-drawer-head { flex: none; display: flex; align-items: center; gap: 8px; min-height: 48px; padding: 4px 12px 4px 16px; border-bottom: 1px solid var(--vscode-panel-border); }
+.work-stage-drawer-title { flex: 1 1 auto; min-width: 0; margin: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: var(--l-note); font-weight: 600; }
+.work-stage-beta { font-size: var(--l-label); font-weight: 600; letter-spacing: .08em; color: var(--vscode-descriptionForeground); }
+.work-stage-drawer-body { position: relative; flex: 1 1 auto; min-height: 96px; }
+.work-stage-error { margin: 0; padding: 12px 16px; font-size: var(--l-note); color: var(--vscode-errorForeground); }
+.l-icon-room { --l-icon: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16' fill='none' stroke='black' stroke-width='1.1' stroke-linejoin='round'%3E%3Cpath d='M2.5 13.5v-7L8 2.5l5.5 4v7z'/%3E%3Cpath d='M6.5 13.5v-4h3v4'/%3E%3C/svg%3E"); }
 
 .panel-conv:has(> .welcome)::before { display: none; }
 .welcome { display: flex; flex-direction: column; gap: var(--l-space-3); box-sizing: border-box; max-width: 760px; margin-top: 8px; padding-bottom: var(--l-space-3); }

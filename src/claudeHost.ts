@@ -80,6 +80,7 @@ import { CLEAR_WORK_INSTRUCTION, closingSummaryInstruction, NOT_A_WORK_INSTRUCTI
 import { classifyPrompt, forgetOwnPrompt, noteOwnPrompt, type OwnPrompt } from "./prompt-origin";
 import { elicitationAnswer, elicitationSpecOf, type ElicitationSpec } from "./elicitation";
 import type { SessionWritesLost } from "./session-writes-lost";
+import { CONFIG_FILE_INVALID } from "./invalid-config-file";
 
 type UserContentBlock =
   | { type: "text"; text: string }
@@ -270,6 +271,7 @@ export interface ClaudeHostOptions {
   askQualityCheck?: boolean;
   todoStore?: TodoStore;
   todoLinkedItem?: TodoLinkedItem;
+  todoParentDecisions?: (sessionId: string) => Promise<string | undefined>;
   migrationTools?: TodoMigrationTools;
   planLaunchVerdict?: (description: string | undefined) => NumberedLaunchVerdict;
   planResumeVerdict?: (to: string, namedToolUseId: string | undefined, toolUseId: string, summary: string | undefined) => ResumeVerdict;
@@ -1034,12 +1036,22 @@ ${ctxJson}`
     }
     const continuedWorkSummary = this.opts.continuedWorkSummary;
     const remoteContext = () => remoteOriginInstruction(planInstruction, singleSummary || continuedWorkSummary?.() === true);
-    if (planInstruction || singleSummary || continuedWorkSummary !== undefined) {
+    const remoteOrigin = planInstruction || singleSummary || continuedWorkSummary !== undefined;
+    const parentDecisions = linkedItem?.parent ? this.opts.todoParentDecisions : undefined;
+    if (remoteOrigin || parentDecisions) {
+      const decisionsContext = async (sessionId: string): Promise<string> => {
+        try { return await parentDecisions?.(sessionId) ?? ""; }
+        catch (error) {
+          this.opts.log(`[todo] could not attach the parent's decisions: ${String(error)}`);
+          return "";
+        }
+      };
       const promptOrigin: ClaudeCodeSdk.HookCallback = async input => {
         if (input.hook_event_name !== "UserPromptSubmit") return {};
         const verdict = classifyPrompt(this.ownPrompts, input.prompt);
         this.ownPrompts = verdict.pending;
-        const context = verdict.own ? "" : remoteContext();
+        const context = [verdict.own || !remoteOrigin ? "" : remoteContext(), verdict.typed ? await decisionsContext(input.session_id) : ""]
+          .filter(Boolean).join("\n\n");
         return context ? { hookSpecificOutput: { hookEventName: "UserPromptSubmit" as const, additionalContext: context } } : {};
       };
       options.hooks = { ...(options.hooks ?? {}), UserPromptSubmit: [...(options.hooks?.UserPromptSubmit ?? []), { hooks: [promptOrigin] }] };
@@ -1223,10 +1235,10 @@ ${ctxJson}`
     return { ok: true, handedOff };
   }
 
-  private queueUserInput(content: UserContentBlock[], extra: { isMeta?: true; uuid: `${string}-${string}-${string}-${string}-${string}` }): void {
+  private queueUserInput(content: UserContentBlock[], extra: { isMeta?: true; uuid: `${string}-${string}-${string}-${string}-${string}` }, typed = false): void {
     this.invalidateHandoffContextUsage();
     this.normalizer.noteOwnInput(extra.uuid);
-    this.ownPrompts = noteOwnPrompt(this.ownPrompts, extra.uuid, content.flatMap((block) => block.type === "text" ? [block.text] : []).join("\n\n"));
+    this.ownPrompts = noteOwnPrompt(this.ownPrompts, extra.uuid, content.flatMap((block) => block.type === "text" ? [block.text] : []).join("\n\n"), typed);
     this.inputQueue.push({
       type: "user",
       message: { role: "user", content },
@@ -1250,7 +1262,7 @@ ${ctxJson}`
 
   get runningTurnId(): string | null { return this.normalizer.turnState === "idle" ? null : this.normalizer.currentTurnId; }
 
-  expectLaisoraWake(expected: boolean): void { this.normalizer.laisoraWakeExpected = expected; }
+  expectLaisoraWake(signalTaken: (() => boolean) | undefined): void { this.normalizer.laisoraWakeSignalTaken = signalTaken; }
 
   get runningExternalRunCount(): number { return this.activeExternalRuns.size; }
 
@@ -1277,7 +1289,7 @@ ${ctxJson}`
     return false;
   }
 
-  send(text: string, images?: ImageAttachment[], sentAt = Date.now(), automatic: LaisoraInput | false = false, uuid?: `${string}-${string}-${string}-${string}-${string}`): boolean {
+  send(text: string, images?: ImageAttachment[], sentAt = Date.now(), automatic: LaisoraInput | false = false, uuid?: `${string}-${string}-${string}-${string}-${string}`, human = true): boolean {
     if (!automatic) this.usageLimitResume.manualSend();
     if (!this.admitSend()) return false;
     const runningAlready = this.normalizer.turnState !== "idle";
@@ -1299,7 +1311,7 @@ ${ctxJson}`
       ),
       { type: "text", text },
     ];
-    this.queueUserInput(content, { ...(automatic ? { isMeta: true as const } : {}), uuid: uuid ?? randomUUID() });
+    this.queueUserInput(content, { ...(automatic ? { isMeta: true as const } : {}), uuid: uuid ?? randomUUID() }, human && !automatic);
     return true;
   }
 
@@ -1412,7 +1424,7 @@ ${ctxJson}`
           { reason: "backend_lost" }
         );
       }
-      this.emitConversationClosed("backend_exited");
+      this.emitConversationClosed(this.normalizer.configFileInvalid ? CONFIG_FILE_INVALID : "backend_exited");
     } catch (e) {
       const aborted = this.abortController.signal.aborted;
       if (this.normalizer.turnState !== "idle") {
@@ -1420,7 +1432,7 @@ ${ctxJson}`
           reason: aborted ? undefined : String(e),
         });
       }
-      this.emitConversationClosed(aborted ? "aborted" : `error: ${String(e)}`);
+      this.emitConversationClosed(aborted ? "aborted" : this.normalizer.configFileInvalid ? CONFIG_FILE_INVALID : `error: ${String(e)}`);
     } finally {
       await Promise.allSettled([...this.activeExternalRuns]);
       await this.attribution.close();
