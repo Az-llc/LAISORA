@@ -29,6 +29,7 @@
   "config.laisora.workStage.rest.order.label": "作業の部屋の並び順",
   "config.laisora.workStage.rest.random":"ほかのキャラクターからランダムに選びます。",
   "config.laisora.workStage.rest.order": "ほかのキャラクターを作業の部屋の並び順に選びます。",
+  "config.laisora.workStage.room.description": "（ベータ）作業の部屋に出す部屋です。LAISORA の設定画面で選びます。空のときは作業の部屋の既定の部屋です。今のデータに無い部屋は無視します。作業の部屋を含む版でだけ効き、ほかの版ではこの設定は何もしません。",
   "config.laisora.workStage.names.description": "（ベータ）作業の部屋のキャラクターに出す名前です（キャラクターごと）。ここに名前の無いキャラクターは自分の名前で出します。LAISORA の設定画面で決めます。作業の部屋を含む版でだけ効き、ほかの版ではこの設定は何もしません。",
   "config.laisora.remoteControl.showCard.description": "会話にRemote Controlのカードを表示します。claude.aiのリンク、接続の状態、セッションにつながる条件を示します。タブのセッションが動いている間は会話に残り、Remote Controlがオフになったこともカードで示します。",
   "config.laisora.remoteControl.waitNotify.enabled.description": "会話があなたを長く待っているとき、Claude アプリからスマホに通知します。Remote Control は通知が要るときだけオンになり、LAISORA で送信や回答をするとまたオフになります。自分でオンにした Remote Control はオンのままです。答えていない判断・実機確認のカードを残して手番を終えた会話は、下の分数が過ぎたら Remote Control をオンにし、Claude を起こして通知を 1 回送ります（Claude の短い手番を使います）。手番の途中の承認や質問にしばらく答えないままのときは Remote Control をオンにし、Claude Code が自分の時機で通知できるようにします。新しく始めた会話と、再開した会話から有効です。Claude Code のテレメトリが無効の間（VS Code の設定 telemetry.telemetryLevel が all（すべて）でないとき、または Claude Code に DISABLE_TELEMETRY が設定されているとき）は Claude Code がスマホに通知できないため、この設定はオフとして扱います。",

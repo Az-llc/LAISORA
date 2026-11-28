@@ -6,7 +6,7 @@ import { handleSegmentedArrow } from "./segmented-keys";
 import { capNameInput } from "./settings-rows";
 import { normalizeDisplayName } from "../display-name";
 import type { WorkStageSettings } from "../protocol";
-import { WORK_STAGE_CAST_RESTS, type WorkStageCast, type WorkStageCastRest, type WorkStageCastSetting, type WorkStageCharacter } from "../work-stage-cast";
+import { WORK_STAGE_CAST_RESTS, type WorkStageCast, type WorkStageCastRest, type WorkStageCastSetting, type WorkStageChoice } from "../work-stage-cast";
 
 interface SettingsControls {
   row(card: HTMLElement, label: string, description: string, control: HTMLElement, focusTarget?: () => HTMLElement | undefined): HTMLElement;
@@ -22,7 +22,7 @@ export interface WorkStageCastSettings {
 
 type FocusWanted = { id: string; control: "earlier" | "remove" } | "choice" | null;
 
-export function characterLabel(cast: WorkStageCast, character: WorkStageCharacter): string {
+export function characterLabel(cast: WorkStageCast, character: WorkStageChoice): string {
   const name = cast.names[character.id];
   return name === undefined || name === character.name ? character.name : l10n.t("{0} ({1})", name, character.name);
 }
@@ -39,7 +39,7 @@ export function focusAfterRemove(list: readonly string[], index: number): FocusW
   return next === undefined ? "choice" : { id: next, control: "remove" };
 }
 
-export function namesWith(names: Readonly<Record<string, string>>, character: WorkStageCharacter, typed: string): Record<string, string> {
+export function namesWith(names: Readonly<Record<string, string>>, character: WorkStageChoice, typed: string): Record<string, string> {
   const name = normalizeDisplayName(typed);
   const next = { ...names };
   if (name === "" || name === character.name) delete next[character.id];
@@ -58,6 +58,16 @@ export function createWorkStageCastSettings(category: HTMLElement, card: HTMLEle
   let shownFor: boolean | undefined;
   let focusWanted: FocusWanted = null;
   let restoreFocus: HTMLElement | undefined;
+
+  const room = element("select", "settings-select");
+  room.id = "setting-work-stage-room";
+  const roomText = row(card, l10n.t("Room"),
+    l10n.t("The room the work stage shows. Default leaves it to the work stage."), room);
+  room.addEventListener("change", () => {
+    if (state === undefined || pending !== null) return;
+    pending = write("room", room.value);
+    drawControls();
+  });
 
   const conductor = element("select", "settings-select");
   conductor.id = "setting-work-stage-conductor";
@@ -118,12 +128,12 @@ export function createWorkStageCastSettings(category: HTMLElement, card: HTMLEle
     () => restRadios.find((radio) => radio.getAttribute("aria-checked") === "true") ?? restRadios[0]);
 
   const namesCard = section(category, l10n.t("Character names"));
-  const nameInputs = new Map<string, { input: HTMLInputElement; text: HTMLElement; character: WorkStageCharacter }>();
+  const nameInputs = new Map<string, { input: HTMLInputElement; text: HTMLElement; character: WorkStageChoice }>();
   const savedNames = (): Readonly<Record<string, string>> => namesSent ?? state?.cast.names ?? {};
   const edited = new Set<HTMLInputElement>();
   let namesInput: HTMLInputElement | null = null;
 
-  const writeName = (character: WorkStageCharacter, input: HTMLInputElement, text: HTMLElement): void => {
+  const writeName = (character: WorkStageChoice, input: HTMLInputElement, text: HTMLElement): void => {
     if (state === undefined) return;
     const base = savedNames();
     const next = namesWith(base, character, input.value);
@@ -135,7 +145,7 @@ export function createWorkStageCastSettings(category: HTMLElement, card: HTMLEle
     namesRequest = write("names", next);
   };
 
-  const buildNames = (characters: readonly WorkStageCharacter[]): void => {
+  const buildNames = (characters: readonly WorkStageChoice[]): void => {
     namesCard.replaceChildren();
     nameInputs.clear();
     for (const character of characters) {
@@ -172,7 +182,7 @@ export function createWorkStageCastSettings(category: HTMLElement, card: HTMLEle
     }
   };
 
-  const optionFor = (cast: WorkStageCast, character: WorkStageCharacter): HTMLOptionElement => {
+  const optionFor = (cast: WorkStageCast, character: WorkStageChoice): HTMLOptionElement => {
     const option = element("option", "", characterLabel(cast, character));
     option.value = character.id;
     return option;
@@ -180,12 +190,22 @@ export function createWorkStageCastSettings(category: HTMLElement, card: HTMLEle
 
   function drawControls(): void {
     const busy = state === undefined || pending !== null;
-    const key = JSON.stringify([state?.characters ?? [], state?.cast ?? null, busy]);
+    const key = JSON.stringify([state?.characters ?? [], state?.rooms ?? [], state?.cast ?? null, busy]);
     if (key === drawnFor) return;
     drawnFor = key;
     const characters = state?.characters ?? [];
     const cast: WorkStageCast = state?.cast ?? { favourites: [], names: {} };
-    if (busy) restoreFocus = [conductor, ...restRadios].find((control) => control === document.activeElement) ?? restoreFocus;
+    if (busy) restoreFocus = [room, conductor, ...restRadios].find((control) => control === document.activeElement) ?? restoreFocus;
+
+    const roomDefault = element("option", "", l10n.t("Default"));
+    roomDefault.value = "";
+    room.replaceChildren(roomDefault, ...(state?.rooms ?? []).map((choice) => {
+      const option = element("option", "", choice.name);
+      option.value = choice.id;
+      return option;
+    }));
+    room.value = cast.room ?? "";
+    room.disabled = busy;
 
     const fallback = element("option", "", l10n.t("Default"));
     fallback.value = "";
@@ -235,7 +255,7 @@ export function createWorkStageCastSettings(category: HTMLElement, card: HTMLEle
       radio.disabled = busy;
     }
 
-    if (state === undefined || conductorText.parentElement!.hidden) {
+    if (state === undefined || (conductorText.parentElement!.hidden && roomText.parentElement!.hidden)) {
       focusWanted = null;
       restoreFocus = undefined;
       return;
@@ -275,13 +295,16 @@ export function createWorkStageCastSettings(category: HTMLElement, card: HTMLEle
       const shown = (next?.characters.length ?? 0) > 0;
       for (const text of [conductorText, favouritesText, restText]) text.parentElement!.hidden = !shown;
       namesCard.parentElement!.hidden = !shown;
+      const roomShown = (next?.rooms.length ?? 0) > 1;
+      roomText.parentElement!.hidden = !roomShown;
       drawControls();
       drawNames(replied);
-      const changed = shownFor !== shown;
-      shownFor = shown;
+      const changed = shownFor !== (shown || roomShown);
+      shownFor = shown || roomShown;
       return changed;
     },
     anchor(setting) {
+      if (setting === "room") return roomText;
       if (setting === "conductor") return conductorText;
       if (setting === "favourites") return favouritesText;
       if (setting === "rest") return restText;

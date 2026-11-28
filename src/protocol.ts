@@ -3,7 +3,7 @@ import { clipText } from "./text-clip";
 import { isToolIntentInput, type ToolIntentInput } from "./tool-intent";
 import { isAccentSettings, isAccentSettingValue, type AccentSettings, type AccentSetting } from "./accent";
 import { isDisplayName } from "./display-name";
-import { isWorkStageCast, isWorkStageCastSettingValue, isWorkStageCharacter, type WorkStageCast, type WorkStageCastSetting, type WorkStageCharacter } from "./work-stage-cast";
+import { isWorkStageCast, isWorkStageCastSettingValue, isWorkStageChoice, type WorkStageCast, type WorkStageCastSetting, type WorkStageChoice } from "./work-stage-cast";
 import { isEventLimit } from "./event-limits";
 import { isTranscriptRetentionDays, isTranscriptRetentionFallback, type TranscriptRetentionFallback } from "./transcript-retention";
 import { configurationBound } from "./configuration-defaults";
@@ -1216,13 +1216,15 @@ export function isHostToSettingsPage(v: unknown): v is HostToSettingsPage {
 export interface WorkStageSettings {
   enabled: boolean;
   cast: WorkStageCast;
-  characters: WorkStageCharacter[];
+  characters: WorkStageChoice[];
+  rooms: WorkStageChoice[];
 }
 
 function isWorkStageSettings(value: unknown): value is WorkStageSettings {
-  return isProfileObject(value) && hasOnlyKeys(value, ["enabled", "cast", "characters"]) && typeof value.enabled === "boolean"
+  return isProfileObject(value) && hasOnlyKeys(value, ["enabled", "cast", "characters", "rooms"]) && typeof value.enabled === "boolean"
     && isWorkStageCast(value.cast)
-    && Array.isArray(value.characters) && value.characters.every(isWorkStageCharacter);
+    && Array.isArray(value.characters) && value.characters.every(isWorkStageChoice)
+    && Array.isArray(value.rooms) && value.rooms.every(isWorkStageChoice);
 }
 
 export interface AskMarks {

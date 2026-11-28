@@ -53,7 +53,7 @@ import { extensionContext, output, store } from "./host-context";
 import { ADDITIONAL_MODELS_KEY, additionalClaudeModelIds, isClaudeVersionId, recomputeModelRows, modelsMessage } from "./gateway-models";
 import { restoreTabsOnStartupEnabled } from "./session-list-wiring";
 import { TODO_ENABLED_SETTING } from "./todo-store";
-import { WORK_STAGE_ENABLED_SETTING, workStageCastSettingKey, workStageCharacters, workStagePresent } from "./work-stage-host";
+import { WORK_STAGE_ENABLED_SETTING, workStageCastSettingKey, workStageChoices, workStagePresent } from "./work-stage-host";
 import { workStageCastOf, workStageCastWrite, type WorkStageCast, type WorkStageCastSetting } from "./work-stage-cast";
 import { todoFeatureEnabled } from "./todo-surface";
 import { EDIT_SUMMARY_SETTING } from "./edit-summary";
@@ -77,7 +77,7 @@ function workStageEnabled(): boolean {
 
 function workStageCast(): WorkStageCast {
   const cfg = getLaisoraConfiguration();
-  return workStageCastOf((setting) => cfg.get<unknown>(workStageCastSettingKey(setting)), workStageCharacters(),
+  return workStageCastOf((setting) => cfg.get<unknown>(workStageCastSettingKey(setting)), workStageChoices(),
     (setting) => configurationDefault<unknown>(workStageCastSettingKey(setting)));
 }
 
@@ -355,7 +355,7 @@ export function settingsStateMessage(): Extract<HostToSettingsPage, { type: "set
     guardEnabled: placementSettings.guardEnabled,
     memoryBlockProjectType: placementSettings.blockProjectType,
     todoEnabled: todoFeatureEnabled(cfg),
-    ...(workStagePresent() ? { workStage: { enabled: workStageEnabled(), cast: workStageCast(), characters: [...workStageCharacters()] } } : {}),
+    ...(workStagePresent() ? { workStage: { enabled: workStageEnabled(), cast: workStageCast(), characters: [...workStageChoices().characters], rooms: [...workStageChoices().rooms] } } : {}),
     reloadNeeded: settingsReloadNeeded(cfg),
     editSummaryEnabled: editSummarySettingEnabled(),
     remoteControlCard: remoteControlCardEnabled(),
@@ -480,7 +480,7 @@ export async function writeWorkStageEnabled(enabled: boolean): Promise<SettingWr
 }
 
 export async function writeWorkStageCastSetting(setting: WorkStageCastSetting, value: unknown): Promise<SettingWriteFailure | undefined> {
-  const accepted = workStagePresent() ? workStageCastWrite(setting, value, workStageCharacters()) : undefined;
+  const accepted = workStagePresent() ? workStageCastWrite(setting, value, workStageChoices()) : undefined;
   return accepted ? updateUserSetting(workStageCastSettingKey(setting), accepted.value) : undefined;
 }
 

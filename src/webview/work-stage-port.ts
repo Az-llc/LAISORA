@@ -52,8 +52,6 @@ export interface StageTextPort {
 
 export interface StageOptionsPort extends Partial<WorkStageMountCast> {
   manifest: unknown;
-  catalogue: unknown;
-  room: unknown;
   assetsBase: string;
   locale?: string;
   text: StageTextPort;
@@ -66,6 +64,4 @@ export interface StageHandlePort {
 
 export interface StageModulePort {
   mountStage(container: HTMLElement, options: StageOptionsPort): StageHandlePort;
-  defaultCatalogue: unknown;
-  officeRoom: unknown;
 }

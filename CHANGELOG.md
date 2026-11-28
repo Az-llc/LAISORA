@@ -1,5 +1,14 @@
 # Changelog
 
+## 1.20.0
+
+- **Work stage (beta).** The chat can show the conversation as a small room where Claude and its
+  delegates work as animals: they walk to their desks, work, talk, wait for your answer at the
+  post, and take a break. Turned off by default; turn it on in the LAISORA settings, where you
+  also choose the room (a cottage study, a greenhouse workshop or an office), the conductor's
+  character, favourite characters and their names.
+- Updated the Claude Agent SDK to 0.3.332 (Claude Code 2.1.332).
+
 ## 1.19.0
 
 - **Broken Claude Code settings file.** When Claude Code cannot start because one of its settings

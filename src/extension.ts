@@ -222,7 +222,7 @@ function activateReady(context: vscode.ExtensionContext): void {
   setActivationT0(activatedAt);
   setExtensionContext(context);
   setOutput(vscode.window.createOutputChannel("LAISORA"));
-  noteWorkStagePresence(context.extensionPath);
+  noteWorkStagePresence(context.extensionPath, String(vscode.env.language ?? "").toLowerCase());
   registerHomePathRoot();
   output.appendLine(`[startup] ${sinceActivation()} activate at ${localIsoTime(activatedAt)}`);
   sampleStartupLoopLag(activatedAt);

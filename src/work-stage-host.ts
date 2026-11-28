@@ -1,6 +1,6 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { workStageCharactersOf, type WorkStageCastSetting, type WorkStageCharacter } from "./work-stage-cast";
+import { workStageCharactersOf, workStageRoomsOf, type WorkStageCastSetting, type WorkStageChoices } from "./work-stage-cast";
 import { assets, data, dataGlobal, pictureDir, pictureSuffix, script, scriptGlobal } from "./work-stage-packet.json";
 
 export const WORK_STAGE_SETTINGS = "workStage";
@@ -53,20 +53,23 @@ export function manifestOfStageData(text: string): unknown {
   }
 }
 
-export function readWorkStageCharacters(extensionPath: string, packet: WorkStagePacket = WORK_STAGE_PACKET): WorkStageCharacter[] {
+const NO_CHOICES: WorkStageChoices = { characters: [], rooms: [] };
+
+export function readWorkStageChoices(extensionPath: string, language: string, packet: WorkStagePacket = WORK_STAGE_PACKET): WorkStageChoices {
   try {
-    return workStageCharactersOf(manifestOfStageData(fs.readFileSync(path.join(extensionPath, ...packet.data.split("/")), "utf8")));
+    const manifest = manifestOfStageData(fs.readFileSync(path.join(extensionPath, ...packet.data.split("/")), "utf8"));
+    return { characters: workStageCharactersOf(manifest), rooms: workStageRoomsOf(manifest, language) };
   } catch {
-    return [];
+    return NO_CHOICES;
   }
 }
 
 let present = false;
-let characters: readonly WorkStageCharacter[] = [];
+let choices: WorkStageChoices = NO_CHOICES;
 
-export function noteWorkStagePresence(extensionPath: string): boolean {
+export function noteWorkStagePresence(extensionPath: string, language: string): boolean {
   present = workStagePresence(extensionPath);
-  characters = present ? readWorkStageCharacters(extensionPath) : [];
+  choices = present ? readWorkStageChoices(extensionPath, language) : NO_CHOICES;
   return present;
 }
 
@@ -74,8 +77,8 @@ export function workStagePresent(): boolean {
   return present;
 }
 
-export function workStageCharacters(): readonly WorkStageCharacter[] {
-  return characters;
+export function workStageChoices(): WorkStageChoices {
+  return choices;
 }
 
 export function workStageRoots(presence: boolean, packet: WorkStagePacket): string[] {

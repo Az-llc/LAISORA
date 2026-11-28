@@ -246,8 +246,6 @@ export class WorkStageDrawer implements DrawerOccupant {
       drawer.body.replaceChildren();
       this.handle = module.mountStage(drawer.body, {
         manifest: globalOf(location.dataGlobal) ?? { chars: {} },
-        catalogue: module.defaultCatalogue,
-        room: module.officeRoom,
         assetsBase: location.assets,
         locale: document.documentElement.lang,
         text: workStageText(),

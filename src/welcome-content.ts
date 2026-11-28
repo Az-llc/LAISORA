@@ -18,6 +18,9 @@ export interface WelcomeUiNames { menuGlyph: string; handoffItem: string; appear
 
 export function welcomeNews(): Readonly<Record<string, readonly WelcomeNewsItem[]>> {
   return {
+    "1.20.0": [
+      { kind: "new", text: l10n.t("Beta: the work stage shows Claude and its delegates as animals working in a room in the chat. It is turned off at first; turn it on in the LAISORA settings, where you also choose the room and the characters.") },
+    ],
     "1.19.0": [
       { kind: "new", text: l10n.t("When a Claude Code settings file is broken, the conversation shows one notice with the file, how to fix it, and buttons that open it.") },
       { kind: "new", text: l10n.t("In a narrow window the message box wraps its controls to two rows, and the model stays visible.") },
